@@ -1038,12 +1038,17 @@ impl Session {
     ) -> Result<(), native_replay::RestartReason> {
         native_replay::bounded_serialized(self, storage::MAX_SESSION_BYTES)?;
         history.bind_feed(&self.messages, &self.compactions)?;
-        history.validate_saved()?;
-        let mut candidate = self.clone();
-        candidate.native_history = Some(history);
-        candidate.validate_native_persistence()?;
-        native_replay::bounded_serialized(&candidate, storage::MAX_SESSION_BYTES)?;
-        self.native_history = candidate.native_history;
+        // Validate the candidate in place and restore the previous history on
+        // refusal; a Session clone is not needed to leave `self` unchanged.
+        // `validate_native_persistence` validates the history first thing.
+        let previous = self.native_history.replace(history);
+        let valid = self.validate_native_persistence().and_then(|()| {
+            native_replay::bounded_serialized(&*self, storage::MAX_SESSION_BYTES).map(|_| ())
+        });
+        if let Err(reason) = valid {
+            self.native_history = previous;
+            return Err(reason);
+        }
         Ok(())
     }
 

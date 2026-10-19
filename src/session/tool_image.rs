@@ -8,10 +8,19 @@ const MAX_TOOL_IMAGE_ENCODED_BYTES: usize = 7 * 1024 * 1024;
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedImage")]
 pub struct PersistedToolImage {
-    data: String,
+    /// Shared so Session clones (several per native turn) do not copy up to
+    /// 5 MiB of base64 per image.
+    #[serde(serialize_with = "serialize_shared")]
+    data: std::sync::Arc<str>,
     mime_type: super::user::ImageMime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     detail: Option<rig::message::ImageDetail>,
+}
+fn serialize_shared<S: serde::Serializer>(
+    data: &std::sync::Arc<str>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(data)
 }
 impl std::fmt::Debug for PersistedToolImage {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,7 +42,7 @@ impl TryFrom<UncheckedImage> for PersistedToolImage {
     type Error = &'static str;
     fn try_from(value: UncheckedImage) -> Result<Self, Self::Error> {
         let image = Self {
-            data: value.data,
+            data: value.data.into(),
             mime_type: value.mime_type,
             detail: value.detail,
         };
@@ -56,7 +65,7 @@ impl PersistedToolImage {
             .and_then(|mime| super::user::ImageMime::parse(mime.to_mime_type()))
             .ok_or("Unsupported tool image MIME type")?;
         let value = Self {
-            data: data.clone(),
+            data: data.as_str().into(),
             mime_type,
             detail: image.detail.clone(),
         };
@@ -69,7 +78,7 @@ impl PersistedToolImage {
             return Err("Tool image exceeds the 5 MiB byte limit");
         }
         let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&self.data)
+            .decode(self.data.as_bytes())
             .map_err(|_| "Invalid tool image base64")?;
         if bytes.len() > cap {
             return Err("Tool image exceeds the 5 MiB byte limit");
@@ -83,7 +92,7 @@ impl PersistedToolImage {
     }
     pub(crate) fn to_rig(&self) -> rig::message::Image {
         rig::message::Image {
-            data: rig::message::DocumentSourceKind::Base64(self.data.clone()),
+            data: rig::message::DocumentSourceKind::Base64(self.data.to_string()),
             media_type: Some(self.mime_type.sdk()),
             detail: self.detail.clone(),
             additional_params: None,

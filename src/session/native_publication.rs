@@ -424,6 +424,19 @@ fn digest(session: &Session) -> anyhow::Result<[u8; 32]> {
     Ok(Sha256::digest(encoded.as_bytes()).into())
 }
 
+/// [`checked_publication`] that also returns the canonical encoding it hashed,
+/// so an unprojected write of the same Session reuses it.
+fn checked_publication_encoded(session: &Session) -> anyhow::Result<(&NativePublication, String)> {
+    let publication = checked_publication_owner(session)?;
+    let encoded = super::storage::serialize_bounded_session(session)?;
+    let digest: [u8; 32] = Sha256::digest(encoded.as_bytes()).into();
+    anyhow::ensure!(
+        digest == publication.digest,
+        "native context snapshot changed before publication"
+    );
+    Ok((publication, encoded))
+}
+
 fn checked_publication_owner(session: &Session) -> anyhow::Result<&NativePublication> {
     let publication = session.native_publication.as_ref().ok_or_else(|| {
         anyhow::anyhow!("unfinished native context requires its saved-session owner")
@@ -537,7 +550,26 @@ fn validate_revision(
 /// Ordinary native-bearing snapshots can never heal an admitted in-flight
 /// checkpoint. Old clones and independently deserialized same-id data refuse.
 pub(super) fn save_snapshot(session: &Session) -> anyhow::Result<()> {
-    let publication = checked_publication(session)?;
+    save_snapshot_inner(session, false)
+}
+
+/// The cheap, synchronous part of a snapshot's admission: the exact retained
+/// owner of this Session. The digest comparison runs with the write.
+pub(super) fn ensure_snapshot_owner(session: &Session) -> anyhow::Result<()> {
+    checked_publication_owner(session).map(|_| ())
+}
+
+/// The deferred writer's form of [`save_snapshot`]. The snapshot was cloned
+/// from the live Session some time ago, so its owner may have since published
+/// a newer revision (next turn, progress, retirement). That checkpoint already
+/// carries everything this snapshot did, so the older one is dropped instead
+/// of reported; every other refusal is unchanged.
+pub(super) fn save_snapshot_deferred(session: &Session) -> anyhow::Result<()> {
+    save_snapshot_inner(session, true)
+}
+
+fn save_snapshot_inner(session: &Session, drop_superseded: bool) -> anyhow::Result<()> {
+    let (publication, encoded) = checked_publication_encoded(session)?;
     let writer = publication.owner.lease.begin_write()?;
     let _io = publication
         .owner
@@ -553,19 +585,41 @@ pub(super) fn save_snapshot(session: &Session) -> anyhow::Result<()> {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if drop_superseded && publication.revision != state.revision {
+            tracing::debug!("deferred native snapshot superseded by a newer checkpoint");
+            return Ok(());
+        }
         validate_revision(publication, &state)?;
         state.phase
     };
-    write_projection(session, phase == Phase::Active)
+    write_projection_with(session, phase == Phase::Active, Some(encoded))
 }
 
 fn write_projection(session: &Session, in_flight: bool) -> anyhow::Result<()> {
-    let mut snapshot = session.clone();
-    if in_flight {
-        snapshot.native_frontier = session.native_frontier.in_flight_projection();
-    }
+    write_projection_with(session, in_flight, None)
+}
+
+/// `encoded` is the canonical encoding of exactly `session`; it is the bytes
+/// to write when no in-flight projection changes the Session.
+fn write_projection_with(
+    session: &Session,
+    in_flight: bool,
+    encoded: Option<String>,
+) -> anyhow::Result<()> {
+    let projected;
+    let snapshot = if in_flight {
+        let mut copy = session.clone();
+        copy.native_frontier = session.native_frontier.in_flight_projection();
+        projected = copy;
+        &projected
+    } else {
+        session
+    };
     snapshot.validate_native_persistence()?;
-    let json = super::storage::serialize_bounded_session(&snapshot)?;
+    let json = match encoded.filter(|_| !in_flight) {
+        Some(encoded) => encoded,
+        None => super::storage::serialize_bounded_session(snapshot)?,
+    };
     let publication = snapshot
         .native_publication
         .as_ref()
@@ -1780,6 +1834,85 @@ mod tests {
             super::super::storage::save_session(&session).unwrap();
             assert_eq!(imported(&session).messages.len(), 2);
             assert!(session.permission_allowlist.is_empty());
+        });
+    }
+
+    #[test]
+    fn native_publication_turn_end_save_is_deferred_off_the_calling_thread() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-publication-deferred");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        session.add_message(super::super::MessageRole::User, "literal prompt");
+        runtime().block_on(async {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let ticket = begin_owned(&mut session, &scope).await.unwrap();
+            session.add_message(super::super::MessageRole::Assistant, "completed answer");
+            retire_owned(
+                &mut session,
+                ticket,
+                RetiredNativeOutcome::Completed,
+                &scope,
+            )
+            .await
+            .unwrap();
+            scope.wait_idle().await;
+            assert!(is_native_bearing(&session));
+
+            let path = super::super::storage::session_path(&session.id).unwrap();
+            super::super::storage::save_session(&session).unwrap();
+            let expected = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+
+            let _defer = super::super::storage::defer_saves_for_test();
+            let before = crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get);
+            super::super::storage::save_session_deferred(&session).unwrap();
+            assert_eq!(
+                crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get),
+                before,
+                "the calling thread performs no durable write"
+            );
+            super::super::storage::flush_deferred_sessions().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            assert_eq!(
+                crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get),
+                before,
+                "the writer thread, not the caller, synced the snapshot"
+            );
+        });
+    }
+
+    #[test]
+    fn native_publication_deferred_snapshot_never_overwrites_a_newer_checkpoint() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-publication-deferred-stale");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        session.add_message(super::super::MessageRole::User, "literal prompt");
+        runtime().block_on(async {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let ticket = begin_owned(&mut session, &scope).await.unwrap();
+            session.add_message(super::super::MessageRole::Assistant, "completed answer");
+            retire_owned(
+                &mut session,
+                ticket,
+                RetiredNativeOutcome::Completed,
+                &scope,
+            )
+            .await
+            .unwrap();
+            scope.wait_idle().await;
+            let queued = session.clone();
+            // The next turn publishes a newer checkpoint before the writer runs.
+            let next = begin_owned(&mut session, &scope).await.unwrap();
+            scope.wait_idle().await;
+            let path = super::super::storage::session_path(&session.id).unwrap();
+            let newer = std::fs::read(&path).unwrap();
+            assert!(save_snapshot(&queued).is_err(), "a sync stale save refuses");
+            save_snapshot_deferred(&queued).expect("the deferred writer drops it");
+            assert_eq!(std::fs::read(&path).unwrap(), newer);
+            drop(next);
+            scope.wait_idle().await;
         });
     }
 

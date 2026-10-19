@@ -322,6 +322,13 @@ pub(crate) const MAX_NATIVE_PAYLOAD: usize = 4 * 1024 * 1024;
 const MAX_NATIVE_FRAME: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_NATIVE_FRAMES: usize = 128;
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes written through `bounded_serialized` on this thread, so tests can
+    /// assert the serialization work of one event does not grow with history.
+    pub(crate) static SERIALIZED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn bounded_serialized<T: serde::Serialize>(
     value: &T,
     limit: usize,
@@ -332,6 +339,8 @@ pub(crate) fn bounded_serialized<T: serde::Serialize>(
     }
     impl std::io::Write for Limited {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            #[cfg(test)]
+            SERIALIZED_BYTES.with(|total| total.set(total.get() + bytes.len()));
             self.bytes = self
                 .bytes
                 .checked_add(bytes.len())
@@ -359,22 +368,22 @@ pub(crate) fn feed_digest(
     messages: &[super::SessionMessage],
     compactions: &[super::Compaction],
 ) -> Result<[u8; 32], RestartReason> {
+    hashed_within(&(messages, compactions), super::storage::MAX_SESSION_BYTES)
+}
+
+/// SHA-256 of the value's JSON, failing past `limit` bytes. The bound and the
+/// hash share one serialization pass; the digest is of the same bytes.
+fn hashed_within<T: serde::Serialize>(value: &T, limit: usize) -> Result<[u8; 32], RestartReason> {
     use sha2::Digest;
-    bounded_serialized(&(messages, compactions), super::storage::MAX_SESSION_BYTES)?;
-    let mut hash = HashWriter(sha2::Sha256::new());
-    serde_json::to_writer(&mut hash, &(messages, compactions))
-        .map_err(|_| RestartReason::UnavailableSource)?;
+    let mut hash = HashWriter(sha2::Sha256::new(), 0, limit);
+    serde_json::to_writer(&mut hash, value).map_err(|_| RestartReason::Limit)?;
     Ok(hash.0.finalize().into())
 }
 
 pub(crate) fn compaction_digest(
     compactions: &[super::Compaction],
 ) -> Result<[u8; 32], RestartReason> {
-    use sha2::Digest;
-    bounded_serialized(&compactions, super::storage::MAX_SESSION_BYTES)?;
-    let mut hash = HashWriter(sha2::Sha256::new());
-    serde_json::to_writer(&mut hash, compactions).map_err(|_| RestartReason::UnavailableSource)?;
-    Ok(hash.0.finalize().into())
+    hashed_within(&compactions, super::storage::MAX_SESSION_BYTES)
 }
 
 /// Without an owned prior commitment, native opaque history is unavailable.
@@ -394,6 +403,199 @@ fn require_plain_messages(messages: &[rig::completion::Message]) -> Result<(), R
             {
                 return Err(RestartReason::UnavailableSource);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Serialized sizes of a growing capture, maintained by its owner so the
+/// whole-history byte bounds are arithmetic instead of a re-serialization.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CaptureSizes {
+    /// Serialized bytes of the base message array.
+    pub(crate) base: usize,
+    /// The base already passed its immutable (plain-message) check.
+    pub(crate) base_checked: bool,
+    /// Serialized bytes of each frame, parallel to the frames.
+    pub(crate) frames: Vec<usize>,
+    /// Leading frames whose immutable checks (delta, commitment) passed.
+    pub(crate) checked_frames: usize,
+}
+
+/// Serialized bytes of `{"version":1,"epoch":E,"base":[..],"frames":[..]}`
+/// (the optional anchor/boundary/host fields are absent for a capture).
+pub(crate) fn capture_history_size(epoch: u64, base: usize, frames: &[usize]) -> usize {
+    const FRAMING: usize = r#"{"version":1,"epoch":,"base":,"frames":[]}"#.len();
+    let digits = epoch.checked_ilog10().map_or(1, |log| log as usize + 1);
+    let commas = frames.len().saturating_sub(1);
+    frames
+        .iter()
+        .fold(FRAMING.saturating_add(digits), |total, size| {
+            total.saturating_add(*size)
+        })
+        .saturating_add(base)
+        .saturating_add(commas)
+}
+
+enum Sizing<'a> {
+    Measure(&'a NativeHistory),
+    Known { epoch: u64, sizes: &'a CaptureSizes },
+}
+
+impl Sizing<'_> {
+    fn check_total(&self) -> Result<(), RestartReason> {
+        match self {
+            Self::Measure(history) => bounded_serialized(*history, MAX_NATIVE_PAYLOAD).map(|_| ()),
+            Self::Known { epoch, sizes } => {
+                let total = capture_history_size(*epoch, sizes.base, &sizes.frames);
+                (total <= MAX_NATIVE_PAYLOAD)
+                    .then_some(())
+                    .ok_or(RestartReason::Limit)
+            }
+        }
+    }
+    fn check_base(&self, base: &[rig::completion::Message]) -> Result<(), RestartReason> {
+        match self {
+            Self::Measure(_) => bounded_serialized(&base, MAX_NATIVE_FRAME).map(|_| ()),
+            Self::Known { sizes, .. } => (sizes.base <= MAX_NATIVE_FRAME)
+                .then_some(())
+                .ok_or(RestartReason::Limit),
+        }
+    }
+    fn base_checked(&self) -> bool {
+        matches!(self, Self::Known { sizes, .. } if sizes.base_checked)
+    }
+    fn check_frame(
+        &self,
+        index: usize,
+        frame: &crate::agent::native_capture::NativeTurnProjection,
+    ) -> Result<(), RestartReason> {
+        match self {
+            Self::Measure(_) => bounded_serialized(frame, MAX_NATIVE_FRAME).map(|_| ()),
+            Self::Known { sizes, .. } => (sizes.frames.get(index).copied().unwrap_or(usize::MAX)
+                <= MAX_NATIVE_FRAME)
+                .then_some(())
+                .ok_or(RestartReason::Limit),
+        }
+    }
+    fn frame_checked(&self, index: usize) -> bool {
+        matches!(self, Self::Known { sizes, .. } if index < sizes.checked_frames)
+    }
+}
+
+fn validate_parts(
+    version: u8,
+    base: &[rig::completion::Message],
+    frames: &[crate::agent::native_capture::NativeTurnProjection],
+    sizing: Sizing<'_>,
+) -> Result<(), RestartReason> {
+    use rig::completion::AssistantContent;
+    if version != 1 || frames.is_empty() || frames.len() > MAX_NATIVE_FRAMES {
+        return Err(RestartReason::UnavailableSource);
+    }
+    sizing.check_total()?;
+    sizing.check_base(base)?;
+    if !sizing.base_checked() {
+        require_plain_messages(base)?;
+    }
+    let mut keys = std::collections::HashSet::new();
+    let mut tool_ids = std::collections::HashSet::new();
+    let mut internal_ids = std::collections::HashSet::new();
+    let mut domain = None;
+    for (index, frame) in frames.iter().enumerate() {
+        if frame.content.len() > MAX_BINDING_BLOCKS
+            || frame.sdk_run_id.is_empty()
+            || frame.sdk_run_id.len() > 512
+            || frame.configured_model.is_empty()
+            || frame.configured_model.len() > 512
+            || !keys.insert((&frame.sdk_run_id, frame.turn))
+        {
+            return Err(RestartReason::UnavailableSource);
+        }
+        sizing.check_frame(index, frame)?;
+        let immutable_checked = sizing.frame_checked(index);
+        let delta = frame
+            .native_input_delta
+            .as_ref()
+            .ok_or(RestartReason::UnavailableSource)?;
+        if !immutable_checked {
+            require_plain_messages(delta)?;
+        }
+        if index == 0 && !delta.is_empty() {
+            return Err(RestartReason::ChangedPrefix);
+        }
+        let commitment = frame
+            .native_commitment
+            .as_ref()
+            .ok_or(RestartReason::UnavailableSource)?;
+        if !immutable_checked {
+            commitment.domain.validate_saved()?;
+            commitment.validate_completed_content(&frame.content)?;
+        }
+        let mut positions = std::collections::HashSet::new();
+        if commitment
+            .blocks
+            .iter()
+            .any(|block| !positions.insert((block.message, block.block)))
+        {
+            return Err(RestartReason::UnavailableSource);
+        }
+        if domain
+            .as_ref()
+            .is_some_and(|domain| domain != &commitment.domain)
+        {
+            return Err(RestartReason::ChangedDomain);
+        }
+        domain = Some(commitment.domain.clone());
+        if commitment.blocks.len() > MAX_BINDING_BLOCKS
+            || commitment.blocks.iter().any(|block| {
+                block.message >= MAX_BINDING_MESSAGES || block.block >= MAX_BINDING_BLOCKS
+            })
+        {
+            return Err(RestartReason::Limit);
+        }
+        let calls: Vec<_> = frame
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                AssistantContent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        // A final, interrupted tool batch may have no advertised mapping.
+        // It stays compatibility data and cannot be a completed boundary.
+        if frame.advertised_tools.len() > calls.len()
+            || (index + 1 != frames.len() && frame.advertised_tools.len() != calls.len())
+        {
+            return Err(RestartReason::UnavailableSource);
+        }
+        for call in &calls {
+            if call.id.is_empty() || call.id.len() > 512 || !tool_ids.insert(&call.id) {
+                return Err(RestartReason::UnavailableSource);
+            }
+        }
+        let mut results = std::collections::HashSet::new();
+        for result in &frame.native_tool_results {
+            let identity = frame
+                .advertised_tools
+                .iter()
+                .find(|identity| identity.tool_id == result.id)
+                .ok_or(RestartReason::UnavailableSource)?;
+            if !results.insert(result.id.as_str()) || result.call_id != identity.provider_id {
+                return Err(RestartReason::UnavailableSource);
+            }
+        }
+        if frame.native_tool_results.len() > calls.len() {
+            return Err(RestartReason::UnavailableSource);
+        }
+        let mut mapped = std::collections::HashSet::new();
+        for identity in &frame.advertised_tools {
+            if identity.internal_id.is_empty() || identity.internal_id.len() > 512
+                || identity.provider_id.as_ref().is_some_and(|id| id.len() > 512)
+                || !internal_ids.insert(&identity.internal_id)
+                || !mapped.insert(&identity.tool_id)
+                || !frame.content.iter().any(|item| matches!(item, AssistantContent::ToolCall(call) if call.id == identity.tool_id))
+            { return Err(RestartReason::UnavailableSource); }
         }
     }
     Ok(())
@@ -485,109 +687,24 @@ impl NativeHistory {
         if let Some(host) = &self.host {
             host.validate()?;
         }
-        use rig::completion::AssistantContent;
-        if self.version != 1 || self.frames.is_empty() || self.frames.len() > MAX_NATIVE_FRAMES {
-            return Err(RestartReason::UnavailableSource);
-        }
-        bounded_serialized(self, MAX_NATIVE_PAYLOAD)?;
-        bounded_serialized(&self.base, MAX_NATIVE_FRAME)?;
-        require_plain_messages(&self.base)?;
-        let mut keys = std::collections::HashSet::new();
-        let mut tool_ids = std::collections::HashSet::new();
-        let mut internal_ids = std::collections::HashSet::new();
-        let mut domain = None;
-        for (index, frame) in self.frames.iter().enumerate() {
-            if frame.content.len() > MAX_BINDING_BLOCKS
-                || frame.sdk_run_id.is_empty()
-                || frame.sdk_run_id.len() > 512
-                || frame.configured_model.is_empty()
-                || frame.configured_model.len() > 512
-                || !keys.insert((&frame.sdk_run_id, frame.turn))
-            {
-                return Err(RestartReason::UnavailableSource);
-            }
-            bounded_serialized(frame, MAX_NATIVE_FRAME)?;
-            let delta = frame
-                .native_input_delta
-                .as_ref()
-                .ok_or(RestartReason::UnavailableSource)?;
-            require_plain_messages(delta)?;
-            if index == 0 && !delta.is_empty() {
-                return Err(RestartReason::ChangedPrefix);
-            }
-            let commitment = frame
-                .native_commitment
-                .as_ref()
-                .ok_or(RestartReason::UnavailableSource)?;
-            commitment.domain.validate_saved()?;
-            commitment.validate_completed_content(&frame.content)?;
-            let mut positions = std::collections::HashSet::new();
-            if commitment
-                .blocks
-                .iter()
-                .any(|block| !positions.insert((block.message, block.block)))
-            {
-                return Err(RestartReason::UnavailableSource);
-            }
-            if domain
-                .as_ref()
-                .is_some_and(|domain| domain != &commitment.domain)
-            {
-                return Err(RestartReason::ChangedDomain);
-            }
-            domain = Some(commitment.domain.clone());
-            if commitment.blocks.len() > MAX_BINDING_BLOCKS
-                || commitment.blocks.iter().any(|block| {
-                    block.message >= MAX_BINDING_MESSAGES || block.block >= MAX_BINDING_BLOCKS
-                })
-            {
-                return Err(RestartReason::Limit);
-            }
-            let calls: Vec<_> = frame
-                .content
-                .iter()
-                .filter_map(|item| match item {
-                    AssistantContent::ToolCall(call) => Some(call),
-                    _ => None,
-                })
-                .collect();
-            // A final, interrupted tool batch may have no advertised mapping.
-            // It stays compatibility data and cannot be a completed boundary.
-            if frame.advertised_tools.len() > calls.len()
-                || (index + 1 != self.frames.len() && frame.advertised_tools.len() != calls.len())
-            {
-                return Err(RestartReason::UnavailableSource);
-            }
-            for call in &calls {
-                if call.id.is_empty() || call.id.len() > 512 || !tool_ids.insert(&call.id) {
-                    return Err(RestartReason::UnavailableSource);
-                }
-            }
-            let mut results = std::collections::HashSet::new();
-            for result in &frame.native_tool_results {
-                let identity = frame
-                    .advertised_tools
-                    .iter()
-                    .find(|identity| identity.tool_id == result.id)
-                    .ok_or(RestartReason::UnavailableSource)?;
-                if !results.insert(result.id.as_str()) || result.call_id != identity.provider_id {
-                    return Err(RestartReason::UnavailableSource);
-                }
-            }
-            if frame.native_tool_results.len() > calls.len() {
-                return Err(RestartReason::UnavailableSource);
-            }
-            let mut mapped = std::collections::HashSet::new();
-            for identity in &frame.advertised_tools {
-                if identity.internal_id.is_empty() || identity.internal_id.len() > 512
-                    || identity.provider_id.as_ref().is_some_and(|id| id.len() > 512)
-                    || !internal_ids.insert(&identity.internal_id)
-                    || !mapped.insert(&identity.tool_id)
-                    || !frame.content.iter().any(|item| matches!(item, AssistantContent::ToolCall(call) if call.id == identity.tool_id))
-                { return Err(RestartReason::UnavailableSource); }
-            }
-        }
-        Ok(())
+        validate_parts(
+            self.version,
+            &self.base,
+            &self.frames,
+            Sizing::Measure(self),
+        )
+    }
+
+    /// Validates a capture's parts in place with sizes the owner tracked
+    /// incrementally: no history clone and no whole-history serialization.
+    /// Accepts and rejects exactly what `from_capture(epoch, base, frames)` does.
+    pub(crate) fn validate_capture(
+        epoch: u64,
+        base: &[rig::completion::Message],
+        frames: &[crate::agent::native_capture::NativeTurnProjection],
+        sizes: &CaptureSizes,
+    ) -> Result<(), RestartReason> {
+        validate_parts(1, base, frames, Sizing::Known { epoch, sizes })
     }
 
     fn validate_boundary(&self, boundary: ReplayBoundary) -> Result<(), RestartReason> {
@@ -796,10 +913,16 @@ const MAX_BINDING_MESSAGES: usize = 4096;
 const MAX_BINDING_BLOCKS: usize = 256;
 const MAX_BINDING_OPAQUE_BLOCKS: usize = MAX_NATIVE_FRAMES * MAX_BINDING_BLOCKS;
 
-struct HashWriter(sha2::Sha256);
+/// Hashes what is written, refusing bytes past its limit (hash, written, limit).
+struct HashWriter(sha2::Sha256, usize, usize);
 impl std::io::Write for HashWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         use sha2::Digest;
+        self.1 = self
+            .1
+            .checked_add(bytes.len())
+            .filter(|size| *size <= self.2)
+            .ok_or_else(|| std::io::Error::other("native payload exceeds limits"))?;
         self.0.update(bytes);
         Ok(bytes.len())
     }
@@ -866,7 +989,7 @@ fn binding_view(
 
 fn value_digest(value: &serde_json::Value) -> Result<[u8; 32], RestartReason> {
     use sha2::Digest;
-    let mut hash = HashWriter(sha2::Sha256::new());
+    let mut hash = HashWriter(sha2::Sha256::new(), 0, usize::MAX);
     serde_json::to_writer(&mut hash, value).map_err(|_| RestartReason::UnavailableSource)?;
     Ok(hash.0.finalize().into())
 }
