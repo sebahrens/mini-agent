@@ -499,10 +499,15 @@ async fn run_hook_with_policy_and_limits(
     // build) are filesystem-heavy: run them on the blocking pool, in the
     // same order as before, so the caller's executor worker (or the TUI task)
     // never stalls on them. Spawning stays here with the execution-root lease.
+    // Preparation starts no process and owns nothing the agent work scope must
+    // reap, so it is plain blocking-pool work rather than scoped work: if the
+    // hook is aborted mid-preparation the awaiting future is dropped and no
+    // child is ever spawned. (Scoped blocking work is also what scope-wide
+    // test gates hold, which must not stall an async hook's launch.)
     let prepared = {
         let policy = policy.clone();
         let prep = prep.clone();
-        crate::agent::runner::spawn_blocking_scoped(move || {
+        tokio::task::spawn_blocking(move || {
             prepare_hook_command(&policy, &prep, &program, &args, search_path.as_deref())
         })
         .await

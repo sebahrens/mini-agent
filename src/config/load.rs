@@ -303,34 +303,29 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
         super::layers::validate_toml_bounds_diagnostic(content, MAX_PRIVATE_CONFIG_BYTES)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
     }
-    // TOML is tokenised once into a table; its keys supply the spelling list and
-    // the table deserialises into Config. A failure re-parses the text so the
-    // error keeps its line/column wording.
-    let mut toml_table: Option<toml::Table> =
+    // The table only supplies the top-level spelling list. Config itself is
+    // deserialised from the text: going through a `toml::Table` routes unknown
+    // keys through serde's flatten buffer, which stringifies TOML datetimes and
+    // breaks the preserved-key round trip (config_cross_feature_round_trip).
+    let toml_keys: Vec<String> =
         if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
-            content.parse::<toml::Table>().ok()
+            content
+                .parse::<toml::Table>()
+                .map(|table| table.keys().cloned().collect())
+                .unwrap_or_default()
         } else {
-            None
+            Vec::new()
         };
-    let toml_keys: Vec<String> = toml_table
-        .as_ref()
-        .map(|table| table.keys().cloned().collect())
-        .unwrap_or_default();
     let mut cfg: Config = match path.extension().and_then(|extension| extension.to_str()) {
-        Some("toml") => toml_table
-            .take()
-            .and_then(|table| <Config as serde::Deserialize>::deserialize(table).ok())
-            .map(Ok)
-            .unwrap_or_else(|| toml::from_str(content))
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "config is not valid TOML ({})",
-                        keys::describe_toml_error(content, &error)
-                    ),
-                )
-            }),
+        Some("toml") => toml::from_str(content).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "config is not valid TOML ({})",
+                    keys::describe_toml_error(content, &error)
+                ),
+            )
+        }),
         _ => serde_yaml_ng::from_str(content).map_err(|error| {
             let message = match error.location() {
                 Some(location) => format!(

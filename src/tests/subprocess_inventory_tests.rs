@@ -790,6 +790,86 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// Counts make adding an identical launch expression visible without coupling
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
+    // perf 2026-10-19: test assertions over returned tool output strings.
+    (
+        "src/extras/hooks/subprocess.rs",
+        "output.started,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/hooks/subprocess.rs",
+        "String::from_utf8_lossy(&output.stderr)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/session/mod.rs",
+        "format_truncated_tool_output_with_notice(&output, len, \"n\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/session/mod.rs",
+        "reference(&output, len, \"n\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.contains(expected), \"{pattern}: {output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(\"b.txt\"), \"{pattern}: {output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(output.contains(\"line 19997 \"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(output.contains(\"line 19998 \"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(!output.contains(\"line 19996 \"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
+    ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
+    // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
+    (
+        "src/extras/acp/mod.rs",
+        "std::process::Command::new(\"kill\")",
+        1,
+        "TEST-ONLY",
+    ),
+    // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
+    (
+        "src/extras/hooks/subprocess.rs",
+        ") -> Result<(tokio::process::Command, std::path::PathBuf), Box<HookOutput>> {",
+        1,
+        "NON-PROCESS",
+    ),
+    // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
+    ("src/sandbox.rs", ".spawn(move || {", 2, "NON-PROCESS"),
+    // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
+    (
+        "src/sandbox.rs",
+        "scope.spawn(move || windows::terminate_helper(*pid));",
+        1,
+        "NON-PROCESS",
+    ),
     // Identity-checked startup-only original Git --exec-path query; never model argv.
     (
         "src/git/runner.rs",
@@ -833,7 +913,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/auth/copilot_protocol_tests.rs",
         "tasks.spawn(async move { r.auth_context().await });",
-        3,
+        4,
         "NON-PROCESS",
     ),
     (
@@ -3222,7 +3302,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/grep.rs",
         "assert_eq!(output, \"No matches found.\");",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -3596,6 +3676,51 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // perf 2026-10-19 tests: assertions over returned tool/hook output values.
+    (
+        "src/agent/tools/grep.rs",
+        &[
+            (
+                "2f9f965dec5fb094307cf349922d1f400621ae69c5bc375933ae58f259994b02",
+                1,
+            ),
+            (
+                "a595abe2b6179eb2bf8960002b0d42f9c6a849b7009eeab360a76729ce98cb07",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/agent/tools/read.rs",
+        &[
+            (
+                "b7a03b6534e677e6f87405ae5664c6b51fb8fe79d400c13a99cf9eea64f47925",
+                1,
+            ),
+            (
+                "cb0fdecd8826463da98c0644258d77a7429996d8129a227f7be8a629295e300f",
+                1,
+            ),
+            (
+                "3392d677f815baf3f1a8d1da8ff565125beb6807fb749545cb569b4fc4235bae",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/session/mod.rs",
+        &[(
+            "7e00ca274d7960ede3231461c848e2d25dade6062e6415c558d538cdc75410f4",
+            1,
+        )],
+    ),
+    (
+        "src/extras/hooks/subprocess.rs",
+        &[(
+            "43ff20d24f612ec32d6c6f3d05e4da9ec76b409dbb60ea69d872e47a6d2594a2",
+            1,
+        )],
+    ),
     // Wakeup tool and App /cron assertions inspect a returned tool-result
     // String or captured renderer output; no process is constructed.
     (
@@ -4369,7 +4494,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "371266118d5513014528466d57966ed6c1909cb33bab1a9fd302e5c6256ad82b",
-                1,
+                2,
             ),
             (
                 "99092c71e9e39b0963c34a3241c195133962a8db5ec43f09bb6cd66917665b9b",
@@ -5188,6 +5313,81 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    // perf 2026-10-19 sites (see UNIFORM_SITES).
+    ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
+    ("src/sandbox.rs", ".spawn(move || {", 2, "NON-PROCESS"),
+    (
+        "src/extras/hooks/subprocess.rs",
+        "output.started,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/hooks/subprocess.rs",
+        "String::from_utf8_lossy(&output.stderr)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/session/mod.rs",
+        "format_truncated_tool_output_with_notice(&output, len, \"n\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/session/mod.rs",
+        "reference(&output, len, \"n\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.contains(expected), \"{pattern}: {output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(\"b.txt\"), \"{pattern}: {output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(output.contains(\"line 19997 \"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(output.contains(\"line 19998 \"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(!output.contains(\"line 19996 \"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/mod.rs",
+        "std::process::Command::new(\"kill\")",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/hooks/subprocess.rs",
+        ") -> Result<(tokio::process::Command, std::path::PathBuf), Box<HookOutput>> {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "scope.spawn(move || windows::terminate_helper(*pid));",
+        1,
+        "NON-PROCESS",
+    ),
     // Guarded Git config fixture constructor and borrowed environment validator.
     (
         "src/git/global_snapshot.rs",
@@ -5224,7 +5424,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/auth/copilot_protocol_tests.rs",
         "tasks.spawn(async move { r.auth_context().await });",
-        3,
+        4,
         "NON-PROCESS",
     ),
     (
