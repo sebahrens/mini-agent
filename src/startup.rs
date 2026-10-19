@@ -361,26 +361,14 @@ fn apply_resume_provider_decision(
 fn configured_sandbox_validation_probe<'a>(
     cli: &'a Cli,
     cfg: &'a Config,
-) -> impl FnOnce() -> anyhow::Result<()> + Send + 'a {
+) -> impl FnOnce() -> anyhow::Result<Option<crate::permission::ValidatedSandbox>> + Send + 'a {
     move || {
         if !cli.general_sandbox_is_eligible(cfg) {
-            return Ok(());
+            return Ok(None);
         }
-        let backend = cli.resolve_sandbox_backend(cfg);
-        let sandbox = Sandbox::new(cli.resolve_sandbox(cfg), &backend)
-            .with_general_profile(
-                cli.resolve_sandbox_profile(cfg),
-                cfg.sandbox_read_roots.clone(),
-                cfg.sandbox_write_roots.clone(),
-            )
-            .with_home_paths(
-                cfg.sandbox_home_mounts.clone(),
-                cfg.sandbox_home_masks.clone(),
-            )
-            .with_windows_appcontainer_roots(
-                cli.resolve_windows_appcontainer_read_roots(cfg),
-                cli.resolve_windows_appcontainer_write_roots(cfg),
-            );
+        let key = crate::permission::ConfiguredSandboxKey::resolve(cli, cfg);
+        let backend = key.backend().to_string();
+        let sandbox = key.build();
         if sandbox.policy() == SandboxPolicy::RequiredButUnavailable
             && unavailable_sandbox_must_fail(cli, cfg, cfg!(target_os = "windows"))
         {
@@ -392,17 +380,18 @@ fn configured_sandbox_validation_probe<'a>(
                 "sandbox backend '{backend}' is unavailable or has no successful production preflight — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly){reason}"
             );
         }
-        Ok(())
+        Ok(Some((key, sandbox)))
     }
 }
 
 #[cfg(test)]
-fn run_startup_probes_concurrently<General, Worker, WorkerStatus>(
+fn run_startup_probes_concurrently<General, GeneralOutput, Worker, WorkerStatus>(
     general: General,
     worker: Worker,
-) -> anyhow::Result<(anyhow::Result<()>, WorkerStatus)>
+) -> anyhow::Result<(anyhow::Result<GeneralOutput>, WorkerStatus)>
 where
-    General: FnOnce() -> anyhow::Result<()> + Send,
+    General: FnOnce() -> anyhow::Result<GeneralOutput> + Send,
+    GeneralOutput: Send,
     Worker: FnOnce() -> WorkerStatus + Send,
     WorkerStatus: Send,
 {
@@ -584,6 +573,9 @@ pub(crate) struct Startup {
     pub ask_tx: Option<AskSender>,
     pub ask_rx: Option<AskReceiver>,
     pub sandbox: Sandbox,
+    /// Configured sandbox built by the validation probe, adopted once by
+    /// `init_features` when built from identical inputs.
+    validated_sandbox: std::sync::Mutex<Option<crate::permission::ValidatedSandbox>>,
     shell_search_path: Option<std::ffi::OsString>,
     pub status_signals: Option<StatusSignals>,
     openrouter_pricing_refresh: Option<OpenRouterPricingRefresh>,
@@ -1412,6 +1404,7 @@ impl Startup {
             ask_tx: None,
             ask_rx: None,
             sandbox: Sandbox::new(false, "bwrap"),
+            validated_sandbox: std::sync::Mutex::new(None),
             shell_search_path: std::env::var_os("PATH"),
             status_signals: None,
             openrouter_pricing_refresh: None,
@@ -1433,7 +1426,13 @@ impl Startup {
     /// other platforms retain the legacy warning only for an entirely
     /// inherited default.
     pub(crate) fn validate_sandbox_availability(&self) -> anyhow::Result<()> {
-        configured_sandbox_validation_probe(&self.cli, &self.cfg)()
+        let validated = configured_sandbox_validation_probe(&self.cli, &self.cfg)()?;
+        // Keep the sandbox the probe built so init_features does not rebuild it.
+        *self
+            .validated_sandbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = validated;
+        Ok(())
     }
 
     /// Validate the general sandbox after capturing the workspace. The independent
@@ -1464,8 +1463,15 @@ impl Startup {
         ));
 
         // Sandbox, tools config, status signals, permission checker
+        let validated = self
+            .validated_sandbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         let (authority, sandbox) =
-            crate::permission::resolve_configured_execution_authority(&self.cli, &self.cfg)?;
+            crate::permission::resolve_configured_execution_authority_reusing(
+                &self.cli, &self.cfg, validated,
+            )?;
         self.sandbox = crate::permission::bind_configured_shell(
             &self.cli,
             &self.cfg,
@@ -5054,6 +5060,88 @@ mod tests {
     }
 
     #[test]
+    fn startup_builds_the_configured_sandbox_once_and_the_final_sandbox_matches_the_old_path() {
+        let configs = [
+            (
+                "disabled",
+                Cli {
+                    no_sandbox: true,
+                    ..Default::default()
+                },
+            ),
+            ("enabled-default", Cli::default()),
+            (
+                "profile",
+                Cli {
+                    sandbox: true,
+                    sandbox_profile: Some(crate::sandbox::SandboxProfile::Workspace),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (label, cli) in configs {
+            let cfg = Config::default();
+            let builds = || crate::permission::configured_sandbox_builds_on_this_thread();
+            let before = builds();
+            let validated = super::configured_sandbox_validation_probe(&cli, &cfg)().unwrap();
+            let probe_builds = builds() - before;
+            let (reused_authority, reused) =
+                crate::permission::resolve_configured_execution_authority_reusing(
+                    &cli, &cfg, validated,
+                )
+                .unwrap();
+            if cli.general_sandbox_is_eligible(&cfg) {
+                assert_eq!(probe_builds, 1, "{label}: probe builds once");
+                assert_eq!(
+                    builds() - before,
+                    1,
+                    "{label}: authority adopts, no rebuild"
+                );
+            } else {
+                assert_eq!(builds() - before, 1, "{label}: only the final build");
+            }
+            let (fresh_authority, fresh) =
+                crate::permission::resolve_configured_execution_authority(&cli, &cfg).unwrap();
+            assert_eq!(reused_authority, fresh_authority, "{label}");
+            assert_eq!(reused.policy(), fresh.policy(), "{label}");
+            assert_eq!(reused.profile(), fresh.profile(), "{label}");
+            assert_eq!(
+                reused.unavailable_diagnostic(),
+                fresh.unavailable_diagnostic(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_validated_sandbox_built_from_different_inputs_is_not_adopted() {
+        let cli = Cli::default();
+        let cfg = Config::default();
+        let other = Cli {
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let stale = (
+            crate::permission::ConfiguredSandboxKey::resolve(&other, &cfg),
+            crate::permission::ConfiguredSandboxKey::resolve(&other, &cfg).build(),
+        );
+        let before = crate::permission::configured_sandbox_builds_on_this_thread();
+        let (_, adopted) = crate::permission::resolve_configured_execution_authority_reusing(
+            &cli,
+            &cfg,
+            Some(stale),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::permission::configured_sandbox_builds_on_this_thread() - before,
+            1
+        );
+        let (_, fresh) =
+            crate::permission::resolve_configured_execution_authority(&cli, &cfg).unwrap();
+        assert_eq!(adopted.policy(), fresh.policy());
+    }
+
+    #[test]
     fn startup_probe_join_starts_both_before_waiting_for_the_slower_probe() {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_general_tx, release_general_rx) = std::sync::mpsc::channel();
@@ -5063,7 +5151,7 @@ mod tests {
         let join = std::thread::spawn(move || {
             let general_started_tx = started_tx.clone();
             let probes = run_startup_probes_concurrently(
-                move || {
+                move || -> anyhow::Result<()> {
                     general_started_tx.send("general").unwrap();
                     release_general_rx.recv().unwrap();
                     anyhow::bail!("closed general failure")

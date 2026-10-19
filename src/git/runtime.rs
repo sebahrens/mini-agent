@@ -39,6 +39,16 @@ struct ModelRoots {
     refused: bool,
 }
 
+impl ModelRoots {
+    fn has_live_authority(&self) -> bool {
+        self.runtimes.iter().any(|root| root.strong_count() > 0)
+            || self
+                .programs
+                .iter()
+                .any(|program| program.strong_count() > 0)
+    }
+}
+
 /// An active host-full command can write every host path except its mounted
 /// readonly exceptions. Reuse the Sandbox's retained root as the lifetime
 /// anchor; this record never grants an executable or keeps a command alive.
@@ -373,14 +383,14 @@ pub(crate) fn check_model_write(path: &Path) -> Result<(), String> {
         .get_or_init(Mutex::default)
         .lock()
         .map_err(|_| "guarded Git protected-file authority is unavailable")?;
-    if !state.runtimes.iter().any(|root| root.strong_count() > 0)
-        && !state
-            .programs
-            .iter()
-            .any(|program| program.strong_count() > 0)
-    {
+    if !state.has_live_authority() {
         return Ok(());
     }
+    let resolved = resolve_model_write_target(path)?;
+    check_resolved_against(&state, &resolved)
+}
+
+fn resolve_model_write_target(path: &Path) -> Result<PathBuf, String> {
     let absolute;
     let path = if path.is_absolute() {
         path
@@ -401,18 +411,51 @@ pub(crate) fn check_model_write(path: &Path) -> Result<(), String> {
             .parent()
             .ok_or("model write target cannot be resolved")?;
     }
-    let resolved = existing
+    Ok(existing
         .canonicalize()
         .map_err(|_| "model write target cannot be resolved")?
-        .join(suffix);
+        .join(suffix))
+}
+
+/// Whether any retained guarded-Git runtime or program binding is alive, i.e.
+/// whether [`check_model_write`] can reject anything. Lets a caller that already
+/// owns a resolver skip resolving when there is nothing to protect.
+pub(crate) fn model_write_guard_active() -> bool {
+    MODEL_ROOTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map(|state| state.has_live_authority())
+        // An unavailable authority must keep failing closed in the checker.
+        .unwrap_or(true)
+}
+
+/// [`check_model_write`] for a target the caller has already resolved to an
+/// absolute, symlink-free path (missing tail allowed) with the permission
+/// checker's resolver. Every retained binding is still revalidated.
+pub(crate) fn check_model_write_resolved(resolved: &Path) -> Result<(), String> {
+    let state = MODEL_ROOTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| "guarded Git protected-file authority is unavailable")?;
+    if !state.has_live_authority() {
+        return Ok(());
+    }
+    if !resolved.is_absolute() {
+        return Err("model write target cannot be resolved".into());
+    }
+    check_resolved_against(&state, resolved)
+}
+
+fn check_resolved_against(state: &ModelRoots, resolved: &Path) -> Result<(), String> {
+    let target = [resolved.to_path_buf()];
     for root in state.runtimes.iter().filter_map(Weak::upgrade) {
         root.validate()?;
-        require_disjoint(root.root(), std::slice::from_ref(&resolved))?;
+        require_disjoint(root.root(), &target)?;
     }
     for program in state.programs.iter().filter_map(Weak::upgrade) {
         program.validate()?;
-        require_disjoint(&program.path, std::slice::from_ref(&resolved))?;
-        require_disjoint(&program.target, std::slice::from_ref(&resolved))?;
+        require_disjoint(&program.path, &target)?;
+        require_disjoint(&program.target, &target)?;
     }
     Ok(())
 }
@@ -749,6 +792,53 @@ mod tests {
             target,
         });
         TrustedProgram::capture_in_state(program, &[], state)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_write_check_against_checker_resolution_matches_the_independent_walk() {
+        let fixture = crate::tests::OwnedTestDirectory::new("model-write-single-resolution");
+        let root = fixture.path().canonicalize().unwrap();
+        let protected = root.join("runtime");
+        let work = root.join("work");
+        std::fs::create_dir_all(protected.join("bin")).unwrap();
+        std::fs::create_dir_all(work.join("nested")).unwrap();
+        std::fs::write(protected.join("bin/git"), b"inert").unwrap();
+        std::os::unix::fs::symlink(&protected, work.join("alias")).unwrap();
+        std::os::unix::fs::symlink(&work, work.join("loop-free")).unwrap();
+        let mut state = ModelRoots::default();
+        let _program = capture_local(&protected.join("bin/git"), &mut state).unwrap();
+
+        let checker = crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::default(),
+            crate::permission::SecurityMode::Standard,
+            Some(work.clone()),
+            None,
+        )
+        .unwrap();
+        for target in [
+            protected.join("bin/git"),
+            protected.join("bin"),
+            protected.join("bin/missing/deep/file"),
+            work.join("alias/bin/git"),
+            work.join("alias/bin/new-file"),
+            work.join("nested/new.txt"),
+            work.join("nested/missing/deeper/new.txt"),
+            work.join("loop-free/nested/../nested/x"),
+            work.join("nested/../../runtime/bin/git"),
+        ] {
+            let old = resolve_model_write_target(&target)
+                .and_then(|resolved| check_resolved_against(&state, &resolved));
+            let resolved = checker
+                .resolve_check_target(target.to_str().unwrap())
+                .expect("checker resolver resolves the fixture");
+            let new = check_resolved_against(&state, &resolved);
+            assert_eq!(old.is_err(), new.is_err(), "{}", target.display());
+        }
+        let denied = checker
+            .resolve_check_target(work.join("alias/bin/git").to_str().unwrap())
+            .unwrap();
+        assert!(check_resolved_against(&state, &denied).is_err());
     }
 
     #[test]
