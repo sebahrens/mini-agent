@@ -1379,3 +1379,30 @@ fn profile100_typed_config_cli_and_explicit_request_precedence() {
     assert!(saved.contains("sandbox-profile = \"host-read\""));
     assert!(!saved.contains("sandbox_profile"));
 }
+
+#[test]
+fn quick_model_context_window_applies_to_main_session_and_subagents() {
+    let cfg: Config = serde_json::from_str(
+        r#"{"quick_models":{"gw":{"provider":"custom","model":"uncatalogued","context_window":400000}}}"#,
+    )
+    .unwrap();
+    let qm = crate::config::quick_models_map(&cfg);
+    assert_eq!(
+        cfg.known_context_window("custom", "uncatalogued", qm),
+        Some(400_000)
+    );
+    assert_eq!(
+        cfg.resolve_context_window("custom", "uncatalogued", qm),
+        400_000
+    );
+    assert_eq!(
+        cfg.resolve_subagent_context_window("custom", "uncatalogued", Some("gw")),
+        400_000
+    );
+    // Without it, both fall back and the main session reports no known window.
+    let bare = Config::default();
+    assert_eq!(
+        bare.known_context_window("custom", "uncatalogued", &Default::default()),
+        None
+    );
+}

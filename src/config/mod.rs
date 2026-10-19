@@ -803,6 +803,15 @@ impl Config {
         usage
     }
 
+    /// One-line notice for a model whose context window nothing knows, so the
+    /// 128k fallback is in effect.
+    pub fn context_window_fallback_notice(provider: &str, model: &str) -> String {
+        format!(
+            "notice: no context window is known for {provider}/{model}; assuming 128000 tokens. \
+             Set `context_window` on its quick model so compaction and the context gauge match the model."
+        )
+    }
+
     pub fn resolve_context_window(
         &self,
         provider: &str,

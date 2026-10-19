@@ -467,8 +467,37 @@ fn resolve_selected_model_capacity(
     selected: Option<&str>,
     source: Option<&ListingKey>,
 ) -> u64 {
+    known_selected_model_capacity(provider, model, cfg, selected, source).unwrap_or(128_000)
+}
+
+/// Apply the selected model's capacity to the session and say so when it is
+/// only the 128k fallback.
+fn apply_selected_model_capacity(
+    ctx: &mut SlashCtx<'_>,
+    provider: &str,
+    model: &str,
+    selected: Option<&str>,
+    source: Option<&ListingKey>,
+) {
+    let known = known_selected_model_capacity(provider, model, ctx.cfg, selected, source);
+    ctx.session.update_context_window(known.unwrap_or(128_000));
+    if known.is_none() {
+        let _ = ctx.renderer.write_line(
+            &Config::context_window_fallback_notice(provider, model),
+            crossterm::style::Color::Yellow,
+        );
+    }
+}
+
+fn known_selected_model_capacity(
+    provider: &str,
+    model: &str,
+    cfg: &Config,
+    selected: Option<&str>,
+    source: Option<&ListingKey>,
+) -> Option<u64> {
     if let Some(pin) = cfg.context_window {
-        return pin;
+        return Some(pin);
     }
     let quick = config::quick_models_map(cfg);
     if let Some(pin) = selected
@@ -476,7 +505,7 @@ fn resolve_selected_model_capacity(
         .filter(|q| q.provider == provider && q.model == model)
         .and_then(|q| q.context_window)
     {
-        return pin;
+        return Some(pin);
     }
     if let Some(pin) = quick
         .iter()
@@ -484,7 +513,7 @@ fn resolve_selected_model_capacity(
         .min_by(|(a, _), (b, _)| a.cmp(b))
         .and_then(|(_, q)| q.context_window)
     {
-        return pin;
+        return Some(pin);
     }
     let live = source
         .filter(|key| key.is_live() && key.matches_provider(provider))
@@ -499,7 +528,6 @@ fn resolve_selected_model_capacity(
         });
     live.map(u64::from)
         .or_else(|| Config::catalog_context_window(provider, model))
-        .unwrap_or(128_000)
 }
 
 async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str, selected_alias: Option<&str>) {
@@ -532,14 +560,8 @@ async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str, selected_alias: Opt
     {
         pricing = info.input_price.zip(info.output_price);
     }
-    ctx.session
-        .update_context_window(resolve_selected_model_capacity(
-            &ctx.session.provider,
-            model_id,
-            ctx.cfg,
-            selected_alias,
-            key.as_ref(),
-        ));
+    let provider = ctx.session.provider.clone();
+    apply_selected_model_capacity(ctx, &provider, model_id, selected_alias, key.as_ref());
     if let Some(note) = apply_model_pricing(ctx.session, model_id, pricing) {
         let _ = ctx
             .renderer
@@ -644,14 +666,8 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
             ctx.session.input_token_cost,
         ));
     ctx.rebuild_agent().await;
-    ctx.session
-        .update_context_window(resolve_selected_model_capacity(
-            new_provider,
-            &model,
-            ctx.cfg,
-            selected_alias,
-            ctx.client.listing_key(new_provider).ok().as_ref(),
-        ));
+    let listing = ctx.client.listing_key(new_provider).ok();
+    apply_selected_model_capacity(ctx, new_provider, &model, selected_alias, listing.as_ref());
     write_ok(
         ctx.renderer,
         format!(
@@ -1662,6 +1678,15 @@ mod model_listing48_cache_tests {
                 None
             ),
             128000
+        );
+        // The fallback is distinguishable, so a switch can announce it.
+        assert_eq!(
+            known_selected_model_capacity("openrouter", "raw-live", &Config::default(), None, None),
+            None
+        );
+        assert!(
+            Config::context_window_fallback_notice("openrouter", "raw-live")
+                .contains("openrouter/raw-live")
         );
         let model = crate::models_catalog::catalog_entries("anthropic")
             .unwrap()

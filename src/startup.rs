@@ -1327,6 +1327,19 @@ impl Startup {
             cfg.known_context_window(session.provider.as_str(), session.model.as_str(), qm_map)
         {
             session.update_context_window(cw);
+        } else if is_interactive
+            && session.provider.as_str() != "openrouter"
+            && session.context_window == 128_000
+        {
+            // OpenRouter models are refreshed from the live listing after
+            // startup, so their window is not yet a fallback here.
+            eprintln!(
+                "{}",
+                Config::context_window_fallback_notice(
+                    session.provider.as_str(),
+                    session.model.as_str()
+                )
+            );
         }
 
         // A resumed session replays its compaction summary as a recap; the

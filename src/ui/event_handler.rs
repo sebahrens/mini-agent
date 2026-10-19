@@ -690,6 +690,10 @@ async fn handle_agent_done(
         }
     }
 
+    if let Some(warning) = context_overflow_warning(ui.session) {
+        renderer.write_line(&warning, C_ERROR)?;
+    }
+
     // `Done` can still be an intermediate state for a loop validation or a
     // following loop iteration. Keep the pre-turn disk snapshot authoritative
     // until App::finalize_turn observes that the whole user turn has settled.
@@ -709,6 +713,20 @@ async fn handle_agent_done(
     }
 
     Ok(())
+}
+
+/// Warning for a session whose context has grown past its window (the gauge
+/// reads over 100%), which compaction did not or could not recover.
+fn context_overflow_warning(session: &crate::session::Session) -> Option<String> {
+    let window = session.context_window;
+    let used = session.effective_context_tokens();
+    (window > 0 && used > window).then(|| {
+        let pct = used.saturating_mul(100) / window;
+        format!(
+            "warning: context is at {pct}% of the {window}-token window ({used} tokens). If {} is larger than that, set `context_window` on its quick model; otherwise run /compress.",
+            session.model
+        )
+    })
 }
 
 fn should_auto_compact_between_turns(
@@ -1442,5 +1460,20 @@ mod tests {
         assert_eq!(session.total_cache_creation_input_tokens, u64::MAX);
         assert_eq!(session.total_estimated_tokens, u64::MAX);
         assert_eq!(session.effective_context_tokens(), u64::MAX);
+    }
+
+    #[test]
+    fn context_overflow_warning_only_past_the_window() {
+        let mut session = crate::session::Session::new("p", "some-model", 1000, "n");
+        session.overhead_tokens = 1000;
+        assert_eq!(super::context_overflow_warning(&session), None);
+        session.overhead_tokens = 1160;
+        let text = super::context_overflow_warning(&session).unwrap();
+        assert!(
+            text.contains("116%") && text.contains("context_window"),
+            "{text}"
+        );
+        session.context_window = 0;
+        assert_eq!(super::context_overflow_warning(&session), None);
     }
 }
