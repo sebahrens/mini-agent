@@ -596,7 +596,51 @@ pub struct Compaction {
     /// the tag existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_ref: Option<CompactString>,
+    /// Older compactions dropped from `Session::compactions` ahead of this one
+    /// (mini-agent-3xwfv). Carried on the first retained record so the
+    /// serialized history, and every digest over it, still commits to the full
+    /// sequence. Absent in every session saved before pruning existed, which
+    /// therefore serialize and digest exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pruned: Option<PrunedCompactions>,
 }
+
+/// Count and hash chain of compactions pruned from the front of the history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PrunedCompactions {
+    pub(crate) count: usize,
+    /// Lowercase hex SHA-256 chain: `H(previous_chain || JSON(record))` over
+    /// each pruned record in order.
+    pub(crate) chain: CompactString,
+}
+
+impl PrunedCompactions {
+    /// Extend the chain by one pruned record (which must carry no `pruned`).
+    fn fold(previous: Option<Self>, removed: &Compaction) -> Self {
+        use sha2::Digest;
+        let (count, chain) = previous
+            .map(|pruned| (pruned.count, pruned.chain))
+            .unwrap_or_default();
+        let mut hash = sha2::Sha256::new();
+        hash.update(chain.as_bytes());
+        // Serializing a plain record cannot fail; fold nothing if it did.
+        hash.update(serde_json::to_vec(removed).unwrap_or_default());
+        let chain: String = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self {
+            count: count + 1,
+            chain: chain.into(),
+        }
+    }
+}
+
+/// Full compaction records kept in memory and on disk. Only the last is ever
+/// replayed; the rest are history, so older ones are folded into
+/// [`PrunedCompactions`].
+pub(crate) const MAX_RETAINED_COMPACTIONS: usize = 4;
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
@@ -2423,6 +2467,41 @@ impl Session {
         self.compactions.last()?.memory_ref.as_deref()
     }
 
+    /// Total compactions this session has performed, including pruned ones.
+    /// Use this, not `compactions.len()`, wherever the count is user-visible
+    /// or part of an identity.
+    pub fn compaction_count(&self) -> usize {
+        self.compactions
+            .first()
+            .and_then(|first| first.pruned.as_ref())
+            .map_or(0, |pruned| pruned.count)
+            + self.compactions.len()
+    }
+
+    /// Drop the newest records until `compaction_count()` is at most `count`
+    /// (turn rollback). The record carrying the pruned prefix is never
+    /// dropped, so the count and chain are not lost.
+    pub(crate) fn rollback_compactions_to_count(&mut self, count: usize) {
+        while self.compaction_count() > count {
+            if self.compactions.len() == 1 && self.compactions[0].pruned.is_some() {
+                break;
+            }
+            if self.compactions.pop().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// Fold records beyond [`MAX_RETAINED_COMPACTIONS`] into the first
+    /// retained record's [`PrunedCompactions`].
+    fn prune_compaction_history(&mut self) {
+        while self.compactions.len() > MAX_RETAINED_COMPACTIONS {
+            let mut removed = self.compactions.remove(0);
+            let previous = removed.pruned.take();
+            self.compactions[0].pruned = Some(PrunedCompactions::fold(previous, &removed));
+        }
+    }
+
     pub fn compacted_context(&self) -> (Option<&str>, usize) {
         let c = match self.compactions.last() {
             Some(c) => c,
@@ -2521,7 +2600,9 @@ impl Session {
             token_savings,
             created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
             memory_ref: Some(memory_ref),
+            pruned: None,
         });
+        self.prune_compaction_history();
 
         // Compaction reindexes messages, so the calibration anchor no longer
         // lines up and an older redo snapshot is no longer composable. Drop
@@ -3509,6 +3590,158 @@ mod truncated_output_format_tests {
                 }
             }
             assert_eq!(view.replaced.len(), 6usize.saturating_sub(keep));
+        }
+    }
+}
+
+#[cfg(test)]
+mod compaction_history_tests {
+    use super::*;
+    use crate::session::native_replay::{compaction_digest, feed_digest};
+
+    fn compacted(times: usize) -> Session {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        for round in 0..times {
+            for i in 0..3 {
+                session.add_message(MessageRole::User, &format!("round {round} message {i}"));
+            }
+            session.compress(format!("summary {round}"), 2, 10);
+        }
+        session
+    }
+
+    fn reload(session: &Session) -> Session {
+        let json = storage::serialize_bounded_session(session).unwrap();
+        storage::decode_session_json(&json).unwrap()
+    }
+
+    #[test]
+    fn history_is_bounded_but_the_count_and_active_summary_are_not() {
+        let session = compacted(MAX_RETAINED_COMPACTIONS + 6);
+        assert_eq!(session.compactions.len(), MAX_RETAINED_COMPACTIONS);
+        assert_eq!(session.compaction_count(), MAX_RETAINED_COMPACTIONS + 6);
+        assert_eq!(
+            session
+                .compactions
+                .first()
+                .unwrap()
+                .pruned
+                .as_ref()
+                .unwrap()
+                .count,
+            6
+        );
+        assert!(
+            session
+                .compactions
+                .last()
+                .unwrap()
+                .summary
+                .contains("summary 9")
+        );
+        assert!(session.compacted_context().0.is_some());
+    }
+
+    #[test]
+    fn the_pruned_chain_is_a_deterministic_function_of_the_full_history() {
+        let record = |summary: &str| Compaction {
+            file_requests: Default::default(),
+            summary: summary.into(),
+            first_kept_index: 1,
+            summarized_count: 1,
+            token_savings: 1,
+            created_at: "t".into(),
+            memory_ref: None,
+            pruned: None,
+        };
+        let chain = |summaries: &[&str]| {
+            summaries
+                .iter()
+                .fold(None, |acc, s| {
+                    Some(PrunedCompactions::fold(acc, &record(s)))
+                })
+                .unwrap()
+        };
+        assert_eq!(chain(&["a", "b"]), chain(&["a", "b"]));
+        assert_ne!(chain(&["a", "b"]), chain(&["b", "a"]));
+        assert_ne!(chain(&["a", "b"]), chain(&["a", "b", "c"]));
+        assert_eq!(chain(&["a", "b", "c"]).count, 3);
+        assert_eq!(chain(&["a"]).chain.len(), 64);
+    }
+
+    #[test]
+    fn digests_survive_a_save_load_cycle_with_and_without_pruning() {
+        for times in [0, 2, MAX_RETAINED_COMPACTIONS, MAX_RETAINED_COMPACTIONS + 5] {
+            let session = compacted(times);
+            let loaded = reload(&session);
+            assert_eq!(loaded.compaction_count(), session.compaction_count());
+            assert_eq!(
+                compaction_digest(&loaded.compactions).unwrap(),
+                compaction_digest(&session.compactions).unwrap(),
+                "{times} compactions"
+            );
+            assert_eq!(
+                feed_digest(&loaded.messages, &loaded.compactions).unwrap(),
+                feed_digest(&session.messages, &session.compactions).unwrap()
+            );
+        }
+    }
+
+    /// A record saved before pruning existed has no `pruned` field. It loads
+    /// unchanged, serializes without one, and its digest is the digest of the
+    /// bytes that were always hashed.
+    #[test]
+    fn old_format_compaction_records_load_and_digest_unchanged() {
+        let old = serde_json::json!([{
+            "summary": "old recap", "first_kept_index": 1, "summarized_count": 2,
+            "token_savings": 10, "created_at": "2026-01-01T00:00:00Z", "memory_ref": "abc"
+        }]);
+        let records: Vec<Compaction> = serde_json::from_value(old).unwrap();
+        assert!(records[0].pruned.is_none());
+        let reserialized = serde_json::to_string(&records).unwrap();
+        assert!(!reserialized.contains("pruned"));
+        let expected = {
+            use sha2::Digest;
+            let bytes: [u8; 32] = sha2::Sha256::digest(reserialized.as_bytes()).into();
+            bytes
+        };
+        assert_eq!(compaction_digest(&records).unwrap(), expected);
+        // An old session with more records than the retained cap still loads
+        // whole; it is only folded when the next compaction happens.
+        let many: Vec<_> = (0..MAX_RETAINED_COMPACTIONS + 3)
+            .map(|i| records[0].clone_with_summary(&format!("s{i}")))
+            .collect();
+        let mut session = compacted(0);
+        session.compactions = many;
+        assert_eq!(session.compaction_count(), MAX_RETAINED_COMPACTIONS + 3);
+        assert_eq!(
+            reload(&session).compactions.len(),
+            MAX_RETAINED_COMPACTIONS + 3
+        );
+    }
+
+    #[test]
+    fn rollback_removes_only_compactions_added_after_the_capture() {
+        let mut session = compacted(MAX_RETAINED_COMPACTIONS + 1);
+        let before = session.compaction_count();
+        for i in 0..2 {
+            session.add_message(MessageRole::User, "a");
+            session.add_message(MessageRole::User, "b");
+            session.add_message(MessageRole::User, "c");
+            session.compress(format!("later {i}"), 2, 1);
+        }
+        assert_eq!(session.compaction_count(), before + 2);
+        session.rollback_compactions_to_count(before);
+        assert_eq!(session.compaction_count(), before);
+        assert!(session.compactions[0].pruned.is_some());
+    }
+
+    impl Compaction {
+        fn clone_with_summary(&self, summary: &str) -> Self {
+            Self {
+                summary: summary.into(),
+                ..self.clone()
+            }
         }
     }
 }

@@ -203,7 +203,7 @@ fn revision(session: &Session) -> Result<[u8; 32], &'static str> {
         &mut writer,
         &(
             session.messages.len(),
-            session.compactions.len(),
+            session.compaction_count(),
             session.compacted_context(),
             &session.messages[start..],
         ),
