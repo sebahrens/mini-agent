@@ -452,6 +452,7 @@ fn load_captured_global_file(
     Some((content, truncated, binding, relative, identity))
 }
 
+#[cfg(test)]
 pub fn load(no_context_files: bool) -> ContextFiles {
     let workspace_root = std::env::current_dir().ok();
     load_for_workspace(no_context_files, workspace_root.as_deref())
@@ -460,6 +461,7 @@ pub fn load(no_context_files: bool) -> ContextFiles {
 /// Load context for one explicitly selected workspace without changing the
 /// process working directory. ACP sessions use this entry point so concurrent
 /// roots cannot affect one another.
+#[cfg(test)]
 pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>) -> ContextFiles {
     load_for_workspace_with(no_context_files, workspace_root, true)
 }
@@ -518,6 +520,7 @@ pub(crate) fn load_for_binding(
     }
 }
 
+#[cfg(test)]
 fn load_for_workspace_with(
     no_context_files: bool,
     workspace_root: Option<&Path>,

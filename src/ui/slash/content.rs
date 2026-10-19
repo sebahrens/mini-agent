@@ -426,7 +426,7 @@ mod theme_selection_tests {
         let mut client = crate::provider::create_client(
             "anthropic",
             Some("unused-test-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
         .unwrap();

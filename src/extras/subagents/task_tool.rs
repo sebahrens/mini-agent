@@ -386,7 +386,7 @@ fn resolve_persona_runtime(
                 client = crate::provider::create_client(
                     &quick_model.provider,
                     api_key,
-                    &config.custom_providers_map(),
+                    config.custom_providers_map(),
                     config.api_keys.as_ref(),
                 )
                 .map_err(|error| {
@@ -2941,7 +2941,7 @@ mod tests {
             let client = crate::provider::create_client(
                 "report-wire",
                 Some("inert-loopback-key"),
-                &config.custom_providers_map(),
+                config.custom_providers_map(),
                 None,
             )
             .unwrap();
@@ -3380,7 +3380,7 @@ mod tests {
             let client = crate::provider::create_client(
                 "openrouter",
                 Some("unused-local-test-key"),
-                &config.custom_providers_map(),
+                config.custom_providers_map(),
                 None,
             )
             .unwrap();

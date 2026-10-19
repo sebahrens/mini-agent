@@ -281,7 +281,7 @@ impl OutputSchema {
         cfg: &crate::config::Config,
     ) -> Option<Value> {
         let custom = cfg.custom_providers_map();
-        let config = crate::provider::resolve_provider_config(provider, &custom).ok()?;
+        let config = crate::provider::resolve_provider_config(provider, custom).ok()?;
         let base = crate::provider::resolve_base_url_with_env(&config, |key| std::env::var(key));
         if !native_endpoint_allowed(provider, custom.contains_key(provider), base.as_deref()) {
             return None;
@@ -392,7 +392,7 @@ pub(crate) async fn repair_rounds(
         }
         let quick_models = crate::config::quick_models_map(cfg);
         let reserve =
-            cfg.resolve_reserve_tokens(&session.model, &quick_models, session.context_window);
+            cfg.resolve_reserve_tokens(&session.model, quick_models, session.context_window);
         if crate::session::Session::estimate_tokens(&repair_prompt).saturating_add(reserve)
             >= session.context_window
         {
@@ -698,7 +698,7 @@ mod tests {
         let client = crate::provider::create_client(
             "schema-test",
             Some("schema-fake-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();

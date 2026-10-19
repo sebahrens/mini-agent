@@ -61,13 +61,13 @@ fn parse_catalog(json: &str) -> HashMap<String, Vec<ModelEntry>> {
     parse_catalog_parts(json).0
 }
 
-/// One deserialisation yields both the entry lists and the explicit image flags.
-fn parse_catalog_parts(
-    json: &str,
-) -> (
+type CatalogParts = (
     HashMap<String, Vec<ModelEntry>>,
     HashMap<String, HashMap<String, bool>>,
-) {
+);
+
+/// One deserialisation yields both the entry lists and the explicit image flags.
+fn parse_catalog_parts(json: &str) -> CatalogParts {
     let raw: HashMap<String, Vec<RawModel>> = match serde_json::from_str(json) {
         Ok(raw) => raw,
         Err(error) => {

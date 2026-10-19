@@ -1201,9 +1201,7 @@ impl Cli {
             Some(q) => (q.model.clone(), q.provider.clone()),
             None => (
                 CompactString::new(m),
-                cfg.provider
-                    .clone()
-                    .unwrap_or_else(|| default_provider(&qm)),
+                cfg.provider.clone().unwrap_or_else(|| default_provider(qm)),
             ),
         });
         let provider_default = || {
@@ -1234,7 +1232,7 @@ impl Cli {
                     .and_then(|m| qm.get(m))
                     .map(|q| q.provider.clone())
             })
-            .unwrap_or_else(|| default_provider(&qm))
+            .unwrap_or_else(|| default_provider(qm))
     }
 
     /// The startup provider/model pair: `--provider`/`--model`/config

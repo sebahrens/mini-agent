@@ -147,7 +147,7 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     let new_client = match crate::provider::create_client(
         &session.provider,
         ctx.cli.api_key.as_deref(),
-        &ctx.cfg.custom_providers_map(),
+        ctx.cfg.custom_providers_map(),
         ctx.cfg.api_keys.as_ref(),
     ) {
         Ok(client) => client,
@@ -282,7 +282,7 @@ pub(crate) fn parse_imported_session(
                 || crate::config::Config::catalog_context_window(&session.provider, &session.model)
                     .is_some();
             let resolved =
-                cfg.resolve_context_window(&session.provider, &session.model, &quick_models);
+                cfg.resolve_context_window(&session.provider, &session.model, quick_models);
             session.update_context_window(if known_here {
                 resolved
             } else {

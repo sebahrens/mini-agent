@@ -273,7 +273,7 @@ async fn image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlat
         let client = crate::provider::create_client(
             "image64-wire",
             Some("unused-owned-fixture"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();
@@ -472,7 +472,7 @@ fn image_read64_capability_uses_actual_backend_model_override_semantics() {
         let client = crate::provider::create_client(
             "image64-cap",
             Some("unused"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();
@@ -606,7 +606,7 @@ async fn image_read64_incomplete_and_ambiguous_batches_refuse_before_http() {
         let client = crate::provider::create_client(
             "image64-negative",
             Some("unused-owned-fixture"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();

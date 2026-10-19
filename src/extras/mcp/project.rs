@@ -216,20 +216,6 @@ pub(crate) fn source_captures() -> usize {
 }
 
 impl OriginAuthority {
-    #[cfg(test)]
-    pub(crate) fn file(
-        root: &crate::paths::WorkspaceBinding,
-        relative: &Path,
-        expected: &str,
-        baseline: &impl serde::Serialize,
-        kind: SourceKind,
-        prior: Option<&std::sync::Arc<Self>>,
-        trust_store: Option<&Path>,
-    ) -> Result<std::sync::Arc<Self>, &'static str> {
-        let capture = SourceCapture::new(root, relative, expected, kind)?;
-        Self::from_capture(&capture, baseline, prior, trust_store)
-    }
-
     pub(crate) fn from_capture(
         capture: &SourceCapture,
         baseline: &impl serde::Serialize,

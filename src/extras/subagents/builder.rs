@@ -2231,7 +2231,7 @@ mod settings127_context_tests {
         let client = crate::provider::create_client(
             "openrouter",
             Some("unused-test-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();

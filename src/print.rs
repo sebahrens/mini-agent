@@ -2071,7 +2071,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let qm_map = config::quick_models_map(cfg);
     let max_tokens = cli.resolve_max_tokens(cfg);
     let max_agent_turns = cli.resolve_max_agent_turns(cfg);
-    let context_window = cfg.resolve_context_window(&provider, &model, &qm_map);
+    let context_window = cfg.resolve_context_window(&provider, &model, qm_map);
     let temperature = config::resolve_temperature(cli, cfg, &model);
     let no_tools = cli.resolve_no_tools(cfg);
     let tools_allowlist = if cli.tools.is_empty() {
@@ -2184,7 +2184,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         ("context-window", context_window.to_string()),
         (
             "reserve-tokens",
-            cfg.resolve_reserve_tokens(&model, &qm_map, context_window)
+            cfg.resolve_reserve_tokens(&model, qm_map, context_window)
                 .to_string(),
         ),
         ("max-read-lines", cfg.resolve_max_read_lines().to_string()),

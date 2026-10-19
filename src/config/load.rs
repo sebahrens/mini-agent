@@ -2592,13 +2592,13 @@ fn project_config_is_trusted_in_workspace_mode(
     let store = paths.project_config_trust_file();
     let root = workspace.root();
     let take_stamp = || {
-        let mut stamp = TrustMemoStamp::new();
-        stamp.push(stat_fingerprint(&root.join(".zerostack"))?);
-        stamp.push(stat_fingerprint(&root.join(".zerostack/config.toml"))?);
-        stamp.push(stat_fingerprint(store.parent()?)?);
         // An absent store is a valid (empty) trust state; fingerprint it as such.
-        stamp.push(stat_fingerprint(&store).unwrap_or([0; 9]));
-        Some(stamp)
+        Some(vec![
+            stat_fingerprint(&root.join(".zerostack"))?,
+            stat_fingerprint(&root.join(".zerostack/config.toml"))?,
+            stat_fingerprint(store.parent()?)?,
+            stat_fingerprint(&store).unwrap_or([0; 9]),
+        ])
     };
     let stamp = take_stamp();
     let key = (root.to_path_buf(), store.clone(), repair);

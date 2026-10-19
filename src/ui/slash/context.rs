@@ -155,7 +155,7 @@ impl ContextDiagnostic {
             .collect();
         let reserve = cfg.resolve_reserve_tokens(
             &session.model,
-            &crate::config::quick_models_map(cfg),
+            crate::config::quick_models_map(cfg),
             session.context_window,
         );
         #[cfg(feature = "memory")]

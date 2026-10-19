@@ -268,7 +268,7 @@ fn app<'a>(
     let client = crate::provider::create_client(
         "mcp57",
         Some("unused-owned-key"),
-        &cfg.custom_providers_map(),
+        cfg.custom_providers_map(),
         None,
     )
     .unwrap();
@@ -1957,7 +1957,7 @@ async fn native_deferred_wire_case(same_response: bool, hook: Option<&str>, cost
         let client = crate::provider::create_client(
             "mcp57",
             Some("owned-inert-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();
@@ -2542,7 +2542,7 @@ async fn native_deferred_case(case: &str) {
     let client = crate::provider::create_client(
         "mcp57",
         Some("owned-inert-key"),
-        &cfg.custom_providers_map(),
+        cfg.custom_providers_map(),
         None,
     )
     .unwrap();

@@ -96,10 +96,10 @@ where
 {
     use crate::auth::LoginRecordState;
     let custom = cfg.custom_providers_map();
-    let Ok(route) = crate::provider::resolve_provider_config(name, &custom) else {
+    let Ok(route) = crate::provider::resolve_provider_config(name, custom) else {
         return CredentialReport::InvalidRoute;
     };
-    if crate::provider::chatgpt_login_route_with_env(name, cli_key, &custom, &get_env)
+    if crate::provider::chatgpt_login_route_with_env(name, cli_key, custom, &get_env)
         .unwrap_or(false)
     {
         let state = crate::auth::oauth::diagnostic_state_at(credentials_dir);
@@ -269,7 +269,7 @@ impl DoctorReport {
         let window = session
             .map(|session| session.context_window)
             .unwrap_or_else(|| {
-                cfg.resolve_context_window(&provider, &model, &crate::config::quick_models_map(cfg))
+                cfg.resolve_context_window(&provider, &model, crate::config::quick_models_map(cfg))
             });
         report.row("context window", window.to_string());
         let (prices, source) = session

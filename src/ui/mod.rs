@@ -1889,7 +1889,7 @@ pub(crate) fn stop_turn_context_exhausted(
         ui.session.context_window,
         ui.cfg.resolve_reserve_tokens(
             &ui.session.model,
-            &crate::config::quick_models_map(ui.cfg),
+            crate::config::quick_models_map(ui.cfg),
             ui.session.context_window,
         ),
         ui.cfg.resolve_keep_recent_tokens(ui.session.context_window),

@@ -353,7 +353,7 @@ fn apply_resume_provider_decision(
         None,
         input,
     ));
-    session.update_context_window(cfg.resolve_context_window(&target.provider, &target.model, &qm));
+    session.update_context_window(cfg.resolve_context_window(&target.provider, &target.model, qm));
 }
 
 /// Capture only immutable startup policy. Runtime publication/cleanup owners
@@ -497,7 +497,7 @@ fn apply_startup_prompt_model(
     session.update_context_window(cfg.resolve_context_window(
         &session.provider,
         &session.model,
-        &qm,
+        qm,
     ));
 }
 
@@ -628,7 +628,7 @@ fn headless_compaction_plan(
     }
     let quick_models = config::quick_models_map(cfg);
     let configured_reserve =
-        cfg.resolve_reserve_tokens(&session.model, &quick_models, session.context_window);
+        cfg.resolve_reserve_tokens(&session.model, quick_models, session.context_window);
     #[cfg(feature = "memory")]
     let reserve =
         crate::extras::memory::effective_session_reserve(configured_reserve, memory, session);
@@ -1083,7 +1083,7 @@ impl Startup {
         let mut session = Session::new(
             &provider,
             &model,
-            cfg.resolve_context_window(&provider, &model, &qm_map),
+            cfg.resolve_context_window(&provider, &model, qm_map),
             name,
         );
 
@@ -1289,7 +1289,7 @@ impl Startup {
         // `context_window`, then the quick model's, then the catalog's — and keep
         // the saved value only when none of them knows the model (mini-agent-ycu8b).
         if let Some(cw) =
-            cfg.known_context_window(session.provider.as_str(), session.model.as_str(), &qm_map)
+            cfg.known_context_window(session.provider.as_str(), session.model.as_str(), qm_map)
         {
             session.update_context_window(cw);
         }
@@ -1311,7 +1311,7 @@ impl Startup {
         let client = provider::create_client(
             &provider,
             cli.api_key.as_deref(),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )?;
 
@@ -1830,7 +1830,7 @@ impl Startup {
             match provider::create_client(
                 &self.provider,
                 self.cli.api_key.as_deref(),
-                &self.cfg.custom_providers_map(),
+                self.cfg.custom_providers_map(),
                 self.cfg.api_keys.as_ref(),
             ) {
                 Ok(new_client) => {
@@ -2144,7 +2144,7 @@ impl Startup {
             let quick_models = config::quick_models_map(&self.cfg);
             let reserve = self.cfg.resolve_reserve_tokens(
                 &self.session.model,
-                &quick_models,
+                quick_models,
                 self.session.context_window,
             );
             if self

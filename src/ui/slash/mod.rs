@@ -167,7 +167,7 @@ impl SlashCtx<'_> {
             crate::provider::create_client(
                 &session.provider,
                 self.cli.api_key.as_deref(),
-                &self.cfg.custom_providers_map(),
+                self.cfg.custom_providers_map(),
                 self.cfg.api_keys.as_ref(),
             )?
         } else {
@@ -212,7 +212,7 @@ impl SlashCtx<'_> {
         let client = crate::provider::create_client(
             provider,
             self.cli.api_key.as_deref(),
-            &self.cfg.custom_providers_map(),
+            self.cfg.custom_providers_map(),
             self.cfg.api_keys.as_ref(),
         )?;
         *self.client = client;
@@ -282,7 +282,7 @@ impl SlashCtx<'_> {
             .update_context_window(self.cfg.resolve_context_window(
                 &self.session.provider,
                 &self.session.model,
-                &crate::config::quick_models_map(self.cfg),
+                crate::config::quick_models_map(self.cfg),
             ));
 
         let _ = self.renderer.write_line(
@@ -325,7 +325,7 @@ pub(crate) async fn apply_prompt_model(
         match crate::provider::create_client(
             &qmc.provider,
             ui.cli.api_key.as_deref(),
-            &ui.cfg.custom_providers_map(),
+            ui.cfg.custom_providers_map(),
             ui.cfg.api_keys.as_ref(),
         ) {
             Ok(new_client) => {
@@ -371,7 +371,7 @@ pub(crate) async fn apply_prompt_model(
         .update_context_window(ui.cfg.resolve_context_window(
             &ui.session.provider,
             &ui.session.model,
-            &qm,
+            qm,
         ));
 
     let _ = renderer.write_line(
@@ -470,7 +470,7 @@ pub async fn handle_compress(
     #[cfg(feature = "memory")]
     let reserve = crate::extras::memory::effective_session_reserve(
         ui.cfg
-            .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window),
+            .resolve_reserve_tokens(&ui.session.model, qm, ui.session.context_window),
         ui.context.memory.as_deref(),
         ui.session,
     );

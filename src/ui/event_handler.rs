@@ -656,7 +656,7 @@ async fn handle_agent_done(
     #[cfg(feature = "memory")]
     let reserve = crate::extras::memory::effective_session_reserve(
         ui.cfg
-            .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window),
+            .resolve_reserve_tokens(&ui.session.model, qm, ui.session.context_window),
         ui.context.memory.as_deref(),
         ui.session,
     );
