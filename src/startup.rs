@@ -5071,6 +5071,14 @@ mod tests {
             ),
             ("enabled-default", Cli::default()),
             (
+                "missing-backend",
+                Cli {
+                    sandbox: true,
+                    sandbox_backend: Some("__missing_backend__".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
                 "profile",
                 Cli {
                     sandbox: true,
@@ -5083,33 +5091,60 @@ mod tests {
             let cfg = Config::default();
             let builds = || crate::permission::configured_sandbox_builds_on_this_thread();
             let before = builds();
-            let validated = super::configured_sandbox_validation_probe(&cli, &cfg)().unwrap();
-            let probe_builds = builds() - before;
-            let (reused_authority, reused) =
-                crate::permission::resolve_configured_execution_authority_reusing(
-                    &cli, &cfg, validated,
-                )
-                .unwrap();
-            if cli.general_sandbox_is_eligible(&cfg) {
-                assert_eq!(probe_builds, 1, "{label}: probe builds once");
-                assert_eq!(
-                    builds() - before,
-                    1,
-                    "{label}: authority adopts, no rebuild"
-                );
-            } else {
-                assert_eq!(builds() - before, 1, "{label}: only the final build");
+            // New path: validation probe, then authority adopting its sandbox.
+            let reused = super::configured_sandbox_validation_probe(&cli, &cfg)()
+                .map_err(|e| e.to_string())
+                .and_then(|validated| {
+                    let probe_builds = builds() - before;
+                    let out = crate::permission::resolve_configured_execution_authority_reusing(
+                        &cli, &cfg, validated,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok((probe_builds, builds() - before, out))
+                });
+            // Old path: a single fresh resolution.
+            let fresh = crate::permission::resolve_configured_execution_authority(&cli, &cfg)
+                .map_err(|e| e.to_string());
+            match (reused, fresh) {
+                (
+                    Ok((probe_builds, total_builds, (reused_authority, reused))),
+                    Ok((fresh_authority, fresh)),
+                ) => {
+                    if cli.general_sandbox_is_eligible(&cfg) {
+                        assert_eq!(probe_builds, 1, "{label}: probe builds once");
+                        assert_eq!(total_builds, 1, "{label}: authority adopts, no rebuild");
+                    } else {
+                        assert_eq!(total_builds, 1, "{label}: only the final build");
+                    }
+                    assert_eq!(reused_authority, fresh_authority, "{label}");
+                    assert_eq!(reused.policy(), fresh.policy(), "{label}");
+                    assert_eq!(reused.profile(), fresh.profile(), "{label}");
+                    assert_eq!(
+                        reused.unavailable_diagnostic(),
+                        fresh.unavailable_diagnostic(),
+                        "{label}"
+                    );
+                }
+                (Err(reused), Err(fresh)) => {
+                    // Both paths refuse. The probe's wording is generic while the
+                    // authority's names the cause, so compare the contract: the
+                    // refusal and the offending backend.
+                    for message in [&reused, &fresh] {
+                        assert!(
+                            message.contains("refusing to start with unsandboxed execution"),
+                            "{label}: {message}"
+                        );
+                        if let Some(backend) = &cli.sandbox_backend {
+                            assert!(message.contains(backend.as_str()), "{label}: {message}");
+                        }
+                    }
+                }
+                (reused, fresh) => panic!(
+                    "{label}: outcomes diverge: new ok={} old ok={}",
+                    reused.is_ok(),
+                    fresh.is_ok()
+                ),
             }
-            let (fresh_authority, fresh) =
-                crate::permission::resolve_configured_execution_authority(&cli, &cfg).unwrap();
-            assert_eq!(reused_authority, fresh_authority, "{label}");
-            assert_eq!(reused.policy(), fresh.policy(), "{label}");
-            assert_eq!(reused.profile(), fresh.profile(), "{label}");
-            assert_eq!(
-                reused.unavailable_diagnostic(),
-                fresh.unavailable_diagnostic(),
-                "{label}"
-            );
         }
     }
 

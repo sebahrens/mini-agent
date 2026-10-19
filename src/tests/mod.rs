@@ -255,7 +255,12 @@ fn shared_process_env_reader_never_observes_a_mutator_scope() {
         with_shared_process_env(|| std::env::var_os(NAME)),
         Some(OsString::from("temporary"))
     );
-    let reader = std::thread::spawn(|| with_shared_process_env(|| std::env::var_os(NAME)));
+    // A libtest test thread with no scope is a `Reader`; a raw spawned thread
+    // is `Unattributed` and reads directly, so give it the test-reader role.
+    let reader = std::thread::spawn(|| {
+        let _role = inherit_env_role(EnvRole::Reader);
+        with_shared_process_env(|| std::env::var_os(NAME))
+    });
     std::thread::sleep(Duration::from_millis(50));
     assert!(!reader.is_finished(), "reader must wait for the mutator");
     drop(environment);
