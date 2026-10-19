@@ -10,21 +10,31 @@ use std::time::{Duration, Instant};
 /// temporary values.
 static PROCESS_ENV_LOCK: RwLock<()> = RwLock::new(());
 
-/// Longest a reader waits for a mutator scope to end before reading anyway.
-/// This only matters when a mutator test waits on a helper thread that itself
-/// resolves paths; the reader then degrades to the old unlocked behaviour
-/// instead of deadlocking.
+/// Longest a test-thread reader waits for a mutator scope to end before
+/// reading anyway.
 const SHARED_ENV_WAIT: Duration = Duration::from_secs(30);
 
 thread_local! {
     static HOLDS_ENV_WRITER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// True for the thread libtest runs a test on (named after the test path) or
+/// the main thread. Helper threads (tokio workers and blocking-pool threads,
+/// `std::thread::spawn`) are unnamed or named otherwise.
+fn is_test_thread() -> bool {
+    let current = std::thread::current();
+    matches!(current.name(), Some(name) if name == "main" || name.contains("::"))
+}
+
 /// Runs `read` (an environment snapshot) so it cannot overlap any
 /// `ScopedProcessEnv` scope owned by another test. The thread owning a scope
-/// reads without locking.
+/// reads without locking. Only test threads wait: a helper thread cannot be
+/// attributed to a test, and one spawned inside a mutator scope (a runtime
+/// worker, a joined thread) would otherwise wait on its own parent's scope
+/// until the timeout, stalling that test; it reads directly, as it did before
+/// the lock existed.
 pub(crate) fn with_shared_process_env<T>(read: impl FnOnce() -> T) -> T {
-    if HOLDS_ENV_WRITER.with(std::cell::Cell::get) {
+    if HOLDS_ENV_WRITER.with(std::cell::Cell::get) || !is_test_thread() {
         return read();
     }
     let deadline = Instant::now() + SHARED_ENV_WAIT;
