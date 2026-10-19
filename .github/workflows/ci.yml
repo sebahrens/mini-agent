@@ -42,9 +42,15 @@ permissions:
 env:
   RUSTFLAGS: ''
 
+# A newer push to the same pull request or branch supersedes the older run, so
+# its remaining (macOS and Windows) minutes are not spent on a stale commit.
+# Tag pushes, scheduled drift runs and manual dispatches are never cancelled:
+# a tag run is the release's CI evidence. Scheduled and dispatched runs also
+# get their own group, because they share refs/heads/<default> with branch
+# pushes and would otherwise be cancelled by the next push.
 concurrency:
-  group: ci-${{ github.ref }}-${{ inputs.scope || 'full' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.ref }}-${{ inputs.scope || 'full' }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.event_name || 'push-or-pr' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) }}
 
 jobs:
   # Which jobs need to run for this event.

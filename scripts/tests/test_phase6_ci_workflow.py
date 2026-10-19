@@ -628,6 +628,20 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     r"(?s)(?:for|foreach).+skills.+cargo test",
                 )
 
+    def test_superseded_branch_and_pr_runs_are_cancelled_but_never_tag_runs(self) -> None:
+        block = self.workflow.split("\nconcurrency:\n", 1)[1].split("\njobs:", 1)[0]
+        group = re.search(r"(?m)^  group: (.+)$", block).group(1)
+        cancel = re.search(r"(?m)^  cancel-in-progress: (.+)$", block).group(1)
+        self.assertIn("github.ref", group)
+        self.assertIn("inputs.scope", group)
+        # Scheduled and dispatched runs must not share a group with push runs.
+        self.assertIn("github.event_name == 'schedule'", group)
+        self.assertIn("github.event_name == 'workflow_dispatch'", group)
+        self.assertIn("github.event_name == 'pull_request'", cancel)
+        self.assertIn("github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')", cancel)
+        self.assertNotIn("schedule", cancel)
+        self.assertNotIn("workflow_dispatch", cancel)
+
     def test_macos_runs_only_platform_feature_rows(self) -> None:
         header = job_body(self.workflow, "test").split("    steps:\n", 1)[0]
         self.assertIn("os: [ubuntu-latest, macos-latest]", header)

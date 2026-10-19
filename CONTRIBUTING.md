@@ -41,6 +41,8 @@ cargo install --path . --debug # the development build/install command
   cache keyed by OS, runner image (`ImageOS`), feature row, toolchain and `Cargo.lock`. The Phase 6
   containment gates run with `cache: false` so their evidence is clean-room, and the native Linux
   gate keeps its own `ubuntu-22.04`-partitioned cache.
+  A newer push to the same pull request or branch cancels the older CI run; tag pushes, the weekly
+  schedule and manual dispatches are never cancelled (they also use their own concurrency group).
 - Dependency changes go only in the root `Cargo.toml` and `Cargo.lock`. Reuse existing dependencies
   instead of adding a second version, and keep optional or platform-specific dependencies behind
   their feature or target.
