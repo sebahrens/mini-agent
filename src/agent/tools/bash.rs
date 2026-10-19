@@ -334,7 +334,16 @@ impl ShellTool {
         // The complete script is the permission key and is passed unchanged to
         // the shell. Never split or tokenize it: Bash can execute nested
         // programs from syntax that ad-hoc command splitting cannot classify.
-        let coaching = check_perm(&self.permission, &self.ask_tx, "shell", &args.command).await?;
+        // The prompt gives the exclusive lane back; no effect precedes it and
+        // the command captures no file identity, so nothing needs re-capture.
+        let (coaching, _released) = super::concurrency::prompt_unlocked(check_perm(
+            &self.permission,
+            &self.ask_tx,
+            "shell",
+            &args.command,
+        ))
+        .await;
+        let coaching = coaching?;
 
         if args.background {
             let timeout = args

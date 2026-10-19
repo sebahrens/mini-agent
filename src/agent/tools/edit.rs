@@ -1174,11 +1174,33 @@ impl EditTool {
             args.edits.as_ref().map(|e| e.len()).unwrap_or(0),
         );
         // Check the path atomic_write will modify, not a symlink that points to it.
-        let coaching = if let Some(workspace) = bound_workspace {
-            check_perm_bound_path(&self.permission, &self.ask_tx, "edit", workspace, relative)
-                .await?
-        } else {
-            check_perm_path(&self.permission, &self.ask_tx, "edit", &path).await?
+        // The prompt gives the exclusive lane back; it is re-acquired before the
+        // answer is used. A bound target was opened and its identity captured
+        // before the prompt, so it is re-captured under the re-acquired lane.
+        let (coaching, released) = super::concurrency::prompt_unlocked(async {
+            if let Some(workspace) = bound_workspace {
+                check_perm_bound_path(&self.permission, &self.ask_tx, "edit", workspace, relative)
+                    .await
+            } else {
+                check_perm_path(&self.permission, &self.ask_tx, "edit", &path).await
+            }
+        })
+        .await;
+        let coaching = coaching?;
+        let (capability_file, capability_metadata) = match (bound_workspace, released) {
+            (Some(workspace), true) => {
+                let (file, metadata) = crate::agent::tools::recapture_bound_file(
+                    workspace,
+                    relative,
+                    capability_metadata
+                        .as_ref()
+                        .expect("bound edit captured its identity"),
+                    false,
+                )
+                .await?;
+                (Some(file), Some(metadata))
+            }
+            _ => (capability_file, capability_metadata),
         };
 
         if let Some(instructions) = &self.read_tracker.instructions {
