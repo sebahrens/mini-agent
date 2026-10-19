@@ -265,6 +265,14 @@ A release is built and published only from a commit CI has passed:
   every other job must succeed on every event (including `harness-regression`, which runs on pushes
   as well as pull requests); `failure` and `cancelled` are never accepted. `scripts/ci_success.py` owns that decision.
   Adding a CI job without adding it to `ci-success` fails the workflow policy tests.
+  The heavy native Phase 6 gates (`macos-worker-containment-gate`, `windows-worker-containment-gate`,
+  `windows-general-sandbox-policy` and the `phase6-cross-platform-gate` aggregate) run only for tag
+  pushes, the weekly schedule and manual `workflow_dispatch`; on pull requests and branch pushes
+  they are skipped and `ci-success` accepts that. On a tag push they are required, so the tag run's
+  `ci-success` still proves them. The native Linux gate (`linux-sandbox-policy`) runs on every
+  event: it is the only per-push coverage of Linux-only code, which cannot be built on a Mac.
+  The macOS gates are reproducible locally on a Mac. To run the full matrix without a tag, start
+  the CI workflow manually (Actions > CI > Run workflow, scope `full`, or `gh workflow run ci.yml`).
 - The release workflow's first job, `verify-ci`, runs before any build. It fails unless the tagged
   commit is an ancestor of `origin/main`, then waits (up to 150 minutes, polling every 30 seconds)
   for the CI run that the same tag push started and requires that run's `ci-success` check run

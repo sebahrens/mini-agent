@@ -20,6 +20,16 @@ on:
     tags:
       - 'v*'
   pull_request:
+  # Fast and slow checks are split. The heavy native Phase 6 gates
+  # (macos-worker-containment-gate, windows-worker-containment-gate,
+  # windows-general-sandbox-policy and their phase6-cross-platform-gate
+  # aggregate) run only for tag pushes, the weekly schedule and manual
+  # dispatch; they are skipped on branch pushes and pull requests. The native
+  # Linux gate (linux-sandbox-policy) is the only per-push coverage of
+  # Linux-only code and runs on every event. A tag run still requires every
+  # gate: scripts/ci_success.py accepts their `skipped` result only for
+  # branch-push and pull-request events, and release.yml requires the tag
+  # run's ci-success.
   # The weekly run is drift detection: nothing in the repository changed, so
   # it re-runs only what a hosted-runner image, toolchain or advisory update
   # can break on its own. That is dependency-policy (fresh advisories and
@@ -1332,7 +1342,7 @@ jobs:
           if-no-files-found: error
 
   macos-worker-containment-gate:
-    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && (github.event_name != 'pull_request' && (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))
     needs: changes
     strategy:
       fail-fast: false
@@ -1667,7 +1677,7 @@ jobs:
         run: python3 -m unittest scripts.tests.test_gym_macos -v
 
   windows-general-sandbox-policy:
-    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox') && (github.event_name != 'pull_request' && (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 90
@@ -1806,7 +1816,7 @@ jobs:
           }
 
   windows-worker-containment-gate:
-    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && (github.event_name != 'pull_request' && (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 90
@@ -2526,7 +2536,7 @@ jobs:
           }
 
   phase6-cross-platform-gate:
-    if: always() && needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: always() && needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && (github.event_name != 'pull_request' && (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))
     needs:
       - changes
       - linux-sandbox-policy
@@ -3247,4 +3257,4 @@ jobs:
       - name: Require every gating job to succeed or be skipped by design
         env:
           CI_NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 scripts/ci_success.py --event "$GITHUB_EVENT_NAME"
+        run: python3 scripts/ci_success.py --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF"

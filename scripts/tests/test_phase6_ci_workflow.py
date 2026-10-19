@@ -642,6 +642,49 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertNotIn("schedule", cancel)
         self.assertNotIn("workflow_dispatch", cancel)
 
+    HEAVY_TERM = (
+        "(github.event_name != 'pull_request' && "
+        "(github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))"
+    )
+    HEAVY_GATES = (
+        "macos-worker-containment-gate", "windows-worker-containment-gate",
+        "windows-general-sandbox-policy", "phase6-cross-platform-gate",
+    )
+
+    def test_heavy_native_gates_run_only_on_tags_schedule_and_dispatch(self) -> None:
+        for job in self.HEAVY_GATES:
+            with self.subTest(job=job):
+                condition = job_body(self.workflow, job).splitlines()[0].strip()
+                self.assertIn(self.HEAVY_TERM, top_level_split(condition[len("if: "):], "&&"))
+        # Everything else, including the native Linux containment gate, keeps
+        # running on every push and pull request.
+        for job in workflow_jobs(self.workflow):
+            if job in self.HEAVY_GATES:
+                continue
+            with self.subTest(light=job):
+                condition = job_body(self.workflow, job).splitlines()[0].strip()
+                self.assertNotIn("startsWith(github.ref", condition)
+        self.assertNotIn(
+            "pull_request", job_body(self.workflow, "linux-sandbox-policy").splitlines()[0]
+        )
+
+    def test_heavy_condition_semantics(self) -> None:
+        def runs(event: str, ref: str) -> bool:
+            return event != "pull_request" and (event != "push" or ref.startswith("refs/tags/"))
+
+        self.assertFalse(runs("pull_request", "refs/pull/1/merge"))
+        self.assertFalse(runs("push", "refs/heads/main"))
+        self.assertTrue(runs("push", "refs/tags/v1.2.3"))
+        self.assertTrue(runs("schedule", "refs/heads/main"))
+        self.assertTrue(runs("workflow_dispatch", "refs/heads/main"))
+
+    def test_ci_success_passes_ref_so_tag_runs_require_the_heavy_gates(self) -> None:
+        body = job_body(self.workflow, "ci-success")
+        self.assertIn('--event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF"', body)
+        # The aggregate depends on every heavy gate, so tag runs cannot skip one.
+        for job in self.HEAVY_GATES:
+            self.assertIn(f"      - {job}\n", body)
+
     def test_macos_runs_only_platform_feature_rows(self) -> None:
         header = job_body(self.workflow, "test").split("    steps:\n", 1)[0]
         self.assertIn("os: [ubuntu-latest, macos-latest]", header)
@@ -1245,6 +1288,48 @@ class CiSuccessPolicyTests(unittest.TestCase):
         for event in ("push", "pull_request", "workflow_dispatch"):
             with self.subTest(event=event):
                 self.assertEqual([], self.evaluate(self.needs("true"), event))
+
+    HEAVY = (
+        "macos-worker-containment-gate", "windows-worker-containment-gate",
+        "windows-general-sandbox-policy", "phase6-cross-platform-gate",
+    )
+
+    def heavy_needs(self, result: str, **overrides: str) -> dict[str, object]:
+        needs = self.needs("true")
+        for job in self.HEAVY:
+            needs[job] = {"result": overrides.get(job, result), "outputs": {}}
+        return needs
+
+    def test_heavy_gates_may_be_skipped_on_pull_requests_and_branch_pushes(self) -> None:
+        needs = self.heavy_needs("skipped")
+        self.assertEqual([], self.evaluate(needs, "pull_request"))
+        self.assertEqual([], self.evaluate_ref(needs, "push", "refs/heads/main"))
+        # A failed or cancelled heavy gate still fails a fast event.
+        failed = self.heavy_needs("skipped", **{"windows-worker-containment-gate": "failure"})
+        self.assertEqual(
+            ["windows-worker-containment-gate finished with 'failure'"],
+            self.evaluate_ref(failed, "push", "refs/heads/main"),
+        )
+
+    def test_heavy_gates_are_required_on_tag_pushes_and_dispatch(self) -> None:
+        self.assertEqual([], self.evaluate_ref(self.heavy_needs("success"), "push", "refs/tags/v1.0.0"))
+        for event, ref in (("push", "refs/tags/v1.0.0"), ("workflow_dispatch", "refs/heads/main")):
+            with self.subTest(event=event):
+                errors = self.evaluate_ref(self.heavy_needs("skipped"), event, ref)
+                self.assertEqual(
+                    sorted(f"{job} finished with 'skipped'" for job in self.HEAVY), errors
+                )
+
+    def test_other_jobs_are_still_required_on_fast_events(self) -> None:
+        needs = self.heavy_needs("skipped")
+        needs["macos-gym-ownership"] = {"result": "skipped", "outputs": {}}
+        errors = self.evaluate_ref(needs, "pull_request", "refs/pull/1/merge")
+        self.assertEqual(["macos-gym-ownership finished with 'skipped'"], errors)
+
+    def evaluate_ref(self, needs: dict[str, object], event: str, ref: str) -> list[str]:
+        from scripts import ci_success
+
+        return ci_success.evaluate(needs, event, ref)
 
     def test_documentation_only_change_accepts_skipped_matrix(self) -> None:
         self.assertEqual([], self.evaluate(self.needs("false")))

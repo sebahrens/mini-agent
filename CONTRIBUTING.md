@@ -43,6 +43,13 @@ cargo install --path . --debug # the development build/install command
   gate keeps its own `ubuntu-22.04`-partitioned cache.
   A newer push to the same pull request or branch cancels the older CI run; tag pushes, the weekly
   schedule and manual dispatches are never cancelled (they also use their own concurrency group).
+  The heavy Windows and macOS Phase 6 containment gates (`macos-worker-containment-gate`,
+  `windows-worker-containment-gate`, `windows-general-sandbox-policy`, `phase6-cross-platform-gate`)
+  run only on `v*` tag pushes, the weekly schedule and manual dispatch; `ci-success` treats them as
+  skipped-by-design on pull requests and branch pushes and requires them on tag runs. The native
+  Linux gate (`linux-sandbox-policy`) still runs on every push and pull request because Linux-only
+  code cannot be compiled on a Mac, while the macOS gates can be reproduced locally on one. Run
+  the full matrix by hand with `gh workflow run ci.yml` (scope `full`).
 - Dependency changes go only in the root `Cargo.toml` and `Cargo.lock`. Reuse existing dependencies
   instead of adding a second version, and keep optional or platform-specific dependencies behind
   their feature or target.
