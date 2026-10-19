@@ -4268,20 +4268,31 @@ mod config69_clone_tests {
         std::fs::create_dir(&directory).unwrap();
         std::fs::write(directory.join("control"), "original").unwrap();
         let binding = WorkspaceBinding::capture(&directory).unwrap();
+        // Descriptor numbers are reused by parallel tests, so closure is
+        // checked by file identity: after the failed clone, the recorded
+        // number must be closed or name a different file than the duplicate.
+        // Only this test opens `directory`, so a matching identity is a leak.
+        fn identity(fd: std::os::fd::RawFd) -> Option<(u64, u64)> {
+            // SAFETY: fstat only reads the descriptor into a local buffer.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            (unsafe { libc::fstat(fd, &mut stat) } == 0)
+                .then_some((stat.st_dev as u64, stat.st_ino as u64))
+        }
         let mut failed_duplicate = None;
         assert!(
             binding
                 .try_clone_with(|_, duplicate| {
-                    failed_duplicate = Some(duplicate.as_raw_fd());
+                    let fd = duplicate.as_raw_fd();
+                    failed_duplicate = Some((fd, identity(fd).expect("duplicate is open")));
                     Err(io::Error::other("controlled capability clone failure"))
                 })
                 .is_err()
         );
-        // SAFETY: F_GETFD observes the integer only; it never owns, closes or
-        // mutates a descriptor. The failed operation must drop its duplicate.
-        assert_eq!(
-            unsafe { libc::fcntl(failed_duplicate.unwrap(), libc::F_GETFD) },
-            -1
+        let (failed_fd, failed_identity) = failed_duplicate.unwrap();
+        assert_ne!(
+            identity(failed_fd),
+            Some(failed_identity),
+            "the failed operation must drop its duplicate"
         );
         let clone = binding.try_clone().unwrap();
         drop(binding);

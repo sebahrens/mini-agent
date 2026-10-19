@@ -3877,9 +3877,16 @@ fn cli_permission_seeds_allow_exact_effects_deny_and_fail_closed_without_saved_g
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|message| message["content"]
-                        .as_str()
-                        .is_some_and(|content| content.contains("Permission denied"))),
+                    .any(|message| {
+                        // Tool results persist their text under `tool.output`
+                        // with only a prefix in `content`.
+                        [&message["content"], &message["tool"]["output"]]
+                            .into_iter()
+                            .any(|text| {
+                                text.as_str()
+                                    .is_some_and(|text| text.contains("Permission denied"))
+                            })
+                    }),
                 "blocked result must be recorded: {session}"
             );
         }

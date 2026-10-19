@@ -1,46 +1,147 @@
 #![allow(unsafe_code)]
 
 use std::ffi::OsString;
-use std::sync::{RwLock, RwLockWriteGuard, TryLockError};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Writers (`ScopedProcessEnv`) hold this exclusively for their whole scope;
-/// process-path readers take it shared only while snapshotting the environment
+/// process-path readers hold it shared only while snapshotting the environment
 /// (`with_shared_process_env`), so a reader never observes a mutator's
 /// temporary values.
-static PROCESS_ENV_LOCK: RwLock<()> = RwLock::new(());
+///
+/// Readers have priority over *queued* writers: a writer also waits while any
+/// reader is waiting, so back-to-back mutator tests cannot starve a reader
+/// (a polling `try_read` on a std `RwLock` did, stalling it for the full wait).
+struct EnvLockState {
+    writer_active: bool,
+    readers: usize,
+    waiting_readers: usize,
+}
+
+static PROCESS_ENV_LOCK: Mutex<EnvLockState> = Mutex::new(EnvLockState {
+    writer_active: false,
+    readers: 0,
+    waiting_readers: 0,
+});
+static PROCESS_ENV_CHANGED: Condvar = Condvar::new();
+
+fn env_state() -> std::sync::MutexGuard<'static, EnvLockState> {
+    PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct EnvWriteGuard;
+
+impl EnvWriteGuard {
+    fn acquire() -> Self {
+        let mut state = env_state();
+        while state.writer_active || state.readers > 0 || state.waiting_readers > 0 {
+            state = PROCESS_ENV_CHANGED
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.writer_active = true;
+        Self
+    }
+}
+
+impl Drop for EnvWriteGuard {
+    fn drop(&mut self) {
+        env_state().writer_active = false;
+        PROCESS_ENV_CHANGED.notify_all();
+    }
+}
 
 /// Longest a reader waits for a mutator scope to end before reading anyway.
-/// This only matters when a mutator test waits on a helper thread that itself
-/// resolves paths; the reader then degrades to the old unlocked behaviour
-/// instead of deadlocking.
 const SHARED_ENV_WAIT: Duration = Duration::from_secs(30);
 
+/// Which side of the process-env lock a thread's reads belong to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EnvRole {
+    /// Owns a `ScopedProcessEnv` (or a helper spawned for such an owner): reads
+    /// its own scope without locking.
+    Writer,
+    /// A test with no scope: its reads wait out other tests' scopes.
+    Reader,
+    /// A helper thread nobody attributed to a test (a runtime worker, a plain
+    /// spawned thread): reads directly, because waiting could stall the scope
+    /// of the test that spawned it.
+    Unattributed,
+}
+
 thread_local! {
-    static HOLDS_ENV_WRITER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ENV_ROLE: std::cell::Cell<Option<EnvRole>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn is_test_thread() -> bool {
+    let current = std::thread::current();
+    matches!(current.name(), Some(name) if name == "main" || name.contains("::"))
+}
+
+/// The role of the calling thread: an explicit assignment (writer scope or an
+/// inherited role), else `Reader` on a libtest test thread, else `Unattributed`.
+pub(crate) fn current_env_role() -> EnvRole {
+    ENV_ROLE.with(std::cell::Cell::get).unwrap_or_else(|| {
+        if is_test_thread() {
+            EnvRole::Reader
+        } else {
+            EnvRole::Unattributed
+        }
+    })
+}
+
+/// Restores the previous role on drop.
+pub(crate) struct EnvRoleGuard(Option<EnvRole>);
+
+/// Gives the calling helper thread the role of the test that spawned it
+/// (captured with [`current_env_role`] on the spawning thread).
+pub(crate) fn inherit_env_role(role: EnvRole) -> EnvRoleGuard {
+    EnvRoleGuard(ENV_ROLE.with(|cell| cell.replace(Some(role))))
+}
+
+impl Drop for EnvRoleGuard {
+    fn drop(&mut self) {
+        ENV_ROLE.with(|cell| cell.set(self.0));
+    }
 }
 
 /// Runs `read` (an environment snapshot) so it cannot overlap any
-/// `ScopedProcessEnv` scope owned by another test. The thread owning a scope
-/// reads without locking.
+/// `ScopedProcessEnv` scope owned by another test. Writers and unattributed
+/// helpers read without locking; only a scope-less test waits.
 pub(crate) fn with_shared_process_env<T>(read: impl FnOnce() -> T) -> T {
-    if HOLDS_ENV_WRITER.with(std::cell::Cell::get) {
+    if current_env_role() != EnvRole::Reader {
         return read();
     }
     let deadline = Instant::now() + SHARED_ENV_WAIT;
-    loop {
-        match PROCESS_ENV_LOCK.try_read() {
-            Ok(_guard) => return read(),
-            Err(TryLockError::Poisoned(poisoned)) => {
-                let _guard = poisoned.into_inner();
-                return read();
-            }
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(TryLockError::WouldBlock) => return read(),
+    let mut state = env_state();
+    state.waiting_readers += 1;
+    while state.writer_active {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // A mutator scope outlived the bound: read anyway.
+            state.waiting_readers -= 1;
+            drop(state);
+            PROCESS_ENV_CHANGED.notify_all();
+            return read();
+        }
+        state = PROCESS_ENV_CHANGED
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+    state.waiting_readers -= 1;
+    state.readers += 1;
+    drop(state);
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            env_state().readers -= 1;
+            PROCESS_ENV_CHANGED.notify_all();
         }
     }
+    let _release = Release;
+    read()
 }
 
 /// An exclusively owned scratch directory, removed even when a test panics.
@@ -92,15 +193,13 @@ fn owned_test_directory_cleans_up_after_panic() {
 
 pub(crate) struct ScopedProcessEnv {
     previous: Vec<(OsString, Option<OsString>)>,
-    _lock: RwLockWriteGuard<'static, ()>,
+    _lock: EnvWriteGuard,
 }
 
 impl ScopedProcessEnv {
     pub(crate) fn set(values: &[(&str, Option<OsString>)]) -> Self {
-        let lock = PROCESS_ENV_LOCK
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        HOLDS_ENV_WRITER.with(|held| held.set(true));
+        let lock = EnvWriteGuard::acquire();
+        ENV_ROLE.with(|cell| cell.set(Some(EnvRole::Writer)));
         let previous = values
             .iter()
             .map(|(name, _)| (OsString::from(name), std::env::var_os(name)))
@@ -122,7 +221,7 @@ impl ScopedProcessEnv {
 
 impl Drop for ScopedProcessEnv {
     fn drop(&mut self) {
-        HOLDS_ENV_WRITER.with(|held| held.set(false));
+        ENV_ROLE.with(|cell| cell.set(None));
         for (name, value) in &self.previous {
             unsafe {
                 match value {

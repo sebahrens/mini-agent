@@ -145,7 +145,9 @@ impl Wire {
         }
     }
     async fn wait_calls(&self, expected: usize) {
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        // Event-driven on `changed`; the bound only turns a lost request into a
+        // failure and is generous so a loaded parallel run never trips it.
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             while self.calls.load(Ordering::Acquire) < expected {
                 self.changed.notified().await;
             }

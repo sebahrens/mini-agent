@@ -1222,7 +1222,17 @@ where
             )
         })
         .ok();
+    #[cfg(test)]
+    let env_role = crate::tests::current_env_role();
+    #[cfg(test)]
+    let dispatcher_owner = crate::tests::fake_model::dispatcher_guard::current_is_owner();
     runtime.spawn_blocking(move || {
+        // Pool threads read process paths as the test that spawned them.
+        #[cfg(test)]
+        let _env_role = crate::tests::inherit_env_role(env_role);
+        #[cfg(test)]
+        let _dispatcher_owner =
+            crate::tests::fake_model::dispatcher_guard::inherit_owner(dispatcher_owner);
         #[cfg(test)]
         if let Some((_, Some(gate))) = &scoped {
             let _ = gate.started_tx.send(());
@@ -1904,7 +1914,7 @@ struct RequestShell<'a, S> {
     model: &'a Option<String>,
     preamble: &'a Option<String>,
     documents: &'a Vec<rig::completion::Document>,
-    tools: &'a Vec<rig::completion::ToolDefinition>,
+    tools: &'a Vec<std::sync::Arc<rig::completion::ToolDefinition>>,
     temperature: &'a Option<f64>,
     max_tokens: &'a Option<u64>,
     tool_choice: &'a Option<rig::message::ToolChoice>,

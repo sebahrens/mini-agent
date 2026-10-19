@@ -120,6 +120,36 @@ pub(crate) mod dispatcher_guard {
 
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    thread_local! {
+        static OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether the calling thread acts for the guard's owner.
+    pub(crate) fn current_is_owner() -> bool {
+        OWNER.with(std::cell::Cell::get)
+    }
+
+    /// Marks a helper thread as acting for the owner (or not) until dropped.
+    pub(crate) fn inherit_owner(owner: bool) -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OWNER.with(|cell| cell.set(self.0));
+            }
+        }
+        Restore(OWNER.with(|cell| cell.replace(owner)))
+    }
+
+    /// True when a guard is live and the calling thread does not act for its
+    /// owner (the owner's test thread and its scoped blocking threads do): every
+    /// other test, and its helper threads, must see no dispatcher, as in
+    /// isolation, instead of running the owner's hooks.
+    pub(crate) fn hidden_from_current_thread() -> bool {
+        HELD.load(std::sync::atomic::Ordering::Acquire) && !OWNER.with(std::cell::Cell::get)
+    }
+
     /// Held for the lifetime of a dispatcher-touching test; resets the
     /// process-global dispatcher on drop.
     pub(crate) struct DispatcherGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
@@ -127,12 +157,17 @@ pub(crate) mod dispatcher_guard {
     /// Acquire exclusive access to the process-global hook dispatcher.
     pub(crate) fn acquire() -> DispatcherGuard {
         let lock = LOCK.get_or_init(|| Mutex::new(()));
-        DispatcherGuard(lock.lock().unwrap_or_else(|e| e.into_inner()))
+        let guard = DispatcherGuard(lock.lock().unwrap_or_else(|e| e.into_inner()));
+        OWNER.with(|owner| owner.set(true));
+        HELD.store(true, std::sync::atomic::Ordering::Release);
+        guard
     }
 
     impl Drop for DispatcherGuard {
         fn drop(&mut self) {
             crate::extras::hooks::reset_dispatcher();
+            HELD.store(false, std::sync::atomic::Ordering::Release);
+            OWNER.with(|owner| owner.set(false));
         }
     }
 }

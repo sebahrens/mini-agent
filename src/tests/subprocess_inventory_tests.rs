@@ -2690,6 +2690,12 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/goal/gate.rs",
+        "assert_eq!(status, GoalStatus::Blocked);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
         "assert_eq!(*status, GoalStatus::AwaitingUser);",
         1,
         "NON-PROCESS",
@@ -2703,7 +2709,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/goal/gate.rs",
         "assert_eq!(*status, GoalStatus::Blocked);",
-        2,
+        3,
         "NON-PROCESS",
     ),
     (
@@ -3340,7 +3346,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    ("src/extras/js/skills/store.rs", "status,", 5, "NON-PROCESS"),
+    ("src/extras/js/skills/store.rs", "status,", 8, "NON-PROCESS"),
     (
         "src/extras/js/skills/store.rs",
         "let revision_changed = if matches!(status.as_str(), \"verified\" | \"awaiting_approval\") {",
@@ -4171,8 +4177,12 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
+                "2d2dd285053cc8bdefc39adfeed3addb47382f1675faeb806dbcc8a2dcb0fa63",
+                1,
+            ),
+            (
                 "8d75b0cb773e965bfd51463713ca3a6d85ef592e89b0d7de8d512d7076d993ae",
-                2,
+                3,
             ),
             (
                 "8e683c287c05b02ec770d6282642cc2ca52a1a16f7c38fb8abf40adaf4031a8e",
