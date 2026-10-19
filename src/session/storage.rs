@@ -138,8 +138,8 @@ pub fn tool_output_dir(session_id: &str) -> PathBuf {
         ))
 }
 
-fn app_paths() -> crate::paths::AppPaths {
-    crate::paths::process_paths().expect("startup must initialize application paths")
+fn app_paths() -> &'static crate::paths::AppPaths {
+    crate::paths::process_paths_ref().expect("startup must initialize application paths")
 }
 
 fn disabled(artifact: &'static str) -> bool {
@@ -175,7 +175,7 @@ fn read_private_string(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 pub(crate) fn config_path() -> PathBuf {
-    app_paths().config_dir
+    app_paths().config_dir.clone()
 }
 
 /// Write `content` privately and atomically via a same-directory temporary

@@ -526,8 +526,11 @@ fn default_quick_models() -> HashMap<String, QuickModelConfig> {
     map
 }
 
-pub fn quick_models_map(cfg: &Config) -> HashMap<String, QuickModelConfig> {
-    cfg.quick_models.clone().unwrap_or_default()
+/// Borrowed quick-model table; an absent table reads as a shared empty map.
+pub fn quick_models_map(cfg: &Config) -> &HashMap<String, QuickModelConfig> {
+    static EMPTY: std::sync::LazyLock<HashMap<String, QuickModelConfig>> =
+        std::sync::LazyLock::new(HashMap::new);
+    cfg.quick_models.as_ref().unwrap_or(&EMPTY)
 }
 
 pub fn save_quick_model(

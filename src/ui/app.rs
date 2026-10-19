@@ -1758,7 +1758,7 @@ impl<'a> App<'a> {
         if let Some(editor) = &ui.cfg.editor {
             input.set_editor(editor.clone());
         }
-        input.set_quick_model_names(config::quick_models_map(ui.cfg).into_keys().collect());
+        input.set_quick_model_names(config::quick_models_map(ui.cfg).keys().cloned().collect());
         {
             let mut providers: Vec<String> =
                 ["anthropic", "openai", "gemini", "openrouter", "ollama"]

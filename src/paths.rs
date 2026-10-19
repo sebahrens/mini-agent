@@ -2234,6 +2234,23 @@ pub fn process_paths() -> Result<AppPaths, AppPathError> {
     }
 }
 
+/// Borrowing form of [`process_paths`] for per-request/per-save callers: no
+/// `PathBuf` clones. Unit tests without installed roots leak one derived value
+/// per call (test-only; production never reaches that arm).
+pub fn process_paths_ref() -> Result<&'static AppPaths, AppPathError> {
+    if let Some(paths) = PROCESS_PATHS.get() {
+        return Ok(paths);
+    }
+    #[cfg(test)]
+    {
+        AppPaths::from_process(std::env::current_dir().ok()).map(|p| &*Box::leak(Box::new(p)))
+    }
+    #[cfg(not(test))]
+    {
+        Err(AppPathError::NotInitialized)
+    }
+}
+
 pub fn process_home_dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(home) = TEST_HOME_OVERRIDE.with(|home| home.borrow().clone()) {
