@@ -44,7 +44,7 @@ impl Wire {
             let mut requests = Vec::new();
             let mut responses = responses.into_iter();
             loop {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + Duration::from_secs(30);
                 let mut socket = loop {
                     match listener.accept() {
                         Ok((socket, _)) => break socket,
