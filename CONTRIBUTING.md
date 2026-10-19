@@ -56,6 +56,33 @@ cargo install --path . --debug # the development build/install command
 - Changes under `scripts/`, `.github/workflows/`, `packaging/` or the release documents are covered by
   `python3 -m unittest` suites in `scripts/tests/` and by `python3 scripts/check-package-metadata.py`.
 
+### Toolchain
+
+`rust-toolchain.toml` pins the compiler (currently `1.96.0`, with `rustfmt` and `clippy`) and CI
+honours it through rustup. **Homebrew's `cargo`/`rustc` ignore that file**, so a Homebrew install
+silently builds with whatever version Homebrew ships and Clippy/rustc differences then appear only
+in CI. Check what you are using with `cargo --version` and `rustc --version` (the CI `test` job
+prints both at the start of each row). To get the pinned toolchain, install
+[rustup](https://rustup.rs) and put `~/.cargo/bin` ahead of `/opt/homebrew/bin` in `PATH`; inside
+the repository `cargo --version` then reports the pinned channel (rustup installs it on first use).
+The pin stays for CI reproducibility. Compile-time measurements made on a different compiler are
+only indicative.
+
+### Compile time and disk use
+
+- A full harness build (`cargo test --no-run`) is dominated by the serial rustc frontend and by
+  monomorphising async/generic dependency code, not by any one test module; the measurements and
+  the parallel-frontend and crate-split evaluation are recorded in
+  [docs/decisions/2026-10-19-crate-split-and-parallel-frontend.md](docs/decisions/2026-10-19-crate-split-and-parallel-frontend.md).
+- `target/` is never pruned by Cargo: every feature row, profile and `RUSTFLAGS` variant keeps its
+  own hashed artefacts, and it can reach hundreds of GB. Sweep it periodically. Either use
+  `cargo sweep --time 14` (the `cargo-sweep` tool; it also prunes registry dependencies), or run
+  `python3 scripts/sweep-target.py`, which lists stale incremental-compilation directories and
+  mini-agent's own hashed outputs older than 14 days. It is a dry run by default; add `--apply` to
+  delete and `--days N` to change the cutoff. Deleted artefacts are simply rebuilt on demand.
+  Do not sweep while a build or test run is in progress, and use a separate `CARGO_TARGET_DIR` for
+  a local feature-row matrix so rows do not share (and constantly rebuild) one directory.
+
 Scope local test runs to changed modules and their affected callers. Several libtest filters can
 run together, for example `cargo test --bin mini-agent -- find_files retry --test-threads=1`.
 Choose feature rows that exercise changed cfg boundaries, and retain integration and native

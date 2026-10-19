@@ -199,6 +199,9 @@ jobs:
       - name: Test CI documentation-only filter
         run: python3 -m unittest scripts.tests.test_ci_docs_filter
 
+      - name: Test target-directory sweep script
+        run: python3 -m unittest scripts.tests.test_sweep_target
+
       - name: Test release workflow policy
         run: |
           python3 -m unittest \
@@ -595,6 +598,12 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Show the toolchain in use
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
 
       - name: Test (${{ matrix.features }}) on Linux
         if: matrix.os != 'macos-latest'
