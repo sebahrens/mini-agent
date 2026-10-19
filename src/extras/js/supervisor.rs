@@ -266,6 +266,18 @@ impl RetirementTicket {
 
 struct BoundedStderrDrain {
     thread: Option<JoinHandle<()>>,
+    exited: Arc<(Mutex<bool>, Condvar)>,
+}
+
+/// Signals drain-thread exit (including by panic) so teardown can wait without polling.
+struct DrainExitSignal(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for DrainExitSignal {
+    fn drop(&mut self) {
+        let (flag, wake) = &*self.0;
+        *flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        wake.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -401,18 +413,19 @@ impl Drop for BoundedStderrDrain {
 
 impl BoundedStderrDrain {
     fn join_bounded(&mut self, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while self
-            .thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
+        if self.thread.is_none() {
+            return;
         }
-        if self.thread.as_ref().is_some_and(JoinHandle::is_finished)
-            && let Some(thread) = self.thread.take()
-        {
+        let exited = {
+            let (flag, wake) = &*self.exited;
+            let guard = flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (guard, _) = wake
+                .wait_timeout_while(guard, timeout, |exited| !*exited)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard
+        };
+        // The signal fires as the thread's last action, so joining an exited drain returns at once.
+        if exited && let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
@@ -2498,14 +2511,18 @@ fn start_stderr_drain(process: &WorkerProcess) -> Result<BoundedStderrDrain, Wor
         .stderr
         .try_clone()
         .map_err(|_| WorkerError::Transport)?;
+    let exited = Arc::new((Mutex::new(false), Condvar::new()));
+    let signal = DrainExitSignal(Arc::clone(&exited));
     let thread = std::thread::Builder::new()
         .name("mini-agent-js-worker-stderr".into())
         .spawn(move || {
+            let _signal = signal;
             discard_worker_stderr(&mut stderr);
         })
         .map_err(|_| WorkerError::Transport)?;
     Ok(BoundedStderrDrain {
         thread: Some(thread),
+        exited,
     })
 }
 
