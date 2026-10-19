@@ -135,7 +135,23 @@ struct FlushCache {
     identity: LedgerIdentity,
     length: u64,
     modified: Option<std::time::SystemTime>,
+    /// Inode change time: unlike mtime it cannot be reset from userspace, so
+    /// a same-length rewrite followed by `utimes` still forces a rescan.
+    changed: Option<(i64, i64)>,
     scan: Scan,
+}
+
+fn change_stamp(metadata: &std::fs::Metadata) -> Option<(i64, i64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.ctime(), metadata.ctime_nsec()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 impl std::fmt::Debug for FlushCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -581,7 +597,11 @@ impl Ledger {
             let metadata = file.metadata()?;
             let length = metadata.len();
             let same_file = LedgerIdentity::of(file).is_ok_and(|id| id == cache.identity);
-            if same_file && length == cache.length && metadata.modified().ok() == cache.modified {
+            if same_file
+                && length == cache.length
+                && metadata.modified().ok() == cache.modified
+                && change_stamp(&metadata) == cache.changed
+            {
                 return Ok(cache.scan);
             }
             if same_file && length > cache.length {
@@ -654,6 +674,7 @@ impl Ledger {
                 identity,
                 length: metadata.len(),
                 modified: metadata.modified().ok(),
+                changed: change_stamp(&metadata),
                 scan: scanned,
             });
         }
