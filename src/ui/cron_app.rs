@@ -138,6 +138,9 @@ impl App<'_> {
     /// The `cron` statusline item: `waiting` while the running scheduled
     /// turn holds a permission or question prompt.
     pub(super) fn cron_status_label(&self) -> Option<String> {
+        if self.cron.is_empty() {
+            return None;
+        }
         let waiting = self.cron_turn.is_some()
             && self.run.is_running
             && (self.permission_prompt.is_some() || self.question_prompt.is_some());
