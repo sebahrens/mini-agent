@@ -1548,8 +1548,10 @@ fn validate_step_result_bounds(result: &StepResult, model_source: &str) -> Resul
     match &result.outcome {
         StepOutcome::Value(value) if value.len() > MAX_RESULT_BYTES => return Err(violation()),
         StepOutcome::Structured(value) => {
-            let encoded = serde_json::to_string(value).map_err(|_| violation())?;
-            if encoded.len() > STRUCTURED_RESULT_MAX_BYTES {
+            // Count without materializing a copy of the (up to 256 KiB) document.
+            let mut counter = JsonByteCounter::default();
+            serde_json::to_writer(&mut counter, value).map_err(|_| violation())?;
+            if counter.bytes > STRUCTURED_RESULT_MAX_BYTES {
                 return Err(violation());
             }
         }
@@ -1572,6 +1574,56 @@ fn validate_step_result_bounds(result: &StepResult, model_source: &str) -> Resul
     Ok(())
 }
 
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Fails the write as soon as the serialized bytes diverge from `expected`.
+struct JsonPrefixComparer<'a> {
+    expected: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> JsonPrefixComparer<'a> {
+    fn new(expected: &'a [u8]) -> Self {
+        Self {
+            expected,
+            offset: 0,
+        }
+    }
+
+    fn is_exact(&self) -> bool {
+        self.offset == self.expected.len()
+    }
+}
+
+impl std::io::Write for JsonPrefixComparer<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let end = self.offset.saturating_add(buf.len());
+        if self.expected.get(self.offset..end) != Some(buf) {
+            return Err(std::io::Error::other("structured result mismatch"));
+        }
+        self.offset = end;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn validate_structured_result_receipt(
     result: &StepResult,
     receipt: &super::session::StructuredResultReceipt,
@@ -1580,8 +1632,11 @@ fn validate_structured_result_receipt(
     let accepted = receipt.accepted().map_err(|_| violation())?;
     match (&result.outcome, accepted) {
         (StepOutcome::Structured(value), Some(expected)) => {
-            let actual = serde_json::to_string(value).map_err(|_| violation())?;
-            (actual == expected).then_some(()).ok_or_else(violation)
+            // Stream-compare against the parent-authoritative string; no allocation and it
+            // stops at the first differing byte.
+            let mut comparer = JsonPrefixComparer::new(expected.as_bytes());
+            serde_json::to_writer(&mut comparer, value).map_err(|_| violation())?;
+            comparer.is_exact().then_some(()).ok_or_else(violation)
         }
         (StepOutcome::Structured(_), None) | (_, Some(_)) => Err(violation()),
         (_, None) => Ok(()),
@@ -3190,6 +3245,12 @@ mod step_result_rendering {
         let mismatched = crate::extras::js::session::StructuredResultReceipt::default();
         mismatched.record("{\"answer\":41}".into()).unwrap();
         assert!(validate_structured_result_receipt(&structured, &mismatched).is_err());
+
+        for near_miss in ["{\"answer\":42}x", "{\"answer\":4", "{\"answer\":421}"] {
+            let receipt = crate::extras::js::session::StructuredResultReceipt::default();
+            receipt.record(near_miss.into()).unwrap();
+            assert!(validate_structured_result_receipt(&structured, &receipt).is_err());
+        }
 
         let matching = crate::extras::js::session::StructuredResultReceipt::default();
         matching.record("{\"answer\":42}".into()).unwrap();
