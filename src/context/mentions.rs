@@ -136,6 +136,42 @@ pub(crate) fn parse_agent_mentions(
     Ok(Some(AgentMentions { names, text }))
 }
 
+/// Hints for bare `@name` tokens whose name is a persona: a bare token is a
+/// file mention, so it never reaches the persona. One line per distinct name,
+/// in first-mention order. Tokens that already use `@agent:`/`@agent-` are
+/// not bare.
+pub(crate) fn bare_persona_hints(text: &str, workspace: Option<&WorkspaceBinding>) -> Vec<String> {
+    let mut available: Option<Vec<String>> = None;
+    let mut hints: Vec<String> = Vec::new();
+    for token in text.split_whitespace() {
+        let leading = token.len() - token.trim_start_matches(LEADING_PUNCTUATION).len();
+        let core = token[leading..].trim_end_matches(TRAILING_PUNCTUATION);
+        let Some(name) = core.strip_prefix('@') else {
+            continue;
+        };
+        if name.is_empty()
+            || name.starts_with("agent:")
+            || name.starts_with("agent-")
+            || !valid_agent_name(name)
+        {
+            continue;
+        }
+        let valid = available.get_or_insert_with(|| available_names_for_workspace(workspace));
+        if valid
+            .binary_search_by(|candidate| candidate.as_str().cmp(name))
+            .is_ok()
+            && !hints
+                .iter()
+                .any(|hint| hint.contains(&format!("'@{name}'")))
+        {
+            hints.push(format!(
+                "hint: '@{name}' is a file mention; to delegate to the {name} persona write '{CANONICAL_PREFIX}{name}'"
+            ));
+        }
+    }
+    hints
+}
+
 /// The non-persisted host routing note for one turn that mentions `names`.
 ///
 /// It names the personas as `task` tool `agent_type` values and leaves the
@@ -177,6 +213,18 @@ pub(crate) fn routing_directive(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_persona_names_get_a_hint_but_prefixed_and_unknown_ones_do_not() {
+        let fx = Fixture::new();
+        let text = format!(
+            "ask @{KNOWN}, @{KNOWN} again, @agent:{OTHER} @agent-{OTHER} @nobody-here a@{KNOWN}"
+        );
+        let hints = bare_persona_hints(&text, fx.binding());
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(hints[0].contains(&format!("@agent:{KNOWN}")), "{hints:?}");
+        assert!(bare_persona_hints("no mentions", fx.binding()).is_empty());
+    }
 
     /// Compiled-in personas that every workspace can resolve.
     const KNOWN: &str = "rust-maintainer";

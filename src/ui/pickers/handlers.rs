@@ -332,7 +332,18 @@ fn accept_command(
                         ),
                     };
                     let mut lp = ListPicker::new();
-                    lp.set_items(items);
+                    if other == "/agent" {
+                        // `/agent` changes the main agent; `@agent:` starts a
+                        // read-only child. Say which one this list is.
+                        lp.set_described_items(
+                            items
+                                .into_iter()
+                                .map(|name| (name, "main-agent persona".to_string()))
+                                .collect(),
+                        );
+                    } else {
+                        lp.set_items(items);
+                    }
                     lp.activate();
                     Picker::Prefixed(lp, prefix)
                 }

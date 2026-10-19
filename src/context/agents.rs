@@ -1269,6 +1269,25 @@ pub(crate) fn available_described_names_for_paths_and_workspace(
     described_names(&load_for_paths_and_workspace(paths, workspace))
 }
 
+/// Sorted names of the personas that declare `mode: write`, so pickers can
+/// label them as write-capable rather than read-only sub-agents.
+#[cfg(feature = "subagents")]
+pub(crate) fn write_persona_names_for_workspace(
+    workspace: Option<&crate::paths::WorkspaceBinding>,
+) -> Vec<String> {
+    let agents = match workspace {
+        Some(workspace) => shared_for_workspace_binding(workspace),
+        None => std::sync::Arc::new(load()),
+    };
+    let mut names: Vec<String> = agents
+        .iter()
+        .filter(|(_, definition)| definition.mode.as_deref() == Some("write"))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 #[cfg(feature = "subagents")]
 fn described_names(agents: &HashMap<String, AgentDefinition>) -> Vec<(String, String)> {
     let mut entries: Vec<_> = agents
