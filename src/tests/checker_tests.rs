@@ -179,11 +179,8 @@ fn guarded_asks_for_write_and_bash() {
         checker.check("bash", "touch notes.txt"),
         CheckResult::Ask
     ));
-    // Read-only scripts are auto-allowed in standard mode (permission::readonly_shell).
-    assert!(matches!(
-        checker.check("bash", "ls -la"),
-        CheckResult::Allowed
-    ));
+    // Read-only auto-allow is Standard-mode only; Guarded still asks.
+    assert!(matches!(checker.check("bash", "ls -la"), CheckResult::Ask));
     assert!(matches!(checker.check("bash", "ls **"), CheckResult::Ask));
     assert!(matches!(checker.check("bash", "pwd"), CheckResult::Allowed));
 }
