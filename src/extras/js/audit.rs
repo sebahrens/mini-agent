@@ -481,6 +481,7 @@ pub(crate) struct EffectAudit {
     current_length: u64,
     current_effect_records: u64,
     previous_hash: String,
+    #[cfg(test)]
     records: Vec<EffectAuditRecord>,
     active: BTreeMap<String, EffectAuditRecord>,
     terminal: HashSet<String>,
@@ -530,6 +531,7 @@ impl EffectAudit {
                 current_length: 0,
                 current_effect_records: 0,
                 previous_hash: ZERO_HASH.into(),
+                #[cfg(test)]
                 records: Vec::new(),
                 active: BTreeMap::new(),
                 terminal: HashSet::new(),
@@ -561,6 +563,7 @@ impl EffectAudit {
                 current_length: 0,
                 current_effect_records: 0,
                 previous_hash: ZERO_HASH.into(),
+                #[cfg(test)]
                 records: Vec::new(),
                 active: BTreeMap::new(),
                 terminal: HashSet::new(),
@@ -739,6 +742,7 @@ impl EffectAudit {
         let mut expected_previous = ZERO_HASH.to_string();
         let mut prior_was_close = false;
         let mut expected_open_previous = ZERO_HASH.to_string();
+        let key_digest = sha256_hex(&self.target_key);
 
         for (position, index) in indices.iter().copied().enumerate() {
             let is_last = position + 1 == indices.len();
@@ -778,14 +782,14 @@ impl EffectAudit {
                         && *segment_index == index
                         && previous_segment_hash == &expected_open_previous
                         && *target_key_version == TARGET_KEY_VERSION
-                        && target_key_digest == &sha256_hex(&self.target_key) =>
+                        && target_key_digest == &key_digest =>
                     {
                         prior_was_close = false;
                         self.rotation_anchors += 1;
                     }
                     StoredKind::Open {
                         target_key_digest, ..
-                    } if target_key_digest != &sha256_hex(&self.target_key) => {
+                    } if target_key_digest != &key_digest => {
                         return Err(AuditError::KeyUnavailable);
                     }
                     StoredKind::Open { .. } => return Err(AuditError::CorruptRecord),
@@ -871,6 +875,7 @@ impl EffectAudit {
                 }
             }
         }
+        #[cfg(test)]
         self.records.push(record);
         Ok(())
     }
@@ -910,21 +915,29 @@ impl EffectAudit {
         body: EffectBody,
     ) -> Result<EffectAuditRecord, AuditError> {
         validate_effect_body(&body)?;
-        let candidate =
-            StoredRecord::new(StoredKind::Effect(body.clone()), self.previous_hash.clone())?;
-        let encoded = encode_record(&candidate)?;
+        // Hash and encode once; only a rotation (which changes `previous_hash`) rebuilds them.
+        let mut stored = StoredRecord::new(StoredKind::Effect(body), self.previous_hash.clone())?;
+        let mut encoded = encode_record(&stored)?;
         if self.current_effect_records > 0
             && self.current_length.saturating_add(encoded.len() as u64)
                 > self.options.max_segment_bytes
         {
             self.rotate()?;
+            stored = StoredRecord::new(stored.kind, self.previous_hash.clone())?;
+            encoded = encode_record(&stored)?;
         }
-        let stored =
-            StoredRecord::new(StoredKind::Effect(body.clone()), self.previous_hash.clone())?;
-        self.append_encoded(&stored)?;
+        self.append_encoded(&stored.record_hash, &encoded)?;
         self.sync_file()?;
         self.current_effect_records += 1;
-        let record = record_from_body(&body, stored.previous_hash, stored.record_hash);
+        let StoredKind::Effect(body) = &stored.kind else {
+            unreachable!("effect record was constructed as an effect");
+        };
+        let record = record_from_body(
+            body,
+            stored.previous_hash.clone(),
+            stored.record_hash.clone(),
+        );
+        #[cfg(test)]
         self.records.push(record.clone());
         Ok(record)
     }
@@ -969,20 +982,20 @@ impl EffectAudit {
 
     fn append_stored(&mut self, kind: StoredKind) -> Result<(), AuditError> {
         let stored = StoredRecord::new(kind, self.previous_hash.clone())?;
-        self.append_encoded(&stored)
+        let encoded = encode_record(&stored)?;
+        self.append_encoded(&stored.record_hash, &encoded)
     }
 
-    fn append_encoded(&mut self, stored: &StoredRecord) -> Result<(), AuditError> {
+    fn append_encoded(&mut self, record_hash: &str, encoded: &[u8]) -> Result<(), AuditError> {
         if self.options.failure == Some(AuditFailurePoint::Append) {
             self.options.failure = None;
             return Err(AuditError::PathUnavailable);
         }
-        let encoded = encode_record(stored)?;
         self.current_file
-            .write_all(&encoded)
+            .write_all(encoded)
             .map_err(|_| AuditError::PathUnavailable)?;
         self.current_length = self.current_length.saturating_add(encoded.len() as u64);
-        self.previous_hash = stored.record_hash.clone();
+        self.previous_hash = record_hash.to_owned();
         Ok(())
     }
 
