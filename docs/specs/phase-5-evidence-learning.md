@@ -431,6 +431,11 @@ Quarantine is immediate for:
 - undeclared capability use (an operation outside the declared capability set, a grant that does
   not hold the capability, or a declared spawn program whose executable identity no longer matches
   the one pinned at grant time) — not a caller-supplied target outside a declared scope;
+  (Pinning stays at grant time: every grant preparation resolves the declared program, opens the
+  file and compares its identity. The SHA-256 of an unchanged file may be reused from a bounded
+  in-process memo keyed by the opened file's `(dev, ino, len, mtime_ns, ctime_ns)`; any change to
+  that fingerprint, or a file modified within the last two seconds, is rehashed in full, and
+  spawn-time capture never uses the memo — mini-agent-k7e1q.)
 - sandbox or permission-policy violation;
 - held-out regression discovered after admission;
 - any timeout/OOM during canary;
