@@ -88,3 +88,24 @@ fn args_field_parses_as_string_list() {
         Some(&["--strict".to_string(), "--verbose".to_string()][..])
     );
 }
+
+#[test]
+fn repo_settings_shape_and_unknown_events_keep_known_hooks() {
+    // Shape of this repository's .claude/settings.json (PreCompact + SessionStart).
+    let value = json!({
+        "PreCompact": [{"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]}],
+        "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]}],
+        "Notification": [{"hooks": [{"type": "command", "command": "notify"}]}],
+        "PermissionRequest": [{"hooks": [{"type": "command", "command": "perm"}]}],
+        "FutureEvent": [{"hooks": [{"type": "command", "command": "later"}]}]
+    });
+    let config = parse_hooks_config(&value).expect("unknown events must not fail the file");
+    for event in [
+        "PreCompact",
+        "SessionStart",
+        "Notification",
+        "PermissionRequest",
+    ] {
+        assert_eq!(config.get(event).map(Vec::len), Some(1), "{event}");
+    }
+}
