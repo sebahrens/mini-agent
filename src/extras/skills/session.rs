@@ -487,6 +487,7 @@ pub(crate) struct InstructionTurn {
     selected: tokio::sync::Mutex<Option<PreparedSelection>>,
     native: std::sync::atomic::AtomicBool,
     native_composition: tokio::sync::Mutex<Option<NativeComposition>>,
+    composed: Mutex<Option<Arc<ComposedPreamble>>>,
     #[cfg(feature = "skills")]
     learned_started: std::sync::atomic::AtomicBool,
 }
@@ -495,6 +496,25 @@ pub(crate) struct PreparedSelection {
     pub(crate) selection: Arc<InstructionSelection>,
     packages: Vec<Package>,
     _lease: Arc<Discovery>,
+}
+
+/// The last composed system preamble of this turn. The selection is immutable
+/// for the turn, so while the block is unchanged the preamble and its digest
+/// are reused rather than re-concatenated and re-hashed on every model request.
+struct ComposedPreamble {
+    selection: Arc<InstructionSelection>,
+    native: bool,
+    block: String,
+    preamble: String,
+    digest: Vec<u8>,
+}
+
+fn composed_preamble(base: &str, block: &str) -> String {
+    if block.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}\n\n{block}")
+    }
 }
 
 struct NativeComposition {
@@ -510,6 +530,7 @@ impl InstructionTurn {
             selected: tokio::sync::Mutex::new(None),
             native: std::sync::atomic::AtomicBool::new(false),
             native_composition: tokio::sync::Mutex::new(None),
+            composed: Mutex::new(None),
             #[cfg(feature = "skills")]
             learned_started: std::sync::atomic::AtomicBool::new(false),
         })
@@ -895,34 +916,57 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for Instructi
         };
         ctx.scratchpad()
             .insert(InstructionCarrier(Arc::clone(&self.turn)));
+        let previous = self
+            .turn
+            .composed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // A learned compositor may change its block between calls; plain
+        // rendering is a pure function of the immutable selection.
         #[cfg(feature = "skills")]
-        let block = if let Some(learned) = &self.learned {
-            match if native {
-                learned.compose_native_instructions(&selection)
-            } else {
-                learned.compose_instructions(&selection)
-            } {
-                Ok(block) => block,
-                Err(error) => return rig::agent::Flow::terminate(error),
-            }
+        let pure_render = self.learned.is_none();
+        #[cfg(not(feature = "skills"))]
+        let pure_render = true;
+        let rendered = previous
+            .as_ref()
+            .filter(|prior| {
+                pure_render && prior.native == native && Arc::ptr_eq(&prior.selection, &selection)
+            })
+            .map(|prior| prior.block.clone());
+        let block = if let Some(block) = rendered {
+            block
         } else {
-            match if native {
+            #[cfg(feature = "skills")]
+            let block = if let Some(learned) = &self.learned {
+                match if native {
+                    learned.compose_native_instructions(&selection)
+                } else {
+                    learned.compose_instructions(&selection)
+                } {
+                    Ok(block) => block,
+                    Err(error) => return rig::agent::Flow::terminate(error),
+                }
+            } else {
+                match if native {
+                    super::selection::render_native_plain(&selection)
+                } else {
+                    super::selection::render_plain(&selection)
+                } {
+                    Ok(block) => block,
+                    Err(error) => return rig::agent::Flow::terminate(error),
+                }
+            };
+            #[cfg(not(feature = "skills"))]
+            let block = match if native {
                 super::selection::render_native_plain(&selection)
             } else {
                 super::selection::render_plain(&selection)
             } {
                 Ok(block) => block,
                 Err(error) => return rig::agent::Flow::terminate(error),
-            }
-        };
-        #[cfg(not(feature = "skills"))]
-        let block = match if native {
-            super::selection::render_native_plain(&selection)
-        } else {
-            super::selection::render_plain(&selection)
-        } {
-            Ok(block) => block,
-            Err(error) => return rig::agent::Flow::terminate(error),
+            };
+            block
         };
         let block = if native {
             if !self.base.contains(super::selection::POLICY) {
@@ -949,13 +993,29 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for Instructi
         } else {
             block
         };
-        let preamble = if block.is_empty() {
-            self.base.clone()
-        } else {
-            format!("{}\n\n{}", self.base, block)
+        let expected_len = self.base.len() + if block.is_empty() { 0 } else { 2 + block.len() };
+        let (preamble, digest) = match previous.filter(|prior| {
+            prior.block == block
+                && prior.preamble.len() == expected_len
+                && prior.preamble.starts_with(&self.base)
+        }) {
+            Some(prior) => (prior.preamble.clone(), prior.digest.clone()),
+            None => {
+                let preamble = composed_preamble(&self.base, &block);
+                let digest = Sha256::digest(preamble.as_bytes()).to_vec();
+                *self.turn.composed.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Arc::new(ComposedPreamble {
+                        selection: Arc::clone(&selection),
+                        native,
+                        block: block.clone(),
+                        preamble: preamble.clone(),
+                        digest: digest.clone(),
+                    }));
+                (preamble, digest)
+            }
         };
         ctx.scratchpad().insert(PreparedInstruction {
-            digest: Sha256::digest(preamble.as_bytes()).to_vec(),
+            digest,
             bytes: preamble.len(),
             selected: !selection.selected.is_empty(),
         });
