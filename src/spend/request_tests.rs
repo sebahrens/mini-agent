@@ -158,7 +158,7 @@ impl Wire {
         let client = crate::provider::create_client(
             "cost-wire",
             Some("unused-fixture-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();
@@ -1785,7 +1785,7 @@ async fn background56_actual_task_and_signed_native_next_prompt_overlap_and_noti
     let client = crate::provider::create_client(
         "background-native",
         cli.api_key.as_deref(),
-        &cfg.custom_providers_map(),
+        cfg.custom_providers_map(),
         None,
     )
     .unwrap();

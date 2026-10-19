@@ -68,6 +68,7 @@ pub struct SlashCtx<'a> {
     pub cfg: &'a Config,
     pub context: &'a mut ContextFiles,
     pub workspace: &'a std::sync::Arc<crate::paths::WorkspaceBinding>,
+    pub custom_commands: &'a mut crate::context::commands::CommandCache,
     pub show_reasoning: &'a mut bool,
     pub reasoning_enabled: &'a mut bool,
     pub is_running: &'a mut bool,
@@ -166,7 +167,7 @@ impl SlashCtx<'_> {
             crate::provider::create_client(
                 &session.provider,
                 self.cli.api_key.as_deref(),
-                &self.cfg.custom_providers_map(),
+                self.cfg.custom_providers_map(),
                 self.cfg.api_keys.as_ref(),
             )?
         } else {
@@ -211,7 +212,7 @@ impl SlashCtx<'_> {
         let client = crate::provider::create_client(
             provider,
             self.cli.api_key.as_deref(),
-            &self.cfg.custom_providers_map(),
+            self.cfg.custom_providers_map(),
             self.cfg.api_keys.as_ref(),
         )?;
         *self.client = client;
@@ -281,7 +282,7 @@ impl SlashCtx<'_> {
             .update_context_window(self.cfg.resolve_context_window(
                 &self.session.provider,
                 &self.session.model,
-                &crate::config::quick_models_map(self.cfg),
+                crate::config::quick_models_map(self.cfg),
             ));
 
         let _ = self.renderer.write_line(
@@ -324,7 +325,7 @@ pub(crate) async fn apply_prompt_model(
         match crate::provider::create_client(
             &qmc.provider,
             ui.cli.api_key.as_deref(),
-            &ui.cfg.custom_providers_map(),
+            ui.cfg.custom_providers_map(),
             ui.cfg.api_keys.as_ref(),
         ) {
             Ok(new_client) => {
@@ -370,7 +371,7 @@ pub(crate) async fn apply_prompt_model(
         .update_context_window(ui.cfg.resolve_context_window(
             &ui.session.provider,
             &ui.session.model,
-            &qm,
+            qm,
         ));
 
     let _ = renderer.write_line(
@@ -469,7 +470,7 @@ pub async fn handle_compress(
     #[cfg(feature = "memory")]
     let reserve = crate::extras::memory::effective_session_reserve(
         ui.cfg
-            .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window),
+            .resolve_reserve_tokens(&ui.session.model, qm, ui.session.context_window),
         ui.context.memory.as_deref(),
         ui.session,
     );
@@ -904,6 +905,7 @@ pub(crate) async fn handle_slash(
         cfg: ui.cfg,
         context: ui.context,
         workspace: &ui.workspace,
+        custom_commands: &mut slash.custom_commands,
         show_reasoning: &mut slash.show_reasoning,
         reasoning_enabled: &mut slash.reasoning_enabled,
         is_running: &mut run.is_running,
@@ -1045,7 +1047,8 @@ pub(crate) async fn handle_slash(
         _ => {
             if let Some(name) = parts[0].strip_prefix('/')
                 && let Some(template) =
-                    crate::context::commands::load_for_workspace(ctx.workspace).remove(name)
+                    crate::context::commands::load_cached(ctx.custom_commands, ctx.workspace)
+                        .and_then(|commands| commands.get(name).cloned())
             {
                 let arguments = text
                     .trim_start()

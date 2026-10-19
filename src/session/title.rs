@@ -292,7 +292,7 @@ pub(crate) async fn generate_for_session(
         crate::provider::create_client(
             &request.provider,
             None,
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
     };

@@ -1145,7 +1145,7 @@ fn acp_client(
     crate::provider::create_client(
         provider,
         cli.api_key.as_deref(),
-        &cfg.custom_providers_map(),
+        cfg.custom_providers_map(),
         cfg.api_keys.as_ref(),
     )
 }
@@ -1539,7 +1539,7 @@ async fn handle_new_session(
         state.cfg.resolve_context_window(
             &provider,
             &model,
-            &crate::config::quick_models_map(&state.cfg),
+            crate::config::quick_models_map(&state.cfg),
         ),
         "",
     );
@@ -4116,10 +4116,10 @@ async fn execute_prompt(
         let context_window =
             state
                 .cfg
-                .resolve_context_window(&provider_str, &model_str, &quick_models);
+                .resolve_context_window(&provider_str, &model_str, quick_models);
         let reserve = state
             .cfg
-            .resolve_reserve_tokens(&model_str, &quick_models, context_window);
+            .resolve_reserve_tokens(&model_str, quick_models, context_window);
         let compaction_client = &client;
         #[cfg(feature = "goal")]
         let goal_store_for_compaction = goal_store.clone();

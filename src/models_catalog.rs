@@ -42,22 +42,9 @@ struct Catalog {
     image_input: HashMap<String, HashMap<String, bool>>,
 }
 static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
-    let raw: HashMap<String, Vec<RawModel>> =
-        serde_json::from_str(CATALOG_JSON).unwrap_or_default();
-    let image_input = raw
-        .into_iter()
-        .map(|(provider, models)| {
-            (
-                provider,
-                models
-                    .into_iter()
-                    .filter_map(|model| model.image_input.map(|image| (model.id, image)))
-                    .collect(),
-            )
-        })
-        .collect();
+    let (entries, image_input) = parse_catalog_parts(CATALOG_JSON);
     Catalog {
-        entries: parse_catalog(CATALOG_JSON),
+        entries,
         image_input,
     }
 });
@@ -69,22 +56,39 @@ pub(crate) fn model_image_input(provider: &str, model: &str) -> Option<bool> {
     CATALOG.image_input.get(provider)?.get(model).copied()
 }
 
+#[cfg(test)]
 fn parse_catalog(json: &str) -> HashMap<String, Vec<ModelEntry>> {
+    parse_catalog_parts(json).0
+}
+
+type CatalogParts = (
+    HashMap<String, Vec<ModelEntry>>,
+    HashMap<String, HashMap<String, bool>>,
+);
+
+/// One deserialisation yields both the entry lists and the explicit image flags.
+fn parse_catalog_parts(json: &str) -> CatalogParts {
     let raw: HashMap<String, Vec<RawModel>> = match serde_json::from_str(json) {
         Ok(raw) => raw,
         Err(error) => {
             tracing::warn!(
                 "embedded data/models.json is malformed; using an empty model catalog: {error}"
             );
-            return HashMap::new();
+            return (HashMap::new(), HashMap::new());
         }
     };
 
-    raw.into_iter()
-        .map(|(provider, models)| {
-            let entries = models
-                .into_iter()
-                .map(|m| ModelEntry {
+    let mut entries = HashMap::with_capacity(raw.len());
+    let mut image_input = HashMap::with_capacity(raw.len());
+    for (provider, models) in raw {
+        let mut flags = HashMap::new();
+        let list = models
+            .into_iter()
+            .map(|m| {
+                if let Some(image) = m.image_input {
+                    flags.insert(m.id.clone(), image);
+                }
+                ModelEntry {
                     id: m.id,
                     display: m.name,
                     context_length: m.context,
@@ -93,11 +97,13 @@ fn parse_catalog(json: &str) -> HashMap<String, Vec<ModelEntry>> {
                     output_price: m.output_price,
                     cache_read_price: m.cache_read_price,
                     cache_write_price: m.cache_write_price,
-                })
-                .collect();
-            (provider, entries)
-        })
-        .collect()
+                }
+            })
+            .collect();
+        entries.insert(provider.clone(), list);
+        image_input.insert(provider, flags);
+    }
+    (entries, image_input)
 }
 
 /// Baked model entries for a provider, or `None` when the provider is not in the

@@ -1403,6 +1403,7 @@ async fn memory_refresh_retires_queued_prebuild_before_starting_turn() {
         );
         let mut run = AgentRunState::default();
         let slash = SlashState {
+            custom_commands: Default::default(),
             show_reasoning: false,
             reasoning_enabled: false,
             todo_tools_enabled: false,
@@ -2111,6 +2112,7 @@ async fn delayed_prebuild_preserves_configuration_and_services_across_interrupti
         ));
         let mut run = AgentRunState::default();
         let slash = SlashState {
+            custom_commands: Default::default(),
             show_reasoning: false,
             reasoning_enabled: false,
             todo_tools_enabled: false,

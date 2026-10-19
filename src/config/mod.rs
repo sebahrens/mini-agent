@@ -721,8 +721,11 @@ impl Config {
         }
     }
 
-    pub fn custom_providers_map(&self) -> HashMap<String, types::CustomProviderConfig> {
-        self.custom_providers.clone().unwrap_or_default()
+    /// Borrowed custom-provider table; absent reads as a shared empty map.
+    pub fn custom_providers_map(&self) -> &HashMap<String, types::CustomProviderConfig> {
+        static EMPTY: std::sync::LazyLock<HashMap<String, types::CustomProviderConfig>> =
+            std::sync::LazyLock::new(HashMap::new);
+        self.custom_providers.as_ref().unwrap_or(&EMPTY)
     }
 
     /// Whether requests for `provider` go through the Anthropic-native API
@@ -1532,14 +1535,12 @@ pub enum ResolvedShowToolDetails {
 
 /// Convenience: resolves temperature with all sources (CLI, quick model, global config).
 pub fn resolve_temperature(cli: &crate::cli::Cli, cfg: &Config, model_id: &str) -> Option<f64> {
-    let qm = quick_models_map(cfg);
-    cfg.resolve_temperature(cli, model_id, &qm)
+    cfg.resolve_temperature(cli, model_id, quick_models_map(cfg))
 }
 
 /// Convenience: resolves extra body params (quick model, global config).
 pub fn resolve_extra_body(cfg: &Config, model_id: &str) -> Option<serde_json::Value> {
-    let qm = quick_models_map(cfg);
-    cfg.resolve_extra_body(model_id, &qm)
+    cfg.resolve_extra_body(model_id, quick_models_map(cfg))
 }
 
 impl ShowToolDetails {

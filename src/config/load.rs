@@ -303,16 +303,34 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
         super::layers::validate_toml_bounds_diagnostic(content, MAX_PRIVATE_CONFIG_BYTES)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
     }
+    // TOML is tokenised once into a table; its keys supply the spelling list and
+    // the table deserialises into Config. A failure re-parses the text so the
+    // error keeps its line/column wording.
+    let mut toml_table: Option<toml::Table> =
+        if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
+            content.parse::<toml::Table>().ok()
+        } else {
+            None
+        };
+    let toml_keys: Vec<String> = toml_table
+        .as_ref()
+        .map(|table| table.keys().cloned().collect())
+        .unwrap_or_default();
     let mut cfg: Config = match path.extension().and_then(|extension| extension.to_str()) {
-        Some("toml") => toml::from_str(content).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "config is not valid TOML ({})",
-                    keys::describe_toml_error(content, &error)
-                ),
-            )
-        }),
+        Some("toml") => toml_table
+            .take()
+            .and_then(|table| <Config as serde::Deserialize>::deserialize(table).ok())
+            .map(Ok)
+            .unwrap_or_else(|| toml::from_str(content))
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "config is not valid TOML ({})",
+                        keys::describe_toml_error(content, &error)
+                    ),
+                )
+            }),
         _ => serde_yaml_ng::from_str(content).map_err(|error| {
             let message = match error.location() {
                 Some(location) => format!(
@@ -333,14 +351,7 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
     cfg.provenance.global_status = Some("loaded");
     let spellings: Vec<String> =
         if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
-            toml::from_str::<toml::Value>(content)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .as_table()
-                        .map(|table| table.keys().cloned().collect())
-                })
-                .unwrap_or_default()
+            toml_keys
         } else {
             serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content)
                 .ok()
@@ -516,8 +527,11 @@ fn default_quick_models() -> HashMap<String, QuickModelConfig> {
     map
 }
 
-pub fn quick_models_map(cfg: &Config) -> HashMap<String, QuickModelConfig> {
-    cfg.quick_models.clone().unwrap_or_default()
+/// Borrowed quick-model table; an absent table reads as a shared empty map.
+pub fn quick_models_map(cfg: &Config) -> &HashMap<String, QuickModelConfig> {
+    static EMPTY: std::sync::LazyLock<HashMap<String, QuickModelConfig>> =
+        std::sync::LazyLock::new(HashMap::new);
+    cfg.quick_models.as_ref().unwrap_or(&EMPTY)
 }
 
 pub fn save_quick_model(
@@ -1027,6 +1041,50 @@ mod doctor_config_tests {
             diagnosed.provenance.local_trust,
             Some("content-bound trusted")
         );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn config69_mcp_global_source_is_read_once_for_all_servers() {
+        let root = crate::tests::OwnedTestDirectory::new("config69-mcp-once");
+        let paths = paths(root.path());
+        std::fs::create_dir(root.path().join("workspace")).unwrap();
+        let workspace = std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(&root.path().join("workspace")).unwrap(),
+        );
+        let global = paths.config_dir.join("config.toml");
+        let mut text = String::from("provider='ollama'\n");
+        for index in 0..5 {
+            text.push_str(&format!("[mcp_servers.s{index}]\ncommand='cmd{index}'\n"));
+        }
+        atomic_config_write(&global, &text).unwrap();
+        let before = crate::extras::mcp::project::source_captures();
+        let cfg = load_from_path_with_sources(
+            global.clone(),
+            None,
+            &paths.project_config_trust_file(),
+            false,
+            Some(&workspace),
+            None,
+        )
+        .0;
+        assert_eq!(
+            crate::extras::mcp::project::source_captures() - before,
+            1,
+            "five servers share one verified read of the global config"
+        );
+        for index in 0..5 {
+            let origin = cfg.mcp_origins[&format!("s{index}")]
+                .iter()
+                .find(|origin| origin.selected)
+                .unwrap();
+            assert!(crate::extras::mcp::project::server_source_is_current(
+                &workspace,
+                &format!("s{index}"),
+                cfg.mcp_servers.as_ref().unwrap().get(&format!("s{index}")),
+                Some(origin),
+            ));
+        }
     }
 
     #[cfg(feature = "mcp")]
@@ -2117,21 +2175,24 @@ fn capture_global_mcp_origins(cfg: &mut Config, path: &Path) -> Result<(), &'sta
         .global_digest
         .as_deref()
         .ok_or("global MCP source bytes are unavailable")?;
-    for (name, server) in servers {
+    for name in servers.keys() {
         if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
             return Err("configured MCP name exceeds bounds");
         }
-        let authority = crate::extras::mcp::project::OriginAuthority::file(
-            &source,
-            Path::new(
-                path.file_name()
-                    .ok_or("global config name is unavailable")?,
-            ),
-            expected,
-            server,
-            crate::extras::mcp::project::SourceKind::GlobalConfig,
-            None,
-            None,
+    }
+    // One read + digest of the global file serves every configured server.
+    let capture = crate::extras::mcp::project::SourceCapture::new(
+        &source,
+        Path::new(
+            path.file_name()
+                .ok_or("global config name is unavailable")?,
+        ),
+        expected,
+        crate::extras::mcp::project::SourceKind::GlobalConfig,
+    )?;
+    for (name, server) in servers {
+        let authority = crate::extras::mcp::project::OriginAuthority::from_capture(
+            &capture, server, None, None,
         )?;
         cfg.mcp_origins.entry(name.clone()).or_default().push(
             crate::extras::mcp::project::ServerOrigin {
@@ -2163,30 +2224,41 @@ fn record_project_mcp_origins(
         return Err("configured MCP server count exceeds bounds".into());
     }
     let source = workspace.root().join(relative).display().to_string();
-    for (name, baseline) in servers {
+    for name in servers.keys() {
         if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
             return Err("configured MCP name exceeds bounds".into());
         }
+    }
+    let capture = if trusted && !servers.is_empty() {
+        Some(
+            crate::extras::mcp::project::SourceCapture::new(
+                workspace,
+                relative,
+                digest,
+                crate::extras::mcp::project::SourceKind::ProjectConfig,
+            )
+            .map_err(str::to_owned)?,
+        )
+    } else {
+        None
+    };
+    for (name, baseline) in servers {
         let prior = cfg
             .mcp_origins
             .get(name)
             .and_then(|origins| origins.iter().find(|origin| origin.selected))
             .and_then(|origin| origin.authority.as_ref());
-        let authority = if trusted {
-            Some(
-                crate::extras::mcp::project::OriginAuthority::file(
-                    workspace,
-                    relative,
-                    digest,
+        let authority = match &capture {
+            Some(capture) => Some(
+                crate::extras::mcp::project::OriginAuthority::from_capture(
+                    capture,
                     baseline,
-                    crate::extras::mcp::project::SourceKind::ProjectConfig,
                     prior,
                     Some(trust_store),
                 )
                 .map_err(str::to_owned)?,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
         let origins = cfg.mcp_origins.entry(name.clone()).or_default();
         origins.retain(|origin| origin.source != source);
@@ -2470,11 +2542,102 @@ pub(crate) fn project_config_relative_is_trusted_at_readonly(
     workspace.validate().is_ok() && store.bindings.contains(&binding)
 }
 
+/// Stat fingerprint of one path (no symlink following): identity, mode,
+/// owner, link count, size and nanosecond mtime/ctime. `ctime` cannot be
+/// restored from user space, so a rewrite that keeps size and mtime still
+/// changes it. `None` means the path is absent or the platform has no such
+/// fields, which disables the trust memo.
+#[cfg(unix)]
+fn stat_fingerprint(path: &Path) -> Option<[i64; 9]> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some([
+        m.dev() as i64,
+        m.ino() as i64,
+        i64::from(m.mode()),
+        i64::from(m.uid()),
+        m.nlink() as i64,
+        m.size() as i64,
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime() ^ m.ctime_nsec().rotate_left(40),
+    ])
+}
+
+#[cfg(not(unix))]
+fn stat_fingerprint(_path: &Path) -> Option<[i64; 9]> {
+    None
+}
+
+type TrustMemoKey = (PathBuf, PathBuf, bool);
+type TrustMemoStamp = Vec<[i64; 9]>;
+
+#[cfg(test)]
+thread_local! {
+    /// Full (content read + trust-store parse) trust evaluations on this thread.
+    static TRUST_FULL_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Memo of the last decision per (workspace, trust store, repair): reused only
+/// while every involved path still has the exact stat fingerprint it had when
+/// the decision was made. Any change, or an unreadable fingerprint, forces the
+/// full evaluation, so revocation and edits are never masked.
 fn project_config_is_trusted_in_workspace_mode(
     paths: &crate::paths::AppPaths,
     workspace: &crate::paths::WorkspaceBinding,
     repair: bool,
 ) -> bool {
+    static MEMO: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<TrustMemoKey, (TrustMemoStamp, bool)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let store = paths.project_config_trust_file();
+    let root = workspace.root();
+    let take_stamp = || {
+        // An absent store is a valid (empty) trust state; fingerprint it as such.
+        Some(vec![
+            stat_fingerprint(&root.join(".zerostack"))?,
+            stat_fingerprint(&root.join(".zerostack/config.toml"))?,
+            stat_fingerprint(store.parent()?)?,
+            stat_fingerprint(&store).unwrap_or([0; 9]),
+        ])
+    };
+    let stamp = take_stamp();
+    let key = (root.to_path_buf(), store.clone(), repair);
+    if let Some(stamp) = &stamp
+        && workspace.validate().is_ok()
+        && let Some((cached, decision)) = MEMO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        && cached == *stamp
+    {
+        return decision;
+    }
+    let decision = project_config_is_trusted_in_workspace_uncached(paths, workspace, repair);
+    // Repair (mode fix-up of the private store) bumps ctime on the store and its
+    // directory. Memoize the post-evaluation stamp only when nothing but ctime
+    // moved during the evaluation; any other difference leaves it unmemoized.
+    let settled = take_stamp().filter(|after| {
+        stamp.as_ref().is_some_and(|before| {
+            before.len() == after.len() && before.iter().zip(after).all(|(a, b)| a[..8] == b[..8])
+        })
+    });
+    if let Some(stamp) = settled {
+        MEMO.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (stamp, decision));
+    }
+    decision
+}
+
+fn project_config_is_trusted_in_workspace_uncached(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    repair: bool,
+) -> bool {
+    #[cfg(test)]
+    TRUST_FULL_EVALUATIONS.with(|n| n.set(n.get() + 1));
     let Ok((_, binding)) =
         read_project_config_in_workspace(workspace, Path::new(".zerostack/config.toml"))
     else {
@@ -4493,6 +4656,37 @@ pub(crate) mod bounded_project_trust_tests {
             credentials_dir: root.join("credentials"),
             project_dir: Some(root.join(".zerostack")),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_decision_is_memoized_on_stat_fingerprint_and_edits_force_full_check() {
+        let root = crate::tests::OwnedTestDirectory::new("trust-memo");
+        let paths = paths(root.path());
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "model='project-model'\n").unwrap();
+        trust_project_config(&config, &paths.project_config_trust_file()).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let count = || TRUST_FULL_EVALUATIONS.with(std::cell::Cell::get);
+
+        let start = count();
+        assert!(project_config_is_trusted_in_workspace(&paths, &workspace));
+        let first = count() - start;
+        assert!(first >= 1);
+        // The first call may repair the store's mode; allow one more settling pass.
+        assert!(project_config_is_trusted_in_workspace(&paths, &workspace));
+        let settled = count();
+        for _ in 0..5 {
+            assert!(project_config_is_trusted_in_workspace(&paths, &workspace));
+        }
+        assert_eq!(count(), settled, "unchanged files are not re-read");
+
+        // Same length, different bytes: the trust binding no longer matches.
+        std::fs::write(&config, "model='project-modeX'\n").unwrap();
+        assert!(!project_config_is_trusted_in_workspace(&paths, &workspace));
+        assert!(count() > settled, "an edited config forces the full check");
     }
 
     #[test]

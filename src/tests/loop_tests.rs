@@ -206,6 +206,7 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
     );
     let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
     let slash = SlashState {
+        custom_commands: Default::default(),
         show_reasoning: false,
         reasoning_enabled: false,
         todo_tools_enabled: false,
@@ -398,6 +399,7 @@ async fn a_goal_paused_during_verification_is_not_overwritten_by_its_result() {
     );
     let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
     let slash = SlashState {
+        custom_commands: Default::default(),
         show_reasoning: false,
         reasoning_enabled: false,
         todo_tools_enabled: false,
@@ -546,6 +548,7 @@ async fn goal_pause_cancels_the_running_verification() {
     );
     let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
     let slash = SlashState {
+        custom_commands: Default::default(),
         show_reasoning: false,
         reasoning_enabled: false,
         todo_tools_enabled: false,

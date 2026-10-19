@@ -3648,7 +3648,7 @@ async fn native_tui_frontend_control(
             let client = crate::provider::create_client(
                 "effort-tui",
                 cli.api_key.as_deref(),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap();
@@ -4158,7 +4158,7 @@ async fn native_steering79_case(stop_at_boundary: bool) {
     let client = crate::provider::create_client(
         "steer79",
         cli.api_key.as_deref(),
-        &cfg.custom_providers_map(),
+        cfg.custom_providers_map(),
         cfg.api_keys.as_ref(),
     )
     .unwrap();

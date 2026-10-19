@@ -99,11 +99,11 @@ fn current_models_resolve_context_and_pricing_offline() {
         let cfg = crate::config::Config::default();
         let quick_models = crate::config::quick_models_map(&cfg);
         assert_eq!(
-            cfg.known_context_window(provider, model, &quick_models),
+            cfg.known_context_window(provider, model, quick_models),
             Some(u64::from(context))
         );
         assert_eq!(
-            cfg.resolve_context_window(provider, model, &quick_models),
+            cfg.resolve_context_window(provider, model, quick_models),
             u64::from(context)
         );
         assert!(crate::config::Config::catalog_input_output_cost(provider, model).is_some());

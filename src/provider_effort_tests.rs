@@ -120,7 +120,7 @@ impl Wire {
         create_client(
             "effort-probe",
             Some("effort-fake-key"),
-            &config.custom_providers_map(),
+            config.custom_providers_map(),
             None,
         )
         .unwrap()

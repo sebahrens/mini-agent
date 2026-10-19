@@ -101,6 +101,7 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
             );
             let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
             let slash = SlashState {
+                custom_commands: Default::default(),
                 show_reasoning: false,
                 reasoning_enabled: false,
                 todo_tools_enabled: false,
@@ -624,6 +625,7 @@ async fn done_paints_the_final_tokens_before_the_agent_task_settles() {
     let mut renderer = crate::ui::renderer::Renderer::for_app_test().unwrap();
     let capture = renderer.capture_bytes();
     let slash = SlashState {
+        custom_commands: Default::default(),
         show_reasoning: false,
         reasoning_enabled: false,
         todo_tools_enabled: false,

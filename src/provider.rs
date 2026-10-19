@@ -592,7 +592,7 @@ impl AnyClient {
         let extras = passive_provider_request_params(
             &model,
             cfg,
-            cfg.resolve_extra_body(model_name, &crate::config::quick_models_map(cfg)),
+            cfg.resolve_extra_body(model_name, crate::config::quick_models_map(cfg)),
             session_id,
             1024,
         )?;
@@ -898,7 +898,7 @@ impl AnyClient {
             .and_then(|alias| quick.get(alias));
         let raw = alias
             .and_then(|entry| entry.extra_body.clone())
-            .or_else(|| cfg.resolve_extra_body(&request.model, &quick));
+            .or_else(|| cfg.resolve_extra_body(&request.model, quick));
         let options = TitleCompletionOptions {
             params: passive_provider_request_params(
                 &model,
@@ -6771,7 +6771,7 @@ mod session_title_completion_tests {
         let client = create_client(
             "title-wire",
             Some("unused-owned-fixture-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
         .unwrap();
@@ -6858,7 +6858,7 @@ mod session_title_completion_tests {
             let client = create_client(
                 "title-private",
                 Some("unused-owned-fixture-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap();
@@ -7017,7 +7017,7 @@ mod git_proposal_wire_tests {
         let client = create_client(
             "git32-wire",
             Some("unused-owned-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
         .unwrap();
@@ -7076,7 +7076,7 @@ mod git_proposal_wire_tests {
             let client = create_client(
                 "git32-wire",
                 Some("unused-owned-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap();

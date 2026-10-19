@@ -695,7 +695,7 @@ pub(crate) async fn ask_with_transcript_observed(
         match crate::provider::create_client(
             &resolved.provider,
             None,
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         ) {
             Ok(client) => {

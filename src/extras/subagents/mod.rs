@@ -148,7 +148,7 @@ pub(crate) fn resolve_config(
         match crate::provider::create_client(
             &sub_provider,
             api_key,
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         ) {
             Ok(c) => c,
@@ -434,7 +434,7 @@ mod tests {
         let main = crate::provider::create_client(
             "openrouter",
             Some("unused-test-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
         .unwrap();
@@ -469,7 +469,7 @@ mod settings127_tests {
         let client = crate::provider::create_client(
             "openrouter",
             Some("unused-test-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();
@@ -612,7 +612,7 @@ mod settings127_tests {
         let client = crate::provider::create_client(
             "openrouter",
             Some("unused-test-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();
@@ -643,7 +643,7 @@ mod settings127_tests {
         let main = crate::provider::create_client(
             "openrouter",
             Some("unused-test-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
         .unwrap();

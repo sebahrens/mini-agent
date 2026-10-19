@@ -433,7 +433,7 @@ fn resolve_model_pricing_with_source_from_listing(
     }
     let quick = {
         config::quick_models_map(cfg)
-            .into_iter()
+            .iter()
             .filter(|(_, quick)| quick.provider == provider && quick.model == model_id)
             // Multiple aliases for one raw id resolve deterministically.
             .min_by(|(a, _), (b, _)| a.cmp(b))
@@ -737,7 +737,7 @@ fn quick_price_notice(quick: &config::QuickModelConfig) -> String {
 
 async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str) -> anyhow::Result<()> {
     let qm = config::quick_models_map(ctx.cfg);
-    match resolve_model_target(arg, &qm) {
+    match resolve_model_target(arg, qm) {
         ModelTarget::Quick(name) => {
             let q = &qm[name];
             ctx.switch_client(&q.provider)?;
@@ -1000,7 +1000,7 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
             let new_client = crate::provider::create_client(
                 &q.provider,
                 ctx.cli.api_key.as_deref(),
-                &ctx.cfg.custom_providers_map(),
+                ctx.cfg.custom_providers_map(),
                 ctx.cfg.api_keys.as_ref(),
             )?;
             let model = new_client.completion_model_with_cache_ttl(
@@ -1361,6 +1361,7 @@ mod model_pricing_tests {
             cfg: &cfg,
             context: &mut context,
             workspace: &workspace,
+            custom_commands: &mut Default::default(),
             show_reasoning: &mut show_reasoning,
             reasoning_enabled: &mut reasoning_enabled,
             is_running: &mut is_running,

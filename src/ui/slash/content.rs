@@ -426,7 +426,7 @@ mod theme_selection_tests {
         let mut client = crate::provider::create_client(
             "anthropic",
             Some("unused-test-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
         .unwrap();
@@ -451,6 +451,7 @@ mod theme_selection_tests {
             cfg: &cfg,
             context: &mut context,
             workspace: &workspace,
+            custom_commands: &mut Default::default(),
             show_reasoning: &mut show_reasoning,
             reasoning_enabled: &mut reasoning_enabled,
             is_running: &mut is_running,

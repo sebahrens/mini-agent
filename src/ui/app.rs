@@ -150,6 +150,7 @@ pub(super) mod test_support {
             run: AgentRunState::default(),
             chain: ChainState::default(),
             slash: SlashState {
+                custom_commands: Default::default(),
                 show_reasoning: false,
                 reasoning_enabled: false,
                 todo_tools_enabled: false,
@@ -187,7 +188,6 @@ pub(super) mod test_support {
             user_rx,
             tui_log_rx: None,
             deferred_user_events: Default::default(),
-            custom_command_cache: Default::default(),
             #[cfg(feature = "subagents")]
             background_requests: Default::default(),
             running: Arc::new(AtomicBool::new(false)),
@@ -265,7 +265,7 @@ mod dot_command_tests {
             client: crate::provider::create_client(
                 "anthropic",
                 Some("unused-test-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -385,7 +385,7 @@ mod btw_pricing_tests {
             client: crate::provider::create_client(
                 "anthropic",
                 Some("unused-test-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -446,7 +446,7 @@ mod btw_pricing_tests {
             client: crate::provider::create_client(
                 "anthropic",
                 Some("unused-test-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -1337,7 +1337,6 @@ pub(crate) struct App<'a> {
     deferred_user_events: std::collections::VecDeque<UserEvent>,
     /// Custom slash templates for completion, re-read only when a template
     /// layer directory changed.
-    custom_command_cache: crate::context::commands::CommandCache,
     #[cfg(feature = "subagents")]
     background_requests: std::collections::VecDeque<crate::permission::ask::UserRequest>,
     running: Arc<AtomicBool>,
@@ -1475,7 +1474,7 @@ mod startup_work_tests {
             client: crate::provider::create_client(
                 "startup-fixture",
                 Some("unused-local-fixture-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -1549,7 +1548,7 @@ mod reasoning_display_tests {
         let client = crate::provider::create_client(
             "openrouter",
             Some("unused-test-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
         .unwrap();
@@ -1758,7 +1757,7 @@ impl<'a> App<'a> {
         if let Some(editor) = &ui.cfg.editor {
             input.set_editor(editor.clone());
         }
-        input.set_quick_model_names(config::quick_models_map(ui.cfg).into_keys().collect());
+        input.set_quick_model_names(config::quick_models_map(ui.cfg).keys().cloned().collect());
         {
             let mut providers: Vec<String> =
                 ["anthropic", "openai", "gemini", "openrouter", "ollama"]
@@ -1787,6 +1786,7 @@ impl<'a> App<'a> {
         };
         let chain = ChainState::default();
         let slash = SlashState {
+            custom_commands: Default::default(),
             show_reasoning: ui.cfg.resolve_show_reasoning(),
             reasoning_enabled: true,
             todo_tools_enabled: false,
@@ -2215,7 +2215,6 @@ impl<'a> App<'a> {
             user_rx,
             tui_log_rx: crate::logging::take_tui_diagnostics(),
             deferred_user_events: std::collections::VecDeque::new(),
-            custom_command_cache: Default::default(),
             #[cfg(feature = "subagents")]
             background_requests: Default::default(),
             running,
@@ -4030,7 +4029,10 @@ impl<'a> App<'a> {
             self.refresh_custom_commands();
         }
         #[cfg(any(feature = "mcp", feature = "subagents"))]
-        if key.code == KeyCode::Char('@') && !self.run.is_running {
+        if key.code == KeyCode::Char('@')
+            && !self.run.is_running
+            && crate::ui::input::mention_can_start_at(&self.input.buffer, self.input.cursor)
+        {
             self.refresh_custom_commands();
         }
 
@@ -6522,7 +6524,7 @@ impl<'a> App<'a> {
 
     fn refresh_custom_commands(&mut self) {
         let commands = crate::context::commands::load_cached(
-            &mut self.custom_command_cache,
+            &mut self.slash.custom_commands,
             &self.ui.workspace,
         )
         .into_iter()
@@ -6580,7 +6582,7 @@ impl<'a> App<'a> {
             };
         let reserve = self.ui.cfg.resolve_reserve_tokens(
             &self.ui.session.model,
-            &config::quick_models_map(self.ui.cfg),
+            config::quick_models_map(self.ui.cfg),
             self.ui.session.context_window,
         );
         if self
@@ -7247,7 +7249,7 @@ impl<'a> App<'a> {
             crate::provider::create_client(
                 &request.provider,
                 None,
-                &self.ui.cfg.custom_providers_map(),
+                self.ui.cfg.custom_providers_map(),
                 self.ui.cfg.api_keys.as_ref(),
             )
         };
@@ -8529,7 +8531,7 @@ mod interrupt_rewind_tests {
             client: crate::provider::create_client(
                 "openrouter",
                 Some("unused-test-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -8779,7 +8781,7 @@ mod interrupt_rewind_tests {
                 client: crate::provider::create_client(
                     "error-fixture",
                     Some("unused-test-key"),
-                    &cfg.custom_providers_map(),
+                    cfg.custom_providers_map(),
                     cfg.api_keys.as_ref(),
                 )
                 .unwrap(),
@@ -8926,7 +8928,7 @@ mod interrupt_rewind_tests {
                 client: crate::provider::create_client(
                     "openrouter",
                     Some("unused-test-key"),
-                    &cfg.custom_providers_map(),
+                    cfg.custom_providers_map(),
                     cfg.api_keys.as_ref(),
                 )
                 .unwrap(),
@@ -9108,7 +9110,7 @@ mod interrupt_rewind_tests {
                     client: crate::provider::create_client(
                         "openrouter",
                         Some("unused-test-key"),
-                        &cfg.custom_providers_map(),
+                        cfg.custom_providers_map(),
                         cfg.api_keys.as_ref(),
                     )
                     .unwrap(),
@@ -9216,7 +9218,7 @@ mod explicit_shell_persistence_tests {
             client: crate::provider::create_client(
                 "openrouter",
                 Some("unused-test-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -9544,7 +9546,7 @@ mod permission_loop_tests {
             client: crate::provider::create_client(
                 "permission-fixture",
                 Some("unused-local-fixture-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -11383,7 +11385,7 @@ mod mutation_consumer_tests {
             client: crate::provider::create_client(
                 "openrouter",
                 Some("unused-test-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -11551,7 +11553,7 @@ mod compaction_visibility_tests {
             client: crate::provider::create_client(
                 "local-test",
                 Some("unused-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -11686,7 +11688,7 @@ mod custom_command_tests {
             client: crate::provider::create_client(
                 "local-test",
                 Some("unused-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -11864,7 +11866,7 @@ mod workspace_session_picker_tests {
             crate::provider::create_client(
                 "anthropic",
                 Some("unused-local-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -12173,7 +12175,7 @@ mod workspace_session_picker_tests {
                         let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&repository).unwrap());
                         let mut session = Session::new("owned116", "unused-model", 128_000, repository.to_str().unwrap());
                         let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
-                        let client = crate::provider::create_client("owned116", Some("unused-local-key"), &cfg.custom_providers_map(), cfg.api_keys.as_ref()).unwrap();
+                        let client = crate::provider::create_client("owned116", Some("unused-local-key"), cfg.custom_providers_map(), cfg.api_keys.as_ref()).unwrap();
                         let ui = UiContext::new(&cli, &cfg, &mut session, &mut context, workspace.clone(), client, None, None, crate::sandbox::Sandbox::new(false,"none").with_workspace_binding(workspace), None);
                         let mut app = fixture_app(ui);
                         app.deferred_user_events.extend([
@@ -12493,7 +12495,7 @@ mod usd_budget_app_tests {
                 client: crate::provider::create_client(
                     "local-test",
                     Some("unused-key"),
-                    &cfg.custom_providers_map(),
+                    cfg.custom_providers_map(),
                     None,
                 )
                 .unwrap(),
@@ -12598,7 +12600,7 @@ mod usd_budget_app_tests {
             client: crate::provider::create_client(
                 "local-test",
                 Some("unused-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -12690,7 +12692,7 @@ mod git_command_consumer_tests {
             crate::provider::create_client(
                 "git32-fixture",
                 Some("unused-local-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -12910,7 +12912,7 @@ mod git_command_consumer_tests {
             crate::provider::create_client(
                 "git32-wire",
                 Some("unused-owned-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -12984,7 +12986,7 @@ mod git_command_consumer_tests {
             crate::provider::create_client(
                 "git32-wire",
                 Some("unused-owned-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -13140,7 +13142,7 @@ mod git_command_consumer_tests {
             crate::provider::create_client(
                 "git32-wire",
                 Some("unused-owned-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -13497,7 +13499,7 @@ mod context_diagnostic_tests {
             client: crate::provider::create_client(
                 "context-local-test",
                 Some("owned-unused-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),
@@ -13819,7 +13821,7 @@ mod git_confirmation_stack_tests {
                         let client = crate::provider::create_client(
                             "git32-fixture",
                             Some("unused-local-key"),
-                            &cfg.custom_providers_map(),
+                            cfg.custom_providers_map(),
                             cfg.api_keys.as_ref(),
                         )
                         .unwrap();
@@ -14203,7 +14205,7 @@ mod plan_approval_tests {
         let client = crate::provider::create_client(
             "plan80",
             Some("unused-local-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
         .unwrap();
@@ -18417,7 +18419,7 @@ mod config_editor68_tests {
                 let mut context=crate::context::load(true).for_workspace_binding(true,&workspace);
                 let mut session=Session::new("editor68","test-model",128_000,root.path().to_str().unwrap());
                 let before=serde_json::to_vec(&session).unwrap();
-                let ui=UiContext {cli:&cli,cfg:&cfg,session:&mut session,native_startup:None,native_ticket: None, #[cfg(feature = "hooks")] pending_session_start_context: None,context:&mut context,workspace,client:crate::provider::create_client("editor68",Some("unused"),&cfg.custom_providers_map(),None).unwrap(),permission:None,ask_tx:None,sandbox:crate::sandbox::Sandbox::new(false,"none"),prebuild_invalidated:Arc::new(AtomicBool::new(false)),status_signals:None,
+                let ui=UiContext {cli:&cli,cfg:&cfg,session:&mut session,native_startup:None,native_ticket: None, #[cfg(feature = "hooks")] pending_session_start_context: None,context:&mut context,workspace,client:crate::provider::create_client("editor68",Some("unused"),cfg.custom_providers_map(),None).unwrap(),permission:None,ask_tx:None,sandbox:crate::sandbox::Sandbox::new(false,"none"),prebuild_invalidated:Arc::new(AtomicBool::new(false)),status_signals:None,
                     #[cfg(feature="skills")] skill_services:Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
                     #[cfg(feature="mcp")] mcp_manager:None,
                 };

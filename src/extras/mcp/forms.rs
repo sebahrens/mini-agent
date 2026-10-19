@@ -32,6 +32,16 @@ impl RawForms {
         if !may_name_form_method(bytes) {
             return;
         }
+        // Too large to carry a form: scan only its header (same path as long
+        // stdio lines) instead of serde-lexing the whole body.
+        if bytes.len() > MAX_BYTES {
+            let mut scan = HeaderScan::default();
+            scan.feed(bytes);
+            self.observe_scanned(scan);
+            return;
+        }
+        #[cfg(test)]
+        FULL_HEADER_LEXES.with(|n| n.set(n.get() + 1));
         // Ignored params/result fields are scanned without allocating their
         // values. Oversized forms get a rejected record before typed decoding;
         // ordinary large tool responses need no second materialized JSON tree.
@@ -95,6 +105,12 @@ impl RawForms {
             .remove(&serde_json::to_value(id).ok()?.to_string())
             .flatten()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// serde header lexes of small messages on this thread (test seam).
+    static FULL_HEADER_LEXES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether `bytes` can contain a JSON string that decodes to
@@ -1025,6 +1041,23 @@ mod tests {
         records.observe(&serde_json::to_vec(&fresh).unwrap());
         let fresh_id = serde_json::from_value(serde_json::json!("fresh")).unwrap();
         assert!(records.take(&fresh_id).is_some());
+    }
+    #[test]
+    fn large_escaped_bodies_skip_the_serde_lex_and_small_forms_still_record() {
+        let records = RawForms::default();
+        let before = FULL_HEADER_LEXES.with(std::cell::Cell::get);
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":"big","result":{{"text":"\u001b[0m {}"}}}}"#,
+            "x".repeat(1024 * 1024)
+        );
+        records.observe(body.as_bytes());
+        assert_eq!(FULL_HEADER_LEXES.with(std::cell::Cell::get), before);
+        let valid = serde_json::json!({"jsonrpc":"2.0","id":"small","method":"elicitation/create","params":{"message":"Public data","requestedSchema":{"type":"object","properties":{"value":{"type":"string"}}}}});
+        records.observe(&serde_json::to_vec(&valid).unwrap());
+        assert_eq!(FULL_HEADER_LEXES.with(std::cell::Cell::get), before + 1);
+        let id: rmcp::model::RequestId =
+            serde_json::from_value(serde_json::json!("small")).unwrap();
+        assert!(records.take(&id).is_some());
     }
     #[test]
     fn method_prefilter_still_sees_escaped_method_names() {
