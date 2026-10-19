@@ -2,6 +2,33 @@ use super::*;
 use crate::ui::app::test_support::fixture_app;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+/// True when descriptor `fd` is still a socket bound to `address`. A
+/// closed descriptor, or one a parallel test reused for something else,
+/// is not: unlike re-binding the released ephemeral port, this cannot be
+/// defeated by another test taking the port.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn fd_is_socket_bound_to(fd: std::os::fd::RawFd, address: std::net::SocketAddr) -> bool {
+    // SAFETY: getsockname only fills a local buffer for the integer fd; it
+    // never owns, closes or mutates the descriptor.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockname(
+            fd,
+            std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr>(),
+            &mut length,
+        )
+    };
+    if status != 0 || libc::c_int::from(storage.ss_family) != libc::AF_INET {
+        return false;
+    }
+    // SAFETY: AF_INET storage is a sockaddr_in.
+    let inet = unsafe { &*std::ptr::addr_of!(storage).cast::<libc::sockaddr_in>() };
+    u16::from_be(inet.sin_port) == address.port()
+        && std::net::Ipv4Addr::from(u32::from_be(inet.sin_addr.s_addr)) == address.ip()
+}
+
 /// Every request, including an unintended provider request, goes to this
 /// owned loopback server. The listener and all accepted sockets are joined.
 struct Server {
@@ -14,6 +41,8 @@ struct Server {
     changed: Arc<tokio::sync::Notify>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(unix)]
+    listener_fd: std::os::fd::RawFd,
     accepted: Arc<std::sync::atomic::AtomicUsize>,
     reject_initialization: Arc<std::sync::atomic::AtomicBool>,
     redirect_to: Arc<std::sync::Mutex<Option<String>>>,
@@ -25,6 +54,8 @@ impl Server {
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
+        #[cfg(unix)]
+        let listener_fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
         let catalogue_count = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let counted_catalogue = catalogue_count.clone();
         let provider_streams = Arc::new(std::sync::Mutex::new(
@@ -162,6 +193,8 @@ impl Server {
         });
         Self {
             address,
+            #[cfg(unix)]
+            listener_fd,
             provider_streams,
             catalogue_count,
             anthropic_prefix,
@@ -221,6 +254,12 @@ impl Server {
             .await
             .unwrap()
             .unwrap();
+        #[cfg(unix)]
+        assert!(
+            !fd_is_socket_bound_to(self.listener_fd, self.address),
+            "server listener must be released"
+        );
+        #[cfg(not(unix))]
         assert!(tokio::net::TcpListener::bind(self.address).await.is_ok());
     }
 }
