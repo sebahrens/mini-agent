@@ -576,7 +576,7 @@ pub fn sanitize_delta(text: &str) -> Sanitized {
 
 /// Whether [`sanitize`] would return `text` unchanged: it holds no character
 /// other than `\n` that [`needs_terminal_sanitizing`] flags.
-fn is_terminal_clean(text: &str) -> bool {
+pub(crate) fn is_terminal_clean(text: &str) -> bool {
     // Printable ASCII and `\n` are always kept; only other bytes need the
     // per-char check.
     text.bytes()

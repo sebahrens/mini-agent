@@ -5075,7 +5075,6 @@ impl<'a> App<'a> {
         // Runs on every event-loop iteration while Git work is pending:
         // repaint only when an observation actually landed in the feed.
         if placed {
-            self.renderer.invalidate();
             self.renderer.render_viewport()?;
         }
         Ok(())
@@ -7094,7 +7093,6 @@ impl<'a> App<'a> {
                             sanitize_output(&tail),
                         )
                     {
-                        self.renderer.invalidate();
                         self.renderer.render_viewport()?;
                     }
                 }
