@@ -127,6 +127,24 @@ struct Scan {
     summary: LedgerSummary,
 }
 
+/// A flush scan plus the file state it describes. A later flush reuses it only
+/// when the file still has this identity, length and modification time under
+/// the writer lock; rows appended by other processes since are scanned from the
+/// cached length, and anything else is rescanned in full.
+struct FlushCache {
+    identity: LedgerIdentity,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    scan: Scan,
+}
+impl std::fmt::Debug for FlushCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlushCache")
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Owns the acquired OS lock independently of descriptor close. A concurrent
 /// fork can retain the open-file description until exec, despite CLOEXEC.
 struct LockedLedgerFile {
@@ -175,6 +193,10 @@ pub(crate) struct Ledger {
     path: PathBuf,
     directory: Mutex<Option<Arc<crate::paths::WorkspaceBinding>>>,
     io: Mutex<()>,
+    /// The flush scan this process last left behind, valid only for the exact
+    /// file identity, length and modification time it was taken at. Read and
+    /// replaced under the writer lock only.
+    flush_cache: Mutex<Option<FlushCache>>,
     #[cfg(test)]
     pre_sync_gate: Option<Arc<PreSyncGate>>,
     #[cfg(test)]
@@ -247,6 +269,7 @@ impl Ledger {
             path: state_dir.join("usage.jsonl"),
             directory: Mutex::new(None),
             io: Mutex::new(()),
+            flush_cache: Mutex::new(None),
             #[cfg(test)]
             pre_sync_gate: PRE_SYNC_GATE.try_with(Clone::clone).ok(),
             #[cfg(test)]
@@ -546,6 +569,32 @@ impl Ledger {
             }
         }
     }
+    /// The ledger's current flush scan, under the writer lock. The cache is
+    /// taken, so any failure before `flush_rows` stores it again leaves none.
+    fn flush_scan(&self, file: &mut File) -> anyhow::Result<Scan> {
+        let cached = self
+            .flush_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(mut cache) = cached {
+            let metadata = file.metadata()?;
+            let length = metadata.len();
+            let same_file = LedgerIdentity::of(file).is_ok_and(|id| id == cache.identity);
+            if same_file && length == cache.length && metadata.modified().ok() == cache.modified {
+                return Ok(cache.scan);
+            }
+            if same_file && length > cache.length {
+                anyhow::ensure!(
+                    length <= MAX_LEDGER_BYTES as u64,
+                    "usage ledger exceeds byte limit"
+                );
+                scan_appended(file, &mut cache.scan, cache.length, length)?;
+                return Ok(cache.scan);
+            }
+        }
+        scan(file, None)
+    }
     fn flush_rows(&self, account: &Account, pending: &[Arc<Row>]) -> anyhow::Result<()> {
         let (file, binding) = self
             .open(true)?
@@ -555,7 +604,7 @@ impl Ledger {
         #[cfg(all(test, unix))]
         self.pause_lock_for_test(&file);
         Self::revalidate(&binding, &file)?;
-        let mut scanned = scan(&mut file, None)?;
+        let mut scanned = self.flush_scan(&mut file)?;
         // Validate the entire pending batch before appending any of it.
         let mut additions = Vec::new();
         for row in pending {
@@ -594,6 +643,20 @@ impl Ledger {
         file.sync_all()
             .map_err(|_| anyhow::anyhow!("usage ledger sync failed"))?;
         Self::revalidate(&binding, &file)?;
+        if let Ok(metadata) = file.metadata()
+            && metadata.len() == scanned.bytes as u64
+            && let Ok(identity) = LedgerIdentity::of(&file)
+        {
+            *self
+                .flush_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(FlushCache {
+                identity,
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+                scan: scanned,
+            });
+        }
         file.release()?;
         for row in pending {
             account.acknowledge(row.id);
@@ -621,6 +684,48 @@ enum ScanMode {
 
 fn scan(file: &mut File, session_id: Option<&str>) -> anyhow::Result<Scan> {
     scan_with(file, session_id, ScanMode::Flush)
+}
+
+/// Extends a flush scan with the rows other processes appended in
+/// `[from, length)`, applying exactly the per-row checks of a full flush scan.
+fn scan_appended(
+    file: &mut File,
+    scanned: &mut Scan,
+    from: u64,
+    length: u64,
+) -> anyhow::Result<()> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::new();
+    (&mut *file).take(length - from).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.last() == Some(&b'\n'),
+        "usage ledger has an incomplete tail"
+    );
+    anyhow::ensure!(
+        scanned.bytes as u64 == from,
+        "usage ledger scan is out of step"
+    );
+    scanned.bytes += bytes.len();
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        scanned.records += 1;
+        anyhow::ensure!(
+            scanned.records <= MAX_LEDGER_RECORDS && line.len() <= MAX_ROW_BYTES && line.len() > 1,
+            "usage ledger record exceeds limits"
+        );
+        let row: Row = serde_json::from_slice(&line[..line.len() - 1])
+            .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
+        row.validate()
+            .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
+        #[cfg(test)]
+        FLUSH_ROWS_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
+        let fingerprint = Sha256::digest(serde_json::to_vec(&row)?).into();
+        anyhow::ensure!(
+            scanned.identities.insert(row.id, fingerprint).is_none(),
+            "usage ledger contains duplicate receipts"
+        );
+        scanned.summary.all_time.add(&row)?;
+    }
+    Ok(())
 }
 
 fn scan_with(file: &mut File, session_id: Option<&str>, mode: ScanMode) -> anyhow::Result<Scan> {
@@ -659,6 +764,8 @@ fn scan_with(file: &mut File, session_id: Option<&str>, mode: ScanMode) -> anyho
             .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
         row.validate()
             .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
+        #[cfg(test)]
+        FLUSH_ROWS_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
         if mode == ScanMode::Flush {
             let fingerprint = Sha256::digest(serde_json::to_vec(&row)?).into();
             anyhow::ensure!(
@@ -724,6 +831,12 @@ const MAX_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 /// Sessions tracked for a checkpoint. A ledger with more distinct sessions is
 /// still scanned exactly; it is simply not checkpointed.
 const MAX_CHECKPOINT_SESSIONS: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// Rows parsed by flush scans (full or appended-tail).
+    static FLUSH_ROWS_PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 thread_local! {
@@ -1371,6 +1484,87 @@ mod tests {
             .unwrap()
             .split_inclusive(|byte| *byte == b'\n')
             .count()
+    }
+
+    fn flush_rows_parsed() -> usize {
+        FLUSH_ROWS_PARSED.with(std::cell::Cell::get)
+    }
+
+    fn one_receipt(session: &str, input_tokens: u64) -> Receipt {
+        Receipt::new(
+            session,
+            "provider",
+            "model",
+            RequestKind::Turn,
+            UsageDelta {
+                input_tokens,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            PriceSnapshot::capture(Some((0.3, 1.7)), Default::default(), false),
+        )
+    }
+
+    fn flush_receipt(ledger: &Ledger, receipt: &Receipt) -> anyhow::Result<()> {
+        let account = Account::new(&receipt.row.session_id, None, 0.0).unwrap();
+        account.observe(receipt).unwrap();
+        ledger.flush(&account)
+    }
+
+    #[test]
+    fn repeated_flushes_do_not_reread_the_ledger_prefix() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-flush-cache");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        append_random_rows(&ledger, &mut rng, 60);
+        let before = flush_rows_parsed();
+        let first = one_receipt("a", 5);
+        flush_receipt(&ledger, &first).unwrap();
+        append_random_rows(&ledger, &mut rng, 20);
+        assert_eq!(flush_rows_parsed() - before, 0, "cached scan is reused");
+        assert_eq!(line_count(&ledger), 81);
+        // A flush of an already-recorded receipt is still a no-op.
+        flush_receipt(&ledger, &first).unwrap();
+        assert_eq!(line_count(&ledger), 81);
+
+        // Rows appended by another writer are scanned, and only those.
+        let other = Ledger::new(&state);
+        flush_receipt(&other, &one_receipt("b", 7)).unwrap();
+        flush_receipt(&other, &one_receipt("b", 8)).unwrap();
+        let before = flush_rows_parsed();
+        let second = one_receipt("a", 9);
+        flush_receipt(&ledger, &second).unwrap();
+        assert_eq!(flush_rows_parsed() - before, 2, "only external rows parsed");
+        assert_eq!(line_count(&ledger), 84);
+        assert_eq!(ledger.summary().unwrap().all_time.records, 84);
+
+        // A receipt re-using a recorded id with different content is rejected,
+        // both for a cached and for an externally appended row.
+        let mut conflicting = one_receipt("a", 11);
+        Arc::get_mut(&mut conflicting.row).unwrap().id = second.row.id;
+        assert!(flush_receipt(&ledger, &conflicting).is_err());
+        let external = one_receipt("b", 12);
+        flush_receipt(&other, &external).unwrap();
+        let mut conflicting = one_receipt("a", 13);
+        Arc::get_mut(&mut conflicting.row).unwrap().id = external.row.id;
+        assert!(flush_receipt(&ledger, &conflicting).is_err());
+        assert_eq!(line_count(&ledger), 85);
+
+        // Replacing the ledger file forces a full rescan.
+        let bytes = std::fs::read(&ledger.path).unwrap();
+        let shorter: Vec<u8> = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .take(10)
+            .flatten()
+            .copied()
+            .collect();
+        std::fs::write(&ledger.path, &shorter).unwrap();
+        let before = flush_rows_parsed();
+        flush_receipt(&ledger, &one_receipt("a", 14)).unwrap();
+        assert_eq!(flush_rows_parsed() - before, 10, "truncation rescans");
+        assert_eq!(line_count(&ledger), 11);
     }
 
     #[test]
