@@ -717,6 +717,90 @@ fn project_definitions_trusted(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> bool {
     crate::config::load::project_config_is_trusted_in_workspace(paths, workspace)
+        || persona_set_trusted(paths, workspace)
+}
+
+/// Project persona files and their content digest.
+pub(crate) struct PersonaSet {
+    pub(crate) digest: String,
+    /// Workspace-relative file names, sorted.
+    pub(crate) files: Vec<String>,
+}
+
+/// Digest over the sorted (relative path, content SHA-256) of every project
+/// persona file in the loader layers. Adding, editing, removing or renaming a
+/// file changes it; an unreadable layer or file yields `None` (never trusted).
+pub(crate) fn project_persona_set(
+    workspace: &crate::paths::WorkspaceBinding,
+) -> Option<PersonaSet> {
+    use sha2::{Digest, Sha256};
+    let mut entries = Vec::new();
+    for layer in PROJECT_AGENT_LAYERS {
+        match workspace.read_relative_definition_layer(
+            Path::new(layer),
+            "md",
+            MAX_AGENT_PROMPT_BYTES,
+            MAX_PROJECT_AGENT_ENTRIES,
+            MAX_PROJECT_AGENT_FILES,
+        ) {
+            Ok(definitions) => {
+                for (name, content) in definitions {
+                    let content = content.ok()?;
+                    entries.push((
+                        format!("{layer}/{name}.md"),
+                        crate::hex::encode_lower(Sha256::digest(content.as_bytes())),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(b"mini-agent-persona-trust-v1\0");
+    for (path, sha) in &entries {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(sha.as_bytes());
+        hasher.update([b'\n']);
+    }
+    Some(PersonaSet {
+        digest: crate::hex::encode_lower(hasher.finalize()),
+        files: entries.into_iter().map(|(path, _)| path).collect(),
+    })
+}
+
+fn persona_set_trusted(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> bool {
+    crate::config::load::persona_trust_matches(paths, workspace, || {
+        project_persona_set(workspace).map(|set| set.digest)
+    })
+}
+
+/// Whether project personas are currently trusted (config or content-bound).
+pub(crate) fn project_personas_trusted(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> bool {
+    project_definitions_trusted(paths, workspace)
+}
+
+/// TUI/stderr notice when project personas exist but are not trusted.
+pub(crate) fn untrusted_personas_notice(
+    workspace: &crate::paths::WorkspaceBinding,
+) -> Option<String> {
+    let paths = crate::paths::process_paths().ok()?;
+    let paths = paths.with_workspace_root(workspace.root()).ok()?;
+    if project_definitions_trusted(&paths, workspace) {
+        return None;
+    }
+    ignored_project_personas_notice(workspace)
 }
 
 fn merge_project_definitions(
@@ -1171,11 +1255,6 @@ fn load_uncached(
     #[cfg(test)]
     UNCACHED_LOADS.with(|loads| loads.set(loads.get() + 1));
     let mut agents = load_base(paths);
-    if !trusted && let Some(notice) = ignored_project_personas_notice(workspace) {
-        // Cache-miss only: an untrusted project's layers are not stamped, so this
-        // is emitted once per workspace and process, not per lookup.
-        tracing::warn!("{notice}");
-    }
     if trusted {
         for layer in PROJECT_AGENT_LAYERS {
             let definitions = workspace.read_relative_definition_layer(
@@ -1258,8 +1337,8 @@ pub(crate) fn ignored_project_personas_notice(
         .map(|more| format!(" (and {more} more)"))
         .unwrap_or_default();
     Some(format!(
-        "project personas ignored ({shown}{more}): this project is not trusted; project personas \
-         load only when the workspace's .zerostack/config.toml is approved at the interactive trust prompt"
+        "project personas ignored ({shown}{more}): this project is not trusted; start mini-agent \
+         interactively in this directory and answer y at the persona trust prompt (headless and ACP runs never trust)"
     ))
 }
 
@@ -2364,6 +2443,100 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn persona_digest_changes_on_edit_add_and_remove() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-persona-digest-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join(".mini-agent/agents")).unwrap();
+        let file = root.join(".mini-agent/agents/x.md");
+        std::fs::write(&file, "one").unwrap();
+        let digest = || {
+            let binding = crate::paths::WorkspaceBinding::capture(&root).unwrap();
+            project_persona_set(&binding).map(|set| set.digest)
+        };
+        let first = digest().unwrap();
+        assert_eq!(digest().unwrap(), first);
+        std::fs::write(&file, "two").unwrap();
+        let edited = digest().unwrap();
+        assert_ne!(edited, first);
+        std::fs::write(root.join(".mini-agent/agents/y.md"), "y").unwrap();
+        let added = digest().unwrap();
+        assert_ne!(added, edited);
+        std::fs::remove_file(root.join(".mini-agent/agents/y.md")).unwrap();
+        assert_eq!(digest().unwrap(), edited);
+        std::fs::remove_file(&file).unwrap();
+        assert!(digest().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn agents_only_project_trust_is_interactive_content_bound_and_per_workspace() {
+        let container = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mini-agent-persona-trust-{}", uuid::Uuid::new_v4()));
+        let root = container.join("project");
+        std::fs::create_dir_all(root.join(".mini-agent/agents")).unwrap();
+        let file = root.join(".mini-agent/agents/x.md");
+        std::fs::write(&file, "---\nmode: write\n---\nPERSONA").unwrap();
+        let paths = isolated_paths(&container);
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&root).unwrap();
+        let names = || available_names_for_paths_and_workspace(&paths, &binding);
+        let review = |interactive: bool, answer: bool| {
+            crate::config::load::review_project_personas(&paths, &binding, interactive, &|_| answer)
+        };
+
+        // Untrusted: inert, and headless/ACP (interactive == false) never trust.
+        assert!(!names().contains(&"x".to_string()));
+        assert!(!review(false, true), "headless must never record trust");
+        assert!(!names().contains(&"x".to_string()));
+        // A declined prompt leaves them inert with the notice available.
+        assert!(!review(true, false));
+        assert!(!names().contains(&"x".to_string()));
+        assert!(
+            ignored_project_personas_notice(&binding)
+                .unwrap()
+                .contains("(x)")
+        );
+
+        // Approved interactively: the personas load.
+        assert!(review(true, true));
+        assert!(names().contains(&"x".to_string()));
+        assert!(!review(true, true), "already trusted: no second prompt");
+
+        // Editing voids trust.
+        std::fs::write(&file, "---\nmode: write\n---\nCHANGED").unwrap();
+        assert!(!names().contains(&"x".to_string()));
+        // So does adding a file next to the approved one.
+        assert!(review(true, true));
+        assert!(names().contains(&"x".to_string()));
+        std::fs::write(root.join(".mini-agent/agents/z.md"), "z").unwrap();
+        assert!(!names().contains(&"x".to_string()));
+
+        // Another workspace with identical files does not inherit trust.
+        let other = container.join("other");
+        std::fs::create_dir_all(other.join(".mini-agent/agents")).unwrap();
+        std::fs::copy(&file, other.join(".mini-agent/agents/x.md")).unwrap();
+        std::fs::copy(
+            root.join(".mini-agent/agents/z.md"),
+            other.join(".mini-agent/agents/z.md"),
+        )
+        .unwrap();
+        let other_binding = crate::paths::WorkspaceBinding::capture(&other).unwrap();
+        assert!(
+            !available_names_for_paths_and_workspace(&paths, &other_binding)
+                .contains(&"x".to_string())
+        );
+
+        drop(binding);
+        drop(other_binding);
+        std::fs::remove_dir_all(container).unwrap();
+    }
+
+    #[test]
     fn agents_only_project_is_inert_and_names_ignored_personas() {
         let root =
             std::env::temp_dir().join(format!("mini-agent-agents-only-{}", uuid::Uuid::new_v4()));
@@ -2376,7 +2549,7 @@ pub(crate) mod tests {
         assert!(lookup_for_workspace("x", Some(&binding)).is_none());
         let notice = ignored_project_personas_notice(&binding).expect("notice");
         assert!(notice.contains("(x)"), "{notice}");
-        assert!(notice.contains(".zerostack/config.toml"), "{notice}");
+        assert!(notice.contains("persona trust prompt"), "{notice}");
         assert!(!notice.contains("PERSONA_BODY"));
 
         let empty =

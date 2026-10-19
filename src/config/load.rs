@@ -242,6 +242,17 @@ struct ProjectConfigTrustStore {
     schema: u32,
     #[serde(default)]
     bindings: Vec<ProjectConfigTrustBinding>,
+    /// Content-bound approvals of a project's persona files, independent of
+    /// any project config (mini-agent-83ioo).
+    #[serde(default)]
+    persona_bindings: Vec<PersonaTrustBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersonaTrustBinding {
+    canonical_project: String,
+    /// Digest over the sorted (relative path, content SHA-256) of every persona file.
+    personas_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -784,6 +795,12 @@ pub(crate) fn load_in_workspace(
     workspace
         .validate()
         .unwrap_or_else(|_| fatal_config_load("error: startup workspace changed".into()));
+    review_project_personas(
+        paths,
+        workspace,
+        interactive,
+        &confirm_project_persona_trust,
+    );
     result
 }
 
@@ -1686,6 +1703,119 @@ fn clamped_retry_warnings(
         .collect()
 }
 
+fn confirm_project_persona_trust(description: &str) -> bool {
+    let mut input = String::new();
+    eprint!("{description}\nTrust exactly these persona files for this project? [y/N] ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn persona_project_key(workspace: &crate::paths::WorkspaceBinding) -> Option<String> {
+    workspace
+        .root()
+        .canonicalize()
+        .ok()?
+        .to_str()
+        .map(str::to_string)
+}
+
+/// Whether the private trust store holds an approval for this workspace whose
+/// digest equals the persona files' current content digest. The digest is
+/// computed only when the store has an entry for the project, and any
+/// unreadable store, link or workspace change is untrusted.
+pub(crate) fn persona_trust_matches(
+    paths: &AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    digest: impl FnOnce() -> Option<String>,
+) -> bool {
+    let Some(project) = persona_project_key(workspace) else {
+        return false;
+    };
+    let Ok(store) = load_project_config_trust_readonly_cached(&paths.project_config_trust_file())
+    else {
+        return false;
+    };
+    if !store
+        .persona_bindings
+        .iter()
+        .any(|binding| binding.canonical_project == project)
+    {
+        return false;
+    }
+    let Some(digest) = digest() else {
+        return false;
+    };
+    workspace.validate().is_ok()
+        && store.persona_bindings.contains(&PersonaTrustBinding {
+            canonical_project: project,
+            personas_sha256: digest,
+        })
+}
+
+/// Records approval of `digest` for `workspace`, replacing any earlier one.
+pub(crate) fn record_persona_trust(
+    paths: &AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    digest: &str,
+) -> Result<(), String> {
+    let project = persona_project_key(workspace)
+        .ok_or_else(|| "project path is not available (values omitted)".to_string())?;
+    let trust_file = paths.project_config_trust_file();
+    let mut store = load_project_config_trust(&trust_file).map_err(|error| error.to_string())?;
+    store
+        .persona_bindings
+        .retain(|binding| binding.canonical_project != project);
+    store.persona_bindings.push(PersonaTrustBinding {
+        canonical_project: project,
+        personas_sha256: digest.to_string(),
+    });
+    if let Some(parent) = trust_file.parent() {
+        crate::fs::ensure_private_directory(parent).map_err(|error| error.to_string())?;
+    }
+    save_project_config_trust(&trust_file, &store).map_err(|error| error.to_string())
+}
+
+/// Interactive-only review of untrusted project persona files. Headless, ACP
+/// and loop runs pass `interactive == false` and never prompt or record.
+/// Returns whether trust was newly recorded.
+pub(crate) fn review_project_personas(
+    paths: &AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    interactive: bool,
+    confirm: &dyn Fn(&str) -> bool,
+) -> bool {
+    if !interactive || crate::context::agents::project_personas_trusted(paths, workspace) {
+        return false;
+    }
+    let Some(set) = crate::context::agents::project_persona_set(workspace) else {
+        return false;
+    };
+    let description = format!(
+        "Project persona files can change agent prompts and tool use.\nProject: {}\nFiles: {}\nPersona digest: {}",
+        workspace.root().display(),
+        set.files.join(", "),
+        set.digest
+    );
+    if !confirm(&description) {
+        return false;
+    }
+    // Re-digest after approval: a file edited during the prompt voids it.
+    match crate::context::agents::project_persona_set(workspace) {
+        Some(again) if again.digest == set.digest => {}
+        _ => return false,
+    }
+    match record_persona_trust(paths, workspace, &set.digest) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!("project personas: trust could not be persisted privately: {error}");
+            false
+        }
+    }
+}
+
 fn confirm_project_config_trust(description: &str) -> bool {
     let mut input = String::new();
     eprint!("{description}\nTrust these settings for this exact project config? [y/N] ");
@@ -1936,7 +2066,6 @@ fn read_project_config(path: &Path) -> io::Result<(String, ProjectConfigTrustBin
     read_project_config_in_workspace(&workspace, &relative)
 }
 
-#[cfg(any(test, feature = "mcp"))]
 fn load_project_config_trust(path: &Path) -> std::io::Result<ProjectConfigTrustStore> {
     load_project_config_trust_mode(path, true)
 }
@@ -1951,6 +2080,7 @@ fn load_project_config_trust_mode(
             return Ok(ProjectConfigTrustStore {
                 schema: PROJECT_CONFIG_TRUST_SCHEMA,
                 bindings: Vec::new(),
+                persona_bindings: Vec::new(),
             });
         }
         Err(error) => return Err(error),
@@ -1961,6 +2091,7 @@ fn load_project_config_trust_mode(
         return Ok(ProjectConfigTrustStore {
             schema: PROJECT_CONFIG_TRUST_SCHEMA,
             bindings: Vec::new(),
+            persona_bindings: Vec::new(),
         });
     }
     Ok(store)
@@ -4160,6 +4291,7 @@ mod project_config_trust_tests {
             &ProjectConfigTrustStore {
                 schema: PROJECT_CONFIG_TRUST_SCHEMA + 1,
                 bindings: Vec::new(),
+                persona_bindings: Vec::new(),
             },
         )
         .unwrap();
