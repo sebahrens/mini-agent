@@ -1301,6 +1301,29 @@ mod tests {
     }
 
     #[test]
+    fn an_untrusted_project_persona_gate_parks_in_round_one_naming_the_action() {
+        let g = goal();
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Blocked)),
+            user_gate: Some(
+                "trust this project's configuration (or install the persona in your global agents directory)"
+                    .into(),
+            ),
+            ..RoundSummary::completed()
+        };
+        match decided(&g, &round) {
+            GateDecision::Stop { status, reason, .. } => {
+                assert_eq!(status, GoalStatus::Blocked);
+                assert!(
+                    reason.contains("trust this project's configuration"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected an immediate blocked stop, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_free_text_blocker_keeps_the_retry_nudge_and_never_suggests_config_changes() {
         let g = goal();
         let round = RoundSummary {

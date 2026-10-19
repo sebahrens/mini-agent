@@ -613,6 +613,14 @@ fn resolve_specialization(
     let Some(definition) = crate::context::agents::lookup_for_workspace(agent_type, workspace)
     else {
         let valid = crate::context::agents::available_names_for_workspace(workspace).join(", ");
+        if crate::context::agents::untrusted_project_persona_exists(agent_type, workspace) {
+            return Err(crate::agent::tools::requires_user_configuration(
+                "trust this project's configuration (or install the persona in your global agents directory)",
+                &format!(
+                    "task: agent_type '{agent_type}' is defined only by a project persona that is ignored until the project config is trusted; valid types: {valid}"
+                ),
+            ));
+        }
         return Err(ToolError::Msg(format!(
             "task: unknown agent_type '{agent_type}'; valid types: {valid}"
         )));
@@ -3403,6 +3411,22 @@ mod tests {
 
         assert!(resolve_specialization(Some("review"), Some(&first_binding)).is_err());
         assert!(resolve_specialization(Some("review"), Some(&second_binding)).is_err());
+        // The refusal is a user-only gate: trusting the project lifts it.
+        let gated = resolve_specialization(Some("review"), Some(&first_binding))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            crate::agent::tools::user_gated_setting(&gated)
+                .is_some_and(|setting| setting.starts_with("trust this project's configuration")),
+            "{gated}"
+        );
+        // A genuinely unknown name stays an ordinary error.
+        let unknown = resolve_specialization(Some("nonexistent"), Some(&first_binding))
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(crate::agent::tools::user_gated_setting(&unknown), None);
 
         drop(first_binding);
         drop(second_binding);

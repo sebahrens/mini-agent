@@ -1305,6 +1305,29 @@ pub(crate) fn lookup_for_workspace(
     }
 }
 
+/// Whether `name` is defined only by a project persona file that is ignored
+/// because the project config is not trusted. Reads no persona contents.
+#[cfg(feature = "subagents")]
+pub(crate) fn untrusted_project_persona_exists(
+    name: &str,
+    workspace: Option<&crate::paths::WorkspaceBinding>,
+) -> bool {
+    let (Some(workspace), true) = (workspace, valid_agent_name(name)) else {
+        return false;
+    };
+    let Ok(paths) = crate::paths::process_paths() else {
+        return false;
+    };
+    let trusted = paths
+        .with_workspace_root(workspace.root())
+        .map(|paths| project_definitions_trusted(&paths, workspace))
+        .unwrap_or(false);
+    !trusted
+        && PROJECT_AGENT_LAYERS.into_iter().any(|layer| {
+            workspace.has_relative_regular_file(&Path::new(layer).join(format!("{name}.md")))
+        })
+}
+
 /// Describe the highest-precedence file that may define `name` without
 /// reading or parsing any persona contents. Permission prompts use this before
 /// a task delegation is authorized; full definition loading happens only
