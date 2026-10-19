@@ -1810,19 +1810,31 @@ fn path_scope_contains(prefix: &str, target: &str) -> bool {
 pub(crate) fn resolve_program_identity(
     program: &str,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
-    resolve_program_identity_inner(program, None)
+    resolve_program_identity_inner(program, None, true)
 }
 
 pub(crate) fn resolve_program_identity_controlled(
     program: &str,
     control: &ExecutablePreparationControl,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
-    resolve_program_identity_inner(program, Some(control))
+    resolve_program_identity_inner(program, Some(control), true)
+}
+
+/// Resolves the executable's path and platform identity without reading its content. Only
+/// for callers that immediately hash the same file through a sealed snapshot and replace the
+/// placeholder digest via `with_content` (Linux immutable-snapshot spawn).
+#[cfg(target_os = "linux")]
+pub(crate) fn resolve_program_identity_unhashed_controlled(
+    program: &str,
+    control: &ExecutablePreparationControl,
+) -> Result<SpawnExecutableIdentity, EffectServiceError> {
+    resolve_program_identity_inner(program, Some(control), false)
 }
 
 fn resolve_program_identity_inner(
     program: &str,
     control: Option<&ExecutablePreparationControl>,
+    hash_content: bool,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
     executable_identity_checkpoint(control)?;
     let source = Path::new(program);
@@ -1891,13 +1903,20 @@ fn resolve_program_identity_inner(
         #[cfg(not(any(unix, windows)))]
         let platform =
             platform_executable_identity(&metadata).ok_or(EffectServiceError::InvalidTarget)?;
-        let content = match control {
-            Some(control) => {
-                copy_and_hash_executable_controlled(&mut file, &mut std::io::sink(), control)
+        let content = if hash_content {
+            match control {
+                Some(control) => {
+                    copy_and_hash_executable_controlled(&mut file, &mut std::io::sink(), control)
+                }
+                None => copy_and_hash_executable(&mut file, &mut std::io::sink()),
             }
-            None => copy_and_hash_executable(&mut file, &mut std::io::sink()),
-        }
-        .map_err(executable_copy_service_error)?;
+            .map_err(executable_copy_service_error)?
+        } else {
+            ExecutableContent {
+                sha256: String::new(),
+                bytes: 0,
+            }
+        };
         return Ok(SpawnExecutableIdentity {
             canonical_path,
             platform,
