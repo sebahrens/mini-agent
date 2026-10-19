@@ -35,6 +35,8 @@ pub struct RoundCollector {
     input_tokens: u64,
     output_tokens: u64,
     failure: Option<String>,
+    /// Setting named by a tool refusal only the user can lift this round.
+    user_gate: Option<String>,
     /// Wall time the agent was actually working, excluding any stretch spent
     /// waiting on a permission prompt. A user at lunch must not consume a
     /// goal's time budget.
@@ -85,6 +87,15 @@ impl RoundCollector {
             }
             AgentEvent::Error { message, .. } => {
                 self.failure = Some(message.to_string());
+            }
+            AgentEvent::ToolResult {
+                output,
+                is_error: true,
+                ..
+            } => {
+                if let Some(setting) = crate::agent::tools::user_gated_setting(output) {
+                    self.user_gate = Some(setting.to_string());
+                }
             }
             _ => {}
         }
@@ -166,6 +177,7 @@ impl RoundCollector {
             open_todos,
             tokens_used: self.input_tokens + self.output_tokens,
             active: self.active,
+            user_gate: self.user_gate.take(),
         }
     }
 }
@@ -461,6 +473,37 @@ mod tests {
             name: CompactString::new(name),
             args: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn the_collector_carries_a_user_gated_refusal_into_the_round_summary() {
+        let mut collector = RoundCollector::new();
+        let refusal = crate::agent::tools::requires_user_configuration(
+            "[subagents] allow_write = true",
+            "task: write personas require [subagents] allow_write = true",
+        );
+        let event = |output: String, is_error: bool| AgentEvent::ToolResult {
+            id: CompactString::new("1"),
+            name: CompactString::new("task"),
+            output: CompactString::new(output),
+            images: Vec::new(),
+            is_error,
+        };
+        // A non-error result mentioning the marker, and an ordinary error,
+        // must not count.
+        collector.observe(&event(refusal.to_string(), false));
+        collector.observe(&event("task: unknown agent_type".into(), true));
+        let g = goal();
+        assert_eq!(
+            collector.clone().finish(&g, RoundEnd::Done, 0).user_gate,
+            None
+        );
+        collector.observe(&event(refusal.to_string(), true));
+        let summary = collector.finish(&g, RoundEnd::Done, 0);
+        assert_eq!(
+            summary.user_gate.as_deref(),
+            Some("[subagents] allow_write = true")
+        );
     }
 
     #[test]
@@ -1693,13 +1736,37 @@ pub fn summary_from_headless_turn(
 
     let mut tool_calls = 0u32;
     let mut mutating_tool_calls = 0u32;
+    let mut task_call_ids = std::collections::HashSet::new();
+    let mut user_gate = None;
     for message in interactions {
+        // Only a refusal returned by the `task` tool itself counts: a file or
+        // command output that merely quotes the marker must not park a goal.
+        if let Message::User { content } = message {
+            for item in content.iter() {
+                if let rig::message::UserContent::ToolResult(result) = item
+                    && task_call_ids.contains(result.id.as_str())
+                {
+                    for part in result.content.iter() {
+                        if let rig::message::ToolResultContent::Text(text) = part
+                            && let Some(setting) =
+                                crate::agent::tools::user_gated_setting(&text.text)
+                        {
+                            user_gate = Some(setting.to_string());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         let Message::Assistant { content, .. } = message else {
             continue;
         };
         for item in content.iter() {
             if let AssistantContent::ToolCall(call) = item {
                 tool_calls += 1;
+                if call.function.name == "task" {
+                    task_call_ids.insert(call.id.clone());
+                }
                 if crate::agent::runner::tool_may_mutate_workspace(&call.function.name) {
                     mutating_tool_calls += 1;
                 }
@@ -1738,6 +1805,7 @@ pub fn summary_from_headless_turn(
             .input_tokens
             .saturating_add(cost.usage.output_tokens),
         active: cost.active,
+        user_gate,
     }
 }
 
