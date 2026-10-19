@@ -1373,7 +1373,11 @@ impl PermissionChecker {
         tracing::debug!("perm check path: tool={}, path={}", tool, path);
         let expanded = crate::fs::expand_tilde(path);
         let unresolved_abs_path = resolve_absolute(&expanded, &self.working_dir);
-        let abs_path = resolve_path_allow_missing(Path::new(&unresolved_abs_path))
+        // Resolve the live path once and share it with the external-directory
+        // checks; each resolution lstat-walks every component.
+        let resolved = resolve_path_allow_missing(Path::new(&unresolved_abs_path));
+        let abs_path = resolved
+            .clone()
             .unwrap_or_else(|| normalize_path(Path::new(&unresolved_abs_path)))
             .to_string_lossy()
             .into_owned();
@@ -1383,11 +1387,23 @@ impl PermissionChecker {
         // Resolve `..` only after following existing symlink components. A
         // lexical rewrite of `link/../target` can otherwise change the path's
         // real subject before the external-workspace decision.
-        let external = self.is_external_path(&unresolved_abs_path);
-        let external_action = if external {
-            self.match_ext_dir(&unresolved_abs_path)
+        let (external, external_action) = if Path::new(&unresolved_abs_path).is_absolute() {
+            let external = self.is_external_resolved(resolved.as_deref());
+            let action = if external {
+                self.match_ext_dir_resolved(resolved.as_deref())
+            } else {
+                None
+            };
+            (external, action)
         } else {
-            None
+            // A relative working directory is re-anchored by the helpers.
+            let external = self.is_external_path(&unresolved_abs_path);
+            let action = if external {
+                self.match_ext_dir(&unresolved_abs_path)
+            } else {
+                None
+            };
+            (external, action)
         };
         self.check_pre_resolved_path(
             tool,
@@ -1396,6 +1412,25 @@ impl PermissionChecker {
             external,
             external_action,
         )
+    }
+
+    /// Check a path the caller has just canonicalized (absolute, symlink-free).
+    /// Resolution is idempotent on such a path, so the live lstat walk of
+    /// [`Self::check_path`] is skipped; a non-absolute input falls back to it.
+    pub(crate) fn check_canonical_resolved_path(&mut self, tool: &str, path: &str) -> CheckResult {
+        let resolved = Path::new(path);
+        if !resolved.is_absolute() {
+            return self.check_path(tool, path);
+        }
+        let tool = canonical_permission_tool(tool);
+        tracing::debug!("perm check canonical path: tool={}, path={}", tool, path);
+        let external = self.is_external_resolved(Some(resolved));
+        let external_action = if external {
+            self.match_ext_dir_resolved(Some(resolved))
+        } else {
+            None
+        };
+        self.check_pre_resolved_path(tool, path, path, external, external_action)
     }
 
     /// Check a canonical permission key bound by the caller to an already-open
@@ -2270,7 +2305,11 @@ impl PermissionChecker {
         } else {
             Path::new(&self.working_dir).join(p)
         };
-        let Some(normalized) = resolve_path_allow_missing(&p) else {
+        self.is_external_resolved(resolve_path_allow_missing(&p).as_deref())
+    }
+
+    fn is_external_resolved(&mut self, normalized: Option<&Path>) -> bool {
+        let Some(normalized) = normalized else {
             return true;
         };
         let normalized_cwd = if let Some(cached) = &self.cached_resolved_cwd {
@@ -2299,8 +2338,11 @@ impl PermissionChecker {
     }
 
     fn match_ext_dir(&self, path_str: &str) -> Option<Action> {
-        let resolved = resolve_path_allow_missing(Path::new(path_str))?;
-        let resolved = resolved.to_string_lossy();
+        self.match_ext_dir_resolved(resolve_path_allow_missing(Path::new(path_str)).as_deref())
+    }
+
+    fn match_ext_dir_resolved(&self, resolved: Option<&Path>) -> Option<Action> {
+        let resolved = resolved?.to_string_lossy();
         self.match_ext_dir_bound(&resolved)
     }
 
@@ -2714,6 +2756,18 @@ pub(crate) fn resolve_path_allow_missing(path: &Path) -> Option<PathBuf> {
             std::env::current_dir().ok()?.join(path)
         };
         let mut resolved = PathBuf::new();
+        // `resolved` ends in existing, non-symlink components that have not yet
+        // been canonicalized. They are canonicalized once, lazily, instead of
+        // re-walking the growing prefix for every component. Windows keeps the
+        // eager form so every later probe uses the verbatim spelling.
+        let mut pending = false;
+        let flush = |resolved: &mut PathBuf, pending: &mut bool| -> Option<()> {
+            if *pending {
+                *resolved = resolved.canonicalize().ok()?;
+                *pending = false;
+            }
+            Some(())
+        };
 
         for component in absolute.components() {
             match component {
@@ -2722,29 +2776,39 @@ pub(crate) fn resolve_path_allow_missing(path: &Path) -> Option<PathBuf> {
                 }
                 std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
+                    flush(&mut resolved, &mut pending)?;
                     resolved.pop();
                 }
                 std::path::Component::Normal(name) => {
-                    resolved.push(name);
-                    match std::fs::symlink_metadata(&resolved) {
+                    let candidate = resolved.join(name);
+                    match std::fs::symlink_metadata(&candidate) {
                         Ok(metadata) if metadata.file_type().is_symlink() => {
-                            let target = std::fs::read_link(&resolved).ok()?;
+                            let target = std::fs::read_link(&candidate).ok()?;
+                            flush(&mut resolved, &mut pending)?;
                             let target = if target.is_absolute() {
                                 target
                             } else {
-                                resolved.parent()?.join(target)
+                                resolved.join(target)
                             };
                             resolved = resolve(&target, symlink_depth + 1)?;
                         }
                         Ok(_) => {
-                            resolved = resolved.canonicalize().ok()?;
+                            resolved = candidate;
+                            pending = true;
+                            if cfg!(windows) {
+                                flush(&mut resolved, &mut pending)?;
+                            }
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            flush(&mut resolved, &mut pending)?;
+                            resolved.push(name);
+                        }
                         Err(_) => return None,
                     }
                 }
             }
         }
+        flush(&mut resolved, &mut pending)?;
 
         Some(resolved)
     }
@@ -4905,4 +4969,146 @@ fn format45_retained_approval_query_preserves_doom_state_and_normal_revocation_p
         !checker.retains_shell_approval(script),
         "explicit deny survives permissive mode"
     );
+}
+
+#[cfg(all(test, unix))]
+mod resolve_path_equivalence_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// Verbatim copy of the previous per-component canonicalizing resolver.
+    fn legacy_resolve_path_allow_missing(path: &Path) -> Option<PathBuf> {
+        fn resolve(path: &Path, symlink_depth: usize) -> Option<PathBuf> {
+            if symlink_depth > 40 {
+                return None;
+            }
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().ok()?.join(path)
+            };
+            let mut resolved = PathBuf::new();
+            for component in absolute.components() {
+                match component {
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                        resolved.push(component.as_os_str());
+                    }
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    std::path::Component::Normal(name) => {
+                        resolved.push(name);
+                        match std::fs::symlink_metadata(&resolved) {
+                            Ok(metadata) if metadata.file_type().is_symlink() => {
+                                let target = std::fs::read_link(&resolved).ok()?;
+                                let target = if target.is_absolute() {
+                                    target
+                                } else {
+                                    resolved.parent()?.join(target)
+                                };
+                                resolved = resolve(&target, symlink_depth + 1)?;
+                            }
+                            Ok(_) => {
+                                resolved = resolved.canonicalize().ok()?;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(_) => return None,
+                        }
+                    }
+                }
+            }
+            Some(resolved)
+        }
+        resolve(path, 0).map(|resolved| normalize_path(&resolved))
+    }
+
+    #[test]
+    fn lazy_resolution_matches_legacy_for_every_shape() {
+        let temp = std::env::temp_dir().join(format!("resolve-eq-{}", uuid::Uuid::new_v4()));
+        let root = temp.canonicalize().unwrap_or(temp.clone());
+        std::fs::create_dir_all(root.join("real/a/b/c")).unwrap();
+        std::fs::write(root.join("real/a/file.txt"), "x").unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        symlink(root.join("real/a"), root.join("abs_link")).unwrap();
+        symlink("real/a", root.join("rel_link")).unwrap();
+        symlink("../real/a/b", root.join("other/up_link")).unwrap();
+        symlink("rel_link", root.join("chain_link")).unwrap();
+        symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+        symlink("loop_b", root.join("loop_a")).unwrap();
+        symlink("loop_a", root.join("loop_b")).unwrap();
+        symlink(root.join("real/a/file.txt"), root.join("file_link")).unwrap();
+
+        let r = |s: &str| root.join(s);
+        let mut cases: Vec<PathBuf> = vec![
+            r("real/a/b/c"),
+            r("real/a/file.txt"),
+            r("real/a/b/c/missing/deeper/still"),
+            r("real/missing"),
+            r("missing/real/a"),
+            r("abs_link/b/c/new.txt"),
+            r("rel_link/file.txt"),
+            r("rel_link/b/../file.txt"),
+            r("rel_link/../a/file.txt"),
+            r("other/up_link/c/x"),
+            r("other/up_link/../../other"),
+            r("chain_link/b"),
+            r("dangling"),
+            r("dangling/child"),
+            r("loop_a"),
+            r("loop_a/child"),
+            r("file_link"),
+            r("file_link/child"),
+            r("real/a/file.txt/child"),
+            r("real/./a/../a/b/./c"),
+            r("real/missing/../a/file.txt"),
+            r("real/a/b/c/../../../../real"),
+            r("real/../../../../../.."),
+            PathBuf::from("/"),
+            PathBuf::from("/nonexistent-root-dir/x/y"),
+            PathBuf::from("relative/missing/path"),
+            PathBuf::from("src/../Cargo.toml"),
+            PathBuf::from("."),
+        ];
+        // Case-folded spelling on case-insensitive volumes (no-op elsewhere).
+        cases.push(PathBuf::from(root.to_string_lossy().to_uppercase()).join("REAL/A/B"));
+        for case in &cases {
+            assert_eq!(
+                resolve_path_allow_missing(case),
+                legacy_resolve_path_allow_missing(case),
+                "resolution diverged for {}",
+                case.display()
+            );
+        }
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn canonical_resolved_check_matches_check_path_for_canonical_input() {
+        let temp = std::env::temp_dir().join(format!("resolve-chk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(temp.join("workspace/sub")).unwrap();
+        std::fs::create_dir_all(temp.join("outside")).unwrap();
+        std::fs::write(temp.join("workspace/sub/f.txt"), "x").unwrap();
+        std::fs::write(temp.join("outside/g.txt"), "x").unwrap();
+        let workspace = temp.join("workspace").canonicalize().unwrap();
+        let outside = temp.join("outside").canonicalize().unwrap();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["standard".to_string()]),
+        )
+        .expect("valid permission fixture");
+        for path in [
+            workspace.join("sub/f.txt"),
+            workspace.join("sub/missing.txt"),
+            outside.join("g.txt"),
+        ] {
+            let path = path.to_string_lossy().into_owned();
+            let direct = checker.check_path("read", &path);
+            let canonical = checker.check_canonical_resolved_path("read", &path);
+            assert_eq!(direct, canonical, "{path}");
+        }
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
 }

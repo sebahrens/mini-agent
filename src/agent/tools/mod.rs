@@ -834,6 +834,17 @@ pub async fn check_perm_path(
     check_perm_path_with_suggestion(permission, ask_tx, tool, path, None, Vec::new()).await
 }
 
+/// Like [`check_perm_path`] for a path the caller has just canonicalized, so
+/// the checker does not walk it a second time.
+pub async fn check_perm_canonicalized_path(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    path: &str,
+) -> Result<Option<String>, ToolError> {
+    check_perm_path_inner(permission, ask_tx, tool, path, None, Vec::new(), true).await
+}
+
 pub(crate) async fn check_perm_path_with_suggestion(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
@@ -841,6 +852,27 @@ pub(crate) async fn check_perm_path_with_suggestion(
     path: &str,
     suggested_pattern: Option<String>,
     additional_allow_patterns: Vec<String>,
+) -> Result<Option<String>, ToolError> {
+    check_perm_path_inner(
+        permission,
+        ask_tx,
+        tool,
+        path,
+        suggested_pattern,
+        additional_allow_patterns,
+        false,
+    )
+    .await
+}
+
+async fn check_perm_path_inner(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    path: &str,
+    suggested_pattern: Option<String>,
+    additional_allow_patterns: Vec<String>,
+    canonicalized: bool,
 ) -> Result<Option<String>, ToolError> {
     if matches!(tool, "write" | "edit" | "notebook_edit") {
         crate::git::runtime::check_model_write(Path::new(path)).map_err(ToolError::Msg)?;
@@ -850,7 +882,13 @@ pub(crate) async fn check_perm_path_with_suggestion(
     };
     let (result, diagnostic) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.check_diagnosed(|guard| guard.check_path(tool, path))
+        guard.check_diagnosed(|guard| {
+            if canonicalized {
+                guard.check_canonical_resolved_path(tool, path)
+            } else {
+                guard.check_path(tool, path)
+            }
+        })
     };
     match result {
         CheckResult::Allowed => Ok(None),

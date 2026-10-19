@@ -5,8 +5,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::agent::tools::crc::{Crc32, crc32_hex};
 use crate::agent::tools::{
-    AskSender, PermCheck, ReadArgs, ReadTracker, ToolError, check_perm_bound_path, check_perm_path,
-    edit_system,
+    AskSender, PermCheck, ReadArgs, ReadTracker, ToolError, check_perm_bound_path,
+    check_perm_canonicalized_path, edit_system,
 };
 use crate::config::types::EditSystem;
 
@@ -294,7 +294,7 @@ impl ReadTool {
             )
         } else {
             let resolved = tokio::fs::canonicalize(&requested).await?;
-            let coaching = check_perm_path(
+            let coaching = check_perm_canonicalized_path(
                 &self.permission,
                 &self.ask_tx,
                 "read",
