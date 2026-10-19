@@ -3467,7 +3467,7 @@ impl AnyAgent {
             agent
                 .hooks
                 .push(crate::extras::skills::session::InstructionContextHook::new(
-                    agent.preamble.clone().unwrap_or_default(),
+                    std::sync::Arc::<str>::from(agent.preamble.as_deref().unwrap_or_default()),
                     turn,
                     query.to_string(),
                     protocol,
@@ -3618,7 +3618,7 @@ impl AnyAgent {
             agent
                 .hooks
                 .push(crate::extras::skills::session::InstructionContextHook::new(
-                    agent.preamble.clone().unwrap_or_default(),
+                    std::sync::Arc::<str>::from(agent.preamble.as_deref().unwrap_or_default()),
                     turn,
                     String::new(),
                     protocol,

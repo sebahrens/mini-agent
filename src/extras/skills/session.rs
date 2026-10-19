@@ -600,7 +600,9 @@ struct NativeSkillReceipt {
 /// never appends instructions to the user's prompt or changes permission state.
 #[derive(Clone)]
 pub(crate) struct InstructionContextHook {
-    base: String,
+    /// The agent's base preamble, shared so the clones rig makes of this hook
+    /// (one set per request) do not copy a prompt of tens of kilobytes.
+    base: Arc<str>,
     turn: Arc<InstructionTurn>,
     query: String,
     protocol: crate::context::instructions::InstructionProtocol,
@@ -609,7 +611,7 @@ pub(crate) struct InstructionContextHook {
 }
 impl InstructionContextHook {
     pub(crate) fn new(
-        base: String,
+        base: impl Into<Arc<str>>,
         turn: Arc<InstructionTurn>,
         query: String,
         protocol: crate::context::instructions::InstructionProtocol,
@@ -618,7 +620,7 @@ impl InstructionContextHook {
         >,
     ) -> Self {
         Self {
-            base,
+            base: base.into(),
             turn,
             query,
             protocol,
@@ -820,20 +822,20 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for Instructi
         } else {
             block
         };
-        let preamble = if block.is_empty() {
-            self.base.clone()
-        } else {
-            format!("{}\n\n{}", self.base, block)
-        };
+        // Without a block the request keeps the base preamble: hash it in
+        // place instead of copying it.
+        let patched = (!block.is_empty()).then(|| format!("{}\n\n{}", self.base, block));
+        let preamble: &str = patched.as_deref().unwrap_or(&self.base);
         ctx.scratchpad().insert(PreparedInstruction {
             digest: Sha256::digest(preamble.as_bytes()).to_vec(),
             bytes: preamble.len(),
             selected: !selection.selected.is_empty(),
         });
-        if block.is_empty() {
-            rig::agent::Flow::cont()
-        } else {
-            rig::agent::Flow::patch_request(rig::agent::RequestPatch::new().preamble(preamble))
+        match patched {
+            None => rig::agent::Flow::cont(),
+            Some(preamble) => {
+                rig::agent::Flow::patch_request(rig::agent::RequestPatch::new().preamble(preamble))
+            }
         }
     }
     fn observes(&self, event: rig::agent::StepEventKind) -> bool {
