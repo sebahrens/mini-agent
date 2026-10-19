@@ -1724,3 +1724,116 @@ mod question_channel_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod compiled_policy_reuse_tests {
+    use super::*;
+
+    fn config_with_unique_rules(tag: &str) -> crate::config::Config {
+        crate::config::Config {
+            permission: Some(serde_json::json!({
+                "read": { format!("{tag}/**/*.secret"): "deny" },
+                "bash": { format!("{tag}-tool *"): "allow" },
+            })),
+            permission_regex: Some(serde_json::json!({
+                "bash": { format!("^{tag}-regex .*$"): "deny" },
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn authority(cli: &crate::cli::Cli, cfg: &crate::config::Config) -> ResolvedExecutionAuthority {
+        resolve_execution_authority(cli, cfg, crate::sandbox::SandboxPolicy::Disabled, "unused")
+            .unwrap()
+    }
+
+    #[test]
+    fn rebuilding_the_same_policy_compiles_no_regex_and_keeps_runtime_state_fresh() {
+        let root = crate::tests::OwnedTestDirectory::new("compiled-policy-reuse");
+        let cli = crate::cli::Cli::default();
+        let cfg = config_with_unique_rules("reuse-a1b2c3");
+
+        let first_before = pattern::regex_compilations_on_this_thread();
+        let (first, ..) = build_interactive_permission_with_cli_at(
+            &cli,
+            &cfg,
+            authority(&cli, &cfg),
+            Some(root.path().to_path_buf()),
+        )
+        .unwrap();
+        let first = first.expect("permission checks enabled");
+        let compiled_first = pattern::regex_compilations_on_this_thread() - first_before;
+        assert!(compiled_first > 0, "the first build must compile the rules");
+
+        // Mutate the first checker's runtime-only state.
+        first
+            .lock()
+            .unwrap()
+            .add_session_allowlist("write".into(), "granted/**");
+
+        let second_before = pattern::regex_compilations_on_this_thread();
+        let (second, ..) = build_interactive_permission_with_cli_at(
+            &cli,
+            &cfg,
+            authority(&cli, &cfg),
+            Some(root.path().to_path_buf()),
+        )
+        .unwrap();
+        let second = second.expect("permission checks enabled");
+        assert_eq!(
+            pattern::regex_compilations_on_this_thread(),
+            second_before,
+            "an identical policy must reuse the compiled regexes"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &second),
+            "each build owns a fresh checker"
+        );
+        assert!(
+            second.lock().unwrap().session_allowlist_is_empty(),
+            "runtime state is never shared between checkers"
+        );
+        assert!(!first.lock().unwrap().session_allowlist_is_empty());
+    }
+
+    #[test]
+    fn a_changed_rule_recompiles_and_decides_by_its_own_content() {
+        let root = crate::tests::OwnedTestDirectory::new("compiled-policy-change");
+        let cli = crate::cli::Cli::default();
+        let build = |action: &str, tag: &str| {
+            let cfg = crate::config::Config {
+                permission: Some(serde_json::json!({
+                    "bash": { format!("{tag}-cmd *"): action },
+                })),
+                ..Default::default()
+            };
+            let (permission, ..) = build_interactive_permission_with_cli_at(
+                &cli,
+                &cfg,
+                authority(&cli, &cfg),
+                Some(root.path().to_path_buf()),
+            )
+            .unwrap();
+            permission.unwrap()
+        };
+        let denied = build("deny", "chg-d4e5f6");
+        let before = pattern::regex_compilations_on_this_thread();
+        let allowed = build("allow", "chg-d4e5f6-other");
+        assert!(pattern::regex_compilations_on_this_thread() > before);
+        let input = "chg-d4e5f6-cmd run";
+        assert!(matches!(
+            denied.lock().unwrap().check("bash", input),
+            checker::CheckResult::Denied(_)
+        ));
+        assert!(
+            !matches!(
+                allowed
+                    .lock()
+                    .unwrap()
+                    .check("bash", "chg-d4e5f6-other-cmd run"),
+                checker::CheckResult::Denied(_)
+            ),
+            "the other policy's rule is its own"
+        );
+    }
+}

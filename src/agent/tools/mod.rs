@@ -876,8 +876,30 @@ async fn check_perm_path_inner(
     additional_allow_patterns: Vec<String>,
     canonicalized: bool,
 ) -> Result<Option<String>, ToolError> {
+    // The protected-Git guard and the checker must judge the same resolved
+    // subject, so resolve once with the checker's resolver and hand the result
+    // to both. The guard still revalidates every retained binding.
+    let mut pre_resolved = None;
     if matches!(tool, "write" | "edit" | "notebook_edit") {
-        crate::git::runtime::check_model_write(Path::new(path)).map_err(ToolError::Msg)?;
+        match permission {
+            Some(perm) if !canonicalized => {
+                if crate::git::runtime::model_write_guard_active() {
+                    let resolved = perm
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .resolve_check_target(path)
+                        .ok_or_else(|| {
+                            ToolError::Msg("model write target cannot be resolved".to_string())
+                        })?;
+                    crate::git::runtime::check_model_write_resolved(&resolved)
+                        .map_err(ToolError::Msg)?;
+                    pre_resolved = Some(Some(resolved));
+                }
+            }
+            _ => {
+                crate::git::runtime::check_model_write(Path::new(path)).map_err(ToolError::Msg)?;
+            }
+        }
     }
     let Some(perm) = permission else {
         return Ok(None);
@@ -888,7 +910,7 @@ async fn check_perm_path_inner(
             if canonicalized {
                 guard.check_canonical_resolved_path(tool, path)
             } else {
-                guard.check_path(tool, path)
+                guard.check_path_with_resolution(tool, path, pre_resolved)
             }
         })
     };
