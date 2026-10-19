@@ -313,8 +313,8 @@ impl PermissionState {
         };
         let header = sanitize_for_review(&header);
         let options = sanitize_for_review(&options);
-        renderer.write_line(&header, C_PERM)?;
-        renderer.write_line(&options, C_PERM)?;
+        // The pending request lives only in the pinned panel; the transcript
+        // gets one compact line after the decision (`note_decision`).
         renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
             tool: header,
             options,
@@ -422,6 +422,7 @@ impl PermissionState {
         if input == PromptInput::AllowWorkspaceEdits {
             // A stale request or replaced workspace cannot change session state.
             let request = self.request.take().expect("approval owns its request");
+            let mut allowed = false;
             let entries = match (&self.workspace_edits, &ui.permission) {
                 (Some(workspace), Some(permission)) => {
                     let mut checker = permission.lock().unwrap_or_else(|error| error.into_inner());
@@ -434,6 +435,7 @@ impl PermissionState {
                         )
                     {
                         if request.reply.send(UserDecision::AllowOnce).is_ok() {
+                            allowed = true;
                             checker.add_workspace_edit_grant(workspace)?
                         } else {
                             Vec::new()
@@ -449,6 +451,16 @@ impl PermissionState {
                 }
             };
             self.finish(renderer)?;
+            note_decision(
+                renderer,
+                &request.tool,
+                &request.input,
+                if allowed {
+                    "allowed (workspace edits, this session)"
+                } else {
+                    "denied"
+                },
+            )?;
             record_session_grants(entries, renderer, ui, run)?;
             return Ok(PermissionEvent::Finished);
         }
@@ -483,7 +495,9 @@ impl PermissionState {
                 return Ok(PermissionEvent::Waiting);
             }
             let request = self.request.take().expect("approval owns its request");
+            let mut note_decision_pending = None;
             let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
+                note_decision_pending = Some("allowed (this session)");
                 permission
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -496,12 +510,17 @@ impl PermissionState {
                 Vec::new()
             };
             self.finish(renderer)?;
+            if let Some(verb) = note_decision_pending {
+                note_decision(renderer, &request.tool, &request.input, verb)?;
+            }
             record_session_grants(entries, renderer, ui, run)?;
             return Ok(PermissionEvent::Finished);
         }
         let request = self.request.take().expect("approval owns its request");
         if input == PromptInput::AllowFolder {
+            let mut allowed = false;
             let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
+                allowed = true;
                 match (&self.folder, &ui.permission) {
                     (Some(folder), Some(permission)) => permission
                         .lock()
@@ -516,6 +535,14 @@ impl PermissionState {
                 Vec::new()
             };
             self.finish(renderer)?;
+            if allowed {
+                note_decision(
+                    renderer,
+                    &request.tool,
+                    &request.input,
+                    "allowed (folder, this session)",
+                )?;
+            }
             record_session_grants(entries, renderer, ui, run)?;
             return Ok(PermissionEvent::Finished);
         }
@@ -526,7 +553,6 @@ impl PermissionState {
                     .suggested_pattern
                     .clone()
                     .unwrap_or_else(|| suggest_pattern(&request.tool, &request.input));
-                renderer.write_line(&format!("  -> will allow: {}", pattern), Color::Green)?;
                 let mut entries = vec![(request.tool.to_string(), pattern.clone())];
                 entries.extend(
                     request
@@ -538,15 +564,43 @@ impl PermissionState {
             }
             _ => (UserDecision::Deny, Vec::new()),
         };
-        let entries = if request.reply.send(decision).is_ok() {
-            entries
-        } else {
-            Vec::new()
+        let verb = match &decision {
+            UserDecision::AllowOnce => "allowed",
+            UserDecision::AllowAlways(_) => "allowed (this session)",
+            _ => "denied",
         };
+        let sent = request.reply.send(decision).is_ok();
+        let entries = if sent { entries } else { Vec::new() };
         self.finish(renderer)?;
+        if sent {
+            note_decision(renderer, &request.tool, &request.input, verb)?;
+        }
         record_session_grants(entries, renderer, ui, run)?;
         Ok(PermissionEvent::Finished)
     }
+}
+
+/// The single compact transcript line left behind by a permission decision.
+fn note_decision(
+    renderer: &mut Renderer,
+    tool: &str,
+    input: &str,
+    verb: &str,
+) -> std::io::Result<()> {
+    renderer.write_line(&decision_line(tool, input, verb), C_PERM)
+}
+
+fn decision_line(tool: &str, input: &str, verb: &str) -> String {
+    const MAX: usize = 60;
+    let flat = sanitize_for_review(input).replace('\n', " ");
+    let flat = flat.trim();
+    let shown: String = if flat.chars().count() > MAX {
+        flat.chars().take(MAX - 1).chain(['…']).collect()
+    } else {
+        flat.to_string()
+    };
+    let mark = if verb == "denied" { "✗" } else { "✓" };
+    format!("{mark} {verb} {tool}: {shown}")
 }
 
 /// Report and persist session grants. The checker already holds them (the
@@ -559,10 +613,6 @@ fn record_session_grants(
     run: &mut AgentRunState,
 ) -> anyhow::Result<()> {
     for (tool, pattern) in entries {
-        renderer.write_line(
-            &format!("  allowed {} {} for this session", tool, pattern),
-            Color::Green,
-        )?;
         ui.session
             .permission_allowlist
             .push(crate::session::PermissionAllowEntry {
@@ -667,6 +717,20 @@ mod tests {
         assert_eq!(
             prompt_scroll(&chord(KeyCode::Char('<'), KeyModifiers::NONE)),
             None
+        );
+    }
+
+    #[test]
+    fn decision_line_is_one_short_line() {
+        let long = format!("echo a\n{}", "x".repeat(200));
+        let line = decision_line("shell", &long, "allowed");
+        assert!(line.starts_with("✓ allowed shell: echo a x"));
+        assert!(!line.contains('\n'));
+        assert!(line.chars().count() < 90);
+        assert!(line.ends_with('…'));
+        assert_eq!(
+            decision_line("edit", "f.rs", "denied"),
+            "✗ denied edit: f.rs"
         );
     }
 

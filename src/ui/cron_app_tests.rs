@@ -428,7 +428,7 @@ async fn cron_arm_and_park_show_notices_and_the_statusline_item() {
         .unwrap();
     assert_eq!(app.cron.len(), 1);
     let notice = app.renderer.notice_text().unwrap_or_default().to_owned();
-    assert!(notice.contains("armed: first fire in 5m"), "{notice}");
+    assert!(notice.contains("armed: every 5m, first fire in 5m"), "{notice}");
     assert_eq!(app.cron_status_label().as_deref(), Some("⟳ 1 in 5m"));
     drop(app);
     provider.finish().await;

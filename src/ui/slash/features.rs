@@ -4,6 +4,10 @@ use crate::ui::slash::write_ok;
 use crate::ui::slash::write_result;
 use crate::ui::slash::{SlashCtx, write_error};
 
+/// Canonical `/loop` usage; `status` is accepted too.
+#[cfg(feature = "loop")]
+pub(crate) const LOOP_USAGE: &str = "usage: /loop <prompt>  |  /loop status  |  /loop stop";
+
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match parts[0] {
         "/compress" | "/compact" => handle_compress(parts, ctx),
@@ -60,7 +64,7 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             }
             None => {
                 write_ok(ctx.renderer, "no active loop");
-                write_result(ctx.renderer, "usage: /loop <prompt>  |  /loop stop");
+                write_result(ctx.renderer, LOOP_USAGE);
             }
         }
         return Ok(());
@@ -107,7 +111,7 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
 
     let prompt = parts[1..].join(" ");
     if prompt.trim().is_empty() {
-        write_error(ctx.renderer, "usage: /loop <prompt>");
+        write_error(ctx.renderer, LOOP_USAGE);
         return Ok(());
     }
     // The plan lives in the workspace the agent edits, not wherever the

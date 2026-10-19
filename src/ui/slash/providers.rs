@@ -541,9 +541,8 @@ async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str, selected_alias: Opt
             key.as_ref(),
         ));
     if let Some(note) = apply_model_pricing(ctx.session, model_id, pricing) {
-        let _ = ctx
-            .renderer
-            .write_line(&note, crossterm::style::Color::Yellow);
+        ctx.renderer
+            .show_notice(&note, crossterm::style::Color::Yellow);
     }
     ctx.session
         .set_cache_prices(crate::pricing::cache_prices_for_model(
@@ -631,9 +630,8 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         )
     });
     if let Some(note) = apply_model_pricing(ctx.session, &model, pricing) {
-        let _ = ctx
-            .renderer
-            .write_line(&note, crossterm::style::Color::Yellow);
+        ctx.renderer
+            .show_notice(&note, crossterm::style::Color::Yellow);
     }
     ctx.session
         .set_cache_prices(crate::pricing::cache_prices_for_model(
@@ -924,6 +922,12 @@ fn parse_models_add<'a>(parts: &'a [&'a str]) -> Result<ModelAddArgs<'a>, ()> {
     Ok((parts[1], parts[2], parts[3], input_cost, output_cost))
 }
 
+/// Canonical usage lines (never the hidden legacy aliases).
+#[cfg(any(test, feature = "subagents"))]
+const SUBAGENT_MODEL_USAGE: &str = "usage: /subagent-model <model-id>";
+#[cfg(any(test, feature = "subagents"))]
+const SUBAGENT_MODELS_USAGE: &str = "usage: /subagent-models <quick-model>";
+
 #[cfg(feature = "subagents")]
 async fn handle_model_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     use crate::extras::subagents;
@@ -931,6 +935,7 @@ async fn handle_model_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow
     if parts.len() < 2 {
         let status = subagents::with_config(|cfg| cfg.model_status())?;
         write_ok(ctx.renderer, crate::ui::events::sanitize_output(&status));
+        write_result(ctx.renderer, SUBAGENT_MODEL_USAGE);
         return Ok(());
     }
 
@@ -941,9 +946,9 @@ async fn handle_model_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow
         .completion_model_with_cache_ttl(new_model.clone(), ctx.cfg.cache_ttl.unwrap_or_default());
     model_for_subagent(ctx, model).await?;
     subagents::set_model_name(new_model.clone());
-    write_ok(
-        ctx.renderer,
-        format!("switched subagent to model: {}", new_model),
+    ctx.renderer.show_notice(
+        &format!("switched subagent to model: {}", new_model),
+        crate::ui::C_AGENT,
     );
     Ok(())
 }
@@ -989,6 +994,7 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
                 );
             }
         }
+        write_result(ctx.renderer, SUBAGENT_MODELS_USAGE);
         return Ok(());
     }
 
@@ -1021,15 +1027,15 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
             model_for_subagent(ctx, model).await?;
             subagents::set_model_name(q.model.to_string());
         }
-        write_ok(
-            ctx.renderer,
-            format!(
+        ctx.renderer.show_notice(
+            &format!(
                 "switched subagent to quick model: {} ({} / {})  {}",
                 name,
                 q.provider,
                 q.model,
                 quick_price_notice(q)
             ),
+            crate::ui::C_AGENT,
         );
     } else {
         write_error(ctx.renderer, format!("unknown quick model: '{}'", name));
@@ -1098,6 +1104,14 @@ mod subagent_command_tests {
         assert!(crate::ui::slash::routes_to_providers("/subagent-models"));
         assert!(crate::ui::slash::routes_to_providers("/model-subagent"));
         assert!(crate::ui::slash::routes_to_providers("/models-subagent"));
+    }
+
+    #[test]
+    fn usage_lines_name_the_canonical_commands() {
+        for usage in [super::SUBAGENT_MODEL_USAGE, super::SUBAGENT_MODELS_USAGE] {
+            assert!(usage.starts_with("usage: /subagent-model"), "{usage}");
+            assert!(!usage.contains("-subagent"), "{usage}");
+        }
     }
 
     #[test]
@@ -1388,15 +1402,14 @@ mod model_pricing_tests {
         );
         assert!(
             ctx.renderer
-                .feed()
-                .block_text(0)
+                .notice_text()
                 .unwrap()
                 .contains("no pricing known for unknown-pricing-test-model")
         );
         assert!(
             ctx.renderer
                 .feed()
-                .block_text(1)
+                .block_text(0)
                 .unwrap()
                 .contains("switched to model")
         );
@@ -1414,7 +1427,7 @@ mod model_pricing_tests {
         );
         assert_eq!(
             ctx.renderer.feed().block_count(),
-            3,
+            2,
             "known model emitted a pricing warning"
         );
         assert!(crate::provider::default_model_for_provider("unpriced-gateway", &cfg).is_none());
@@ -1428,15 +1441,14 @@ mod model_pricing_tests {
         );
         assert!(
             ctx.renderer
-                .feed()
-                .block_text(3)
+                .notice_text()
                 .unwrap()
                 .contains("no pricing known for")
         );
         assert!(
             ctx.renderer
                 .feed()
-                .block_text(4)
+                .block_text(2)
                 .unwrap()
                 .contains("switched to provider: unpriced-gateway")
         );
