@@ -549,6 +549,11 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         }
     }
 
+    // Overlap the host sandbox backend probe (a process spawn) with the
+    // remaining startup; the later availability check joins its result.
+    if cli.resolve_sandbox(&cfg) && cli.general_sandbox_is_eligible(&cfg) {
+        sandbox::begin_backend_probe(&cli.resolve_sandbox_backend(&cfg));
+    }
     let version_changed = docs::ensure_global()?;
     // ── Hooks: load settings.json config, apply trust, install dispatcher ──
     // Done this early (before provider/API-key resolution) so `--hooks-test`

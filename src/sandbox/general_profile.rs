@@ -342,13 +342,14 @@ pub(super) fn protected_host_paths() -> Result<Vec<PathBuf>, String> {
 
 impl HostFilesystem {
     pub(super) fn capture(sandbox: &Sandbox, cwd: &Path, cache: &Path) -> Result<Self, String> {
-        let CapturedRoots {
-            reads,
-            writes,
-            files,
-        } = capture_roots(sandbox, cwd)?;
-        #[cfg(not(unix))]
-        drop(files);
+        // Explicit roots are captured once per base and only re-validated on
+        // each launch (same cache the Seatbelt arm uses); `append_roots`
+        // still validates every mount before it is bound.
+        let roots = sandbox.general_roots(cwd)?;
+        let reads = roots.reads.clone();
+        let writes = roots.writes.clone();
+        #[cfg(unix)]
+        let files = roots.files.clone();
         let mut masks = Vec::new();
         for path in configured_private_paths(&sandbox.home_masks)? {
             let canonical = match path.canonicalize() {
@@ -900,6 +901,45 @@ mod tests {
             &fixture.cache,
         );
         assert!(!plain.iter().any(|value| value.contains(".gitconfig")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bwrap_host_filesystem_captures_explicit_roots_once_and_revalidates_each_launch() {
+        let fixture = Fixture::new();
+        let read_root = fixture.root.path().join("read-root");
+        let write_root = fixture.root.path().join("write-root");
+        std::fs::create_dir(&read_root).unwrap();
+        std::fs::create_dir(&write_root).unwrap();
+        let sandbox = Sandbox::new(true, "bwrap").with_general_profile(
+            SandboxProfile::HostRead,
+            vec![read_root.clone()],
+            vec![write_root.clone()],
+        );
+        let captures = || crate::sandbox::GENERAL_ROOT_CAPTURES.with(std::cell::Cell::get);
+        let before = captures();
+        let first = bwrap_args(&sandbox, &fixture.cwd, &fixture.cache);
+        assert_eq!(
+            captures() - before,
+            2,
+            "first launch captures each root once"
+        );
+        let second = bwrap_args(&sandbox, &fixture.cwd, &fixture.cache);
+        assert_eq!(captures() - before, 2, "second launch reuses the bindings");
+        assert_eq!(first.len(), second.len());
+        let canonical = read_root.canonicalize().unwrap();
+        assert!(
+            second
+                .windows(3)
+                .any(|v| v[0] == "--ro-bind-fd" && Path::new(&v[2]) == canonical)
+        );
+
+        // A replaced root fails identity validation and is captured again.
+        std::fs::remove_dir(&read_root).unwrap();
+        std::fs::create_dir(&read_root).unwrap();
+        let before_replacement = captures();
+        bwrap_args(&sandbox, &fixture.cwd, &fixture.cache);
+        assert_eq!(captures() - before_replacement, 2);
     }
 
     #[test]

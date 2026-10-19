@@ -918,10 +918,7 @@ impl PermissionChecker {
         };
         match &self.pinned_hook_files_override {
             Some(files) => crate::extras::hooks::is_pinned_hook_file(files, relative),
-            None => crate::extras::hooks::is_pinned_hook_file(
-                &crate::extras::hooks::pinned_hook_files(),
-                relative,
-            ),
+            None => crate::extras::hooks::is_pinned_by_installed_dispatcher(relative),
         }
     }
 

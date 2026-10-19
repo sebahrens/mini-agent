@@ -140,18 +140,20 @@ pub const SANDBOX_OFF_LABEL: &str = "sandbox:off";
 /// The persistent sandbox indicator for `sandbox`, or `None` when the session
 /// is contained or the operator disabled sandboxing deliberately.
 pub(crate) fn sandbox_label(sandbox: &crate::sandbox::Sandbox) -> Option<&'static str> {
-    if sandbox.policy() != crate::sandbox::SandboxPolicy::Disabled {
+    // Evaluated every frame: read configuration fields only. `policy()` is
+    // `Disabled` exactly when containment was not requested, and running it
+    // would canonicalize roots and masks on each frame.
+    if sandbox.containment_requested() {
         match sandbox.profile() {
-            crate::sandbox::SandboxProfile::HostFull => return Some("sandbox:host-full"),
-            crate::sandbox::SandboxProfile::HostRead => return Some("sandbox:host-read"),
-            crate::sandbox::SandboxProfile::Workspace => {}
+            crate::sandbox::SandboxProfile::HostFull => Some("sandbox:host-full"),
+            crate::sandbox::SandboxProfile::HostRead => Some("sandbox:host-read"),
+            crate::sandbox::SandboxProfile::Workspace => None,
         }
+    } else {
+        sandbox
+            .is_unavailable_default_fallback()
+            .then_some(SANDBOX_OFF_LABEL)
     }
-    matches!(
-        sandbox.explicit_shell_boundary(),
-        crate::sandbox::ExplicitShellBoundary::UnavailableDefaultFallback { .. }
-    )
-    .then_some(SANDBOX_OFF_LABEL)
 }
 
 static SPEC: OnceLock<StatusLineConfig> = OnceLock::new();

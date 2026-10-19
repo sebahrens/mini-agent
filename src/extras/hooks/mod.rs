@@ -242,24 +242,30 @@ pub(crate) fn diagnostic_hook_metadata()
         .map(|dispatcher| dispatcher.diagnostic_metadata()))
 }
 
-/// Workspace-relative paths of the hook files the installed dispatcher has
-/// content-bound. File tools refuse to modify them: a rewrite would only make
-/// the hook fail closed until restart.
-pub(crate) fn pinned_hook_files() -> Vec<std::path::PathBuf> {
-    get_dispatcher()
-        .map(|dispatcher| dispatcher.pinned_workspace_paths())
-        .unwrap_or_default()
-}
+// File tools refuse to modify the hook files the installed dispatcher has
+// content-bound (see `is_pinned_by_installed_dispatcher`): a rewrite would only
+// make the hook fail closed until restart.
 
 /// True when `relative` (a workspace-relative spelling) names one of `pinned`.
 /// Compared case-insensitively with `/` and `\` as equal separators, so a
 /// case-insensitive volume cannot be used to spell around the protection.
 pub(crate) fn is_pinned_hook_file(pinned: &[std::path::PathBuf], relative: &str) -> bool {
-    let normalize = |text: &str| text.replace('\\', "/").to_lowercase();
-    let relative = normalize(relative.trim_start_matches("./"));
+    let relative = normalize_pinned_spelling(relative.trim_start_matches("./"));
     pinned
         .iter()
-        .any(|path| normalize(&path.to_string_lossy()) == relative)
+        .any(|path| normalize_pinned_spelling(&path.to_string_lossy()) == relative)
+}
+
+/// The comparison spelling [`is_pinned_hook_file`] uses for both sides.
+pub(crate) fn normalize_pinned_spelling(text: &str) -> String {
+    text.replace('\\', "/").to_lowercase()
+}
+
+/// [`is_pinned_hook_file`] against the installed dispatcher's pins, which are
+/// normalized once at load: no pinned-path list is cloned or re-lowercased.
+pub(crate) fn is_pinned_by_installed_dispatcher(relative: &str) -> bool {
+    let relative = normalize_pinned_spelling(relative.trim_start_matches("./"));
+    get_dispatcher().is_some_and(|dispatcher| dispatcher.is_pinned_normalized(&relative))
 }
 
 /// Test-only: clears the process-global dispatcher so a test that installed one

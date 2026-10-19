@@ -38,6 +38,12 @@ const GIT_DIR_ENTRIES: [&str; 2] = ["config.worktree", "commondir"];
 /// Upper bound on bytes read from a `.git` gitfile or a `commondir` pointer.
 const POINTER_FILE_LIMIT: u64 = 4096;
 
+#[cfg(test)]
+thread_local! {
+    /// `discover` calls made by this thread (test probe).
+    pub(super) static DISCOVER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The Git metadata layout of one workspace, in configured spellings.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct GitMetadataLayout {
@@ -54,6 +60,8 @@ pub(super) struct GitMetadataLayout {
 /// outside every writable root already. A linked worktree's gitfile is
 /// followed to its Git directory and that directory's `commondir`.
 pub(super) fn discover(workspace: &Path) -> GitMetadataLayout {
+    #[cfg(test)]
+    DISCOVER_CALLS.with(|count| count.set(count.get() + 1));
     let dot_git = workspace.join(".git");
     let Ok(metadata) = std::fs::symlink_metadata(&dot_git) else {
         return GitMetadataLayout::default();
@@ -150,7 +158,12 @@ fn spellings(path: &Path) -> Vec<PathBuf> {
 /// writable) so it cannot be renamed away, edited under another name and
 /// renamed back.
 pub(super) fn seatbelt_write_denies(workspace: &Path) -> String {
-    let layout = discover(workspace);
+    seatbelt_write_denies_for(&discover(workspace))
+}
+
+/// [`seatbelt_write_denies`] for a layout the caller already discovered, so
+/// one launch walks the workspace's `.git` metadata once.
+pub(super) fn seatbelt_write_denies_for(layout: &GitMetadataLayout) -> String {
     let mut filters: Vec<String> = Vec::new();
     let planned = layout
         .pinned_dir
@@ -214,6 +227,15 @@ impl BwrapGitMetadataBinds {
     /// entries that cannot be pinned safely refuse the launch.
     #[cfg(unix)]
     pub(super) fn open(workspace_root: &Path) -> Result<Self, String> {
+        Self::open_with_layout(workspace_root).map(|(binds, _, _)| binds)
+    }
+
+    /// [`Self::open`] that also returns the canonical root and the layout it
+    /// discovered, for callers that need the same view of the metadata.
+    #[cfg(unix)]
+    pub(super) fn open_with_layout(
+        workspace_root: &Path,
+    ) -> Result<(Self, PathBuf, GitMetadataLayout), String> {
         let root = std::fs::canonicalize(workspace_root)
             .map_err(|_| "cannot resolve workspace Git metadata root".to_string())?;
         match std::fs::symlink_metadata(root.join(".git")) {
@@ -291,7 +313,7 @@ impl BwrapGitMetadataBinds {
                 fd,
             });
         }
-        Ok(Self { entries })
+        Ok((Self { entries }, root, layout))
     }
 
     #[cfg(not(unix))]
@@ -419,8 +441,30 @@ fn inspect_external_protected_entry(root: &Path, path: &Path) -> Result<(), Stri
 /// same vnode. Apply the same static alias validation before every profile
 /// lookup, including cache hits; descriptors are not passed to Seatbelt.
 #[cfg(target_os = "macos")]
-pub(super) fn validate_workspace_aliases(workspace: &Path) -> Result<(), String> {
-    BwrapGitMetadataBinds::open(workspace).map(|_| ())
+pub(super) fn validate_workspace_aliases(workspace: &Path) -> Result<ValidatedGitMetadata, String> {
+    BwrapGitMetadataBinds::open_with_layout(workspace)
+        .map(|(_, root, layout)| ValidatedGitMetadata { root, layout })
+}
+
+/// What one alias validation discovered, for reuse within the same launch
+/// only. It is never cached across commands: the next command validates again.
+#[cfg(target_os = "macos")]
+pub(super) struct ValidatedGitMetadata {
+    root: PathBuf,
+    layout: GitMetadataLayout,
+}
+
+#[cfg(target_os = "macos")]
+impl ValidatedGitMetadata {
+    /// The Seatbelt write denials for `workspace`, reusing the validated
+    /// layout when it was discovered from the same spelling.
+    pub(super) fn seatbelt_write_denies(&self, workspace: &Path) -> String {
+        if self.root == workspace {
+            seatbelt_write_denies_for(&self.layout)
+        } else {
+            seatbelt_write_denies(workspace)
+        }
+    }
 }
 
 /// Inspect the inode actually supplied to bubblewrap, not a second pathname
