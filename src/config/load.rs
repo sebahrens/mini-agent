@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use std::io;
+use std::sync::{Arc, Mutex};
 
 use crate::config::keys;
 use crate::config::{
@@ -2479,11 +2480,85 @@ fn project_config_is_trusted_in_workspace_mode(
     else {
         return false;
     };
-    let Ok(store) = load_project_config_trust_mode(&paths.project_config_trust_file(), repair)
-    else {
+    let trust_file = paths.project_config_trust_file();
+    let store = if repair {
+        load_project_config_trust_mode(&trust_file, true).map(Arc::new)
+    } else {
+        load_project_config_trust_readonly_cached(&trust_file)
+    };
+    let Ok(store) = store else {
         return false;
     };
     workspace.validate().is_ok() && store.bindings.contains(&binding)
+}
+
+/// Stat fingerprint of the trust store: any rewrite (in place or by rename)
+/// changes the inode, length, mtime or ctime, so a hit proves the parsed
+/// content is still the file's content. Entries younger than the quiet window
+/// are never cached, so a rewrite in the same timestamp tick cannot hide.
+#[cfg(unix)]
+type TrustStamp = (u64, u64, u64, i64, i64, i64, i64);
+
+#[cfg(unix)]
+fn trust_store_stamp(path: &Path) -> Option<TrustStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let window = if cfg!(test) { 0 } else { 3 };
+    (now.saturating_sub(metadata.mtime().max(metadata.ctime())) >= window).then_some((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ))
+}
+
+/// Read-only trust-store load that skips the read, JSON parse and private-file
+/// checks while the file's stat fingerprint is unchanged. Revocation is an edit
+/// of the store, which changes the fingerprint, so it applies on the next call.
+fn load_project_config_trust_readonly_cached(
+    path: &Path,
+) -> io::Result<Arc<ProjectConfigTrustStore>> {
+    #[cfg(unix)]
+    {
+        static CACHE: Mutex<Vec<(PathBuf, TrustStamp, Arc<ProjectConfigTrustStore>)>> =
+            Mutex::new(Vec::new());
+        let parent_linked = path
+            .parent()
+            .and_then(|parent| std::fs::symlink_metadata(parent).ok())
+            .is_none_or(|metadata| metadata.file_type().is_symlink());
+        if !parent_linked && let Some(before) = trust_store_stamp(path) {
+            let hit = CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|(cached, stamp, _)| cached == path && *stamp == before)
+                .map(|(_, _, store)| Arc::clone(store));
+            if let Some(store) = hit {
+                return Ok(store);
+            }
+            let store = Arc::new(load_project_config_trust_mode(path, false)?);
+            if trust_store_stamp(path) == Some(before) {
+                let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                cache.retain(|(cached, _, _)| cached != path);
+                if cache.len() >= 8 {
+                    cache.remove(0);
+                }
+                cache.push((path.to_path_buf(), before, Arc::clone(&store)));
+            }
+            return Ok(store);
+        }
+    }
+    load_project_config_trust_mode(path, false).map(Arc::new)
 }
 
 /// Record trust for `project_config` exactly as an interactive approval would.

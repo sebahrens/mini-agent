@@ -346,6 +346,29 @@ fn task_outcome_is_ordered_after_invocations_and_ignores_uninvoked_skills() {
 }
 
 #[test]
+fn compaction_check_is_read_only_and_reports_work_only_for_expired_events() {
+    let (root, mut store, skill) = fixture();
+    let retention = RetentionService::new(&mut store);
+    assert!(!retention.has_expired_work(1_000).unwrap(), "empty store");
+    TelemetryIngestor::new(&mut store)
+        .ingest(&selected_batch(&skill, "turn-recent"))
+        .unwrap();
+    let mut retention = RetentionService::new(&mut store);
+    // The fixture event is created far in the future: nothing is expired.
+    assert!(!retention.has_expired_work(1_000).unwrap());
+    assert!(retention.has_expired_work(2_000_000_001).unwrap());
+    let report = retention
+        .compact_before(2_000_000_001, 1, 2_000_000_002)
+        .unwrap();
+    assert_eq!(report.compacted_events, 1);
+    assert!(
+        !retention.has_expired_work(2_000_000_001).unwrap(),
+        "watermark advanced"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn skill_retention_recovery_compaction_is_idempotent_and_preserves_aggregates() {
     let (root, mut store, skill) = fixture();
     let events = vec![

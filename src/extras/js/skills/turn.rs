@@ -599,18 +599,31 @@ impl SkillRuntime {
             }
         };
         let mut refresh_pending = false;
+        // The lease is read on the same blocking hop as the refresh check; it
+        // only needs the coordinator, so a second pool handoff adds latency, not
+        // safety. When the hop itself fails the lease is taken separately below.
+        let mut prefetched_lease = None;
         if let Some(coordinator) = &self.learned {
             let coordinator = Arc::clone(coordinator);
             let may_schedule = self.background_rebuild_enabled();
+            let wants_lease = query_embedding.is_some();
             match crate::agent::runner::spawn_blocking_scoped(move || {
                 let needs_refresh = coordinator.needs_refresh();
                 if matches!(needs_refresh, Ok(true)) && may_schedule {
                     coordinator.schedule_rebuild();
                 }
-                (needs_refresh, coordinator.rebuild_backoff_diagnostic())
+                let lease = wants_lease.then(|| coordinator.lease());
+                (
+                    needs_refresh,
+                    coordinator.rebuild_backoff_diagnostic(),
+                    lease,
+                )
             })
             .await
-            {
+            .map(|(needs_refresh, backoff, lease)| {
+                prefetched_lease = lease;
+                (needs_refresh, backoff)
+            }) {
                 Ok((Ok(true), backoff)) => {
                     refresh_pending = true;
                     diagnostics.push("learned_js_refresh_pending".to_string());
@@ -644,9 +657,12 @@ impl SkillRuntime {
             // publication can hold while it waits on another process's SQLite
             // write lock, so it belongs on the same blocking hop as every other
             // store access on this path instead of on the async executor.
-            let leased = {
-                let coordinator = Arc::clone(coordinator);
-                crate::agent::runner::spawn_blocking_scoped(move || coordinator.lease()).await
+            let leased = match prefetched_lease.take() {
+                Some(lease) => Ok(lease),
+                None => {
+                    let coordinator = Arc::clone(coordinator);
+                    crate::agent::runner::spawn_blocking_scoped(move || coordinator.lease()).await
+                }
             };
             let leased = match leased {
                 Ok(Ok(index)) => {
@@ -680,34 +696,31 @@ impl SkillRuntime {
                 let vector = vector.clone();
                 let policy = self.learned_policy.clone();
                 let pure_only = self.pure_learned_only;
+                let routing_coordinator = (!pure_only).then(|| Arc::clone(coordinator));
                 match crate::agent::runner::spawn_blocking_scoped(move || {
-                    if pure_only {
+                    let skills = if pure_only {
                         index
                             .search_pure_with_metrics(&query, &vector, &policy)
                             .map(|output| output.skills)
                     } else {
                         index.search(&query, &vector, &policy)
-                    }
-                })
-                .await
-                {
-                    Ok(Ok(skills)) => {
+                    }?;
+                    // Routing context is read on the search hop itself.
+                    let routing_context = routing_coordinator.and_then(|coordinator| {
                         let active_ids = skills
                             .iter()
                             .map(|skill| skill.artifact.id.clone())
                             .collect::<Vec<_>>();
-                        let routing_context = if self.pure_learned_only {
-                            None
-                        } else {
-                            let coordinator = Arc::clone(coordinator);
-                            crate::agent::runner::spawn_blocking_scoped(move || {
-                                coordinator.routing_context(&active_ids, generation)
-                            })
-                            .await
+                        coordinator
+                            .routing_context(&active_ids, generation)
                             .ok()
-                            .and_then(Result::ok)
                             .flatten()
-                        };
+                    });
+                    Ok::<_, super::index::SkillIndexError>((skills, routing_context))
+                })
+                .await
+                {
+                    Ok(Ok((skills, routing_context))) => {
                         let turn_id = learned_bundle.turn_id.clone();
                         learned_bundle.skills = skills
                             .into_iter()

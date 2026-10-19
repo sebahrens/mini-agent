@@ -1108,9 +1108,19 @@ fn compact_expired_events(store: &mut SkillStore) {
         return;
     };
     let cutoff = now.saturating_sub(super::retention::DEFAULT_RAW_RETENTION_SECONDS);
-    if let Err(error) =
-        super::retention::RetentionService::new(store).compact_before(cutoff, 1, now)
-    {
+    let mut service = super::retention::RetentionService::new(store);
+    // Events only expire after the retention window, so almost every batch has
+    // nothing to compact: a read-only look decides, and the write lock that
+    // routing reads and rebuilds contend for is taken only when there is work.
+    match service.has_expired_work(cutoff) {
+        Ok(false) => return,
+        Ok(true) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "automatic skill telemetry compaction check failed");
+            return;
+        }
+    }
+    if let Err(error) = service.compact_before(cutoff, 1, now) {
         tracing::warn!(error = %error, "automatic skill telemetry compaction failed");
     }
 }
@@ -1470,14 +1480,16 @@ fn validate_against_durable_terminals(
 }
 
 fn insert_event(tx: &Transaction<'_>, event: &SkillEvent) -> Result<bool, TelemetryError> {
-    let changed = tx.execute(
-        "INSERT OR IGNORE INTO skill_events (
+    let changed = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO skill_events (
             invocation_id, skill_id, turn_id, tool_call_id, event_kind,
             export_name, outcome, latency_us, retrieval_score, retrieval_rank,
             query_fingerprint, index_generation, evidence_complete, production,
             argument_shape, created_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        params![
+        )?
+        .execute(params![
             event.invocation_id,
             event.skill_id,
             event.turn_id,
@@ -1494,8 +1506,7 @@ fn insert_event(tx: &Transaction<'_>, event: &SkillEvent) -> Result<bool, Teleme
             i64::from(event.production),
             event.argument_shape,
             event.created_at,
-        ],
-    )?;
+        ])?;
     if changed == 1 {
         return Ok(true);
     }
@@ -1555,7 +1566,7 @@ fn update_stats(tx: &Transaction<'_>, event: &SkillEvent) -> Result<(), Telemetr
     let negative = i64::from(event.kind == SkillEventKind::UserNegative);
     let latency = event.latency_us.unwrap_or(0) as i64;
 
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO skill_stats (
             skill_id, selected_count, invoked_count, direct_success_count,
             direct_failure_count, timeout_count, oom_count, policy_fault_count,
@@ -1578,21 +1589,21 @@ fn update_stats(tx: &Transaction<'_>, event: &SkillEvent) -> Result<(), Telemetr
                 user_negative_count + excluded.user_negative_count,
             latency_total_us = latency_total_us + excluded.latency_total_us,
             updated_at = MAX(updated_at, excluded.updated_at)",
-        params![
-            event.skill_id,
-            selected,
-            invoked,
-            success,
-            failure,
-            timeout,
-            oom,
-            policy_fault,
-            positive,
-            negative,
-            latency,
-            event.created_at,
-        ],
-    )?;
+    )?
+    .execute(params![
+        event.skill_id,
+        selected,
+        invoked,
+        success,
+        failure,
+        timeout,
+        oom,
+        policy_fault,
+        positive,
+        negative,
+        latency,
+        event.created_at,
+    ])?;
     Ok(())
 }
 
