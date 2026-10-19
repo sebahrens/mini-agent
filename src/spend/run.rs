@@ -350,7 +350,7 @@ impl Run {
     /// The same account, ledger and captured profile recording `kind`. ACP
     /// scopes a `/cron` fire's turn with [`RequestKind::Scheduled`] this way,
     /// so its receipts and its `UserPromptSubmit` origin say "scheduled".
-    #[cfg(feature = "acp")]
+    #[cfg(any(feature = "acp", test))]
     pub(crate) fn with_kind(&self, kind: RequestKind) -> Self {
         Self {
             kind,
