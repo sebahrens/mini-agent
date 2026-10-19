@@ -2555,9 +2555,23 @@ fn format_truncated_tool_output_with_notice(
     output_chars: usize,
     notice: &str,
 ) -> String {
-    let head: String = output.chars().take(TOOL_RESULT_HEAD_CHARS).collect();
-    let tail_start = output_chars.saturating_sub(TOOL_RESULT_TAIL_CHARS);
-    let tail: String = output.chars().skip(tail_start).collect();
+    // Byte offsets found from each end, so only the kept head and tail are
+    // walked and the omitted middle is never scanned or copied.
+    let head_end = output
+        .char_indices()
+        .nth(TOOL_RESULT_HEAD_CHARS)
+        .map_or(output.len(), |(index, _)| index);
+    let tail_begin = if output_chars <= TOOL_RESULT_TAIL_CHARS {
+        0
+    } else {
+        output
+            .char_indices()
+            .rev()
+            .nth(TOOL_RESULT_TAIL_CHARS - 1)
+            .map_or(0, |(index, _)| index)
+    };
+    let head = &output[..head_end];
+    let tail = &output[tail_begin..];
     let omitted = output_chars.saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
 
     format!(
@@ -3335,5 +3349,53 @@ mod memory_placement_tests {
         assert_eq!(legacy.memory_placement, MemoryPlacement::LegacySystem);
         value["memory_placement"] = serde_json::json!("permit");
         assert!(serde_json::from_value::<Session>(value).is_err());
+    }
+}
+
+#[cfg(test)]
+mod truncated_output_format_tests {
+    use super::*;
+
+    /// The original char-iterator formulation the byte-slicing one must equal.
+    fn reference(output: &str, output_chars: usize, notice: &str) -> String {
+        let head: String = output.chars().take(TOOL_RESULT_HEAD_CHARS).collect();
+        let tail_start = output_chars.saturating_sub(TOOL_RESULT_TAIL_CHARS);
+        let tail: String = output.chars().skip(tail_start).collect();
+        let omitted = output_chars.saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
+        format!(
+            "{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n{notice}\n\n{tail}"
+        )
+    }
+
+    #[test]
+    fn byte_sliced_truncation_equals_the_char_iterator_form() {
+        let total = TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS;
+        for len in [
+            0,
+            1,
+            TOOL_RESULT_HEAD_CHARS,
+            TOOL_RESULT_TAIL_CHARS - 1,
+            TOOL_RESULT_TAIL_CHARS,
+            TOOL_RESULT_TAIL_CHARS + 1,
+            total - 1,
+            total,
+            total + 1,
+            total + 5_000,
+        ] {
+            for unit in ["a", "é", "日", "😀"] {
+                let output = unit.repeat(len);
+                assert_eq!(
+                    format_truncated_tool_output_with_notice(&output, len, "n"),
+                    reference(&output, len, "n"),
+                    "{len} x {unit}"
+                );
+            }
+        }
+        let mixed: String = (0..30_000).map(|i| ["x", "ß", "字", "🦀"][i % 4]).collect();
+        let chars = mixed.chars().count();
+        assert_eq!(
+            format_truncated_tool_output_with_notice(&mixed, chars, "n"),
+            reference(&mixed, chars, "n")
+        );
     }
 }

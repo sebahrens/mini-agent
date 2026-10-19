@@ -112,8 +112,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
 
         let session_id = self.session_id.to_string();
         let tool_name_owned = tool_name.to_owned();
-        let output = result.to_owned();
-        let output_for_write = output.clone();
+        let output: Arc<str> = Arc::from(result);
+        let output_for_write = Arc::clone(&output);
         let saved = spawn_blocking_scoped(move || {
             crate::session::storage::save_tool_output(
                 &session_id,
@@ -238,6 +238,17 @@ struct ToolLoopState {
     failures: HashMap<ToolCallFingerprint, u32>,
     recent_successful_edits: VecDeque<ToolCallFingerprint>,
     blocked_edit_pair: Option<[ToolCallFingerprint; 2]>,
+    /// Fingerprints computed at `ToolCall`, keyed by the call's internal id and
+    /// tagged with a cheap hash of the raw argument text, so `ToolResult`
+    /// reuses them instead of parsing and canonically hashing the args again.
+    pending: HashMap<String, (u64, ToolCallFingerprint)>,
+}
+
+fn raw_args_hash(args: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    args.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl ToolLoopState {
@@ -319,10 +330,17 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
     async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
             StepEvent::ToolCall {
-                tool_name, args, ..
+                tool_name,
+                args,
+                internal_call_id,
+                ..
             } => {
                 let fingerprint = tool_call_fingerprint(tool_name, args);
+                let raw = raw_args_hash(args);
                 let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                    state
+                        .pending
+                        .insert(internal_call_id.to_owned(), (raw, fingerprint));
                     state.exact_failure_notice(fingerprint).or_else(|| {
                         (tool_name == "edit")
                             .then(|| state.alternating_edit_notice(fingerprint))
@@ -342,7 +360,15 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 if outcome.is_error() || outcome.is_denied() {
                     record_tool_failure(internal_call_id);
                 }
-                let fingerprint = tool_call_fingerprint(tool_name, args);
+                let raw = raw_args_hash(args);
+                let cached = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                    state
+                        .pending
+                        .remove(internal_call_id)
+                        .filter(|(cached_raw, _)| *cached_raw == raw)
+                        .map(|(_, fingerprint)| fingerprint)
+                });
+                let fingerprint = cached.unwrap_or_else(|| tool_call_fingerprint(tool_name, args));
                 let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
                     state.record_result(tool_name, fingerprint, outcome)
                 });
@@ -360,8 +386,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
 }
 
 pub(crate) fn is_tool_loop_notice(output: &str) -> bool {
-    output.starts_with(TOOL_LOOP_NOTICE_PREFIX)
-        || output.contains(&format!("\n\n{TOOL_LOOP_NOTICE_PREFIX}"))
+    const SUFFIX_NEEDLE: &str = concat!("\n\n", "[tool-loop detected]");
+    output.starts_with(TOOL_LOOP_NOTICE_PREFIX) || output.contains(SUFFIX_NEEDLE)
 }
 
 #[derive(Clone)]
@@ -6087,6 +6113,19 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(repeated.to_string().contains("already read"));
+    }
+
+    #[test]
+    fn tool_loop_notice_detection_matches_prefix_and_suffix_forms() {
+        let notice = super::TOOL_LOOP_NOTICE_PREFIX;
+        assert!(super::is_tool_loop_notice(&format!("{notice} stop")));
+        assert!(super::is_tool_loop_notice(&format!(
+            "result\n\n{notice} stop"
+        )));
+        assert!(!super::is_tool_loop_notice(&format!(
+            "result {notice} inline"
+        )));
+        assert!(!super::is_tool_loop_notice("plain result"));
     }
 
     #[test]
