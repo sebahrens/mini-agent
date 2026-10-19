@@ -11,6 +11,7 @@ use super::draw_picker_rows;
 const BASE_COMMANDS: &[&str] = &[
     "/add",
     "/agent",
+    "/bottom",
     "/btw",
     "/clear",
     "/compress",
@@ -54,6 +55,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/steer",
     "/theme",
     "/toggle",
+    "/top",
     "/tutor",
     "/undo",
     "/vim",

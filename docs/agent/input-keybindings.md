@@ -19,6 +19,13 @@ existing context-dependent behavior. Picker, approval, Question, plan and Git
 confirmation choices retain their raw operator keys; configuration never
 synthesizes an approval. Keyboard preferences require project config trust.
 
+Transcript navigation actions: `page_up` (`pageup`, `alt+up`), `page_down`
+(`pagedown`, `alt+down`), `transcript_top` (`ctrl+home`, `alt+shift+up`, `alt+<`)
+and `transcript_bottom` (`ctrl+end`, `alt+shift+down`, `alt+>`). The Alt chords
+serve keyboards without PageUp/PageDown/Home/End. Alt+Up/Down used to fall
+through to the editor as plain Up/Down; Alt+Left/Right word motions and every
+Vim binding are unchanged. The permission prompt uses the same default table.
+
 Vim starts in Insert mode when enabled. Escape enters Normal mode; `hjkl`,
 `w`, `b`, `0`, `$`, `x`, `dd`, `u`, `i`, `a`, `I` and `A` affect only the input
 draft. `/` collects a literal search of at most 256 bytes; Enter finds the next

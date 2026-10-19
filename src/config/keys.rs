@@ -253,6 +253,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("statusline").described("Configurable status-bar (up to 3 lines). When absent, a built-in default layout is used.").shaped(ConfigShape::Object),
     key("chat_left_margin").described("Left padding (columns) for the chat area. Default: 0.").shaped(ConfigShape::Integer),
     key("mouse_capture").described("Capture mouse events in the TUI (wheel scrolling, click-to-place-cursor, link opening, drag-to-copy). `false` leaves the mouse to the terminal so its native selection works. Default: true.").shaped(ConfigShape::Bool),
+    key("mouse_scroll_lines").described("Transcript lines scrolled per plain mouse-wheel notch (1..=20); Shift/Ctrl + wheel scrolls a page per notch. Only used while `mouse_capture` is on. Default: 1.").shaped(ConfigShape::Integer),
     key("terminal_title").described("Report agent activity in the terminal/window title (`mini-agent: working`, `waiting for approval`, `idle`) so terminal multiplexers and tab bars can show it; the previous title is…").shaped(ConfigShape::Bool),
     key("terminal_notify").described("Desktop notification escape (`osc9`, `osc777`) emitted when a turn finishes or a permission prompt waits. Default: off.").shaped(ConfigShape::Enum(&["off", "osc9", "osc777"])),
     key("terminal_prompt_marks").described("Emit OSC 133 semantic prompt marks: a prompt while the TUI waits for input, command start while a run is active, command end when it finishes. Default: false.").shaped(ConfigShape::Bool),

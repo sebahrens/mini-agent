@@ -1390,9 +1390,12 @@ fn worktree_startup_requested(cli: &crate::cli::Cli) -> bool {
 /// actions, quit) joins it first.
 fn defers_startup_work(event: &UserEvent) -> bool {
     match event {
-        UserEvent::Paste(_) | UserEvent::ScrollUp | UserEvent::ScrollDown | UserEvent::Resize => {
-            true
-        }
+        UserEvent::Paste(_)
+        | UserEvent::ScrollUp
+        | UserEvent::ScrollDown
+        | UserEvent::ScrollPageUp
+        | UserEvent::ScrollPageDown
+        | UserEvent::Resize => true,
         UserEvent::Key(key) => {
             key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
                 && matches!(
@@ -3270,7 +3273,11 @@ impl<'a> App<'a> {
     /// stop a batch and are handled (and painted) individually.
     fn coalescible_user_event(&self, event: &UserEvent) -> bool {
         match event {
-            UserEvent::ScrollUp | UserEvent::ScrollDown | UserEvent::MouseDrag { .. } => true,
+            UserEvent::ScrollUp
+            | UserEvent::ScrollDown
+            | UserEvent::ScrollPageUp
+            | UserEvent::ScrollPageDown
+            | UserEvent::MouseDrag { .. } => true,
             // An empty paste reads the clipboard image instead.
             UserEvent::Paste(text) => !text.is_empty(),
             UserEvent::Key(key) => {
@@ -3490,16 +3497,22 @@ impl<'a> App<'a> {
             }
             UserEvent::ScrollUp => {
                 if !self.renderer.input_scroll_up() {
-                    self.renderer.scroll_line_up();
+                    for _ in 0..self.ui.cfg.resolve_mouse_scroll_lines() {
+                        self.renderer.scroll_line_up();
+                    }
                 }
             }
             UserEvent::ScrollDown => {
                 if self.renderer.is_scrolling() {
-                    self.renderer.scroll_line_down();
+                    for _ in 0..self.ui.cfg.resolve_mouse_scroll_lines() {
+                        self.renderer.scroll_line_down();
+                    }
                 } else {
                     self.renderer.input_scroll_down();
                 }
             }
+            UserEvent::ScrollPageUp => self.renderer.scroll_page_up(),
+            UserEvent::ScrollPageDown => self.renderer.scroll_page_down(),
             UserEvent::MouseDown { row, col } => {
                 if let Some(pos) =
                     self.renderer
@@ -5331,7 +5344,15 @@ impl<'a> App<'a> {
         }
         // Display-only controls remain available while approval owns input.
         if (key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL))
-            || matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            || matches!(
+                self.keyboard_action(key),
+                Some(
+                    KeyAction::PageUp
+                        | KeyAction::PageDown
+                        | KeyAction::TranscriptTop
+                        | KeyAction::TranscriptBottom
+                )
+            )
             || (self.renderer.selection_active
                 && matches!(key.code, KeyCode::Char('y') | KeyCode::Esc))
         {
@@ -10217,6 +10238,92 @@ mod permission_loop_tests {
                 .unwrap(),
             ControlFlow::Break(())
         ));
+    }
+
+    #[tokio::test]
+    async fn kbv3d_modifier_chords_and_slash_commands_navigate_the_transcript() {
+        let root = crate::tests::OwnedTestDirectory::new("kbv3d-navigation");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("nav-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        for i in 0..400 {
+            app.renderer
+                .write_line(&format!("transcript line {i}"), C_AGENT)
+                .unwrap();
+        }
+        app.renderer.render_viewport().unwrap();
+        assert!(!app.renderer.is_scrolling());
+        let alt = KeyModifiers::ALT;
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        // Alt+Up pages up and Alt+Down pages back to the live tail.
+        for (code, modifiers, scrolling) in [
+            (KeyCode::Up, alt, true),
+            (KeyCode::Down, alt, false),
+            (KeyCode::Up, alt_shift, true),
+            (KeyCode::Down, alt_shift, false),
+            (KeyCode::Char('<'), alt, true),
+            (KeyCode::Char('>'), alt, false),
+            // Some terminals also report Shift for the `<` and `>` characters.
+            (KeyCode::Char('<'), alt_shift, true),
+            (KeyCode::Char('>'), alt_shift, false),
+        ] {
+            app.input.clear_buffer();
+            // Same result with a non-empty draft: the chords are not editor keys.
+            for c in "draft".chars() {
+                app.input.handle_paste(c.to_string().into());
+            }
+            let _ = app
+                .handle_user_event(UserEvent::Key(KeyEvent::new(code, modifiers)))
+                .await
+                .unwrap();
+            assert_eq!(
+                app.renderer.is_scrolling(),
+                scrolling,
+                "{code:?} {modifiers:?}"
+            );
+            assert_eq!(app.input.buffer, "draft", "{code:?} {modifiers:?}");
+        }
+        // Wheel events: a page notch scrolls further than a line notch.
+        let _ = app
+            .handle_user_event(UserEvent::ScrollPageUp)
+            .await
+            .unwrap();
+        assert!(app.renderer.is_scrolling());
+        let _ = app
+            .handle_user_event(UserEvent::ScrollPageDown)
+            .await
+            .unwrap();
+        assert!(!app.renderer.is_scrolling());
+        // /top and /bottom work without any navigation key.
+        app.input.clear_buffer();
+        crate::startup::heap_future(|| app.run_slash_command("/top"))
+            .await
+            .unwrap();
+        assert!(app.renderer.is_scrolling());
+        crate::startup::heap_future(|| app.run_slash_command("/bottom"))
+            .await
+            .unwrap();
+        assert!(!app.renderer.is_scrolling());
+        crate::startup::heap_future(|| app.run_slash_command("/top extra"))
+            .await
+            .unwrap();
+        assert!(!app.renderer.is_scrolling());
+        assert!(app.renderer.captured_output().contains("usage: /top"));
     }
 
     #[tokio::test]

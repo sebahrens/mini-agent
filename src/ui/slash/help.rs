@@ -83,6 +83,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     );
     emit(
         false,
+        "  /top, /bottom         scroll the transcript to its start or end (no keys needed)",
+    );
+    emit(
+        false,
         "  /vim [on|off]         toggle input Vim editing for this UI session",
     );
     emit(
@@ -451,12 +455,18 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
 fn keys_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(true, "keys:");
     emit(false, "  ? (empty input)        show these shortcuts");
-    emit(false, "  PgUp/PgDn             scroll chat history");
+    emit(
+        false,
+        "  PgUp/PgDn, Alt+Up/Down scroll chat history by a page (Shift/Ctrl+wheel too)",
+    );
     emit(
         false,
         "  Home/End               line start/end (empty input: top/bottom)",
     );
-    emit(false, "  Ctrl+Home/Ctrl+End     jump to top/bottom of chat");
+    emit(
+        false,
+        "  Ctrl+Home/Ctrl+End     jump to top/bottom of chat (also Alt+Shift+Up/Down, Alt+</Alt+>)",
+    );
     emit(
         false,
         "  /<command>             command picker (Tab insert, Enter run, Esc cancel)",

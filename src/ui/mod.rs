@@ -756,11 +756,7 @@ pub(crate) fn spawn_event_thread_with_events(
                 }
                 Ok(event::Event::Mouse(m)) => match m.kind {
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                        let scroll = if matches!(m.kind, MouseEventKind::ScrollUp) {
-                            UserEvent::ScrollUp
-                        } else {
-                            UserEvent::ScrollDown
-                        };
+                        let scroll = wheel_event(m.kind == MouseEventKind::ScrollUp, m.modifiers);
                         if user_tx.blocking_send(scroll).is_err() {
                             break;
                         }
@@ -863,6 +859,49 @@ pub(crate) enum SubmitAction {
 /// life of the thing you most want to ask about, leaving Ctrl-C as the only
 /// control. Neither spawns anything: one reads the record, the other writes a
 /// status the driver checks before it relaunches.
+/// Map one wheel notch to a user event: Shift or Ctrl + wheel pages the
+/// transcript, a plain notch scrolls by lines.
+pub(crate) fn wheel_event(up: bool, modifiers: KeyModifiers) -> UserEvent {
+    let page = modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL);
+    match (up, page) {
+        (true, false) => UserEvent::ScrollUp,
+        (false, false) => UserEvent::ScrollDown,
+        (true, true) => UserEvent::ScrollPageUp,
+        (false, true) => UserEvent::ScrollPageDown,
+    }
+}
+
+#[cfg(test)]
+mod wheel_event_tests {
+    use super::*;
+
+    #[test]
+    fn shift_or_ctrl_wheel_pages_and_a_plain_notch_scrolls_lines() {
+        for (modifiers, page) in [
+            (KeyModifiers::NONE, false),
+            (KeyModifiers::ALT, false),
+            (KeyModifiers::SHIFT, true),
+            (KeyModifiers::CONTROL, true),
+            (KeyModifiers::SHIFT | KeyModifiers::ALT, true),
+        ] {
+            assert!(
+                matches!(
+                    (wheel_event(true, modifiers), page),
+                    (UserEvent::ScrollPageUp, true) | (UserEvent::ScrollUp, false)
+                ),
+                "{modifiers:?}"
+            );
+            assert!(
+                matches!(
+                    (wheel_event(false, modifiers), page),
+                    (UserEvent::ScrollPageDown, true) | (UserEvent::ScrollDown, false)
+                ),
+                "{modifiers:?}"
+            );
+        }
+    }
+}
+
 pub(crate) fn allowed_while_running(text: &str) -> bool {
     let t = text.trim_start();
     crate::ui::slash::is_readonly_diagnostic(t)

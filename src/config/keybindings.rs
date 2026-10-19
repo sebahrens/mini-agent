@@ -96,10 +96,22 @@ const SPECS: &[ActionSpec] = &[
     app!(Eof, "eof", "ctrl+d"),
     app!(CycleMode, "cycle_mode", "shift+tab", "backtab"),
     app!(CycleReasoning, "cycle_reasoning", "ctrl+r"),
-    app!(PageUp, "page_up", "pageup"),
-    app!(PageDown, "page_down", "pagedown"),
-    app!(TranscriptTop, "transcript_top", "ctrl+home"),
-    app!(TranscriptBottom, "transcript_bottom", "ctrl+end"),
+    app!(PageUp, "page_up", "pageup", "alt+up"),
+    app!(PageDown, "page_down", "pagedown", "alt+down"),
+    app!(
+        TranscriptTop,
+        "transcript_top",
+        "ctrl+home",
+        "alt+shift+up",
+        "alt+<"
+    ),
+    app!(
+        TranscriptBottom,
+        "transcript_bottom",
+        "ctrl+end",
+        "alt+shift+down",
+        "alt+>"
+    ),
     app!(OpenEditor, "open_editor", "ctrl+g"),
     app!(Lazygit, "lazygit", "ctrl+o", "ctrl+shift+o"),
     ActionSpec {
@@ -473,6 +485,24 @@ fn legacy_default_event(key: KeyEvent, editor: bool, windows: bool) -> Option<Ke
                 event(KeyCode::Char('o'), KeyModifiers::CONTROL)
             }
             code @ (KeyCode::PageUp | KeyCode::PageDown) => event(code, KeyModifiers::NONE),
+            // Navigation chords for keyboards without PageUp/PageDown/Home/End
+            // (macOS laptops): Option+Up/Down page, Option+Shift+Up/Down and
+            // Option+< / Option+> jump. Terminals report `<`/`>` as Alt+char
+            // with or without Shift, so both are accepted.
+            code @ (KeyCode::Up | KeyCode::Down)
+                if key.modifiers == KeyModifiers::ALT
+                    || key.modifiers == (KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                event(code, key.modifiers)
+            }
+            code @ KeyCode::Char('<' | '>')
+                if alt
+                    && !ctrl
+                    && (key.modifiers == KeyModifiers::ALT
+                        || key.modifiers == (KeyModifiers::ALT | KeyModifiers::SHIFT)) =>
+            {
+                event(code, KeyModifiers::ALT)
+            }
             code @ (KeyCode::Home | KeyCode::End) if ctrl => event(code, KeyModifiers::CONTROL),
             KeyCode::BackTab
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
@@ -588,6 +618,82 @@ mod tests {
         assert_eq!(
             KeyBindings::canonical(KeyAction::LineStart),
             Some(ctrl('a'))
+        );
+    }
+
+    #[test]
+    fn kbv3d_navigation_chords_resolve_without_shadowing_editor_motions() {
+        let defaults = KeyBindings::default();
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let (alt, shift) = (KeyModifiers::ALT, KeyModifiers::SHIFT);
+        for (event, action) in [
+            (key(KeyCode::PageUp, KeyModifiers::NONE), KeyAction::PageUp),
+            (key(KeyCode::Up, alt), KeyAction::PageUp),
+            (
+                key(KeyCode::PageDown, KeyModifiers::NONE),
+                KeyAction::PageDown,
+            ),
+            (key(KeyCode::Down, alt), KeyAction::PageDown),
+            (
+                key(KeyCode::Home, KeyModifiers::CONTROL),
+                KeyAction::TranscriptTop,
+            ),
+            (key(KeyCode::Up, alt | shift), KeyAction::TranscriptTop),
+            (key(KeyCode::Char('<'), alt), KeyAction::TranscriptTop),
+            (
+                key(KeyCode::Char('<'), alt | shift),
+                KeyAction::TranscriptTop,
+            ),
+            (
+                key(KeyCode::End, KeyModifiers::CONTROL),
+                KeyAction::TranscriptBottom,
+            ),
+            (key(KeyCode::Down, alt | shift), KeyAction::TranscriptBottom),
+            (key(KeyCode::Char('>'), alt), KeyAction::TranscriptBottom),
+            (
+                key(KeyCode::Char('>'), alt | shift),
+                KeyAction::TranscriptBottom,
+            ),
+        ] {
+            assert_eq!(defaults.action(event, false), Some(action), "{event:?}");
+        }
+        // Plain and Shift arrows, Alt+Left/Right word motions and unmodified
+        // `<`/`>` are not navigation keys.
+        for event in [
+            key(KeyCode::Up, KeyModifiers::NONE),
+            key(KeyCode::Down, shift),
+            key(KeyCode::Left, alt),
+            key(KeyCode::Right, alt),
+            key(KeyCode::Char('<'), KeyModifiers::NONE),
+            key(KeyCode::Char('>'), shift),
+        ] {
+            assert_eq!(defaults.action(event, false), None, "{event:?}");
+        }
+        assert_eq!(
+            defaults.action(key(KeyCode::Left, alt), true),
+            Some(KeyAction::WordLeft)
+        );
+        assert_eq!(
+            defaults.action(key(KeyCode::Right, alt), true),
+            Some(KeyAction::WordRight)
+        );
+        // The first chord stays the canonical one used by transcript_scroll_key.
+        assert_eq!(
+            KeyBindings::canonical(KeyAction::PageUp),
+            Some(key(KeyCode::PageUp, KeyModifiers::NONE))
+        );
+        assert_eq!(
+            KeyBindings::canonical(KeyAction::TranscriptTop),
+            Some(key(KeyCode::Home, KeyModifiers::CONTROL))
+        );
+        // Users can rebind or unbind them: an empty list drops the aliases.
+        let unbound =
+            KeyBindings::from_overrides(Some(&BTreeMap::from([("page_up".into(), vec![])])))
+                .unwrap();
+        assert_eq!(unbound.action(key(KeyCode::Up, alt), false), None);
+        assert_eq!(
+            unbound.action(key(KeyCode::PageUp, KeyModifiers::NONE), false),
+            None
         );
     }
 
