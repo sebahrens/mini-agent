@@ -122,7 +122,19 @@ impl PersistedUserMessage {
             .collect::<Vec<_>>()
             .join("\n")
     }
+    /// Cheap per-save recheck. A value of this type can only be built through
+    /// `new`/deserialization, which run the full [`Self::validate`] (JSON
+    /// envelope count and base64 decode), and its blocks are private and never
+    /// mutated, so a save repeats only the O(blocks) structural limits and
+    /// never decodes an image again (mini-agent-gjuyl).
+    pub(crate) fn validate_stored(&self) -> Result<(), &'static str> {
+        self.validate_limits()
+    }
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        self.validate_limits()?;
+        self.validate_encoding()
+    }
+    fn validate_limits(&self) -> Result<(), &'static str> {
         if self.blocks.is_empty() || self.blocks.len() > MAX_USER_BLOCKS {
             return Err("user content block count is outside the supported limit");
         }
@@ -156,6 +168,9 @@ impl PersistedUserMessage {
         {
             return Err("user content exceeds its aggregate limit");
         }
+        Ok(())
+    }
+    fn validate_encoding(&self) -> Result<(), &'static str> {
         struct EncodedBytes(usize);
         impl std::io::Write for EncodedBytes {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -246,6 +261,21 @@ mod tests {
             "before 雪\nafter $HOME @file"
         );
         assert!(restored.messages[0].user.is_some());
+    }
+    // mini-agent-gjuyl: the per-save recheck keeps the structural limits but
+    // never decodes an image; construction/deserialization still do.
+    #[test]
+    fn stored_user_rows_recheck_limits_without_decoding_images() {
+        let forged = PersistedUserMessage {
+            blocks: vec![UserBlock::Image {
+                data: "not base64 !!".into(),
+                mime_type: ImageMime::Png,
+            }],
+        };
+        assert!(forged.validate().is_err());
+        assert!(forged.validate_stored().is_ok());
+        let empty = PersistedUserMessage { blocks: Vec::new() };
+        assert!(empty.validate_stored().is_err());
     }
     #[test]
     fn canonical_user53_rejects_role_projection_and_forged_tool_authority() {
