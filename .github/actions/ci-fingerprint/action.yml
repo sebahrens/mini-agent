@@ -43,14 +43,27 @@ runs:
         FP_CLASSES: ${{ inputs.classes }}
         FP_ROW: ${{ inputs.row }}
         FP_ACTION_PATH: ${{ github.action_path }}
+      continue-on-error: true
       run: |
-        py=$(command -v python3 || command -v python)
-        "$py" "$FP_ACTION_PATH/../../../scripts/ci_fingerprint.py" compute \
-          --job "$FP_JOB" --classes "$FP_CLASSES" --row "$FP_ROW"
+        # Fail open: any failure here means "no fingerprint", so the job runs.
+        # Values go in --opt=value form so a row such as --no-default-features
+        # is not mistaken for an option.
+        py=$(command -v python3 || command -v python || true)
+        if [ -z "$py" ] || ! "$py" "$FP_ACTION_PATH/../../../scripts/ci_fingerprint.py" compute \
+          --job="$FP_JOB" --classes="$FP_CLASSES" --row="$FP_ROW"; then
+          {
+            echo "read=false"
+            echo "write=false"
+            echo "fingerprint="
+            echo "key="
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::fingerprint unavailable; running the job"
+        fi
 
     - name: Look up the pass marker
       id: lookup
       if: inputs.mode == 'check' && steps.compute.outputs.read == 'true'
+      continue-on-error: true
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ${{ runner.temp }}/ci-pass-marker
@@ -60,6 +73,7 @@ runs:
     - name: Report the result
       id: result
       if: inputs.mode == 'check'
+      continue-on-error: true
       shell: bash
       env:
         HIT: ${{ steps.lookup.outputs.cache-hit }}
@@ -74,6 +88,7 @@ runs:
 
     - name: Write the pass marker
       if: inputs.mode == 'save'
+      continue-on-error: true
       shell: bash
       env:
         FP_KEY: ${{ inputs.key }}
@@ -81,10 +96,12 @@ runs:
         MARKER: ${{ runner.temp }}/ci-pass-marker
       run: |
         py=$(command -v python3 || command -v python)
-        "$py" "$FP_ACTION_PATH/../../../scripts/ci_fingerprint.py" marker "$MARKER" --key "$FP_KEY"
+        "$py" "$FP_ACTION_PATH/../../../scripts/ci_fingerprint.py" marker "$MARKER" --key="$FP_KEY" \
+          || echo "::notice::pass marker not written"
 
     - name: Save the pass marker
       if: inputs.mode == 'save' && inputs.key != ''
+      continue-on-error: true
       uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ${{ runner.temp }}/ci-pass-marker
