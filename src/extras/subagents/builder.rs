@@ -2359,6 +2359,65 @@ mod settings127_context_tests {
     }
 
     #[tokio::test]
+    async fn incremental_prepared_estimate_equals_full_serialization_across_turns() {
+        // Wide characters in the preamble and a growing history: every call's
+        // incremental estimate must equal the full-serialization estimate.
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("inc-1", "context_probe", serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::tool_call("inc-2", "context_probe", serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("日本語の応答 ok"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .preamble("日本語のプロンプト small")
+            .max_tokens(2048)
+            .tool(MockExtensionsProbeTool::default())
+            .default_max_turns(6)
+            .add_hook(ChildContextGuard { window: 1_000_000 })
+            .build();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let admission = crate::agent::runner::SubagentAdmission::new(|| true, {
+            let observed = observed.clone();
+            move |_, fallback| observed.lock().unwrap().push(fallback.input_tokens)
+        });
+        let ledger = crate::agent::runner::SharedUsageLedger::default().with_admission(admission);
+        let probe = SerializationProbe::default();
+        let mut stream = agent
+            .stream_chat("brief", Vec::<rig::completion::Message>::new())
+            .add_hook(ledger.clone())
+            .add_hook(probe.clone())
+            .await;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(rig::agent::MultiTurnStreamItem::CompletionCall(call)) => {
+                    ledger.record_completion(call.usage)
+                }
+                Ok(_) => {}
+                Err(error) => panic!("unexpected stream error: {error}"),
+            }
+        }
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3);
+        let fallbacks = observed.lock().unwrap().clone();
+        assert_eq!(fallbacks.len(), 3);
+        for (input, request) in fallbacks.into_iter().zip(requests.iter()) {
+            assert_eq!(
+                input,
+                crate::session::Session::estimate_tokens(&serde_json::to_string(request).unwrap())
+            );
+        }
+        assert_eq!(*probe.0.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
     async fn subagent127_prepared_context_counts_history_tools_and_reserved_output_before_dispatch()
     {
         for (window, max_tokens, preamble, history, expected_calls) in [

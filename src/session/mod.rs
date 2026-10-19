@@ -1285,6 +1285,14 @@ impl Session {
     }
 
     pub fn estimate_tokens(text: &str) -> u64 {
+        let (wide, narrow) = Self::char_counts(text);
+        Self::estimate_tokens_from_counts(wide, narrow)
+    }
+
+    /// `(wide, narrow)` character counts of `text`; additive over
+    /// concatenation, so an estimate of joined pieces can be built from
+    /// per-piece counts without re-scanning the pieces.
+    pub(crate) fn char_counts(text: &str) -> (u64, u64) {
         let mut wide: u64 = 0;
         let mut narrow: u64 = 0;
         for ch in text.chars() {
@@ -1294,6 +1302,10 @@ impl Session {
                 narrow += 1;
             }
         }
+        (wide, narrow)
+    }
+
+    pub(crate) fn estimate_tokens_from_counts(wide: u64, narrow: u64) -> u64 {
         // Wide text remains close to one token per character. For narrow text,
         // 4 chars/token undercounts code and JSON before provider calibration;
         // 13/4 (3.25 chars/token) is a deliberate conservative midpoint of the

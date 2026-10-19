@@ -4413,6 +4413,25 @@ impl<'a> App<'a> {
         };
         let mid_turn_pressure =
             mid_turn_observation.filter(|(_, threshold, pressure)| pressure > threshold);
+        if awaits_compaction_decision
+            && let Some(decision_tx) = self.run.compaction_decision_tx.as_ref()
+        {
+            // Tell the runner when it may skip parking for this boundary: only
+            // a completion above the threshold can end in Compact or a stop.
+            decision_tx.publish_gate(if mid_turn_observation.is_some() {
+                crate::agent::runner::CompactionPressureGate::Limit {
+                    window: self.ui.session.context_window,
+                    threshold: self
+                        .ui
+                        .cfg
+                        .resolve_mid_turn_compact_threshold()
+                        .unwrap_or(0.0),
+                    anthropic_native: self.ui.cfg.is_anthropic_native(&self.ui.session.provider),
+                }
+            } else {
+                crate::agent::runner::CompactionPressureGate::Off
+            });
+        }
 
         // Preserve an interrupted turn once the model or a tool made observable
         // progress. Only a zero-progress failure restores the prompt and the
@@ -4520,6 +4539,16 @@ impl<'a> App<'a> {
         // On irreducible pressure, leave the runner parked on its decision
         // receive and abort it below; acknowledging Continue would race the
         // hard stop against the next tool batch.
+        // Learn, in event order, whether the runner waited for this boundary,
+        // and raise the stop barrier before anything else can let it proceed.
+        if awaits_compaction_decision
+            && let Some(decision_tx) = self.run.compaction_decision_tx.as_ref()
+        {
+            decision_tx.take_parked();
+            if pressure_action == MidTurnPressureAction::StopContextExhausted {
+                decision_tx.request_stop();
+            }
+        }
         if awaits_compaction_decision
             && pressure_action != MidTurnPressureAction::StopContextExhausted
             && let Some(decision_tx) = self.run.compaction_decision_tx.as_ref()
@@ -6302,6 +6331,11 @@ impl<'a> App<'a> {
         // user-event/event-loop polling frame, including unrelated commands.
         let prior_question_session = self.ui.session.id.clone();
         let had_pending_question = self.ui.session.pending_question.is_some();
+        if let Some(decision_tx) = self.run.compaction_decision_tx.as_ref() {
+            // A command may change the model or window the runner's pressure
+            // gate was published for.
+            decision_tx.invalidate_gate();
+        }
         let result = crate::startup::heap_future(|| {
             crate::ui::slash::handle_slash(
                 text,
@@ -6619,6 +6653,9 @@ impl<'a> App<'a> {
         }
         if let Some(model) = &template.model {
             let model_command = format!("/model {model}");
+            if let Some(decision_tx) = self.run.compaction_decision_tx.as_ref() {
+                decision_tx.invalidate_gate();
+            }
             let result = crate::startup::heap_future(|| {
                 crate::ui::slash::handle_slash(
                     &model_command,
