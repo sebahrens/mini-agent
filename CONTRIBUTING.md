@@ -33,6 +33,14 @@ cargo install --path . --debug # the development build/install command
 - CI also runs `cargo clippy --locked --all-targets -- -D warnings` across a matrix of feature rows
   (see `.github/workflows/ci.yml`). Code must compile warning-free with default features and with
   `--no-default-features`; gate optional code behind its owning feature.
+- CI cost policy (enforced by `scripts/tests/test_phase6_ci_workflow.py`): the `test` job runs the
+  full feature matrix on Linux but only the platform rows on macOS (default, `sandbox`, `js`,
+  `js,sandbox` and the two `hooks` rows), because a macOS minute costs ten Linux minutes. The plain
+  compile jobs (`clippy`, `test`, `all-features`, `parallel-test-smoke`, `mcp-stdio`,
+  `lsp-lifecycle`, `windows-default-compile`, `windows-hooks-compile`) restore a compiled-dependency
+  cache keyed by OS, runner image (`ImageOS`), feature row, toolchain and `Cargo.lock`. The Phase 6
+  containment gates run with `cache: false` so their evidence is clean-room, and the native Linux
+  gate keeps its own `ubuntu-22.04`-partitioned cache.
 - Dependency changes go only in the root `Cargo.toml` and `Cargo.lock`. Reuse existing dependencies
   instead of adding a second version, and keep optional or platform-specific dependencies behind
   their feature or target.

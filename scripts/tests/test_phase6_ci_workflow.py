@@ -141,6 +141,43 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertEqual(cache_key.group(1), runner)
         self.assertNotIn("cache-shared-key:", rust)
 
+    CACHED_COMPILE_JOBS = (
+        "clippy", "test", "all-features", "parallel-test-smoke",
+        "windows-default-compile", "windows-hooks-compile", "mcp-stdio", "lsp-lifecycle",
+    )
+    CLEAN_ROOM_CONTAINMENT_JOBS = (
+        "macos-worker-containment-gate", "windows-worker-containment-gate",
+        "windows-general-sandbox-policy", "phase6-cross-platform-gate",
+    )
+
+    def test_compile_jobs_cache_dependencies_partitioned_by_image_and_row(self) -> None:
+        for name in self.CACHED_COMPILE_JOBS:
+            with self.subTest(job=name):
+                body = job_body(self.workflow, name)
+                derive = body.split("- name: Derive the compiled-dependency cache key\n", 1)[1]
+                derive = derive.split("\n      - name:", 1)[0]
+                self.assertIn("id: cache-key", derive)
+                # OS, runner image (ImageOS) and the feature row are all in the key.
+                self.assertIn("${RUNNER_OS}-${ImageOS:-unknown}-", derive)
+                self.assertIn("CACHE_ROW: ${{ matrix.features }}", derive)
+                self.assertLess(
+                    body.index("Derive the compiled-dependency cache key"),
+                    body.index("- name: Install Rust"),
+                )
+                rust = body.split("- name: Install Rust\n", 1)[1].split("\n      - name:", 1)[0]
+                self.assertIn("cache-key: ${{ steps.cache-key.outputs.key }}", rust)
+                self.assertNotIn("cache-shared-key:", rust)
+                self.assertNotRegex(rust, r"(?m)^          cache: false")
+
+    def test_containment_gates_stay_uncached_for_clean_room_evidence(self) -> None:
+        for name in self.CLEAN_ROOM_CONTAINMENT_JOBS:
+            with self.subTest(job=name):
+                body = job_body(self.workflow, name)
+                rust = body.split("- name: Install Rust\n", 1)[1].split("\n      - name:", 1)[0]
+                self.assertRegex(rust, r"(?m)^          cache: false$")
+                self.assertNotIn("cache-key:", rust)
+                self.assertNotIn("actions/cache@", body)
+
     def test_native_workspace_names_match_the_actual_defining_sources(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
         step = linux.split("- name: Test native Linux workspace real paths and snapshot authority", 1)[1].split("- name:", 1)[0]
