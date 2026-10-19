@@ -175,7 +175,15 @@ fn guarded_asks_for_write_and_bash() {
     // Bash: no default rule matches (it's a different pattern)
     assert!(matches!(checker.check("bash", "wget"), CheckResult::Ask));
     // Only byte-for-byte exact Bash allow rules apply.
-    assert!(matches!(checker.check("bash", "ls -la"), CheckResult::Ask));
+    assert!(matches!(
+        checker.check("bash", "touch notes.txt"),
+        CheckResult::Ask
+    ));
+    // Read-only scripts are auto-allowed in standard mode (permission::readonly_shell).
+    assert!(matches!(
+        checker.check("bash", "ls -la"),
+        CheckResult::Allowed
+    ));
     assert!(matches!(checker.check("bash", "ls **"), CheckResult::Ask));
     assert!(matches!(checker.check("bash", "pwd"), CheckResult::Allowed));
 }
@@ -749,7 +757,15 @@ fn standard_deny_still_works_for_non_path_tools() {
 #[test]
 fn standard_allows_configured_bash_commands() {
     let mut checker = make_checker(SecurityMode::Standard);
-    assert!(matches!(checker.check("bash", "ls -la"), CheckResult::Ask));
+    assert!(matches!(
+        checker.check("bash", "touch notes.txt"),
+        CheckResult::Ask
+    ));
+    // Read-only scripts are auto-allowed in standard mode (permission::readonly_shell).
+    assert!(matches!(
+        checker.check("bash", "ls -la"),
+        CheckResult::Allowed
+    ));
     assert!(matches!(
         checker.check("bash", "git status"),
         CheckResult::Allowed
@@ -2599,12 +2615,10 @@ fn explicit_shell_prefix_grants_validate_complete_commands_and_deny_precedence()
         for command in [
             "git status; rm -rf /",
             "git status && printf bad",
-            "git status | cat",
             "git status\nrm -rf /",
             "git status > log",
             "git status $(id)",
             "git status @args",
-            "git status \"--short\"",
             "git statusx",
             "gitx status",
         ] {
@@ -2619,7 +2633,7 @@ fn explicit_shell_prefix_grants_validate_complete_commands_and_deny_precedence()
             CheckResult::Denied(_)
         ));
         assert_eq!(
-            checker.check(tool, "git status --verbose"),
+            checker.check(tool, "git commit --verbose"),
             CheckResult::Ask
         );
     }
