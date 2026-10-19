@@ -31,7 +31,7 @@ thread_local! {
     static ENV_ROLE: std::cell::Cell<Option<EnvRole>> = const { std::cell::Cell::new(None) };
 }
 
-fn is_test_thread() -> bool {
+pub(crate) fn is_test_thread() -> bool {
     let current = std::thread::current();
     matches!(current.name(), Some(name) if name == "main" || name.contains("::"))
 }

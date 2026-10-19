@@ -120,6 +120,22 @@ pub(crate) mod dispatcher_guard {
 
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    thread_local! {
+        static OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// True when another test's guard is live and the calling thread is a
+    /// different libtest test thread: that test must see no dispatcher, as it
+    /// would in isolation, instead of running the owner's hooks. Helper threads
+    /// (runtime workers) cannot be attributed and keep seeing it.
+    pub(crate) fn hidden_from_current_thread() -> bool {
+        HELD.load(std::sync::atomic::Ordering::Acquire)
+            && !OWNER.with(std::cell::Cell::get)
+            && crate::tests::is_test_thread()
+    }
+
     /// Held for the lifetime of a dispatcher-touching test; resets the
     /// process-global dispatcher on drop.
     pub(crate) struct DispatcherGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
@@ -127,12 +143,17 @@ pub(crate) mod dispatcher_guard {
     /// Acquire exclusive access to the process-global hook dispatcher.
     pub(crate) fn acquire() -> DispatcherGuard {
         let lock = LOCK.get_or_init(|| Mutex::new(()));
-        DispatcherGuard(lock.lock().unwrap_or_else(|e| e.into_inner()))
+        let guard = DispatcherGuard(lock.lock().unwrap_or_else(|e| e.into_inner()));
+        OWNER.with(|owner| owner.set(true));
+        HELD.store(true, std::sync::atomic::Ordering::Release);
+        guard
     }
 
     impl Drop for DispatcherGuard {
         fn drop(&mut self) {
             crate::extras::hooks::reset_dispatcher();
+            HELD.store(false, std::sync::atomic::Ordering::Release);
+            OWNER.with(|owner| owner.set(false));
         }
     }
 }

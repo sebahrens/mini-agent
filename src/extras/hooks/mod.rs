@@ -227,6 +227,10 @@ pub(crate) fn init_dispatcher(dispatcher: dispatcher::HookDispatcher) {
 }
 
 pub(crate) fn get_dispatcher() -> Option<std::sync::Arc<dispatcher::HookDispatcher>> {
+    #[cfg(test)]
+    if crate::tests::fake_model::dispatcher_guard::hidden_from_current_thread() {
+        return None;
+    }
     DISPATCHER.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
