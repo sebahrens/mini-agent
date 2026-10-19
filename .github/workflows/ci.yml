@@ -503,6 +503,28 @@ jobs:
           - "--no-default-features --features hooks,js,subagents,skills,sandbox"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
+        # macOS runs only the rows that reach platform code: the default build,
+        # sandbox (Seatbelt), the JS worker rows, and the hooks rows (process
+        # launch and termination). The remaining rows are platform-independent
+        # cfg/feature-graph checks that the Linux rows already prove, and a
+        # macOS minute costs ten Linux minutes. Linux keeps the full matrix.
+        exclude:
+          - os: macos-latest
+            features: "--no-default-features"
+          - os: macos-latest
+            features: "--no-default-features --features memory"
+          - os: macos-latest
+            features: "--no-default-features --features skills"
+          - os: macos-latest
+            features: "--no-default-features --features mcp"
+          - os: macos-latest
+            features: "--no-default-features --features acp"
+          - os: macos-latest
+            features: "--no-default-features --features goal"
+          - os: macos-latest
+            features: "--no-default-features --features js,skills"
+          - os: macos-latest
+            features: "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:

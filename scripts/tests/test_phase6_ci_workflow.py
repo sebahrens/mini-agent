@@ -591,6 +591,32 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     r"(?s)(?:for|foreach).+skills.+cargo test",
                 )
 
+    def test_macos_runs_only_platform_feature_rows(self) -> None:
+        header = job_body(self.workflow, "test").split("    steps:\n", 1)[0]
+        self.assertIn("os: [ubuntu-latest, macos-latest]", header)
+        exclude = header.split("        exclude:\n", 1)[1].split("    runs-on:", 1)[0]
+        pairs = re.findall(
+            r'- os: (\S+)\n\s+features: "([^"]*)"', exclude
+        )
+        self.assertTrue(pairs)
+        # Linux keeps the full matrix: nothing may be excluded for it.
+        self.assertEqual({os_name for os_name, _ in pairs}, {"macos-latest"})
+        all_rows = set(self.matrix_features(job_body(self.workflow, "test")))
+        excluded = {features for _, features in pairs}
+        self.assertLess(excluded, all_rows)
+        remaining = all_rows - excluded
+        self.assertEqual(
+            remaining,
+            {
+                "",
+                "--no-default-features --features sandbox",
+                "--no-default-features --features js",
+                "--no-default-features --features js,sandbox",
+                "--no-default-features --features hooks,advisor,lsp,multimodal,pdf",
+                "--no-default-features --features hooks,js,subagents,skills,sandbox",
+            },
+        )
+
     def test_matrix_isolates_process_global_worker_and_skill_tests(self) -> None:
         body = job_body(self.workflow, "test")
         full_path = (
