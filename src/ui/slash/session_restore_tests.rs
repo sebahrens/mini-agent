@@ -231,9 +231,11 @@ async fn exercise_replacement(provider_changed: bool, foreign: bool) {
     ]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    // The CLI key is scoped to the startup provider, so the replacement
+    // provider carries its own designated credential.
     let cfg: Config = serde_json::from_value(json!({"custom_providers": {
         "replacement-fixture": {"provider_type":"openai", "base_url":endpoint, "api_style":"completions"}
-    }})).unwrap();
+    }, "api_keys": {"replacement-fixture": "unused-test-key"}})).unwrap();
     let mut context = ContextFiles {
         #[cfg(feature = "mcp")]
         mcp_discovery: Default::default(),

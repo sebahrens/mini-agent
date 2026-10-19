@@ -583,6 +583,32 @@ impl AgentDefinition {
         (!notices.is_empty()).then(|| notices.join("\n"))
     }
 
+    /// Pinned child settings worth showing the model: write mode and the
+    /// frontmatter `model:` string (raw id or quick-model alias), bounded.
+    #[cfg(any(test, feature = "subagents"))]
+    fn schema_annotation(&self) -> String {
+        let mut parts = Vec::new();
+        if self.mode.as_deref() == Some("write") {
+            parts.push("mode: write".to_string());
+        }
+        if let Some(model) = self
+            .model
+            .as_deref()
+            .map(|model| model.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|model| !model.is_empty())
+        {
+            parts.push(format!(
+                "model: {}",
+                model.chars().take(64).collect::<String>()
+            ));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", parts.join(", "))
+        }
+    }
+
     #[cfg(any(test, feature = "subagents"))]
     fn one_line_description(&self) -> String {
         if let Some(description) = &self.description {
@@ -1234,9 +1260,12 @@ fn described_names(agents: &HashMap<String, AgentDefinition>) -> Vec<(String, St
 }
 
 #[cfg(feature = "subagents")]
+/// `(name, annotation, description)` per specialist. The annotation is empty
+/// for a plain persona, else `[mode: write, model: <frontmatter value>]`
+/// (mini-agent-7q04e): the frontmatter strings only, never a resolved secret.
 pub(crate) fn available_schema_entries_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, String)> {
     let agents = match workspace {
         Some(workspace) => shared_for_workspace_binding(workspace),
         None => std::sync::Arc::new(load()),
@@ -1258,7 +1287,7 @@ pub(crate) fn available_schema_entries_for_workspace(
                         .join(", ")
                 ));
             }
-            (name, description)
+            (name, definition.schema_annotation(), description)
         })
         .collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
@@ -1319,6 +1348,18 @@ pub(crate) fn source_hint_for_workspace(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn schema_annotation_shows_pinned_model_and_write_mode_only() {
+        let plain = parse_for_test("plain", "---\ndescription: Reads code.\n---\nBody.");
+        assert_eq!(plain.schema_annotation(), "");
+        let pinned = parse_for_test("pinned", "---\nmodel: fast\nmode: write\n---\nBody.");
+        assert_eq!(pinned.schema_annotation(), " [mode: write, model: fast]");
+        let model_only = parse_for_test("m", "---\nmodel: vendor/raw-id\n---\nBody.");
+        assert_eq!(model_only.schema_annotation(), " [model: vendor/raw-id]");
+        let design = parse_for_test("d", "---\nmode: design\n---\nBody.");
+        assert_eq!(design.schema_annotation(), "");
+    }
 
     fn isolated_paths(root: &Path) -> crate::paths::AppPaths {
         crate::paths::AppPaths {

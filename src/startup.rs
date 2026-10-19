@@ -1513,7 +1513,7 @@ impl Startup {
                 &self.provider,
                 &self.client,
                 &self.cfg,
-                self.cli.api_key.as_deref(),
+                &self.cli.scoped_api_key(&self.cfg),
             ) {
                 Ok(client) => Some(client),
                 Err(error) => {
@@ -1829,7 +1829,7 @@ impl Startup {
         if self.client.provider_name() != self.provider.as_str() {
             match provider::create_client(
                 &self.provider,
-                self.cli.api_key.as_deref(),
+                self.cli.api_key_for(&self.cfg, &self.provider),
                 self.cfg.custom_providers_map(),
                 self.cfg.api_keys.as_ref(),
             ) {

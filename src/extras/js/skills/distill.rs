@@ -835,7 +835,7 @@ async fn generalize_package(
     let model_name = cli.resolve_model(cfg);
     let client = provider::create_client(
         &provider_name,
-        cli.api_key.as_deref(),
+        cli.api_key_for(cfg, &provider_name),
         cfg.custom_providers_map(),
         cfg.api_keys.as_ref(),
     )

@@ -437,7 +437,10 @@ The `agent_type` schema is generated when the task tool is built. Its enum lists
 the definitions resolved for the active workspace, and its description gives a
 bounded one-line summary from `description` or, when absent, each persona's
 first paragraph. Unknown names are still rejected with the current valid-name
-list. Unknown frontmatter keys are ignored for forward compatibility, logged,
+list. A persona that pins `model:` or `mode: write` is annotated as
+`name [mode: write, model: <value>]` (frontmatter text only, no resolved
+credential), and the description states that the child model and write mode come
+from the persona definition. Unknown frontmatter keys are ignored for forward compatibility, logged,
 and surfaced in the task result so typos cannot silently change behavior.
 
 The same resolved definitions can specialize the main loop. `/agent` lists
@@ -606,15 +609,20 @@ model id in `model:` stays on the parent's provider.
 - Write children run one at a time even with `task_max_concurrency` above one,
   so independent implementation steps are serialized. Parallel isolation is
   tracked in bead `mini-agent-9pnc5`.
-- The effective model and mode of each child are not yet shown in the task
-  result or `/agent` output; visibility is tracked in `mini-agent-7q04e`.
+- The task tool's `agent_type` description shows each persona's pinned
+  `model:` and write mode, for example `implementer [mode: write, model: glm]`,
+  so the model can see that a child model is chosen by the persona definition.
+  The effective model of a finished child is still not echoed in the task
+  result or `/agent` output.
 - The `glm` provider is credential-isolated (see
   [Custom provider credentials](CONFIG.md#custom-provider-credentials)): it
   uses only `EXAMPLE_GLM_API_KEY` or `api_keys.glm`, never `OPENAI_API_KEY`.
-  An explicit `--api-key` takes priority over that isolation for every provider
-  the session starts, including `glm`, so supply the keys through environment
-  variables when the pipeline spans several endpoints. If the key is missing the
-  task fails with `could not initialize provider 'glm'` instead of falling back.
+  An explicit `--api-key` is scoped to the session provider it was given for:
+  a persona child that switches to another provider, including `glm`, never
+  receives it and resolves that provider's own credential instead. Supply the
+  keys of the other endpoints through their environment variables or
+  `api_keys`. If the key is missing the task fails with
+  `could not initialize provider 'glm'` instead of falling back.
 
 ## What the Subagent Can Do
 

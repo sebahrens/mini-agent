@@ -166,7 +166,7 @@ impl SlashCtx<'_> {
         let next_client = if provider_changed {
             crate::provider::create_client(
                 &session.provider,
-                self.cli.api_key.as_deref(),
+                self.cli.api_key_for(self.cfg, &session.provider),
                 self.cfg.custom_providers_map(),
                 self.cfg.api_keys.as_ref(),
             )?
@@ -211,7 +211,7 @@ impl SlashCtx<'_> {
     pub fn switch_client(&mut self, provider: &str) -> anyhow::Result<()> {
         let client = crate::provider::create_client(
             provider,
-            self.cli.api_key.as_deref(),
+            self.cli.api_key_for(self.cfg, provider),
             self.cfg.custom_providers_map(),
             self.cfg.api_keys.as_ref(),
         )?;
@@ -324,7 +324,7 @@ pub(crate) async fn apply_prompt_model(
     if provider_changed {
         match crate::provider::create_client(
             &qmc.provider,
-            ui.cli.api_key.as_deref(),
+            ui.cli.api_key_for(ui.cfg, &qmc.provider),
             ui.cfg.custom_providers_map(),
             ui.cfg.api_keys.as_ref(),
         ) {

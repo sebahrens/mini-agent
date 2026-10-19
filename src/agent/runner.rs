@@ -7514,6 +7514,7 @@ mod tests {
         let configured = crate::extras::subagents::SubagentConfig {
             client,
             provider_name: "openrouter".into(),
+            session_provider: "openrouter".into(),
             model_name: "fixture".into(),
             fallback_notice: None,
             api_key: None,

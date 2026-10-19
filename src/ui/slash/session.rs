@@ -146,7 +146,7 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     session.overhead_parts = parts;
     let new_client = match crate::provider::create_client(
         &session.provider,
-        ctx.cli.api_key.as_deref(),
+        ctx.cli.api_key_for(ctx.cfg, &session.provider),
         ctx.cfg.custom_providers_map(),
         ctx.cfg.api_keys.as_ref(),
     ) {
