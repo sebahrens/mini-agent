@@ -223,6 +223,72 @@ pub(crate) fn resolve_execution_authority(
     })
 }
 
+/// Every input that determines the configured (pre-degradation) sandbox. Two
+/// equal keys build interchangeable sandboxes, which lets startup reuse the one
+/// its validation probe already built instead of constructing it again.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ConfiguredSandboxKey {
+    enabled: bool,
+    backend: String,
+    profile: crate::sandbox::SandboxProfile,
+    read_roots: Vec<std::path::PathBuf>,
+    write_roots: Vec<std::path::PathBuf>,
+    home_mounts: Vec<String>,
+    home_masks: Vec<String>,
+    appcontainer_read_roots: Vec<std::path::PathBuf>,
+    appcontainer_write_roots: Vec<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONFIGURED_SANDBOX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn configured_sandbox_builds_on_this_thread() -> usize {
+    CONFIGURED_SANDBOX_BUILDS.with(std::cell::Cell::get)
+}
+
+impl ConfiguredSandboxKey {
+    pub(crate) fn resolve(cli: &crate::cli::Cli, cfg: &crate::config::Config) -> Self {
+        Self {
+            enabled: cli.resolve_sandbox(cfg),
+            backend: cli.resolve_sandbox_backend(cfg),
+            profile: cli.resolve_sandbox_profile(cfg),
+            read_roots: cfg.sandbox_read_roots.clone(),
+            write_roots: cfg.sandbox_write_roots.clone(),
+            home_mounts: cfg.sandbox_home_mounts.clone(),
+            home_masks: cfg.sandbox_home_masks.clone(),
+            appcontainer_read_roots: cli.resolve_windows_appcontainer_read_roots(cfg),
+            appcontainer_write_roots: cli.resolve_windows_appcontainer_write_roots(cfg),
+        }
+    }
+
+    pub(crate) fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    pub(crate) fn build(&self) -> crate::sandbox::Sandbox {
+        #[cfg(test)]
+        CONFIGURED_SANDBOX_BUILDS.with(|count| count.set(count.get() + 1));
+        crate::sandbox::Sandbox::new(self.enabled, &self.backend)
+            .with_general_profile(
+                self.profile,
+                self.read_roots.clone(),
+                self.write_roots.clone(),
+            )
+            .with_home_paths(self.home_mounts.clone(), self.home_masks.clone())
+            .with_windows_appcontainer_roots(
+                self.appcontainer_read_roots.clone(),
+                self.appcontainer_write_roots.clone(),
+            )
+    }
+}
+
+/// A configured sandbox built once by startup's validation probe, tagged with
+/// the inputs it was built from.
+pub(crate) type ValidatedSandbox = (ConfiguredSandboxKey, crate::sandbox::Sandbox);
+
 /// Resolve authority against the configured sandbox and materialize the
 /// sandbox selected by that decision. Both interactive startup and ACP call
 /// this before constructing execution machinery.
@@ -230,21 +296,23 @@ pub(crate) fn resolve_configured_execution_authority(
     cli: &crate::cli::Cli,
     cfg: &crate::config::Config,
 ) -> Result<(ResolvedExecutionAuthority, crate::sandbox::Sandbox), ExecutionAuthorityError> {
-    let backend = cli.resolve_sandbox_backend(cfg);
-    let configured = crate::sandbox::Sandbox::new(cli.resolve_sandbox(cfg), &backend)
-        .with_general_profile(
-            cli.resolve_sandbox_profile(cfg),
-            cfg.sandbox_read_roots.clone(),
-            cfg.sandbox_write_roots.clone(),
-        )
-        .with_home_paths(
-            cfg.sandbox_home_mounts.clone(),
-            cfg.sandbox_home_masks.clone(),
-        )
-        .with_windows_appcontainer_roots(
-            cli.resolve_windows_appcontainer_read_roots(cfg),
-            cli.resolve_windows_appcontainer_write_roots(cfg),
-        );
+    resolve_configured_execution_authority_reusing(cli, cfg, None)
+}
+
+/// [`resolve_configured_execution_authority`] that adopts `validated` as the
+/// configured sandbox when it was built from identical inputs. The authority,
+/// degradation and final sandbox are always computed here, never reused.
+pub(crate) fn resolve_configured_execution_authority_reusing(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    validated: Option<ValidatedSandbox>,
+) -> Result<(ResolvedExecutionAuthority, crate::sandbox::Sandbox), ExecutionAuthorityError> {
+    let key = ConfiguredSandboxKey::resolve(cli, cfg);
+    let backend = key.backend().to_string();
+    let configured = match validated {
+        Some((validated_key, sandbox)) if validated_key == key => sandbox,
+        _ => key.build(),
+    };
     let policy = if cli.general_sandbox_is_eligible(cfg) {
         configured.policy()
     } else {
