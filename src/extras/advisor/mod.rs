@@ -115,7 +115,7 @@ pub(crate) fn model_client(
         crate::provider::create_client(
             provider,
             api_key,
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
     }
@@ -1203,7 +1203,7 @@ mod tests {
         let main = crate::provider::create_client(
             "main_gateway",
             Some("test-key"),
-            &config.custom_providers_map(),
+            config.custom_providers_map(),
             None,
         )
         .unwrap();
@@ -1251,7 +1251,7 @@ mod tests {
         let main = crate::provider::create_client(
             "main_gateway",
             Some("test-key"),
-            &config.custom_providers_map(),
+            config.custom_providers_map(),
             None,
         )
         .unwrap();
@@ -1274,7 +1274,7 @@ mod tests {
         let refreshed = crate::provider::create_client(
             "advisor_gateway",
             Some("rotated-key"),
-            &config.custom_providers_map(),
+            config.custom_providers_map(),
             None,
         )
         .unwrap();
@@ -1494,7 +1494,7 @@ mod request_param_tests {
         let client = crate::provider::create_client(
             "advisor_capture",
             Some("test-key"),
-            &cfg.custom_providers_map(),
+            cfg.custom_providers_map(),
             None,
         )
         .unwrap();

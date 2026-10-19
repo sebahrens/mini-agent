@@ -309,6 +309,7 @@ impl ContextFiles {
         }
     }
 
+    #[cfg(any(test, feature = "acp", feature = "git-worktree"))]
     pub(crate) fn for_workspace_binding(
         &self,
         no_context_files: bool,
@@ -637,6 +638,7 @@ impl ContextBudget {
 /// Reads context only from the explicitly selected workspace root. Global
 /// application context is loaded separately; parent directories outside the
 /// workspace capability must never influence the prompt.
+#[cfg(any(test, feature = "archmd"))]
 fn walk_context_files(
     workspace_root: Option<&Path>,
 ) -> (

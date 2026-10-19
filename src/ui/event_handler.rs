@@ -672,7 +672,7 @@ async fn handle_agent_done(
     #[cfg(not(feature = "memory"))]
     let reserve = ui
         .cfg
-        .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window);
+        .resolve_reserve_tokens(&ui.session.model, qm, ui.session.context_window);
 
     if ui.session.native_history_snapshot().is_none()
         && should_auto_compact_between_turns(

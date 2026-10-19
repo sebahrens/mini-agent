@@ -477,7 +477,7 @@ pub async fn handle_compress(
     #[cfg(not(feature = "memory"))]
     let reserve = ui
         .cfg
-        .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window);
+        .resolve_reserve_tokens(&ui.session.model, qm, ui.session.context_window);
     let keep_recent = ui.cfg.resolve_keep_recent_tokens(ui.session.context_window);
     let keep_recent_tool_results = ui.cfg.resolve_keep_recent_tool_results();
     let max_tokens = ui.session.context_window.saturating_sub(reserve);

@@ -845,6 +845,7 @@ fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition>
 ///   project override (.zerostack/agents → .mini-agent/agents → .claude/agents)
 ///   → user global (data_dir/agents/<name>.md)
 ///   → compiled-in default (data/agents/<name>.md)
+#[cfg(any(test, feature = "subagents"))]
 pub fn load() -> HashMap<String, AgentDefinition> {
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     if let Some(root) = paths.project_dir.as_deref().and_then(Path::parent)

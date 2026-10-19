@@ -13391,7 +13391,7 @@ mod git_feature_off_consumer_tests {
             crate::provider::create_client(
                 "git32-feature-off",
                 Some("unused-owned-key"),
-                &cfg.custom_providers_map(),
+                cfg.custom_providers_map(),
                 cfg.api_keys.as_ref(),
             )
             .unwrap(),

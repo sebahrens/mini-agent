@@ -205,12 +205,14 @@ impl FileCheckpoints {
     }
     /// Whole-inventory edits (rewind, compaction, restore) diff a snapshot.
     fn edit(&self) -> FileMutation<'_> {
-        let mut mutation = self.edit_marked();
         #[cfg(feature = "subagents")]
         {
+            let mut mutation = self.edit_marked();
             mutation.before = Some(mutation.state.data.clone());
+            mutation
         }
-        mutation
+        #[cfg(not(feature = "subagents"))]
+        self.edit_marked()
     }
     /// Per-tool-call edits call `FileMutation::mark` where data actually changes.
     fn edit_marked(&self) -> FileMutation<'_> {

@@ -836,7 +836,7 @@ async fn generalize_package(
     let client = provider::create_client(
         &provider_name,
         cli.api_key.as_deref(),
-        &cfg.custom_providers_map(),
+        cfg.custom_providers_map(),
         cfg.api_keys.as_ref(),
     )
     .context("no usable provider for generalization")?;
