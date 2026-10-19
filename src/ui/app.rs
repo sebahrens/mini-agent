@@ -4526,6 +4526,16 @@ impl<'a> App<'a> {
         // On irreducible pressure, leave the runner parked on its decision
         // receive and abort it below; acknowledging Continue would race the
         // hard stop against the next tool batch.
+        // Learn, in event order, whether the runner waited for this boundary,
+        // and raise the stop barrier before anything else can let it proceed.
+        if awaits_compaction_decision
+            && let Some(decision_tx) = self.run.compaction_decision_tx.as_ref()
+        {
+            decision_tx.take_parked();
+            if pressure_action == MidTurnPressureAction::StopContextExhausted {
+                decision_tx.request_stop();
+            }
+        }
         if awaits_compaction_decision
             && pressure_action != MidTurnPressureAction::StopContextExhausted
             && let Some(decision_tx) = self.run.compaction_decision_tx.as_ref()
@@ -6300,6 +6310,11 @@ impl<'a> App<'a> {
         // user-event/event-loop polling frame, including unrelated commands.
         let prior_question_session = self.ui.session.id.clone();
         let had_pending_question = self.ui.session.pending_question.is_some();
+        if let Some(decision_tx) = self.run.compaction_decision_tx.as_ref() {
+            // A command may change the model or window the runner's pressure
+            // gate was published for.
+            decision_tx.invalidate_gate();
+        }
         let result = crate::startup::heap_future(|| {
             crate::ui::slash::handle_slash(
                 text,
@@ -6617,6 +6632,9 @@ impl<'a> App<'a> {
         }
         if let Some(model) = &template.model {
             let model_command = format!("/model {model}");
+            if let Some(decision_tx) = self.run.compaction_decision_tx.as_ref() {
+                decision_tx.invalidate_gate();
+            }
             let result = crate::startup::heap_future(|| {
                 crate::ui::slash::handle_slash(
                     &model_command,

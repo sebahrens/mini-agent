@@ -761,7 +761,70 @@ impl CompactionPressureGate {
 /// plus the shared pressure gate.
 pub(crate) struct CompactionDecisionTx {
     tx: mpsc::Sender<CompactionBoundaryDecision>,
-    gate: Arc<std::sync::Mutex<CompactionPressureGate>>,
+    shared: Arc<CompactionShared>,
+}
+
+/// State shared by the runner and the UI to keep the unparked fast path
+/// fail-closed.
+///
+/// * `gate` is the last published pressure gate, stamped with the
+///   `generation` it was published at; `latest` is bumped by the UI whenever
+///   anything the pressure test depends on may have changed. A runner that
+///   sees `generation != latest` parks (the pre-gate behavior).
+/// * `parked` records, per boundary event and in event order, whether the
+///   runner is waiting for that event's decision.
+/// * `stop` is the barrier the UI raises, synchronously and before it aborts
+///   the run, when it decides StopContextExhausted; hooks refuse further tool
+///   calls and model requests once it is set.
+pub(crate) struct CompactionShared {
+    gate: std::sync::Mutex<(CompactionPressureGate, u64)>,
+    latest: std::sync::atomic::AtomicU64,
+    parked: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    stop: AtomicBool,
+}
+
+impl CompactionShared {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gate: std::sync::Mutex::new((CompactionPressureGate::Unknown, 0)),
+            latest: std::sync::atomic::AtomicU64::new(0),
+            parked: Default::default(),
+            stop: AtomicBool::new(false),
+        })
+    }
+
+    /// Whether the runner may skip waiting for the decision on `delta`.
+    fn may_skip_park(&self, delta: &UsageDelta) -> bool {
+        let (gate, generation) = *self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        generation == self.latest.load(Ordering::Acquire) && !gate.may_act(delta)
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+}
+
+/// Refuses tool calls and model requests once the UI has decided to stop the
+/// run for context exhaustion.
+struct StopBarrierHook(Arc<CompactionShared>);
+
+impl<M: CompletionModel> AgentHook<M> for StopBarrierHook {
+    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+        match event {
+            StepEvent::ToolCall { .. } | StepEvent::CompletionRequestPrepared { .. }
+                if self.0.stop_requested() =>
+            {
+                Flow::terminate("context window exhausted")
+            }
+            _ => Flow::cont(),
+        }
+    }
+    fn observes(&self, kind: StepEventKind) -> bool {
+        matches!(
+            kind,
+            StepEventKind::ToolCall | StepEventKind::CompletionRequestPrepared
+        )
+    }
 }
 
 impl CompactionDecisionTx {
@@ -772,8 +835,33 @@ impl CompactionDecisionTx {
         self.tx.send(decision).await
     }
 
+    /// Publish the gate at a fresh generation (the runner trusts it only
+    /// while no later `invalidate_gate` happened).
     pub(crate) fn publish_gate(&self, gate: CompactionPressureGate) {
-        *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = gate;
+        let generation = self.shared.latest.fetch_add(1, Ordering::AcqRel) + 1;
+        *self.shared.gate.lock().unwrap_or_else(|e| e.into_inner()) = (gate, generation);
+    }
+
+    /// Something the pressure test depends on (model, window, config) may
+    /// have changed: the runner parks until the next publish.
+    pub(crate) fn invalidate_gate(&self) {
+        self.shared.latest.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether the runner waited for the oldest unanswered boundary event.
+    /// Unknown counts as parked (the safe reading).
+    pub(crate) fn take_parked(&self) -> bool {
+        self.shared
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+            .unwrap_or(true)
+    }
+
+    /// Raise the stop barrier; call before aborting the run.
+    pub(crate) fn request_stop(&self) {
+        self.shared.stop.store(true, Ordering::Release);
     }
 }
 
@@ -3398,11 +3486,11 @@ where
     };
     let (compaction_decision_raw_tx, mut compaction_decision_rx) =
         mpsc::channel::<CompactionBoundaryDecision>(COMPACTION_DECISION_CAPACITY);
-    let compaction_gate = Arc::new(std::sync::Mutex::new(CompactionPressureGate::Unknown));
-    let runner_compaction_gate = Arc::clone(&compaction_gate);
+    let compaction_shared = CompactionShared::new();
+    let runner_compaction_shared = Arc::clone(&compaction_shared);
     let compaction_decision_tx = CompactionDecisionTx {
         tx: compaction_decision_raw_tx,
-        gate: compaction_gate,
+        shared: compaction_shared,
     };
     let compaction_enabled = Arc::new(AtomicBool::new(false));
     let runner_compaction_enabled = Arc::clone(&compaction_enabled);
@@ -3563,6 +3651,7 @@ where
                                 crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY,
                             )
                             .add_hook(steering_hook.clone())
+                            .add_hook(StopBarrierHook(Arc::clone(&runner_compaction_shared)))
                             .add_hook(native_capture.clone())
                             .add_hook(crate::spend::run::AdmissionHook(
                                 crate::spend::run::Run::current(),
@@ -4053,6 +4142,17 @@ where
                             usage.cache_creation_input_tokens,
                             observed_tokens(usage_ledger.total),
                         );
+                        // Decided before the event is visible to the UI, and
+                        // recorded in event order so the UI knows whether the
+                        // runner is waiting for this boundary's decision.
+                        let will_park = !runner_compaction_shared.may_skip_park(&delta);
+                        if delta.has_values() && runner_compaction_enabled.load(Ordering::Acquire) {
+                            runner_compaction_shared
+                                .parked
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push_back(will_park);
+                        }
                         let usage_event_delivered = if delta.has_values() {
                             event_tx
                                 .send(AgentEvent::UsageDelta {
@@ -4068,16 +4168,12 @@ where
                         if usage_event_delivered
                             && runner_compaction_enabled.load(Ordering::Acquire)
                         {
-                            let may_act = runner_compaction_gate
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .may_act(&delta);
                             // The UI answers every boundary event. Park for the
                             // answer only when this completion could trigger
                             // compaction or a context-exhausted stop; otherwise
                             // leave the (Continue) answer queued and keep going.
                             unparked_decisions += 1;
-                            if may_act {
+                            if will_park {
                                 while unparked_decisions > 0 {
                                     unparked_decisions -= 1;
                                     match compaction_decision_rx.recv().await {
@@ -4102,6 +4198,12 @@ where
                             } else {
                                 drain_compaction_decisions!();
                             }
+                        }
+                        if runner_compaction_shared.stop_requested() {
+                            // The UI decided StopContextExhausted for a
+                            // boundary the runner did not wait on: start no
+                            // tool batch. The UI is aborting this run.
+                            return;
                         }
                         if let Some((used, budget)) =
                             exhausted_token_budget(usage_ledger.total, turn_token_budget)
@@ -5538,7 +5640,7 @@ mod tests {
             },
         ] {
             let calls = Arc::new(AtomicUsize::new(0));
-            let (mut runner, _decision_tx) = gated_tool_runner(gate, calls.clone());
+            let (mut runner, decision_tx) = gated_tool_runner(gate, calls.clone());
             let mut usage_events = 0;
             let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
@@ -5546,7 +5648,13 @@ mod tests {
                         crate::event::AgentEvent::UsageDelta {
                             awaits_compaction_decision: true,
                             ..
-                        } => usage_events += 1,
+                        } => {
+                            usage_events += 1;
+                            assert!(
+                                !decision_tx.take_parked(),
+                                "below-threshold boundary must be recorded as not parked"
+                            );
+                        }
                         crate::event::AgentEvent::Done { response, .. } => break response,
                         crate::event::AgentEvent::Error { message, .. } => {
                             panic!("unexpected runner error: {message}")
@@ -5692,6 +5800,64 @@ mod tests {
         );
         assert_eq!(text_of(&item), "x");
         assert!(carried.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalidated_pressure_gate_forces_the_runner_to_park() {
+        // The gate says "far below threshold", but a later invalidation (model
+        // or window change) means the runner must not trust it.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut runner, decision_tx) =
+            gated_tool_runner(super::CompactionPressureGate::Off, calls.clone());
+        decision_tx.invalidate_gate();
+        loop {
+            match runner.event_rx.recv().await.expect("runner event") {
+                crate::event::AgentEvent::UsageDelta {
+                    awaits_compaction_decision: true,
+                    ..
+                } => break,
+                crate::event::AgentEvent::Done { .. } => panic!("finished without parking"),
+                _ => {}
+            }
+        }
+        assert!(
+            decision_tx.take_parked(),
+            "stale gate must be recorded as parked"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no tool may start on a stale gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_decided_for_an_unwaited_boundary_prevents_the_tool_batch() {
+        // The gate lets the runner skip the park; the UI then decides Stop and
+        // raises the barrier before the runner reaches its tool batch.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut runner, decision_tx) =
+            gated_tool_runner(super::CompactionPressureGate::Off, calls.clone());
+        decision_tx.request_stop();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = runner.event_rx.recv().await {
+                assert!(
+                    !matches!(
+                        event,
+                        crate::event::AgentEvent::ToolResult { .. }
+                            | crate::event::AgentEvent::Done { .. }
+                    ),
+                    "run continued past a requested stop: {event:?}"
+                );
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "runner must end once the stop barrier is raised"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no tool call may execute");
     }
 
     #[tokio::test]
