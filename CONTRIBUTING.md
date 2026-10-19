@@ -50,6 +50,27 @@ cargo install --path . --debug # the development build/install command
   Linux gate (`linux-sandbox-policy`) still runs on every push and pull request because Linux-only
   code cannot be compiled on a Mac, while the macOS gates can be reproduced locally on one. Run
   the full matrix by hand with `gh workflow run ci.yml` (scope `full`).
+- CI test-impact selection (`scripts/ci_scope.py`, `scripts/ci_fingerprint.py`; tests in
+  `scripts/tests/test_ci_scope.py` and `test_ci_fingerprint.py`). The `changes` job classifies a push
+  or pull request as `docs`, `tests` or `code`. `tests` means every non-docs path is test-only by
+  path (`src/tests/**`, `*_tests.rs`, `src/**/tests/**`, `tests/**`); a production file with an
+  inline `#[cfg(test)]` module is `code`, as is any mixed diff. A `tests` run keeps `fmt`/policy,
+  Linux `clippy`, the Linux `test` rows, `all-features`, the Linux `parallel-test-smoke` and
+  `linux-sandbox-policy`, and skips macOS/Windows rows, platform smokes, packaging, install, VS Code
+  and the heavy gates. A test path whose name contains `windows`/`appcontainer`/`lpac` or
+  `macos`/`seatbelt`, or whose file is gated as a whole by `#![cfg(...)]`, also runs that
+  platform's rows. `scripts/ci_success.py` accepts the skips only for `tests` scope on push and
+  pull request. Tags, the schedule, dispatch, an unresolvable base or any doubt run the full matrix.
+- CI pass fingerprints: `clippy`, `test`, `all-features`, `parallel-test-smoke`, `mcp-stdio` and
+  `lsp-lifecycle` start with `.github/actions/ci-fingerprint`. The fingerprint is the SHA-256 of the
+  job id, feature row, runner OS/`ImageOS`/arch, `Cargo.lock`, `rust-toolchain.toml`, the workflow
+  file and the tracked files of the job's input class (`production` excludes docs nothing reads and
+  test-only paths; `production+tests` keeps tests). A successful push to `main` saves the marker
+  `ci-pass-<job>-<fingerprint>` through `actions/cache`; later runs restore it lookup-only and skip
+  the remaining steps with a notice naming the fingerprint. Pull requests read main's markers but
+  never write; tags, the schedule and dispatch never read or write. The Phase 6 containment gates
+  and `linux-sandbox-policy` never use markers. Editing the workflow or the action invalidates
+  every marker.
 - Dependency changes go only in the root `Cargo.toml` and `Cargo.lock`. Reuse existing dependencies
   instead of adding a second version, and keep optional or platform-specific dependencies behind
   their feature or target.
