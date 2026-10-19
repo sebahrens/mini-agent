@@ -424,6 +424,19 @@ fn digest(session: &Session) -> anyhow::Result<[u8; 32]> {
     Ok(Sha256::digest(encoded.as_bytes()).into())
 }
 
+/// [`checked_publication`] that also returns the canonical encoding it hashed,
+/// so an unprojected write of the same Session reuses it.
+fn checked_publication_encoded(session: &Session) -> anyhow::Result<(&NativePublication, String)> {
+    let publication = checked_publication_owner(session)?;
+    let encoded = super::storage::serialize_bounded_session(session)?;
+    let digest: [u8; 32] = Sha256::digest(encoded.as_bytes()).into();
+    anyhow::ensure!(
+        digest == publication.digest,
+        "native context snapshot changed before publication"
+    );
+    Ok((publication, encoded))
+}
+
 fn checked_publication_owner(session: &Session) -> anyhow::Result<&NativePublication> {
     let publication = session.native_publication.as_ref().ok_or_else(|| {
         anyhow::anyhow!("unfinished native context requires its saved-session owner")
@@ -556,7 +569,7 @@ pub(super) fn save_snapshot_deferred(session: &Session) -> anyhow::Result<()> {
 }
 
 fn save_snapshot_inner(session: &Session, drop_superseded: bool) -> anyhow::Result<()> {
-    let publication = checked_publication(session)?;
+    let (publication, encoded) = checked_publication_encoded(session)?;
     let writer = publication.owner.lease.begin_write()?;
     let _io = publication
         .owner
@@ -579,16 +592,34 @@ fn save_snapshot_inner(session: &Session, drop_superseded: bool) -> anyhow::Resu
         validate_revision(publication, &state)?;
         state.phase
     };
-    write_projection(session, phase == Phase::Active)
+    write_projection_with(session, phase == Phase::Active, Some(encoded))
 }
 
 fn write_projection(session: &Session, in_flight: bool) -> anyhow::Result<()> {
-    let mut snapshot = session.clone();
-    if in_flight {
-        snapshot.native_frontier = session.native_frontier.in_flight_projection();
-    }
+    write_projection_with(session, in_flight, None)
+}
+
+/// `encoded` is the canonical encoding of exactly `session`; it is the bytes
+/// to write when no in-flight projection changes the Session.
+fn write_projection_with(
+    session: &Session,
+    in_flight: bool,
+    encoded: Option<String>,
+) -> anyhow::Result<()> {
+    let projected;
+    let snapshot = if in_flight {
+        let mut copy = session.clone();
+        copy.native_frontier = session.native_frontier.in_flight_projection();
+        projected = copy;
+        &projected
+    } else {
+        session
+    };
     snapshot.validate_native_persistence()?;
-    let json = super::storage::serialize_bounded_session(&snapshot)?;
+    let json = match encoded.filter(|_| !in_flight) {
+        Some(encoded) => encoded,
+        None => super::storage::serialize_bounded_session(snapshot)?,
+    };
     let publication = snapshot
         .native_publication
         .as_ref()

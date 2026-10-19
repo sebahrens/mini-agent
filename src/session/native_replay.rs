@@ -368,22 +368,22 @@ pub(crate) fn feed_digest(
     messages: &[super::SessionMessage],
     compactions: &[super::Compaction],
 ) -> Result<[u8; 32], RestartReason> {
+    hashed_within(&(messages, compactions), super::storage::MAX_SESSION_BYTES)
+}
+
+/// SHA-256 of the value's JSON, failing past `limit` bytes. The bound and the
+/// hash share one serialization pass; the digest is of the same bytes.
+fn hashed_within<T: serde::Serialize>(value: &T, limit: usize) -> Result<[u8; 32], RestartReason> {
     use sha2::Digest;
-    bounded_serialized(&(messages, compactions), super::storage::MAX_SESSION_BYTES)?;
-    let mut hash = HashWriter(sha2::Sha256::new());
-    serde_json::to_writer(&mut hash, &(messages, compactions))
-        .map_err(|_| RestartReason::UnavailableSource)?;
+    let mut hash = HashWriter(sha2::Sha256::new(), 0, limit);
+    serde_json::to_writer(&mut hash, value).map_err(|_| RestartReason::Limit)?;
     Ok(hash.0.finalize().into())
 }
 
 pub(crate) fn compaction_digest(
     compactions: &[super::Compaction],
 ) -> Result<[u8; 32], RestartReason> {
-    use sha2::Digest;
-    bounded_serialized(&compactions, super::storage::MAX_SESSION_BYTES)?;
-    let mut hash = HashWriter(sha2::Sha256::new());
-    serde_json::to_writer(&mut hash, compactions).map_err(|_| RestartReason::UnavailableSource)?;
-    Ok(hash.0.finalize().into())
+    hashed_within(&compactions, super::storage::MAX_SESSION_BYTES)
 }
 
 /// Without an owned prior commitment, native opaque history is unavailable.
@@ -913,10 +913,16 @@ const MAX_BINDING_MESSAGES: usize = 4096;
 const MAX_BINDING_BLOCKS: usize = 256;
 const MAX_BINDING_OPAQUE_BLOCKS: usize = MAX_NATIVE_FRAMES * MAX_BINDING_BLOCKS;
 
-struct HashWriter(sha2::Sha256);
+/// Hashes what is written, refusing bytes past its limit (hash, written, limit).
+struct HashWriter(sha2::Sha256, usize, usize);
 impl std::io::Write for HashWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         use sha2::Digest;
+        self.1 = self
+            .1
+            .checked_add(bytes.len())
+            .filter(|size| *size <= self.2)
+            .ok_or_else(|| std::io::Error::other("native payload exceeds limits"))?;
         self.0.update(bytes);
         Ok(bytes.len())
     }
@@ -983,7 +989,7 @@ fn binding_view(
 
 fn value_digest(value: &serde_json::Value) -> Result<[u8; 32], RestartReason> {
     use sha2::Digest;
-    let mut hash = HashWriter(sha2::Sha256::new());
+    let mut hash = HashWriter(sha2::Sha256::new(), 0, usize::MAX);
     serde_json::to_writer(&mut hash, value).map_err(|_| RestartReason::UnavailableSource)?;
     Ok(hash.0.finalize().into())
 }
