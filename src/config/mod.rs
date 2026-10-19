@@ -553,6 +553,11 @@ pub struct Config {
     /// its native selection works. Default: true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mouse_capture: Option<bool>,
+    /// Transcript lines one plain mouse-wheel notch scrolls (1..=20).
+    /// Shift/Ctrl + wheel always scrolls a page per notch. Ignored when
+    /// `mouse_capture = false`. Default: 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mouse_scroll_lines: Option<u16>,
     /// Report agent activity in the terminal/window title (`mini-agent:
     /// working`, `waiting for approval`, `idle`) so terminal multiplexers and
     /// tab bars can show it; the previous title is restored on exit.
@@ -971,6 +976,10 @@ impl Config {
 
     pub fn resolve_mouse_capture(&self) -> bool {
         self.mouse_capture.unwrap_or(true)
+    }
+
+    pub fn resolve_mouse_scroll_lines(&self) -> usize {
+        usize::from(self.mouse_scroll_lines.unwrap_or(1).clamp(1, 20))
     }
 
     pub fn resolve_terminal_title(&self) -> bool {
@@ -1811,6 +1820,16 @@ mod tests {
         let cfg: Config = toml::from_str("terminal_notify = \"osc9\"\n").unwrap();
         assert_eq!(cfg.resolve_terminal_notify(), TerminalNotify::Osc9);
         assert!(toml::from_str::<Config>("terminal_notify = \"bell\"\n").is_err());
+    }
+
+    #[test]
+    fn toml_mouse_scroll_lines_defaults_to_one_and_is_clamped() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.resolve_mouse_scroll_lines(), 1);
+        for (text, expected) in [("5", 5), ("0", 1), ("500", 20)] {
+            let cfg: Config = toml::from_str(&format!("mouse_scroll_lines = {text}\n")).unwrap();
+            assert_eq!(cfg.resolve_mouse_scroll_lines(), expected, "{text}");
+        }
     }
 
     #[test]
