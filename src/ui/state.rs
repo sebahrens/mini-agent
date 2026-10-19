@@ -522,8 +522,7 @@ pub(crate) struct AgentRunState {
     pub is_running: bool,
     pub agent_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub main_abort: Option<tokio::task::AbortHandle>,
-    pub compaction_decision_tx:
-        Option<mpsc::Sender<crate::agent::runner::CompactionBoundaryDecision>>,
+    pub compaction_decision_tx: Option<crate::agent::runner::CompactionDecisionTx>,
     /// Number of oldest live tool results cleared from the history supplied to
     /// the currently spawned runner. Provider calibration must use this exact
     /// projection rather than recomputing it after in-turn results are added.

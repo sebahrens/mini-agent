@@ -4400,6 +4400,25 @@ impl<'a> App<'a> {
         };
         let mid_turn_pressure =
             mid_turn_observation.filter(|(_, threshold, pressure)| pressure > threshold);
+        if awaits_compaction_decision
+            && let Some(decision_tx) = self.run.compaction_decision_tx.as_ref()
+        {
+            // Tell the runner when it may skip parking for this boundary: only
+            // a completion above the threshold can end in Compact or a stop.
+            decision_tx.publish_gate(if mid_turn_observation.is_some() {
+                crate::agent::runner::CompactionPressureGate::Limit {
+                    window: self.ui.session.context_window,
+                    threshold: self
+                        .ui
+                        .cfg
+                        .resolve_mid_turn_compact_threshold()
+                        .unwrap_or(0.0),
+                    anthropic_native: self.ui.cfg.is_anthropic_native(&self.ui.session.provider),
+                }
+            } else {
+                crate::agent::runner::CompactionPressureGate::Off
+            });
+        }
 
         // Preserve an interrupted turn once the model or a tool made observable
         // progress. Only a zero-progress failure restores the prompt and the

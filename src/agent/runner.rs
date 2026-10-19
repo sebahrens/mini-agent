@@ -686,7 +686,7 @@ pub struct AgentRunner {
     /// interrupted run keeps driving its stream — and therefore keeps executing
     /// tools (edit/write/bash) — invisibly. Aborting stops it for real.
     pub abort_handle: tokio::task::AbortHandle,
-    pub(crate) compaction_decision_tx: Option<mpsc::Sender<CompactionBoundaryDecision>>,
+    pub(crate) compaction_decision_tx: Option<CompactionDecisionTx>,
     compaction_enabled: Arc<AtomicBool>,
 }
 
@@ -710,6 +710,77 @@ pub(crate) enum CompactionBoundaryDecision {
     Continue,
     Compact,
 }
+
+/// Context-pressure thresholds the UI publishes so the runner can tell, from a
+/// completion's own usage, whether the UI could answer `Compact` or stop the
+/// run as context-exhausted. Only then does the runner park for the decision;
+/// clearly below the threshold it keeps polling the stream so tool execution
+/// does not wait on the UI's frame latency.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CompactionPressureGate {
+    /// Nothing published yet: always park (the pre-gate behavior).
+    Unknown,
+    /// The UI will never act on pressure for this run (compaction disabled,
+    /// no session, no threshold or unknown context window).
+    Off,
+    /// The UI acts when `real_input_tokens / window > threshold`.
+    Limit {
+        window: u64,
+        threshold: f64,
+        anthropic_native: bool,
+    },
+}
+
+impl CompactionPressureGate {
+    /// Same arithmetic as the UI's mid-turn pressure test, so the two sides
+    /// agree for equal published values.
+    fn may_act(self, delta: &UsageDelta) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Off => false,
+            Self::Limit {
+                window,
+                threshold,
+                anthropic_native,
+            } => {
+                let real_input_tokens = crate::session::Session::real_input_tokens(
+                    anthropic_native,
+                    delta.input_tokens,
+                    delta.total_tokens,
+                    delta.output_tokens,
+                    delta.cached_input_tokens,
+                    delta.cache_creation_input_tokens,
+                );
+                window == 0 || real_input_tokens as f64 / window as f64 > threshold
+            }
+        }
+    }
+}
+
+/// UI-side handle to the runner's compaction boundary: the decision channel
+/// plus the shared pressure gate.
+pub(crate) struct CompactionDecisionTx {
+    tx: mpsc::Sender<CompactionBoundaryDecision>,
+    gate: Arc<std::sync::Mutex<CompactionPressureGate>>,
+}
+
+impl CompactionDecisionTx {
+    pub(crate) async fn send(
+        &self,
+        decision: CompactionBoundaryDecision,
+    ) -> Result<(), mpsc::error::SendError<CompactionBoundaryDecision>> {
+        self.tx.send(decision).await
+    }
+
+    pub(crate) fn publish_gate(&self, gate: CompactionPressureGate) {
+        *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = gate;
+    }
+}
+
+/// Decision channel capacity. A runner that did not park leaves its decision
+/// queued; at most one `UsageDelta` per completion can be in flight on the
+/// bounded event channel, so this can never fill and block the UI.
+const COMPACTION_DECISION_CAPACITY: usize = 64;
 
 tokio::task_local! {
     static AGENT_WORK_SCOPE: Arc<AgentWorkScope>;
@@ -1717,9 +1788,7 @@ pub(crate) fn prepared_request_input_estimate(
     {
         return cached.input_tokens;
     }
-    let input_tokens = serde_json::to_string(request)
-        .ok()
-        .map(|text| crate::session::Session::estimate_tokens(&text));
+    let input_tokens = incremental_request_estimate(ctx, request);
     ctx.scratchpad().insert(PreparedRequestEstimate {
         turn,
         request: address,
@@ -1727,6 +1796,86 @@ pub(crate) fn prepared_request_input_estimate(
         serializations: previous.map_or(0, |cached| cached.serializations) + 1,
     });
     input_tokens
+}
+
+/// Per-run cache of the character counts of every history message already
+/// measured. A child's history is append-only, so each model call re-measures
+/// only the new suffix; a cached message is reused only while it is equal to
+/// the message at the same index, so an edited or reordered history is
+/// re-measured rather than trusted.
+#[cfg(feature = "subagents")]
+#[derive(Clone, Default)]
+struct HistoryCountCache(std::sync::Arc<std::sync::Mutex<Vec<(Message, u64, u64)>>>);
+
+/// Every `CompletionRequest` field except `chat_history`, serialized under the
+/// same names so that, together with the history framing, the character counts
+/// equal those of `serde_json::to_string(request)`.
+#[cfg(feature = "subagents")]
+#[derive(serde::Serialize)]
+struct RequestShell<'a, S> {
+    model: &'a Option<String>,
+    preamble: &'a Option<String>,
+    documents: &'a Vec<rig::completion::Document>,
+    tools: &'a Vec<rig::completion::ToolDefinition>,
+    temperature: &'a Option<f64>,
+    max_tokens: &'a Option<u64>,
+    tool_choice: &'a Option<rig::message::ToolChoice>,
+    additional_params: &'a Option<serde_json::Value>,
+    output_schema: &'a Option<S>,
+}
+
+/// Exactly `Session::estimate_tokens(&serde_json::to_string(request))`,
+/// serializing only the history messages not seen on an earlier call.
+#[cfg(feature = "subagents")]
+pub(crate) fn incremental_request_estimate(
+    ctx: &rig::agent::HookContext,
+    request: &rig::completion::CompletionRequest,
+) -> Option<u64> {
+    let cache = match ctx.scratchpad().get::<HistoryCountCache>() {
+        Some(cache) => cache,
+        None => {
+            let cache = HistoryCountCache::default();
+            ctx.scratchpad().insert(cache.clone());
+            cache
+        }
+    };
+    let shell = serde_json::to_string(&RequestShell {
+        model: &request.model,
+        preamble: &request.preamble,
+        documents: &request.documents,
+        tools: &request.tools,
+        temperature: &request.temperature,
+        max_tokens: &request.max_tokens,
+        tool_choice: &request.tool_choice,
+        additional_params: &request.additional_params,
+        output_schema: &request.output_schema,
+    })
+    .ok()?;
+    let (mut wide, mut narrow) = crate::session::Session::char_counts(&shell);
+    // `,"chat_history":[` + `]` and one comma between consecutive messages.
+    let history_len = request.chat_history.len();
+    narrow += ",\"chat_history\":".len() as u64 + 2 + history_len.saturating_sub(1) as u64;
+    let mut measured = cache.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut keep = 0;
+    for (index, message) in request.chat_history.iter().enumerate() {
+        match measured.get(index) {
+            Some((cached, ..)) if cached == message => keep = index + 1,
+            _ => break,
+        }
+    }
+    measured.truncate(keep);
+    for message in request.chat_history.iter().skip(keep) {
+        let (message_wide, message_narrow) =
+            crate::session::Session::char_counts(&serde_json::to_string(message).ok()?);
+        measured.push((message.clone(), message_wide, message_narrow));
+    }
+    for (_, message_wide, message_narrow) in measured.iter() {
+        wide += message_wide;
+        narrow += message_narrow;
+    }
+    Some(crate::session::Session::estimate_tokens_from_counts(
+        wide, narrow,
+    ))
 }
 
 #[cfg(feature = "subagents")]
@@ -1964,6 +2113,79 @@ fn charge_nonterminal_eof(
     }
 
     Ok(())
+}
+
+/// Most ready deltas folded into one headless output write.
+const COALESCE_MAX_ITEMS: usize = 64;
+
+/// Fold deltas of the same kind that the stream can yield *without waiting*
+/// into `item`, so a burst costs one output write instead of one per token.
+/// No timer is involved: the stream is polled once per candidate and a
+/// pending or different item ends the batch (a different ready item is parked
+/// in `carried` and handled next, preserving order). The merged size stays
+/// within the per-event progress bound so stream-json never truncates more
+/// than the unmerged deltas would.
+fn coalesce_ready_deltas<S, R, E>(
+    stream: &mut S,
+    item: &mut Result<MultiTurnStreamItem<R>, E>,
+    carried: &mut Option<Result<MultiTurnStreamItem<R>, E>>,
+) -> usize
+where
+    S: futures::Stream<Item = Result<MultiTurnStreamItem<R>, E>> + Unpin,
+{
+    use futures::FutureExt;
+    let Ok(MultiTurnStreamItem::StreamAssistantItem(first)) = item else {
+        return 0;
+    };
+    let mut merged = 0;
+    while merged < COALESCE_MAX_ITEMS - 1 {
+        let current_len = match &*first {
+            StreamedAssistantContent::Text(text) if text.additional_params.is_none() => {
+                text.text.len()
+            }
+            StreamedAssistantContent::ReasoningDelta { reasoning, .. } => reasoning.len(),
+            _ => return merged,
+        };
+        if current_len >= crate::print::HEADLESS_PROGRESS_BYTES {
+            break;
+        }
+        let Some(Some(next)) = stream.next().now_or_never() else {
+            break;
+        };
+        match (&mut *first, next) {
+            (
+                StreamedAssistantContent::Text(into),
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(from))),
+            ) if from.additional_params.is_none()
+                && into.text.len() + from.text.len() <= crate::print::HEADLESS_PROGRESS_BYTES =>
+            {
+                into.text.push_str(&from.text);
+                merged += 1;
+            }
+            (
+                StreamedAssistantContent::ReasoningDelta {
+                    id: into_id,
+                    reasoning: into,
+                },
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ReasoningDelta {
+                        id: from_id,
+                        reasoning: from,
+                    },
+                )),
+            ) if *into_id == from_id
+                && into.len() + from.len() <= crate::print::HEADLESS_PROGRESS_BYTES =>
+            {
+                into.push_str(&from);
+                merged += 1;
+            }
+            (_, other) => {
+                *carried = Some(other);
+                break;
+            }
+        }
+    }
+    merged
 }
 
 fn append_streamed_text(interactions: &mut Vec<Message>, text: &str) {
@@ -3174,8 +3396,14 @@ where
         steering: steering.clone(),
         events: event_tx.clone(),
     };
-    let (compaction_decision_tx, mut compaction_decision_rx) =
-        mpsc::channel::<CompactionBoundaryDecision>(1);
+    let (compaction_decision_raw_tx, mut compaction_decision_rx) =
+        mpsc::channel::<CompactionBoundaryDecision>(COMPACTION_DECISION_CAPACITY);
+    let compaction_gate = Arc::new(std::sync::Mutex::new(CompactionPressureGate::Unknown));
+    let runner_compaction_gate = Arc::clone(&compaction_gate);
+    let compaction_decision_tx = CompactionDecisionTx {
+        tx: compaction_decision_raw_tx,
+        gate: compaction_gate,
+    };
     let compaction_enabled = Arc::new(AtomicBool::new(false));
     let runner_compaction_enabled = Arc::clone(&compaction_enabled);
     let runner_lifecycle_tx = event_tx.clone();
@@ -3275,6 +3503,25 @@ where
         let mut usage_ledger = UsageLedger::default();
         let mut completion_retry = CompletionRetryState::new(&retry_config);
         let mut compaction_requested = false;
+        // Boundary events whose decision the runner did not wait for.
+        let mut unparked_decisions = 0usize;
+        // Absorb already-queued decisions without waiting: a late `Compact`
+        // is honored at the next correlated ToolResult like a parked one.
+        macro_rules! drain_compaction_decisions {
+            () => {
+                while unparked_decisions > 0 {
+                    match compaction_decision_rx.try_recv() {
+                        Ok(decision) => {
+                            unparked_decisions -= 1;
+                            if decision == CompactionBoundaryDecision::Compact {
+                                compaction_requested = true;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            };
+        }
         usage_ledger.start_stream();
         // Overrides the next continuation message (bottom of the outer
         // `loop`); set when a `Stop` hook forces continuation instead of the
@@ -3591,6 +3838,7 @@ where
                                 })
                                 .await;
                         }
+                        drain_compaction_decisions!();
                         if compaction_requested
                             && tool_calls.pending.is_empty()
                             && crate::question::required().is_none()
@@ -3820,21 +4068,39 @@ where
                         if usage_event_delivered
                             && runner_compaction_enabled.load(Ordering::Acquire)
                         {
-                            match compaction_decision_rx.recv().await {
-                                Some(CompactionBoundaryDecision::Compact) => {
-                                    // Rig publishes CompletionCall before it
-                                    // surfaces the completed tool call and its
-                                    // result, so eligibility cannot be decided
-                                    // from the tracker yet. Keep the request
-                                    // armed until a correlated ToolResult; a
-                                    // text-only completion reaches Done without
-                                    // consuming it.
-                                    compaction_requested = true;
+                            let may_act = runner_compaction_gate
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .may_act(&delta);
+                            // The UI answers every boundary event. Park for the
+                            // answer only when this completion could trigger
+                            // compaction or a context-exhausted stop; otherwise
+                            // leave the (Continue) answer queued and keep going.
+                            unparked_decisions += 1;
+                            if may_act {
+                                while unparked_decisions > 0 {
+                                    unparked_decisions -= 1;
+                                    match compaction_decision_rx.recv().await {
+                                        Some(CompactionBoundaryDecision::Compact) => {
+                                            // Rig publishes CompletionCall before it
+                                            // surfaces the completed tool call and its
+                                            // result, so eligibility cannot be decided
+                                            // from the tracker yet. Keep the request
+                                            // armed until a correlated ToolResult; a
+                                            // text-only completion reaches Done without
+                                            // consuming it.
+                                            compaction_requested = true;
+                                        }
+                                        Some(CompactionBoundaryDecision::Continue) => {}
+                                        None => {
+                                            runner_compaction_enabled
+                                                .store(false, Ordering::Release);
+                                            unparked_decisions = 0;
+                                        }
+                                    }
                                 }
-                                Some(CompactionBoundaryDecision::Continue) => {}
-                                None => {
-                                    runner_compaction_enabled.store(false, Ordering::Release);
-                                }
+                            } else {
+                                drain_compaction_decisions!();
                             }
                         }
                         if let Some((used, budget)) =
@@ -4426,7 +4692,18 @@ where
         continue_turn = false;
         let mut terminal_response_seen = false;
         let mut retrying_interrupted_completion = false;
-        while let Some(item) = await_turn!(stream.next()) {
+        // A non-delta item peeked while coalescing; handled next, in order.
+        let mut carried = None;
+        loop {
+            let mut item = match carried.take() {
+                Some(item) => item,
+                None => match await_turn!(stream.next()) {
+                    Some(item) => item,
+                    None => break,
+                },
+            };
+            // One output write per burst of already-ready deltas, not per token.
+            coalesce_ready_deltas(&mut stream, &mut item, &mut carried);
             // Keep event handling out of the frame that polls the model/tool
             // stream. A task tool can recursively drive another agent there;
             // this large match is only active after that stream yields an item.
@@ -5206,6 +5483,215 @@ mod tests {
             tool_result_ids_of(&interactions),
             ["compact-first", "compact-second"]
         );
+    }
+
+    fn gated_tool_runner(
+        gate: super::CompactionPressureGate,
+        calls: Arc<AtomicUsize>,
+    ) -> (super::AgentRunner, super::CompactionDecisionTx) {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("gate-first", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response(usage(120, 8, 0, 0)),
+            ],
+            vec![
+                MockStreamEvent::text("finished"),
+                MockStreamEvent::final_response(usage(140, 4, 0, 0)),
+            ],
+        ]);
+        let paused = super::spawn_agent_paused(
+            AgentBuilder::new(model)
+                .tool(CountingTool(calls))
+                .default_max_turns(2)
+                .build(),
+            "run the tool".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        paused
+            .runner
+            .compaction_decision_tx
+            .as_ref()
+            .expect("interactive runner exposes its boundary decision channel")
+            .publish_gate(gate);
+        let mut runner = paused.start_interactive();
+        let decision_tx = runner.compaction_decision_tx.take().unwrap();
+        (runner, decision_tx)
+    }
+
+    #[tokio::test]
+    async fn interactive_runner_below_pressure_threshold_never_awaits_the_decision() {
+        // 120 of 10_000 tokens is far below a 0.5 threshold: the UI would
+        // answer Continue, so the runner must not wait for it. Nobody answers
+        // here; the tool batch and the follow-up call still complete.
+        for gate in [
+            super::CompactionPressureGate::Off,
+            super::CompactionPressureGate::Limit {
+                window: 10_000,
+                threshold: 0.5,
+                anthropic_native: false,
+            },
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (mut runner, _decision_tx) = gated_tool_runner(gate, calls.clone());
+            let mut usage_events = 0;
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    match runner.event_rx.recv().await.expect("runner event") {
+                        crate::event::AgentEvent::UsageDelta {
+                            awaits_compaction_decision: true,
+                            ..
+                        } => usage_events += 1,
+                        crate::event::AgentEvent::Done { response, .. } => break response,
+                        crate::event::AgentEvent::Error { message, .. } => {
+                            panic!("unexpected runner error: {message}")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("an unanswered below-threshold boundary must not park the runner");
+            assert_eq!(response, "finished");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(usage_events, 2, "the UI still observes every boundary");
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_runner_near_pressure_threshold_still_parks_before_tools() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut runner, decision_tx) = gated_tool_runner(
+            super::CompactionPressureGate::Limit {
+                window: 200,
+                threshold: 0.5,
+                anthropic_native: false,
+            },
+            calls.clone(),
+        );
+        // Wait for the boundary event; do not answer yet.
+        loop {
+            match runner.event_rx.recv().await.expect("runner event") {
+                crate::event::AgentEvent::UsageDelta {
+                    awaits_compaction_decision: true,
+                    ..
+                } => break,
+                crate::event::AgentEvent::Done { .. } => panic!("finished without parking"),
+                _ => {}
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an over-threshold completion must hold the tool batch for the decision"
+        );
+        decision_tx
+            .send(super::CompactionBoundaryDecision::Continue)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = runner.event_rx.recv().await {
+                if matches!(event, crate::event::AgentEvent::ToolResult { .. }) {
+                    return;
+                }
+            }
+            panic!("runner ended without running the tool");
+        })
+        .await
+        .expect("answering Continue releases the tool batch");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    type ReadyItem = Result<MultiTurnStreamItem<()>, ()>;
+
+    fn ready_text(text: &str) -> ReadyItem {
+        Ok(MultiTurnStreamItem::StreamAssistantItem(
+            StreamedAssistantContent::Text(rig::message::Text::new(text)),
+        ))
+    }
+
+    fn ready_reasoning(text: &str) -> ReadyItem {
+        Ok(MultiTurnStreamItem::StreamAssistantItem(
+            StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: text.to_owned(),
+            },
+        ))
+    }
+
+    fn text_of(item: &ReadyItem) -> &str {
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                &t.text
+            }
+            Ok(MultiTurnStreamItem::StreamAssistantItem(
+                StreamedAssistantContent::ReasoningDelta { reasoning, .. },
+            )) => reasoning,
+            _ => panic!("not a delta"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_text_deltas_coalesce_into_bounded_batches_preserving_bytes() {
+        let tokens: Vec<String> = (0..1000).map(|i| format!("t{i} ")).collect();
+        let expected: String = tokens.concat();
+        let mut stream = futures::stream::iter(tokens.iter().map(|t| ready_text(t)));
+        let mut written = String::new();
+        let mut batches = 0;
+        let mut carried = None;
+        loop {
+            let mut item = match carried.take() {
+                Some(item) => item,
+                None => match stream.next().await {
+                    Some(item) => item,
+                    None => break,
+                },
+            };
+            super::coalesce_ready_deltas(&mut stream, &mut item, &mut carried);
+            written.push_str(text_of(&item));
+            batches += 1;
+        }
+        assert_eq!(written, expected, "coalescing must not change the bytes");
+        assert!(
+            batches <= 1000usize.div_ceil(super::COALESCE_MAX_ITEMS) + 1,
+            "1000 ready deltas produced {batches} writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn coalescing_stops_at_a_different_item_and_at_a_pending_stream() {
+        // A reasoning delta never merges into text and is handed back in order.
+        let mut stream = futures::stream::iter(vec![
+            ready_text("b"),
+            ready_text("c"),
+            ready_reasoning("r"),
+            ready_text("d"),
+        ]);
+        let mut item = ready_text("a");
+        let mut carried = None;
+        assert_eq!(
+            super::coalesce_ready_deltas(&mut stream, &mut item, &mut carried),
+            2
+        );
+        assert_eq!(text_of(&item), "abc");
+        assert_eq!(text_of(carried.as_ref().unwrap()), "r");
+
+        // A stream with nothing ready is not waited on.
+        let mut pending = futures::stream::pending::<ReadyItem>();
+        let mut item = ready_text("x");
+        let mut carried = None;
+        assert_eq!(
+            super::coalesce_ready_deltas(&mut pending, &mut item, &mut carried),
+            0
+        );
+        assert_eq!(text_of(&item), "x");
+        assert!(carried.is_none());
     }
 
     #[tokio::test]
