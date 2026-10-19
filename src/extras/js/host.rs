@@ -2940,6 +2940,26 @@ fn discovery_json_string_upper_bound(value: &str) -> usize {
     value.len().saturating_mul(6).saturating_add(2)
 }
 
+/// Length of `value`'s JSON encoding, counted without materializing it.
+fn json_encoded_len<T: serde::Serialize>(value: &T) -> serde_json::Result<usize> {
+    struct Counter(usize);
+
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
 fn execute_discovery(
     prepared: PreparedDiscoveryEffect,
     control: &ExecutablePreparationControl,
@@ -4009,9 +4029,8 @@ impl ParentEffectService for ParentHostEffectService {
                             .execute_read(target, bridge.clone())
                             .await
                             .map_err(HostEffectError::from)?;
-                        let item_bytes = serde_json::to_string(&content)
-                            .map_err(|_| HostEffectError::BackendFailure)?
-                            .len();
+                        let item_bytes = json_encoded_len(&content)
+                            .map_err(|_| HostEffectError::BackendFailure)?;
                         encoded_bytes = encoded_bytes
                             .checked_add(item_bytes)
                             .and_then(|bytes| bytes.checked_add(usize::from(!contents.is_empty())))
