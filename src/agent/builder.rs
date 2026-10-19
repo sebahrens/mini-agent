@@ -977,7 +977,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     } else {
         match cfg.resolve_lsp() {
             Some(config) => {
-                crate::extras::lsp::LspManager::prepare(&config, workspace.clone()).await
+                crate::extras::lsp::LspManager::prepare_for_session(&config, workspace.clone())
+                    .await
             }
             None => None,
         }

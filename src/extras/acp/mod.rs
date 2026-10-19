@@ -50,6 +50,11 @@ const MAX_ACP_SESSIONS: usize = 64;
 #[cfg(feature = "mcp")]
 const MAX_ACP_CLIENT_MCP_SERVERS: usize = 8;
 
+#[cfg(test)]
+thread_local! {
+    static LIVE_BYTES_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct SessionHistory {
     #[cfg(feature = "hooks")]
     hooks_started: bool,
@@ -60,6 +65,81 @@ struct SessionHistory {
     policy: policy::SessionPolicy,
     pending_question: Option<crate::question::QuestionRequired>,
     manual_compact: bool,
+    /// Servers and managers that outlive a single prompt.
+    reuse: SessionReuse,
+}
+
+/// Prompt-spanning runtime owned by one ACP session. Each prompt builds a new
+/// agent, but spawning and initializing MCP servers and language servers is
+/// far costlier than the turn's first token, so they are connected lazily by
+/// the first prompt that needs them and reused until the session closes, the
+/// connection ends, their configuration changes, or a prompt fails or is
+/// cancelled (which may leave a server mid-request).
+#[derive(Default)]
+struct SessionReuse {
+    #[cfg(feature = "lsp")]
+    lsp: Arc<crate::extras::lsp::SessionLsp>,
+    #[cfg(feature = "mcp")]
+    mcp: Option<PromptMcp>,
+}
+
+impl SessionReuse {
+    async fn shutdown(&mut self) {
+        #[cfg(feature = "mcp")]
+        if let Some(mcp) = self.mcp.take() {
+            mcp.close(false).await;
+        }
+        #[cfg(feature = "lsp")]
+        self.lsp.shutdown().await;
+    }
+}
+
+/// A connected MCP manager with the scope that owns its connections and the
+/// identity of the configuration it was connected for.
+#[cfg(feature = "mcp")]
+struct PromptMcp {
+    manager: crate::extras::mcp::McpClientManager,
+    scope: Arc<crate::agent::runner::AgentWorkScope>,
+    key: Option<McpKey>,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(PartialEq, Eq)]
+struct McpKey {
+    workspace: usize,
+    servers: String,
+}
+
+#[cfg(feature = "mcp")]
+impl McpKey {
+    fn new(cfg: &Config, workspace: &Arc<crate::paths::WorkspaceBinding>) -> Self {
+        let servers: std::collections::BTreeMap<_, _> = cfg.mcp_servers.iter().flatten().collect();
+        Self {
+            workspace: Arc::as_ptr(workspace) as usize,
+            servers: serde_json::to_string(&servers).unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl PromptMcp {
+    /// Still the right manager for `key`: same configuration and workspace,
+    /// every configured server connected, and no server connection closed.
+    fn is_reusable(&self, key: &McpKey) -> bool {
+        self.key.as_ref() == Some(key)
+            && self
+                .manager
+                .configured_count()
+                .is_none_or(|configured| self.manager.handles.len() >= configured)
+            && self.manager.all_connections_open()
+    }
+
+    async fn close(self, cancelled: bool) {
+        if cancelled {
+            self.scope.cancellation_handle().cancel();
+        }
+        self.manager.shutdown().await;
+    }
 }
 
 impl Default for SessionHistory {
@@ -72,6 +152,7 @@ impl Default for SessionHistory {
             policy: Default::default(),
             pending_question: None,
             manual_compact: false,
+            reuse: Default::default(),
         }
     }
 }
@@ -123,6 +204,8 @@ impl SessionHistory {
             .collect()
     }
     fn live_bytes(&self) -> usize {
+        #[cfg(test)]
+        LIVE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
         struct Count(usize);
         impl std::io::Write for Count {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -167,8 +250,33 @@ impl SessionHistory {
             .copied()
             .unwrap_or(self.session.messages.len())
     }
+    #[cfg(test)]
     async fn compact_with<F, Fut>(
         &mut self,
+        control: &TurnControl,
+        #[cfg(feature = "goal")] goal_store: Option<&crate::extras::goal::GoalStore>,
+        summarize: F,
+    ) -> Option<crate::event::UsageDelta>
+    where
+        F: FnMut(Vec<crate::session::SessionMessage>, Option<String>) -> Fut,
+        Fut: Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
+    {
+        let needs = self.needs_compaction();
+        self.compact_with_known(
+            needs,
+            control,
+            #[cfg(feature = "goal")]
+            goal_store,
+            summarize,
+        )
+        .await
+    }
+    /// `needs` is the caller's current `needs_compaction()`: it serializes the
+    /// whole live history, so it is evaluated once per decision rather than at
+    /// every call site.
+    async fn compact_with_known<F, Fut>(
+        &mut self,
+        mut needs: bool,
         control: &TurnControl,
         #[cfg(feature = "goal")] goal_store: Option<&crate::extras::goal::GoalStore>,
         mut summarize: F,
@@ -178,7 +286,7 @@ impl SessionHistory {
         Fut: Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
     {
         #[cfg(feature = "subagents")]
-        let _background_pause = if self.needs_compaction() {
+        let _background_pause = if needs {
             match &self.session.background_pool {
                 Some(pool) => Some(pool.pause_for_history().await.ok()?),
                 None => None,
@@ -191,7 +299,7 @@ impl SessionHistory {
         if let Some(goal) = goal_store {
             self.session.goal_store = goal.clone();
         }
-        while self.needs_compaction() {
+        while needs {
             if control.is_cancelled() {
                 return None;
             }
@@ -260,6 +368,7 @@ impl SessionHistory {
             };
             self.session.compress(output.summary, completed_cut, 0);
             self.manual_compact = false;
+            needs = self.needs_compaction();
         }
         Some(usage)
     }
@@ -660,6 +769,10 @@ impl Drop for SessionLease {
 
 struct AcpState {
     leases: Arc<SessionLeases>,
+    /// Provider clients shared by every prompt. `cli` and `cfg` never change
+    /// for the server's lifetime, so a provider name determines its client; a
+    /// fresh `reqwest::Client` per prompt would discard the TLS connection pool.
+    provider_clients: ProviderClients,
     idle: Arc<idle::Idle>,
     cli: Cli,
     cfg: Config,
@@ -1037,6 +1150,34 @@ fn acp_client(
     )
 }
 
+/// Per-provider client cache. `AnyClient` clones share one connection pool.
+/// Failures are not cached, so a later prompt retries credential resolution.
+#[derive(Default)]
+struct ProviderClients {
+    clients: StdMutex<HashMap<String, crate::provider::AnyClient>>,
+    #[cfg(test)]
+    builds: std::sync::atomic::AtomicUsize,
+}
+
+impl ProviderClients {
+    fn get(
+        &self,
+        cli: &Cli,
+        cfg: &Config,
+        provider: &str,
+    ) -> anyhow::Result<crate::provider::AnyClient> {
+        let mut clients = lock_unpoisoned(&self.clients);
+        if let Some(client) = clients.get(provider) {
+            return Ok(client.clone());
+        }
+        let client = acp_client(cli, cfg, provider)?;
+        #[cfg(test)]
+        self.builds.fetch_add(1, Ordering::Relaxed);
+        clients.insert(provider.to_owned(), client.clone());
+        Ok(client)
+    }
+}
+
 /// The subagent configuration an ACP server installs, or `None` when the
 /// `task` tool is disabled or the main provider has no usable client.
 #[cfg(feature = "subagents")]
@@ -1107,6 +1248,7 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
         cfg,
         context,
         leases: Arc::default(),
+        provider_clients: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         cancel_routes: StdMutex::new(HashMap::new()),
         shell_search_path: std::env::var_os("PATH"),
@@ -1310,6 +1452,18 @@ async fn connect_agent(
         for pool in pools {
             pool.close().await;
         }
+    }
+    // Servers kept for later prompts end with the connection. Teardown has
+    // cancelled every turn, so each history lock is released promptly.
+    let histories = state
+        .sessions
+        .lock()
+        .await
+        .values()
+        .map(|session| session.history.clone())
+        .collect::<Vec<_>>();
+    for history in histories {
+        history.lock().await.reuse.shutdown().await;
     }
     state.idle.wait_settled().await;
     result
@@ -1585,6 +1739,7 @@ async fn install_session(
                 policy,
                 pending_question,
                 manual_compact: false,
+                reuse: Default::default(),
             })),
             workspace,
             context: Arc::new(context),
@@ -1909,8 +2064,23 @@ async fn handle_close_session(
     {
         pool.close().await;
     }
-    #[cfg(not(feature = "subagents"))]
-    drop(removed);
+    // Stop the session's MCP and language servers. An idle session is torn
+    // down before the response; a session whose cancelled turn is still
+    // settling is torn down by a task that waits for that turn (the turn
+    // itself closes whatever it was holding).
+    if let Some(removed) = removed {
+        let history = removed.history.clone();
+        drop(removed);
+        match history.clone().try_lock_owned() {
+            Ok(mut idle_history) => idle_history.reuse.shutdown().await,
+            Err(_) => {
+                let activity = state.idle.admit()?;
+                tokio::spawn(activity.track(async move {
+                    history.lock().await.reuse.shutdown().await;
+                }));
+            }
+        }
+    }
 
     responder.respond(CloseSessionResponse::new())
 }
@@ -3273,9 +3443,16 @@ async fn run_prompt(
         }
     }
     #[cfg(all(not(test), feature = "mcp"))]
-    let mut mcp_manager = None;
+    let mut mcp_manager: Option<PromptMcp> = None;
     #[cfg(all(test, feature = "mcp"))]
-    let mut mcp_manager = lock_unpoisoned(&state.mcp_fixture).take();
+    let mut mcp_manager: Option<PromptMcp> =
+        lock_unpoisoned(&state.mcp_fixture)
+            .take()
+            .map(|manager| PromptMcp {
+                manager,
+                scope: crate::agent::runner::AgentWorkScope::new(),
+                key: None,
+            });
     #[cfg(feature = "goal")]
     let goal_store_for_gate = goal_store.clone();
     #[cfg(feature = "goal")]
@@ -3324,11 +3501,23 @@ async fn run_prompt(
         )
     })
     .await;
-    // Keep the history lock and generation registered until every per-prompt
-    // server is closed, including cancellation during agent/runner preparation.
+    // Keep the history lock and generation registered until every server this
+    // prompt does not hand back to the session is closed, including
+    // cancellation during agent/runner preparation. Only a prompt that ended
+    // cleanly leaves its servers connected for the next one.
     #[cfg(feature = "mcp")]
-    if let Some(manager) = mcp_manager {
-        manager.shutdown().await;
+    if let Some(mcp) = mcp_manager {
+        let cancelled = registration.control.is_cancelled();
+        let clean = !cancelled
+            && matches!(
+                &result,
+                Ok(outcome) if outcome.reason == StopReason::EndTurn && outcome.error.is_none()
+            );
+        if clean {
+            history.reuse.mcp = Some(mcp);
+        } else {
+            mcp.close(cancelled).await;
+        }
     }
     let mut outcome = match result {
         Ok(outcome) => outcome,
@@ -3610,12 +3799,10 @@ async fn settle_acp_goal_round(
         let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
         let judged = match judge {
             Some(resolved) if request.run_judge && !checks_rejected => {
-                match crate::provider::create_client(
-                    &resolved.provider,
-                    state.cli.api_key.as_deref(),
-                    &cfg.custom_providers_map(),
-                    cfg.api_keys.as_ref(),
-                ) {
+                match state
+                    .provider_clients
+                    .get(&state.cli, cfg, &resolved.provider)
+                {
                     Ok(client) => Some(
                         crate::extras::goal::judge::ask_with_transcript_observed(
                             &goal,
@@ -3744,7 +3931,7 @@ async fn execute_prompt(
     >,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
-    #[cfg(feature = "mcp")] mcp_manager: &mut Option<crate::extras::mcp::McpClientManager>,
+    #[cfg(feature = "mcp")] mcp_manager: &mut Option<PromptMcp>,
     // Filled by the permission bridge with the time the user held this turn.
     #[cfg(feature = "goal")] blocked_ms: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<PromptOutcome, agent_client_protocol::Error> {
@@ -3870,7 +4057,10 @@ async fn execute_prompt(
         prompt_text.len(),
     );
 
-    let client = match acp_client(&state.cli, &state.cfg, &provider_str) {
+    let client = match state
+        .provider_clients
+        .get(&state.cli, &state.cfg, &provider_str)
+    {
         Ok(client) => client,
         Err(error) => {
             return Ok(PromptOutcome::failed(error.to_string()));
@@ -3879,7 +4069,8 @@ async fn execute_prompt(
 
     let native = matches!(&client, crate::provider::AnyClient::Anthropic(_))
         || crate::session::native_publication::is_native_bearing(&history.session);
-    if native && history.needs_compaction() {
+    let needs_compaction = history.needs_compaction();
+    if native && needs_compaction {
         return Ok(PromptOutcome::failed(
             "native history cannot be compacted in place; start a new ACP session".into(),
         ));
@@ -3917,7 +4108,7 @@ async fn execute_prompt(
     // belong to this ACP logical session and survive prompt cancellation.
     #[cfg(feature = "goal")]
     let mut compaction_usage = crate::event::UsageDelta::default();
-    if history.needs_compaction() {
+    if needs_compaction {
         #[cfg(feature = "hooks")]
         crate::startup::heap_future(|| crate::extras::hooks::dispatch_pre_compact(true, None))
             .await;
@@ -3944,7 +4135,8 @@ async fn execute_prompt(
             ))
         });
         let compacted = history
-            .compact_with(
+            .compact_with_known(
+                needs_compaction,
                 &control,
                 #[cfg(feature = "goal")]
                 Some(&goal_store_for_compaction),
@@ -4062,60 +4254,79 @@ async fn execute_prompt(
         history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results())
     };
     #[cfg(feature = "mcp")]
-    {
-        *mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
-            let client_servers = state
-                .sessions
-                .lock()
-                .await
-                .get(&session_id)
-                .map(|session| session.client_mcp_servers.clone())
-                .unwrap_or_default();
-            let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
-            let Some(manager) =
-                connect_prompt_mcp(&mcp_cfg, &workspace, &work_scope, control.cancelled()).await
-            else {
-                return Ok(PromptOutcome::cancelled(None));
-            };
-            manager
-        } else {
-            None
-        };
+    if state.cli.mcp_is_eligible(&state.cfg) {
+        let client_servers = state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|session| session.client_mcp_servers.clone())
+            .unwrap_or_default();
+        let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
+        let key = McpKey::new(&mcp_cfg, &workspace);
+        // A manager this prompt did not connect stays at the session's
+        // disposal until the prompt finishes (`run_prompt` hands it back).
+        match history.reuse.mcp.take() {
+            Some(previous) if previous.is_reusable(&key) => *mcp_manager = Some(previous),
+            stale => {
+                if let Some(stale) = stale {
+                    stale.close(false).await;
+                }
+                // The servers belong to the session, not to this prompt: they
+                // connect under their own scope so a later prompt's cancellation
+                // cannot reach connections it did not start.
+                let scope = crate::agent::runner::AgentWorkScope::new();
+                #[cfg(feature = "hooks")]
+                scope.set_hook_execution_root(workspace.root());
+                let Some(connected) =
+                    connect_prompt_mcp(&mcp_cfg, &workspace, &scope, control.cancelled()).await
+                else {
+                    return Ok(PromptOutcome::cancelled(None));
+                };
+                *mcp_manager = connected.map(|manager| PromptMcp {
+                    manager,
+                    scope,
+                    key: Some(key),
+                });
+            }
+        }
     }
     let native_js_context = history.session.native_js_context();
     let tool_output_session_id = session_id.to_string();
-    let Some(agent) = run_owned_pre_run(
-        &control,
-        &work_scope,
-        crate::provider::build_agent_in_workspace(
-            model,
-            &state.cli,
-            &state.cfg,
-            &context,
-            workspace,
-            permission,
-            ask_tx,
-            sandbox,
-            read_tracker,
-            todo_store,
-            #[cfg(feature = "goal")]
-            goal_store,
-            &tool_output_session_id,
-            None,
-            native_js_context,
-            false,
-            temperature,
-            extra_body,
-            #[cfg(feature = "js")]
-            js_session_state,
-            #[cfg(feature = "skills")]
-            skill_services,
-            #[cfg(feature = "mcp")]
-            mcp_manager.as_ref(),
-        ),
-    )
-    .await
-    else {
+    let build = crate::provider::build_agent_in_workspace(
+        model,
+        &state.cli,
+        &state.cfg,
+        &context,
+        workspace,
+        permission,
+        ask_tx,
+        sandbox,
+        read_tracker,
+        todo_store,
+        #[cfg(feature = "goal")]
+        goal_store,
+        &tool_output_session_id,
+        None,
+        native_js_context,
+        false,
+        temperature,
+        extra_body,
+        #[cfg(feature = "js")]
+        js_session_state,
+        #[cfg(feature = "skills")]
+        skill_services,
+        #[cfg(feature = "mcp")]
+        mcp_manager.as_ref().map(|mcp| &mcp.manager),
+    );
+    // Language servers outlive the turn: the builder reuses the session's
+    // manager instead of re-scanning PATH and restarting every server.
+    #[cfg(feature = "lsp")]
+    let build = {
+        let lsp_session = history.reuse.lsp.clone();
+        async move { lsp_session.scope(build).await }
+    };
+    let Some(agent) = run_owned_pre_run(&control, &work_scope, build).await else {
         return Ok(PromptOutcome::cancelled(None));
     };
 
@@ -4373,6 +4584,76 @@ fn relay_plan_if_changed(
     }
 }
 
+/// Streamed deltas arrive a few characters at a time; one `session/update`
+/// per delta costs a JSON-RPC frame and a pipe write each.
+const TEXT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(32);
+const TEXT_FLUSH_BYTES: usize = 4096;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextKind {
+    Message,
+    Thought,
+}
+
+/// Consecutive same-kind text deltas, flushed as one chunk after
+/// [`TEXT_FLUSH_INTERVAL`], once [`TEXT_FLUSH_BYTES`] accumulate, when the
+/// kind changes, or before any other update (so ordering is unchanged).
+#[derive(Default)]
+struct PendingText {
+    buffer: Option<(TextKind, String, tokio::time::Instant)>,
+}
+
+impl PendingText {
+    fn is_pending(&self) -> bool {
+        self.buffer.is_some()
+    }
+
+    async fn deadline_elapsed(&self) {
+        if let Some((_, _, started)) = &self.buffer {
+            tokio::time::sleep_until(*started + TEXT_FLUSH_INTERVAL).await;
+        }
+    }
+
+    fn push(
+        &mut self,
+        kind: TextKind,
+        text: &str,
+        session_id: &SessionId,
+        cx: &ConnectionTo<Client>,
+    ) {
+        if self
+            .buffer
+            .as_ref()
+            .is_some_and(|(pending, _, _)| *pending != kind)
+        {
+            self.flush(session_id, cx);
+        }
+        let (_, buffer, _) = self
+            .buffer
+            .get_or_insert_with(|| (kind, String::new(), tokio::time::Instant::now()));
+        buffer.push_str(text);
+        if buffer.len() >= TEXT_FLUSH_BYTES {
+            self.flush(session_id, cx);
+        }
+    }
+
+    fn flush(&mut self, session_id: &SessionId, cx: &ConnectionTo<Client>) {
+        let Some((kind, text, _)) = self.buffer.take() else {
+            return;
+        };
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+        let update = match kind {
+            TextKind::Message => SessionUpdate::AgentMessageChunk(chunk),
+            TextKind::Thought => SessionUpdate::AgentThoughtChunk(chunk),
+        };
+        if let Err(error) =
+            cx.send_notification(SessionNotification::new(session_id.clone(), update))
+        {
+            tracing::warn!("ACP failed to send text notification: {}", error);
+        }
+    }
+}
+
 async fn relay_prompt_events(
     session_id: SessionId,
     cx: ConnectionTo<Client>,
@@ -4385,16 +4666,27 @@ async fn relay_prompt_events(
     relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
     #[cfg(feature = "goal")]
     let mut usage = rig::completion::Usage::default();
+    let mut pending_text = PendingText::default();
     loop {
         let event = tokio::select! {
             biased;
             _ = control.cancelled() => {
+                pending_text.flush(&session_id, &cx);
                 return cancelled_after_runner_with_plan(
                     &mut rx, &session_id, &cx, &plan_store, &mut last_plan,
                 ).await;
             }
+            () = pending_text.deadline_elapsed(), if pending_text.is_pending() => {
+                pending_text.flush(&session_id, &cx);
+                continue;
+            }
             event = rx.recv() => event,
         };
+        // Streamed text is coalesced; anything else (tool call, result,
+        // terminal event, ...) is ordered after every delta that preceded it.
+        if !matches!(event, Some(AgentEvent::Token(_) | AgentEvent::Reasoning(_))) {
+            pending_text.flush(&session_id, &cx);
+        }
         let Some(event) = event else {
             return PromptOutcome {
                 reason: StopReason::Refusal,
@@ -4407,32 +4699,14 @@ async fn relay_prompt_events(
         };
         match event {
             AgentEvent::Token(text) => {
-                let chunk =
-                    ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
-                let notif = SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(chunk),
-                );
-                if let Err(e) = cx.send_notification(notif) {
-                    tracing::warn!("ACP failed to send token notification: {}", e);
-                }
+                pending_text.push(TextKind::Message, &text, &session_id, &cx);
             }
             AgentEvent::Reasoning(text) => {
-                let chunk =
-                    ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
-                let notif = SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::AgentThoughtChunk(chunk),
-                );
-                if let Err(e) = cx.send_notification(notif) {
-                    tracing::warn!("ACP failed to send reasoning notification: {}", e);
-                }
+                pending_text.push(TextKind::Thought, &text, &session_id, &cx);
             }
             AgentEvent::ToolCall { id, name, args } => {
                 let id = ToolCallId::new(id.to_string());
-                let args_str = args.to_string();
-                let tool_call = ToolCall::new(id.clone(), name.to_string())
-                    .raw_input(serde_json::from_str(&args_str).ok());
+                let tool_call = ToolCall::new(id.clone(), name.to_string()).raw_input(Some(args));
                 let notif = SessionNotification::new(
                     session_id.clone(),
                     SessionUpdate::ToolCall(tool_call),
@@ -4966,6 +5240,36 @@ mod history_tests {
                 ),
             "a single oversized turn must be replaced by its bounded recap"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_decision_serializes_live_history_once() {
+        let mut history = SessionHistory::default();
+        history.commit_completed_turn("hello", vec![Message::assistant("hi")]);
+        LIVE_BYTES_CALLS.with(|calls| calls.set(0));
+        // `compact_with` decides once and the loop does not re-ask when
+        // nothing needs compacting; a known decision costs nothing.
+        history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |_, _| async { unreachable!("history is within bounds") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(LIVE_BYTES_CALLS.with(std::cell::Cell::get), 1);
+        history
+            .compact_with_known(
+                false,
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |_, _| async { unreachable!("history is within bounds") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(LIVE_BYTES_CALLS.with(std::cell::Cell::get), 1);
     }
 
     #[tokio::test]
@@ -5825,6 +6129,7 @@ mod protocol_tests {
             cfg: Config::default(),
             context: crate::context::load(true),
             leases: Arc::default(),
+            provider_clients: Default::default(),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
@@ -5848,6 +6153,7 @@ mod protocol_tests {
             cfg: Config::default(),
             context: crate::context::load(true),
             leases: Arc::default(),
+            provider_clients: Default::default(),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
@@ -5874,6 +6180,7 @@ mod protocol_tests {
             cfg: Config::default(),
             context: crate::context::load(true),
             leases: Arc::default(),
+            provider_clients: Default::default(),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
@@ -5913,6 +6220,7 @@ mod protocol_tests {
             cfg: Config::default(),
             context: crate::context::load(true),
             leases: Arc::default(),
+            provider_clients: Default::default(),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: Some(std::ffi::OsString::from("bin")),
@@ -5944,6 +6252,108 @@ mod protocol_tests {
             response: response.into(),
             interactions,
         }
+    }
+
+    #[tokio::test]
+    async fn streamed_text_is_coalesced_and_ordered_before_other_updates() {
+        let fixture: PromptFixture = Arc::new(|_, _| {
+            Box::pin(async move {
+                let mut events = Vec::new();
+                for index in 0..200 {
+                    events.push(AgentEvent::Token(format!("m{index} ").into()));
+                }
+                events.push(AgentEvent::Reasoning("think-1 ".into()));
+                events.push(AgentEvent::Reasoning("think-2".into()));
+                events.push(AgentEvent::Token("before-tool ".into()));
+                events.push(AgentEvent::ToolCall {
+                    id: "coalesce-a".into(),
+                    name: "read".into(),
+                    args: serde_json::json!({"path": "a"}),
+                });
+                events.push(AgentEvent::Token("after-tool".into()));
+                events.push(done("end", vec![Message::assistant("end")]));
+                Ok(events)
+            })
+        });
+        let state = fixture_state(fixture);
+        let notifications = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = notifications.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let response = cx
+                    .send_request(prompt(session, "stream"))
+                    .block_task()
+                    .await?;
+                assert_eq!(response.stop_reason, StopReason::EndTurn);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // (kind, text) in arrival order; kind: 'm' message, 't' thought, 'c' tool call.
+        let mut order = Vec::<(char, String)>::new();
+        for notification in notifications.lock().unwrap().iter() {
+            let (kind, text) = match &notification.update {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(text) => ('m', text.text.clone()),
+                    _ => continue,
+                },
+                SessionUpdate::AgentThoughtChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(text) => ('t', text.text.clone()),
+                    _ => continue,
+                },
+                SessionUpdate::ToolCall(_) => ('c', String::new()),
+                _ => continue,
+            };
+            order.push((kind, text));
+        }
+        let kinds = order.iter().map(|(kind, _)| *kind).collect::<String>();
+        let tool_at = kinds.find('c').expect("tool call notification");
+        assert!(
+            kinds[..tool_at]
+                .chars()
+                .all(|kind| matches!(kind, 'm' | 't')),
+            "{kinds}"
+        );
+        let joined = |kind: char, range: std::ops::Range<usize>| {
+            order[range]
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, text)| text.as_str())
+                .collect::<String>()
+        };
+        let expected_messages = (0..200).map(|i| format!("m{i} ")).collect::<String>();
+        assert_eq!(
+            joined('m', 0..tool_at),
+            format!("{expected_messages}before-tool ")
+        );
+        assert_eq!(joined('t', 0..tool_at), "think-1 think-2");
+        assert_eq!(joined('m', tool_at + 1..order.len()), "after-tool");
+        // Reasoning stays before the later message text it preceded.
+        let first_thought = kinds.find('t').unwrap();
+        assert!(kinds[..first_thought].chars().all(|kind| kind == 'm'));
+        assert!(
+            kinds[..tool_at].len() < 100,
+            "{} chunks for 203 deltas",
+            kinds[..tool_at].len()
+        );
     }
 
     fn prompt(session_id: SessionId, text: &str) -> PromptRequest {
@@ -8919,7 +9329,10 @@ mod protocol_tests {
                                 std::future::pending().await
                             }
                             "prepare-error" => Err("preparation failed".to_string()),
-                            "error" => Ok(vec![AgentEvent::Error {
+                            // A clean turn keeps the session's servers connected, so
+                            // teardown-time cancellation needs a turn that tears
+                            // them down: one that ended in an error.
+                            "error" | "cleanup-cancel" => Ok(vec![AgentEvent::Error {
                                 message: "tool failed".into(),
                                 interactions: vec![Message::assistant("effect recorded")],
                             }]),
@@ -8964,6 +9377,42 @@ mod protocol_tests {
                             .block_task()
                             .await
                     });
+                    if case == "done" {
+                        // A clean turn leaves the session's servers connected
+                        // for the next prompt; closing the session ends them.
+                        let done = tokio::time::timeout(Duration::from_secs(2), response)
+                            .await
+                            .unwrap()
+                            .unwrap()?;
+                        assert_eq!(done.stop_reason, StopReason::EndTurn);
+                        assert!(
+                            process_is_alive(pid),
+                            "a clean prompt must not tear the session's server down"
+                        );
+                        let closing = tokio::spawn({
+                            let close_cx = cx.clone();
+                            let session = session.clone();
+                            async move {
+                                close_cx
+                                    .send_request(CloseSessionRequest::new(session))
+                                    .block_task()
+                                    .await
+                            }
+                        });
+                        assert_eq!(wait_for_pid(&lease.with_extension("eof")).await, pid);
+                        assert!(
+                            process_is_alive(pid),
+                            "close must wait for the server to exit before responding"
+                        );
+                        assert!(!closing.is_finished());
+                        std::fs::write(lease.with_extension("release"), b"exit").unwrap();
+                        tokio::time::timeout(Duration::from_secs(2), closing)
+                            .await
+                            .unwrap()
+                            .unwrap()?;
+                        assert!(!process_is_alive(pid), "session close ends the server");
+                        return Ok(());
+                    }
                     if case == "prepare-cancel" {
                         tokio::time::timeout(Duration::from_secs(2), preparing.notified())
                             .await
@@ -9042,6 +9491,64 @@ mod protocol_tests {
                 .await
                 .unwrap();
         }
+        server.cleanup();
+    }
+
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn session_mcp_manager_is_reused_only_for_its_config_while_connected() {
+        use crate::extras::mcp::{McpClientManager, client::McpClientHandle};
+        use crate::tests::mcp_stdio_tests::{FixtureBuild, process_is_alive, wait_for_pid};
+
+        let server = FixtureBuild::compile();
+        let lease = server.lease("reuse");
+        let server_config = server.config(
+            server.executable.display().to_string(),
+            Vec::new(),
+            "gated-eof",
+            &lease,
+        );
+        let handle = McpClientHandle::connect("reuse".into(), &server_config)
+            .await
+            .unwrap();
+        let pid = wait_for_pid(&lease).await;
+        let workspace = ProtocolTempDir::new();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(workspace.path()).unwrap());
+        let mut cfg = Config {
+            mcp_servers: Some(HashMap::from([("reuse".to_owned(), server_config)])),
+            ..Config::default()
+        };
+        let key = McpKey::new(&cfg, &binding);
+        let mcp = PromptMcp {
+            manager: McpClientManager::from_handles(vec![handle]),
+            scope: crate::agent::runner::AgentWorkScope::new(),
+            key: Some(McpKey::new(&cfg, &binding)),
+        };
+        assert!(mcp.is_reusable(&key));
+        cfg.mcp_servers = None;
+        assert!(
+            !mcp.is_reusable(&McpKey::new(&cfg, &binding)),
+            "a changed server set must reconnect"
+        );
+        let other = Arc::new(crate::paths::WorkspaceBinding::capture(workspace.path()).unwrap());
+        assert!(
+            !mcp.is_reusable(&McpKey::new(&Config::default(), &other)),
+            "a different workspace binding must reconnect"
+        );
+        std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .unwrap();
+        for _ in 0..200 {
+            if !mcp.manager.all_connections_open() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!mcp.is_reusable(&key), "a dead server must reconnect");
+        std::fs::write(lease.with_extension("release"), b"exit").unwrap();
+        mcp.close(false).await;
+        assert!(!process_is_alive(pid));
         server.cleanup();
     }
 
@@ -10804,6 +11311,21 @@ model = "acme-fast"
             ..Default::default()
         };
         assert!(acp_client(&cli, &cfg, "acme").is_ok());
+    }
+
+    #[test]
+    fn acp_provider_client_is_built_once_and_failures_are_not_cached() {
+        let cfg = config(CUSTOM);
+        let clients = ProviderClients::default();
+        assert!(clients.get(&Cli::default(), &cfg, "acme").is_err());
+        let cli = Cli {
+            api_key: Some("cli-key".into()),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            assert!(clients.get(&cli, &cfg, "acme").is_ok());
+        }
+        assert_eq!(clients.builds.load(Ordering::Relaxed), 1);
     }
 
     #[cfg(feature = "subagents")]
