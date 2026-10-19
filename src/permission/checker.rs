@@ -411,6 +411,8 @@ pub struct PermissionChecker {
     shell_allow_prefixes: Vec<crate::permission::shell_prefix::ShellPrefix>,
     /// Read-only git scripts may auto-allow only while the sandbox is enforced.
     readonly_git_auto_allow: bool,
+    /// The shell is contained by an active sandbox (recursive reads may auto-allow).
+    readonly_contained: bool,
     default_action: Action,
     ext_dir_rules: Vec<(Pattern, Action)>,
     doom_loop_action: Action,
@@ -604,6 +606,7 @@ impl PermissionChecker {
             rules: self.rules.clone(),
             shell_allow_prefixes: self.shell_allow_prefixes.clone(),
             readonly_git_auto_allow: self.readonly_git_auto_allow,
+            readonly_contained: self.readonly_contained,
             default_action: self.default_action,
             ext_dir_rules: self.ext_dir_rules.clone(),
             doom_loop_action: self.doom_loop_action,
@@ -884,6 +887,7 @@ impl PermissionChecker {
             shell_allow_prefixes,
             readonly_git_auto_allow: sandbox
                 != crate::permission::SandboxResolution::DegradedUnavailable,
+            readonly_contained: sandbox == crate::permission::SandboxResolution::Enforced,
             default_action,
             ext_dir_rules,
             doom_loop_action,
@@ -1409,6 +1413,44 @@ impl PermissionChecker {
             != Action::Deny
     }
 
+    /// A classified read-only script auto-allows only when every path argument
+    /// resolves (following symlinks) inside the workspace and passes the read
+    /// policy's deny and protected-path checks, and recursive commands run
+    /// under an active sandbox.
+    fn read_only_script_verified(&self, script: &str) -> bool {
+        let Some(report) = crate::permission::readonly_shell::classify(
+            script,
+            &self.working_dir,
+            self.readonly_git_auto_allow,
+        ) else {
+            return false;
+        };
+        if report.recursive && !self.readonly_contained {
+            return false;
+        }
+        let Some(cwd) = self.cached_resolved_cwd.as_deref() else {
+            return false;
+        };
+        report.paths.iter().all(|arg| {
+            let Some(resolved) = self.resolve_check_target(arg) else {
+                return false;
+            };
+            if !resolved.starts_with(cwd) {
+                return false;
+            }
+            let abs = resolved.to_string_lossy();
+            let relative = self.workspace_relative(&abs);
+            let mut inputs: SmallVec<[&str; 3]> = SmallVec::new();
+            inputs.push(&abs);
+            inputs.push(arg);
+            if let Some(relative) = relative.as_deref() {
+                inputs.push(relative);
+            }
+            !self.matches_deny_rule("read", &inputs)
+                && self.isolation_denial("read", &inputs).is_none()
+        })
+    }
+
     fn check_inner(
         &mut self,
         tool: &str,
@@ -1472,11 +1514,7 @@ impl PermissionChecker {
             && tool == "shell"
             && matched.is_empty()
             && action == Action::Ask
-            && crate::permission::readonly_shell::is_read_only_script(
-                policy_input,
-                &self.working_dir,
-                self.readonly_git_auto_allow,
-            )
+            && self.read_only_script_verified(policy_input)
         {
             action = Action::Allow;
         }

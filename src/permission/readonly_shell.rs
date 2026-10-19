@@ -9,21 +9,36 @@
 
 use std::path::{Component, Path};
 
-/// Whether `script` consists solely of allowlisted read-only commands.
-/// `allow_git` is false when the session runs unsandboxed after a fallback:
-/// git can launch repository-configured helpers (`diff.external`, textconv,
-/// `core.fsmonitor`), which is why the built-in `git status` allow is withheld
-/// in that case as well.
-pub(crate) fn is_read_only_script(script: &str, working_dir: &str, allow_git: bool) -> bool {
-    let Some(segments) = lex(script) else {
-        return false;
-    };
+/// What the checker must still verify before auto-allowing a classified script.
+#[derive(Debug, Default)]
+pub(crate) struct ReadOnlyScript {
+    /// Every non-flag argument (and `--opt=value` value): resolved by the
+    /// checker, which requires it to stay inside the workspace and pass the
+    /// read policy, so a symlinked argument cannot reach outside.
+    pub(crate) paths: Vec<String>,
+    /// Some command traverses directories; auto-allow only under an active sandbox.
+    pub(crate) recursive: bool,
+}
+
+/// Classify `script`; `None` unless it consists solely of allowlisted
+/// read-only commands. `allow_git` is false when the session runs unsandboxed
+/// after a fallback: git can launch repository-configured helpers
+/// (`diff.external`, textconv, `core.fsmonitor`).
+pub(crate) fn classify(script: &str, working_dir: &str, allow_git: bool) -> Option<ReadOnlyScript> {
+    let segments = lex(script)?;
     if segments.is_empty() {
-        return false;
+        return None;
     }
-    segments
-        .iter()
-        .all(|words| command_is_read_only(words, working_dir, allow_git))
+    let mut report = ReadOnlyScript::default();
+    for words in &segments {
+        command_is_read_only(words, working_dir, allow_git, &mut report).then_some(())?;
+    }
+    Some(report)
+}
+
+#[cfg(test)]
+pub(crate) fn is_read_only_script(script: &str, working_dir: &str, allow_git: bool) -> bool {
+    classify(script, working_dir, allow_git).is_some()
 }
 
 /// Split into pipeline/list segments of unquoted words. `None` on any syntax
@@ -141,7 +156,12 @@ fn short_cluster_has(arg: &str, letters: &[char]) -> bool {
         && arg.chars().skip(1).any(|c| letters.contains(&c))
 }
 
-fn command_is_read_only(words: &[String], working_dir: &str, allow_git: bool) -> bool {
+fn command_is_read_only(
+    words: &[String],
+    working_dir: &str,
+    allow_git: bool,
+    report: &mut ReadOnlyScript,
+) -> bool {
     let Some((command, args)) = words.split_first() else {
         return false;
     };
@@ -152,27 +172,61 @@ fn command_is_read_only(words: &[String], working_dir: &str, allow_git: bool) ->
     {
         return false;
     }
+    for arg in args {
+        if command == "sed" && is_sed_script(arg) {
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if let Some((_, value)) = long.split_once('=') {
+                report.paths.push(value.to_string());
+            }
+        } else if !arg.starts_with('-') {
+            report.paths.push(arg.clone());
+        }
+    }
     match command.as_str() {
-        "ls" | "cat" | "head" | "wc" | "grep" => true,
+        "ls" => !args
+            .iter()
+            .any(|a| short_cluster_has(a, &['L', 'H']) || a.starts_with("--dereference")),
+        "cat" | "head" | "wc" => true,
+        "grep" => {
+            if args
+                .iter()
+                .any(|a| short_cluster_has(a, &['R']) || a == "--dereference-recursive")
+            {
+                return false;
+            }
+            report.recursive |= args
+                .iter()
+                .any(|a| short_cluster_has(a, &['r']) || a == "--recursive" || a == "recurse");
+            true
+        }
         "tail" => {
             !args
                 .iter()
                 .any(|a| short_cluster_has(a, &['f', 'F']) || a.starts_with("--follow"))
                 && !args.iter().any(|a| a.starts_with("--retry"))
         }
-        "rg" => !args.iter().any(|a| {
-            a.starts_with("--pre")
-                || a.starts_with("--hostname-bin")
-                || a == "--search-zip"
-                || short_cluster_has(a, &['z'])
-        }),
-        "find" => !args.iter().any(|a| {
-            matches!(
-                a.as_str(),
-                "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete"
-            ) || a.starts_with("-fprint")
-                || a == "-fls"
-        }),
+        "rg" => {
+            report.recursive = true;
+            !args.iter().any(|a| {
+                a.starts_with("--pre")
+                    || a.starts_with("--hostname-bin")
+                    || a == "--search-zip"
+                    || a == "--follow"
+                    || short_cluster_has(a, &['z', 'L'])
+            })
+        }
+        "find" => {
+            report.recursive = true;
+            !args.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-L" | "-H" | "-follow"
+                ) || a.starts_with("-fprint")
+                    || a == "-fls"
+            })
+        }
         "sed" => sed_is_read_only(args),
         "git" => allow_git && git_is_read_only(args),
         _ => false,
@@ -350,6 +404,34 @@ mod tests {
     }
 
     #[test]
+    fn link_following_flags_ask() {
+        for script in [
+            "grep -R foo .",
+            "grep --dereference-recursive foo .",
+            "rg -L foo",
+            "rg --follow foo",
+            "find -L . -name x",
+            "find -H . -name x",
+            "find . -follow",
+            "ls -L",
+            "ls -H",
+            "ls --dereference",
+        ] {
+            no(script);
+        }
+    }
+
+    #[test]
+    fn recursion_is_reported() {
+        let report = |s: &str| super::classify(s, WD, true).unwrap().recursive;
+        assert!(report("grep -rn foo src"));
+        assert!(report("rg foo"));
+        assert!(report("find . -name x"));
+        assert!(!report("grep foo src/main.rs"));
+        assert!(!report("cat a | head"));
+    }
+
+    #[test]
     fn git_withheld_when_unsandboxed() {
         assert!(!ro("git log", WD, false));
         assert!(ro("ls", WD, false));
@@ -384,5 +466,54 @@ mod tests {
         assert_eq!(degraded.check("bash", "git log"), CheckResult::Ask);
         let mut restrictive = checker(SecurityMode::Restrictive, Enforced);
         assert_eq!(restrictive.check("bash", "ls"), CheckResult::Ask);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checker_refuses_symlinks_leaving_the_workspace_and_uncontained_recursion() {
+        use crate::permission::checker::CheckResult;
+        use crate::permission::{PermissionConfigs, SandboxResolution::*, SecurityMode};
+        let fixture = crate::tests::OwnedTestDirectory::new("readonly-shell-links");
+        let root = fixture.path().canonicalize().unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(root.join("secret"), b"s").unwrap();
+        std::fs::write(work.join("src/a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink(root.join("secret"), work.join("link")).unwrap();
+        std::os::unix::fs::symlink(work.join("src/a.txt"), work.join("inner")).unwrap();
+        let make = |sandbox| {
+            crate::permission::checker::PermissionChecker::new_for_sandbox(
+                &PermissionConfigs::default(),
+                SecurityMode::Standard,
+                Some(work.clone()),
+                None,
+                sandbox,
+            )
+            .unwrap()
+        };
+        let mut enforced = make(Enforced);
+        assert_eq!(
+            enforced.check("bash", "cat src/a.txt"),
+            CheckResult::Allowed
+        );
+        assert_eq!(enforced.check("bash", "cat inner"), CheckResult::Allowed);
+        assert_eq!(enforced.check("bash", "cat link"), CheckResult::Ask);
+        assert_eq!(enforced.check("bash", "head -n 1 link"), CheckResult::Ask);
+        assert_eq!(
+            enforced.check("bash", "grep -rn a src"),
+            CheckResult::Allowed
+        );
+        let mut disabled = make(Disabled);
+        assert_eq!(
+            disabled.check("bash", "cat src/a.txt"),
+            CheckResult::Allowed
+        );
+        assert_eq!(disabled.check("bash", "cat link"), CheckResult::Ask);
+        assert_eq!(disabled.check("bash", "grep -rn a src"), CheckResult::Ask);
+        assert_eq!(disabled.check("bash", "find . -name x"), CheckResult::Ask);
+        assert_eq!(
+            disabled.check("bash", "grep -n a src/a.txt"),
+            CheckResult::Allowed
+        );
     }
 }
