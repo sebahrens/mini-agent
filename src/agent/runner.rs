@@ -2387,8 +2387,7 @@ fn convert_history_uncached(
     canonical: bool,
 ) -> Vec<Message> {
     let (summary, first_kept) = session.compacted_context();
-    let replay_messages =
-        session.context_messages_with_pruned_tool_results(keep_recent_tool_results);
+    let replay_messages = session.pruned_context(keep_recent_tool_results);
     let remaining = replay_messages.len().saturating_sub(first_kept);
     let extra = if summary.is_some() { 1 } else { 0 };
     let mut messages = Vec::with_capacity(remaining + extra);
@@ -2428,7 +2427,7 @@ fn convert_history_uncached(
     let mut result_counts: HashMap<&str, usize> = HashMap::new();
     let mut call_positions: HashMap<&str, usize> = HashMap::new();
     let mut result_positions: HashMap<&str, usize> = HashMap::new();
-    for (position, msg) in replay_messages[first_kept..].iter().enumerate() {
+    for (position, msg) in replay_messages.iter_from(first_kept).enumerate() {
         let Some(id) = msg.tool_call_id.as_deref().filter(|id| !id.is_empty()) else {
             continue;
         };
@@ -2481,7 +2480,7 @@ fn convert_history_uncached(
     // would put the same `call_id` in the history twice.
     let mut replayed_subagent_ids: HashSet<String> = HashSet::new();
 
-    for msg in &replay_messages[first_kept..] {
+    for msg in replay_messages.iter_from(first_kept) {
         let structured_call_open = open_call_ids.len() > completed_call_ids.len();
         if !structured_call_open && !deferred_subagent_records.is_empty() {
             messages.append(&mut deferred_subagent_records);

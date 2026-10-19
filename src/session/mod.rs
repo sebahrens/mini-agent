@@ -2166,24 +2166,44 @@ impl Session {
         &self,
         keep_recent: usize,
     ) -> Vec<SessionMessage> {
+        let view = self.pruned_context(keep_recent);
+        let mut messages = self.messages.clone();
+        for (index, replacement) in view.replaced {
+            messages[index] = replacement;
+        }
+        messages
+    }
+
+    /// The same projection as [`Self::context_messages_with_pruned_tool_results`]
+    /// without copying the transcript: unchanged messages are borrowed and only
+    /// the cleared tool results are projected into owned replacements.
+    pub fn pruned_context(&self, keep_recent: usize) -> PrunedContext<'_> {
         let (_, first_live) = self.compacted_context();
         let mut remaining_to_clear = self.live_tool_result_clear_count(first_live, keep_recent);
-        let mut messages = self.messages.clone();
+        let mut replaced = Vec::new();
 
-        for message in &mut messages[first_live..] {
-            if message.role != MessageRole::ToolResult || remaining_to_clear == 0 {
+        for (offset, original) in self.messages[first_live..].iter().enumerate() {
+            if remaining_to_clear == 0 {
+                break;
+            }
+            if original.role != MessageRole::ToolResult {
                 continue;
             }
             remaining_to_clear -= 1;
-            let (content, notice) = projected_cleared_tool_result(message);
+            let mut message = original.clone();
+            let (content, notice) = projected_cleared_tool_result(&message);
             message.content = CompactString::new(content);
             message.estimated_tokens = Self::estimate_tokens(&message.content);
             if let Some(PersistedToolMessage::Result { output, .. }) = &mut message.tool {
                 *output = CompactString::new(notice);
             }
+            replaced.push((first_live + offset, message));
         }
 
-        messages
+        PrunedContext {
+            messages: &self.messages,
+            replaced,
+        }
     }
 
     /// Estimated live-context pressure after old tool results are cleared.
@@ -2518,6 +2538,36 @@ impl Session {
             anyhow::bail!("compaction summarized no messages; nothing to drain");
         }
         Ok(drain)
+    }
+}
+
+/// A borrowed view of the transcript with old tool results projected to their
+/// recovery notices; see [`Session::pruned_context`].
+pub struct PrunedContext<'a> {
+    messages: &'a [SessionMessage],
+    /// Owned replacements, ascending by message index.
+    replaced: Vec<(usize, SessionMessage)>,
+}
+
+impl PrunedContext<'_> {
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// The projected messages from index `start` on.
+    pub fn iter_from(&self, start: usize) -> impl Iterator<Item = &SessionMessage> + '_ {
+        let mut next = self.replaced.partition_point(|(index, _)| *index < start);
+        self.messages
+            .iter()
+            .enumerate()
+            .skip(start)
+            .map(move |(index, original)| match self.replaced.get(next) {
+                Some((replaced, message)) if *replaced == index => {
+                    next += 1;
+                    message
+                }
+                _ => original,
+            })
     }
 }
 
@@ -3397,5 +3447,35 @@ mod truncated_output_format_tests {
             format_truncated_tool_output_with_notice(&mixed, chars, "n"),
             reference(&mixed, chars, "n")
         );
+    }
+    #[test]
+    fn pruned_context_view_equals_the_cloned_projection_without_cloning_the_rest() {
+        let mut session = Session::new("openai", "model", 10_000, "");
+        session.add_message(MessageRole::User, "start");
+        for index in 0..6 {
+            let id = format!("call-{index}");
+            session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": id}));
+            session.add_tool_result_with_id(
+                &id,
+                "read",
+                &format!("output-{index}-{}", "x".repeat(300)),
+            );
+            session.add_message(MessageRole::Assistant, &format!("note {index}"));
+        }
+        for keep in [0, 1, 3, 6, 10] {
+            let cloned = session.context_messages_with_pruned_tool_results(keep);
+            let view = session.pruned_context(keep);
+            assert_eq!(view.len(), cloned.len());
+            for start in [0, 4, cloned.len()] {
+                let viewed: Vec<_> = view.iter_from(start).collect();
+                assert_eq!(viewed.len(), cloned.len() - start);
+                for (shown, expected) in viewed.into_iter().zip(&cloned[start..]) {
+                    assert_eq!(shown.content, expected.content);
+                    assert_eq!(shown.tool, expected.tool);
+                    assert_eq!(shown.estimated_tokens, expected.estimated_tokens);
+                }
+            }
+            assert_eq!(view.replaced.len(), 6usize.saturating_sub(keep));
+        }
     }
 }
