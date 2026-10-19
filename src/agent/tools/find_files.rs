@@ -767,10 +767,7 @@ impl BoundDirectory {
 
     pub(super) fn list_entries(&self) -> std::io::Result<Vec<BoundListEntry>> {
         let mut chain = IgnoreChain::default();
-        let (global, _) = GitignoreBuilder::new(&self.approved_root).build_global();
-        if !global.is_empty() {
-            chain = chain.append(vec![global]);
-        }
+        chain = chain.append(global_ignore_matchers(&self.approved_root));
         chain = chain.append(parent_ignore_matchers(&self.approved_root));
         let mut local_matchers = Vec::new();
         for ignore_name in [".gitignore", ".ignore"] {
@@ -781,13 +778,7 @@ impl BoundDirectory {
             }
         }
         chain = chain.append(local_matchers);
-        if let Ok(exclude) = open_relative(&self.root, Path::new(".git/info/exclude"))
-            && let Some(matcher) = ignore_matcher(
-                exclude,
-                &self.approved_root,
-                self.approved_root.join(".git/info/exclude"),
-            )
-        {
+        if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root) {
             chain = chain.append(vec![matcher]);
         }
 
@@ -960,10 +951,7 @@ impl BoundDirectory {
         max_entries: usize,
     ) -> std::io::Result<(Vec<BoundDiscoveryEntry>, bool)> {
         let mut chain = IgnoreChain::default();
-        let (global, _) = GitignoreBuilder::new(&self.approved_root).build_global();
-        if !global.is_empty() {
-            chain = chain.append(vec![global]);
-        }
+        chain = chain.append(global_ignore_matchers(&self.approved_root));
         chain = chain.append(parent_ignore_matchers(&self.approved_root));
         let mut local_matchers = Vec::new();
         for ignore_name in [".gitignore", ".ignore"] {
@@ -1118,18 +1106,9 @@ impl BoundWalker {
         hidden: Option<PathFilter>,
     ) -> std::io::Result<Self> {
         let mut matchers = IgnoreChain::default();
-        let (global, _) = GitignoreBuilder::new(&approved_root).build_global();
-        if !global.is_empty() {
-            matchers = matchers.append(vec![global]);
-        }
+        matchers = matchers.append(global_ignore_matchers(&approved_root));
         matchers = matchers.append(parent_ignore_matchers(&approved_root));
-        if let Ok(exclude) = open_relative(&root, Path::new(".git/info/exclude"))
-            && let Some(matcher) = ignore_matcher(
-                exclude,
-                &approved_root,
-                approved_root.join(".git/info/exclude"),
-            )
-        {
+        if let Some(matcher) = root_exclude_matcher(&root, &approved_root) {
             matchers = matchers.append(vec![matcher]);
         }
         let frame = DirectoryFrame::new(root, PathBuf::new(), matchers, &approved_root)?;
@@ -1343,24 +1322,202 @@ fn parent_ignore_sources(approved_root: &Path) -> Vec<(PathBuf, PathBuf)> {
     sources
 }
 
+fn ignore_source_stamp(source: &Path) -> IgnoreSourceStamp {
+    match std::fs::metadata(source) {
+        Ok(metadata) => IgnoreSourceStamp {
+            source: source.to_path_buf(),
+            length: Some(metadata.len()),
+            modified: metadata.modified().ok(),
+            is_file: metadata.is_file(),
+        },
+        Err(_) => IgnoreSourceStamp {
+            source: source.to_path_buf(),
+            length: None,
+            modified: None,
+            is_file: false,
+        },
+    }
+}
+
 fn parent_ignore_stamps(sources: &[(PathBuf, PathBuf)]) -> Vec<IgnoreSourceStamp> {
     sources
         .iter()
-        .map(|(_, source)| match std::fs::metadata(source) {
-            Ok(metadata) => IgnoreSourceStamp {
-                source: source.clone(),
-                length: Some(metadata.len()),
-                modified: metadata.modified().ok(),
-                is_file: metadata.is_file(),
-            },
-            Err(_) => IgnoreSourceStamp {
-                source: source.clone(),
-                length: None,
-                modified: None,
-                is_file: false,
-            },
-        })
+        .map(|(_, source)| ignore_source_stamp(source))
         .collect()
+}
+
+struct GlobalIgnoreCacheEntry {
+    /// GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, XDG_CONFIG_HOME and the home
+    /// directory: the inputs that choose which git configs are read.
+    env: Vec<Option<std::ffi::OsString>>,
+    /// Every git config candidate plus the resolved `core.excludesFile`.
+    sources: Vec<PathBuf>,
+    stamps: Vec<IgnoreSourceStamp>,
+    matchers: Arc<[Gitignore]>,
+}
+
+type GlobalIgnoreCache = Mutex<HashMap<PathBuf, GlobalIgnoreCacheEntry>>;
+static GLOBAL_IGNORE_CACHE: LazyLock<GlobalIgnoreCache> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static ROOT_EXCLUDE_CACHE: LazyLock<
+    Mutex<HashMap<PathBuf, (IgnoreSourceStamp, Option<Gitignore>)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn global_ignore_env() -> Vec<Option<std::ffi::OsString>> {
+    [
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "XDG_CONFIG_HOME",
+        "HOME",
+        "USERPROFILE",
+    ]
+    .iter()
+    .map(std::env::var_os)
+    .collect()
+}
+
+/// The git config files `core.excludesFile` can come from, mirroring the
+/// lookup `ignore` performs in `build_global`.
+fn global_ignore_config_files(env: &[Option<std::ffi::OsString>]) -> Vec<PathBuf> {
+    let nonempty = |value: &Option<std::ffi::OsString>| {
+        value
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let mut files = Vec::with_capacity(4);
+    if let Some(path) = nonempty(&env[0]) {
+        files.push(path);
+    }
+    let home = std::env::home_dir();
+    if let Some(home) = &home {
+        files.push(home.join(".gitconfig"));
+    }
+    if let Some(xdg) = nonempty(&env[2]).or_else(|| home.as_ref().map(|home| home.join(".config")))
+    {
+        files.push(xdg.join("git/config"));
+    }
+    files.push(nonempty(&env[1]).unwrap_or_else(|| PathBuf::from("/etc/gitconfig")));
+    files
+}
+
+fn global_ignore_matchers(approved_root: &Path) -> Arc<[Gitignore]> {
+    let env = global_ignore_env();
+    let config_files = global_ignore_config_files(&env);
+    global_ignore_cached(
+        &GLOBAL_IGNORE_CACHE,
+        approved_root,
+        env,
+        config_files,
+        ignore::gitignore::gitconfig_excludes_path,
+        || {
+            let (global, _) = GitignoreBuilder::new(approved_root).build_global();
+            if global.is_empty() {
+                Arc::from(Vec::new())
+            } else {
+                Arc::from(vec![global])
+            }
+        },
+    )
+}
+
+/// Memoize the global excludes matcher per root, valid while the environment
+/// and the stamps (length, mtime) of every git config candidate and of the
+/// resolved excludes file are unchanged. Misses rebuild exactly as before.
+fn global_ignore_cached(
+    cache: &GlobalIgnoreCache,
+    approved_root: &Path,
+    env: Vec<Option<std::ffi::OsString>>,
+    config_files: Vec<PathBuf>,
+    resolve_excludes: impl Fn() -> Option<PathBuf>,
+    build: impl Fn() -> Arc<[Gitignore]>,
+) -> Arc<[Gitignore]> {
+    let known_sources = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(approved_root)
+        .filter(|entry| entry.env == env)
+        .map(|entry| (entry.sources.clone(), entry.stamps.clone()));
+    if let Some((sources, stamps)) = known_sources {
+        let current: Vec<_> = sources
+            .iter()
+            .map(|source| ignore_source_stamp(source))
+            .collect();
+        if current == stamps
+            && let Some(matchers) = cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(approved_root)
+                .filter(|entry| entry.env == env && entry.stamps == stamps)
+                .map(|entry| Arc::clone(&entry.matchers))
+        {
+            return matchers;
+        }
+    }
+
+    let mut sources = config_files;
+    sources.extend(resolve_excludes());
+    let stamps_of = |sources: &[PathBuf]| -> Vec<IgnoreSourceStamp> {
+        sources
+            .iter()
+            .map(|source| ignore_source_stamp(source))
+            .collect()
+    };
+    let mut stamps = stamps_of(&sources);
+    let mut matchers = build();
+    let after_build = stamps_of(&sources);
+    if after_build != stamps {
+        // A source changed while it was being read; rebuild once and keep
+        // the newer stamps so the next call revalidates.
+        stamps = after_build;
+        matchers = build();
+    }
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if cache.len() >= MAX_PARENT_IGNORE_CACHE_ENTRIES && !cache.contains_key(approved_root) {
+        cache.clear();
+    }
+    cache.insert(
+        approved_root.to_path_buf(),
+        GlobalIgnoreCacheEntry {
+            env,
+            sources,
+            stamps,
+            matchers: Arc::clone(&matchers),
+        },
+    );
+    matchers
+}
+
+/// `.git/info/exclude` of the bound root. The file is still opened relative to
+/// the root descriptor; only the read and parse are skipped while the opened
+/// file's (length, mtime) stamp matches the cached one.
+fn root_exclude_matcher(root: &File, approved_root: &Path) -> Option<Gitignore> {
+    let exclude = open_relative(root, Path::new(".git/info/exclude")).ok()?;
+    let source = approved_root.join(".git/info/exclude");
+    let metadata = exclude.metadata().ok()?;
+    let stamp = IgnoreSourceStamp {
+        source: source.clone(),
+        length: Some(metadata.len()),
+        modified: metadata.modified().ok(),
+        is_file: metadata.is_file(),
+    };
+    if let Some((cached_stamp, matcher)) = ROOT_EXCLUDE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(approved_root)
+        && *cached_stamp == stamp
+    {
+        return matcher.clone();
+    }
+    let matcher = ignore_matcher(exclude, approved_root, source);
+    let mut cache = ROOT_EXCLUDE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if cache.len() >= MAX_PARENT_IGNORE_CACHE_ENTRIES && !cache.contains_key(approved_root) {
+        cache.clear();
+    }
+    cache.insert(approved_root.to_path_buf(), (stamp, matcher.clone()));
+    matcher
 }
 
 fn parse_parent_ignore_matchers(sources: &[(PathBuf, PathBuf)]) -> Arc<[Gitignore]> {
@@ -2680,6 +2837,57 @@ mod tests {
         std::fs::write(&ignore, "different-length-name.txt\n").unwrap();
         let refreshed = parent_ignore_matchers(&workspace);
         assert!(!Arc::ptr_eq(&cached, &refreshed));
+    }
+
+    #[test]
+    fn global_ignore_matchers_are_cached_until_a_config_or_the_environment_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let container = TempDir::new("global_ignore_cache");
+        let root = container.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = container.path().join("gitconfig");
+        let excludes = container.path().join("global_ignore");
+        std::fs::write(&config, "[core]\n\texcludesfile = x\n").unwrap();
+        std::fs::write(&excludes, "one.txt\n").unwrap();
+        let cache = GlobalIgnoreCache::default();
+        let builds = AtomicUsize::new(0);
+        let call = |env: Vec<Option<std::ffi::OsString>>| {
+            global_ignore_cached(
+                &cache,
+                &root,
+                env,
+                vec![config.clone()],
+                || Some(excludes.clone()),
+                || {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Arc::from(Vec::new())
+                },
+            )
+        };
+        let first = call(vec![None]);
+        let second = call(vec![None]);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "warm call must not rebuild"
+        );
+
+        std::fs::write(&excludes, "different-length.txt\n").unwrap();
+        let third = call(vec![None]);
+        assert!(!Arc::ptr_eq(&second, &third));
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        std::fs::write(&config, "[core]\n\texcludesfile = other-path\n").unwrap();
+        call(vec![None]);
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+
+        call(vec![Some("elsewhere".into())]);
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            4,
+            "environment change rebuilds"
+        );
     }
 
     #[test]
