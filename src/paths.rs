@@ -77,6 +77,9 @@ pub(crate) struct WorkspaceBinding {
     directory: std::fs::File,
     capability: cap_std::fs::Dir,
     identity: crate::fs::CheckedMetadata,
+    /// Per-binding `validate` calls (any thread), for "validated once per effect" tests.
+    #[cfg(test)]
+    validations: std::sync::atomic::AtomicUsize,
 }
 
 impl WorkspaceBinding {
@@ -166,6 +169,8 @@ impl WorkspaceBinding {
             directory,
             capability,
             identity: metadata,
+            #[cfg(test)]
+            validations: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -191,6 +196,8 @@ impl WorkspaceBinding {
             directory,
             capability,
             identity: self.identity.clone(),
+            #[cfg(test)]
+            validations: std::sync::atomic::AtomicUsize::new(0),
         };
         self.validate().map_err(io::Error::other)?;
         clone.validate().map_err(io::Error::other)?;
@@ -901,11 +908,19 @@ impl WorkspaceBinding {
         self.directory.try_clone()
     }
 
+    #[cfg(all(test, feature = "skills"))]
+    pub(crate) fn validation_count(&self) -> usize {
+        self.validations.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Fail closed if the canonical target or its directory identity changed.
     /// Consumers call this immediately before each filesystem/process effect.
     pub(crate) fn validate(&self) -> Result<(), String> {
         #[cfg(test)]
         VALIDATE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        #[cfg(test)]
+        self.validations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(target_os = "linux")]
         self.spelling
             .validate()
