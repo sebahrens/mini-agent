@@ -586,7 +586,7 @@ impl InvocationGrant {
         let spawn_program_identities =
             run_executable_preparation(deadline, cancellation, move |control| {
                 resolve_skill_spawn_programs(spawn_programs, |program| {
-                    resolve_program_identity_controlled(program, &control)
+                    resolve_program_identity_memoized_controlled(program, &control)
                 })
             })
             .await
@@ -1810,14 +1810,38 @@ fn path_scope_contains(prefix: &str, target: &str) -> bool {
 pub(crate) fn resolve_program_identity(
     program: &str,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
-    resolve_program_identity_inner(program, None, true)
+    resolve_program_identity_inner(program, None, ContentHash::Full)
 }
 
 pub(crate) fn resolve_program_identity_controlled(
     program: &str,
     control: &ExecutablePreparationControl,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
-    resolve_program_identity_inner(program, Some(control), true)
+    resolve_program_identity_inner(program, Some(control), ContentHash::Full)
+}
+
+/// Grant-time resolution for skill manifest preparation: identical to
+/// [`resolve_program_identity_controlled`] (the executable is resolved, opened and
+/// identity-checked on every call) except that the SHA-256 is reused when the opened file's
+/// stat fingerprint is unchanged. Spawn-time capture never uses this path and always rehashes.
+#[cfg(all(test, feature = "skills"))]
+pub(crate) fn resolve_program_identity_with_cache(
+    program: &str,
+    cache: &'static ProgramHashCache,
+) -> Result<SpawnExecutableIdentity, EffectServiceError> {
+    resolve_program_identity_inner(program, None, ContentHash::Memoized(cache))
+}
+
+#[cfg(feature = "skills")]
+pub(crate) fn resolve_program_identity_memoized_controlled(
+    program: &str,
+    control: &ExecutablePreparationControl,
+) -> Result<SpawnExecutableIdentity, EffectServiceError> {
+    resolve_program_identity_inner(
+        program,
+        Some(control),
+        ContentHash::Memoized(program_hash_cache()),
+    )
 }
 
 /// Resolves the executable's path and platform identity without reading its content. Only
@@ -1828,13 +1852,113 @@ pub(crate) fn resolve_program_identity_unhashed_controlled(
     program: &str,
     control: &ExecutablePreparationControl,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
-    resolve_program_identity_inner(program, Some(control), false)
+    resolve_program_identity_inner(program, Some(control), ContentHash::Skip)
+}
+
+/// How [`resolve_program_identity_inner`] obtains the executable's content digest.
+#[derive(Clone, Copy)]
+enum ContentHash {
+    /// Placeholder digest; the caller hashes the same file itself (Linux sealed snapshot).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Skip,
+    /// Always read and hash the whole file.
+    Full,
+    /// Reuse the digest while the opened file's stat fingerprint is unchanged.
+    #[cfg(feature = "skills")]
+    Memoized(&'static ProgramHashCache),
+}
+
+/// `(dev, ino, len, mtime_ns, ctime_ns)` of an opened executable.
+#[cfg(feature = "skills")]
+type ProgramStatFingerprint = (u64, u64, u64, i128, i128);
+
+#[cfg(all(feature = "skills", unix))]
+fn program_stat_fingerprint(metadata: &std::fs::Metadata) -> Option<ProgramStatFingerprint> {
+    use std::os::unix::fs::MetadataExt;
+
+    let nanos = |secs: i64, nsec: i64| i128::from(secs) * 1_000_000_000 + i128::from(nsec);
+    Some((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        nanos(metadata.mtime(), metadata.mtime_nsec()),
+        nanos(metadata.ctime(), metadata.ctime_nsec()),
+    ))
+}
+
+/// Windows has no ctime in `Metadata`; it is never memoized and always rehashes.
+#[cfg(all(feature = "skills", not(unix)))]
+fn program_stat_fingerprint(_metadata: &std::fs::Metadata) -> Option<ProgramStatFingerprint> {
+    None
+}
+
+/// Bounded memo of executable content digests keyed by stat fingerprint (mini-agent-k7e1q).
+///
+/// The cache never replaces the grant-time open, identity comparison or pinned digest; it only
+/// skips re-reading bytes of a file whose `(dev, ino, len, mtime, ctime)` are exactly those that
+/// were hashed. A file modified within `racy_window` of the observation is not stored, so a
+/// same-timestamp rewrite cannot be mistaken for the hashed version.
+#[cfg(feature = "skills")]
+pub(crate) struct ProgramHashCache {
+    entries: Mutex<HashMap<ProgramStatFingerprint, ExecutableContent>>,
+    racy_window: std::time::Duration,
+    #[cfg(test)]
+    hashes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "skills")]
+const PROGRAM_HASH_CACHE_CAPACITY: usize = 256;
+#[cfg(feature = "skills")]
+const PROGRAM_HASH_RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(feature = "skills")]
+impl ProgramHashCache {
+    pub(crate) fn new(racy_window: std::time::Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            racy_window,
+            #[cfg(test)]
+            hashes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of full content hashes this cache has caused (cache misses).
+    #[cfg(test)]
+    pub(crate) fn hash_count(&self) -> usize {
+        self.hashes.load(Ordering::SeqCst)
+    }
+
+    fn get(&self, key: &ProgramStatFingerprint) -> Option<ExecutableContent> {
+        self.entries.lock().ok()?.get(key).cloned()
+    }
+
+    fn insert(&self, key: ProgramStatFingerprint, content: ExecutableContent) {
+        let newest = key.3.max(key.4);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as i128);
+        if now.saturating_sub(newest) < self.racy_window.as_nanos() as i128 {
+            return;
+        }
+        if let Ok(mut entries) = self.entries.lock() {
+            if entries.len() >= PROGRAM_HASH_CACHE_CAPACITY {
+                entries.clear();
+            }
+            entries.insert(key, content);
+        }
+    }
+}
+
+#[cfg(feature = "skills")]
+fn program_hash_cache() -> &'static ProgramHashCache {
+    static CACHE: OnceLock<ProgramHashCache> = OnceLock::new();
+    CACHE.get_or_init(|| ProgramHashCache::new(PROGRAM_HASH_RACY_WINDOW))
 }
 
 fn resolve_program_identity_inner(
     program: &str,
     control: Option<&ExecutablePreparationControl>,
-    hash_content: bool,
+    hash_content: ContentHash,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
     executable_identity_checkpoint(control)?;
     let source = Path::new(program);
@@ -1903,19 +2027,46 @@ fn resolve_program_identity_inner(
         #[cfg(not(any(unix, windows)))]
         let platform =
             platform_executable_identity(&metadata).ok_or(EffectServiceError::InvalidTarget)?;
-        let content = if hash_content {
+        #[cfg(feature = "skills")]
+        let fingerprint = match hash_content {
+            ContentHash::Memoized(_) => program_stat_fingerprint(&metadata),
+            _ => None,
+        };
+        let hash = |file: &mut std::fs::File| {
             match control {
                 Some(control) => {
-                    copy_and_hash_executable_controlled(&mut file, &mut std::io::sink(), control)
+                    copy_and_hash_executable_controlled(file, &mut std::io::sink(), control)
                 }
-                None => copy_and_hash_executable(&mut file, &mut std::io::sink()),
+                None => copy_and_hash_executable(file, &mut std::io::sink()),
             }
-            .map_err(executable_copy_service_error)?
-        } else {
-            ExecutableContent {
+            .map_err(executable_copy_service_error)
+        };
+        let content = match hash_content {
+            ContentHash::Skip => ExecutableContent {
                 sha256: String::new(),
                 bytes: 0,
-            }
+            },
+            ContentHash::Full => hash(&mut file)?,
+            #[cfg(feature = "skills")]
+            ContentHash::Memoized(cache) => match fingerprint.and_then(|key| cache.get(&key)) {
+                Some(content) => content,
+                None => {
+                    #[cfg(test)]
+                    cache.hashes.fetch_add(1, Ordering::SeqCst);
+                    let content = hash(&mut file)?;
+                    if let Some(key) = fingerprint {
+                        // Fingerprint the same open descriptor again after hashing: a write
+                        // that raced the read changes it, and the entry is simply not stored.
+                        let after = file
+                            .metadata()
+                            .map_err(|_| EffectServiceError::InvalidTarget)?;
+                        if program_stat_fingerprint(&after) == Some(key) {
+                            cache.insert(key, content.clone());
+                        }
+                    }
+                    content
+                }
+            },
         };
         return Ok(SpawnExecutableIdentity {
             canonical_path,

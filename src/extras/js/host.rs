@@ -101,6 +101,7 @@ pub(crate) enum AllowPolicyReason {
     NoConfiguredRoots(FileAccess),
     InvalidConfiguration(FileAccess),
     InvalidTarget(FileAccess),
+    #[cfg_attr(not(test), allow(dead_code))]
     AmbiguousSymlink(FileAccess),
     OutsideConfiguredRoots(FileAccess),
     ProtectedGitAuthority,
@@ -254,6 +255,8 @@ impl AllowConfig {
         Self::from_settings(base, None, None, None, true, true)
     }
 
+    /// Resolving reference decision, kept as the oracle for [`Self::authorize_read_canonical`].
+    #[cfg(test)]
     pub(crate) fn authorize_read(&self, target: &Path) -> AuthorizationDecision {
         let resolved = match resolve_policy_read_target(&self.base, target) {
             Ok(path) => path,
@@ -262,6 +265,7 @@ impl AllowConfig {
         authorize_resolved(&self.read, resolved, FileAccess::Read)
     }
 
+    #[cfg(test)]
     pub(crate) fn authorize_write(&self, target: &Path) -> AuthorizationDecision {
         let resolved = match resolve_policy_write_target(&self.base, target) {
             Ok(path) => path,
@@ -271,6 +275,33 @@ impl AllowConfig {
             return AuthorizationDecision::Denied(AllowPolicyReason::ProtectedGitAuthority);
         }
         authorize_resolved(&self.write, resolved, FileAccess::Write)
+    }
+
+    /// Policy decision for a read target that [`resolve_read_target`] or discovery preparation
+    /// already canonicalized in this same effect (mini-agent-q3uvr). It runs the identical
+    /// spelling and root checks as [`Self::authorize_read`] but does not canonicalize again; the
+    /// caller must have just re-proved the target's identity (descriptor or `fstat`-style check).
+    fn authorize_read_canonical(&self, canonical: &Path) -> AuthorizationDecision {
+        if !is_normalized_absolute(canonical) {
+            return AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(
+                FileAccess::Read,
+            ));
+        }
+        authorize_resolved(&self.read, canonical.to_path_buf(), FileAccess::Read)
+    }
+
+    /// Write counterpart of [`Self::authorize_read_canonical`]: identical spelling, protected
+    /// Git authority and root checks without re-resolving an already canonical target.
+    fn authorize_write_canonical(&self, canonical: &Path) -> AuthorizationDecision {
+        if !is_normalized_absolute(canonical) {
+            return AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(
+                FileAccess::Write,
+            ));
+        }
+        if crate::git::runtime::check_model_write(canonical).is_err() {
+            return AuthorizationDecision::Denied(AllowPolicyReason::ProtectedGitAuthority);
+        }
+        authorize_resolved(&self.write, canonical.to_path_buf(), FileAccess::Write)
     }
 
     fn authorize_bound(&self, relative: &Path, access: FileAccess) -> AuthorizationDecision {
@@ -303,6 +334,21 @@ impl AllowConfig {
         }
         self.authorize_bound(relative, FileAccess::Write)
     }
+}
+
+/// True for an absolute path with only root/prefix/normal components and unambiguous spelling,
+/// i.e. the shape `std::fs::canonicalize` produces.
+fn is_normalized_absolute(path: &Path) -> bool {
+    use std::path::Component;
+
+    path.is_absolute()
+        && !path_has_ambiguous_spelling(path)
+        && path.components().all(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        })
 }
 
 fn path_has_ambiguous_spelling(path: &Path) -> bool {
@@ -432,6 +478,7 @@ fn build_path_policy(
     PathPolicy::Roots(canonical_roots)
 }
 
+#[cfg(test)]
 fn resolve_policy_read_target(base: &Path, target: &Path) -> Result<PathBuf, AllowPolicyReason> {
     if path_has_ambiguous_spelling(target) {
         return Err(AllowPolicyReason::InvalidTarget(FileAccess::Read));
@@ -441,6 +488,7 @@ fn resolve_policy_read_target(base: &Path, target: &Path) -> Result<PathBuf, All
     std::fs::canonicalize(absolute).map_err(|_| AllowPolicyReason::InvalidTarget(FileAccess::Read))
 }
 
+#[cfg(test)]
 fn resolve_policy_write_target(base: &Path, target: &Path) -> Result<PathBuf, AllowPolicyReason> {
     use std::path::Component;
 
@@ -2856,11 +2904,7 @@ async fn prepare_discovery_root(
     action: DiscoveryAction,
     cancellation: PermCancellation,
 ) -> Result<(PreparedDiscoveryEffect, Option<String>), HostEffectError> {
-    file.allow_config
-        .workspace_binding()
-        .map(|workspace| workspace.validate())
-        .transpose()
-        .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
+    validate_effect_workspace(file, &cancellation).await?;
     let output_base = file.allow_config.effect_base();
     let tool = action.permission_tool();
     let expanded = match file.allow_config.effect_target(path) {
@@ -3187,16 +3231,32 @@ fn workspace_relative_path(base: &Path, target: &Path) -> Result<Option<String>,
     Ok(Some(components.join("/")))
 }
 
+/// Validates the retained workspace binding once for one effect, on the blocking pool so its
+/// canonicalize/stat chain never stalls the executor (mini-agent-q3uvr). Bound-path opens after
+/// this go through the retained capability descriptor, so one validation covers every item of a
+/// multi-path effect.
+async fn validate_effect_workspace(
+    file: &FileEffectService,
+    cancellation: &PermCancellation,
+) -> Result<(), HostEffectError> {
+    let Some(workspace) = file.allow_config.workspace_binding() else {
+        return Ok(());
+    };
+    let workspace = workspace.clone();
+    let validation = crate::agent::runner::spawn_blocking_scoped(move || workspace.validate());
+    tokio::select! {
+        result = validation => result
+            .map_err(|_| HostEffectError::BackendFailure)?
+            .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged)),
+        _ = cancellation.cancelled() => Err(HostEffectError::InvocationCancelled),
+    }
+}
+
 async fn prepare_parent_read(
     file: &FileEffectService,
     path: &str,
     cancellation: PermCancellation,
 ) -> Result<(PreparedReadEffect, Option<String>), HostEffectError> {
-    file.allow_config
-        .workspace_binding()
-        .map(|workspace| workspace.validate())
-        .transpose()
-        .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
     let path = match file.allow_config.effect_target(path) {
         EffectTargetPath::Bound {
             workspace,
@@ -3233,6 +3293,39 @@ async fn prepare_parent_read(
     Ok((PreparedReadEffect::Path(target), workspace_relative))
 }
 
+/// Fails closed with `TargetChanged` unless `target.path` still names the file whose identity
+/// was captured when it was resolved.
+async fn ensure_read_target_unchanged(
+    target: &ResolvedReadTarget,
+) -> Result<(), EffectServiceError> {
+    let current = crate::fs::stable_path_metadata(&target.path)
+        .await
+        .map_err(file_path_error)?;
+    crate::fs::ensure_same_file(&target.path, &target.identity, &current).map_err(file_path_error)
+}
+
+/// Write counterpart of [`ensure_read_target_unchanged`]: the canonical parent directory must
+/// still be the captured one and the final component must not have become a symlink.
+async fn ensure_write_target_unchanged(
+    target: &ResolvedWriteTarget,
+) -> Result<(), EffectServiceError> {
+    let parent = target
+        .path
+        .parent()
+        .ok_or(EffectServiceError::InvalidTarget)?;
+    let current = crate::fs::stable_path_metadata(parent)
+        .await
+        .map_err(file_path_error)?;
+    crate::fs::ensure_same_file(parent, &target.parent_identity, &current)
+        .map_err(file_path_error)?;
+    match tokio::fs::symlink_metadata(&target.path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(EffectServiceError::FinalSymlink),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(file_path_error(error)),
+    }
+}
+
 async fn authorize_parent_read(
     file: &FileEffectService,
     target: &PreparedReadEffect,
@@ -3241,8 +3334,12 @@ async fn authorize_parent_read(
 ) -> Result<String, EffectServiceError> {
     match target {
         PreparedReadEffect::Path(target) => {
+            // The path was canonicalized once in `resolve_read_target`. Re-prove that it is
+            // still the same file (no-follow open + identity compare) instead of
+            // canonicalizing it again; execution repeats the same identity check.
+            ensure_read_target_unchanged(target).await?;
             if let AuthorizationDecision::Denied(reason) =
-                file.allow_config.authorize_read(&target.path)
+                file.allow_config.authorize_read_canonical(&target.path)
             {
                 return Err(file_policy_service_error(reason));
             }
@@ -3551,12 +3648,14 @@ impl ParentEffectService for ParentHostEffectService {
             }
             match operation {
                 EffectOperation::ReadFile { path } => {
+                    validate_effect_workspace(&self.file, &cancellation).await?;
                     let (target, workspace_relative) =
                         prepare_parent_read(&self.file, path, cancellation).await?;
                     self.validated = Some(PreparedParentEffect::Read(target));
                     Ok(NormalizedTarget::ReadFile { workspace_relative })
                 }
                 EffectOperation::ReadFiles { paths } => {
+                    validate_effect_workspace(&self.file, &cancellation).await?;
                     let mut targets = Vec::with_capacity(paths.len());
                     let mut workspace_relative = Vec::with_capacity(paths.len());
                     for path in paths {
@@ -3600,12 +3699,7 @@ impl ParentEffectService for ParentHostEffectService {
                     Ok(NormalizedTarget::ReadFile { workspace_relative })
                 }
                 EffectOperation::WriteFile { path, content } => {
-                    self.file
-                        .allow_config
-                        .workspace_binding()
-                        .map(|workspace| workspace.validate())
-                        .transpose()
-                        .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
+                    validate_effect_workspace(&self.file, &cancellation).await?;
                     let path = match self.file.allow_config.effect_target(path) {
                         EffectTargetPath::Ambient(path) => path,
                         EffectTargetPath::Bound {
@@ -3833,10 +3927,12 @@ impl ParentEffectService for ParentHostEffectService {
                                 .map_err(permission_service_error)?;
                             Ok::<_, EffectServiceError>(permission_path)
                         } else {
+                            // `permission_path` is the canonical root whose descriptor
+                            // `BoundDirectory::open` already holds and every traversal uses.
                             if let AuthorizationDecision::Denied(reason) = self
                                 .file
                                 .allow_config
-                                .authorize_read(&target.permission_path)
+                                .authorize_read_canonical(&target.permission_path)
                             {
                                 return Err(file_policy_service_error(reason));
                             }
@@ -3865,8 +3961,11 @@ impl ParentEffectService for ParentHostEffectService {
                     let call = async {
                         match &target {
                             PreparedWriteEffect::Path(target) => {
-                                if let AuthorizationDecision::Denied(reason) =
-                                    self.file.allow_config.authorize_write(&target.path)
+                                ensure_write_target_unchanged(target).await?;
+                                if let AuthorizationDecision::Denied(reason) = self
+                                    .file
+                                    .allow_config
+                                    .authorize_write_canonical(&target.path)
                                 {
                                     return Err(file_policy_service_error(reason));
                                 }
@@ -7809,6 +7908,180 @@ mod tests {
         expect_denied(
             policy.authorize_read(&safe.join("..").join("safe-evil").join("secret.txt")),
             AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+    }
+
+    #[test]
+    fn canonical_authorization_decides_exactly_like_resolving_authorization() {
+        let temp = TempDir::new();
+        let safe = temp.path().join("safe").canonicalize().unwrap_or_else(|_| {
+            std::fs::create_dir_all(temp.path().join("safe")).unwrap();
+            temp.path().join("safe").canonicalize().unwrap()
+        });
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside = outside.canonicalize().unwrap();
+        std::fs::write(safe.join("a.txt"), "a").unwrap();
+        std::fs::write(outside.join("b.txt"), "b").unwrap();
+        let roots = vec![safe.to_string_lossy().into_owned()];
+        let policy =
+            AllowConfig::from_settings(temp.path(), None, Some(&roots), Some(&roots), false, false);
+        for target in [
+            safe.join("a.txt"),
+            safe.clone(),
+            outside.join("b.txt"),
+            outside.clone(),
+        ] {
+            assert_eq!(
+                policy.authorize_read_canonical(&target),
+                policy.authorize_read(&target),
+                "read decision for {}",
+                target.display()
+            );
+        }
+        for target in [
+            safe.join("a.txt"),
+            safe.join("new.txt"),
+            outside.join("new.txt"),
+        ] {
+            assert_eq!(
+                policy.authorize_write_canonical(&target),
+                policy.authorize_write(&target),
+                "write decision for {}",
+                target.display()
+            );
+        }
+        // Non-canonical spellings are refused outright rather than re-resolved.
+        for target in [
+            safe.join("..").join("safe").join("a.txt"),
+            PathBuf::from("relative.txt"),
+        ] {
+            assert!(matches!(
+                policy.authorize_read_canonical(&target),
+                AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(FileAccess::Read))
+            ));
+            assert!(matches!(
+                policy.authorize_write_canonical(&target),
+                AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(FileAccess::Write))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_target_swapped_to_symlink_or_other_file_is_rejected_before_authorization() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let root = temp.path().canonicalize().unwrap();
+        let target_path = root.join("target.txt");
+        let other = root.join("other.txt");
+        std::fs::write(&target_path, "approved").unwrap();
+        std::fs::write(&other, "other").unwrap();
+
+        let resolved = resolve_read_target(&root, "target.txt").await.unwrap();
+        ensure_read_target_unchanged(&resolved)
+            .await
+            .expect("unchanged file keeps its identity");
+
+        std::fs::remove_file(&target_path).unwrap();
+        symlink(&other, &target_path).unwrap();
+        assert_eq!(
+            ensure_read_target_unchanged(&resolved).await,
+            Err(EffectServiceError::TargetChanged),
+            "a symlink swapped in after resolution must fail closed"
+        );
+
+        std::fs::remove_file(&target_path).unwrap();
+        std::fs::write(&target_path, "replacement inode").unwrap();
+        assert_eq!(
+            ensure_read_target_unchanged(&resolved).await,
+            Err(EffectServiceError::TargetChanged),
+            "a different file at the same path must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_target_swapped_to_symlink_or_other_parent_is_rejected_before_authorization() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/file.txt"), "old").unwrap();
+        std::fs::write(root.join("elsewhere.txt"), "elsewhere").unwrap();
+
+        let resolved = resolve_write_target(&root, "dir/file.txt").await.unwrap();
+        ensure_write_target_unchanged(&resolved).await.unwrap();
+
+        std::fs::remove_file(root.join("dir/file.txt")).unwrap();
+        symlink(root.join("elsewhere.txt"), root.join("dir/file.txt")).unwrap();
+        assert_eq!(
+            ensure_write_target_unchanged(&resolved).await,
+            Err(EffectServiceError::FinalSymlink)
+        );
+        std::fs::remove_file(root.join("dir/file.txt")).unwrap();
+
+        std::fs::rename(root.join("dir"), root.join("dir-retained")).unwrap();
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        assert_eq!(
+            ensure_write_target_unchanged(&resolved).await,
+            Err(EffectServiceError::TargetChanged),
+            "a replaced parent directory must fail closed"
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn read_files_validates_the_workspace_once_per_effect() {
+        let directory = TempDir::new();
+        let workspace_root = directory.path().join("workspace");
+        std::fs::create_dir_all(workspace_root.join("files")).unwrap();
+        std::fs::write(workspace_root.join("files/a.txt"), "a").unwrap();
+        std::fs::write(workspace_root.join("files/b.txt"), "b").unwrap();
+        std::fs::write(workspace_root.join("files/c.txt"), "c").unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap());
+        let captured = workspace.validation_count();
+        let permission = host_permission(workspace_root.clone(), Action::Allow, Action::Allow);
+        let owner = PermissionBridgeOwner::new(Some(permission), None, STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(&workspace_root)
+                    .with_workspace_binding(workspace.clone()),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let (mut broker, request) = scoped_host_broker(
+            &directory,
+            "read-files-validate-once",
+            service,
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["files".into()],
+            },
+            EffectOperation::ReadFiles {
+                paths: vec![
+                    "files/a.txt".into(),
+                    "files/b.txt".into(),
+                    "files/c.txt".into(),
+                ],
+            },
+            true,
+        );
+        broker
+            .dispatch(request, PermCancellation::new())
+            .await
+            .expect("bound multi-file read is allowed");
+        assert_eq!(
+            workspace.validation_count() - captured,
+            1,
+            "three items share one workspace validation"
         );
     }
 

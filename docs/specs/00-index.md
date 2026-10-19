@@ -249,6 +249,19 @@ cached as authority.
 | Shell launches wrapped by their output worker on the blocking pool (validate, wrap, spawn order unchanged) | Phase 2 | mini-agent-cttyn.51 |
 | A startup worker probe still queued at exit is cancelled before it runs; a running native preflight is joined through its cleanup | Phase 6 (startup probe lifecycle) | mini-agent-cttyn.64 |
 
+## Delivered performance follow-up (2026-10-19, JS and Phase 6)
+
+Three findings of the 2026-10-19 runtime performance review (epic `mini-agent-1acnc`) landed as code
+with the guarantees they touch preserved. The detail is in
+[`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md) under "Delivered corrections
+(2026-10-19 performance follow-up)". None changes the Phase 6 canonical checklist.
+
+| Change | Owning spec | Bead |
+|--------|-------------|------|
+| Grant-time spawn-program identity keeps its open and identity check; the content SHA-256 is memoized by the opened file's stat fingerprint, never at spawn time | Phase 5 / Phase 6 | mini-agent-k7e1q |
+| File effect targets canonicalized once; authorization re-proves identity (no-follow open / parent identity) instead of canonicalizing again; workspace binding validated once per effect off the executor | Phase 6 | mini-agent-q3uvr |
+| macOS preflight parent-death canary overlaps the first generation's Ready proof; both launches and all image hashes kept | Phase 6 | mini-agent-rnleg |
+
 ## Delivered features: `@agent` mentions and `/cron` (2026-10-18)
 
 Epic `mini-agent-5eoy7` (label `feature-2026-10-18`) added `@agent:<name>` mentions and the

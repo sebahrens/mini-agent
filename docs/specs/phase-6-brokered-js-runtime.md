@@ -841,7 +841,13 @@ full one-time-image launches (worker matrix and guardian parent-death canary) an
 child-side image hashes. The platform table requires the macOS launcher to repeat "the worker
 denial/readback plus guardian parent-death preflight", and every generation used by that matrix must
 prove the same full content digest, with authenticated Ready independently rehashing. No redundant
-launch or hash is removed on performance grounds.
+launch or hash is removed on performance grounds. The parent-death canary is started as soon as
+the first generation's publication (and its root lock) is complete, so it overlaps that generation's
+authenticated-Ready proof instead of following it; it reuses the persisted source-digest expectation
+the first launch just wrote, owns a separate set of probe sentinels, and must still report the same
+full image digest as the first generation. Each generation is a distinct clone, so image digests are
+never shared between launches. If the first generation fails, the canary is still joined and its own
+cleanup runs before the preflight reports the first generation's error.
 
 **Retained executable selection (`mini-agent-i7ro6.86`; amendment 2026-10-15).**
 A process retains the first generation's already-proven image only after its authenticated Ready
@@ -1474,6 +1480,35 @@ change the worker's canonical containment checklist.
    containment is explicitly disabled. Direct-child completion remains authoritative if inherited
    pipes reveal a descendant outside the owned group; that condition is surfaced and audited
    rather than rewritten as a false direct-child failure.
+
+## Delivered corrections (2026-10-19 performance follow-up)
+
+The 2026-10-19 runtime performance review (epic `mini-agent-1acnc`) corrected three findings that
+touch this corpus. None changes the canonical Phase 6 checklist above; invariant 5 keeps its
+wording.
+
+1. **Skill spawn-program hashing (`mini-agent-k7e1q`).** Grant preparation still resolves, opens and
+   identity-checks each declared executable on every call, so the pinning point stays at grant
+   time. Only the content SHA-256 is memoized, in a bounded process-local table keyed by the
+   *opened* file's `(dev, ino, len, mtime_ns, ctime_ns)`; the fingerprint is re-read after hashing
+   and a file modified in the last two seconds is never stored. A changed fingerprint rehashes in
+   full. The per-effect `PreparedSpawnEffect` capture does not use the memo and still hashes (or
+   seals) the executable immediately before spawn, and `enforce_manifest_scope` still denies a
+   mismatch as a policy fault. Windows has no ctime in `Metadata` and always rehashes.
+2. **File effect resolution (`mini-agent-q3uvr`).** An ambient read or write target is
+   canonicalized once, in preparation. Authorization then re-proves identity rather than
+   canonicalizing again: reads reopen the canonical path with a no-follow open and compare the
+   captured file identity; writes compare the captured parent-directory identity and reject a final
+   symlink; discovery roots are already traversed through the descriptor opened at preparation.
+   The root/Git-authority policy then runs on that canonical path (`authorize_*_canonical`, same
+   checks, no re-resolution), and execution repeats its existing identity check, so a swap to a
+   symlink or another inode between authorization and effect is still rejected as `TargetChanged`
+   or `FinalSymlink`. The retained workspace binding is validated once per effect (not once per
+   `read_files` item) on the blocking pool. The shared permission checker's own path resolution is
+   unchanged and still runs per effect.
+3. **macOS preflight (`mini-agent-rnleg`).** See "macOS preflight launch count" above: both launches
+   and every image hash remain; the parent-death canary now overlaps the first generation's Ready
+   proof.
 
 ## Acceptance matrix
 
