@@ -222,6 +222,7 @@ mod tests {
             open_todos: 0,
             tokens_used: 100,
             active: std::time::Duration::from_secs(5),
+            user_gate: None,
         }
     }
 

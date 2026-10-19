@@ -343,7 +343,7 @@ configured provider endpoints win endpoint environment fallbacks.
 
 | Public control | Purpose and precedence |
 |---|---|
-| `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_API_KEY` | Provider API keys: `--api-key` wins, then the designated provider environment variable, then `api_keys` in config. Ollama may run without a key. Isolated custom providers read only their designated `api_key_env` and their own config slot; `inherit_builtin_key = true` explicitly permits vendor credential inheritance. |
+| `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_API_KEY` | Provider API keys: `--api-key` wins for the session's own provider, then the designated provider environment variable, then `api_keys` in config. `--api-key` is never forwarded to a different provider (persona or subagent quick-models, the advisor, a `/model` or `/provider` switch, ACP turns on another provider): that provider resolves its own credential and fails closed without one. Ollama may run without a key. Isolated custom providers read only their designated `api_key_env` and their own config slot; `inherit_builtin_key = true` explicitly permits vendor credential inheritance. |
 | `ANTHROPIC_AUTH_TOKEN` | Native Anthropic bearer credential: `--api-key` and the designated API-key environment variable win; this token then wins config-file keys. It is consulted only when credential inheritance is allowed and no explicit `api_key_env` is configured. It sends `Authorization: Bearer <token>` without `x-api-key`; API-key values remain API keys regardless of their contents. Empty credentials are ignored. |
 | `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL` | Endpoint fallbacks only when no endpoint is configured in `custom_providers`. A configured endpoint wins and its credential-isolation policy remains in force. Empty/whitespace fallbacks are ignored. Anthropic accepts its root, `/v1`, or `/v1/messages` form; OpenAI compatible gateway URLs select Chat Completions unless `api_style` explicitly selects another protocol. Other providers use their normal endpoint or a configured custom endpoint. |
 | `ZS_PROVIDER`, `ZS_MODEL` | Environment-backed `--provider` and `--model`: explicit CLI wins, then these values, then config/default provider and model selection. |
@@ -1407,8 +1407,9 @@ mid_turn_compact_threshold = 0.80 # compact mid-turn at 80% real prompt pressure
 ## Custom provider credentials
 
 Every `custom_providers` entry is credential-isolated: its API key comes only
-from `--api-key`, the variable named by its own `api_key_env`, or
-`api_keys["<entry name>"]`. The vendor key of its `provider_type`
+from `--api-key` (when the entry is the session's startup provider), the
+variable named by its own `api_key_env`, or `api_keys["<entry name>"]`. A
+`--api-key` given for another provider is never sent to it. The vendor key of its `provider_type`
 (`OPENAI_API_KEY`, `GEMINI_API_KEY`, `api_keys.openai`, ...) is never used, so a
 real vendor key is not sent to a third-party `base_url` that merely speaks the
 same protocol.
@@ -2676,7 +2677,7 @@ attach the decision to the call they already rendered.
 ACP turns select their provider and model exactly like interactive startup:
 `--provider`/`--model`/config resolution, then `--quick-model` overriding both.
 A custom provider's `model` is only the default when nothing else names a
-model. Provider clients honour `--api-key` first, and turns use the configured
+model. Provider clients honour `--api-key` first for the startup provider only (another provider resolves its own credential), and turns use the configured
 `[retry]` policy. The server also initialises the `task` tool's subagent
 configuration (`subagent_model`, `subagent_provider`, `task_max_turns`) at
 startup, so delegated read-only agents work over ACP.

@@ -4889,6 +4889,33 @@ where
     ))
 }
 
+/// The `--api-key` value together with the one provider it was given for.
+///
+/// The key is scoped: it is handed only to the provider it belongs to (the
+/// session's startup provider). Any other provider -- a persona quick-model,
+/// the advisor, a `/model` switch -- gets `None` and resolves its own
+/// designated credential (`api_key_env`, `api_keys[alias]`, vendor variable),
+/// failing closed without one. This keeps a vendor key from reaching an
+/// isolated third-party `base_url` (mini-agent-zmt7r).
+#[derive(Clone, Debug)]
+pub(crate) struct CliKey<'a> {
+    pub key: Option<&'a str>,
+    pub provider: String,
+}
+
+impl<'a> CliKey<'a> {
+    pub(crate) fn new(key: Option<&'a str>, provider: &str) -> Self {
+        Self {
+            key,
+            provider: provider.to_owned(),
+        }
+    }
+
+    pub(crate) fn for_provider(&self, target: &str) -> Option<&'a str> {
+        self.key.filter(|_| self.provider == target)
+    }
+}
+
 pub fn create_client(
     provider_name: &str,
     api_key: Option<&str>,

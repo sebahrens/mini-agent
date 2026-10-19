@@ -255,7 +255,7 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
                     &ctx.session.provider,
                     ctx.client,
                     ctx.cfg,
-                    ctx.cli.api_key.as_deref(),
+                    &ctx.cli.scoped_api_key(ctx.cfg),
                 ) {
                     write_error(
                         ctx.renderer,

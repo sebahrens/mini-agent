@@ -1136,7 +1136,8 @@ fn acp_provider_and_model(
 }
 
 /// The ACP turn client, with the same credential precedence as startup
-/// (`--api-key` first).
+/// (`--api-key` first) for the startup provider only; any other provider
+/// resolves its own designated credential (mini-agent-zmt7r).
 fn acp_client(
     cli: &Cli,
     cfg: &Config,
@@ -1144,7 +1145,7 @@ fn acp_client(
 ) -> anyhow::Result<crate::provider::AnyClient> {
     crate::provider::create_client(
         provider,
-        cli.api_key.as_deref(),
+        cli.api_key_for(cfg, provider),
         cfg.custom_providers_map(),
         cfg.api_keys.as_ref(),
     )
@@ -11308,9 +11309,17 @@ model = "acme-fast"
         );
         let cli = Cli {
             api_key: Some("cli-key".into()),
+            provider: Some("acme".into()),
             ..Default::default()
         };
         assert!(acp_client(&cli, &cfg, "acme").is_ok());
+        // The key belongs to the startup provider; another provider never
+        // receives it and fails closed without its own credential.
+        let other = Cli {
+            provider: Some("other".into()),
+            ..cli
+        };
+        assert!(acp_client(&other, &cfg, "acme").is_err());
     }
 
     #[test]
@@ -11320,6 +11329,7 @@ model = "acme-fast"
         assert!(clients.get(&Cli::default(), &cfg, "acme").is_err());
         let cli = Cli {
             api_key: Some("cli-key".into()),
+            provider: Some("acme".into()),
             ..Default::default()
         };
         for _ in 0..3 {

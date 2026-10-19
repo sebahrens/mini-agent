@@ -117,7 +117,7 @@ charged to the session at the session model's prices.
 | ------ | ------- |
 | `active` | Being worked on. |
 | `awaiting user` | The agent asked you something. Answer it and the goal resumes. |
-| `blocked` | The same blocker survived several rounds with no progress. |
+| `blocked` | The same blocker survived several rounds with no progress, or a refusal only you can lift (for example `[subagents] allow_write = true` for a write persona) was hit: the goal parks at once and names the setting; change it, then `/goal resume`. |
 | `paused` | Parked, by the harness or by you. `/goal status` says why. |
 | `budget limited` | Rounds, tokens, or time ran out. Raise a bound and resume. |
 | `met` | Reached, and verified as deeply as you configured. |

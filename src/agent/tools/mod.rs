@@ -471,6 +471,30 @@ use crate::extras::mcp::config::TrustedMcpServer;
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 use crate::permission::checker::{CheckResult, PermCheck};
 
+const USER_GATE_OPEN: &str = "<requires-user-configuration>";
+const USER_GATE_CLOSE: &str = "</requires-user-configuration>";
+
+/// A refusal that only the user can lift by changing their own configuration
+/// (for example `[subagents] allow_write = true`). The typed marker lets the
+/// goal driver park immediately with the setting named instead of nudging the
+/// model to hunt for a way around it (mini-agent-9wq59). `setting` is a short
+/// literal naming the setting to change, never model- or file-derived text.
+#[cfg_attr(not(feature = "subagents"), allow(dead_code))]
+pub(crate) fn requires_user_configuration(setting: &str, message: &str) -> ToolError {
+    ToolError::Msg(format!(
+        "{USER_GATE_OPEN}{setting}{USER_GATE_CLOSE} {message}"
+    ))
+}
+
+/// The setting named by a [`requires_user_configuration`] refusal found in a
+/// tool result, if any.
+#[cfg_attr(not(feature = "goal"), allow(dead_code))]
+pub(crate) fn user_gated_setting(output: &str) -> Option<&str> {
+    let start = output.find(USER_GATE_OPEN)? + USER_GATE_OPEN.len();
+    let len = output[start..].find(USER_GATE_CLOSE)?;
+    Some(&output[start..start + len])
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("{0}")]

@@ -73,6 +73,9 @@ pub struct RoundSummary {
     /// prompt. Carried at full precision so a test can prove the clock stopped
     /// without sleeping a whole second to see it.
     pub active: std::time::Duration,
+    /// The setting a tool refusal this round named as changeable only by the
+    /// user (`agent::tools::requires_user_configuration`).
+    pub user_gate: Option<String>,
 }
 
 impl RoundSummary {
@@ -90,6 +93,7 @@ impl RoundSummary {
             open_todos: 0,
             tokens_used: 0,
             active: std::time::Duration::ZERO,
+            user_gate: None,
         }
     }
 
@@ -248,6 +252,14 @@ and any blocker, then finish.";
 /// Instruction for an ordinary unfinished round.
 pub const KEEP_WORKING_INSTRUCTION: &str =
     "The goal is not complete yet. Continue working toward it, then call goal_report.";
+
+/// The parked reason for a blocker only the user can lift.
+fn user_gate_message(setting: &str, blocker: &str) -> String {
+    format!(
+        "needs your configuration: set {setting} in your global config, then run /goal resume. \
+         Reported blocker: {blocker}"
+    )
+}
 
 fn blocked_instruction(attempt: u32, limit: u32, blocker: &str) -> String {
     format!(
@@ -457,6 +469,18 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
             .as_ref()
             .and_then(|r| r.blocker.clone())
             .unwrap_or_else(|| "unspecified".into());
+        // A gate only the user can open (a refused setting) is not worth
+        // retry rounds, and retrying nudges the model to look for a way to
+        // widen its own permissions. Park now and name the setting.
+        if let Some(setting) = round.user_gate.as_deref()
+            && round.mutating_tool_calls == 0
+        {
+            return Step::Decided(GateDecision::stop(
+                GoalStatus::Blocked,
+                user_gate_message(setting, &blocker),
+                VerdictSource::ModelReport,
+            ));
+        }
         let streak = if round.mutating_tool_calls > 0 {
             1
         } else {
@@ -1246,6 +1270,79 @@ mod tests {
         }
         apply(&mut g, &round, &decision, None, None);
         assert_eq!(g.status, GoalStatus::AwaitingUser);
+    }
+
+    // Rows 8 and 9, user-gated variant (mini-agent-9wq59).
+    #[test]
+    fn a_user_gated_blocker_parks_in_round_one_naming_the_setting() {
+        let mut g = goal();
+        let mut gated = report(ReportStatus::Blocked);
+        gated.blocker = Some("write persona refused".into());
+        let round = RoundSummary {
+            report: Some(gated),
+            user_gate: Some("[subagents] allow_write = true".into()),
+            ..RoundSummary::completed()
+        };
+        let decision = decided(&g, &round);
+        match &decision {
+            GateDecision::Stop { status, reason, .. } => {
+                assert_eq!(*status, GoalStatus::Blocked);
+                assert!(
+                    reason.contains("[subagents] allow_write = true"),
+                    "{reason}"
+                );
+                assert!(reason.contains("/goal resume"), "{reason}");
+            }
+            other => panic!("expected an immediate blocked stop, got {other:?}"),
+        }
+        apply(&mut g, &round, &decision, None, None);
+        assert_eq!(g.status, GoalStatus::Blocked);
+        assert_eq!(g.progress.rounds, 1);
+    }
+
+    #[test]
+    fn an_untrusted_project_persona_gate_parks_in_round_one_naming_the_action() {
+        let g = goal();
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Blocked)),
+            user_gate: Some(
+                "trust this project's configuration (or install the persona in your global agents directory)"
+                    .into(),
+            ),
+            ..RoundSummary::completed()
+        };
+        match decided(&g, &round) {
+            GateDecision::Stop { status, reason, .. } => {
+                assert_eq!(status, GoalStatus::Blocked);
+                assert!(
+                    reason.contains("trust this project's configuration"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected an immediate blocked stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_free_text_blocker_keeps_the_retry_nudge_and_never_suggests_config_changes() {
+        let g = goal();
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Blocked)),
+            ..RoundSummary::completed()
+        };
+        match decided(&g, &round) {
+            GateDecision::Continue { instruction, .. } => {
+                assert!(instruction.contains("attempt 1 of 3"));
+                let lower = instruction.to_lowercase();
+                for word in ["allow_write", "permission", "trust", "sandbox", "config"] {
+                    assert!(
+                        !lower.contains(word),
+                        "nudge mentions {word}: {instruction}"
+                    );
+                }
+            }
+            other => panic!("free-text blocker must still retry, got {other:?}"),
+        }
     }
 
     // Rows 8 and 9.

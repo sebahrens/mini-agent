@@ -999,7 +999,7 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
         if q.provider.as_str() != current_provider {
             let new_client = crate::provider::create_client(
                 &q.provider,
-                ctx.cli.api_key.as_deref(),
+                ctx.cli.api_key_for(ctx.cfg, &q.provider),
                 ctx.cfg.custom_providers_map(),
                 ctx.cfg.api_keys.as_ref(),
             )?;
@@ -1303,7 +1303,8 @@ mod model_pricing_tests {
         let cfg: Config = serde_json::from_value(serde_json::json!({
             "custom_providers": { "unpriced-gateway": {
                 "provider_type": "openai", "base_url": "http://127.0.0.1:1/v1", "api_style": "completions"
-            } }
+            } },
+            "api_keys": { "unpriced-gateway": "unused-test-key" }
         })).unwrap();
         let mut context = crate::context::ContextFiles {
             #[cfg(feature = "mcp")]

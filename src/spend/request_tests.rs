@@ -959,6 +959,7 @@ async fn usd_budget_native_actual_task_batch_held_children_keep_independent_prof
     let config = crate::extras::subagents::SubagentConfig {
         client,
         provider_name: "cost-wire".into(),
+        session_provider: "cost-wire".into(),
         model_name: "fallback-model".into(),
         fallback_notice: None,
         api_key: Some("unused-fixture-key".into()),
@@ -1718,6 +1719,7 @@ async fn background56_actual_task_and_signed_native_next_prompt_overlap_and_noti
     let child_config = crate::extras::subagents::SubagentConfig {
         client: child_client,
         provider_name: "cost-wire".into(),
+        session_provider: "cost-wire".into(),
         model_name: "fixture".into(),
         fallback_notice: None,
         api_key: Some("inert-child-key".into()),
