@@ -1812,6 +1812,17 @@ pub struct PathOverrides {
 
 impl PathOverrides {
     fn from_process() -> Self {
+        #[cfg(test)]
+        {
+            crate::tests::with_shared_process_env(Self::read_process)
+        }
+        #[cfg(not(test))]
+        {
+            Self::read_process()
+        }
+    }
+
+    fn read_process() -> Self {
         Self {
             home_dir: std::env::var_os(crate::product::GLOBAL_HOME_ENV),
             config_dir: std::env::var_os("ZS_CONFIG_DIR"),
