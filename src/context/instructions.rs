@@ -136,7 +136,8 @@ impl InstructionRoot {
 struct Source {
     id: String,
     path: PathBuf,
-    text: String,
+    /// Immutable once read: clones share the allocation instead of copying it.
+    text: Arc<str>,
     binding: Arc<WorkspaceBinding>,
     project: bool,
     scope: PathBuf,
@@ -495,26 +496,38 @@ impl WorkspaceInstructions {
         if sources.is_empty() {
             return Ok(());
         }
+        // Within one authorization pass the project-config trust answer and each
+        // distinct binding's validity are asked once; the per-source read-Allow
+        // permission decision below is still made for every source.
+        let mut trusted = None;
+        let mut validated: Vec<*const WorkspaceBinding> = Vec::new();
         for source in sources {
             if source.project {
                 let paths = self
                     .paths
                     .as_ref()
                     .ok_or("Instruction trust paths unavailable")?;
-                if !crate::config::load::project_config_is_trusted_in_workspace_readonly(
-                    paths,
-                    &self.workspace,
-                ) {
+                let trusted = *trusted.get_or_insert_with(|| {
+                    crate::config::load::project_config_is_trusted_in_workspace_readonly(
+                        paths,
+                        &self.workspace,
+                    )
+                });
+                if !trusted {
                     return Err(
                         "Workspace instructions require trust for the captured project config"
                             .into(),
                     );
                 }
             }
-            source
-                .binding
-                .validate()
-                .map_err(|_| "Instruction binding changed")?;
+            let binding = Arc::as_ptr(&source.binding);
+            if !validated.contains(&binding) {
+                source
+                    .binding
+                    .validate()
+                    .map_err(|_| "Instruction binding changed")?;
+                validated.push(binding);
+            }
             let identity = source
                 .binding
                 .logical_relative_path(&source.path)
@@ -603,7 +616,7 @@ impl WorkspaceInstructions {
         let mut source = Source {
             id: String::new(),
             path,
-            text: String::new(),
+            text: Arc::from(""),
             binding: binding.clone(),
             project,
             scope: scope.to_owned(),
@@ -644,7 +657,7 @@ impl WorkspaceInstructions {
         source.text = match crate::paths::read_utf8_bounded_status(file, remaining)
             .map_err(|_| "Could not read workspace instructions")?
         {
-            crate::paths::BoundedUtf8Read::Content(text) => text,
+            crate::paths::BoundedUtf8Read::Content(text) => Arc::from(text),
             _ => return Err("Workspace instructions exceed the bounded UTF-8 source limit".into()),
         };
         binding
@@ -1504,7 +1517,7 @@ mod tests {
             let sources = service.load(Path::new("effect.txt")).unwrap();
             assert_eq!(sources.len(), if aliases_first { 1 } else { 2 });
             assert_eq!(sources[0].path, Path::new(first));
-            assert_eq!(sources[0].text, "SAME_CONTENT\n");
+            assert_eq!(&*sources[0].text, "SAME_CONTENT\n");
             if !aliases_first {
                 assert_eq!(sources[1].path, Path::new(alias));
                 assert_ne!(sources[0].id, sources[1].id);
@@ -1537,7 +1550,7 @@ mod tests {
         assert_eq!(sources.len(), usize::from(!alias));
         assert!(!service.initial_overlay().contains("ROOT @AGENTS"));
         if !alias {
-            assert_eq!(sources[0].text, "DISTINCT_LOWERCASE_ROOT\n");
+            assert_eq!(&*sources[0].text, "DISTINCT_LOWERCASE_ROOT\n");
         }
     }
     #[test]
@@ -1593,7 +1606,9 @@ mod tests {
         let reused = service
             .load(Path::new("nested/deeper/another.txt"))
             .unwrap();
-        assert_eq!(reused[0].text, "SHARED_ROOT_SCOPE @nested/inner.md\n");
+        assert_eq!(&*reused[0].text, "SHARED_ROOT_SCOPE @nested/inner.md\n");
+        // Reuse shares the retained allocation rather than copying every text.
+        assert!(Arc::ptr_eq(&sources[0].text, &reused[0].text));
     }
     #[test]
     fn context63_include_cycles_depth_missing_escape_and_postescape_budget_are_bounded() {
