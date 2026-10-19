@@ -5,6 +5,11 @@
 //! read-only tools take a shared lease, while mutating and unknown tools take
 //! an exclusive lease. The conservative default keeps extension/MCP tools from
 //! acquiring parallel mutation authority accidentally.
+//!
+//! `edit`, `write`, `notebook_edit` and `shell` give the exclusive lease back
+//! only while their permission prompt is open ([`prompt_unlocked`]) and
+//! re-acquire it before using the answer; targets opened before the prompt are
+//! re-captured and a changed identity is the ordinary path-changed error.
 
 use std::sync::Arc;
 
@@ -63,9 +68,79 @@ fn access_for_call(access: ToolAccess, args: &str) -> ToolAccess {
     }
 }
 
-enum Lease<'a> {
-    Shared(#[allow(dead_code)] tokio::sync::RwLockReadGuard<'a, ()>),
-    Exclusive(#[allow(dead_code)] tokio::sync::RwLockWriteGuard<'a, ()>),
+enum Lease {
+    Shared(#[allow(dead_code)] tokio::sync::OwnedRwLockReadGuard<()>),
+    Exclusive(#[allow(dead_code)] tokio::sync::OwnedRwLockWriteGuard<()>),
+}
+
+/// The lease one tool call holds, reachable from the permission prompt.
+///
+/// An exclusive lease exists to stop concurrent mutation authority, but a
+/// permission wait precedes any effect. Mutating tools that opt in through
+/// [`prompt_unlocked`] let the prompt give the lease back so read-only calls
+/// from the same batch (and other prompts) are not stalled behind a human
+/// answer. The lease is re-acquired before the tool continues, and such a tool
+/// must treat every identity it captured before the prompt as stale and
+/// re-capture it under the re-acquired lease.
+struct LaneSlot {
+    lane: Arc<RwLock<()>>,
+    lease: std::sync::Mutex<Option<Lease>>,
+}
+
+/// Set by a tool around its permission check to allow that check to release
+/// the exclusive lease while the prompt is open.
+#[derive(Default)]
+struct PromptUnlock {
+    released: std::sync::atomic::AtomicBool,
+}
+
+tokio::task_local! {
+    static LANE: Arc<LaneSlot>;
+    static PROMPT_UNLOCK: Arc<PromptUnlock>;
+}
+
+/// Run a permission check that may release the exclusive lease while the user
+/// is asked. Returns the check's output and whether the lease was released
+/// (so every file identity captured before the prompt must be re-captured).
+pub(crate) async fn prompt_unlocked<F: std::future::Future>(check: F) -> (F::Output, bool) {
+    let marker = Arc::new(PromptUnlock::default());
+    let output = PROMPT_UNLOCK.scope(Arc::clone(&marker), check).await;
+    (
+        output,
+        marker.released.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
+/// An exclusive lease given back for the duration of one prompt.
+pub(crate) struct SuspendedLease {
+    slot: Arc<LaneSlot>,
+}
+
+/// Give back the calling tool's exclusive lease if the tool opted in through
+/// [`prompt_unlocked`]. Shared leases, unscoped callers and tools that did not
+/// opt in keep what they hold.
+pub(crate) fn suspend_for_prompt() -> Option<SuspendedLease> {
+    let marker = PROMPT_UNLOCK.try_with(Arc::clone).ok()?;
+    let slot = LANE.try_with(Arc::clone).ok()?;
+    {
+        let mut lease = slot.lease.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*lease, Some(Lease::Exclusive(_))) {
+            return None;
+        }
+        *lease = None;
+    }
+    marker
+        .released
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    Some(SuspendedLease { slot })
+}
+
+impl SuspendedLease {
+    /// Wait for the exclusive lease again. Queues behind any other holder.
+    pub(crate) async fn resume(self) {
+        let guard = Arc::clone(&self.slot.lane).write_owned().await;
+        *self.slot.lease.lock().unwrap_or_else(|e| e.into_inner()) = Some(Lease::Exclusive(guard));
+    }
 }
 
 struct ConcurrencyBoundTool {
@@ -89,11 +164,17 @@ impl ConcurrencyBoundTool {
         }
     }
 
-    async fn lease(&self, args: &str) -> Lease<'_> {
-        match access_for_call(self.access, args) {
-            ToolAccess::Read => Lease::Shared(self.lane.read().await),
-            ToolAccess::Write | ToolAccess::JobStatus => Lease::Exclusive(self.lane.write().await),
-        }
+    async fn lease(&self, args: &str) -> Arc<LaneSlot> {
+        let lease = match access_for_call(self.access, args) {
+            ToolAccess::Read => Lease::Shared(Arc::clone(&self.lane).read_owned().await),
+            ToolAccess::Write | ToolAccess::JobStatus => {
+                Lease::Exclusive(Arc::clone(&self.lane).write_owned().await)
+            }
+        };
+        Arc::new(LaneSlot {
+            lane: Arc::clone(&self.lane),
+            lease: std::sync::Mutex::new(Some(lease)),
+        })
     }
 
     fn question_admission() -> Result<(), ToolError> {
@@ -124,12 +205,15 @@ impl ToolDyn for ConcurrencyBoundTool {
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
         let spend = crate::spend::run::Run::current();
         let future = async move {
-            let _lease = self.lease(&args).await;
-            crate::spend::run::admit_current_effect()
-                .await
-                .map_err(|error| ToolError::ToolCallError(error.into()))?;
-            Self::question_admission()?;
-            self.inner.call(args).await
+            let slot = self.lease(&args).await;
+            LANE.scope(slot, async {
+                crate::spend::run::admit_current_effect()
+                    .await
+                    .map_err(|error| ToolError::ToolCallError(error.into()))?;
+                Self::question_admission()?;
+                self.inner.call(args).await
+            })
+            .await
         };
         let future = crate::spend::run::scope(spend, future);
         #[cfg(feature = "acp")]
@@ -147,12 +231,15 @@ impl ToolDyn for ConcurrencyBoundTool {
             .cloned()
             .or_else(crate::spend::run::Run::current);
         let future = async move {
-            let _lease = self.lease(&args).await;
-            crate::spend::run::admit_current_effect()
-                .await
-                .map_err(|error| ToolError::ToolCallError(error.into()))?;
-            Self::question_admission()?;
-            self.inner.call_with_extensions(args, extensions).await
+            let slot = self.lease(&args).await;
+            LANE.scope(slot, async {
+                crate::spend::run::admit_current_effect()
+                    .await
+                    .map_err(|error| ToolError::ToolCallError(error.into()))?;
+                Self::question_admission()?;
+                self.inner.call_with_extensions(args, extensions).await
+            })
+            .await
         };
         let future = crate::spend::run::scope(spend, future);
         let future = crate::question::scope_extensions(extensions, future);
@@ -177,14 +264,17 @@ impl ToolDyn for ConcurrencyBoundTool {
             None
         };
         let future = async move {
-            let _lease = self.lease(&args).await;
-            if let Err(error) = crate::spend::run::admit_current_effect().await {
-                return ToolExecutionResult::denied(error.to_string());
-            }
-            if let Err(error) = Self::question_admission() {
-                return ToolExecutionResult::denied(error.to_string());
-            }
-            self.inner.call_structured(args, extensions).await
+            let slot = self.lease(&args).await;
+            LANE.scope(slot, async {
+                if let Err(error) = crate::spend::run::admit_current_effect().await {
+                    return ToolExecutionResult::denied(error.to_string());
+                }
+                if let Err(error) = Self::question_admission() {
+                    return ToolExecutionResult::denied(error.to_string());
+                }
+                self.inner.call_structured(args, extensions).await
+            })
+            .await
         };
         let future = crate::agent::tools::bash::scope_shell_call_id(call_id, future);
         let future = crate::spend::run::scope(spend, future);
@@ -215,8 +305,8 @@ mod tests {
     use super::*;
 
     #[derive(Clone)]
-    struct ProbeTool {
-        name: &'static str,
+    pub(super) struct ProbeTool {
+        pub(super) name: &'static str,
         active: Arc<AtomicUsize>,
         maximum: Arc<AtomicUsize>,
         entered: Arc<tokio::sync::Notify>,
@@ -251,7 +341,7 @@ mod tests {
         }
     }
 
-    fn probe(
+    pub(super) fn probe(
         name: &'static str,
     ) -> (
         ProbeTool,
@@ -665,5 +755,391 @@ mod question_boundary_tests {
                 assert!(outcome.model_output().contains("user answer"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_release_tests {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use rig::tool::{Tool, ToolOutcome};
+
+    use super::tests::{ProbeTool, probe};
+    use super::*;
+    use crate::permission::ask::{AskRequest, UserDecision, UserRequest};
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+
+    const WAIT: Duration = Duration::from_secs(3);
+
+    fn asking_permission(root: &std::path::Path) -> crate::permission::checker::PermCheck {
+        Arc::new(std::sync::Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(PermissionConfig {
+                    write: Some(ToolPerm::Simple(Action::Ask)),
+                    edit: Some(ToolPerm::Simple(Action::Ask)),
+                    notebook_edit: Some(ToolPerm::Simple(Action::Ask)),
+                    bash: Some(ToolPerm::Simple(Action::Ask)),
+                    read: Some(ToolPerm::Simple(Action::Allow)),
+                    ..Default::default()
+                }),
+                SecurityMode::Standard,
+                Some(root.to_path_buf()),
+                None,
+            )
+            .unwrap(),
+        ))
+    }
+
+    async fn next_request(receiver: &mut tokio::sync::mpsc::Receiver<UserRequest>) -> AskRequest {
+        tokio::time::timeout(WAIT, receiver.recv())
+            .await
+            .expect("permission request")
+            .expect("ask channel open")
+            .into_permission()
+    }
+
+    /// A mutating probe that asks through the real permission path (opted in)
+    /// and then holds the lane until released.
+    #[derive(Clone)]
+    struct AskingProbe {
+        permission: crate::permission::checker::PermCheck,
+        ask_tx: crate::permission::ask::AskSender,
+        probe: ProbeTool,
+        name: &'static str,
+    }
+
+    impl Tool for AskingProbe {
+        const NAME: &'static str = "write";
+        type Error = ToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn name(&self) -> String {
+            self.name.to_owned()
+        }
+
+        fn description(&self) -> String {
+            String::new()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+            let (checked, released) = prompt_unlocked(crate::agent::tools::check_perm(
+                &Some(self.permission.clone()),
+                &Some(self.ask_tx.clone()),
+                "shell",
+                "touch effect",
+            ))
+            .await;
+            checked.map_err(|error| ToolError::ToolCallError(error.to_string().into()))?;
+            assert!(released, "the answered prompt must report the release");
+            Tool::call(&self.probe, args)
+                .await
+                .map_err(|never| match never {})
+        }
+    }
+
+    #[tokio::test]
+    async fn read_enters_while_a_mutating_call_awaits_approval_then_exclusivity_returns() {
+        let root = crate::tests::OwnedTestDirectory::new("prompt-release-probe");
+        let (probe, entered, release, maximum) = probe("write");
+        let mut read = probe.clone();
+        read.name = "read";
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let asking = AskingProbe {
+            permission: asking_permission(root.path()),
+            ask_tx: sender,
+            probe: probe.clone(),
+            name: "write",
+        };
+        let tools = Arc::new(bind(vec![Box::new(asking), Box::new(read.clone())]));
+        let write_tools = Arc::clone(&tools);
+        let write = tokio::spawn(async move { write_tools[0].call("{}".to_owned()).await });
+        let request = next_request(&mut receiver).await;
+
+        // The prompt is unanswered, yet a read from the same batch runs.
+        let read_tools = Arc::clone(&tools);
+        let first_read = tokio::spawn(async move { read_tools[1].call("{}".to_owned()).await });
+        tokio::time::timeout(WAIT, entered.notified())
+            .await
+            .expect("read must enter while the write waits for approval");
+        release.notify_one();
+        first_read.await.unwrap().unwrap();
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+
+        // After approval the write is exclusive again: a new read cannot enter.
+        request.reply.send(UserDecision::AllowOnce).unwrap();
+        tokio::time::timeout(WAIT, entered.notified())
+            .await
+            .expect("approved write proceeds");
+        let read_tools = Arc::clone(&tools);
+        let second_read = tokio::spawn(async move { read_tools[1].call("{}".to_owned()).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), entered.notified())
+                .await
+                .is_err(),
+            "the re-acquired lane must exclude reads while the write runs"
+        );
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        write.await.unwrap().unwrap();
+        tokio::time::timeout(WAIT, entered.notified())
+            .await
+            .expect("read runs after the write finished");
+        release.notify_one();
+        second_read.await.unwrap().unwrap();
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn denied_prompt_returns_the_lane_and_reports_denial() {
+        let root = crate::tests::OwnedTestDirectory::new("prompt-release-denied");
+        let permission = asking_permission(root.path());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let tools = Arc::new(bind(vec![
+            Box::new(
+                crate::agent::tools::write::WriteTool::new(Some(permission), Some(sender), None)
+                    .with_workspace_root(root.path().to_path_buf()),
+            ),
+            Box::new(crate::agent::tools::read::ReadTool::new(
+                None, None, None, 100,
+            )),
+        ]));
+        let write_tools = Arc::clone(&tools);
+        let write = tokio::spawn(async move {
+            write_tools[0]
+                .call(serde_json::json!({"path":"new.txt","content":"x"}).to_string())
+                .await
+        });
+        let request = next_request(&mut receiver).await;
+        request.reply.send(UserDecision::Deny).unwrap();
+        assert!(write.await.unwrap().is_err());
+        assert!(!root.path().join("new.txt").exists());
+        // The exclusive lane is free again: a following write is not stuck.
+        let again_tools = Arc::clone(&tools);
+        let again = tokio::spawn(async move {
+            again_tools[0]
+                .call(serde_json::json!({"path":"again.txt","content":"x"}).to_string())
+                .await
+        });
+        next_request(&mut receiver)
+            .await
+            .reply
+            .send(UserDecision::AllowOnce)
+            .unwrap();
+        tokio::time::timeout(WAIT, again)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(root.path().join("again.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn real_read_runs_while_a_real_write_awaits_approval() {
+        let root = crate::tests::OwnedTestDirectory::new("prompt-release-real-write");
+        std::fs::write(root.path().join("existing.txt"), "hello\n").unwrap();
+        let permission = asking_permission(root.path());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let tools = Arc::new(bind(vec![
+            Box::new(
+                crate::agent::tools::write::WriteTool::new(
+                    Some(permission.clone()),
+                    Some(sender),
+                    None,
+                )
+                .with_workspace_root(root.path().to_path_buf()),
+            ),
+            Box::new(
+                crate::agent::tools::read::ReadTool::new(Some(permission), None, None, 100)
+                    .with_workspace_root(root.path().to_path_buf()),
+            ),
+        ]));
+        let write_tools = Arc::clone(&tools);
+        let write = tokio::spawn(async move {
+            write_tools[0]
+                .call(serde_json::json!({"path":"fresh.txt","content":"new"}).to_string())
+                .await
+        });
+        let request = next_request(&mut receiver).await;
+        let read = tokio::time::timeout(
+            WAIT,
+            tools[1].call(serde_json::json!({"path":"existing.txt"}).to_string()),
+        )
+        .await
+        .expect("read must not wait for the write prompt")
+        .unwrap();
+        assert!(read.contains("hello"));
+        assert!(!root.path().join("fresh.txt").exists());
+        request.reply.send(UserDecision::AllowOnce).unwrap();
+        tokio::time::timeout(WAIT, write)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("fresh.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    fn edit_args(search: &str, replace: &str) -> String {
+        serde_json::json!({
+            "path": "shared.txt",
+            "block": format!("<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE"),
+        })
+        .to_string()
+    }
+
+    fn edit_tool(
+        root: &std::path::Path,
+        permission: &crate::permission::checker::PermCheck,
+        sender: &crate::permission::ask::AskSender,
+    ) -> Box<dyn ToolDyn> {
+        Box::new(
+            crate::agent::tools::edit::EditTool::new(
+                Some(permission.clone()),
+                Some(sender.clone()),
+            )
+            .with_workspace(root),
+        )
+    }
+
+    #[tokio::test]
+    async fn two_same_file_edits_needing_approval_never_publish_a_stale_identity() {
+        let root = crate::tests::OwnedTestDirectory::new("prompt-release-two-edits");
+        let file = root.path().join("shared.txt");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let permission = asking_permission(root.path());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let tools = Arc::new(bind(vec![
+            edit_tool(root.path(), &permission, &sender),
+            edit_tool(root.path(), &permission, &sender),
+        ]));
+        let extensions = Arc::new(ToolCallExtensions::new());
+        let mut calls = Vec::new();
+        let mut requests = Vec::new();
+        for (index, (search, replace)) in [("one", "ONE"), ("two", "TWO")].into_iter().enumerate() {
+            let tools = Arc::clone(&tools);
+            let extensions = Arc::clone(&extensions);
+            let args = edit_args(search, replace);
+            calls.push(tokio::spawn(async move {
+                tools[index].call_structured(args, &extensions).await
+            }));
+            // Both prompts must be open at once: the first edit gave the lane back.
+            requests.push(next_request(&mut receiver).await);
+        }
+        let second = requests.pop().unwrap();
+        let first = requests.pop().unwrap();
+        first.reply.send(UserDecision::AllowOnce).unwrap();
+        let first_result = tokio::time::timeout(WAIT, calls.remove(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first_result.outcome(), ToolOutcome::Success));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ONE\ntwo\n");
+
+        second.reply.send(UserDecision::AllowOnce).unwrap();
+        let second_result = tokio::time::timeout(WAIT, calls.remove(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!matches!(second_result.outcome(), ToolOutcome::Success));
+        assert!(
+            second_result
+                .model_output()
+                .contains("Path changed after permission check"),
+            "{}",
+            second_result.model_output()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ONE\ntwo\n");
+    }
+
+    #[tokio::test]
+    async fn external_replacement_between_prompt_and_approval_is_a_stale_identity_error() {
+        let root = crate::tests::OwnedTestDirectory::new("prompt-release-external-edit");
+        let file = root.path().join("shared.txt");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let permission = asking_permission(root.path());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let tools = Arc::new(bind(vec![edit_tool(root.path(), &permission, &sender)]));
+        let extensions = Arc::new(ToolCallExtensions::new());
+        let call_tools = Arc::clone(&tools);
+        let call_extensions = Arc::clone(&extensions);
+        let call = tokio::spawn(async move {
+            call_tools[0]
+                .call_structured(edit_args("one", "ONE"), &call_extensions)
+                .await
+        });
+        let request = next_request(&mut receiver).await;
+        // Replace the file by rename, as an editor or another process would.
+        let replacement = root.path().join("replacement.tmp");
+        std::fs::write(&replacement, "external\ntwo\n").unwrap();
+        std::fs::rename(&replacement, &file).unwrap();
+        request.reply.send(UserDecision::AllowOnce).unwrap();
+        let result = tokio::time::timeout(WAIT, call).await.unwrap().unwrap();
+        assert!(!matches!(result.outcome(), ToolOutcome::Success));
+        assert!(
+            result
+                .model_output()
+                .contains("Path changed after permission check"),
+            "{}",
+            result.model_output()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "external\ntwo\n");
+    }
+
+    #[tokio::test]
+    async fn notebook_replaced_between_prompt_and_approval_is_a_stale_identity_error() {
+        const NOTEBOOK: &str = r#"{"cells":[{"cell_type":"code","id":"a","metadata":{},"source":"x","outputs":[],"execution_count":null}],"metadata":{},"nbformat":4,"nbformat_minor":5}"#;
+        let root = crate::tests::OwnedTestDirectory::new("prompt-release-notebook");
+        let file = root.path().join("nb.ipynb");
+        std::fs::write(&file, NOTEBOOK).unwrap();
+        let permission = asking_permission(root.path());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let workspace = crate::agent::tools::capture_workspace_binding(root.path().to_path_buf());
+        let tools = Arc::new(bind(vec![Box::new(
+            crate::agent::tools::notebook::NotebookTool::new(
+                Some(permission),
+                Some(sender),
+                workspace,
+                crate::agent::tools::ReadTracker::new(true),
+                None,
+                Default::default(),
+            ),
+        )]));
+        let extensions = Arc::new(ToolCallExtensions::new());
+        let call_tools = Arc::clone(&tools);
+        let call_extensions = Arc::clone(&extensions);
+        let call = tokio::spawn(async move {
+            call_tools[0]
+                .call_structured(
+                    serde_json::json!({"path":"nb.ipynb","mode":"replace","cell_index":0,"source":"y"})
+                        .to_string(),
+                    &call_extensions,
+                )
+                .await
+        });
+        let request = next_request(&mut receiver).await;
+        let external = NOTEBOOK.replace("\"x\"", "\"external\"");
+        let replacement = root.path().join("replacement.tmp");
+        std::fs::write(&replacement, &external).unwrap();
+        std::fs::rename(&replacement, &file).unwrap();
+        request.reply.send(UserDecision::AllowOnce).unwrap();
+        let result = tokio::time::timeout(WAIT, call).await.unwrap().unwrap();
+        assert!(!matches!(result.outcome(), ToolOutcome::Success));
+        assert!(
+            result
+                .model_output()
+                .contains("Path changed after permission check"),
+            "{}",
+            result.model_output()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), external);
     }
 }

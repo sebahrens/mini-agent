@@ -470,7 +470,7 @@ impl NotebookTool {
         super::validate_workspace_binding(Some(&self.workspace))?;
         let target = super::resolve_tool_target(Some(&self.workspace), &args.path);
         let bound = target.bound_relative.clone();
-        let (file, identity, expected, parent) = if let Some(relative) = &bound {
+        let (file, identity, expected, parent, captured) = if let Some(relative) = &bound {
             let file = self
                 .workspace
                 .open_regular_relative(relative)
@@ -482,8 +482,9 @@ impl NotebookTool {
                     .logical_relative_path(relative)?
                     .to_string_lossy()
                     .into_owned(),
-                Some(expected),
+                Some(expected.clone()),
                 None,
+                expected,
             )
         } else {
             let canonical = tokio::fs::canonicalize(&target.requested).await?;
@@ -511,19 +512,45 @@ impl NotebookTool {
                 canonical.to_string_lossy().into_owned(),
                 None,
                 Some(parent),
+                metadata,
             )
         };
-        let coaching = if let Some(relative) = &bound {
-            check_perm_bound_path(
-                &self.permission,
-                &self.ask_tx,
-                "notebook_edit",
-                &self.workspace,
-                relative,
-            )
-            .await?
+        // The prompt gives the exclusive lane back; it is re-acquired before the
+        // answer is used. The target was opened and its identity captured before
+        // the prompt, so it is re-captured under the re-acquired lane.
+        let (coaching, released) = super::concurrency::prompt_unlocked(async {
+            if let Some(relative) = &bound {
+                check_perm_bound_path(
+                    &self.permission,
+                    &self.ask_tx,
+                    "notebook_edit",
+                    &self.workspace,
+                    relative,
+                )
+                .await
+            } else {
+                check_perm_path(&self.permission, &self.ask_tx, "notebook_edit", &identity).await
+            }
+        })
+        .await;
+        let coaching = coaching?;
+        let (file, expected) = if released {
+            if let Some(relative) = &bound {
+                let (file, current) =
+                    super::recapture_bound_file(&self.workspace, relative, &captured, true).await?;
+                (file, Some(current))
+            } else {
+                drop(file);
+                let fresh = crate::fs::open_stable_file(Path::new(&identity))
+                    .await?
+                    .into_std()
+                    .await;
+                let current = crate::fs::checked_file_metadata(&fresh)?;
+                crate::fs::ensure_same_file(Path::new(&identity), &captured, &current)?;
+                (fresh, expected)
+            }
         } else {
-            check_perm_path(&self.permission, &self.ask_tx, "notebook_edit", &identity).await?
+            (file, expected)
         };
         if let Some(instructions) = &self.tracker.instructions {
             let instruction_target = bound.as_deref().unwrap_or(Path::new(&identity));

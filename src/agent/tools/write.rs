@@ -246,9 +246,18 @@ impl WriteTool {
         if let Some(relative) = target.bound_relative.as_deref()
             && let Some(workspace) = &self.workspace
         {
-            let coaching =
-                check_perm_bound_path(&self.permission, &self.ask_tx, "write", workspace, relative)
-                    .await?;
+            // Nothing is opened before the prompt, so the exclusive lane can be
+            // given back while the user decides: the target is opened and read
+            // only after the lane is re-acquired.
+            let (coaching, _released) = super::concurrency::prompt_unlocked(check_perm_bound_path(
+                &self.permission,
+                &self.ask_tx,
+                "write",
+                workspace,
+                relative,
+            ))
+            .await;
+            let coaching = coaching?;
             if let Some(instructions) = &self.read_tracker.instructions {
                 instructions.before_mutation(relative, extensions).await?;
             }
@@ -479,13 +488,17 @@ impl WriteTool {
         let resolved = resolve_write_path(&requested).await?;
         let path = resolved.as_path();
         // Check the path atomic_write will modify, not a symlink that points to it.
-        let coaching = check_perm_path(
+        // Only the resolved path precedes the prompt; the target is opened and
+        // read after the exclusive lane is re-acquired and the path is
+        // re-resolved below ("Path changed after permission check").
+        let (coaching, _released) = super::concurrency::prompt_unlocked(check_perm_path(
             &self.permission,
             &self.ask_tx,
             "write",
             &path.to_string_lossy(),
-        )
-        .await?;
+        ))
+        .await;
+        let coaching = coaching?;
 
         if let Some(instructions) = &self.read_tracker.instructions {
             instructions.before_mutation(path, extensions).await?;

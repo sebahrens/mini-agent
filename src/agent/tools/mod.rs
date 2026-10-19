@@ -115,6 +115,37 @@ pub(crate) fn resolve_tool_target(
     }
 }
 
+/// Re-open a workspace-bound mutation target after its permission prompt gave
+/// the exclusive tool lane back (see `concurrency::prompt_unlocked`).
+///
+/// The returned handle and identity replace those captured before the prompt.
+/// If the target was replaced meanwhile, for example by another tool call in
+/// the same batch, this returns the ordinary path-changed error so the model
+/// re-reads and retries instead of publishing against a stale identity.
+pub(crate) async fn recapture_bound_file(
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+    relative: &Path,
+    previous: &crate::fs::CheckedMetadata,
+    regular_only: bool,
+) -> Result<(std::fs::File, crate::fs::CheckedMetadata), ToolError> {
+    let owned = std::sync::Arc::clone(workspace);
+    let owned_relative = relative.to_path_buf();
+    let (file, current) = crate::agent::runner::spawn_blocking_scoped(move || {
+        let file = if regular_only {
+            owned.open_regular_relative(&owned_relative)
+        } else {
+            owned.open_relative(&owned_relative)
+        }?;
+        let current = crate::fs::checked_file_metadata(&file)?;
+        Ok::<_, io::Error>((file, current))
+    })
+    .await
+    .map_err(|_| ToolError::Msg("Target re-open job failed".to_string()))?
+    .map_err(|error| bound_open_error(workspace, relative, error))?;
+    crate::fs::ensure_same_file(relative, previous, &current)?;
+    Ok((file, current))
+}
+
 /// Explain a failed bound-workspace open that was refused because the path is,
 /// or passes through, a symbolic link.
 ///
@@ -617,7 +648,11 @@ async fn handle_ask_inner(
         suggested => (suggested, additional_allow_patterns),
     };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    crate::permission::ask::send_permission_request(
+    // A mutating tool that opted in gives its exclusive lane lease back while
+    // the user decides; nothing has taken effect yet. It is re-acquired before
+    // the tool continues (see `concurrency::prompt_unlocked`).
+    let suspended = concurrency::suspend_for_prompt();
+    let sent = crate::permission::ask::send_permission_request(
         ask_tx,
         AskRequest {
             diagnostic: Some(diagnostic),
@@ -633,9 +668,17 @@ async fn handle_ask_inner(
             reply: reply_tx,
         },
     )
-    .await
-    .map_err(|_| ToolError::Msg("Permission system unavailable".to_string()))?;
-    let decision = reply_rx.await;
+    .await;
+    let decision = match sent {
+        Ok(()) => Some(reply_rx.await),
+        Err(_) => None,
+    };
+    if let Some(suspended) = suspended {
+        suspended.resume().await;
+    }
+    let Some(decision) = decision else {
+        return Err(ToolError::Msg("Permission system unavailable".to_string()));
+    };
     if let Some(required) = crate::question::required() {
         return Err(ToolError::Msg(required.to_string()));
     }
