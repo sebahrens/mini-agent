@@ -5187,6 +5187,7 @@ wait
                     plan: IsolationPlan {
                         parent_root: root,
                         base_dir: Some(base),
+                        create_gate: None,
                     },
                     _repo: repo,
                     head,
@@ -5574,6 +5575,42 @@ wait
                 fixture.root(),
                 &format!("refs/heads/{branch}")
             ));
+            fixture.assert_parent_untouched();
+        }
+
+        #[tokio::test]
+        async fn a_create_that_finishes_after_cancellation_is_discarded() {
+            let mut fixture = Fixture::new("isolation-cancel-mid-create");
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            fixture.plan.create_gate = Some((entered.clone(), release.clone()));
+            let plan = fixture.plan.clone();
+            let parent = fixture.parent();
+            let child = tokio::spawn(async move { prepare(&plan, &parent).await.map(|_| ()) });
+            entered.notified().await;
+            let base = fixture.plan.base_dir.clone().unwrap();
+            let created = || {
+                std::fs::read_dir(&base)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("subagent-"))
+                    .count()
+            };
+            assert_eq!(
+                created(),
+                1,
+                "the worktree exists while create is in flight"
+            );
+            child.abort();
+            let _ = child.await;
+            release.add_permits(1);
+            let root = fixture.root().to_path_buf();
+            assert!(
+                eventually(|| created() == 0
+                    && git_stdout(&root, ["branch", "--list", "subagent-*"]).is_empty())
+                .await,
+                "a worktree created after cancellation was orphaned"
+            );
             fixture.assert_parent_untouched();
         }
     }

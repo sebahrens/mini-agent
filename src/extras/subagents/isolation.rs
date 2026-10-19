@@ -23,6 +23,13 @@ pub(crate) struct IsolationPlan {
     /// Directory that receives the worktrees. `None` is the parent's directory
     /// (the same default as `/worktree`).
     pub(crate) base_dir: Option<PathBuf>,
+    /// Test seam: signalled once creation finished, then held until released,
+    /// so a test can drop the caller while the create is still in flight.
+    #[cfg(test)]
+    pub(crate) create_gate: Option<(
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Semaphore>,
+    )>,
 }
 
 /// What an isolated child left behind.
@@ -220,13 +227,36 @@ mod real {
             "subagent-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
-        let (_, info) =
-            git_worktree::create(&plan.parent_root, &name, plan.base_dir.as_deref()).await?;
-        let mut owned = IsolatedWorktree {
-            info,
-            base: String::new(),
-            armed: true,
-        };
+        // Creation runs in its own task and hands back an armed guard through
+        // a channel. If this future is dropped first, the guard is dropped
+        // wherever it ends up (failed send, or the channel's own drop) and
+        // discards the worktree, so a late-finishing create is never orphaned.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let create_plan = plan.clone();
+        drop(crate::agent::runner::spawn_async_scoped(async move {
+            let created = git_worktree::create(
+                &create_plan.parent_root,
+                &name,
+                create_plan.base_dir.as_deref(),
+            )
+            .await
+            .map(|(_, info)| IsolatedWorktree {
+                info,
+                base: String::new(),
+                armed: true,
+            });
+            #[cfg(test)]
+            if let Some((entered, release)) = &create_plan.create_gate {
+                entered.notify_one();
+                if let Ok(permit) = release.acquire().await {
+                    permit.forget();
+                }
+            }
+            let _ = tx.send(created);
+        }));
+        let mut owned = rx
+            .await
+            .map_err(|_| "worktree creation task stopped before returning".to_string())??;
         let derived = async {
             owned.base = git_worktree::head_oid(&owned.info.worktree_path).await?;
             let binding = crate::paths::WorkspaceBinding::capture(&owned.info.worktree_path)

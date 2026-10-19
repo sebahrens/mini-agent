@@ -1141,6 +1141,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                         )
                     })?,
                 base_dir: self.isolation_base_dir.clone(),
+                #[cfg(test)]
+                create_gate: None,
             })
         } else {
             None
