@@ -37,6 +37,28 @@ pub(crate) struct InstructionServices {
     current: RwLock<Arc<Discovery>>,
     generation: AtomicU64,
     refresh_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The last clean full discovery with the stat signature of its sources,
+    /// taken before the scan. Reused only while the signature, the imported
+    /// catalogue and every root's authority are unchanged.
+    discovery_cache: Mutex<Option<CachedDiscovery>>,
+    /// Number of full discovery passes (collect, hash, publish), for tests.
+    discover_runs: AtomicU64,
+    /// Skill document vectors by (model id, revision, immutable record digest).
+    /// The document text is a pure function of the digest, so a vector is
+    /// computed once per model and digest instead of once per turn.
+    #[cfg(feature = "skills")]
+    document_embeddings: Mutex<DocumentEmbeddings>,
+}
+
+#[cfg(feature = "skills")]
+type DocumentEmbeddings = std::collections::HashMap<(String, String, String), (String, Vec<f32>)>;
+
+#[cfg(feature = "skills")]
+const MAX_CACHED_DOCUMENT_EMBEDDINGS: usize = 4096;
+
+struct CachedDiscovery {
+    signature: [u8; 32],
+    discovery: Arc<Discovery>,
 }
 
 impl InstructionOwner {
@@ -81,6 +103,10 @@ impl InstructionOwner {
             current: RwLock::new(Arc::new(Discovery::default())),
             generation: AtomicU64::new(0),
             refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
+            discovery_cache: Mutex::new(None),
+            discover_runs: AtomicU64::new(0),
+            #[cfg(feature = "skills")]
+            document_embeddings: Mutex::new(Default::default()),
         });
         *cached = Some(Arc::clone(&service));
         service
@@ -190,16 +216,22 @@ impl InstructionServices {
         self: &Arc<Self>,
         explicit: bool,
     ) -> Result<Arc<Discovery>, String> {
+        self.refresh_inner(explicit, false).await
+    }
+
+    /// `force` skips the unchanged-sources shortcut and always runs the full
+    /// collect, hash, publish and verify pass.
+    async fn refresh_inner(
+        self: &Arc<Self>,
+        explicit: bool,
+        force: bool,
+    ) -> Result<Arc<Discovery>, String> {
         let _gate = Arc::clone(&self.refresh_gate).lock_owned().await;
         let service = Arc::clone(self);
         let discovered = blocking_owned(move || {
             service.workspace.validate()?;
             let roots = service.source_roots(explicit);
-            Ok::<_, String>(Arc::new(super::discovery::discover(
-                &service.paths,
-                &roots,
-                &service.permission,
-            )))
+            Ok::<_, String>(service.discover_or_reuse(&roots, force))
         })
         .await
         .map_err(|_| "instruction discovery worker unavailable")??;
@@ -211,6 +243,110 @@ impl InstructionServices {
         *self.current.write().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&discovered);
         self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(discovered)
+    }
+
+    /// Check cheaply, redo only on change: the previous clean discovery is
+    /// reused when no source file or directory changed (stat signature), the
+    /// imported catalogue is unchanged, and every existing root still holds its
+    /// trust and read authority. Anything else runs the full pass.
+    fn discover_or_reuse(&self, roots: &[SourceRoot], force: bool) -> Arc<Discovery> {
+        let mut cache = self
+            .discovery_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The signature is taken before the scan: a write racing the scan then
+        // differs from the stored one and forces the next pass to redo it.
+        let signature = super::discovery::source_signature(roots);
+        if !force
+            && let (Some(signature), Some(cached)) = (signature, cache.as_ref())
+            && cached.signature == signature
+            && cached
+                .discovery
+                .catalogues
+                .first()
+                .is_some_and(|imported| imported.lexical_is_current())
+            && super::discovery::roots_still_authorized(roots, &self.paths, &self.permission)
+        {
+            return Arc::clone(&cached.discovery);
+        }
+        self.discover_runs.fetch_add(1, Ordering::Relaxed);
+        let discovery = Arc::new(super::discovery::discover(
+            &self.paths,
+            roots,
+            &self.permission,
+        ));
+        *cache = signature
+            .filter(|_| discovery.diagnostics.is_empty())
+            .map(|signature| CachedDiscovery {
+                signature,
+                discovery: Arc::clone(&discovery),
+            });
+        discovery
+    }
+
+    /// Fill `records[..].embedding`, embedding only the digests this model has
+    /// not seen yet. The cache lock is never held across the embedding call.
+    #[cfg(feature = "skills")]
+    fn embed_records(
+        &self,
+        embedder: &crate::extras::js::skills::embed::Embedder,
+        records: &mut [super::index::AgentSkillRecord],
+    ) -> Result<(), String> {
+        let model = embedder.model_metadata();
+        let key = |record: &super::index::AgentSkillRecord| {
+            (
+                model.model_id.clone(),
+                model.model_revision.clone(),
+                record.digest.clone(),
+            )
+        };
+        let documents = records
+            .iter()
+            .map(|record| record.embedding_document())
+            .collect::<Vec<_>>();
+        let mut missing = Vec::new();
+        {
+            let cache = self
+                .document_embeddings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (index, record) in records.iter_mut().enumerate() {
+                match cache.get(&key(record)) {
+                    Some((document, vector)) if *document == documents[index] => {
+                        record.embedding = vector.clone();
+                    }
+                    _ => missing.push(index),
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let batch = missing
+            .iter()
+            .map(|index| documents[*index].clone())
+            .collect::<Vec<_>>();
+        let vectors = embedder
+            .embed_documents(&batch)
+            .map_err(|_| "skill metadata embedding unavailable")?;
+        if vectors.len() != missing.len() {
+            return Err("skill metadata embedding unavailable".into());
+        }
+        let mut cache = self
+            .document_embeddings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.len().saturating_add(missing.len()) > MAX_CACHED_DOCUMENT_EMBEDDINGS {
+            cache.clear();
+        }
+        for (index, vector) in missing.into_iter().zip(vectors) {
+            cache.insert(
+                key(&records[index]),
+                (documents[index].clone(), vector.clone()),
+            );
+            records[index].embedding = vector;
+        }
+        Ok(())
     }
 
     pub(crate) fn same_authority(&self, other: &Self) -> bool {
@@ -228,7 +364,7 @@ impl InstructionServices {
     }
 
     pub(crate) async fn pin(self: &Arc<Self>, name: &str) -> Result<Pin, String> {
-        let snapshot = self.refresh(true).await?;
+        let snapshot = self.refresh_inner(true, true).await?;
         let package = snapshot
             .packages
             .get(name)
@@ -298,11 +434,12 @@ impl InstructionServices {
         blocking_owned(move || {
             // Recheck original source authority immediately before loading the
             // immutable snapshot. Cached publication is not continued approval.
+            let memo = super::discovery::SourceAuthMemo::default();
             #[allow(unused_mut)]
             let mut records: Vec<_> = snapshot
                 .packages
                 .values()
-                .filter(|package| package.authorized(&services.paths, &services.permission))
+                .filter(|package| package.authorized(&services.paths, &services.permission, &memo))
                 .map(|package| {
                     let mut record = (*package.record).clone();
                     record.embedding.clear();
@@ -312,16 +449,7 @@ impl InstructionServices {
             #[cfg(feature = "skills")]
             let semantic_model = if vector.is_some() {
                 let embedder = embedder.as_ref().expect("query vector has an embedder");
-                let documents = records
-                    .iter()
-                    .map(|record| record.embedding_document())
-                    .collect::<Vec<_>>();
-                let vectors = embedder
-                    .embed_documents(&documents)
-                    .map_err(|_| "skill metadata embedding unavailable")?;
-                for (record, embedding) in records.iter_mut().zip(vectors) {
-                    record.embedding = embedding;
-                }
+                services.embed_records(embedder, &mut records)?;
                 Some(embedder.model_metadata().clone())
             } else {
                 None
@@ -506,10 +634,11 @@ impl InstructionTurn {
     async fn revalidate_packages(&self, packages: Vec<Package>) -> Result<(), String> {
         let services = Arc::clone(&self.services);
         let allowed = blocking_owned(move || {
+            let memo = super::discovery::SourceAuthMemo::default();
             services.workspace.validate().is_ok()
                 && packages
                     .iter()
-                    .all(|package| package.authorized(&services.paths, &services.permission))
+                    .all(|package| package.authorized(&services.paths, &services.permission, &memo))
         })
         .await
         .map_err(|_| "skill source revalidation worker unavailable")?;
@@ -935,6 +1064,10 @@ mod discovery_tests {
                 current: RwLock::new(Arc::new(Discovery::default())),
                 generation: AtomicU64::new(0),
                 refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
+                discovery_cache: Mutex::new(None),
+                discover_runs: AtomicU64::new(0),
+                #[cfg(feature = "skills")]
+                document_embeddings: Mutex::new(Default::default()),
             });
             Self {
                 services,
@@ -1309,6 +1442,139 @@ mod discovery_tests {
             !snapshot.packages.contains_key("home-skill"),
             "lower priority root cannot escape shared cap"
         );
+    }
+
+    #[tokio::test]
+    async fn unchanged_sources_are_discovered_once_and_any_edit_rediscovers() {
+        let fixture = Fixture::new(false);
+        let path = fixture.skill(".claude/skills", "reviewer", "code review", "first source");
+        let first = fixture.services.refresh(false).await.unwrap();
+        let second = fixture.services.refresh(false).await.unwrap();
+        let again = fixture.services.select("review code", None).await.unwrap();
+        assert_eq!(again.selected.len(), 1);
+        assert!(Arc::ptr_eq(&first, &second), "unchanged tree is reused");
+        assert_eq!(fixture.services.discover_runs.load(Ordering::Relaxed), 1);
+
+        // Same length, different bytes: only mtime/ctime can tell.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            &path,
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("first", "FIRST"),
+        )
+        .unwrap();
+        let third = fixture.services.refresh(false).await.unwrap();
+        assert!(!Arc::ptr_eq(&second, &third));
+        assert_eq!(fixture.services.discover_runs.load(Ordering::Relaxed), 2);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fixture.skill(".claude/skills", "writer", "docs", "new package");
+        let fourth = fixture.services.refresh(false).await.unwrap();
+        assert_eq!(fourth.packages.len(), 2);
+        assert_eq!(fixture.services.discover_runs.load(Ordering::Relaxed), 3);
+
+        // An explicit pin always runs the full pass.
+        fixture.services.pin("writer").await.unwrap();
+        assert_eq!(fixture.services.discover_runs.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn trust_store_revocation_takes_effect_on_the_next_call_despite_caching() {
+        let fixture = Fixture::new(false);
+        fixture.skill(".claude/skills", "reviewer", "code review", "source");
+        let pin = fixture.services.pin("reviewer").await.unwrap();
+        let turn = InstructionTurn::new(fixture.services.clone(), Some(pin));
+        turn.prepare("review code").await.unwrap();
+        turn.prepare("again").await.unwrap();
+        turn.prepare("and again").await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::remove_file(fixture.services.paths.project_config_trust_file()).unwrap();
+        assert!(
+            turn.prepare("retry").await.is_err(),
+            "revoked trust refuses the retained package"
+        );
+        let snapshot = fixture.services.refresh(false).await.unwrap();
+        assert!(snapshot.packages.is_empty());
+        assert!(!snapshot.diagnostics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_completion_calls_skip_full_reads_but_a_byte_change_still_fails() {
+        let fixture = Fixture::new(false);
+        let path = fixture.skill(".claude/skills", "reviewer", "code review", "first source");
+        let resource = path.parent().unwrap().join("notes.txt");
+        std::fs::write(&resource, "resource bytes").unwrap();
+        let pin = fixture.services.pin("reviewer").await.unwrap();
+        let turn = InstructionTurn::new(fixture.services.clone(), Some(pin));
+        turn.prepare("review code").await.unwrap();
+        let package = fixture.services.cached().packages["reviewer"].clone();
+        for _ in 0..3 {
+            turn.prepare("completion call").await.unwrap();
+        }
+        assert_eq!(
+            package.full_read_count(),
+            0,
+            "no file was re-read or re-hashed"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&resource, "RESOURCE BYTES").unwrap();
+        assert!(turn.prepare("retry").await.is_err());
+        assert!(
+            package.full_read_count() > 0,
+            "a changed stamp falls back to the hash"
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn skill_document_embeddings_are_computed_once_per_digest() {
+        use crate::extras::js::skills::embed::{Embedder, EmbeddingBackend, EmbeddingError};
+        use std::sync::atomic::AtomicUsize;
+        #[derive(Default)]
+        struct Counting(AtomicUsize);
+        impl EmbeddingBackend for Counting {
+            fn embed_documents(&self, d: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+                self.0.fetch_add(d.len(), Ordering::SeqCst);
+                Ok(d.iter().map(|_| vec![1.0, 0.0]).collect())
+            }
+            fn embed_query(&self, _: &str) -> Result<Vec<f32>, EmbeddingError> {
+                Ok(vec![1.0, 0.0])
+            }
+            fn model_id(&self) -> &str {
+                "counting"
+            }
+            fn model_revision(&self) -> &str {
+                "1"
+            }
+            fn dimensions(&self) -> usize {
+                2
+            }
+            fn normalized(&self) -> bool {
+                true
+            }
+        }
+        let fixture = Fixture::new(false);
+        fixture.skill(".claude/skills", "reviewer", "code review", "source");
+        let backend = Arc::new(Counting::default());
+        let embedder = Arc::new(Embedder::with_backend(backend.clone()).unwrap());
+        for _ in 0..2 {
+            fixture
+                .services
+                .select_with_embedder("review code", None, Some(embedder.clone()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fixture.skill(".claude/skills", "writer", "docs", "second package");
+        fixture
+            .services
+            .select_with_embedder("review code", None, Some(embedder))
+            .await
+            .unwrap();
+        assert_eq!(backend.0.load(Ordering::SeqCst), 2, "only the new digest");
     }
 
     #[cfg(unix)]

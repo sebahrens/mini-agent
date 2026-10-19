@@ -184,6 +184,16 @@ impl AgentSkillCatalog {
         Ok(index)
     }
 
+    /// Whether the installed tree still matches the last lexical refresh. The
+    /// comparison is the stat-only signature plus the tiny ACTIVE pointers; installed
+    /// digests are content-addressed, so it reads no skill content.
+    pub(crate) fn lexical_is_current(&self) -> bool {
+        match (&self.signature, catalog_signature(&self.root)) {
+            (Some(recorded), Ok(current)) => *recorded == current,
+            _ => false,
+        }
+    }
+
     fn scan_records(
         &self,
         signature: &CatalogSignature,

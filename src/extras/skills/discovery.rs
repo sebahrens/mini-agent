@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sha2::{Digest, Sha256};
 
@@ -43,14 +43,103 @@ struct SourceFile {
     path: PathBuf,
     metadata: crate::fs::CheckedMetadata,
     hash: Vec<u8>,
+    /// Stat fingerprint recorded while the file's content hash was known to
+    /// match. A file whose identity, length, mtime and ctime all still equal it
+    /// has not been written since, so the per-call re-read and re-hash is
+    /// skipped; any difference falls back to the full hash comparison. Set only
+    /// once the timestamps are older than `QUIET_WINDOW_SECS`, so a rewrite in
+    /// the same filesystem timestamp tick cannot hide behind it.
+    stamp: Arc<OnceLock<FileStamp>>,
+    #[cfg(test)]
+    full_reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileStamp {
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+/// Timestamps younger than this may still share a tick with a later write.
+const QUIET_WINDOW_SECS: i64 = if cfg!(test) { 0 } else { 3 };
+
+/// The stamp of `metadata`, or `None` when this platform has no ctime to back
+/// it or the file changed too recently to be trusted as unchanged.
+pub(crate) fn quiet_file_stamp(metadata: &std::fs::Metadata) -> Option<FileStamp> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let stamp = FileStamp {
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        stamp_is_quiet(&stamp, now).then_some(stamp)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn stamp_is_quiet(stamp: &FileStamp, now_secs: i64) -> bool {
+    now_secs.saturating_sub(stamp.mtime.0.max(stamp.ctime.0)) >= QUIET_WINDOW_SECS
+}
+
+/// Per-pass memo of the source-level authority decision (workspace validation,
+/// project trust, read permission). The decision is identical for every package
+/// of one root, so one select evaluates it once per root rather than once per
+/// package; the next select starts a fresh memo, so revocation is never cached.
+#[derive(Default)]
+pub(crate) struct SourceAuthMemo(std::cell::RefCell<Vec<(&'static str, PathBuf, bool)>>);
+
+impl SourceAuthMemo {
+    fn authorized(
+        &self,
+        source: &SourceRoot,
+        paths: &AppPaths,
+        permission: &Option<PermCheck>,
+    ) -> bool {
+        if let Some((_, _, verdict)) = self.0.borrow().iter().find(|(origin, directory, _)| {
+            *origin == source.origin && *directory == source.directory
+        }) {
+            return *verdict;
+        }
+        let verdict = source_authorized(source, paths, permission);
+        self.0
+            .borrow_mut()
+            .push((source.origin, source.directory.clone(), verdict));
+        verdict
+    }
 }
 
 impl Package {
-    pub(crate) fn authorized(&self, paths: &AppPaths, permission: &Option<PermCheck>) -> bool {
+    /// Test seam: how many times `authorized` fell back to reading and hashing
+    /// a captured file instead of trusting its unchanged stat fingerprint.
+    #[cfg(test)]
+    pub(crate) fn full_read_count(&self) -> usize {
+        self.files
+            .iter()
+            .map(|file| file.full_reads.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    }
+
+    pub(crate) fn authorized(
+        &self,
+        paths: &AppPaths,
+        permission: &Option<PermCheck>,
+        memo: &SourceAuthMemo,
+    ) -> bool {
         let Some(source) = &self.source else {
             return true;
         };
-        if !source_authorized(source, paths, permission)
+        if !memo.authorized(source, paths, permission)
             || !allowed(
                 &source.binding,
                 &self.source_directory.join("SKILL.md"),
@@ -112,6 +201,16 @@ impl Package {
                 if crate::fs::windows_file_link_count(&file).ok() != Some(1) {
                     return false;
                 }
+                let current = quiet_file_stamp(&metadata);
+                if let (Some(recorded), Some(current)) = (captured.stamp.get(), current)
+                    && *recorded == current
+                {
+                    return true;
+                }
+                #[cfg(test)]
+                captured
+                    .full_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut bytes = Vec::new();
                 if file
                     .take(metadata.len().saturating_add(1))
@@ -121,7 +220,11 @@ impl Package {
                 {
                     return false;
                 }
-                Sha256::digest(&bytes).as_slice() == captured.hash
+                let matches = Sha256::digest(&bytes).as_slice() == captured.hash;
+                if matches && let Some(current) = current {
+                    let _ = captured.stamp.set(current);
+                }
+                matches
             })
     }
 }
@@ -162,6 +265,121 @@ pub(crate) fn source_authorized(
                 &source.binding,
             ))
         && allowed(&source.binding, &source.directory, permission)
+}
+
+/// Stat-only fingerprint of every source root: for each directory and file
+/// below it, its relative path, kind, device, inode, length, mtime and ctime
+/// (so a rename, a delete, a create and any content write all change it), with
+/// directory listings sorted. It reads no file content. `None` means the tree
+/// cannot be fingerprinted cheaply and soundly (non-Unix, a stat error, a
+/// recently written entry that could share a timestamp tick with a later
+/// write, or more entries than discovery itself accepts), and the caller must
+/// run the full discovery.
+pub(crate) fn source_signature(roots: &[SourceRoot]) -> Option<[u8; 32]> {
+    #[cfg(unix)]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        let mut hash = Sha256::new();
+        let mut budget = MAX_ENTRIES.saturating_mul(4);
+        for source in roots {
+            hash.update(source.origin.as_bytes());
+            hash.update([0]);
+            hash.update(source.directory.as_os_str().as_encoded_bytes());
+            hash.update([0]);
+            let base = source.binding.root().join(&source.directory);
+            signature_node(&base, 0, now, &mut budget, &mut hash)?;
+        }
+        Some(hash.finalize().into())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = roots;
+        None
+    }
+}
+
+#[cfg(unix)]
+fn signature_node(
+    path: &Path,
+    depth: usize,
+    now: i64,
+    budget: &mut usize,
+    hash: &mut Sha256,
+) -> Option<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hash.update(b"absent\0");
+            return Some(());
+        }
+        Err(_) => return None,
+    };
+    *budget = budget.checked_sub(1)?;
+    let kind = metadata.file_type();
+    let tag: u8 = if kind.is_symlink() {
+        b'l'
+    } else if kind.is_dir() {
+        b'd'
+    } else if kind.is_file() {
+        b'f'
+    } else {
+        b'o'
+    };
+    let stamp = FileStamp {
+        len: metadata.len(),
+        mtime: (metadata.mtime(), metadata.mtime_nsec()),
+        ctime: (metadata.ctime(), metadata.ctime_nsec()),
+    };
+    if !stamp_is_quiet(&stamp, now) {
+        return None;
+    }
+    hash.update([tag]);
+    hash.update(metadata.dev().to_le_bytes());
+    hash.update(metadata.ino().to_le_bytes());
+    hash.update(stamp.len.to_le_bytes());
+    hash.update(stamp.mtime.0.to_le_bytes());
+    hash.update(stamp.mtime.1.to_le_bytes());
+    hash.update(stamp.ctime.0.to_le_bytes());
+    hash.update(stamp.ctime.1.to_le_bytes());
+    if tag == b'd' {
+        if depth > MAX_DEPTH + 1 {
+            return None;
+        }
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(path).ok()? {
+            names.push(entry.ok()?.file_name());
+        }
+        names.sort();
+        hash.update((names.len() as u64).to_le_bytes());
+        for name in names {
+            hash.update(name.as_encoded_bytes());
+            hash.update([0]);
+            signature_node(&path.join(&name), depth + 1, now, budget, hash)?;
+        }
+    }
+    Some(())
+}
+
+/// Whether every source root that exists is still authorized. A cached
+/// discovery is only reusable when none of its roots lost (or newly gained)
+/// the trust and read authority it was built under; a root that cannot even be
+/// opened sends the caller to the full pass, which reports why.
+pub(crate) fn roots_still_authorized(
+    roots: &[SourceRoot],
+    paths: &AppPaths,
+    permission: &Option<PermCheck>,
+) -> bool {
+    let memo = SourceAuthMemo::default();
+    roots.iter().all(
+        |source| match source.binding.open_dir_relative(&source.directory) {
+            Ok(_) => memo.authorized(source, paths, permission),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        },
+    )
 }
 
 /// Source order is priority order. First valid name wins; invalid packages do
@@ -501,10 +719,17 @@ fn collect(
             {
                 return Err("resource changed during read".into());
             }
+            let stamp = Arc::new(OnceLock::new());
+            if let Some(recorded) = quiet_file_stamp(&before) {
+                let _ = stamp.set(recorded);
+            }
             files.push(SourceFile {
                 path,
                 metadata: before,
                 hash: Sha256::digest(&content).to_vec(),
+                stamp,
+                #[cfg(test)]
+                full_reads: Arc::default(),
             });
             tree.insert_file(&relative, content)
                 .map_err(|error| error.to_string())?;
