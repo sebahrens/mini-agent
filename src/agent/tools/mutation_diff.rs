@@ -60,6 +60,20 @@ pub(crate) struct AppliedRange {
     pub after_end: usize,
 }
 
+/// True when `a` and `b` are equal after folding every `\r\n` to `\n`,
+/// without allocating either folded copy.
+fn eq_ignoring_crlf(a: &str, b: &str) -> bool {
+    fn folded(s: &str) -> impl Iterator<Item = u8> + '_ {
+        let bytes = s.as_bytes();
+        bytes
+            .iter()
+            .enumerate()
+            .filter(move |&(i, &byte)| !(byte == b'\r' && bytes.get(i + 1) == Some(&b'\n')))
+            .map(|(_, &byte)| byte)
+    }
+    folded(a).eq(folded(b))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MutationDiff {
     pub path: String,
@@ -248,7 +262,11 @@ impl MutationDiff {
             // One stored row is one logical display row, including unusual
             // filenames and bare CR characters. File-supplied escapes remain
             // inert data until every display consumer sanitizes them.
-            let text = text.replace('\r', "\\r").replace('\n', "\\n");
+            let text: std::borrow::Cow<'_, str> = if text.contains(['\r', '\n']) {
+                std::borrow::Cow::Owned(text.replace('\r', "\\r").replace('\n', "\\n"))
+            } else {
+                std::borrow::Cow::Borrowed(text)
+            };
             let clipped: String = text.chars().take(MAX_ROW_CHARS).collect();
             let clipped_flag = clipped.len() < text.len();
             let clipped = if clipped_flag {
@@ -272,10 +290,7 @@ impl MutationDiff {
             &format!("--- {}", if before.is_none() { "/dev/null" } else { path }),
         );
         row(DiffKind::Notice, &format!("+++ {path}"));
-        if before.is_some()
-            && old != after
-            && old.replace("\r\n", "\n") == after.replace("\r\n", "\n")
-        {
+        if before.is_some() && old != after && eq_ignoring_crlf(old, after) {
             row(DiffKind::Notice, "Line endings changed (CRLF/LF)");
         }
         if result.content_unchanged {
@@ -503,6 +518,25 @@ impl MutationDiff {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crlf_fold_comparison_matches_replace() {
+        for (a, b) in [
+            ("a\r\nb", "a\nb"),
+            ("a\r\nb", "a\rb"),
+            ("a\r", "a"),
+            ("a\r\n", "a\n"),
+            ("\r\r\n", "\r\n"),
+            ("x", "x"),
+            ("", ""),
+        ] {
+            assert_eq!(
+                super::eq_ignoring_crlf(a, b),
+                a.replace("\r\n", "\n") == b.replace("\r\n", "\n"),
+                "{a:?} {b:?}"
+            );
+        }
+    }
+
     use super::*;
     #[test]
     fn actual_unicode_replacements_and_noop_are_distinguished() {
