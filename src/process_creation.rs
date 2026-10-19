@@ -14,14 +14,33 @@ use std::time::{Duration, Instant};
 use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
 #[cfg(windows)]
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 #[cfg(windows)]
 static PROCESS_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
+// Wakes deadline-bounded waiters when the creation lock is released, so they park instead of
+// sleep-spinning. It carries no data and never replaces `PROCESS_CREATION_LOCK`.
+#[cfg(windows)]
+static CREATION_RELEASED: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+
 pub(crate) struct CreationGuard {
     #[cfg(windows)]
-    _inner: MutexGuard<'static, ()>,
+    _inner: Option<MutexGuard<'static, ()>>,
+}
+
+#[cfg(windows)]
+impl Drop for CreationGuard {
+    fn drop(&mut self) {
+        // Release the creation lock first, then wake a waiter. A waiter checks the lock while
+        // holding the notification mutex, so it cannot miss this wakeup.
+        drop(self._inner.take());
+        let _sync = CREATION_RELEASED
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        CREATION_RELEASED.1.notify_one();
+    }
 }
 
 pub(crate) fn creation_guard() -> io::Result<CreationGuard> {
@@ -34,7 +53,9 @@ pub(crate) fn creation_guard() -> io::Result<CreationGuard> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         PROCESS_CREATION_LOCK.clear_poison();
-        return Ok(CreationGuard { _inner: guard });
+        return Ok(CreationGuard {
+            _inner: Some(guard),
+        });
     }
     #[cfg(not(windows))]
     {
@@ -53,13 +74,26 @@ pub(crate) fn creation_wait_attempts() -> u64 {
 
 #[cfg(windows)]
 pub(crate) fn creation_guard_until(deadline: Instant) -> io::Result<CreationGuard> {
+    // The notification mutex is held across each lock check and released only by the condvar
+    // wait, so a release between the check and the wait cannot be missed. The 5 ms cap is a
+    // safety net for guards released by the plain blocking `creation_guard` path.
+    let mut sync = CREATION_RELEASED
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     loop {
         match PROCESS_CREATION_LOCK.try_lock() {
-            Ok(guard) => return Ok(CreationGuard { _inner: guard }),
+            Ok(guard) => {
+                return Ok(CreationGuard {
+                    _inner: Some(guard),
+                });
+            }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 let guard = poisoned.into_inner();
                 PROCESS_CREATION_LOCK.clear_poison();
-                return Ok(CreationGuard { _inner: guard });
+                return Ok(CreationGuard {
+                    _inner: Some(guard),
+                });
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 #[cfg(test)]
@@ -70,10 +104,13 @@ pub(crate) fn creation_guard_until(deadline: Instant) -> io::Result<CreationGuar
                         "Windows process-creation lock deadline elapsed",
                     ));
                 }
-                std::thread::sleep(
-                    Duration::from_millis(5)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
+                let slice = Duration::from_millis(5)
+                    .min(deadline.saturating_duration_since(Instant::now()));
+                sync = CREATION_RELEASED
+                    .1
+                    .wait_timeout(sync, slice)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0;
             }
         }
     }

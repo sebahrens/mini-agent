@@ -4744,9 +4744,7 @@ impl Sandbox {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .extend(groups.iter().copied());
-        for pid in groups {
-            kill_process_group(pid);
-        }
+        kill_process_groups(&groups);
     }
 
     #[cfg(test)]
@@ -5470,6 +5468,41 @@ pub(crate) fn kill_process_group(pid: u32) {
             return;
         }
         windows::terminate_helper(pid);
+    }
+}
+
+/// Terminates every group in `pids` before returning.
+///
+/// On Unix this signals each group in turn. On Windows each helper may take up
+/// to ~5 s to cancel cooperatively, so the helpers are terminated concurrently
+/// and the call is bounded by the slowest one rather than the sum. It still
+/// completes before returning, preserving the ordering `kill_active` needs.
+fn kill_process_groups(pids: &[u32]) {
+    #[cfg(not(windows))]
+    for pid in pids {
+        kill_process_group(*pid);
+    }
+    #[cfg(windows)]
+    {
+        if let [pid] = pids {
+            kill_process_group(*pid);
+            return;
+        }
+        let terminate_all = || {
+            std::thread::scope(|scope| {
+                for pid in pids {
+                    scope.spawn(move || windows::terminate_helper(*pid));
+                }
+            });
+        };
+        #[cfg(feature = "multithread")]
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(terminate_all);
+            return;
+        }
+        terminate_all();
     }
 }
 
