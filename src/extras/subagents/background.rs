@@ -433,6 +433,11 @@ impl Pool {
             "background task workspace changed"
         );
         let retained = self.workspace.get_or_init(|| workspace.clone());
+        // The task tool passes the very binding the pool retained: it was just
+        // validated, and comparing a fingerprint with itself proves nothing.
+        if Arc::ptr_eq(retained, workspace) {
+            return Ok(());
+        }
         retained.validate().map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
             retained
@@ -922,6 +927,27 @@ mod tests {
         let recorder = session.file_checkpoints.recorder(&session.id, 0, true);
         (session, pool, root, run, recorder)
     }
+    #[test]
+    fn validating_the_retained_workspace_binding_validates_it_once() {
+        let root = crate::tests::OwnedTestDirectory::new("background-validate-once");
+        let (_session, pool, workspace, _run, _recorder) = fixture(&root);
+        pool.validate_workspace(&workspace).unwrap();
+        let before = crate::paths::VALIDATE_CALLS.with(std::cell::Cell::get);
+        for _ in 0..3 {
+            pool.validate_workspace(&workspace).unwrap();
+        }
+        let after = crate::paths::VALIDATE_CALLS.with(std::cell::Cell::get);
+        assert_eq!(
+            after - before,
+            3,
+            "one validation per call for the retained Arc"
+        );
+
+        // A distinct binding of the same directory still compares identities.
+        let other = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        pool.validate_workspace(&other).unwrap();
+    }
+
     async fn settled(pool: &Pool, id: &str) -> SavedTask {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {

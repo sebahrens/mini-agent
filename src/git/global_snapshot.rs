@@ -315,7 +315,6 @@ impl GlobalSources {
         roots: &[PathBuf],
     ) -> Result<SelectedGlobals, String> {
         let runtime = runner.guarded_runtime()?;
-        runtime.validate(roots)?;
         // The frozen graph's native selection depends only on the repository
         // location when every condition is path-based. Reuse the
         // origin-checked selection; runtime and helper authority below are
@@ -325,6 +324,10 @@ impl GlobalSources {
         let selected = match cached {
             Some(selected) => selected,
             None => {
+                // Fresh selection runs Git with the retained runtime; the
+                // cache-hit path is validated by the launcher right before
+                // spawn (`configure_guarded_command`).
+                runtime.validate(roots)?;
                 let selected = Arc::new(self.select_uncached(runner, repository).await?);
                 if let Some(key) = key {
                     self.selections.insert(key, selected.clone());

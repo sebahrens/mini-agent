@@ -104,6 +104,8 @@ enum CreateStepError {
 
 struct CreateState {
     repo_path: PathBuf,
+    /// Canonical common Git directory, resolved once before the mutation.
+    common_dir: PathBuf,
     target: PathBuf,
     branch: String,
     expected_branch_oid: String,
@@ -362,23 +364,60 @@ async fn current_branch_at(repo_path: &Path) -> Result<Option<String>, String> {
 /// A local-only target has nothing to pull. If either half of Git's upstream
 /// configuration is present, let `git pull` validate it and report failures.
 async fn target_has_pull_configuration(repo_path: &Path, target: &str) -> Result<bool, String> {
-    for suffix in ["remote", "merge"] {
-        let key = format!("branch.{target}.{suffix}");
-        let output = worktree_runner()
-            .run_allow_exit(
-                repo_path,
-                "target-upstream",
-                ["config", "--get", key.as_str()],
-                QUERY_LIMITS,
-            )
-            .await?;
-        match output.exit_status.and_then(|status| status.code()) {
-            Some(0) => return Ok(true),
-            Some(1) => {}
-            _ => return Err(command_failure("target-upstream", &output)),
-        }
+    let pattern = format!(r"^branch\.{}\.(remote|merge)$", regex_escape(target));
+    let output = worktree_runner()
+        .run_allow_exit(
+            repo_path,
+            "target-upstream",
+            ["config", "--get-regexp", pattern.as_str()],
+            QUERY_LIMITS,
+        )
+        .await?;
+    match output.exit_status.and_then(|status| status.code()) {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(command_failure("target-upstream", &output)),
     }
-    Ok(false)
+}
+
+/// Escapes POSIX extended-regex metacharacters in a branch name.
+fn regex_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ".^$*+?()[]{}|\\".contains(ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// One `git rev-parse` process answering several path queries, one output line
+/// per query in argument order. Paths containing a line break cannot be split
+/// this way and are refused rather than misparsed.
+async fn rev_parse_paths(
+    repo_path: &Path,
+    operation: &'static str,
+    queries: &[&str],
+) -> Result<Vec<PathBuf>, String> {
+    let mut args = vec!["rev-parse"];
+    args.extend_from_slice(queries);
+    let output = run_query(repo_path, operation, args).await?;
+    let text = trim_line(&output.stdout);
+    let paths = text
+        .split(|byte| *byte == b'\n')
+        .map(output_path)
+        .collect::<Vec<_>>();
+    let expected = queries
+        .iter()
+        .filter(|query| !query.starts_with("--path-format"))
+        .count();
+    if paths.len() != expected {
+        return Err(format!(
+            "git {operation} returned an unexpected number of paths"
+        ));
+    }
+    Ok(paths)
 }
 
 async fn validate_branch_name(repo_path: &Path, branch: &str) -> Result<(), String> {
@@ -397,34 +436,26 @@ async fn validate_branch_name(repo_path: &Path, branch: &str) -> Result<(), Stri
 
 pub async fn detect(repo_path: &Path) -> Option<WorktreeInfo> {
     let repo_path = canonical_path(repo_path, "repository").ok()?;
-    let common = run_query(
+    let paths = rev_parse_paths(
         &repo_path,
-        "common-dir",
-        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        "worktree-identity",
+        &[
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--git-dir",
+            "--show-toplevel",
+        ],
     )
     .await
     .ok()?;
-    let git_dir = run_query(
-        &repo_path,
-        "git-dir",
-        ["rev-parse", "--path-format=absolute", "--git-dir"],
-    )
-    .await
-    .ok()?;
-    let common_dir = canonical_path(&output_path(&common.stdout), "common Git directory").ok()?;
-    let git_dir = canonical_path(&output_path(&git_dir.stdout), "Git directory").ok()?;
+    let [common_dir, git_dir, root] = <[PathBuf; 3]>::try_from(paths).ok()?;
+    let common_dir = canonical_path(&common_dir, "common Git directory").ok()?;
+    let git_dir = canonical_path(&git_dir, "Git directory").ok()?;
     if common_dir == git_dir {
         return None;
     }
 
-    let root = run_query(
-        &repo_path,
-        "worktree-root",
-        ["rev-parse", "--show-toplevel"],
-    )
-    .await
-    .ok()?;
-    let worktree_path = canonical_path(&output_path(&root.stdout), "worktree root").ok()?;
+    let worktree_path = canonical_path(&root, "worktree root").ok()?;
     let main_repo_path = canonical_path(common_dir.parent()?, "main repository").ok()?;
     let branch = current_branch(&repo_path).await?;
 
@@ -470,16 +501,21 @@ pub async fn create(
 
 /// The checkout that contains `repo_path` (its Git toplevel) followed by the
 /// main worktree when `repo_path` is inside a linked worktree.
-async fn checkout_roots(repo_path: &Path) -> Result<Vec<PathBuf>, String> {
-    let root = run_query(repo_path, "worktree-root", ["rev-parse", "--show-toplevel"]).await?;
-    let toplevel = canonical_path(&output_path(&root.stdout), "worktree root")?;
-    let common = run_query(
+async fn checkout_roots(repo_path: &Path) -> Result<(Vec<PathBuf>, PathBuf), String> {
+    let paths = rev_parse_paths(
         repo_path,
-        "common-dir",
-        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        "checkout-roots",
+        &[
+            "--show-toplevel",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
     )
     .await?;
-    let common_dir = canonical_path(&output_path(&common.stdout), "common Git directory")?;
+    let [root, common] = <[PathBuf; 2]>::try_from(paths)
+        .map_err(|_| "git checkout-roots returned an unexpected number of paths".to_string())?;
+    let toplevel = canonical_path(&root, "worktree root")?;
+    let common_dir = canonical_path(&common, "common Git directory")?;
     let mut roots = vec![toplevel];
     if common_dir.file_name() == Some(std::ffi::OsStr::new(".git"))
         && let Some(main) = common_dir.parent()
@@ -487,7 +523,7 @@ async fn checkout_roots(repo_path: &Path) -> Result<Vec<PathBuf>, String> {
     {
         roots.push(main.to_path_buf());
     }
-    Ok(roots)
+    Ok((roots, common_dir))
 }
 
 /// Resolve the new worktree directory. The default base is the parent of the
@@ -524,7 +560,7 @@ async fn create_with_limits(
     add_limits: CommandLimits,
 ) -> Result<(PathBuf, WorktreeInfo), String> {
     let repo_path = canonical_path(repo_path, "repository")?;
-    let checkouts = checkout_roots(&repo_path).await?;
+    let (checkouts, common_dir) = checkout_roots(&repo_path).await?;
     let target = default_or_explicit_target(&checkouts, base_dir, name)?;
     validate_branch_name(&repo_path, name).await?;
     let guard = acquire_repository(&repo_path).await?;
@@ -541,6 +577,7 @@ async fn create_with_limits(
     let expected_branch_oid = revision_oid(&repo_path, "HEAD").await?;
     let state = CreateState {
         repo_path,
+        common_dir,
         target,
         branch: name.to_string(),
         expected_branch_oid,
@@ -710,17 +747,7 @@ async fn create_transaction(
     .await?;
     let worktree_path =
         canonical_path(&state.target, "worktree path").map_err(CreateStepError::Command)?;
-    let common = await_create_step(
-        response_tx,
-        run_query(
-            &state.repo_path,
-            "common-dir",
-            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        ),
-    )
-    .await?;
-    let common_dir = canonical_path(&output_path(&common.stdout), "common Git directory")
-        .map_err(CreateStepError::Command)?;
+    let common_dir = state.common_dir.clone();
     let main_repo_path = canonical_path(
         common_dir.parent().ok_or_else(|| {
             CreateStepError::Command("common Git directory has no repository parent".to_string())
@@ -1233,19 +1260,36 @@ async fn try_merge_transaction(
         }
     }
 
-    match await_merge_step(
+    // The merge itself is local; fetched refs only matter to the later `git
+    // pull`, which runs only when the target has upstream configuration. Skip
+    // contacting every remote for a local-only target.
+    let pull_configured = match await_merge_step(
         response_tx,
-        run_network(&main_repo_path, "fetch", ["fetch", "--all"]),
+        target_has_pull_configuration(&main_repo_path, target),
     )
     .await
     {
-        Ok(_) => {}
+        Ok(configured) => configured,
         Err(MergeStepError::Command(error)) => {
-            return SupervisedMerge::Deliver(
-                early_merge_error(&mut state, format!("fetch failed: {error}")).await,
-            );
+            return SupervisedMerge::Deliver(early_merge_error(&mut state, error).await);
         }
         Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
+    };
+    if pull_configured {
+        match await_merge_step(
+            response_tx,
+            run_network(&main_repo_path, "fetch", ["fetch", "--all"]),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(MergeStepError::Command(error)) => {
+                return SupervisedMerge::Deliver(
+                    early_merge_error(&mut state, format!("fetch failed: {error}")).await,
+                );
+            }
+            Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
+        }
     }
     state.branch_switch_attempted = true;
     match await_merge_step(
@@ -1279,20 +1323,6 @@ async fn try_merge_transaction(
     .await
     {
         Ok(oid) => Some(oid),
-        Err(MergeStepError::Command(error)) => {
-            return SupervisedMerge::Deliver(
-                early_merge_error_after_branch_change(&mut state, error, Vec::new()).await,
-            );
-        }
-        Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
-    };
-    let pull_configured = match await_merge_step(
-        response_tx,
-        target_has_pull_configuration(&main_repo_path, target),
-    )
-    .await
-    {
-        Ok(configured) => configured,
         Err(MergeStepError::Command(error)) => {
             return SupervisedMerge::Deliver(
                 early_merge_error_after_branch_change(&mut state, error, Vec::new()).await,

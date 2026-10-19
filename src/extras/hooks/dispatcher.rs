@@ -733,7 +733,7 @@ impl HookDispatcher {
         project_dir: &str,
         execution_root: &HookExecutionRootLease,
     ) -> Vec<HookOutput> {
-        let stdin = serde_json::to_vec(envelope).unwrap_or_default();
+        let stdin: Arc<[u8]> = serde_json::to_vec(envelope).unwrap_or_default().into();
         let mut futures = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
@@ -1194,7 +1194,8 @@ fn merge_decisions(event: &str, outputs: &[HookOutput]) -> Decision {
 }
 
 fn merge_post_tool_use_decisions(outputs: &[HookOutput], tool_response: &str) -> Decision {
-    let mut redacted = tool_response.to_string();
+    // Only copy the response once a redaction literal actually matches.
+    let mut redacted = std::borrow::Cow::Borrowed(tool_response);
     let mut changed = false;
 
     for output in outputs {
@@ -1211,13 +1212,18 @@ fn merge_post_tool_use_decisions(outputs: &[HookOutput], tool_response: &str) ->
     }
 
     if changed {
-        Decision::Rewrite { content: redacted }
+        Decision::Rewrite {
+            content: redacted.into_owned(),
+        }
     } else {
         Decision::Continue
     }
 }
 
-fn apply_redactions(tool_response: &mut String, value: &serde_json::Value) -> bool {
+fn apply_redactions(
+    tool_response: &mut std::borrow::Cow<'_, str>,
+    value: &serde_json::Value,
+) -> bool {
     let Some(redactions) = value.get("redactions").and_then(|value| value.as_array()) else {
         return false;
     };
@@ -1228,7 +1234,8 @@ fn apply_redactions(tool_response: &mut String, value: &serde_json::Value) -> bo
         .filter(|literal| !literal.is_empty())
     {
         if tool_response.contains(literal) {
-            *tool_response = tool_response.replace(literal, REDACTION_MARKER);
+            *tool_response =
+                std::borrow::Cow::Owned(tool_response.replace(literal, REDACTION_MARKER));
             changed = true;
         }
     }
@@ -1319,7 +1326,7 @@ mod tests {
 
     #[test]
     fn redactions_replace_only_requested_non_empty_literals() {
-        let mut response = "token=secret; status=ok".to_string();
+        let mut response = std::borrow::Cow::Borrowed("token=secret; status=ok");
 
         let changed = apply_redactions(
             &mut response,
@@ -1332,7 +1339,7 @@ mod tests {
 
     #[test]
     fn missing_redactions_leave_the_response_unchanged() {
-        let mut response = "authoritative result".to_string();
+        let mut response = std::borrow::Cow::Borrowed("authoritative result");
 
         let changed = apply_redactions(
             &mut response,
@@ -1341,5 +1348,15 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(response, "authoritative result");
+
+        let changed = apply_redactions(
+            &mut response,
+            &serde_json::json!({"redactions": ["absent literal"]}),
+        );
+        assert!(!changed);
+        assert!(
+            matches!(response, std::borrow::Cow::Borrowed(_)),
+            "an unmatched redaction must not copy the response"
+        );
     }
 }

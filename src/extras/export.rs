@@ -77,30 +77,35 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
             out.push_str(&record);
         }
     }
+    // One reusable buffer per export; each message is serialized straight from
+    // borrowed fields instead of through an owned `Value` tree.
+    let mut line = Vec::new();
+    out.reserve(
+        session
+            .messages
+            .iter()
+            .map(|msg| msg.content.len().saturating_add(96))
+            .fold(0usize, usize::saturating_add)
+            .min(MAX_SESSION_IMPORT_BYTES),
+    );
     for msg in &session.messages {
-        let mut line = serde_json::json!({
-            "role": msg.role,
-            "content": msg.content.as_str(),
-            "estimated_tokens": msg.estimated_tokens,
-        });
-        if let Some(id) = &msg.tool_call_id {
-            line["tool_call_id"] = serde_json::Value::String(id.to_string());
-        }
-        if let Some(tool) = &msg.tool {
-            line["tool"] =
-                serde_json::to_value(tool).context("serialize structured tool record")?;
-        }
-        if let Some(diff) = &msg.recorded_diff
-            && diff.bounded()
-        {
-            line["recorded_diff"] =
-                serde_json::to_value(diff).context("serialize mutation preview")?;
-        }
-        if let Some(user) = &msg.user {
+        if msg.user.is_some() {
             msg.validate_user().map_err(anyhow::Error::msg)?;
-            line["user"] = serde_json::to_value(user)?;
         }
-        let line = line.to_string();
+        line.clear();
+        serde_json::to_writer(
+            &mut line,
+            &ExportLine {
+                role: &msg.role,
+                content: msg.content.as_str(),
+                estimated_tokens: msg.estimated_tokens,
+                tool_call_id: msg.tool_call_id.as_deref(),
+                tool: msg.tool.as_ref(),
+                recorded_diff: msg.recorded_diff.as_ref().filter(|diff| diff.bounded()),
+                user: msg.user.as_ref(),
+            },
+        )
+        .context("serialize session message")?;
         if line.len() > MAX_SESSION_IMPORT_LINE_BYTES {
             anyhow::bail!("session message exceeds the JSONL line limit");
         }
@@ -111,10 +116,26 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
             );
         }
         out.push('\n');
-        out.push_str(&line);
+        out.push_str(std::str::from_utf8(&line).context("session message was not UTF-8")?);
     }
     out.push('\n');
     Ok(out)
+}
+
+/// Borrowed export line. Field order is the emitted key order.
+#[derive(serde::Serialize)]
+struct ExportLine<'a> {
+    role: &'a MessageRole,
+    content: &'a str,
+    estimated_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<&'a crate::session::PersistedToolMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recorded_diff: Option<&'a crate::agent::tools::mutation_diff::MutationDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a crate::session::user::PersistedUserMessage>,
 }
 
 /// Tolerant import shape: `estimated_tokens` is optional so JSONL produced by
@@ -785,10 +806,34 @@ pub fn session_to_html(session: &Session) -> String {
         session.total_output_tokens,
         session.total_cost,
     ));
-    TEMPLATE
-        .replace("{{title}}", &title)
-        .replace("{{meta}}", &meta)
-        .replace("{{messages}}", &messages)
+    fill_template(
+        TEMPLATE,
+        &[
+            ("{{title}}", &title),
+            ("{{meta}}", &meta),
+            ("{{messages}}", &messages),
+        ],
+    )
+}
+
+/// Substitutes each placeholder in one pass over `template`. Substituted text
+/// is never rescanned, so exported content that happens to contain a
+/// placeholder spelling stays literal.
+fn fill_template(template: &str, values: &[(&str, &str)]) -> String {
+    let extra = values.iter().map(|(_, value)| value.len()).sum::<usize>();
+    let mut out = String::with_capacity(template.len().saturating_add(extra));
+    let mut rest = template;
+    while let Some((at, key, value)) = values
+        .iter()
+        .filter_map(|(key, value)| rest.find(key).map(|at| (at, *key, *value)))
+        .min_by_key(|(at, _, _)| *at)
+    {
+        out.push_str(&rest[..at]);
+        out.push_str(value);
+        rest = &rest[at + key.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Render Markdown without ever passing attacker-authored HTML through to the
@@ -1081,5 +1126,45 @@ mod effort_control_tests {
             let malformed = format!("{}\n{}\n", header, lines.collect::<Vec<_>>().join("\n"));
             assert!(parse_session_file(&malformed).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod serialization_shape_tests {
+    use super::*;
+
+    #[test]
+    fn jsonl_message_lines_keep_their_exact_bytes() {
+        let mut session = Session::new("anthropic", "claude-sonnet-4-6", 128_000, "");
+        session.add_message(MessageRole::User, "quote \" and 雪 and \n newline");
+        session.add_message(MessageRole::Assistant, "answer");
+        let jsonl = session_to_jsonl(&session).unwrap();
+        let lines = jsonl.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1 + session.messages.len());
+        for (line, msg) in lines[1..].iter().zip(&session.messages) {
+            let expected = serde_json::json!({
+                "role": msg.role,
+                "content": msg.content.as_str(),
+                "estimated_tokens": msg.estimated_tokens,
+            })
+            .to_string();
+            assert_eq!(*line, expected);
+        }
+    }
+
+    #[test]
+    fn template_placeholders_are_filled_once_and_substituted_text_stays_literal() {
+        let filled = fill_template(
+            "<t>{{title}}</t><m>{{meta}}</m>{{messages}}<t>{{title}}</t>",
+            &[
+                ("{{title}}", "a {{meta}} b"),
+                ("{{meta}}", "M"),
+                ("{{messages}}", "body {{title}}"),
+            ],
+        );
+        assert_eq!(
+            filled,
+            "<t>a {{meta}} b</t><m>M</m>body {{title}}<t>a {{meta}} b</t>"
+        );
     }
 }

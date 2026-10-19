@@ -903,6 +903,8 @@ impl WorkspaceBinding {
     /// Fail closed if the canonical target or its directory identity changed.
     /// Consumers call this immediately before each filesystem/process effect.
     pub(crate) fn validate(&self) -> Result<(), String> {
+        #[cfg(test)]
+        VALIDATE_CALLS.with(|calls| calls.set(calls.get() + 1));
         #[cfg(target_os = "linux")]
         self.spelling
             .validate()
@@ -925,6 +927,12 @@ impl WorkspaceBinding {
             .map_err(|_| "workspace binding handle identity changed".to_string())?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `WorkspaceBinding::validate` calls on this thread, for "validated once" tests.
+    pub(crate) static VALIDATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn sibling_temp_name(name: &OsStr) -> OsString {

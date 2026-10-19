@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use compact_str::CompactString;
 use rig::tool::Tool;
@@ -2216,4 +2216,49 @@ fn lsp44_auto_path_admission_preserves_overrides_and_ignores_relative_or_oversiz
     assert_eq!(names(&user, std::ffi::OsStr::new(".")), ["a-custom"]);
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert!(names(&user, root.path().as_os_str()).is_empty());
+}
+
+#[tokio::test]
+async fn edit_wait_shortens_after_a_missed_publish_and_recovers_after_a_late_one() {
+    let root = TempRoot::new("adaptive-edit-wait");
+    let file = root.path().join("quiet.rs");
+    std::fs::write(&file, "fn quiet() {}").unwrap();
+    let file = file.canonicalize().unwrap();
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    if !manager.handles(&file) {
+        return;
+    }
+    let uri = crate::extras::lsp::client::file_uri(&file).unwrap();
+
+    // First edit: the server never publishes, so the full window elapses.
+    let started = Instant::now();
+    assert!(
+        manager
+            .diagnostics_block_for_edit(&file, Some(0))
+            .await
+            .is_none()
+    );
+    assert!(started.elapsed() >= Duration::from_millis(900));
+
+    // Later edits do not repeat the full second of waiting.
+    let started = Instant::now();
+    assert!(
+        manager
+            .diagnostics_block_for_edit(&file, Some(0))
+            .await
+            .is_none()
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "waited {:?} after a missed publish",
+        started.elapsed()
+    );
+
+    // A publish that lands after we stopped waiting proves the server is alive:
+    // the next edit (baseline past the miss) gets the full window again.
+    manager.set_synced_document_for_test(&uri, 1, true);
+    assert!(manager.publish_synced_diagnostics_for_test(&uri, "rust", None, Vec::new()));
+    let started = Instant::now();
+    let _ = manager.diagnostics_block_for_edit(&file, Some(1)).await;
+    assert!(started.elapsed() >= Duration::from_millis(900));
 }

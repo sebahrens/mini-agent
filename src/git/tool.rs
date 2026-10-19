@@ -55,8 +55,90 @@ pub(crate) struct GitTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     exact_files: bool,
+    filter_drivers: Arc<FilterDriverCache>,
     #[cfg(test)]
     test_uncontained: bool,
+}
+
+/// Memoized result of the filter-driver config probe. The key is the full
+/// content of the repository-controlled config files, so any edit (including
+/// an in-place same-size rewrite) misses the cache.
+#[derive(Default)]
+struct FilterDriverCache {
+    entry: std::sync::Mutex<Option<(Vec<u8>, Vec<String>)>>,
+    #[cfg(test)]
+    probes: std::sync::atomic::AtomicUsize,
+}
+
+/// Largest repository config file that is fingerprinted by content.
+const CONFIG_FINGERPRINT_MAX_BYTES: u64 = 64 * 1024;
+
+/// Content fingerprint of every repository-controlled config file Git reads
+/// for this checkout. `None` when the answer cannot be keyed safely: unusual
+/// layouts, oversized files, or any `include`/`includeIf` (included files are
+/// not fingerprinted).
+fn config_fingerprint(root: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let dot_git = root.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    let (git_dir, common_dir) = if meta.is_dir() {
+        (dot_git.clone(), dot_git)
+    } else if meta.is_file() {
+        let mut text = String::new();
+        std::fs::File::open(&dot_git)
+            .ok()?
+            .take(4096)
+            .read_to_string(&mut text)
+            .ok()?;
+        let git_dir = root.join(text.trim().strip_prefix("gitdir:")?.trim());
+        let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+            Ok(common) => git_dir.join(common.trim()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+            Err(_) => return None,
+        };
+        (git_dir, common)
+    } else {
+        return None;
+    };
+    let mut files = vec![
+        git_dir.join("config"),
+        git_dir.join("config.worktree"),
+        common_dir.join("config"),
+        common_dir.join("config.worktree"),
+    ];
+    files.dedup();
+    let mut seen = Vec::new();
+    let mut key = Vec::new();
+    for path in files {
+        if seen.contains(&path) {
+            continue;
+        }
+        key.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        key.push(0);
+        match std::fs::File::open(&path) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(CONFIG_FINGERPRINT_MAX_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                if bytes.len() as u64 > CONFIG_FINGERPRINT_MAX_BYTES
+                    || bytes
+                        .windows(7)
+                        .any(|window| window.eq_ignore_ascii_case(b"include"))
+                {
+                    return None;
+                }
+                key.push(1);
+                key.extend_from_slice(&bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => key.push(2),
+            Err(_) => return None,
+        }
+        key.push(0);
+        seen.push(path);
+    }
+    Some(key)
 }
 
 impl GitTool {
@@ -76,6 +158,7 @@ impl GitTool {
             permission,
             ask_tx,
             exact_files: false,
+            filter_drivers: Arc::default(),
             #[cfg(test)]
             test_uncontained: false,
         })
@@ -334,6 +417,41 @@ impl GitTool {
         (!id.is_empty()).then(|| id.to_string())
     }
 
+    /// [`Self::configured_filter_drivers`], skipped while the repository config
+    /// files are byte-identical to those of the last successful probe. The
+    /// production runner's global/system configuration is a frozen snapshot;
+    /// unguarded runners (tests) re-probe nothing extra because their globals
+    /// are fixed for the test's duration.
+    async fn cached_filter_drivers(&self) -> Result<Vec<String>, ToolError> {
+        let root = self.workspace.root().to_path_buf();
+        let key = crate::agent::runner::spawn_blocking_scoped(move || config_fingerprint(&root))
+            .await
+            .ok()
+            .flatten();
+        if let Some(key) = &key
+            && let Some((cached_key, drivers)) = self
+                .filter_drivers
+                .entry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            && cached_key == key
+        {
+            return Ok(drivers.clone());
+        }
+        #[cfg(test)]
+        self.filter_drivers
+            .probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let drivers = self.configured_filter_drivers().await?;
+        *self
+            .filter_drivers
+            .entry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = key.map(|key| (key, drivers.clone()));
+        Ok(drivers)
+    }
+
     /// Names of the filter drivers the contained Git would see configured.
     async fn configured_filter_drivers(&self) -> Result<Vec<String>, ToolError> {
         let output = self
@@ -378,7 +496,7 @@ impl GitTool {
     /// the operation, additionally empties each configured driver so an
     /// attribute written after this probe still executes nothing.
     async fn filter_guard(&self, operation: &'static str) -> Result<Vec<String>, ToolError> {
-        let drivers = self.configured_filter_drivers().await?;
+        let drivers = self.cached_filter_drivers().await?;
         if drivers.is_empty() {
             return Ok(Vec::new());
         }
@@ -1076,6 +1194,7 @@ mod tests {
                 permission: None,
                 ask_tx: None,
                 exact_files: false,
+                filter_drivers: Arc::default(),
                 test_uncontained: true,
             }
         }
@@ -1485,6 +1604,45 @@ mod tests {
             "refusal must name the attribute and driver: {error}"
         );
         assert!(!marker.exists(), "the workspace clean filter must not run");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filter_driver_probe_is_reused_until_repository_config_changes() {
+        let repo = TestRepo::new();
+        repo.write("tracked.txt", "content\n");
+        repo.git(["add", "tracked.txt"]);
+        repo.git(["commit", "--quiet", "-m", "base"]);
+        let tool = repo.tool();
+        let probes = || {
+            tool.filter_drivers
+                .probes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        for _ in 0..3 {
+            tool.call(args(GitOperation::Status, &[], None))
+                .await
+                .expect("status");
+        }
+        assert_eq!(probes(), 1, "unchanged config must not re-probe");
+
+        // A same-length in-place config edit still invalidates the cache.
+        repo.write("tracked.txt", "changed\n");
+        repo.write(".gitattributes", "tracked.txt filter=probe\n");
+        repo.git(["add", ".gitattributes"]);
+        let marker = configure_marker_filter(&repo);
+        let after = tool.call(args(GitOperation::Status, &[], None)).await;
+        assert_eq!(probes(), 2, "changed config must re-probe");
+        assert!(!marker.exists(), "the workspace clean filter must not run");
+        drop(after);
+
+        // `include` makes the config unkeyable: always re-probe.
+        repo.git(["config", "include.path", "extra.cfg"]);
+        let before = probes();
+        for _ in 0..2 {
+            let _ = tool.call(args(GitOperation::Status, &[], None)).await;
+        }
+        assert_eq!(probes(), before + 2);
     }
 
     #[cfg(unix)]
