@@ -2465,11 +2465,12 @@ impl<R: std::io::Read, W: Write> WorkerTransport<R, W> {
         invocation_id: &super::protocol::InvocationId,
         sequence: &Mutex<u64>,
     ) -> Result<EffectResult, ()> {
+        let request_ordinal = request.effect_ordinal;
         let frame = WireFrame::invocation(
             build.clone(),
             invocation_id.clone(),
             *sequence.lock().map_err(|_| ())?,
-            WorkerFrame::EffectRequest(Box::new(request.clone())),
+            WorkerFrame::EffectRequest(Box::new(request)),
         );
         self.protocol.on_send(&frame).map_err(|_| ())?;
         write_terminal(&mut self.output, &frame)?;
@@ -2487,7 +2488,7 @@ impl<R: std::io::Read, W: Write> WorkerTransport<R, W> {
             ParentFrame::EffectResponse(EffectResponse {
                 effect_ordinal,
                 result,
-            }) if effect_ordinal == request.effect_ordinal => Ok(result),
+            }) if effect_ordinal == request_ordinal => Ok(result),
             _ => Err(()),
         }
     }

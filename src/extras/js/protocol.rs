@@ -981,7 +981,8 @@ struct BoundedPayload {
 impl BoundedPayload {
     fn new() -> Self {
         Self {
-            bytes: Vec::new(),
+            // Most frames are small; start past the first few doubling reallocations.
+            bytes: Vec::with_capacity(4096),
             exceeded: false,
         }
     }
