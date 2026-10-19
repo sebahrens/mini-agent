@@ -10,31 +10,64 @@ use std::time::{Duration, Instant};
 /// temporary values.
 static PROCESS_ENV_LOCK: RwLock<()> = RwLock::new(());
 
-/// Longest a test-thread reader waits for a mutator scope to end before
-/// reading anyway.
+/// Longest a reader waits for a mutator scope to end before reading anyway.
 const SHARED_ENV_WAIT: Duration = Duration::from_secs(30);
 
-thread_local! {
-    static HOLDS_ENV_WRITER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// Which side of the process-env lock a thread's reads belong to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EnvRole {
+    /// Owns a `ScopedProcessEnv` (or a helper spawned for such an owner): reads
+    /// its own scope without locking.
+    Writer,
+    /// A test with no scope: its reads wait out other tests' scopes.
+    Reader,
+    /// A helper thread nobody attributed to a test (a runtime worker, a plain
+    /// spawned thread): reads directly, because waiting could stall the scope
+    /// of the test that spawned it.
+    Unattributed,
 }
 
-/// True for the thread libtest runs a test on (named after the test path) or
-/// the main thread. Helper threads (tokio workers and blocking-pool threads,
-/// `std::thread::spawn`) are unnamed or named otherwise.
+thread_local! {
+    static ENV_ROLE: std::cell::Cell<Option<EnvRole>> = const { std::cell::Cell::new(None) };
+}
+
 fn is_test_thread() -> bool {
     let current = std::thread::current();
     matches!(current.name(), Some(name) if name == "main" || name.contains("::"))
 }
 
+/// The role of the calling thread: an explicit assignment (writer scope or an
+/// inherited role), else `Reader` on a libtest test thread, else `Unattributed`.
+pub(crate) fn current_env_role() -> EnvRole {
+    ENV_ROLE.with(std::cell::Cell::get).unwrap_or_else(|| {
+        if is_test_thread() {
+            EnvRole::Reader
+        } else {
+            EnvRole::Unattributed
+        }
+    })
+}
+
+/// Restores the previous role on drop.
+pub(crate) struct EnvRoleGuard(Option<EnvRole>);
+
+/// Gives the calling helper thread the role of the test that spawned it
+/// (captured with [`current_env_role`] on the spawning thread).
+pub(crate) fn inherit_env_role(role: EnvRole) -> EnvRoleGuard {
+    EnvRoleGuard(ENV_ROLE.with(|cell| cell.replace(Some(role))))
+}
+
+impl Drop for EnvRoleGuard {
+    fn drop(&mut self) {
+        ENV_ROLE.with(|cell| cell.set(self.0));
+    }
+}
+
 /// Runs `read` (an environment snapshot) so it cannot overlap any
-/// `ScopedProcessEnv` scope owned by another test. The thread owning a scope
-/// reads without locking. Only test threads wait: a helper thread cannot be
-/// attributed to a test, and one spawned inside a mutator scope (a runtime
-/// worker, a joined thread) would otherwise wait on its own parent's scope
-/// until the timeout, stalling that test; it reads directly, as it did before
-/// the lock existed.
+/// `ScopedProcessEnv` scope owned by another test. Writers and unattributed
+/// helpers read without locking; only a scope-less test waits.
 pub(crate) fn with_shared_process_env<T>(read: impl FnOnce() -> T) -> T {
-    if HOLDS_ENV_WRITER.with(std::cell::Cell::get) || !is_test_thread() {
+    if current_env_role() != EnvRole::Reader {
         return read();
     }
     let deadline = Instant::now() + SHARED_ENV_WAIT;
@@ -110,7 +143,7 @@ impl ScopedProcessEnv {
         let lock = PROCESS_ENV_LOCK
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        HOLDS_ENV_WRITER.with(|held| held.set(true));
+        ENV_ROLE.with(|cell| cell.set(Some(EnvRole::Writer)));
         let previous = values
             .iter()
             .map(|(name, _)| (OsString::from(name), std::env::var_os(name)))
@@ -132,7 +165,7 @@ impl ScopedProcessEnv {
 
 impl Drop for ScopedProcessEnv {
     fn drop(&mut self) {
-        HOLDS_ENV_WRITER.with(|held| held.set(false));
+        ENV_ROLE.with(|cell| cell.set(None));
         for (name, value) in &self.previous {
             unsafe {
                 match value {

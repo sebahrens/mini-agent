@@ -1222,7 +1222,12 @@ where
             )
         })
         .ok();
+    #[cfg(test)]
+    let env_role = crate::tests::current_env_role();
     runtime.spawn_blocking(move || {
+        // Pool threads read process paths as the test that spawned them.
+        #[cfg(test)]
+        let _env_role = crate::tests::inherit_env_role(env_role);
         #[cfg(test)]
         if let Some((_, Some(gate))) = &scoped {
             let _ = gate.started_tx.send(());
