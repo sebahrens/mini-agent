@@ -1160,6 +1160,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             )
             .with_workspace_binding(workspace.clone())
             .with_workspace_instructions(instructions.clone());
+            #[cfg(feature = "git-worktree")]
+            let task_tool = task_tool.with_isolation_base_dir(cli.resolve_wt_base_dir(cfg));
             // Only an explicitly configured parent response cap constrains a
             // separately configured child; the implicit parent default is not
             // a permanent 16K ceiling on child settings.

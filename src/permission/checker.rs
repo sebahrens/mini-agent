@@ -442,6 +442,27 @@ pub struct PermissionChecker {
     /// A scoped grant an embedded built-in prompt asked for, waiting for the
     /// user's one-time decision. Arming it grants nothing by itself.
     prompt_grant_offer: Option<PromptGrantOffer>,
+    /// Set only on the checker of a worktree-isolated subagent child. It makes
+    /// every mutation of the parent checkout (and of any `.git` entry) a hard
+    /// denial that no rule, grant, hook verdict or user approval can lift.
+    isolation: Option<IsolationPolicy>,
+}
+
+/// Hard mutation boundary of a worktree-isolated subagent child.
+#[derive(Debug, Clone)]
+struct IsolationPolicy {
+    /// Canonical roots the child must never mutate: the parent checkout and
+    /// the main repository.
+    denied_roots: Vec<PathBuf>,
+}
+
+/// Tools that never mutate the filesystem; every other tool name is treated as
+/// a mutation by the isolation boundary (fail closed for unknown tools).
+fn is_non_mutating_path_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read" | "grep" | "find_files" | "list_dir" | "todo_write"
+    )
 }
 
 /// Tools covered by a one-approval folder grant: enough to inspect and edit
@@ -548,6 +569,94 @@ impl PermissionChecker {
         self.plan_write_root = Some(plan_write_root);
         self.cached_resolved_cwd = resolve_path_allow_missing(Path::new(&self.working_dir));
         Ok(())
+    }
+
+    /// Derive the checker of a worktree-isolated subagent child: the same
+    /// compiled policy and mode, anchored at the child's worktree, with every
+    /// session grant dropped (grants name parent-tree paths) and a hard
+    /// boundary denying any mutation of `denied_roots` or of a `.git` entry.
+    /// Nothing the child does is recorded in the parent's checker.
+    #[cfg(all(feature = "git-worktree", feature = "subagents"))]
+    pub(crate) fn derive_isolated_child(
+        &self,
+        worktree: &Path,
+        denied_roots: &[PathBuf],
+    ) -> anyhow::Result<Self> {
+        let (canonical, plan_write_root) = canonical_working_dir(worktree)?;
+        let denied_roots = denied_roots
+            .iter()
+            .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+            .collect::<Vec<_>>();
+        if denied_roots
+            .iter()
+            .any(|root| canonical.starts_with(root) || root.starts_with(&canonical))
+        {
+            anyhow::bail!(
+                "isolated worktree {} overlaps the parent workspace",
+                canonical.display()
+            );
+        }
+        let working_dir = canonical.to_string_lossy().into_owned();
+        let cached_resolved_cwd = resolve_path_allow_missing(Path::new(&working_dir));
+        Ok(Self {
+            rules: self.rules.clone(),
+            shell_allow_prefixes: self.shell_allow_prefixes.clone(),
+            default_action: self.default_action,
+            ext_dir_rules: self.ext_dir_rules.clone(),
+            doom_loop_action: self.doom_loop_action,
+            working_dir,
+            plan_write_root: Some(plan_write_root),
+            session_allowlist: Vec::new(),
+            last_call: None,
+            consecutive_repeat_count: 0,
+            mode: self.mode,
+            user_mode: self.user_mode,
+            ask_cause: AskCause::ModePolicy,
+            permission_modes: self.permission_modes.clone(),
+            allow_all_mcp_calls: self.allow_all_mcp_calls,
+            // Not the parent's policy watcher: this checker is a snapshot.
+            compatibility_revision: None,
+            cached_resolved_cwd,
+            tool_output_binding: None,
+            #[cfg(feature = "hooks")]
+            hook_decisions: std::collections::HashMap::new(),
+            #[cfg(feature = "hooks")]
+            pinned_hook_files_override: self.pinned_hook_files_override.clone(),
+            prompt_grant_offer: None,
+            isolation: Some(IsolationPolicy { denied_roots }),
+        })
+    }
+
+    /// The isolation boundary's verdict for one mutation, or `None` when the
+    /// checker is not isolated or the access is read-only / contained.
+    fn isolation_denial(&self, tool: &str, inputs: &[&str]) -> Option<CheckResult> {
+        let policy = self.isolation.as_ref()?;
+        if is_non_mutating_path_tool(tool) {
+            return None;
+        }
+        for input in inputs {
+            let path = Path::new(input);
+            let normalized = normalize_path(path);
+            if path.is_absolute()
+                && policy
+                    .denied_roots
+                    .iter()
+                    .any(|root| normalized.starts_with(root))
+            {
+                return Some(CheckResult::Denied(
+                    "Blocked: a worktree-isolated subagent has no write authority over the parent workspace".to_string(),
+                ));
+            }
+            if normalized.components().any(|component| {
+                matches!(component, std::path::Component::Normal(name)
+                    if name.to_string_lossy().eq_ignore_ascii_case(".git"))
+            }) {
+                return Some(CheckResult::Denied(
+                    "Blocked: a worktree-isolated subagent cannot modify Git metadata".to_string(),
+                ));
+            }
+        }
+        None
     }
 
     fn compile_config(
@@ -791,6 +900,7 @@ impl PermissionChecker {
             #[cfg(feature = "hooks")]
             pinned_hook_files_override: None,
             prompt_grant_offer: None,
+            isolation: None,
         };
         #[cfg(feature = "hooks")]
         crate::extras::hooks::set_active_permission_mode(mode);
@@ -1502,6 +1612,9 @@ impl PermissionChecker {
         if self.matches_deny_rule(tool, &inputs) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
+        if let Some(denial) = self.isolation_denial(tool, &inputs) {
+            return denial;
+        }
         #[cfg(feature = "hooks")]
         if self.writes_pinned_hook_file(tool, relative.as_deref()) {
             return CheckResult::Denied(PINNED_HOOK_FILE_DENIAL.to_string());
@@ -1689,6 +1802,9 @@ impl PermissionChecker {
 
         if self.matches_deny_rule(tool, &[&logical, &relative]) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
+        }
+        if let Some(denial) = self.isolation_denial(tool, &[&logical, &relative]) {
+            return denial;
         }
         #[cfg(feature = "hooks")]
         if self.writes_pinned_hook_file(tool, Some(&relative)) {

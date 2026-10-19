@@ -5101,4 +5101,517 @@ wait
             .unwrap();
         assert!(!worktree.exists(), "worktree cleanup did not resume safely");
     }
+
+    /// Worktree-isolated write subagent children (mini-agent-9pnc5): each
+    /// child gets its own worktree and branch, tools and permissions bound to
+    /// that worktree only, and no write authority over the parent tree.
+    #[cfg(feature = "subagents")]
+    mod isolation {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        use crate::extras::subagents::builder::{SubagentAuthorization, WriteChildTools};
+        use crate::extras::subagents::isolation::{IsolationOutcome, IsolationPlan, prepare};
+        use crate::permission::checker::{CheckResult, PermissionChecker};
+        use crate::permission::{PermissionConfigs, SecurityMode};
+
+        fn allow_all() -> PermissionConfigs {
+            PermissionConfigs {
+                glob: serde_json::from_value(serde_json::json!({
+                    "read": "allow", "edit": "allow", "write": "allow",
+                    "shell": "allow", "list_dir": "allow", "grep": "allow",
+                    "find_files": "allow"
+                }))
+                .unwrap(),
+                ..Default::default()
+            }
+        }
+
+        fn yolo_checker(root: &Path) -> PermissionChecker {
+            PermissionChecker::new(
+                &allow_all(),
+                SecurityMode::Yolo,
+                Some(root.to_path_buf()),
+                Some(vec!["yolo".into()]),
+            )
+            .unwrap()
+        }
+
+        fn parent_authorization(
+            root: &Path,
+            sandbox: crate::sandbox::Sandbox,
+            permission: bool,
+        ) -> SubagentAuthorization {
+            let binding = Arc::new(crate::paths::WorkspaceBinding::capture(root).unwrap());
+            let permission = permission.then(|| Arc::new(Mutex::new(yolo_checker(root))));
+            SubagentAuthorization::new(permission, None, false)
+                .with_workspace_binding(Some(binding.clone()))
+                .with_write_tools(Some(WriteChildTools {
+                    sandbox: sandbox.with_workspace_binding(binding),
+                    write_enabled: true,
+                    edit_enabled: true,
+                    shell_enabled: true,
+                    max_text_file_size: Some(1024 * 1024),
+                    max_shell_output_lines: Some(100),
+                    shell_timeout_secs: 10,
+                    diff_options: Default::default(),
+                    formatter: None,
+                    #[cfg(feature = "lsp")]
+                    lsp: None,
+                }))
+        }
+
+        struct Fixture {
+            _repo: TempRepo,
+            plan: IsolationPlan,
+            head: String,
+        }
+
+        impl Fixture {
+            fn new(label: &str) -> Self {
+                let repo = TempRepo::new(label);
+                let root = repo.path().canonicalize().unwrap();
+                #[cfg(unix)]
+                {
+                    // A tracked link back to the parent checkout: a child that
+                    // follows it would write the parent tree.
+                    std::os::unix::fs::symlink(&root, root.join("link")).unwrap();
+                    git(&root, ["add", "link"]);
+                    git(&root, ["commit", "-m", "link"]);
+                }
+                let head = git_stdout(&root, ["rev-parse", "HEAD"]);
+                // Siblings of the checkout, so `../repository/x` from a
+                // worktree names the parent tree.
+                let base = root.parent().unwrap().to_path_buf();
+                Self {
+                    plan: IsolationPlan {
+                        parent_root: root,
+                        base_dir: Some(base),
+                        create_gate: None,
+                    },
+                    _repo: repo,
+                    head,
+                }
+            }
+
+            fn root(&self) -> &Path {
+                &self.plan.parent_root
+            }
+
+            fn parent(&self) -> SubagentAuthorization {
+                parent_authorization(
+                    self.root(),
+                    crate::sandbox::Sandbox::new(false, "auto"),
+                    true,
+                )
+            }
+
+            fn assert_parent_untouched(&self) {
+                let root = self.root();
+                assert_eq!(git_stdout(root, ["rev-parse", "HEAD"]), self.head);
+                assert_eq!(
+                    git_stdout(root, ["rev-parse", "--abbrev-ref", "HEAD"]),
+                    "main"
+                );
+                assert_eq!(git_stdout(root, ["status", "--porcelain"]), "");
+                assert_eq!(
+                    std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+                    "initial\n"
+                );
+            }
+        }
+
+        fn tools(authorization: &SubagentAuthorization) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+            authorization.filesystem_tools(1024 * 1024, 200, 100, 100, Some(100), None)
+        }
+
+        async fn call(
+            tools: &[Box<dyn rig::tool::ToolDyn>],
+            name: &str,
+            input: serde_json::Value,
+        ) -> Result<String, rig::tool::ToolError> {
+            tools
+                .iter()
+                .find(|tool| tool.name() == name)
+                .unwrap_or_else(|| panic!("child has no {name} tool"))
+                .call(input.to_string())
+                .await
+        }
+
+        fn replace_block(from: &str, to: &str) -> String {
+            format!("<<<<<<< SEARCH\n{from}\n=======\n{to}\n>>>>>>> REPLACE")
+        }
+
+        async fn edit_tracked_file(authorization: &SubagentAuthorization, text: &str) {
+            let tools = tools(authorization);
+            call(&tools, "read", serde_json::json!({"path": "tracked.txt"}))
+                .await
+                .unwrap();
+            call(
+                &tools,
+                "edit",
+                serde_json::json!({"path": "tracked.txt", "block": replace_block("initial", text)}),
+            )
+            .await
+            .unwrap();
+            call(
+                &tools,
+                "write",
+                serde_json::json!({"path": format!("added-{text}.txt"), "content": text}),
+            )
+            .await
+            .unwrap();
+        }
+
+        fn branch_of(outcome: &IsolationOutcome) -> (&str, &Path, &[String], &str) {
+            match outcome {
+                IsolationOutcome::Branch {
+                    branch,
+                    worktree,
+                    commits,
+                    diff_stat,
+                    ..
+                } => (branch, worktree, commits, diff_stat),
+                other => panic!("expected a branch, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn two_isolated_children_edit_the_same_file_concurrently_on_their_own_branches() {
+            let fixture = Fixture::new("isolation-concurrent");
+            let parent = fixture.parent();
+            let (first, second) = tokio::join!(
+                prepare(&fixture.plan, &parent),
+                prepare(&fixture.plan, &parent)
+            );
+            let (first, first_auth) = first.unwrap();
+            let (second, second_auth) = second.unwrap();
+            assert_ne!(first.path(), second.path());
+            assert_ne!(first.branch(), second.branch());
+            assert!(first.path().is_dir() && second.path().is_dir());
+
+            tokio::join!(
+                edit_tracked_file(&first_auth, "alpha"),
+                edit_tracked_file(&second_auth, "beta")
+            );
+            // Nothing reaches the parent tree while the children run.
+            fixture.assert_parent_untouched();
+            assert!(!fixture.root().join("added-alpha.txt").exists());
+
+            let (first_outcome, second_outcome) = tokio::join!(first.finish(), second.finish());
+            let (first_branch, first_tree, first_commits, first_stat) = branch_of(&first_outcome);
+            let (second_branch, second_tree, second_commits, _) = branch_of(&second_outcome);
+            assert_ne!(first_branch, second_branch);
+            assert_eq!(first_commits.len(), 1, "{first_commits:?}");
+            assert_eq!(second_commits.len(), 1, "{second_commits:?}");
+            assert!(first_stat.contains("tracked.txt"), "{first_stat}");
+            let root = fixture.root();
+            assert_eq!(
+                git_stdout(root, ["show", &format!("{first_branch}:tracked.txt")]),
+                "alpha"
+            );
+            assert_eq!(
+                git_stdout(root, ["show", &format!("{second_branch}:tracked.txt")]),
+                "beta"
+            );
+            assert_eq!(
+                git_stdout(root, ["show", &format!("{first_branch}:added-alpha.txt")]),
+                "alpha"
+            );
+            assert!(
+                first_tree.is_dir() && second_tree.is_dir(),
+                "branches keep their worktrees"
+            );
+            assert!(first_outcome.render().contains(first_branch));
+            // The merge stays explicit: the parent is still exactly as it was.
+            fixture.assert_parent_untouched();
+        }
+
+        #[tokio::test]
+        async fn isolated_child_cannot_write_the_parent_workspace() {
+            let fixture = Fixture::new("isolation-no-parent-write");
+            let (worktree, authorization) =
+                prepare(&fixture.plan, &fixture.parent()).await.unwrap();
+            let tools = tools(&authorization);
+            let root = fixture.root();
+            let parent_file = root.join("tracked.txt");
+
+            // Absolute path to a new parent file: refused, not created.
+            let escape = root.join("escape.txt");
+            assert!(
+                call(
+                    &tools,
+                    "write",
+                    serde_json::json!({"path": &escape, "content": "x"})
+                )
+                .await
+                .is_err()
+            );
+            assert!(!escape.exists());
+            // Relative traversal from the worktree into the parent checkout.
+            let traversal = root.join("escape-relative.txt");
+            assert!(
+                call(
+                    &tools,
+                    "write",
+                    serde_json::json!({"path": "../repository/escape-relative.txt", "content": "x"})
+                )
+                .await
+                .is_err()
+            );
+            assert!(!traversal.exists());
+            // Editing an existing parent file by absolute path, after a
+            // successful read of it (reads are not what isolation removes).
+            call(&tools, "read", serde_json::json!({"path": &parent_file}))
+                .await
+                .unwrap();
+            let error = call(
+                &tools,
+                "edit",
+                serde_json::json!({"path": &parent_file, "block": replace_block("initial", "pwned")}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("no write authority"), "{error}");
+            // A tracked link back to the parent tree is not a way in.
+            #[cfg(unix)]
+            {
+                assert!(
+                    call(
+                        &tools,
+                        "write",
+                        serde_json::json!({"path": "link/escape-link.txt", "content": "x"})
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(!root.join("escape-link.txt").exists());
+            }
+            fixture.assert_parent_untouched();
+            drop(worktree.finish().await);
+        }
+
+        #[test]
+        fn isolated_permission_boundary_is_hard_even_in_yolo_with_parent_grants() {
+            let directory = OwnedDirectory::create(
+                std::env::temp_dir().join(format!("mini-agent-iso-perm-{}", uuid::Uuid::new_v4())),
+            );
+            let parent = directory.path().canonicalize().unwrap().join("parent");
+            let child = directory.path().canonicalize().unwrap().join("child");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::create_dir_all(&child).unwrap();
+            let parent_file = parent.join("src.rs").to_string_lossy().into_owned();
+
+            let mut checker = yolo_checker(&parent);
+            checker.add_session_allowlist("write".into(), &format!("{}/**", parent.display()));
+            assert_eq!(
+                checker.check_path("write", &parent_file),
+                CheckResult::Allowed
+            );
+
+            let mut isolated = checker
+                .derive_isolated_child(&child, std::slice::from_ref(&parent))
+                .unwrap();
+            for tool in [
+                "write",
+                "edit",
+                "notebook_edit",
+                "js/write_file",
+                "unknown_mutator",
+            ] {
+                assert!(
+                    matches!(
+                        isolated.check_path(tool, &parent_file),
+                        CheckResult::Denied(_)
+                    ),
+                    "{tool} reached the parent workspace"
+                );
+            }
+            // Inside the child's own worktree the inherited rules apply.
+            let own = child.join("src.rs").to_string_lossy().into_owned();
+            assert_eq!(isolated.check_path("write", &own), CheckResult::Allowed);
+            assert_eq!(
+                isolated.check_bound_path("edit", &own),
+                CheckResult::Allowed
+            );
+            // Git metadata is never writable, in any spelling.
+            for metadata in [
+                ".git",
+                ".git/hooks/pre-commit",
+                ".git/config",
+                ".GIT/hooks/x",
+            ] {
+                let path = child.join(metadata).to_string_lossy().into_owned();
+                assert!(
+                    matches!(isolated.check_path("write", &path), CheckResult::Denied(_)),
+                    "{metadata}"
+                );
+                assert!(
+                    matches!(
+                        isolated.check_bound_path("write", &path),
+                        CheckResult::Denied(_)
+                    ),
+                    "{metadata}"
+                );
+            }
+            // The parent's own checker is unchanged by the derivation.
+            assert_eq!(
+                checker.check_path("write", &parent_file),
+                CheckResult::Allowed
+            );
+            // A worktree inside the parent tree is refused outright.
+            assert!(
+                checker
+                    .derive_isolated_child(&parent.join("nested"), std::slice::from_ref(&parent))
+                    .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn isolated_authorization_fails_closed_and_drops_unconfined_shell() {
+            let fixture = Fixture::new("isolation-authorization");
+            // No permission checker means no parent-tree denial is enforceable.
+            let unchecked = parent_authorization(
+                fixture.root(),
+                crate::sandbox::Sandbox::new(false, "auto"),
+                false,
+            );
+            let error = prepare(&fixture.plan, &unchecked).await.err().unwrap();
+            assert!(error.contains("requires permission checks"), "{error}");
+            assert!(
+                !git_stdout(fixture.root(), ["branch", "--list", "subagent-*"])
+                    .contains("subagent-"),
+                "a refused child must leave no branch"
+            );
+
+            // An uncontained sandbox could write anywhere: no shell tool.
+            let (worktree, authorization) =
+                prepare(&fixture.plan, &fixture.parent()).await.unwrap();
+            let kinds = authorization.filesystem_tool_kinds(None);
+            use crate::context::agents::AgentTool;
+            assert!(kinds.contains(&AgentTool::Write) && kinds.contains(&AgentTool::Edit));
+            assert!(!kinds.contains(&AgentTool::Shell), "{kinds:?}");
+            drop(worktree.finish().await);
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[tokio::test]
+        async fn isolated_shell_is_sandboxed_to_its_worktree() {
+            let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+            let fixture = Fixture::new("isolation-shell");
+            #[cfg(target_os = "macos")]
+            let backend = "seatbelt";
+            #[cfg(target_os = "linux")]
+            let backend = "bwrap";
+            let parent = parent_authorization(
+                fixture.root(),
+                crate::sandbox::Sandbox::new(true, backend),
+                true,
+            );
+            let (worktree, authorization) = prepare(&fixture.plan, &parent).await.unwrap();
+            let tools = tools(&authorization);
+            let pwned = fixture.root().join("pwned.txt");
+            let script = format!(
+                "echo inside > inside.txt; touch '{}' 2>/dev/null; echo done",
+                pwned.display()
+            );
+            let result = call(&tools, "shell", serde_json::json!({"command": script})).await;
+            let inside = worktree.path().join("inside.txt");
+            if result.is_err() || !inside.exists() {
+                eprintln!("skipping: the native sandbox is unusable on this host: {result:?}");
+            } else {
+                assert!(!pwned.exists(), "the sandboxed child wrote the parent tree");
+            }
+            fixture.assert_parent_untouched();
+            drop(worktree.finish().await);
+        }
+
+        async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+            for _ in 0..200 {
+                if done() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            done()
+        }
+
+        #[tokio::test]
+        async fn cancelling_an_isolated_child_removes_its_worktree_and_branch() {
+            let fixture = Fixture::new("isolation-cancel");
+            let (worktree, _authorization) =
+                prepare(&fixture.plan, &fixture.parent()).await.unwrap();
+            let path = worktree.path().to_path_buf();
+            let branch = worktree.branch().to_string();
+            assert!(path.is_dir());
+            let child = tokio::spawn(async move {
+                let _held = worktree;
+                std::future::pending::<()>().await;
+            });
+            tokio::task::yield_now().await;
+            child.abort();
+            let _ = child.await;
+            let root = fixture.root().to_path_buf();
+            let reference = format!("refs/heads/{branch}");
+            assert!(
+                eventually(|| !path.exists() && !optional_test_ref_exists(&root, &reference)).await,
+                "cancellation left {} / {branch}",
+                path.display()
+            );
+            fixture.assert_parent_untouched();
+        }
+
+        #[tokio::test]
+        async fn an_isolated_child_that_changed_nothing_is_cleaned_up() {
+            let fixture = Fixture::new("isolation-unchanged");
+            let (worktree, _authorization) =
+                prepare(&fixture.plan, &fixture.parent()).await.unwrap();
+            let path = worktree.path().to_path_buf();
+            let branch = worktree.branch().to_string();
+            assert_eq!(worktree.finish().await, IsolationOutcome::Unchanged);
+            assert!(!path.exists());
+            assert!(!optional_test_ref_exists(
+                fixture.root(),
+                &format!("refs/heads/{branch}")
+            ));
+            fixture.assert_parent_untouched();
+        }
+
+        #[tokio::test]
+        async fn a_create_that_finishes_after_cancellation_is_discarded() {
+            let mut fixture = Fixture::new("isolation-cancel-mid-create");
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            fixture.plan.create_gate = Some((entered.clone(), release.clone()));
+            let plan = fixture.plan.clone();
+            let parent = fixture.parent();
+            let child = tokio::spawn(async move { prepare(&plan, &parent).await.map(|_| ()) });
+            entered.notified().await;
+            let base = fixture.plan.base_dir.clone().unwrap();
+            let created = || {
+                std::fs::read_dir(&base)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("subagent-"))
+                    .count()
+            };
+            assert_eq!(
+                created(),
+                1,
+                "the worktree exists while create is in flight"
+            );
+            child.abort();
+            let _ = child.await;
+            release.add_permits(1);
+            let root = fixture.root().to_path_buf();
+            assert!(
+                eventually(|| created() == 0
+                    && git_stdout(&root, ["branch", "--list", "subagent-*"]).is_empty())
+                .await,
+                "a worktree created after cancellation was orphaned"
+            );
+            fixture.assert_parent_untouched();
+        }
+    }
 }

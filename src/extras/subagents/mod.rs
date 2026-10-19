@@ -9,6 +9,7 @@ use crate::provider::AnyClient;
 pub(crate) mod background;
 pub(crate) mod builder;
 pub(crate) mod cost;
+pub(crate) mod isolation;
 pub(crate) mod prompt;
 pub(crate) mod task_tool;
 

@@ -100,6 +100,8 @@ struct AgentMetadata {
     tool_narrowing_notice: Option<String>,
     model: Option<String>,
     turn_budget: Option<AgentTurnBudget>,
+    /// `isolation: worktree` was requested.
+    isolation_worktree: bool,
     /// The turn budget came from the deprecated `effort` alias.
     deprecated_effort_alias: bool,
     unknown_keys: Vec<String>,
@@ -254,9 +256,19 @@ fn normalize_agent_definition(
     }
     let deprecated_effort_alias = deprecated_effort.is_some();
     let turn_budget = turn_budget.or(deprecated_effort);
+    let isolation_worktree = match mapping.get(serde_yaml_ng::Value::String("isolation".into())) {
+        None => false,
+        Some(value) => match value.as_str() {
+            Some("worktree") => true,
+            Some("none") => false,
+            Some(_) => return Err("frontmatter isolation must be worktree or none"),
+            None => return Err("frontmatter isolation must be a string"),
+        },
+    };
     let known_keys = [
         "name",
         "mode",
+        "isolation",
         "description",
         "tools",
         "required_tools",
@@ -288,6 +300,7 @@ fn normalize_agent_definition(
                     tool_narrowing_notice,
                     model,
                     turn_budget,
+                    isolation_worktree,
                     deprecated_effort_alias,
                     unknown_keys,
                 },
@@ -472,6 +485,10 @@ pub struct AgentDefinition {
     /// Optional `turn_budget` tier (formerly `effort`) that narrows the global
     /// child turn cap. Unrelated to the model's `[reasoning] effort`.
     pub(crate) turn_budget: Option<AgentTurnBudget>,
+    /// `isolation: worktree`: a write-mode persona runs each child in its own
+    /// git worktree and branch instead of the parent workspace. Meaningless
+    /// (and ignored) without `mode: write`.
+    pub(crate) isolation_worktree: bool,
     pub source: AgentDefinitionSource,
     project_notes_path: Option<PathBuf>,
     ignored_definition_notices: Vec<String>,
@@ -495,6 +512,7 @@ fn merge_definitions(
                 required_tools: metadata.required_tools,
                 model: metadata.model,
                 turn_budget: metadata.turn_budget,
+                isolation_worktree: metadata.isolation_worktree,
                 source: source.clone(),
                 project_notes_path: None,
                 ignored_definition_notices: notices,
@@ -534,6 +552,7 @@ impl AgentDefinition {
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            isolation_worktree: false,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -820,6 +839,7 @@ fn merge_external_definitions(
                         required_tools: metadata.required_tools,
                         model: metadata.model,
                         turn_budget: metadata.turn_budget,
+                        isolation_worktree: metadata.isolation_worktree,
                         source: source.clone(),
                         project_notes_path: None,
                         ignored_definition_notices: notices,
@@ -1941,6 +1961,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn persona_isolation_is_an_explicit_worktree_opt_in() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition(
+                "impl".into(),
+                format!("---\nname: impl\nmode: write\n{frontmatter}\n---\nbody"),
+            )
+        };
+
+        assert!(!parse("tools: Read").unwrap().2.isolation_worktree);
+        assert!(parse("isolation: worktree").unwrap().2.isolation_worktree);
+        assert!(!parse("isolation: none").unwrap().2.isolation_worktree);
+        // Unknown spellings fail the definition rather than silently running
+        // a write child in the shared parent workspace.
+        for invalid in [
+            "isolation: container",
+            "isolation: [worktree]",
+            "isolation: true",
+        ] {
+            let error = parse(invalid).unwrap_err();
+            assert!(error.contains("isolation must be"), "{invalid}: {error}");
+        }
+        let definition = parse_for_test("impl", "---\nmode: write\nisolation: worktree\n---\nbody");
+        assert!(definition.isolation_worktree);
+        assert!(!parse_for_test("impl", "---\nmode: write\n---\nbody").isolation_worktree);
+    }
+
+    #[test]
     fn persona_turn_budget_accepts_deprecated_effort_alias_but_not_both() {
         let parse = |frontmatter: &str| {
             normalize_agent_definition(
@@ -2121,6 +2168,7 @@ pub(crate) mod tests {
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            isolation_worktree: false,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -2133,6 +2181,7 @@ pub(crate) mod tests {
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            isolation_worktree: false,
             source: AgentDefinitionSource::UserGlobal,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -2151,6 +2200,7 @@ pub(crate) mod tests {
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            isolation_worktree: false,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),

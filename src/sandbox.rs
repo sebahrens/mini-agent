@@ -2775,6 +2775,34 @@ impl Sandbox {
         Ok(self.with_workspace_binding(workspace))
     }
 
+    /// Whether commands launched from `workspace` could write under
+    /// `forbidden`. Fails closed: an uncontained sandbox, the host-wide
+    /// profile, an unresolvable root set, or any configured extra write root
+    /// that overlaps `forbidden` all answer yes. Used to decide whether a
+    /// worktree-isolated subagent may keep its shell tool.
+    #[cfg(all(feature = "git-worktree", feature = "subagents"))]
+    pub(crate) fn may_write_under(&self, workspace: &Path, forbidden: &Path) -> bool {
+        if !self.enabled || self.profile == SandboxProfile::HostFull {
+            return true;
+        }
+        let overlaps = |root: &Path| root.starts_with(forbidden) || forbidden.starts_with(root);
+        if self
+            .windows_appcontainer_write_roots
+            .iter()
+            .any(|root| overlaps(root))
+        {
+            return true;
+        }
+        match self.general_roots(workspace) {
+            Ok(roots) => roots.writes.iter().any(|root| {
+                let root = root.root();
+                // The workspace's own binding is the child's grant, not an extra.
+                root != workspace && overlaps(root)
+            }),
+            Err(_) => true,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn workspace_root_for_test(&self) -> Option<&Path> {
         self.workspace_binding

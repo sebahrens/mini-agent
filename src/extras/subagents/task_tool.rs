@@ -446,6 +446,8 @@ fn render_task_brief(index: usize, brief: &TaskBrief) -> Result<String, ToolErro
 #[derive(Clone, Debug)]
 struct ResolvedSpecialization {
     write_mode: bool,
+    /// `isolation: worktree` on a write persona.
+    isolation_worktree: bool,
     prompt: String,
     result_notice: Option<String>,
     #[cfg(any(test, feature = "hooks"))]
@@ -631,6 +633,7 @@ fn resolve_specialization(
     let source = definition.source_description(agent_type);
     Ok(Some(ResolvedSpecialization {
         write_mode: definition.mode.as_deref() == Some("write"),
+        isolation_worktree: definition.isolation_worktree,
         prompt: definition.prompt,
         result_notice,
         #[cfg(any(test, feature = "hooks"))]
@@ -667,6 +670,8 @@ pub struct TaskTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+    /// Directory for worktree-isolated children (`None`: next to the repo).
+    isolation_base_dir: Option<std::path::PathBuf>,
     instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
     response_max_tokens: Option<u64>,
     #[cfg(feature = "archmd")]
@@ -753,6 +758,7 @@ impl TaskTool {
             permission,
             ask_tx,
             workspace: None,
+            isolation_base_dir: None,
             instructions: None,
             response_max_tokens: None,
             #[cfg(feature = "archmd")]
@@ -765,6 +771,13 @@ impl TaskTool {
             #[cfg(feature = "js")]
             read_only_js: None,
         }
+    }
+
+    /// Where worktree-isolated write children are created.
+    #[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+    pub(crate) fn with_isolation_base_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.isolation_base_dir = dir;
+        self
     }
 
     pub(crate) fn with_write_tools(mut self, tools: builder::WriteChildTools) -> Self {
@@ -921,7 +934,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 "agent_type": {
                     "type": "string",
                     "enum": specialist_names,
-                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Specialists are read-only by default. A trusted persona with mode: write requires [subagents] allow_write = true and inherits only eligible parent tools, permissions and sandbox; write children run one at a time. The child model and write mode come from the persona definition (frontmatter model: and mode: write); add or edit a persona to change them. Available specialists:\n{specialist_descriptions}")
+                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Specialists are read-only by default. A trusted persona with mode: write requires [subagents] allow_write = true and inherits only eligible parent tools, permissions and sandbox; write children run one at a time, unless the persona sets isolation: worktree, which runs each child in its own git worktree and branch (parallel; the parent workspace is never written; the branch is returned for an explicit merge). The child model and write mode come from the persona definition (frontmatter model: and mode: write); add or edit a persona to change them. Available specialists:\n{specialist_descriptions}")
                 }
             },
             // Exclusivity is stated in the descriptions and enforced by
@@ -1002,6 +1015,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         let write_mode = specialization
             .as_ref()
             .is_some_and(|persona| persona.write_mode);
+        let mut isolated = false;
         if write_mode {
             if !config
                 .subagents
@@ -1016,16 +1030,28 @@ editing in a known location, grepping for a literal you will act on immediately.
             if self.write_tools.is_none() || self.workspace.is_none() {
                 return Err(ToolError::Msg("task: write persona requires the parent's captured workspace and tool environment".into()));
             }
+            isolated = specialization
+                .as_ref()
+                .is_some_and(|persona| persona.isolation_worktree);
+            if isolated && self.permission.is_none() {
+                return Err(ToolError::Msg(
+                    "task: worktree isolation requires permission checks; none are active".into(),
+                ));
+            }
             let input = permission_input(
                 &prompts,
                 agent_type.as_deref(),
                 permission_source.as_deref(),
-                Some(
-                    "write-capable child: eligible write/edit/shell tools; parent's permissions and sandbox; one child at a time",
-                ),
+                Some(if isolated {
+                    "write-capable child in its own git worktree and branch: eligible write/edit/shell tools confined to that worktree (no write access to the parent workspace); parent's permission rules and sandbox; children may run in parallel; the branch is returned for an explicit merge"
+                } else {
+                    "write-capable child: eligible write/edit/shell tools; parent's permissions and sandbox; one child at a time"
+                }),
             );
             check_perm(&self.permission, &self.ask_tx, Self::NAME, &input).await?;
-            limits.max_concurrency = 1;
+            if uses_shared_write_lane(write_mode, isolated) {
+                limits.max_concurrency = 1;
+            }
         }
         self.preflight_persona_tools(specialization.as_ref(), &config)?;
         #[cfg(feature = "hooks")]
@@ -1165,6 +1191,28 @@ editing in a known location, grepping for a literal you will act on immediately.
             authorization
         };
         let lane_workspace = self.workspace.clone();
+        let isolation = if isolated {
+            Some(super::isolation::IsolationPlan {
+                parent_root: self
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.root().to_path_buf())
+                    .ok_or_else(|| {
+                        ToolError::Msg(
+                            "task: worktree isolation requires the parent's captured workspace"
+                                .into(),
+                        )
+                    })?,
+                base_dir: self.isolation_base_dir.clone(),
+                #[cfg(test)]
+                create_gate: None,
+            })
+        } else {
+            None
+        };
+        // An isolated child writes only its own worktree, so it does not
+        // occupy the session's single shared write lane.
+        let lane_write_mode = uses_shared_write_lane(write_mode, isolated);
         // The user's prompt suffix is read once per call, not once per child.
         let suffix: Option<Arc<str>> = crate::session::storage::load_suffix().map(Arc::from);
         let pool_weak = task_pool.as_ref().map(Arc::downgrade);
@@ -1217,6 +1265,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             let suffix = suffix.clone();
             let authorization = authorization.clone();
             let lane_workspace = lane_workspace.clone();
+            let isolation = isolation.clone();
             #[cfg(feature = "skills")]
             let skill_services = skill_services
                 .as_ref()
@@ -1272,6 +1321,21 @@ editing in a known location, grepping for a literal you will act on immediately.
                 #[cfg(not(feature = "hooks"))]
                 let execution_prompt = prompt_text;
 
+                // Isolated child: its own worktree and an authorization bound
+                // to it alone. The guard removes the worktree if this future
+                // is dropped before `finish`.
+                let (isolated_worktree, authorization) = match &isolation {
+                    Some(plan) => match super::isolation::prepare(plan, &authorization).await {
+                        Ok((worktree, authorization)) => (Some(worktree), authorization),
+                        Err(error) => {
+                            return ChildExecution {
+                                output: Err(format!("worktree isolation unavailable: {error}")),
+                                cost_units: 0,
+                            };
+                        }
+                    },
+                    None => (None, authorization),
+                };
                 let model = client.completion_model_with_cache_ttl(
                     model_name,
                     config.cache_ttl.unwrap_or_default(),
@@ -1382,6 +1446,16 @@ editing in a known location, grepping for a literal you will act on immediately.
                     }
                     None => enforce_bounded_report_contract(&response, max_report_bytes),
                 });
+                let output = match isolated_worktree {
+                    Some(worktree) => {
+                        let section = worktree.finish().await.render();
+                        match output {
+                            Ok(text) => Ok(format!("{text}{section}")),
+                            Err(text) => Err(format!("{text}{section}")),
+                        }
+                    }
+                    None => output,
+                };
                 let cost_units = child_budget.used.load(std::sync::atomic::Ordering::Acquire);
                 ChildExecution { output, cost_units }
             });
@@ -1392,7 +1466,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 future,
                 pool_weak.clone(),
                 lane,
-                write_mode,
+                lane_write_mode,
                 lane_workspace,
                 admission_run,
             );
@@ -1445,6 +1519,13 @@ fn merge_forced_continuation_run(
         original.usage = combined_usage;
         original
     }
+}
+
+/// Whether a child takes the session's single shared write lane (and so caps
+/// its batch at one child). Only a write child that shares the parent
+/// workspace does; a worktree-isolated child writes nothing the others see.
+fn uses_shared_write_lane(write_mode: bool, isolated: bool) -> bool {
+    write_mode && !isolated
 }
 
 type ChildFuture = Pin<Box<dyn Future<Output = ChildExecution> + Send>>;
@@ -3454,6 +3535,7 @@ mod tests {
     fn hook_identity_uses_the_resolved_specialist_and_source() {
         let specialization = ResolvedSpecialization {
             write_mode: false,
+            isolation_worktree: false,
             prompt: "review carefully".into(),
             result_notice: None,
             source: "trusted project override /workspace/.zerostack/agents/review.md".into(),
@@ -3476,9 +3558,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_non_isolated_write_children_take_the_shared_write_lane() {
+        assert!(uses_shared_write_lane(true, false));
+        assert!(!uses_shared_write_lane(true, true));
+        assert!(!uses_shared_write_lane(false, false));
+        assert!(!uses_shared_write_lane(false, true));
+    }
+
     fn runtime_specialization() -> ResolvedSpecialization {
         ResolvedSpecialization {
             write_mode: false,
+            isolation_worktree: false,
             prompt: "review carefully".into(),
             result_notice: None,
             source: "compiled-in default".into(),
