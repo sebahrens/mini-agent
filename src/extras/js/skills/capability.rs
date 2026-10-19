@@ -590,7 +590,7 @@ mod effect_error_code_tests {
             EffectErrorCode::AuditFailure,
             EffectErrorCode::OutcomeUnknown,
         ] {
-            let error = encode_effect_result(EffectResult::Error(EffectError { code }))
+            let error = encode_effect_result(EffectResult::Error(EffectError::new(code)))
                 .expect_err("a failed effect must not encode as a value");
             match error {
                 CapabilityError::EffectFailed(observed) => assert_eq!(observed, code),

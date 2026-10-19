@@ -28,7 +28,8 @@ use super::audit::{
     EffectDenial, EffectIntent, SanitizedTarget,
 };
 use super::protocol::{
-    AdvisoryAttribution, EffectError, EffectErrorCode, EffectRequest, GrantId, InvocationId,
+    AdvisoryAttribution, DenialReason, EffectError, EffectErrorCode, EffectRequest, GrantId,
+    InvocationId,
 };
 pub(crate) use super::protocol::{EffectOperation, EffectResult};
 #[cfg(feature = "skills")]
@@ -775,6 +776,10 @@ pub(crate) enum HostEffectError {
     IsDirectory,
     #[error("operation target is outside the allowed scope")]
     TargetDenied,
+    #[error("no file roots are configured")]
+    NoConfiguredRoots,
+    #[error("operation target is outside the configured roots")]
+    OutsideRoots,
     #[error("permission policy denies the operation")]
     PermissionDenied,
     #[error("permission prompt timed out")]
@@ -797,7 +802,9 @@ impl HostEffectError {
             Self::InvalidTarget => EffectErrorCode::InvalidTarget,
             Self::NotFound => EffectErrorCode::NotFound,
             Self::IsDirectory => EffectErrorCode::IsDirectory,
-            Self::TargetDenied => EffectErrorCode::Denied,
+            Self::TargetDenied | Self::NoConfiguredRoots | Self::OutsideRoots => {
+                EffectErrorCode::Denied
+            }
             Self::InvocationCancelled => EffectErrorCode::Cancelled,
             Self::AskTimedOut | Self::EffectTimedOut => EffectErrorCode::TimedOut,
             Self::OutputLimit => EffectErrorCode::TooLarge,
@@ -819,9 +826,19 @@ impl HostEffectError {
         }
     }
 
+    fn denial_reason(self) -> Option<DenialReason> {
+        match self {
+            Self::NoConfiguredRoots => Some(DenialReason::NoConfiguredRoots),
+            Self::OutsideRoots => Some(DenialReason::OutsideRoots),
+            Self::PermissionDenied => Some(DenialReason::PermissionDenied),
+            _ => None,
+        }
+    }
+
     fn into_wire_result(self) -> EffectResult {
         EffectResult::Error(EffectError {
             code: self.wire_code(),
+            reason: self.denial_reason(),
         })
     }
 }
@@ -843,9 +860,9 @@ impl From<EffectServiceError> for HostEffectError {
             EffectServiceError::IsDirectory => Self::IsDirectory,
             #[cfg(any(test, feature = "sandbox"))]
             EffectServiceError::TargetDenied => Self::TargetDenied,
-            EffectServiceError::FileNoConfiguredRoots
-            | EffectServiceError::FileInvalidConfiguration
-            | EffectServiceError::FileOutsideConfiguredRoots => Self::TargetDenied,
+            EffectServiceError::FileNoConfiguredRoots => Self::NoConfiguredRoots,
+            EffectServiceError::FileOutsideConfiguredRoots => Self::OutsideRoots,
+            EffectServiceError::FileInvalidConfiguration => Self::TargetDenied,
             EffectServiceError::PermissionDenied | EffectServiceError::DoomLoopDenied => {
                 Self::PermissionDenied
             }
@@ -2389,6 +2406,35 @@ mod closed_effect_error_tests {
             let mapped = HostEffectError::from(service);
             assert_eq!(mapped, host);
             assert_eq!(mapped.wire_code(), wire);
+        }
+    }
+
+    #[test]
+    fn file_root_denials_carry_a_closed_reason_without_changing_the_code() {
+        for (service, reason) in [
+            (
+                EffectServiceError::FileNoConfiguredRoots,
+                Some(DenialReason::NoConfiguredRoots),
+            ),
+            (
+                EffectServiceError::FileOutsideConfiguredRoots,
+                Some(DenialReason::OutsideRoots),
+            ),
+            (
+                EffectServiceError::PermissionDenied,
+                Some(DenialReason::PermissionDenied),
+            ),
+            (EffectServiceError::FileInvalidConfiguration, None),
+            (EffectServiceError::NotFound, None),
+        ] {
+            let result = HostEffectError::from(service).into_wire_result();
+            let EffectResult::Error(error) = result else {
+                panic!("expected an error result");
+            };
+            assert_eq!(error.reason, reason, "{service:?}");
+            if reason.is_some() {
+                assert_eq!(error.code, EffectErrorCode::Denied);
+            }
         }
     }
 }

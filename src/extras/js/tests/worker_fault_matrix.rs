@@ -48,9 +48,7 @@ impl InvocationEffectHandler for MatrixEffects {
         let outcome_unknown = self.outcome_unknown;
         Box::pin(async move {
             if outcome_unknown {
-                EffectResult::Error(EffectError {
-                    code: EffectErrorCode::OutcomeUnknown,
-                })
+                EffectResult::Error(EffectError::new(EffectErrorCode::OutcomeUnknown))
             } else {
                 EffectResult::ReadFile {
                     content: "fixture".into(),

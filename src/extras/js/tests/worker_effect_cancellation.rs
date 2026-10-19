@@ -47,9 +47,7 @@ impl InvocationEffectHandler for CancellationWitness {
             // reaping a process tree, draining a proposal response, or persisting reconciliation.
             tokio::time::sleep(Duration::from_millis(30)).await;
             reconciled.store(true, Ordering::Release);
-            EffectResult::Error(EffectError {
-                code: EffectErrorCode::OutcomeUnknown,
-            })
+            EffectResult::Error(EffectError::new(EffectErrorCode::OutcomeUnknown))
         })
     }
 

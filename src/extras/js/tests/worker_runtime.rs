@@ -4066,6 +4066,7 @@ fn run_scripted_supervisor_worker() -> ! {
                         ParentFrame::EffectResponse(EffectResponse {
                             result: EffectResult::Error(EffectError {
                                 code: EffectErrorCode::OutcomeUnknown,
+                                ..
                             }),
                             ..
                         })

@@ -150,9 +150,9 @@ fn outcome_unknown_response(sequence: u64, ordinal: u32) -> ParentWireFrame {
         sequence,
         ParentFrame::EffectResponse(EffectResponse {
             effect_ordinal: ordinal,
-            result: EffectResult::Error(crate::extras::js::protocol::EffectError {
-                code: crate::extras::js::protocol::EffectErrorCode::OutcomeUnknown,
-            }),
+            result: EffectResult::Error(crate::extras::js::protocol::EffectError::new(
+                crate::extras::js::protocol::EffectErrorCode::OutcomeUnknown,
+            )),
         }),
     )
 }
@@ -981,7 +981,7 @@ fn worker_protocol_v6_effect_error_codes_are_closed_and_source_free() {
         (EffectErrorCode::Denied, r#"{"code":"denied"}"#),
         (EffectErrorCode::TooLarge, r#"{"code":"too_large"}"#),
     ] {
-        let error = EffectError { code };
+        let error = EffectError::new(code);
         assert_eq!(serde_json::to_string(&error).unwrap(), encoded);
         assert_eq!(serde_json::from_str::<EffectError>(encoded).unwrap(), error);
     }
