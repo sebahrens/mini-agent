@@ -3647,3 +3647,72 @@ async fn usd_budget_js_broker_denies_before_preparation_and_after_late_approval_
         assert!(!ledger_root.path().join("tmp/NEVER").exists());
     }
 }
+
+#[cfg(all(unix, feature = "skills"))]
+mod program_hash_memoization {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+    use crate::extras::js::broker::{ProgramHashCache, resolve_program_identity_with_cache};
+
+    fn leaked_cache() -> &'static ProgramHashCache {
+        // Zero racy window: freshly written fixtures are eligible for memoization.
+        Box::leak(Box::new(ProgramHashCache::new(Duration::ZERO)))
+    }
+
+    fn script(directory: &AuditTempRoot, body: &str) -> String {
+        let path = directory.0.join("memoized-command");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn two_grants_of_an_unchanged_program_hash_once() {
+        let directory = AuditTempRoot::new("hash-memo-unchanged");
+        let program = script(&directory, "#!/bin/sh\nprintf original");
+        let cache = leaked_cache();
+        let first = resolve_program_identity_with_cache(&program, cache).unwrap();
+        let second = resolve_program_identity_with_cache(&program, cache).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(cache.hash_count(), 1, "unchanged program hashes once");
+        assert_eq!(first, resolve_program_identity(&program).unwrap());
+    }
+
+    #[test]
+    fn modified_program_is_rehashed_and_content_change_is_rejected() {
+        let directory = AuditTempRoot::new("hash-memo-modified");
+        let program = script(&directory, "#!/bin/sh\nprintf original");
+        let cache = leaked_cache();
+        let original = resolve_program_identity_with_cache(&program, cache).unwrap();
+
+        // Same length, different bytes: only mtime/ctime distinguish the file.
+        std::thread::sleep(Duration::from_millis(30));
+        std::fs::write(&program, "#!/bin/sh\nprintf replaced").unwrap();
+        let replaced = resolve_program_identity_with_cache(&program, cache).unwrap();
+        assert_eq!(cache.hash_count(), 2, "changed fingerprint forces a rehash");
+        assert_ne!(original, replaced, "identity must bind the new content");
+
+        // Different length.
+        std::thread::sleep(Duration::from_millis(30));
+        std::fs::write(&program, "#!/bin/sh\nprintf a-longer-replacement").unwrap();
+        let longer = resolve_program_identity_with_cache(&program, cache).unwrap();
+        assert_eq!(cache.hash_count(), 3);
+        assert_ne!(replaced, longer);
+    }
+
+    #[test]
+    fn recently_modified_program_is_not_memoized() {
+        let directory = AuditTempRoot::new("hash-memo-racy");
+        let program = script(&directory, "#!/bin/sh\nprintf original");
+        let cache: &'static ProgramHashCache =
+            Box::leak(Box::new(ProgramHashCache::new(Duration::from_secs(3600))));
+        resolve_program_identity_with_cache(&program, cache).unwrap();
+        resolve_program_identity_with_cache(&program, cache).unwrap();
+        assert_eq!(
+            cache.hash_count(),
+            2,
+            "racy-window files are always rehashed"
+        );
+    }
+}
