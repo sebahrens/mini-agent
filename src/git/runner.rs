@@ -89,6 +89,9 @@ fn repository_mutation_lock(repository_key: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
+/// `PATH` string and its canonical absolute entries.
+type PathEntryCache = Arc<std::sync::Mutex<Option<(OsString, Arc<Vec<PathBuf>>)>>>;
+
 #[derive(Clone)]
 pub(crate) struct GitRunner {
     program: Arc<PathBuf>,
@@ -106,7 +109,7 @@ pub(crate) struct GitRunner {
     /// Canonical absolute `PATH` entries, keyed by the `PATH` string they were
     /// resolved from. Disjointness from model-writable roots is still checked
     /// on every command.
-    path_entries: Arc<std::sync::Mutex<Option<(OsString, Arc<Vec<PathBuf>>)>>>,
+    path_entries: PathEntryCache,
     #[cfg(test)]
     path_canonicalizations: Arc<std::sync::atomic::AtomicUsize>,
 }
