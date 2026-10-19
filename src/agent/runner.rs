@@ -1904,7 +1904,7 @@ struct RequestShell<'a, S> {
     model: &'a Option<String>,
     preamble: &'a Option<String>,
     documents: &'a Vec<rig::completion::Document>,
-    tools: &'a Vec<rig::completion::ToolDefinition>,
+    tools: &'a Vec<std::sync::Arc<rig::completion::ToolDefinition>>,
     temperature: &'a Option<f64>,
     max_tokens: &'a Option<u64>,
     tool_choice: &'a Option<rig::message::ToolChoice>,
