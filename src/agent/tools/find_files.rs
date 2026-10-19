@@ -651,6 +651,7 @@ mod bound_platform {
 
 pub(crate) struct BoundFile {
     pub(crate) path: PathBuf,
+    #[cfg_attr(not(feature = "js"), allow(dead_code))]
     pub(crate) file_name: OsString,
     pub(crate) file: File,
     pub(crate) metadata: std::fs::Metadata,
@@ -706,6 +707,7 @@ static PARENT_IGNORE_CACHE: LazyLock<Mutex<HashMap<PathBuf, ParentIgnoreCacheEnt
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl BoundDirectory {
+    #[cfg_attr(not(feature = "js"), allow(dead_code))]
     pub(crate) fn approved_root(&self) -> &Path {
         &self.approved_root
     }
@@ -1359,9 +1361,9 @@ struct GlobalIgnoreCacheEntry {
 type GlobalIgnoreCache = Mutex<HashMap<PathBuf, GlobalIgnoreCacheEntry>>;
 static GLOBAL_IGNORE_CACHE: LazyLock<GlobalIgnoreCache> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static ROOT_EXCLUDE_CACHE: LazyLock<
-    Mutex<HashMap<PathBuf, (IgnoreSourceStamp, Option<Gitignore>)>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+type RootExcludeCache = Mutex<HashMap<PathBuf, (IgnoreSourceStamp, Option<Gitignore>)>>;
+static ROOT_EXCLUDE_CACHE: LazyLock<RootExcludeCache> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn global_ignore_env() -> Vec<Option<std::ffi::OsString>> {
     [
