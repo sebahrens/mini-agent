@@ -942,11 +942,25 @@ impl InputEditor {
                 && data.chars().all(|c| !c.is_control())
         });
         if picker_accepts_query {
-            for (i, c) in data.char_indices() {
+            let mut rest: &str = &data;
+            // The text before the first space extends an open file query as
+            // one edit, so the cache is scanned once rather than per char.
+            if let Some(Picker::File(picker)) = self.picker.as_mut()
+                && picker.active
+            {
+                let split = rest.find(' ').unwrap_or(rest.len());
+                if split > 0 {
+                    picker.push_query_str(&rest[..split]);
+                    self.buffer.insert_str(self.cursor, &rest[..split]);
+                    self.cursor += split;
+                    rest = &rest[split..];
+                }
+            }
+            for (i, c) in rest.char_indices() {
                 if !self.picker.as_ref().is_some_and(Picker::active) {
                     // A space closes the file picker; the rest is plain text.
-                    self.buffer.insert_str(self.cursor, &data[i..]);
-                    self.cursor += data.len() - i;
+                    self.buffer.insert_str(self.cursor, &rest[i..]);
+                    self.cursor += rest.len() - i;
                     break;
                 }
                 let handled =
@@ -2025,6 +2039,21 @@ mod skill_completion_tests {
 #[cfg(test)]
 mod busy67_editor_tests {
     use super::*;
+    #[test]
+    fn pasting_into_an_open_file_picker_extends_the_query_in_one_edit() {
+        let mut editor = InputEditor::new();
+        editor.handle_paste("see @".into());
+        assert!(matches!(editor.picker, Some(Picker::File(_))));
+        crate::ui::pickers::file::take_filter_counts();
+        editor.handle_paste("src/ui tail".into());
+        let (_, rescans) = crate::ui::pickers::file::take_filter_counts();
+        // One rescan for the pasted path; the space then closes the picker
+        // and the rest is plain text.
+        assert_eq!(rescans, 1);
+        assert_eq!(editor.buffer, "see @src/ui tail");
+        assert_eq!(editor.cursor, editor.buffer.len());
+        assert!(editor.picker.as_ref().is_none_or(|p| !p.active()));
+    }
     #[test]
     fn empty_question_is_host_help_but_nonempty_and_paste_are_literal() {
         let mut editor = InputEditor::new();

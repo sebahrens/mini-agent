@@ -50,9 +50,61 @@ mod mcp_resource_tests {
 /// Matches kept per query; the overlay draws at most ten of them.
 const MAX_MATCHES: usize = 50;
 
+/// A finished walk younger than this is reused as is when the picker
+/// reopens for the same root.
+const WALK_REUSE_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+/// A finished walk up to this old is shown at once while a background walk
+/// refreshes it; an older one is dropped and the picker walks from scratch.
+const WALK_REUSE_STALE: std::time::Duration = std::time::Duration::from_secs(600);
+/// Walk results kept, one per root.
+const WALK_SNAPSHOTS: usize = 4;
+
+/// The last completed walk of a root: names only, no filesystem authority.
+struct WalkSnapshot {
+    root: PathBuf,
+    finished: std::time::Instant,
+    entries: Vec<CacheEntry>,
+}
+
+static WALK_SNAPSHOT_CACHE: std::sync::Mutex<Vec<WalkSnapshot>> = std::sync::Mutex::new(Vec::new());
+
+/// The root a walk of `workspace` covers; the process directory without one.
+fn walk_root(workspace: Option<&crate::paths::WorkspaceBinding>) -> PathBuf {
+    match workspace {
+        Some(workspace) => workspace.root().to_path_buf(),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
+/// The remembered walk of `root` and how long ago it finished.
+fn cached_walk(root: &Path) -> Option<(Vec<CacheEntry>, std::time::Duration)> {
+    let cache = WALK_SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let snapshot = cache.iter().find(|snapshot| snapshot.root == root)?;
+    let age = snapshot.finished.elapsed();
+    (age <= WALK_REUSE_STALE).then(|| (snapshot.entries.clone(), age))
+}
+
+fn remember_walk(root: PathBuf, entries: Vec<CacheEntry>) {
+    let mut cache = WALK_SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.retain(|snapshot| snapshot.root != root);
+    if cache.len() >= WALK_SNAPSHOTS {
+        cache.remove(0);
+    }
+    cache.push(WalkSnapshot {
+        root,
+        finished: std::time::Instant::now(),
+        entries,
+    });
+}
+
 /// One walked (or virtual) entry. The lowercase form and the directory flag
 /// are computed once, in the walk thread, so filtering is an allocation-free
 /// `contains` and drawing never touches the filesystem.
+#[derive(Clone)]
 pub(crate) struct CacheEntry {
     path: PathBuf,
     lower: String,
@@ -107,6 +159,17 @@ pub(crate) fn take_filter_counts() -> (usize, usize) {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Test-only: directory walks started by pickers on this thread.
+    static WALKS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_walks_started() -> usize {
+    WALKS_STARTED.with(|walks| walks.replace(0))
+}
+
+#[cfg(test)]
 fn count_filter(scanned: usize, rescan: bool) {
     FILTER_COUNTS.with(|counts| {
         let (entries, rescans) = counts.get();
@@ -138,6 +201,11 @@ pub struct FilePicker {
     walk_rx: Option<mpsc::Receiver<Vec<CacheEntry>>>,
     walk_cancel: Arc<AtomicBool>,
     walk_workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+    /// Set by the walk thread when it ran to the end (not cancelled).
+    walk_complete: Arc<AtomicBool>,
+    /// While a remembered list is on screen, the background walk that will
+    /// replace it collects here; it swaps in when the walk completes.
+    refresh: Option<Vec<CacheEntry>>,
 }
 
 impl FilePicker {
@@ -160,6 +228,8 @@ impl FilePicker {
             walk_rx: None,
             walk_cancel: Arc::new(AtomicBool::new(false)),
             walk_workspace: None,
+            walk_complete: Arc::new(AtomicBool::new(false)),
+            refresh: None,
         }
     }
 
@@ -256,6 +326,7 @@ impl FilePicker {
         self.file_cache.clear();
         self.virtual_len = 0;
         self.loading = false;
+        self.refresh = None;
         self.walk_workspace = workspace.clone();
         if require_binding
             && workspace
@@ -266,20 +337,44 @@ impl FilePicker {
         }
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // A walk of this root finished recently: show it at once instead
+            // of walking again, and only refresh it in the background when
+            // it is no longer fresh.
+            let root = walk_root(workspace.as_deref());
+            if let Some((entries, age)) = cached_walk(&root) {
+                self.file_cache = entries;
+                self.filter();
+                if age <= WALK_REUSE_FRESH {
+                    return;
+                }
+                self.refresh = Some(Vec::new());
+            }
+            #[cfg(test)]
+            WALKS_STARTED.with(|walks| walks.set(walks.get() + 1));
             self.loading = true;
             self.walk_cancel = Arc::new(AtomicBool::new(false));
+            self.walk_complete = Arc::new(AtomicBool::new(false));
             let cancel = self.walk_cancel.clone();
+            let complete = self.walk_complete.clone();
             let (tx, rx) = mpsc::channel();
             self.walk_rx = Some(rx);
             handle.spawn_blocking(move || {
-                if let Some(workspace) = workspace {
-                    if workspace.validate().is_ok() {
-                        walk_entries_streaming(workspace.root(), &cancel, |batch| {
+                let mut all = Vec::new();
+                let finished = if let Some(workspace) = workspace {
+                    workspace.validate().is_ok()
+                        && walk_entries_streaming(workspace.root(), &cancel, |batch| {
+                            all.extend(batch.iter().cloned());
                             workspace.validate().is_ok() && tx.send(batch).is_ok()
-                        });
-                    }
+                        })
                 } else {
-                    walk_entries_streaming(Path::new("."), &cancel, |batch| tx.send(batch).is_ok());
+                    walk_entries_streaming(Path::new("."), &cancel, |batch| {
+                        all.extend(batch.iter().cloned());
+                        tx.send(batch).is_ok()
+                    })
+                };
+                if finished {
+                    remember_walk(root, all);
+                    complete.store(true, Ordering::Release);
                 }
             });
         } else {
@@ -317,6 +412,7 @@ impl FilePicker {
         self.walk_cancel.store(true, Ordering::Relaxed);
         self.walk_rx = None;
         self.loading = false;
+        self.refresh = None;
     }
 
     /// Whether the background walk is still streaming paths.
@@ -355,8 +451,12 @@ impl FilePicker {
             loop {
                 match rx.try_recv() {
                     Ok(batch) => {
-                        self.file_cache.extend(batch);
-                        changed = true;
+                        if let Some(fresh) = &mut self.refresh {
+                            fresh.extend(batch);
+                        } else {
+                            self.file_cache.extend(batch);
+                            changed = true;
+                        }
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -369,6 +469,15 @@ impl FilePicker {
         if done {
             self.loading = false;
             self.walk_rx = None;
+            if let Some(fresh) = self.refresh.take()
+                && self.walk_complete.load(Ordering::Acquire)
+            {
+                // The remembered list gives way to the finished walk.
+                self.file_cache.truncate(self.virtual_len);
+                self.file_cache.extend(fresh);
+                self.filter();
+                return true;
+            }
         }
         if changed {
             // Only the new entries can add matches: everything before them
@@ -388,6 +497,23 @@ impl FilePicker {
         self.query.insert(byte_pos, c);
         self.cursor += 1;
         // Filter even while the walk is streaming so matches update live.
+        self.filter();
+    }
+
+    /// Insert `text` at the query cursor as one edit: the cache is scanned
+    /// once for the result, which equals typing the characters one by one.
+    pub(crate) fn push_query_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let byte_pos = self
+            .query
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.query.len());
+        self.query.insert_str(byte_pos, text);
+        self.cursor += text.chars().count();
         self.filter();
     }
 
@@ -550,7 +676,7 @@ pub(crate) fn walk_files_streaming(
     cancel: &AtomicBool,
     mut emit: impl FnMut(Vec<PathBuf>) -> bool,
 ) {
-    walk_entries_streaming(Path::new(root), cancel, |batch| {
+    let _ = walk_entries_streaming(Path::new(root), cancel, |batch| {
         emit(batch.into_iter().map(|entry| entry.path).collect())
     });
 }
@@ -562,7 +688,7 @@ fn walk_entries_streaming(
     root: &Path,
     cancel: &AtomicBool,
     mut emit: impl FnMut(Vec<CacheEntry>) -> bool,
-) {
+) -> bool {
     let walker = ignore::WalkBuilder::new(root)
         // Dot-entries are pruned by `filter_entry` below so the walker never
         // descends into `.git`; the built-in hidden filter is equivalent but
@@ -579,7 +705,7 @@ fn walk_entries_streaming(
     let mut entries = 0usize;
     for entry in walker.flatten() {
         if cancel.load(Ordering::Relaxed) {
-            return;
+            return false;
         }
         if entry.depth() == 0 {
             continue;
@@ -607,15 +733,13 @@ fn walk_entries_streaming(
             files += 1;
         }
         if batch.len() >= WALK_BATCH_SIZE && !emit(std::mem::take(&mut batch)) {
-            return;
+            return false;
         }
         if files >= MAX_WALK_FILES || entries >= MAX_WALK_ENTRIES {
             break;
         }
     }
-    if !batch.is_empty() {
-        let _ = emit(batch);
-    }
+    batch.is_empty() || emit(batch)
 }
 
 /// Collect the full walk into a `Vec` (used by the synchronous fallback and
@@ -666,6 +790,82 @@ mod cache_tests {
         picker.char_input('9');
         picker.char_input('9');
         assert_eq!(picker.matches, naive_matches(&paths, "e_1999"));
+    }
+
+    async fn finish_walk(picker: &mut FilePicker) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while picker.is_loading() {
+                picker.try_finish_loading();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("walk finishes");
+    }
+
+    #[test]
+    fn a_pasted_query_scans_the_cache_once_and_matches_typing_it() {
+        let paths: Vec<PathBuf> = (0..1_000)
+            .map(|index| PathBuf::from(format!("Dir{}/File_{index}.RS", index % 37)))
+            .collect();
+        let pasted = "dir3/file_3";
+        let mut typed = FilePicker::new();
+        typed.test_set_cache(paths.clone());
+        for c in pasted.chars() {
+            typed.char_input(c);
+        }
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(paths);
+        take_filter_counts();
+        picker.push_query_str("dir3/");
+        picker.push_query_str(&pasted["dir3/".len()..]);
+        let (_, rescans) = take_filter_counts();
+        assert_eq!(rescans, 2, "one rescan per pasted segment");
+        assert_eq!(picker.query, typed.query);
+        assert_eq!(picker.cursor, typed.cursor);
+        assert_eq!(picker.matches, typed.matches);
+        assert!(!picker.matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reopening_for_the_same_root_reuses_the_finished_walk() {
+        let root = crate::tests::OwnedTestDirectory::new("file-picker-walk-reuse");
+        std::fs::write(root.path().join("first.txt"), "").unwrap();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        take_walks_started();
+        let mut first = FilePicker::new();
+        first.activate_for_add(Some(binding.clone()));
+        finish_walk(&mut first).await;
+        // The walk thread publishes its snapshot as it exits.
+        while !first.walk_complete.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(take_walks_started(), 1);
+
+        let mut second = FilePicker::new();
+        second.activate_for_add(Some(binding.clone()));
+        assert_eq!(take_walks_started(), 0, "a fresh walk is reused");
+        assert!(!second.is_loading());
+        second.set_add_argument(5, "first");
+        assert_eq!(second.matches, vec![PathBuf::from("first.txt")]);
+
+        // Past the fresh window the list shows at once and a background walk
+        // replaces it.
+        {
+            let mut cache = WALK_SNAPSHOT_CACHE.lock().unwrap();
+            let snapshot = cache.iter_mut().find(|s| s.root == binding.root()).unwrap();
+            snapshot.finished -= WALK_REUSE_FRESH + std::time::Duration::from_secs(1);
+        }
+        std::fs::write(root.path().join("second.txt"), "").unwrap();
+        let mut third = FilePicker::new();
+        third.activate_for_add(Some(binding));
+        assert_eq!(take_walks_started(), 1);
+        assert!(third.is_loading());
+        third.set_add_argument(5, "first");
+        assert_eq!(third.matches, vec![PathBuf::from("first.txt")]);
+        finish_walk(&mut third).await;
+        third.set_add_argument(5, "second");
+        assert_eq!(third.matches, vec![PathBuf::from("second.txt")]);
     }
 
     #[tokio::test]
