@@ -348,7 +348,7 @@ fn task_outcome_is_ordered_after_invocations_and_ignores_uninvoked_skills() {
 #[test]
 fn compaction_check_is_read_only_and_reports_work_only_for_expired_events() {
     let (root, mut store, skill) = fixture();
-    let mut retention = RetentionService::new(&mut store);
+    let retention = RetentionService::new(&mut store);
     assert!(!retention.has_expired_work(1_000).unwrap(), "empty store");
     TelemetryIngestor::new(&mut store)
         .ingest(&selected_batch(&skill, "turn-recent"))
