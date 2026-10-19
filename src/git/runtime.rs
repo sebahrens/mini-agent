@@ -126,7 +126,20 @@ static MODEL_ROOTS: OnceLock<Mutex<ModelRoots>> = OnceLock::new();
 
 /// Existing Sandbox clones retain the actual root through owned process
 /// retirement. Weak accounting never keeps a retired Windows directory locked.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
 pub(crate) fn record_model_root(root: &Arc<crate::paths::WorkspaceBinding>) -> Result<(), String> {
+    record_model_roots(&[(root, false)])
+}
+
+/// [`record_model_root`] for every root of one launch under a single lock
+/// acquisition. Each retained runtime and trusted program binding is validated
+/// once for the whole batch instead of once per root. A root flagged
+/// `validated` was identity-checked by the caller immediately before this
+/// call, so its own binding is not validated a second time; the runtime and
+/// program checks, disjointness and the refusal latch apply to every root.
+pub(crate) fn record_model_roots(
+    roots: &[(&Arc<crate::paths::WorkspaceBinding>, bool)],
+) -> Result<(), String> {
     let mut state = MODEL_ROOTS
         .get_or_init(Mutex::default)
         .lock()
@@ -134,32 +147,43 @@ pub(crate) fn record_model_root(root: &Arc<crate::paths::WorkspaceBinding>) -> R
     state.roots.retain(|root| root.strong_count() > 0);
     state.runtimes.retain(|root| root.strong_count() > 0);
     state.programs.retain(|program| program.strong_count() > 0);
-    if root.validate().is_err() || state.refused {
-        state.refused = true;
-        return Err("guarded Git model-root authority changed".into());
+    for (root, validated) in roots {
+        if (!validated && root.validate().is_err()) || state.refused {
+            state.refused = true;
+            return Err("guarded Git model-root authority changed".into());
+        }
     }
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let root_paths = roots
+        .iter()
+        .map(|(root, _)| root.root().to_path_buf())
+        .collect::<Vec<_>>();
     for runtime in state.runtimes.iter().filter_map(Weak::upgrade) {
         runtime.validate()?;
-        require_disjoint(runtime.root(), &[root.root().to_path_buf()])?;
+        require_disjoint(runtime.root(), &root_paths)?;
     }
     for program in state.programs.iter().filter_map(Weak::upgrade) {
         program.validate()?;
-        require_disjoint(&program.path, &[root.root().to_path_buf()])?;
-        require_disjoint(&program.target, &[root.root().to_path_buf()])?;
+        require_disjoint(&program.path, &root_paths)?;
+        require_disjoint(&program.target, &root_paths)?;
     }
-    if state
-        .roots
-        .iter()
-        .filter_map(Weak::upgrade)
-        .any(|old| Arc::ptr_eq(&old, root))
-    {
-        return Ok(());
+    for (root, _) in roots {
+        if state
+            .roots
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|old| Arc::ptr_eq(&old, root))
+        {
+            continue;
+        }
+        if state.roots.len() >= MAX_ROOTS {
+            state.refused = true;
+            return Err("guarded Git model-root count exceeds its bound".into());
+        }
+        state.roots.push(Arc::downgrade(root));
     }
-    if state.roots.len() >= MAX_ROOTS {
-        state.refused = true;
-        return Err("guarded Git model-root count exceeds its bound".into());
-    }
-    state.roots.push(Arc::downgrade(root));
     Ok(())
 }
 

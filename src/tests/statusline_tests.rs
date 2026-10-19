@@ -864,6 +864,31 @@ fn busy67_numeric_progress_is_sticky_and_invalidates_cached_status() {
 }
 
 #[test]
+fn sandbox_label_reads_configuration_without_evaluating_policy() {
+    use crate::sandbox::{Sandbox, SandboxProfile};
+    let contained = Sandbox::new(true, "bwrap");
+    assert_eq!(statusline::sandbox_label(&contained), None);
+    let host_read = Sandbox::new(true, "bwrap").with_general_profile(
+        SandboxProfile::HostRead,
+        Vec::new(),
+        Vec::new(),
+    );
+    assert_eq!(
+        statusline::sandbox_label(&host_read),
+        Some("sandbox:host-read")
+    );
+    // A disabled sandbox never reports a host profile.
+    assert_eq!(
+        statusline::sandbox_label(&Sandbox::new(false, "bwrap").with_general_profile(
+            SandboxProfile::HostFull,
+            Vec::new(),
+            Vec::new(),
+        )),
+        None
+    );
+}
+
+#[test]
 fn profile100_host_full_is_a_persistent_red_status_segment() {
     let sandbox = crate::sandbox::Sandbox::new(true, "bwrap").with_general_profile(
         crate::sandbox::SandboxProfile::HostFull,

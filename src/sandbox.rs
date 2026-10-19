@@ -92,6 +92,46 @@ struct SeatbeltRootInputs {
 struct SeatbeltPrivateInputs {
     private_read_denies: String,
     namespace: SeatbeltNamespaceDenies,
+    /// Rendered denials for the last protected Git storage set. The set is
+    /// still produced (and its bindings validated) on every launch; only the
+    /// canonicalizing render is reused while the set is unchanged.
+    protected: Mutex<Option<(Vec<PathBuf>, Arc<SeatbeltProtectedDenies>)>>,
+}
+
+/// Seatbelt denials derived only from a protected storage path set.
+#[derive(Debug)]
+struct SeatbeltProtectedDenies {
+    storage: String,
+    namespace: String,
+}
+
+impl SeatbeltPrivateInputs {
+    fn protected_denies(
+        &self,
+        protected: &[PathBuf],
+    ) -> Result<Arc<SeatbeltProtectedDenies>, String> {
+        let mut cached = self
+            .protected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((paths, denies)) = cached.as_ref()
+            && paths.as_slice() == protected
+        {
+            return Ok(denies.clone());
+        }
+        #[cfg(test)]
+        PROTECTED_DENY_RENDERS.with(|count| count.set(count.get() + 1));
+        let storage = seatbelt_private_read_denies(
+            &protected
+                .iter()
+                .map(|path| (path.as_path(), "protected Git storage"))
+                .collect::<Vec<_>>(),
+        )?;
+        let namespace = self.namespace.rendered_with(protected)?;
+        let denies = Arc::new(SeatbeltProtectedDenies { storage, namespace });
+        *cached = Some((protected.to_vec(), denies.clone()));
+        Ok(denies)
+    }
 }
 
 /// Ordered, de-duplicated `(literal ...)` namespace denials.
@@ -146,6 +186,8 @@ fn extend_namespace_denies(
 
 #[cfg(test)]
 thread_local! {
+    /// Protected-storage Seatbelt renders performed by this thread (test probe).
+    static PROTECTED_DENY_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Explicit-root captures performed by this thread (test probe).
     static GENERAL_ROOT_CAPTURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1344,27 +1386,75 @@ fn probe_seatbelt() -> bool {
 /// Run a backend probe for at most three seconds. A probe that exits unsuccessfully returns its
 /// stderr pipe (when the command piped one) so the caller can classify the failure; a spawn
 /// failure or timeout returns `Err(None)`.
+///
+/// A helper thread blocks in `wait()` and reports the status over a channel, so a probe that
+/// finishes in a few milliseconds is observed immediately rather than at the next poll tick. On
+/// timeout the child is killed and the helper reaps it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(unsafe_code)]
 fn bounded_backend_probe(
     mut command: std::process::Command,
 ) -> Result<(), Option<std::process::ChildStderr>> {
+    const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
     let Ok(mut child) = command.spawn_guarded() else {
         return Err(None);
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(_)) => return Err(child.stderr.take()),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+    let stderr = child.stderr.take();
+    let Ok(pid) = i32::try_from(child.id()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(None);
+    };
+    let reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter_reaped = reaped.clone();
+    let waiter = std::thread::Builder::new()
+        .name("sandbox-backend-probe".into())
+        .spawn(move || {
+            let status = child.wait();
+            waiter_reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = done_tx.send(status);
+        });
+    if waiter.is_err() {
+        // The child moved into the failed closure; stop it so it cannot linger.
+        // SAFETY: `pid` names the unreaped child spawned above.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        return Err(None);
+    }
+    match done_rx.recv_timeout(PROBE_BUDGET) {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(_)) => Err(stderr),
+        Ok(Err(_)) => Err(None),
+        Err(_) => {
+            if !reaped.load(std::sync::atomic::Ordering::SeqCst) {
+                // SAFETY: the helper has not reaped the child, so `pid` is
+                // still this probe's process; it reaps the killed child.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
             }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(None);
-            }
+            Err(None)
         }
+    }
+}
+
+/// Start the host backend availability probe on a background thread so its
+/// process spawn overlaps the rest of startup. [`Sandbox::policy`] joins the
+/// same one-time cache on first use, so the probe still runs exactly once and
+/// every availability decision is unchanged; only its latency moves off the
+/// startup path.
+pub(crate) fn begin_backend_probe(backend: &str) {
+    let probe: Option<fn() -> bool> = match backend {
+        #[cfg(target_os = "macos")]
+        "seatbelt" => Some(seatbelt_exists),
+        #[cfg(target_os = "linux")]
+        "bwrap" => Some(bwrap_exists),
+        _ => None,
+    };
+    if let Some(probe) = probe {
+        let _ = std::thread::Builder::new()
+            .name("sandbox-backend-prewarm".into())
+            .spawn(move || {
+                probe();
+            });
     }
 }
 
@@ -1854,32 +1944,53 @@ impl Sandbox {
             .git_write_roots
             .lock()
             .map_err(|_| "sandbox Git write-root authority is unavailable")?;
+        // Bindings are recorded as one batch so the retained Git runtime and
+        // program bindings are validated once per launch, not per candidate.
+        // `true` marks a binding whose identity was checked a moment ago in
+        // this launch (a retained binding, a freshly captured one, or one
+        // validated by `general_roots`).
+        let mut recorded: Vec<(Arc<crate::paths::WorkspaceBinding>, bool)> = Vec::new();
+        let mut added: Vec<Arc<crate::paths::WorkspaceBinding>> = Vec::new();
         for (canonical, resolved) in candidates {
             if let Some(old) = retained.iter().find(|old| old.root() == canonical) {
                 old.validate()?;
-                crate::git::runtime::record_model_root(old)?;
+                recorded.push((old.clone(), true));
                 continue;
             }
-            if retained.len() >= 256 {
+            if added.iter().any(|new| new.root() == canonical) {
+                // Same root twice in one launch (for example an explicit
+                // write root equal to the workspace): already in the batch.
+                continue;
+            }
+            if retained.len() + added.len() >= 256 {
                 return Err("sandbox Git write-root count exceeds its bound".into());
             }
-            let binding = if let Some(workspace) = self
+            let (binding, validated) = if let Some(workspace) = self
                 .workspace_binding
                 .as_ref()
                 .filter(|root| root.root() == canonical)
             {
-                workspace.clone()
+                (workspace.clone(), false)
             } else if let Some(resolved) = resolved {
-                resolved.clone()
+                (resolved.clone(), true)
             } else {
-                Arc::new(
-                    crate::paths::WorkspaceBinding::capture(&canonical)
-                        .map_err(|_| "sandbox Git write-root authority cannot be retained")?,
+                (
+                    Arc::new(
+                        crate::paths::WorkspaceBinding::capture(&canonical)
+                            .map_err(|_| "sandbox Git write-root authority cannot be retained")?,
+                    ),
+                    true,
                 )
             };
-            crate::git::runtime::record_model_root(&binding)?;
-            retained.push(binding);
+            added.push(binding.clone());
+            recorded.push((binding, validated));
         }
+        let batch = recorded
+            .iter()
+            .map(|(binding, validated)| (binding, *validated))
+            .collect::<Vec<_>>();
+        crate::git::runtime::record_model_roots(&batch)?;
+        retained.extend(added);
         if self.profile == SandboxProfile::HostFull {
             let owner = retained
                 .first()
@@ -1940,6 +2051,7 @@ impl Sandbox {
         let inputs = Arc::new(SeatbeltPrivateInputs {
             private_read_denies,
             namespace,
+            protected: Mutex::new(None),
         });
         *cached = Some(inputs.clone());
         Ok(inputs)
@@ -2101,6 +2213,9 @@ impl Sandbox {
         // Admitted commands retain the old lease independently. An idle
         // session switch must not keep a retired host-full domain alive.
         candidate.git_write_roots = Arc::new(Mutex::new(Vec::new()));
+        // Home-mount grants depend on the profile, so resolved roots captured
+        // under the previous profile must not be reused.
+        candidate.cached_general_roots = Arc::new(Mutex::new(Vec::new()));
         if !candidate.profile_supported() {
             return Err("this backend cannot enforce the selected filesystem profile".into());
         }
@@ -2449,6 +2564,24 @@ impl Sandbox {
         self
     }
 
+    /// Whether OS containment was requested. [`Self::policy`] is `Disabled`
+    /// exactly when this is false, so UI code that only needs that fact does
+    /// not run the backend and mask checks `policy` performs.
+    pub(crate) fn containment_requested(&self) -> bool {
+        self.enabled
+    }
+
+    /// Whether the default sandbox degraded to unsandboxed explicit shells;
+    /// equivalent to `explicit_shell_boundary()` being
+    /// `UnavailableDefaultFallback` without evaluating the policy.
+    pub(crate) fn is_unavailable_default_fallback(&self) -> bool {
+        !self.enabled
+            && matches!(
+                self.disabled_reason,
+                DisabledSandboxReason::UnavailableDefaultFallback
+            )
+    }
+
     pub(crate) fn explicit_shell_boundary(&self) -> ExplicitShellBoundary {
         match self.policy() {
             SandboxPolicy::Disabled => match self.disabled_reason {
@@ -2718,7 +2851,7 @@ impl Sandbox {
         // (fixed per Sandbox) and strings derived from validated roots are
         // reused.
         #[cfg(target_os = "macos")]
-        git_metadata::validate_workspace_aliases(workspace)?;
+        let validated_metadata = git_metadata::validate_workspace_aliases(workspace)?;
         let workspace_str = seatbelt_string_literal(workspace, "working directory")?;
         let cache_str = seatbelt_string_literal(cache, "application cache")?;
         let app_paths = crate::paths::process_paths().map_err(|error| {
@@ -2727,15 +2860,16 @@ impl Sandbox {
         let private = self.seatbelt_private_inputs()?;
         let private_read_denies = &private.private_read_denies;
         // Recomputed per launch: the workspace may gain or relink a `.git`.
+        // On macOS this reuses the layout the alias validation just
+        // discovered for this same launch.
+        #[cfg(target_os = "macos")]
+        let git_write_denies = validated_metadata.seatbelt_write_denies(workspace);
+        #[cfg(not(target_os = "macos"))]
         let git_write_denies = git_metadata::seatbelt_write_denies(workspace);
         let mut protected = crate::git::runtime::protected_runtime_paths()?;
         protected.push(app_paths.cache_dir);
-        let protected_storage = seatbelt_private_read_denies(
-            &protected
-                .iter()
-                .map(|path| (path.as_path(), "protected Git storage"))
-                .collect::<Vec<_>>(),
-        )?;
+        let protected_denies = private.protected_denies(&protected)?;
+        let protected_storage = &protected_denies.storage;
         let roots = self.general_roots(workspace)?;
         let root_inputs =
             seatbelt_root_inputs(&roots, workspace, cache, &workspace_str, &cache_str)?;
@@ -2744,7 +2878,7 @@ impl Sandbox {
             extra_writes,
             metadata_ancestors,
         } = root_inputs.as_ref();
-        let namespace_denies = private.namespace.rendered_with(&protected)?;
+        let namespace_denies = &protected_denies.namespace;
         let cache_read_identity = format!(
             "{private_read_denies}|profile={}|reads={extra_reads}|writes={extra_writes}|metadata={metadata_ancestors}",
             self.profile
@@ -2772,10 +2906,10 @@ impl Sandbox {
             &cache_str,
             private_read_denies,
             &git_write_denies,
-            &protected_storage,
+            protected_storage,
             extra_reads,
             extra_writes,
-            &namespace_denies,
+            namespace_denies,
             metadata_ancestors,
             deny_network,
         );
@@ -3022,7 +3156,7 @@ impl Sandbox {
         }
 
         if self.backend == "zerobox" {
-            let zerobox = find_trusted_system_executable("zerobox").ok_or_else(|| {
+            let zerobox = zerobox_path().ok_or_else(|| {
                 "sandbox backend 'zerobox' is not a trusted system executable — refusing to run hook unsandboxed"
                     .to_string()
             })?;
@@ -4774,11 +4908,51 @@ pub(crate) fn hook_containment_supported(backend: &str) -> bool {
     cfg!(unix) && matches!(backend, "bwrap" | "seatbelt" | "zerobox")
 }
 
+/// The last trusted `sh` and the `PATH` it was resolved under.
+#[cfg(feature = "hooks")]
+static HOOK_SH_PATH: Mutex<Option<(std::ffi::OsString, PathBuf)>> = Mutex::new(None);
+
+#[cfg(all(test, feature = "hooks"))]
+thread_local! {
+    /// `PATH` walks performed to locate the hook readiness shell (test probe).
+    static HOOK_SH_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(feature = "hooks", any(target_os = "linux", target_os = "macos")))]
+fn cached_shell_is_trusted(shell: &Path) -> bool {
+    is_trusted_system_path(shell)
+}
+
+#[cfg(all(feature = "hooks", not(any(target_os = "linux", target_os = "macos"))))]
+fn cached_shell_is_trusted(_shell: &Path) -> bool {
+    false
+}
+
+/// Trusted `sh` for the hook readiness launcher. The `PATH` walk (one
+/// canonicalize per entry) runs once per distinct `PATH` value; the trust
+/// proof of the cached target (root-owned, not group/world-writable chain) is
+/// still re-checked on every launch, and any failure resolves afresh.
 #[cfg(feature = "hooks")]
 fn hook_readiness_shell() -> Result<PathBuf, String> {
-    find_trusted_system_executable("sh").ok_or_else(|| {
+    let path = std::env::var_os("PATH");
+    let mut cached = HOOK_SH_PATH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let (Some(path), Some((cached_path, shell))) = (&path, cached.as_ref())
+        && cached_path == path
+        && cached_shell_is_trusted(shell)
+    {
+        return Ok(shell.clone());
+    }
+    #[cfg(test)]
+    HOOK_SH_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+    let shell = find_trusted_system_executable("sh").ok_or_else(|| {
         "sandbox: no trusted system `sh` is available for the hook readiness launcher".to_string()
-    })
+    })?;
+    if let Some(path) = path {
+        *cached = Some((path, shell.clone()));
+    }
+    Ok(shell)
 }
 
 async fn wait_for_command_cancellation(cancellation: Option<&mut watch::Receiver<bool>>) {
@@ -6023,6 +6197,34 @@ mod sandbox_tests {
     }
 
     use super::*;
+
+    #[test]
+    fn repeated_launches_retain_each_write_root_once() {
+        let owned = crate::tests::OwnedTestDirectory::new("retain-roots-once");
+        let _env = crate::tests::ScopedProcessEnv::set(&[(
+            "ZS_CACHE_DIR",
+            Some(owned.path().join("cache").into_os_string()),
+        )]);
+        let root = owned.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let extra = owned.path().join("extra");
+        std::fs::create_dir(&extra).unwrap();
+        // One explicit write root equals the workspace, one is distinct.
+        let sandbox = Sandbox::new(true, "__missing_retain_once_backend").with_general_profile(
+            SandboxProfile::Workspace,
+            Vec::new(),
+            vec![root.clone(), extra.clone()],
+        );
+        sandbox.retain_git_write_roots(&root).unwrap();
+        let retained = || sandbox.git_write_roots.lock().unwrap().len();
+        let first = retained();
+        // workspace, cache and the extra root; the duplicate collapses.
+        assert_eq!(first, 3);
+        sandbox.retain_git_write_roots(&root).unwrap();
+        sandbox.retain_git_write_roots(&root).unwrap();
+        assert_eq!(retained(), first, "relaunches validate, never re-add");
+    }
 
     #[test]
     fn profile100_admitted_carrier_keeps_write_authority_after_sandbox_drop() {
@@ -7739,6 +7941,30 @@ mod sandbox_tests {
             new_session < separator,
             "--new-session must be a bubblewrap option, not a child argument: {args:?}"
         );
+    }
+
+    #[cfg(all(feature = "hooks", any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn hook_readiness_shell_walks_path_once_per_path_value() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[(
+            "PATH",
+            Some("/nonexistent-mini-agent-dir:/bin:/usr/bin".into()),
+        )]);
+        let walks = || HOOK_SH_RESOLUTIONS.with(std::cell::Cell::get);
+        let before = walks();
+        let first = hook_readiness_shell().unwrap();
+        let after_first = walks();
+        let second = hook_readiness_shell().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(walks(), after_first, "an unchanged PATH reuses the result");
+        assert!(after_first - before <= 1);
+        drop(_env);
+        let _other = crate::tests::ScopedProcessEnv::set(&[(
+            "PATH",
+            Some("/usr/bin:/bin:/nonexistent-mini-agent-dir".into()),
+        )]);
+        hook_readiness_shell().unwrap();
+        assert_eq!(walks(), after_first + 1, "a different PATH resolves again");
     }
 
     #[cfg(feature = "hooks")]
@@ -9757,6 +9983,35 @@ echo PRIVATE_TEMP_PASS"#,
             cached_again.as_ref(),
             "repeated cache reads must return identical profile text"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seatbelt_profile_discovers_git_metadata_once_and_reuses_protected_denies() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
+        let scratch = ScratchDir::new();
+        let workspace = scratch.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git/hooks")).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let cache_dir = std::env::temp_dir().join(format!("test-cache-{}", uuid::Uuid::new_v4()));
+        let sandbox = Sandbox::new(true, "seatbelt");
+        let discovers = || git_metadata::DISCOVER_CALLS.with(std::cell::Cell::get);
+        let renders = || PROTECTED_DENY_RENDERS.with(std::cell::Cell::get);
+
+        let (d0, r0) = (discovers(), renders());
+        let first = sandbox
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
+            .unwrap();
+        assert_eq!(discovers() - d0, 1, "one .git discovery per launch");
+        assert_eq!(renders() - r0, 1);
+        let second = sandbox
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
+            .unwrap();
+        // Every launch still discovers and validates the metadata again...
+        assert_eq!(discovers() - d0, 2);
+        // ...but the unchanged protected set is not canonicalized again.
+        assert_eq!(renders() - r0, 1);
+        assert_eq!(first.as_ref(), second.as_ref());
     }
 
     #[cfg(unix)]

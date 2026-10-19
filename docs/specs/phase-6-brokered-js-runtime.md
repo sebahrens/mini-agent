@@ -836,6 +836,13 @@ Opted-in containment evidence reports only the closed source-evidence token
 `MACOS_SOURCE_DIGEST_EXPECTATION_V1=source_read` or `matched_image`; it exposes no path,
 lookup key, digest or executable bytes. Normal operation keeps this in debug tracing.
 
+**macOS preflight launch count (`mini-agent-rnleg`; decision 2026-10-19).** The preflight keeps both
+full one-time-image launches (worker matrix and guardian parent-death canary) and the parent-side and
+child-side image hashes. The platform table requires the macOS launcher to repeat "the worker
+denial/readback plus guardian parent-death preflight", and every generation used by that matrix must
+prove the same full content digest, with authenticated Ready independently rehashing. No redundant
+launch or hash is removed on performance grounds.
+
 **Retained executable selection (`mini-agent-i7ro6.86`; amendment 2026-10-15).**
 A process retains the first generation's already-proven image only after its authenticated Ready
 rehash, identity-bound unlink, and complete successful native containment preflight, including

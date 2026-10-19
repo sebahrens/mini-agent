@@ -409,6 +409,56 @@ struct HookRunControls<'a> {
     execution_root: Option<&'a super::dispatcher::HookExecutionRootLease>,
 }
 
+/// Every thread that ran [`prepare_hook_command`] (test probe).
+#[cfg(test)]
+static PREPARE_THREADS: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+
+/// Resolve the hook program, verify its content pins and wrap it in the
+/// sandbox. Runs on the blocking pool; every denial is returned as the
+/// finished `HookOutput` the caller reports unchanged.
+fn prepare_hook_command(
+    policy: &HookPolicy,
+    prep: &HookLaunchPrep,
+    program: &str,
+    args: &[String],
+    search_path: Option<&std::ffi::OsStr>,
+) -> Result<(tokio::process::Command, std::path::PathBuf), Box<HookOutput>> {
+    #[cfg(test)]
+    PREPARE_THREADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(std::thread::current().id());
+    let project_dir = prep.project_dir.as_path();
+    let denied = |stderr: Vec<u8>| {
+        Box::new(HookOutput {
+            started: false,
+            exit_code: None,
+            stdout: Vec::new(),
+            stderr,
+            status: HookStatus::PolicyDenied,
+            diagnostics: policy.launch_denied_diagnostics(),
+        })
+    };
+    let program = super::pins::resolve_hook_program(program, search_path, project_dir)
+        .map_err(|message| denied(message.into_bytes()))?;
+    if let Some(pins) = &policy.content_pins
+        && let Err(message) = pins.verify_launch(project_dir, &program, args)
+    {
+        tracing::warn!("hooks: {message}");
+        return Err(denied(message.into_bytes()));
+    }
+    let program = program.to_string_lossy().into_owned();
+    let explicit_env = prep
+        .explicit_env
+        .as_ref()
+        .map_err(|message| denied(message.clone().into_bytes()))?;
+    let cmd = policy
+        .sandbox
+        .wrap_hook_command(&program, args, project_dir, explicit_env)
+        .map_err(|message| denied(message.into_bytes()))?;
+    Ok((cmd, prep.project_dir.clone()))
+}
+
 async fn run_hook_with_policy_and_limits(
     command: &str,
     args: Option<&[String]>,
@@ -439,69 +489,40 @@ async fn run_hook_with_policy_and_limits(
         Ok(prep) => prep,
         Err(output) => return output,
     };
-    let project_dir = prep.project_dir.as_path();
     let search_path = policy
         .env
         .get("PATH")
         .map(std::ffi::OsString::from)
         .or_else(|| std::env::var_os("PATH"));
-    let program =
-        match super::pins::resolve_hook_program(&program, search_path.as_deref(), project_dir) {
-            Ok(path) => path,
-            Err(message) => {
-                return HookOutput {
-                    started: false,
-                    exit_code: None,
-                    stdout: Vec::new(),
-                    stderr: message.into_bytes(),
-                    status: HookStatus::PolicyDenied,
-                    diagnostics: policy.launch_denied_diagnostics(),
-                };
-            }
-        };
-    if let Some(pins) = &policy.content_pins
-        && let Err(message) = pins.verify_launch(project_dir, &program, &args)
-    {
-        tracing::warn!("hooks: {message}");
-        return HookOutput {
-            started: false,
-            exit_code: None,
-            stdout: Vec::new(),
-            stderr: message.into_bytes(),
-            status: HookStatus::PolicyDenied,
-            diagnostics: policy.launch_denied_diagnostics(),
-        };
-    }
-    let program = program.to_string_lossy().into_owned();
-    let explicit_env = match &prep.explicit_env {
-        Ok(env) => env,
-        Err(message) => {
+    // Program resolution (a PATH walk), content-pin hashing and sandbox
+    // wrapping (write-root validation, Git metadata alias scan, profile
+    // build) are filesystem-heavy: run them on the blocking pool, in the
+    // same order as before, so the caller's executor worker (or the TUI task)
+    // never stalls on them. Spawning stays here with the execution-root lease.
+    let prepared = {
+        let policy = policy.clone();
+        let prep = prep.clone();
+        crate::agent::runner::spawn_blocking_scoped(move || {
+            prepare_hook_command(&policy, &prep, &program, &args, search_path.as_deref())
+        })
+        .await
+    };
+    let (mut cmd, project_dir) = match prepared {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(output)) => return *output,
+        Err(error) => {
+            tracing::warn!("hooks: launch preparation task failed: {error}");
             return HookOutput {
                 started: false,
                 exit_code: None,
                 stdout: Vec::new(),
-                stderr: message.clone().into_bytes(),
+                stderr: b"hook launch preparation did not complete".to_vec(),
                 status: HookStatus::PolicyDenied,
                 diagnostics: policy.launch_denied_diagnostics(),
             };
         }
     };
-    let mut cmd = match policy
-        .sandbox
-        .wrap_hook_command(&program, &args, project_dir, explicit_env)
-    {
-        Ok(command) => command,
-        Err(message) => {
-            return HookOutput {
-                started: false,
-                exit_code: None,
-                stdout: Vec::new(),
-                stderr: message.into_bytes(),
-                status: HookStatus::PolicyDenied,
-                diagnostics: policy.launch_denied_diagnostics(),
-            };
-        }
-    };
+    let project_dir = project_dir.as_path();
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -852,6 +873,35 @@ pub(crate) async fn run_shell_condition_at_root(
 #[cfg(test)]
 mod launch_prep_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn launch_preparation_runs_off_the_calling_task_thread() {
+        let root = crate::tests::OwnedTestDirectory::new("hook-prepare-off-task");
+        let caller = std::thread::current().id();
+        let output = run_hook_with_limits(
+            "true",
+            Some(&[]),
+            b"{}",
+            std::time::Duration::from_secs(10),
+            &root.path().to_string_lossy(),
+            DEFAULT_HOOK_LIMITS,
+        )
+        .await;
+        assert!(
+            output.started,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let threads = PREPARE_THREADS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!threads.is_empty());
+        assert!(
+            !threads.contains(&caller),
+            "program resolution and sandbox wrapping must not run on the caller's thread"
+        );
+    }
 
     #[test]
     fn condition_and_handler_share_one_launch_prep_per_policy() {

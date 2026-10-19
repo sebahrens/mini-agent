@@ -193,6 +193,10 @@ pub(crate) struct HookDispatcher {
     /// the dispatcher is bound to its project root. `None` only for unbound
     /// test dispatchers; a bound dispatcher verifies every launch.
     content_pins: Option<HashMap<HookHandler, Arc<HookContentPins>>>,
+    /// `pinned_workspace_paths` in the comparison spelling of
+    /// `super::normalize_pinned_spelling`, built once with the pins so a
+    /// write check normalizes only its own input.
+    pinned_normalized: Arc<[String]>,
 }
 
 pub(crate) type HookDiagnosticMetadata = (usize, usize, Option<usize>);
@@ -314,6 +318,12 @@ impl HookDispatcher {
             },
             None => ExecutionRootBinding::Unbound,
         };
+        let pinned_normalized: Arc<[String]> = content_pins
+            .iter()
+            .flat_map(|pins| pins.values())
+            .flat_map(|pins| pins.workspace_paths())
+            .map(|path| super::normalize_pinned_spelling(&path.to_string_lossy()))
+            .collect();
         Ok(Self {
             events,
             sandbox_backend: sandbox_backend.to_string(),
@@ -324,6 +334,7 @@ impl HookDispatcher {
             })),
             once_ran: Arc::new(Mutex::new(HashSet::new())),
             content_pins,
+            pinned_normalized,
         })
     }
 
@@ -335,17 +346,10 @@ impl HookDispatcher {
         Some(pins.get(handler).cloned().unwrap_or_default())
     }
 
-    /// Workspace-relative paths of every content-bound hook file.
-    pub(crate) fn pinned_workspace_paths(&self) -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = self
-            .content_pins
-            .iter()
-            .flat_map(|pins| pins.values())
-            .flat_map(|pins| pins.workspace_paths().map(Path::to_path_buf))
-            .collect();
-        paths.sort();
-        paths.dedup();
-        paths
+    /// Whether `normalized` (see `super::normalize_pinned_spelling`) names a
+    /// content-bound hook file.
+    pub(crate) fn is_pinned_normalized(&self, normalized: &str) -> bool {
+        self.pinned_normalized.iter().any(|path| path == normalized)
     }
 
     /// Disables dispatch through the process-wide execution root (turns bound
