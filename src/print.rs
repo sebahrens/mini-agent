@@ -1399,7 +1399,13 @@ pub(crate) async fn files_changed_since(
     interactions: &[Message],
 ) -> Vec<String> {
     let (_, mut files) = interaction_summary(root, interactions);
-    let after = capture_workspace_change_baseline(root).await;
+    // The after-capture only feeds the diff against a baseline; without one
+    // it would spawn Git for nothing.
+    let after = if baseline.is_some() {
+        capture_workspace_change_baseline(root).await
+    } else {
+        None
+    };
     if let (Some(before), Some(after)) = (baseline, after.as_ref()) {
         for path in before.paths.keys().chain(after.paths.keys()) {
             if before.paths.get(path) != after.paths.get(path) {
