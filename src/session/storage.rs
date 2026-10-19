@@ -35,6 +35,16 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+/// Session file bytes. Identical to [`serialize_bounded_session`] except that a
+/// tool-result row whose display `content` is `prefix + tool.output` writes the
+/// output once (`content_prefix`), roughly halving tool-heavy files and the
+/// 8 MiB budget they consume (mini-agent-buv2v). Loading restores `content`
+/// exactly, and every digest is taken over the canonical form, never this one.
+pub(super) fn serialize_session_for_storage(session: &Session) -> anyhow::Result<String> {
+    let _storage = super::StorageEncodingGuard::enable();
+    serialize_bounded_session(session)
+}
+
 pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<String> {
     #[cfg(test)]
     SERIALIZE_BOUNDED_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -244,7 +254,7 @@ pub(crate) fn prepare_save(session: &Session) -> anyhow::Result<PreparedSave> {
         .map_err(anyhow::Error::from)?;
     Ok(PreparedSave::Legacy {
         id: session.id.to_string(),
-        json: serialize_bounded_session(session)?,
+        json: serialize_session_for_storage(session)?,
     })
 }
 
@@ -303,7 +313,7 @@ pub fn save_session_deferred(session: &Session) -> anyhow::Result<()> {
     session
         .validate_native_persistence()
         .map_err(anyhow::Error::from)?;
-    let json = serialize_bounded_session(session)?;
+    let json = serialize_session_for_storage(session)?;
     deferred::queue(
         &runtime,
         &session.id,

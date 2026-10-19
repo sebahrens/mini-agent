@@ -190,7 +190,7 @@ pub enum MessageRole {
     SubagentToolCall,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "UncheckedSessionMessage")]
 pub struct SessionMessage {
     /// Ordered canonical text/image payload; absent for legacy text-only rows.
@@ -220,7 +220,12 @@ struct UncheckedSessionMessage {
     #[serde(default)]
     recorded_diff: Option<crate::agent::tools::mutation_diff::MutationDiff>,
     role: MessageRole,
-    content: CompactString,
+    #[serde(default)]
+    content: Option<CompactString>,
+    /// Storage form of a tool-result row whose `content` is
+    /// `prefix + tool.output`: the shared output is written once.
+    #[serde(default)]
+    content_prefix: Option<CompactString>,
     estimated_tokens: u64,
     #[serde(default)]
     tool_call_id: Option<CompactString>,
@@ -228,14 +233,102 @@ struct UncheckedSessionMessage {
     tool: Option<PersistedToolMessage>,
 }
 
+/// Wire shape of [`SessionMessage`]. The canonical form (what every digest,
+/// export and in-memory comparison sees) always carries `content` and never
+/// `content_prefix`, byte-identical to the former derived encoding.
+#[derive(Serialize)]
+struct SessionMessageRepr<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: &'a Option<user::PersistedUserMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recorded_diff: &'a Option<crate::agent::tools::mutation_diff::MutationDiff>,
+    role: MessageRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_prefix: Option<&'a str>,
+    estimated_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: &'a Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: &'a Option<PersistedToolMessage>,
+}
+
+thread_local! {
+    /// Set only while the session file bytes are produced (see
+    /// [`storage::serialize_session_for_storage`]); every other serialization,
+    /// including all digests, stays canonical.
+    static STORAGE_ENCODING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tool outputs below this size are not worth a second field.
+const STORAGE_DEDUP_MIN_OUTPUT_BYTES: usize = 64;
+
+pub(crate) struct StorageEncodingGuard(bool);
+
+impl StorageEncodingGuard {
+    pub(crate) fn enable() -> Self {
+        Self(STORAGE_ENCODING.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for StorageEncodingGuard {
+    fn drop(&mut self) {
+        STORAGE_ENCODING.with(|flag| flag.set(self.0));
+    }
+}
+
+impl Serialize for SessionMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut content = Some(self.content.as_str());
+        let mut content_prefix = None;
+        if self.role == MessageRole::ToolResult
+            && self.user.is_none()
+            && let Some(PersistedToolMessage::Result { output, .. }) = &self.tool
+            && output.len() >= STORAGE_DEDUP_MIN_OUTPUT_BYTES
+            && STORAGE_ENCODING.with(std::cell::Cell::get)
+            && let Some(prefix) = self.content.strip_suffix(output.as_str())
+        {
+            content = None;
+            content_prefix = Some(prefix);
+        }
+        SessionMessageRepr {
+            user: &self.user,
+            recorded_diff: &self.recorded_diff,
+            role: self.role,
+            content,
+            content_prefix,
+            estimated_tokens: self.estimated_tokens,
+            tool_call_id: &self.tool_call_id,
+            tool: &self.tool,
+        }
+        .serialize(serializer)
+    }
+}
+
 impl TryFrom<UncheckedSessionMessage> for SessionMessage {
     type Error = &'static str;
     fn try_from(value: UncheckedSessionMessage) -> Result<Self, Self::Error> {
+        let content = match (value.content, value.content_prefix) {
+            (Some(content), None) => content,
+            (None, Some(prefix)) => match &value.tool {
+                Some(PersistedToolMessage::Result { output, .. })
+                    if value.role == MessageRole::ToolResult && value.user.is_none() =>
+                {
+                    let mut content = CompactString::new(prefix.as_str());
+                    content.push_str(output);
+                    content
+                }
+                _ => return Err("session row has a content prefix without a tool result"),
+            },
+            (None, None) => return Err("session row has no content"),
+            (Some(_), Some(_)) => return Err("session row has both content and a content prefix"),
+        };
         let message = Self {
             user: value.user,
             recorded_diff: value.recorded_diff,
             role: value.role,
-            content: value.content,
+            content,
             estimated_tokens: value.estimated_tokens,
             tool_call_id: value.tool_call_id,
             tool: value.tool,
@@ -3742,6 +3835,115 @@ mod compaction_history_tests {
                 summary: summary.into(),
                 ..self.clone()
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod storage_encoding_tests {
+    use super::*;
+    use crate::session::native_replay::feed_digest;
+
+    fn tool_heavy() -> Session {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        session.add_message(MessageRole::User, "inspect the files");
+        for i in 0..3 {
+            let id = format!("call-{i}");
+            session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": "a.txt"}));
+            session.add_tool_result_with_id(&id, "read", &format!("line {i}\n").repeat(200));
+        }
+        session.add_tool_call_with_id("tiny", "shell", &serde_json::json!({"command": "true"}));
+        session.add_tool_result_with_id("tiny", "shell", "ok");
+        session
+    }
+
+    /// The canonical (digest) encoding of a message is the byte-for-byte shape
+    /// the derived serializer always produced.
+    #[test]
+    fn canonical_encoding_is_unchanged_and_has_no_storage_fields() {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        session.add_tool_call_with_id("c", "read", &serde_json::json!({}));
+        session.add_tool_result_with_id("c", "read", &"x".repeat(100));
+        let row = serde_json::to_string(&session.messages[1]).unwrap();
+        let expected = format!(
+            "{{\"role\":\"tool_result\",\"content\":\"read:\\n{x}\",\"estimated_tokens\":{t},\"tool_call_id\":\"c\",\"tool\":{{\"kind\":\"result\",\"output\":\"{x}\"}}}}",
+            x = "x".repeat(100),
+            t = session.messages[1].estimated_tokens
+        );
+        assert_eq!(row, expected);
+        assert!(!row.contains("content_prefix"));
+    }
+
+    #[test]
+    fn storage_encoding_writes_each_tool_output_once_and_loads_back_exactly() {
+        let session = tool_heavy();
+        let canonical = storage::serialize_bounded_session(&session).unwrap();
+        let stored = storage::serialize_session_for_storage(&session).unwrap();
+        assert!(
+            stored.len() < canonical.len() * 3 / 4,
+            "{} vs {}",
+            stored.len(),
+            canonical.len()
+        );
+        assert_eq!(
+            stored.matches("content_prefix").count(),
+            3,
+            "tiny result stays whole"
+        );
+        // The flag does not leak into later canonical serialization.
+        assert_eq!(
+            storage::serialize_bounded_session(&session).unwrap(),
+            canonical
+        );
+
+        let loaded = storage::decode_session_json(&stored).unwrap();
+        for (a, b) in session.messages.iter().zip(&loaded.messages) {
+            assert_eq!(a.content, b.content);
+        }
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&session).unwrap()
+        );
+        // Digests are over the canonical form: identical across the cycle.
+        assert_eq!(
+            storage::serialize_bounded_session(&loaded).unwrap(),
+            canonical
+        );
+        assert_eq!(
+            feed_digest(&loaded.messages, &loaded.compactions).unwrap(),
+            feed_digest(&session.messages, &session.compactions).unwrap()
+        );
+        // And a second save of the loaded session is byte-identical.
+        assert_eq!(
+            storage::serialize_session_for_storage(&loaded).unwrap(),
+            stored
+        );
+    }
+
+    #[test]
+    fn old_format_files_with_both_fields_still_load() {
+        let session = tool_heavy();
+        let canonical = storage::serialize_bounded_session(&session).unwrap();
+        let loaded = storage::decode_session_json(&canonical).unwrap();
+        assert_eq!(loaded.messages[2].content, session.messages[2].content);
+        assert_eq!(
+            storage::serialize_bounded_session(&loaded).unwrap(),
+            canonical
+        );
+    }
+
+    #[test]
+    fn rows_that_cannot_expand_are_rejected() {
+        let row = |extra: &str| format!("{{\"role\":\"assistant\",\"estimated_tokens\":1{extra}}}");
+        for json in [
+            row(",\"content_prefix\":\"read:\\n\""),
+            row(",\"content\":\"a\",\"content_prefix\":\"b\""),
+            row(""),
+        ] {
+            assert!(
+                serde_json::from_str::<SessionMessage>(&json).is_err(),
+                "{json}"
+            );
         }
     }
 }
