@@ -2851,11 +2851,11 @@ where
 }
 
 fn normalized_continuation_bridge(
-    completed_interactions: &[Message],
+    completed_interactions: Vec<Message>,
     uncommitted_interactions: &[Message],
     continuation_instruction: &str,
 ) -> Vec<Message> {
-    let mut bridge = completed_interactions.to_vec();
+    let mut bridge = completed_interactions;
     bridge.extend_from_slice(uncommitted_interactions);
     if matches!(bridge.last(), Some(Message::User { .. })) {
         bridge.push(Message::assistant(String::new()));
@@ -3606,14 +3606,14 @@ where
                             return;
                         }
                     }
-                    Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    Ok(MultiTurnStreamItem::FinalResponse(mut res)) => {
                         terminal_response_seen = true;
                         let expected_prompt = stream_prompt.as_ref().map_or_else(
                             || retry_message.clone(),
                             |prompt| Message::user(prompt.clone()),
                         );
                         let completed_delta = match completed_stream_delta_message(
-                            res.messages.clone(),
+                            res.messages.take(),
                             &expected_prompt,
                         ) {
                             Ok(messages) => messages,
@@ -3973,19 +3973,20 @@ where
             } else {
                 new_interactions.as_slice()
             };
-            let continuation_bridge = normalized_continuation_bridge(
-                &completed_interactions,
+            // The bridge is the new `completed_interactions`: build it by
+            // moving the old one in and lend it to the injector below.
+            completed_interactions = normalized_continuation_bridge(
+                std::mem::take(&mut completed_interactions),
                 uncommitted_interactions,
                 &continuation_instruction,
             );
-            completed_interactions = continuation_bridge.clone();
             stream_prompt = Some(continuation_instruction.clone());
             stream = stream_policy.apply(
                 continue_prompt_message_injector(
                     &agent,
                     &retry_message,
                     &retry_history,
-                    &continuation_bridge,
+                    &completed_interactions,
                     remaining_turns,
                     native_capture.clone(),
                     Some(steering_hook.clone()),
@@ -4757,7 +4758,7 @@ where
             let new_interactions = take_new_interactions(&mut interactions);
             committed_interactions.extend(new_interactions.iter().cloned());
             continuation_bridge = normalized_continuation_bridge(
-                &continuation_bridge,
+                std::mem::take(&mut continuation_bridge),
                 &new_interactions,
                 &continuation_instruction,
             );
