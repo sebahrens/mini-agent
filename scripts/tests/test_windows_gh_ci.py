@@ -311,10 +311,11 @@ def condition_value(expression: str, event: str, scope: str, code: str, ref: str
         return True
     if expression == "startsWith(github.ref, 'refs/tags/')":
         return ref.startswith("refs/tags/")
-    match = re.fullmatch(r"(github\.event_name|inputs\.scope|needs\.changes\.outputs\.code) (==|!=) '([^']*)'", expression)
+    match = re.fullmatch(r"(github\.event_name|inputs\.scope|needs\.changes\.outputs\.(?:code|full|macos|windows)) (==|!=) '([^']*)'", expression)
     if match is None:
         raise AssertionError(f"unsupported selector expression: {expression!r}")
-    actual = {"github.event_name": event, "inputs.scope": scope, "needs.changes.outputs.code": code}[match[1]]
+    # The test-impact scope outputs (mini-agent-m7wn5) default to 'true' (full matrix).
+    actual = {"github.event_name": event, "inputs.scope": scope, "needs.changes.outputs.code": code}.get(match[1], "true")
     return (actual == match[3]) if match[2] == "==" else (actual != match[3])
 
 

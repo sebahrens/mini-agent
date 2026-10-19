@@ -687,7 +687,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
 
     def test_macos_runs_only_platform_feature_rows(self) -> None:
         header = job_body(self.workflow, "test").split("    steps:\n", 1)[0]
-        self.assertIn("os: [ubuntu-latest, macos-latest]", header)
+        self.assertIn("os: ${{ fromJSON(needs.changes.outputs.test_os) }}", header)
         exclude = header.split("        exclude:\n", 1)[1].split("    runs-on:", 1)[0]
         pairs = re.findall(
             r'- os: (\S+)\n\s+features: "([^"]*)"', exclude
@@ -887,7 +887,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         body = job_body(self.workflow, "parallel-test-smoke")
         header = body.split("    steps:\n", 1)[0]
         self.assertIn("fail-fast: false", header)
-        self.assertIn("os: [ubuntu-latest, macos-latest]", header)
+        self.assertIn("os: ${{ fromJSON(needs.changes.outputs.test_os) }}", header)
         self.assertIn("runs-on: ${{ matrix.os }}", header)
         self.assertNotIn("continue-on-error", header)
         step = body.split(
@@ -930,7 +930,11 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         )
         lint_step = all_features.split(lint, 1)[0].rsplit("- name:", 1)[1]
         self.assertNotIn("continue-on-error", lint_step)
-        self.assertNotIn("if:", lint_step)
+        # Only the pass-fingerprint guard (mini-agent-m7wn5) may condition it.
+        self.assertEqual(
+            ["steps.fp.outputs.skip != 'true'"],
+            re.findall(r"(?m)^\s+if: (.*)$", lint_step),
+        )
 
     def test_every_job_declares_a_bounded_timeout(self) -> None:
         # Without a job-level timeout a hung job holds a runner for GitHub's

@@ -43,6 +43,8 @@ def validate_preparation(body):
     if cargo is None or body.index(PREP) > cargo.start():
         raise AssertionError("Git preparation must precede the first Cargo command")
     step = body[:body.index(PREP)].rsplit("      - name:", 1)[1]
+    # The pass-fingerprint guard (mini-agent-m7wn5) is the only allowed condition.
+    step = step.replace("if: steps.fp.outputs.skip != 'true'", "")
     if "continue-on-error" in step:
         raise AssertionError("Git preparation cannot fail open")
     if "if:" in step:
@@ -71,7 +73,10 @@ def linux_compiling_jobs(workflow):
     for name, job in document["jobs"].items():
         runner = job.get("runs-on", "")
         matrix = job.get("strategy", {}).get("matrix", {})
-        platforms = matrix.get("os", []) + [row.get("os", "") for row in matrix.get("include", [])]
+        os_rows = matrix.get("os", [])
+        if isinstance(os_rows, str):  # fromJSON(needs.changes.outputs.test_os): Linux is always a row
+            os_rows = ["ubuntu-latest"]
+        platforms = os_rows + [row.get("os", "") for row in matrix.get("include", [])]
         linux = "ubuntu" in runner or "linux" in runner
         if "matrix.os" in runner:
             linux = any("ubuntu" in platform or "linux" in platform for platform in platforms)
@@ -90,7 +95,7 @@ def validate_linux_preparation(job):
         raise AssertionError("local action must follow checkout")
     if index >= next(i for i, step in enumerate(steps) if compiles_our_crate(step)):
         raise AssertionError("Linux prerequisites must precede the first crate compilation")
-    if steps[index].get("if") or steps[index].get("continue-on-error"):
+    if steps[index].get("if") not in (None, "steps.fp.outputs.skip != 'true'") or steps[index].get("continue-on-error"):
         raise AssertionError("Linux prerequisites must not be skipped or fail open")
 
 

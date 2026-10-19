@@ -84,6 +84,13 @@ jobs:
     timeout-minutes: 10
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      # Test-impact scope (mini-agent-m7wn5). Every default fails open: when
+      # the scope step is skipped or fails, the full matrix runs.
+      scope: ${{ steps.scope.outputs.scope || 'code' }}
+      full: ${{ steps.scope.outputs.full || 'true' }}
+      macos: ${{ steps.scope.outputs.macos || 'true' }}
+      windows: ${{ steps.scope.outputs.windows || 'true' }}
+      test_os: ${{ steps.scope.outputs.test_os || '["ubuntu-latest","macos-latest"]' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -164,6 +171,21 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "Documentation-only change; skipping build, lint, and test jobs."
           fi
+
+      # Refines code=true: a push or pull request whose every non-docs path is
+      # test-only by path gets scope=tests (fmt/policy, Linux clippy and the
+      # Linux test rows; macOS/Windows rows only for platform-specific test
+      # paths). Tags, schedule, dispatch, an unresolvable base or any doubt
+      # keep scope=code, the full matrix. scripts/ci_scope.py owns the rules.
+      - name: Classify the change as tests or code
+        id: scope
+        if: steps.filter.outputs.code == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: python3 scripts/ci_scope.py || echo "scope classification failed; running the full matrix"
 
   fmt:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full')
@@ -268,7 +290,7 @@ jobs:
   # vendor-npm/ manifest and archive bytes as an uncached one. release.yml
   # does not use this cache and always packs from the registry.
   corresponding-source:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -314,7 +336,7 @@ jobs:
   # weeks (mini-agent-5casv). Only a documentation-only change or the Windows
   # sandbox dispatch scope skips it; neither step reads pull-request context.
   harness-regression:
-    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -370,7 +392,7 @@ jobs:
           bash scripts/gym/train.sh --help > /dev/null
 
   package-compliance-smoke:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     strategy:
       fail-fast: false
@@ -389,7 +411,7 @@ jobs:
         run: python3 scripts/smoke-package-compliance.py ${{ matrix.channels }}
 
   vscode:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -479,7 +501,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Skip when these inputs already passed on main
+        id: fp
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: check
+          job: clippy
+          classes: production+tests
+          row: ${{ matrix.features }}
+
       - name: Prepare guarded Git runtime
+        if: steps.fp.outputs.skip != 'true'
         uses: ./.github/actions/prepare-git-runtime
 
       # The compiled-dependency cache is partitioned by OS, runner image
@@ -488,6 +520,7 @@ jobs:
       # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
       # not available to `with:` expressions, so a step derives the key.
       - name: Derive the compiled-dependency cache key
+        if: steps.fp.outputs.skip != 'true'
         id: cache-key
         shell: bash
         env:
@@ -497,15 +530,26 @@ jobs:
           echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
+        if: steps.fp.outputs.skip != 'true'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Run Clippy (${{ matrix.features }})
+        if: steps.fp.outputs.skip != 'true'
         # Every supported row is strict, including tests. Deliberately retained
         # feedback actor variants have individual, conditional lint expectations
         # in feedback.rs; these expire when their production consumers appear.
         run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+
+      - name: Record the pass marker for these inputs
+        if: success() && steps.fp.outputs.skip != 'true' && steps.fp.outputs.write == 'true'
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: save
+          job: clippy
+          classes: production+tests
+          key: ${{ steps.fp.outputs.key }}
 
   test:
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
@@ -513,7 +557,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.changes.outputs.test_os) }}
         # The documented supported feature combinations. Isolated memory and
         # sandbox rows catch missing cfg gates that default features can mask.
         # `skills` implies `js`, so a skills-without-JS state is unselectable by
@@ -570,13 +614,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Skip when these inputs already passed on main
+        id: fp
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: check
+          job: test
+          classes: production+tests
+          row: ${{ matrix.features }}
+
       - name: Prepare guarded Git runtime
+        if: steps.fp.outputs.skip != 'true'
         uses: ./.github/actions/prepare-git-runtime
 
       # GitHub's macOS runner work-temp volume does not provide the durable
       # directory-sync semantics required by private persistence tests.
       - name: Use the durable macOS temporary root
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-latest' && steps.fp.outputs.skip != 'true'
         shell: bash
         run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
@@ -586,6 +640,7 @@ jobs:
       # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
       # not available to `with:` expressions, so a step derives the key.
       - name: Derive the compiled-dependency cache key
+        if: steps.fp.outputs.skip != 'true'
         id: cache-key
         shell: bash
         env:
@@ -595,25 +650,27 @@ jobs:
           echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
+        if: steps.fp.outputs.skip != 'true'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Show the toolchain in use
+        if: steps.fp.outputs.skip != 'true'
         shell: bash
         run: |
           rustc --version
           cargo --version
 
       - name: Test (${{ matrix.features }}) on Linux
-        if: matrix.os != 'macos-latest'
+        if: matrix.os != 'macos-latest' && steps.fp.outputs.skip != 'true'
         run: >-
           cargo test --locked ${{ matrix.features }} -- --test-threads=1
           --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
           --skip extras::js::tests::skill_runtime_binding
 
       - name: Test (${{ matrix.features }}) on macOS with process-global worker isolation
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-latest' && steps.fp.outputs.skip != 'true'
         run: >-
           cargo test --locked ${{ matrix.features }} -- --test-threads=1
           --skip extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver
@@ -621,7 +678,7 @@ jobs:
           --skip extras::js::tests::skill_runtime_binding
 
       - name: Test skill runtime binding in a fresh process
-        if: contains(matrix.features, 'skills')
+        if: contains(matrix.features, 'skills') && steps.fp.outputs.skip != 'true'
         env:
           RUST_MIN_STACK: 8388608
         run: >-
@@ -631,7 +688,8 @@ jobs:
       - name: Test macOS agent-rebuild worker reuse in a fresh process
         if: >-
           matrix.os == 'macos-latest' &&
-          (matrix.features == '' || contains(matrix.features, 'js') || contains(matrix.features, 'skills'))
+          (matrix.features == '' || contains(matrix.features, 'js') || contains(matrix.features, 'skills')) &&
+          steps.fp.outputs.skip != 'true'
         run: >-
           cargo test --locked ${{ matrix.features }}
           extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver
@@ -641,7 +699,8 @@ jobs:
         if: >-
           contains(matrix.features, 'skills') &&
           contains(matrix.features, 'sandbox') &&
-          contains(matrix.features, 'subagents')
+          contains(matrix.features, 'subagents') &&
+          steps.fp.outputs.skip != 'true'
         env:
           RUST_MIN_STACK: 8388608
         run: >-
@@ -650,12 +709,21 @@ jobs:
           -- --exact --test-threads=1
 
       - name: Validate deterministic skill retrieval benchmark metrics
-        if: matrix.os == 'ubuntu-latest' && matrix.features == '--no-default-features --features js,skills'
+        if: matrix.os == 'ubuntu-latest' && matrix.features == '--no-default-features --features js,skills' && steps.fp.outputs.skip != 'true'
         run: cargo test --locked --no-default-features --features js,skills skill_retrieval_benchmark_smoke -- --nocapture
 
       - name: Compile the full Phase 5 operations audit
-        if: matrix.os == 'ubuntu-latest' && matrix.features == '--no-default-features --features js,skills'
+        if: matrix.os == 'ubuntu-latest' && matrix.features == '--no-default-features --features js,skills' && steps.fp.outputs.skip != 'true'
         run: cargo test --locked --no-default-features --features js,skills phase5_operations_benchmark
+
+      - name: Record the pass marker for these inputs
+        if: success() && steps.fp.outputs.skip != 'true' && steps.fp.outputs.write == 'true'
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: save
+          job: test
+          classes: production+tests
+          key: ${{ steps.fp.outputs.key }}
 
   # The local ONNX/BGE embedding backend and the complete feature union run on
   # Linux, where ort-sys publishes a supported runtime artifact. The union is
@@ -672,7 +740,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Skip when these inputs already passed on main
+        id: fp
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: check
+          job: all-features
+          classes: production+tests
+          row: ''
+
       - name: Prepare guarded Git runtime
+        if: steps.fp.outputs.skip != 'true'
         uses: ./.github/actions/prepare-git-runtime
 
       # The compiled-dependency cache is partitioned by OS, runner image
@@ -681,6 +759,7 @@ jobs:
       # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
       # not available to `with:` expressions, so a step derives the key.
       - name: Derive the compiled-dependency cache key
+        if: steps.fp.outputs.skip != 'true'
         id: cache-key
         shell: bash
         env:
@@ -690,30 +769,44 @@ jobs:
           echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
+        if: steps.fp.outputs.skip != 'true'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Run Clippy (--all-features)
+        if: steps.fp.outputs.skip != 'true'
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Test all features
+        if: steps.fp.outputs.skip != 'true'
         run: >-
           cargo test --locked --all-features -- --test-threads=1
           --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
           --skip extras::acp::protocol_tests::cancellation_reaps_configured_async_user_prompt_hook
 
       - name: Test all-features async hook cancellation in a fresh process
+        if: steps.fp.outputs.skip != 'true'
         run: >-
           cargo test --locked --all-features
           extras::acp::protocol_tests::cancellation_reaps_configured_async_user_prompt_hook
           -- --exact --test-threads=1
 
       - name: Test all-features task-level skill eval in a fresh process
+        if: steps.fp.outputs.skip != 'true'
         run: >-
           cargo test --locked --all-features
           tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
           -- --exact --test-threads=1
+
+      - name: Record the pass marker for these inputs
+        if: success() && steps.fp.outputs.skip != 'true' && steps.fp.outputs.write == 'true'
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: save
+          job: all-features
+          classes: production+tests
+          key: ${{ steps.fp.outputs.key }}
 
   # Every `test` row serialises with --test-threads=1, so only this job sees
   # the load of the standard parallel runner that local `cargo test` applies.
@@ -724,18 +817,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.changes.outputs.test_os) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Skip when these inputs already passed on main
+        id: fp
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: check
+          job: parallel-test-smoke
+          classes: production+tests
+          row: ${{ matrix.features }}
+
       - name: Prepare guarded Git runtime
+        if: steps.fp.outputs.skip != 'true'
         uses: ./.github/actions/prepare-git-runtime
       # GitHub's macOS runner work-temp volume does not provide the durable
       # directory-sync semantics required by private persistence tests.
       - name: Use the durable macOS temporary root
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-latest' && steps.fp.outputs.skip != 'true'
         shell: bash
         run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
       # The compiled-dependency cache is partitioned by OS, runner image
@@ -744,6 +847,7 @@ jobs:
       # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
       # not available to `with:` expressions, so a step derives the key.
       - name: Derive the compiled-dependency cache key
+        if: steps.fp.outputs.skip != 'true'
         id: cache-key
         shell: bash
         env:
@@ -753,14 +857,25 @@ jobs:
           echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
+        if: steps.fp.outputs.skip != 'true'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
       - name: Test the default suite with the standard parallel runner
+        if: steps.fp.outputs.skip != 'true'
         run: cargo test --locked
 
+      - name: Record the pass marker for these inputs
+        if: success() && steps.fp.outputs.skip != 'true' && steps.fp.outputs.write == 'true'
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: save
+          job: parallel-test-smoke
+          classes: production+tests
+          key: ${{ steps.fp.outputs.key }}
+
   windows-default-compile:
-    if: (needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows-command-family' || inputs.scope == 'windows-session-storage'))) && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: (needs.changes.outputs.code == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows-command-family' || inputs.scope == 'windows-session-storage'))) && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.windows == 'true'
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 30
@@ -964,7 +1079,7 @@ jobs:
           retention-days: 7
 
   windows-hooks-compile:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.windows == 'true'
     needs: changes
     strategy:
       fail-fast: false
@@ -1593,7 +1708,7 @@ jobs:
           if-no-files-found: error
 
   windows-worker-launcher-unit:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.windows == 'true'
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 60
@@ -1676,7 +1791,7 @@ jobs:
           -- --exact --nocapture
 
   macos-gym-ownership:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.macos == 'true'
     needs: changes
     runs-on: macos-latest
     timeout-minutes: 15
@@ -2613,7 +2728,7 @@ jobs:
           if-no-files-found: error
 
   platform-paths:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     strategy:
       fail-fast: false
@@ -2800,7 +2915,7 @@ jobs:
           if-no-files-found: error
 
   platform-path-negative-controls:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -2857,7 +2972,7 @@ jobs:
           if-no-files-found: error
 
   platform-path-install-smoke:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     strategy:
       fail-fast: false
@@ -2970,7 +3085,7 @@ jobs:
           if-no-files-found: error
 
   mcp-stdio:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     strategy:
       fail-fast: false
@@ -2981,11 +3096,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Skip when these inputs already passed on main
+        id: fp
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: check
+          job: mcp-stdio
+          classes: production+tests
+          row: ''
+
       - name: Prepare guarded Git runtime
+        if: steps.fp.outputs.skip != 'true'
         uses: ./.github/actions/prepare-git-runtime
 
       - name: Use the durable macOS temporary root
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-latest' && steps.fp.outputs.skip != 'true'
         shell: bash
         run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
@@ -2995,6 +3120,7 @@ jobs:
       # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
       # not available to `with:` expressions, so a step derives the key.
       - name: Derive the compiled-dependency cache key
+        if: steps.fp.outputs.skip != 'true'
         id: cache-key
         shell: bash
         env:
@@ -3004,18 +3130,30 @@ jobs:
           echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
+        if: steps.fp.outputs.skip != 'true'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Test MCP stdio lifecycle and ACP startup cancellation
+        if: steps.fp.outputs.skip != 'true'
         run: cargo test --locked --no-default-features --features mcp,acp mcp_stdio
 
       - name: Test MCP HTTP and OAuth initialization bounds
+        if: steps.fp.outputs.skip != 'true'
         run: cargo test --locked --no-default-features --features mcp,acp mcp_http_tests
 
+      - name: Record the pass marker for these inputs
+        if: success() && steps.fp.outputs.skip != 'true' && steps.fp.outputs.write == 'true'
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: save
+          job: mcp-stdio
+          classes: production+tests
+          key: ${{ steps.fp.outputs.key }}
+
   lsp-lifecycle:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     strategy:
       fail-fast: false
@@ -3026,7 +3164,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Skip when these inputs already passed on main
+        id: fp
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: check
+          job: lsp-lifecycle
+          classes: production+tests
+          row: ''
+
       - name: Prepare guarded Git runtime
+        if: steps.fp.outputs.skip != 'true'
         uses: ./.github/actions/prepare-git-runtime
 
       # The compiled-dependency cache is partitioned by OS, runner image
@@ -3035,6 +3183,7 @@ jobs:
       # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
       # not available to `with:` expressions, so a step derives the key.
       - name: Derive the compiled-dependency cache key
+        if: steps.fp.outputs.skip != 'true'
         id: cache-key
         shell: bash
         env:
@@ -3044,19 +3193,30 @@ jobs:
           echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
+        if: steps.fp.outputs.skip != 'true'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Test Windows atomic publication and sharing contracts
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest' && steps.fp.outputs.skip != 'true'
         run: cargo test --locked --no-default-features --features lsp atomic_write_tests
 
       - name: Test LSP process lifecycle
+        if: steps.fp.outputs.skip != 'true'
         run: cargo test --locked --no-default-features --features lsp lsp_process
 
+      - name: Record the pass marker for these inputs
+        if: success() && steps.fp.outputs.skip != 'true' && steps.fp.outputs.write == 'true'
+        uses: ./.github/actions/ci-fingerprint
+        with:
+          mode: save
+          job: lsp-lifecycle
+          classes: production+tests
+          key: ${{ steps.fp.outputs.key }}
+
   install:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     strategy:
       fail-fast: false
@@ -3082,7 +3242,7 @@ jobs:
         run: cargo install --locked --path . --debug
 
   windows-msi:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 30
@@ -3143,7 +3303,7 @@ jobs:
           if (Test-Path $installed) { throw 'MSI uninstall left the installed binary behind' }
 
   package:
-    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -3184,7 +3344,7 @@ jobs:
             grep -Fxq "JS runtime check: PASS (2)"
 
   dependency-policy:
-    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
