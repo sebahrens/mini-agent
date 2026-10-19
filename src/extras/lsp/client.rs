@@ -26,6 +26,65 @@ pub(crate) struct Document {
     text: String,
     identity: crate::fs::CheckedMetadata,
     content: crate::fs::ContentDigest,
+    /// Wall-clock time just before identity capture and the read; the
+    /// reference for deciding whether file timestamps are trustworthy.
+    started: std::time::SystemTime,
+}
+
+/// A file whose last change is within this window of our read could be changed
+/// again inside the same timestamp tick, so its timestamps prove nothing.
+const RACY_WINDOW: Duration = Duration::from_millis(50);
+
+#[cfg(test)]
+thread_local! {
+    static REHASH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the retained handle still reports the exact size and change times
+/// captured at read, with the last change old enough that a same-tick rewrite
+/// is impossible. Only then may the second full-file hash be skipped.
+fn stat_proves_unchanged(document: &Document) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let before: &std::fs::Metadata = &document.identity;
+        let Ok(now) = document.identity.handle().metadata() else {
+            return false;
+        };
+        if now.len() != before.len()
+            || now.mtime() != before.mtime()
+            || now.mtime_nsec() != before.mtime_nsec()
+            || now.ctime() != before.ctime()
+            || now.ctime_nsec() != before.ctime_nsec()
+        {
+            return false;
+        }
+        let last = (before.ctime(), before.ctime_nsec()).max((before.mtime(), before.mtime_nsec()));
+        let (Ok(secs), Ok(nanos)) = (u64::try_from(last.0), u32::try_from(last.1)) else {
+            return false;
+        };
+        let changed = std::time::UNIX_EPOCH + Duration::new(secs, nanos);
+        document
+            .started
+            .duration_since(changed)
+            .is_ok_and(|age| age > RACY_WINDOW)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = document;
+        false
+    }
+}
+
+/// Confirms the bytes read still match the file, hashing again only when
+/// timestamps cannot prove it.
+async fn document_content_current(document: &Document) -> bool {
+    if stat_proves_unchanged(document) {
+        return true;
+    }
+    #[cfg(test)]
+    REHASH_COUNT.with(|count| count.set(count.get() + 1));
+    content_matches(&document.identity, Some(document.content)).await
 }
 
 /// Observe the kernel pipe state without writing a probe frame. A fixture's
@@ -57,6 +116,7 @@ pub(crate) fn pipe_reader_closed_for_test(
 
 /// Capture identity from the same authorized handle that supplies the text.
 pub(crate) async fn read_document(file: tokio::fs::File) -> std::io::Result<Document> {
+    let started = std::time::SystemTime::now();
     let identity = crate::fs::checked_tokio_file_metadata(&file).await?;
     let text = read_document_text(file).await?;
     let content = crate::fs::ContentDigest::of(text.as_bytes());
@@ -64,6 +124,7 @@ pub(crate) async fn read_document(file: tokio::fs::File) -> std::io::Result<Docu
         text,
         identity,
         content,
+        started,
     })
 }
 
@@ -884,6 +945,7 @@ impl LspClient {
                 text,
                 identity,
                 content,
+                ..
             } = document;
             enum Sync {
                 Open,
@@ -1016,7 +1078,7 @@ impl LspClient {
         let relative = parent_path.strip_prefix(self.workspace.root()).ok()?;
         let wire_uri = file_uri(&self.server_root.join(relative))?;
         let uri = file_uri(&parent_path)?;
-        if !content_matches(&document.identity, Some(document.content)).await {
+        if !document_content_current(document).await {
             return None;
         }
         self.workspace.validate().ok()?;
@@ -1151,6 +1213,20 @@ struct SupervisedProtocol {
     shutdown_probe: ShutdownProbe,
 }
 
+/// The raw child under any wrapper layers: a wrapper's `inner` is a distinct
+/// object, while the raw tokio child returns itself.
+fn innermost_child(child: &mut dyn ChildWrapper) -> &mut dyn ChildWrapper {
+    let is_raw = std::ptr::addr_eq(
+        child.inner() as *const dyn ChildWrapper,
+        child as *const dyn ChildWrapper,
+    );
+    if is_raw {
+        child
+    } else {
+        innermost_child(child.inner_mut())
+    }
+}
+
 async fn supervise_child(
     name: String,
     mut child: Box<dyn ChildWrapper>,
@@ -1168,22 +1244,21 @@ async fn supervise_child(
         #[cfg(test)]
         shutdown_probe,
     } = protocol;
-    // Poll the direct child as well as protocol tasks. A crashed server can
+    // Await the direct child as well as protocol tasks. A crashed server can
     // leave a descendant holding inherited stdio open; waiting only for EOF
-    // or the whole process group would then hang forever.
-    let mut poll = tokio::time::interval(Duration::from_millis(25));
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => break,
-            _ = poll.tick() => {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::debug!("lsp[{name}]: child status failed: {error}");
-                        break;
-                    }
-                }
+    // or the whole process group would then hang forever. The wrapper's own
+    // `wait` also blocks reaping the group after the leader exits, so wait on
+    // the raw child, which completes as soon as the direct child does.
+    //
+    // Tokio caches the status, so the wrapper's later `wait`/`try_wait` in
+    // `terminate_and_reap` still observe it and reap the remaining group
+    // members as before.
+    let direct = innermost_child(child.as_mut());
+    tokio::select! {
+        _ = shutdown_rx.recv() => {}
+        status = direct.wait() => {
+            if let Err(error) = status {
+                tracing::debug!("lsp[{name}]: child status failed: {error}");
             }
         }
     }
@@ -1857,5 +1932,38 @@ mod boundary_tests {
         drop(manager);
         drop(workspace);
         std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settled_unchanged_document_is_hashed_once_and_racy_or_rewritten_files_rehash() {
+        let dir = std::env::temp_dir().join(format!("lsp-rehash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, b"fn a() {}\n").unwrap();
+        let rehashes = || REHASH_COUNT.with(std::cell::Cell::get);
+
+        // Fresh write: timestamps are inside the racy window, so rehash.
+        let racy = read_document(crate::fs::open_stable_file(&path).await.unwrap())
+            .await
+            .unwrap();
+        let start = rehashes();
+        assert!(document_content_current(&racy).await);
+        assert_eq!(rehashes(), start + 1);
+
+        // Settled and unchanged: the read-time hash is the only hash.
+        tokio::time::sleep(RACY_WINDOW * 2).await;
+        let settled = read_document(crate::fs::open_stable_file(&path).await.unwrap())
+            .await
+            .unwrap();
+        let start = rehashes();
+        assert!(document_content_current(&settled).await);
+        assert_eq!(rehashes(), start, "no second hash for a settled file");
+
+        // Same-length in-place rewrite changes ctime: detected by rehash.
+        std::fs::write(&path, b"fn b() {}\n").unwrap();
+        assert!(!document_content_current(&settled).await);
+        assert_eq!(rehashes(), start + 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

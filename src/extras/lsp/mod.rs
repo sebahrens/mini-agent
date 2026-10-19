@@ -29,6 +29,10 @@ use client::{DiagStore, LspClient};
 /// stay fast; servers that don't republish identical diagnostics just time
 /// out and reuse the previous (identical) set.
 const DIAG_WAIT: Duration = Duration::from_millis(1000);
+/// Wait used after a server missed its publish window: long enough to notice a
+/// server that republishes promptly again, short enough that a server which
+/// never republishes (indexing, identical-diagnostics dedupe) costs ~nothing.
+const DIAG_WAIT_AFTER_MISS: Duration = Duration::from_millis(50);
 const SERVER_RETRY_BASE: Duration = Duration::from_secs(1);
 const SERVER_RETRY_MAX: Duration = Duration::from_secs(60);
 const SERVER_FAILURE_COUNT_MAX: u32 = 7;
@@ -104,12 +108,24 @@ struct Inner {
     failures: Mutex<HashMap<String, ServerFailureState>>,
     diags: DiagStore,
     diag_notify: Arc<Notify>,
+    /// server name → whether its last edit wait missed the publish.
+    publish_waits: Mutex<HashMap<String, PublishWaitState>>,
     #[cfg(test)]
     active_bindings: Arc<AtomicUsize>,
     #[cfg(test)]
     peak_bindings: Arc<AtomicUsize>,
     #[cfg(test)]
     test_synced_documents: Arc<std::sync::Mutex<HashMap<String, client::SyncedDocument>>>,
+}
+
+/// Adaptive state for the post-edit `publishDiagnostics` wait of one server.
+#[derive(Debug, Default, Clone)]
+struct PublishWaitState {
+    /// The last edit wait timed out without a publish.
+    missed: bool,
+    /// Cache uri and publish counter at that miss; a later counter increase
+    /// means the server published after we stopped waiting.
+    missed_at: Option<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -335,6 +351,7 @@ impl LspManager {
             failures: Mutex::new(HashMap::new()),
             diags: DiagStore::default(),
             diag_notify: Arc::new(Notify::new()),
+            publish_waits: Mutex::new(HashMap::new()),
             #[cfg(test)]
             active_bindings: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -510,10 +527,36 @@ impl LspManager {
         wait: Duration,
         baseline: Option<u64>,
     ) -> Option<String> {
+        self.diagnostics_block_observed(path, wait, baseline)
+            .await
+            .0
+    }
+
+    /// Like [`Self::diagnostics_block_since`], also reporting whether the
+    /// awaited publish arrived (`None` when no wait took place).
+    async fn diagnostics_block_observed(
+        &self,
+        path: &Path,
+        wait: Duration,
+        baseline: Option<u64>,
+    ) -> (Option<String>, Option<bool>) {
         if !self.handles(path) {
-            return None;
+            return (None, None);
         }
-        let uri = client::file_uri(path)?;
+        let Some(uri) = client::file_uri(path) else {
+            return (None, None);
+        };
+        let (output, published) = self.diagnostics_block_wait(uri, wait, baseline).await;
+        (output, Some(published))
+    }
+
+    async fn diagnostics_block_wait(
+        &self,
+        uri: String,
+        wait: Duration,
+        baseline: Option<u64>,
+    ) -> (Option<String>, bool) {
+        let mut published = false;
         // A production edit atomically replaces the file, so the previous
         // cache identity is expected to be stale here. Its version remains the
         // synchronization baseline while we wait for a publish tied to the new
@@ -541,6 +584,7 @@ impl LspManager {
                 .map(|d| d.version)
                 .unwrap_or(0);
             if current > v0 {
+                published = true;
                 break;
             }
             if tokio::time::timeout_at(deadline, &mut notified)
@@ -550,6 +594,10 @@ impl LspManager {
                 break; // timeout: use whatever is stored
             }
         }
+        (self.format_stored_diagnostics(uri).await, published)
+    }
+
+    async fn format_stored_diagnostics(&self, uri: String) -> Option<String> {
         self.inner.workspace.validate().ok()?;
         let file = self.inner.diags.lock().unwrap().get(&uri)?.clone();
         let output = crate::agent::runner::spawn_blocking_scoped(move || {
@@ -573,8 +621,67 @@ impl LspManager {
         path: &Path,
         baseline: Option<u64>,
     ) -> Option<String> {
-        self.diagnostics_block_since(path, DIAG_WAIT, baseline)
-            .await
+        self.diagnostics_block_adaptive(path, baseline).await
+    }
+
+    /// Edit-time wait that shortens itself for servers which did not publish
+    /// within the last full window, and returns to the full window as soon as
+    /// the server is seen publishing again.
+    async fn diagnostics_block_adaptive(
+        &self,
+        path: &Path,
+        baseline: Option<u64>,
+    ) -> Option<String> {
+        let server = registry::server_for_path(&self.inner.servers, path)?
+            .0
+            .clone();
+        let uri = client::file_uri(path)?;
+        let missed = {
+            let mut waits = self
+                .inner
+                .publish_waits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = waits.entry(server.clone()).or_default();
+            // A publish that landed after an earlier wait gave up proves the
+            // server still republishes, only slowly.
+            if let (Some((missed_uri, missed_version)), Some(baseline)) =
+                (&state.missed_at, baseline)
+                && *missed_uri == uri
+                && baseline > *missed_version
+            {
+                *state = PublishWaitState::default();
+            }
+            state.missed
+        };
+        let wait = if missed {
+            DIAG_WAIT_AFTER_MISS
+        } else {
+            DIAG_WAIT
+        };
+        let (output, published) = self
+            .diagnostics_block_wait(uri.clone(), wait, baseline)
+            .await;
+        let mut waits = self
+            .inner
+            .publish_waits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = waits.entry(server).or_default();
+        if published {
+            *state = PublishWaitState::default();
+        } else {
+            state.missed = true;
+            let version = self
+                .inner
+                .diags
+                .lock()
+                .unwrap()
+                .get(&uri)
+                .map_or(0, |diagnostics| diagnostics.version);
+            state.missed_at = Some((uri, version));
+        }
+        output
     }
 
     pub async fn diagnostics_block_relative(
@@ -583,6 +690,11 @@ impl LspManager {
         wait: Duration,
         baseline: Option<u64>,
     ) -> Option<String> {
+        let parent = self.resolve_relative(relative)?;
+        self.diagnostics_block_since(&parent, wait, baseline).await
+    }
+
+    fn resolve_relative(&self, relative: &Path) -> Option<PathBuf> {
         self.inner.workspace.validate().ok()?;
         let parent = self
             .inner
@@ -591,10 +703,9 @@ impl LspManager {
             .join(relative)
             .canonicalize()
             .ok()?;
-        if !parent.starts_with(self.inner.workspace.root()) {
-            return None;
-        }
-        self.diagnostics_block_since(&parent, wait, baseline).await
+        parent
+            .starts_with(self.inner.workspace.root())
+            .then_some(parent)
     }
 
     pub async fn diagnostics_block_for_relative_edit(
@@ -602,8 +713,8 @@ impl LspManager {
         relative: &Path,
         baseline: Option<u64>,
     ) -> Option<String> {
-        self.diagnostics_block_relative(relative, DIAG_WAIT, baseline)
-            .await
+        let parent = self.resolve_relative(relative)?;
+        self.diagnostics_block_adaptive(&parent, baseline).await
     }
 
     /// Sorted cache candidates that contain at least one error or warning.
