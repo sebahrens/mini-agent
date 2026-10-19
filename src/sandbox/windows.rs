@@ -2364,12 +2364,33 @@ fn canonical_file(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+/// Parent-side digest memo for `prove_executable`: the executable is still
+/// opened and its volume/file identity read on every call, but the image is
+/// re-hashed only when identity, length or last-write time differ from the
+/// entry that produced the cached digest. The helper's own pre-launch
+/// verification (`lock_executable`) never consults it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ExecutableStamp {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+    len: u64,
+    last_write: u64,
+}
+
+static EXECUTABLE_PROOF_CACHE: std::sync::Mutex<
+    Option<std::collections::HashMap<PathBuf, (ExecutableStamp, FileProof)>>,
+> = std::sync::Mutex::new(None);
+
 fn prove_executable(path: &Path) -> Result<FileProof, String> {
-    let (_, proof) = lock_executable(path)?;
+    let (_, proof) = lock_executable_inner(path, true)?;
     Ok(proof)
 }
 
 fn lock_executable(path: &Path) -> Result<(File, FileProof), String> {
+    lock_executable_inner(path, false)
+}
+
+fn lock_executable_inner(path: &Path, memoize: bool) -> Result<(File, FileProof), String> {
     let canonical = canonical_file(path, "executable proof")?;
     let mut file = open_stable_path(
         &canonical,
@@ -2382,6 +2403,29 @@ fn lock_executable(path: &Path) -> Result<(File, FileProof), String> {
     // writes and deletion through every alias until process creation.
     let identity = crate::fs::windows_file_identity(&file)
         .map_err(|error| format!("sandbox: inspect executable identity: {error}"))?;
+    let stamp = if memoize {
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("sandbox: inspect executable metadata: {error}"))?;
+        Some(ExecutableStamp {
+            volume_serial_number: identity.volume_serial_number,
+            file_id: identity.file_id,
+            len: metadata.len(),
+            last_write: metadata.last_write_time(),
+        })
+    } else {
+        None
+    };
+    if let Some(stamp) = stamp {
+        let cache = EXECUTABLE_PROOF_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached, proof)) = cache.as_ref().and_then(|map| map.get(&canonical))
+            && *cached == stamp
+        {
+            return Ok((file, *proof));
+        }
+    }
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -2398,6 +2442,13 @@ fn lock_executable(path: &Path) -> Result<(File, FileProof), String> {
         file_id: identity.file_id,
         sha256: hasher.finalize().into(),
     };
+    if let Some(stamp) = stamp {
+        EXECUTABLE_PROOF_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(canonical, (stamp, proof));
+    }
     Ok((file, proof))
 }
 
