@@ -292,6 +292,14 @@ impl ToolServerHandle {
         }
     }
 
+    /// Whether `get_tool_defs(None)` would advertise a static tool registered
+    /// under `tool_name`, without building any definition.
+    pub async fn advertises_static_tool(&self, tool_name: &str) -> bool {
+        let state = self.0.read().await;
+        state.static_tool_names.iter().any(|name| name == tool_name)
+            && state.toolset.get(tool_name).is_some()
+    }
+
     /// Retrieve tool definitions, optionally using a prompt to select
     /// dynamic tools from configured vector stores.
     pub async fn get_tool_defs(
