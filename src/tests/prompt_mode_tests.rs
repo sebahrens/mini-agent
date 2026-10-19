@@ -398,3 +398,40 @@ fn autoconfig_keeps_the_user_selected_mode() {
         assert_eq!(current_mode(&perm), mode);
     }
 }
+
+// Designer -> implementer -> reviewer pipeline fixture
+// (tests/fixtures/persona-pipeline): `/agent designer` activates the `design`
+// prompt and the prompt maps to the opus quick model.
+#[test]
+fn pipeline_designer_persona_activates_design_prompt_and_opus_model() {
+    let config: crate::config::Config = toml::from_str(include_str!(
+        "../../tests/fixtures/persona-pipeline/config.toml"
+    ))
+    .unwrap();
+    let mut context = make_context(&[(
+        "design",
+        include_str!("../../tests/fixtures/persona-pipeline/prompts/design.md"),
+    )]);
+    context.agent_definitions.insert(
+        "designer".to_string(),
+        crate::context::agents::parse_for_test(
+            "designer",
+            include_str!("../../tests/fixtures/persona-pipeline/agents/designer.md"),
+        ),
+    );
+
+    let outcome = apply_main_agent("designer", &mut context, &None).unwrap();
+
+    assert_eq!(outcome.default_prompt.as_deref(), Some("design"));
+    assert!(outcome.prompt_applied);
+    assert_eq!(context.current_prompt_name.as_deref(), Some("design"));
+    assert_eq!(context.current_agent_name.as_deref(), Some("designer"));
+    // The prompt selects the model switch `switch_to_prompt_model` performs.
+    let alias = config.resolve_prompt_model("design").unwrap();
+    assert_eq!(alias, "opus");
+    let opus = &crate::config::quick_models_map(&config)[alias];
+    assert_eq!(opus.provider.as_str(), "anthropic");
+    assert_eq!(opus.model.as_str(), "example-opus-model");
+    // Other prompts are unmapped, so only `design` moves the main model.
+    assert_eq!(config.resolve_prompt_model("code"), None);
+}

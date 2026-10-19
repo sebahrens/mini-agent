@@ -5204,6 +5204,9 @@ mod tests {
 }
 
 #[cfg(test)]
+mod persona_pipeline_tests;
+
+#[cfg(test)]
 mod response_limit_tests {
     use super::{MAX_BRIEF_ITEM_BYTES, TaskArgs, TaskTool, render_task_brief, task_heading};
     #[test]

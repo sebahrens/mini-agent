@@ -1438,6 +1438,10 @@ base_url = "https://gw.example/v1"
 api_key_env = "GATEWAY_API_KEY"   # or: api_keys.custom = "..."
 ```
 
+A custom provider can also back a quick-model alias used by a subagent persona,
+for example a `glm` provider serving write-mode implementer children; see
+[Designer → implementer → reviewer pipeline](SUBAGENTS.md#designer--implementer--reviewer-pipeline).
+
 If you deliberately run a proxy that should receive your vendor key (for
 example a local logging proxy in front of OpenAI), opt in on that entry:
 
