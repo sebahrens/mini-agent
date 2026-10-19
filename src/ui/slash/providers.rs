@@ -460,6 +460,7 @@ fn apply_model_pricing(
     ))
 }
 
+#[cfg(test)]
 fn resolve_selected_model_capacity(
     provider: &str,
     model: &str,

@@ -121,6 +121,9 @@ impl Run {
             .initialize_spend_account(cfg.max_budget_usd)
             .err()
             .map(|_| Arc::<str>::from("invalid session cost accounting baseline"));
+        session
+            .spend_account
+            .set_token_caps(cfg.max_session_input_tokens, cfg.max_session_total_tokens);
         let ledger =
             crate::paths::process_paths_ref().map(|paths| Arc::new(Ledger::new(&paths.state_dir)));
         let (ledger, setup_error) = match ledger {
@@ -183,6 +186,7 @@ impl Run {
         selected: Option<&str>,
     ) -> anyhow::Result<Self> {
         let account = Account::new(session_id, cfg.max_budget_usd, 0.0)?;
+        account.set_token_caps(cfg.max_session_input_tokens, cfg.max_session_total_tokens);
         let (ledger, setup_error) = match crate::paths::process_paths_ref() {
             Ok(paths) => {
                 let ledger = account.runtime_ledger(Arc::new(Ledger::new(&paths.state_dir)));

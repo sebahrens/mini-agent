@@ -116,7 +116,11 @@ pub(crate) fn prepare(
     }
     if matches!(
         canonical,
-        "max_budget_usd" | "cache_ttl" | "permission_mode_cycle"
+        "max_budget_usd"
+            | "max_session_input_tokens"
+            | "max_session_total_tokens"
+            | "cache_ttl"
+            | "permission_mode_cycle"
     ) {
         return Err("This setting can only be changed in global configuration");
     }

@@ -1260,6 +1260,9 @@ impl Startup {
         }
 
         session.initialize_spend_account(max_budget_usd)?;
+        session
+            .spend_account
+            .set_token_caps(cfg.max_session_input_tokens, cfg.max_session_total_tokens);
         let reconciliation_scope = crate::agent::runner::AgentWorkScope::new();
         let reconciliation_cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(
             std::sync::Arc::clone(&reconciliation_scope),

@@ -1267,6 +1267,11 @@ impl Cli {
         crate::spend::validate_cap(self.max_budget_usd.or(cfg.max_budget_usd))
     }
 
+    /// True when a USD or session token ceiling bounds spend.
+    pub(crate) fn has_spend_ceiling(&self, cfg: &config::Config) -> anyhow::Result<bool> {
+        Ok(self.resolve_max_budget_usd(cfg)?.is_some() || cfg.has_session_token_ceiling())
+    }
+
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
         self.max_tokens.or(cfg.max_tokens).unwrap_or(16384)
     }

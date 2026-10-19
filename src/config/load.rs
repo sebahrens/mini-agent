@@ -2057,6 +2057,8 @@ pub(super) fn merge_config_value_layer(
 ) -> Result<Config, String> {
     if let Some(table) = local.as_table_mut() {
         table.remove("max_budget_usd");
+        table.remove("max_session_input_tokens");
+        table.remove("max_session_total_tokens");
         table.remove("cache_ttl");
     }
     let mut provenance = base.provenance.clone();
@@ -3407,6 +3409,21 @@ mod project_config_trust_tests {
         let trust = root.join("state/config/trusted-project-configs.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         (root, config, trust)
+    }
+
+    #[test]
+    fn session_token_ceilings_are_global_only() {
+        let base = Config {
+            max_session_total_tokens: Some(10),
+            ..Default::default()
+        };
+        let local: toml::Value =
+            toml::from_str("max_session_input_tokens = 99\nmax_session_total_tokens = 5000\nchat_left_margin = 3\n")
+                .unwrap();
+        let merged = super::merge_config_value(&base, local).unwrap();
+        assert_eq!(merged.max_session_total_tokens, Some(10));
+        assert_eq!(merged.max_session_input_tokens, None);
+        assert_eq!(merged.chat_left_margin, Some(3));
     }
 
     #[test]

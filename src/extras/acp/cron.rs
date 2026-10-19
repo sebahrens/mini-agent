@@ -49,8 +49,7 @@ const RUN_REFUSED: &str = "cron: /cron run is not available over ACP (there is n
 const RESUME_REFUSED: &str =
     "cron: /cron resume is not available over ACP (ACP schedules are never saved)";
 const PAYLOAD_REFUSED: &str = "cron: ACP cron payloads are plain prompts; slash commands and shell (!) lines cannot be scheduled over ACP";
-const BUDGET_UNBOUNDED: &str =
-    "cron: no max_budget_usd is set, so scheduled turns are unbounded in spend";
+const BUDGET_UNBOUNDED: &str = "cron: no max_budget_usd or session token ceiling is set, so scheduled turns are unbounded in spend";
 
 /// How long a due fire waits before re-checking a busy session.
 const BUSY_POLL: Duration = Duration::from_secs(1);
@@ -393,10 +392,7 @@ pub(super) async fn handle_command(
         let sess = sessions
             .get(session_id)
             .ok_or_else(|| agent_client_protocol::Error::new(-32602, "unknown ACP session"))?;
-        (
-            sess.cron.shared(),
-            sess.spend.account.snapshot().cap.is_some(),
-        )
+        (sess.cron.shared(), sess.spend.account.has_ceiling())
     };
     let edit = cron
         .apply(
@@ -523,7 +519,7 @@ async fn fire(
         return Fire::Busy;
     }
     let account = &sess.spend.account;
-    if account.snapshot().cap.is_some() && account.admit(sess.spend.prices).is_err() {
+    if account.has_ceiling() && account.admit(sess.spend.prices).is_err() {
         if let Some(count) = cron.suspend() {
             let _ = notice(
                 cx,

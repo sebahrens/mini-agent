@@ -126,6 +126,12 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("max_budget_usd")
         .described("Global spend ceiling in US dollars")
         .shaped(ConfigShape::Number),
+    key("max_session_input_tokens")
+        .described("Global session ceiling on observed input tokens (needs no prices)")
+        .shaped(ConfigShape::Integer),
+    key("max_session_total_tokens")
+        .described("Global session ceiling on observed input plus output tokens (needs no prices)")
+        .shaped(ConfigShape::Integer),
     key("cache_ttl").described("Owner-selected native Anthropic cache TTL. Project layers cannot alter this billing policy. Omission preserves manual five-minute caching.").shaped(ConfigShape::Enum(&["5m", "1h"])),
     key("temperature")
         .described("Sampling temperature")
