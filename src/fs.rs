@@ -1469,6 +1469,7 @@ pub(crate) fn atomic_write_sync(path: &Path, contents: &[u8]) -> std::io::Result
 /// previous record can never fuse with this one. Callers serialize writers
 /// (the memory store holds its flock). Returns `Unsupported` where the
 /// primitive is unavailable; callers fall back to `atomic_write_sync`.
+#[cfg(feature = "memory")]
 pub(crate) fn private_append_sync(
     path: &Path,
     record: &[u8],
@@ -1506,6 +1507,7 @@ pub(crate) fn private_append_sync(
     )
 }
 
+#[cfg(feature = "memory")]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(unsafe_code)]
 fn private_append_platform(
@@ -1613,6 +1615,7 @@ fn private_append_platform(
     Ok(())
 }
 
+#[cfg(feature = "memory")]
 #[cfg(windows)]
 fn private_append_platform(
     parent: &Path,
@@ -1666,6 +1669,7 @@ fn private_append_platform(
     Ok(())
 }
 
+#[cfg(feature = "memory")]
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn private_append_platform(
     _parent: &Path,

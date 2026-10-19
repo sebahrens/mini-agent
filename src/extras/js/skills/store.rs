@@ -735,64 +735,6 @@ impl SkillStore {
         Ok(snapshot)
     }
 
-    /// Load identity-checked active and canary artifacts that need embeddings.
-    ///
-    /// Canaries remain excluded from the published retrieval snapshot, but
-    /// their vectors must migrate with the active corpus so replacement
-    /// routing continues to work after an embedding model revision changes.
-    #[cfg(test)]
-    pub fn embedding_backfill_rows(
-        &self,
-        model_id: &str,
-        model_revision: &str,
-    ) -> Result<Vec<(SkillArtifact, Option<StoredEmbedding>)>, StoreError> {
-        let mut statement = self.db.prepare(
-            "SELECT r.id, r.identity_version, r.source, r.description, r.tags_json,
-                    r.exports_json, r.tests_json, r.capability_json, r.status,
-                    e.dimensions, e.normalized, e.embedding
-             FROM skill_revisions r
-             LEFT JOIN skill_embeddings e
-               ON e.skill_id = r.id AND e.model_id = ? AND e.model_revision = ?
-             WHERE r.status IN ('active', 'canary') AND r.identity_version = 2
-             ORDER BY r.id",
-        )?;
-        let rows = statement.query_map(params![model_id, model_revision], |row| {
-            Ok((
-                read_artifact_row(row)?,
-                row.get::<_, Option<i64>>(9)?,
-                row.get::<_, Option<i64>>(10)?,
-                row.get::<_, Option<Vec<u8>>>(11)?,
-            ))
-        })?;
-
-        let mut snapshot = Vec::new();
-        for row in rows {
-            let (artifact, dimensions, normalized, bytes) = row?;
-            let Ok(artifact) = artifact else {
-                continue;
-            };
-            if artifact.verify_identity().is_err() {
-                continue;
-            }
-            let embedding = match decode_stored_embedding(
-                &artifact.id,
-                model_id,
-                model_revision,
-                dimensions,
-                normalized,
-                bytes,
-            ) {
-                Ok(embedding) => embedding,
-                Err(error) => {
-                    tracing::warn!(skill_id = %artifact.id, %error, "ignoring corrupt learned-skill embedding row");
-                    None
-                }
-            };
-            snapshot.push((artifact, embedding));
-        }
-        Ok(snapshot)
-    }
-
     /// Load lifecycle and embedding data without fetching artifact bodies.
     ///
     /// Index rebuilds already hold an identity-checked artifact snapshot. This

@@ -937,6 +937,7 @@ impl WorkspaceBinding {
     /// compared, so only this binding's own held descriptor is re-checked by
     /// identity (one fstat). Any difference falls back to the full `validate`,
     /// and nothing is cached across calls.
+    #[cfg(feature = "mcp")]
     pub(crate) fn validate_after(&self, validated: &Self) -> Result<(), String> {
         if self.root != validated.root
             || crate::fs::ensure_same_file(&self.root, &self.identity, &validated.identity).is_err()
