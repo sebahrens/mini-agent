@@ -194,6 +194,20 @@ impl MutationDiff {
         ranges: Vec<AppliedRange>,
         options: DiffOptions,
     ) -> Option<Self> {
+        Self::build_with_digests(path, before, after, ranges, options, None, None)
+    }
+
+    /// Like `build`, reusing SHA-256 hex digests the caller already holds for
+    /// exactly `before`/`after` instead of hashing the same bytes again.
+    pub(crate) fn build_with_digests(
+        path: &str,
+        before: Option<&str>,
+        after: &str,
+        ranges: Vec<AppliedRange>,
+        options: DiffOptions,
+        before_sha256: Option<String>,
+        after_sha256: Option<String>,
+    ) -> Option<Self> {
         let options = options.bounded();
         let old = before.unwrap_or_default();
         if options.max_lines == 0
@@ -227,8 +241,8 @@ impl MutationDiff {
         let (old_ids, new_ids) = line_identities(&old_lines, &new_lines);
         let mut result = Self {
             path: path.into(),
-            before_sha256: before.map(digest),
-            after_sha256: digest(after),
+            before_sha256: before_sha256.or_else(|| before.map(digest)),
+            after_sha256: after_sha256.unwrap_or_else(|| digest(after)),
             before_bytes: old.len(),
             after_bytes: after.len(),
             ranges,
@@ -434,6 +448,31 @@ impl MutationDiff {
                 after_end: after.len(),
             }],
             options,
+        )
+    }
+
+    /// `replacement` reusing digests the caller already holds for exactly these bytes.
+    pub(crate) fn replacement_with_digests(
+        path: &str,
+        before: Option<&str>,
+        after: &str,
+        options: DiffOptions,
+        before_sha256: Option<String>,
+        after_sha256: String,
+    ) -> Option<Self> {
+        Self::build_with_digests(
+            path,
+            before,
+            after,
+            vec![AppliedRange {
+                before_start: 0,
+                before_end: before.map_or(0, str::len),
+                after_start: 0,
+                after_end: after.len(),
+            }],
+            options,
+            before_sha256,
+            Some(after_sha256),
         )
     }
 

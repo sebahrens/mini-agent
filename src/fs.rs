@@ -709,6 +709,11 @@ pub(crate) struct ContentDigest {
 }
 
 impl ContentDigest {
+    /// Lowercase SHA-256 hex, identical to hashing the same bytes directly.
+    pub(crate) fn hex(&self) -> String {
+        crate::hex::encode_lower(self.hash)
+    }
+
     pub(crate) fn of(bytes: &[u8]) -> Self {
         use sha2::Digest;
 

@@ -82,7 +82,7 @@ pub(crate) struct WorkspaceBinding {
 impl WorkspaceBinding {
     /// Bounded compatibility data, never a persisted workspace capability.
     /// Check the path size before canonicalization or any owned encoding, and
-    /// validate both sides of reading the already-retained physical identity.
+    /// validate the binding after folding in the already-retained identity.
     #[allow(
         dead_code,
         reason = "shared API is intentionally dormant before its frontend consumer lands"
@@ -121,7 +121,8 @@ impl WorkspaceBinding {
                 hash.update(unit.to_le_bytes());
             }
         }
-        self.validate()?;
+        // `identity` is the immutable captured value, so one validation after
+        // it is folded in establishes the same fact as a bracketing pair.
         hash.update(self.identity.identity_fingerprint());
         self.validate()?;
         Ok(hash.finalize().into())
