@@ -11793,6 +11793,7 @@ mod custom_command_tests {
         let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
         let cli = crate::cli::Cli {
             no_session: true,
+            provider: Some("local-test".into()),
             api_key: Some("unused-key".into()),
             no_tools: true,
             no_sandbox: true,
