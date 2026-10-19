@@ -6,6 +6,44 @@ use std::env::VarError;
 pub(crate) mod oauth;
 pub(crate) mod openai_plan;
 
+/// Identity of a private credential record as of a read: replacing,
+/// rewriting, truncating or removing the file changes it (every save is an
+/// atomic replace). Lets a request reuse a still-valid token without taking
+/// the credential lock and parsing the record again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileFingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl FileFingerprint {
+    /// The fingerprint of `path`, read through the same private-file check as
+    /// the stores, so a replaced, shared or foreign file is never trusted.
+    pub(crate) fn of_private_file(path: &std::path::Path) -> Option<Self> {
+        let file =
+            crate::fs::open_private_file_checked(path, crate::fs::PrivateFileAccess::Read).ok()?;
+        let metadata = file.metadata().ok()?;
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            identity,
+        })
+    }
+}
+
 /// Local, read-only presence metadata. This never grants request authority or
 /// claims that an account is valid with the remote provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
