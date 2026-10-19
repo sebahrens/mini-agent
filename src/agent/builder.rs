@@ -2381,7 +2381,7 @@ mod extra_file_tests {
                             .is_some_and(|required| required.len() == 1)
                     );
                     assert_eq!(d.parameters["additionalProperties"], false);
-                    d.name
+                    d.name.clone()
                 })
                 .collect::<Vec<_>>();
             names.sort();
@@ -3242,7 +3242,7 @@ mod js_tests {
                 .await
                 .unwrap()
                 .into_iter()
-                .map(|tool| tool.name)
+                .map(|tool| tool.name.clone())
                 .collect()
         }
 

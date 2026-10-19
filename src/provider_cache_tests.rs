@@ -24,11 +24,13 @@ async fn cache71_typed_ttl_factory_preserves_default_and_sets_native_one_hour_wi
                 .preamble("stable system".to_string())
                 .max_tokens(1000)
                 .build();
-            request.tools.push(rig::completion::ToolDefinition {
-                name: "static_tool".into(),
-                description: "No effect is executed by this wire probe".into(),
-                parameters: json!({"type":"object","properties":{}}),
-            });
+            request
+                .tools
+                .push(std::sync::Arc::new(rig::completion::ToolDefinition {
+                    name: "static_tool".into(),
+                    description: "No effect is executed by this wire probe".into(),
+                    parameters: json!({"type":"object","properties":{}}),
+                }));
             if stream {
                 let mut response = model.stream(request).await.unwrap();
                 while let Some(part) = response.next().await {
@@ -606,4 +608,131 @@ async fn cache71_actual_canonical_mixed_receipt_and_missing_split_remain_honest(
             json!({"type":"ephemeral","ttl":"1h"})
         );
     }
+}
+
+struct SchemaProbe {
+    name: &'static str,
+    schema: Value,
+    schema_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl rig::tool::ToolDyn for SchemaProbe {
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+
+    fn description(&self) -> String {
+        format!("probe tool {}", self.name)
+    }
+
+    fn parameters(&self) -> Value {
+        self.schema_calls.fetch_add(1, Ordering::SeqCst);
+        self.schema.clone()
+    }
+
+    fn call<'a>(
+        &'a self,
+        _args: String,
+    ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<String, rig::tool::ToolError>> {
+        Box::pin(async { Ok(String::new()) })
+    }
+}
+
+/// Memoized definitions are shared (not deep-cloned) into every request, the
+/// schema is built once per registration, and the serialized provider request
+/// bytes equal those of the legacy owned-definition construction.
+#[tokio::test]
+async fn memoized_tool_definitions_are_shared_across_requests_with_identical_wire_bytes() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probes = [
+        (
+            "read_file",
+            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        ),
+        (
+            "mcp__github__create_issue",
+            json!({"type":"object","properties":{"title":{"type":"string","description":"é界"},"labels":{"type":"array","items":{"type":"string"}}},"required":["title"],"additionalProperties":false}),
+        ),
+        (
+            "mcp__db__query",
+            json!({"type":"object","properties":{"sql":{"type":"string"},"limit":{"type":"integer","minimum":1}}}),
+        ),
+    ];
+    let tools = crate::agent::tools::memoize::definitions(
+        probes
+            .iter()
+            .map(|(name, schema)| {
+                Box::new(SchemaProbe {
+                    name,
+                    schema: schema.clone(),
+                    schema_calls: Arc::clone(&calls),
+                }) as Box<dyn rig::tool::ToolDyn>
+            })
+            .collect(),
+    );
+    let handle = rig::tool::server::ToolServer::new().run();
+    handle
+        .append_toolset(rig::tool::ToolSet::from_tools_boxed(tools))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), probes.len());
+
+    let first = handle.get_tool_defs(None).await.unwrap();
+    let second = handle.get_tool_defs(None).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        probes.len(),
+        "schemas are built once per registration"
+    );
+    assert_eq!(first.len(), probes.len());
+    for (a, b) in first.iter().zip(&second) {
+        assert!(
+            Arc::ptr_eq(a, b),
+            "{} must be shared across requests",
+            a.name
+        );
+    }
+
+    let wire = Wire::new(vec![(false, json!({"id":"msg_t","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-opus-5-5","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}).to_string())]);
+    let AnyModel::Anthropic(model) = wire.client().completion_model("claude-opus-5-5") else {
+        unreachable!()
+    };
+    let request = model
+        .completion_request("tools")
+        .max_tokens(100)
+        .tools(first.clone())
+        .build();
+    assert!(
+        Arc::ptr_eq(&request.tools[1], &first[1]),
+        "the request carries the shared Arc"
+    );
+    model.completion(request).await.unwrap();
+    let body = wire.finish().remove(0);
+
+    let legacy: Vec<Value> = probes
+        .iter()
+        .map(|(name, schema)| {
+            serde_json::to_value(rig::providers::anthropic::completion::ToolDefinition {
+                name: name.to_string(),
+                description: Some(format!("probe tool {name}")),
+                input_schema: schema.clone(),
+                cache_control: None,
+            })
+            .unwrap()
+        })
+        .collect();
+    let sent_tools: Vec<Value> = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            let mut tool = tool.clone();
+            tool.as_object_mut().unwrap().remove("cache_control");
+            tool
+        })
+        .collect();
+    assert_eq!(
+        serde_json::to_string(&sent_tools).unwrap(),
+        serde_json::to_string(&legacy).unwrap()
+    );
 }

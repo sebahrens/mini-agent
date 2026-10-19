@@ -4,13 +4,15 @@
 //! implementations still need to return owned values, but their descriptions
 //! and JSON schemas only need to be constructed once per registered instance.
 
+use std::sync::Arc;
+
 use rig::completion::ToolDefinition;
 use rig::tool::{ToolCallExtensions, ToolDyn, ToolError, ToolExecutionResult};
 use rig::wasm_compat::WasmBoxedFuture;
 
 struct DefinitionMemoizedTool {
     inner: Box<dyn ToolDyn>,
-    definition: ToolDefinition,
+    definition: Arc<ToolDefinition>,
 }
 
 impl DefinitionMemoizedTool {
@@ -20,7 +22,10 @@ impl DefinitionMemoizedTool {
             description: inner.description(),
             parameters: inner.parameters(),
         };
-        Self { inner, definition }
+        Self {
+            inner,
+            definition: Arc::new(definition),
+        }
     }
 }
 
@@ -35,6 +40,12 @@ impl ToolDyn for DefinitionMemoizedTool {
 
     fn parameters(&self) -> serde_json::Value {
         self.definition.parameters.clone()
+    }
+
+    /// Shares the one memoized definition, so a completion request carries an
+    /// `Arc` clone instead of a deep copy of the schema and description.
+    fn shared_definition(&self) -> Option<Arc<ToolDefinition>> {
+        Some(Arc::clone(&self.definition))
     }
 
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {

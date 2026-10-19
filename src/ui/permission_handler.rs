@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::Color;
 
+use crate::config::keybindings::KeyAction;
 use crate::event::UserEvent;
 use crate::permission::checker::PromptGrantOffer;
 use crate::ui::events::sanitize_for_review;
@@ -91,15 +92,26 @@ pub(super) fn prompt_scroll(event: &UserEvent) -> Option<PromptScroll> {
     match event {
         UserEvent::ScrollUp => Some(PromptScroll::LineUp),
         UserEvent::ScrollDown => Some(PromptScroll::LineDown),
-        UserEvent::Key(key) => match key.code {
-            KeyCode::Up => Some(PromptScroll::LineUp),
-            KeyCode::Down => Some(PromptScroll::LineDown),
-            KeyCode::PageUp => Some(PromptScroll::PageUp),
-            KeyCode::PageDown => Some(PromptScroll::PageDown),
-            KeyCode::Home => Some(PromptScroll::Top),
-            KeyCode::End => Some(PromptScroll::Bottom),
-            _ => None,
-        },
+        UserEvent::ScrollPageUp => Some(PromptScroll::PageUp),
+        UserEvent::ScrollPageDown => Some(PromptScroll::PageDown),
+        // The shared keybindings layer owns the page and jump chords (PageUp,
+        // Alt+Up, Ctrl+Home, Alt+<, ...), so the prompt never drifts from the
+        // idle prompt. Prompts use the default table, as `keyboard_action` does.
+        UserEvent::Key(key) => {
+            match crate::config::keybindings::KeyBindings::default().action(*key, false) {
+                Some(KeyAction::PageUp) => Some(PromptScroll::PageUp),
+                Some(KeyAction::PageDown) => Some(PromptScroll::PageDown),
+                Some(KeyAction::TranscriptTop) => Some(PromptScroll::Top),
+                Some(KeyAction::TranscriptBottom) => Some(PromptScroll::Bottom),
+                _ => match key.code {
+                    KeyCode::Up => Some(PromptScroll::LineUp),
+                    KeyCode::Down => Some(PromptScroll::LineDown),
+                    KeyCode::Home => Some(PromptScroll::Top),
+                    KeyCode::End => Some(PromptScroll::Bottom),
+                    _ => None,
+                },
+            }
+        }
         _ => None,
     }
 }
@@ -619,6 +631,43 @@ mod tests {
             assert_eq!(prompt_scroll(&key(KeyCode::Char(answer))), None);
         }
         assert_eq!(prompt_scroll(&key(KeyCode::Esc)), None);
+    }
+
+    #[test]
+    fn kbv3d_modifier_chords_and_page_wheel_scroll_while_a_prompt_waits() {
+        let chord = |code, modifiers| UserEvent::Key(KeyEvent::new(code, modifiers));
+        let alt = KeyModifiers::ALT;
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        for (event, expected) in [
+            (chord(KeyCode::Up, alt), PromptScroll::PageUp),
+            (chord(KeyCode::Down, alt), PromptScroll::PageDown),
+            (chord(KeyCode::Up, alt_shift), PromptScroll::Top),
+            (chord(KeyCode::Down, alt_shift), PromptScroll::Bottom),
+            (chord(KeyCode::Char('<'), alt), PromptScroll::Top),
+            (chord(KeyCode::Char('>'), alt_shift), PromptScroll::Bottom),
+            (
+                chord(KeyCode::Home, KeyModifiers::CONTROL),
+                PromptScroll::Top,
+            ),
+            (
+                chord(KeyCode::End, KeyModifiers::CONTROL),
+                PromptScroll::Bottom,
+            ),
+            (UserEvent::ScrollPageUp, PromptScroll::PageUp),
+            (UserEvent::ScrollPageDown, PromptScroll::PageDown),
+        ] {
+            assert_eq!(prompt_scroll(&event), Some(expected), "{event:?}");
+        }
+        // Plain arrows still move by line and answer keys are never claimed.
+        assert_eq!(
+            prompt_scroll(&chord(KeyCode::Up, KeyModifiers::NONE)),
+            Some(PromptScroll::LineUp)
+        );
+        assert_eq!(prompt_scroll(&chord(KeyCode::Char('y'), alt)), None);
+        assert_eq!(
+            prompt_scroll(&chord(KeyCode::Char('<'), KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]

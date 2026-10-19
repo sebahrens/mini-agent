@@ -22,8 +22,12 @@ pub(crate) struct SubagentConfig {
     /// Retained so the TUI can restate a startup fallback after taking over
     /// stderr, and model queries can report the actual selection honestly.
     pub fallback_notice: Option<String>,
-    /// CLI key retained only so a persona quick-model can select another
-    /// provider with the same explicit credential semantics as startup.
+    /// The session's own provider: the only provider `api_key` may be sent to.
+    pub session_provider: String,
+    /// The `--api-key` value, valid for `session_provider` only. A persona
+    /// quick-model on any other provider resolves that provider's own
+    /// designated credential instead, so a vendor key never reaches a
+    /// third-party `base_url`.
     pub api_key: Option<String>,
     pub max_turns: usize,
     /// Shared so each delegation snapshots it by reference count instead of
@@ -113,8 +117,9 @@ where
 /// Resolve the subagent provider/model/client exactly as interactive startup
 /// does: `subagent_model` (quick-model alias or raw id with
 /// `subagent_provider`) > `subagent_provider` + main model > main model. A
-/// different provider gets its own client with the same explicit credential
-/// semantics; if that client cannot be built the main provider is used.
+/// different provider gets its own client resolved from that provider's own
+/// designated credential (never the `--api-key`, which is scoped to the main
+/// provider); if that client cannot be built the main provider is used.
 pub(crate) fn resolve_config(
     cfg: &crate::config::Config,
     api_key: Option<&str>,
@@ -148,7 +153,7 @@ pub(crate) fn resolve_config(
     } else {
         match crate::provider::create_client(
             &sub_provider,
-            api_key,
+            None,
             cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         ) {
@@ -179,6 +184,7 @@ pub(crate) fn resolve_config(
         provider_name: sub_provider,
         model_name: sub_model,
         fallback_notice,
+        session_provider: main_provider.to_owned(),
         api_key: api_key.map(str::to_owned),
         max_turns: task_max_turns,
         config: std::sync::Arc::new(cfg.clone()),

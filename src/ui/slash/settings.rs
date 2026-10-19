@@ -19,6 +19,20 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
             }
             Ok(())
         }
+        "/top" | "/bottom" => {
+            if parts.len() != 1 {
+                write_error(ctx.renderer, format!("usage: {}", parts[0]));
+                return Ok(());
+            }
+            // Key-independent fallback for terminals without Home/End or
+            // PageUp/PageDown; scrolls without adding transcript output.
+            if parts[0] == "/top" {
+                ctx.renderer.scroll_to_top();
+            } else {
+                ctx.renderer.scroll_to_bottom()?;
+            }
+            Ok(())
+        }
         "/vim" => {
             let enabled = match parts {
                 ["/vim"] => !ctx.input.vim_enabled(),
@@ -241,7 +255,7 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
                     &ctx.session.provider,
                     ctx.client,
                     ctx.cfg,
-                    ctx.cli.api_key.as_deref(),
+                    &ctx.cli.scoped_api_key(ctx.cfg),
                 ) {
                     write_error(
                         ctx.renderer,

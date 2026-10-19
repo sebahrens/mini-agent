@@ -2036,3 +2036,90 @@ fn cached_context_block_skips_unchanged_inputs_and_sees_every_change() {
     assert!(relogged.contains("log entry two"), "{relogged}");
     cleanup(&m);
 }
+
+fn durable_syncs() -> usize {
+    crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get)
+}
+
+#[test]
+fn plain_appends_sync_once_and_read_back_identically() {
+    let m = fresh("append-sync");
+    m.write(WriteTarget::Daily, "first", WriteMode::Append, None)
+        .unwrap();
+    let before = durable_syncs();
+    for i in 0..5 {
+        m.write(
+            WriteTarget::Daily,
+            &format!("entry {i}"),
+            WriteMode::Append,
+            None,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        durable_syncs() - before,
+        5,
+        "one fsync per append, no temp-file rewrite or directory sync"
+    );
+    assert_eq!(
+        fs::read_to_string(daily(&m, "2026-05-25")).unwrap(),
+        "first\nentry 0\nentry 1\nentry 2\nentry 3\nentry 4\n"
+    );
+    m.write(WriteTarget::Scratchpad, "- [ ] a", WriteMode::Append, None)
+        .unwrap();
+    m.write(WriteTarget::Note, "n1", WriteMode::Append, Some("topic"))
+        .unwrap();
+    m.write(WriteTarget::Note, "n2", WriteMode::Append, Some("topic"))
+        .unwrap();
+    assert_eq!(fs::read_to_string(scratchpad(&m)).unwrap(), "- [ ] a\n");
+    assert_eq!(
+        fs::read_to_string(pdir(&m).join("notes").join("topic.md")).unwrap(),
+        "n1\nn2\n"
+    );
+    cleanup(&m);
+}
+
+#[test]
+fn torn_final_record_is_tolerated_on_read_and_repaired_by_the_next_append() {
+    let m = fresh("append-torn");
+    let path = daily(&m, "2026-05-25");
+    // A previous append interrupted mid-record and mid-character.
+    let mut torn = b"complete\npartial \xe2\x82".to_vec();
+    fs::write(&path, &torn).unwrap();
+    torn.truncate(b"complete\npartial ".len());
+    assert_eq!(
+        crate::extras::memory::read_text_for_tests(&path).unwrap(),
+        String::from_utf8(torn).unwrap()
+    );
+    m.write(WriteTarget::Daily, "next", WriteMode::Append, None)
+        .unwrap();
+    // The torn bytes stay as they were; the new record starts on its own line.
+    let bytes = fs::read(&path).unwrap();
+    assert!(bytes.starts_with(b"complete\npartial \xe2\x82\nnext\n"));
+    // Other invalid UTF-8 is still an error, not silently accepted.
+    fs::write(&path, b"bad \xff byte\n").unwrap();
+    assert!(crate::extras::memory::read_text_for_tests(&path).is_err());
+    cleanup(&m);
+}
+
+#[cfg(unix)]
+#[test]
+fn plain_append_refuses_symlink_hardlink_and_directory_targets() {
+    use std::os::unix::fs::symlink;
+    let m = fresh("append-refuse");
+    let outside = pdir(&m).join("outside.txt");
+    fs::write(&outside, "outside\n").unwrap();
+    let notes = pdir(&m).join("notes");
+    symlink(&outside, notes.join("linked.md")).unwrap();
+    fs::hard_link(&outside, notes.join("hard.md")).unwrap();
+    fs::create_dir(notes.join("dir.md")).unwrap();
+    for name in ["linked", "hard", "dir"] {
+        assert!(
+            m.write(WriteTarget::Note, "x", WriteMode::Append, Some(name))
+                .is_err(),
+            "{name} must be refused"
+        );
+    }
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside\n");
+    cleanup(&m);
+}

@@ -2,6 +2,50 @@ use std::borrow::Cow;
 
 use regex::Regex;
 
+/// Upper bound on distinct compiled sources kept; the cache is dropped
+/// wholesale when exceeded so a long-lived server cannot grow it unboundedly.
+const COMPILED_REGEX_CACHE_LIMIT: usize = 4096;
+
+static COMPILED_REGEXES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Regex>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Regex compilations (cache misses) performed on this thread.
+    static REGEX_COMPILATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn regex_compilations_on_this_thread() -> usize {
+    REGEX_COMPILATIONS.with(std::cell::Cell::get)
+}
+
+/// Compile a policy regex, reusing an earlier compilation of the identical
+/// final source. The key is the exact regex text (after glob conversion,
+/// tilde expansion and filesystem alias resolution), so a changed policy or a
+/// retargeted symlink yields a different key and recompiles; only the pure,
+/// immutable `Regex` is shared. All rule and runtime state stays per checker.
+fn compiled_regex(source: &str) -> Result<Regex, regex::Error> {
+    let cache = COMPILED_REGEXES.get_or_init(Default::default);
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(source)
+    {
+        return Ok(hit.clone());
+    }
+    #[cfg(test)]
+    REGEX_COMPILATIONS.with(|count| count.set(count.get() + 1));
+    let compiled = Regex::new(source)?;
+    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if guard.len() >= COMPILED_REGEX_CACHE_LIMIT {
+        guard.clear();
+    }
+    guard.insert(source.to_owned(), compiled.clone());
+    Ok(compiled)
+}
+
 #[derive(Debug, Clone)]
 pub struct Pattern {
     regex: Regex,
@@ -68,10 +112,10 @@ impl Pattern {
         let original = pattern.to_string();
         let expanded = crate::fs::expand_tilde(pattern);
         Pattern {
-            regex: Regex::new(&glob_to_regex(&expanded))
+            regex: compiled_regex(&glob_to_regex(&expanded))
                 .expect("glob conversion must always produce a valid regular expression"),
             #[cfg(any(target_os = "macos", windows))]
-            folded_regex: Regex::new(&format!("(?i){}", glob_to_regex(&expanded)))
+            folded_regex: compiled_regex(&format!("(?i){}", glob_to_regex(&expanded)))
                 .expect("glob conversion must always produce a valid regular expression"),
             specificity: glob_specificity(&expanded),
             generated_web_origin: false,
@@ -87,9 +131,9 @@ impl Pattern {
         // slip past an anchored deny rule. Caller flags such as `(?i)` remain
         // valid after the prefix.
         Ok(Pattern {
-            regex: Regex::new(&format!("(?s){expanded}"))?,
+            regex: compiled_regex(&format!("(?s){expanded}"))?,
             #[cfg(any(target_os = "macos", windows))]
-            folded_regex: Regex::new(&format!("(?i)(?s){expanded}"))?,
+            folded_regex: compiled_regex(&format!("(?i)(?s){expanded}"))?,
             specificity: regex_specificity(&expanded),
             generated_web_origin: false,
             absolute_anchored: expanded.strip_prefix('^').is_some_and(|rest| {

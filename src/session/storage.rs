@@ -27,7 +27,27 @@ pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
     Ok(session)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts whole-session serializations on this test thread so tests can
+    /// pin that per-event paths (tool calls/results) do not re-encode it.
+    pub(crate) static SERIALIZE_BOUNDED_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Session file bytes. Identical to [`serialize_bounded_session`] except that a
+/// tool-result row whose display `content` is `prefix + tool.output` writes the
+/// output once (`content_prefix`), roughly halving tool-heavy files and the
+/// 8 MiB budget they consume (mini-agent-buv2v). Loading restores `content`
+/// exactly, and every digest is taken over the canonical form, never this one.
+pub(super) fn serialize_session_for_storage(session: &Session) -> anyhow::Result<String> {
+    let _storage = super::StorageEncodingGuard::enable();
+    serialize_bounded_session(session)
+}
+
 pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<String> {
+    #[cfg(test)]
+    SERIALIZE_BOUNDED_CALLS.with(|calls| calls.set(calls.get() + 1));
     // Encode the shared stores' coherent observation cut through a thread-local
     // override instead of deep-cloning the whole Session (mini-agent-hcb3s).
     #[cfg(feature = "subagents")]
@@ -205,20 +225,59 @@ pub(crate) fn atomic_write_with_failure(
 }
 
 pub fn save_session(session: &Session) -> anyhow::Result<()> {
-    // A synchronous save supersedes any queued turn-end snapshot and must not
-    // race an in-flight one: drop the queued bytes and join the writer first.
-    deferred::supersede(&session.id);
+    prepare_save(session)?.commit()
+}
+
+/// A session snapshot captured for a later blocking write. A legacy session is
+/// fully encoded (borrowing the live session, no deep clone); a native-bearing
+/// session needs the write-time digest/revision/lease checks against a whole
+/// `Session`, so it keeps an owned clone (mini-agent-twon3).
+pub(crate) enum PreparedSave {
+    Native(Box<Session>),
+    Legacy { id: String, json: String },
+    Disabled { id: String },
+}
+
+/// Validate and capture `session` exactly as [`save_session`] does, without
+/// touching the disk. The result is `Send` and is written by [`PreparedSave::commit`].
+pub(crate) fn prepare_save(session: &Session) -> anyhow::Result<PreparedSave> {
     if super::native_publication::is_native_bearing(session) {
-        return super::native_publication::save_snapshot(session);
+        return Ok(PreparedSave::Native(Box::new(session.clone())));
     }
     if disabled("sessions") {
-        return Ok(());
+        return Ok(PreparedSave::Disabled {
+            id: session.id.to_string(),
+        });
     }
     session
         .validate_native_persistence()
         .map_err(anyhow::Error::from)?;
-    let json = serialize_bounded_session(session)?;
-    write_legacy_snapshot(&session.id, json.as_bytes())
+    Ok(PreparedSave::Legacy {
+        id: session.id.to_string(),
+        json: serialize_session_for_storage(session)?,
+    })
+}
+
+impl PreparedSave {
+    pub(crate) fn commit(self) -> anyhow::Result<()> {
+        match self {
+            // A synchronous save supersedes any queued turn-end snapshot and
+            // must not race an in-flight one: drop the queued bytes and join
+            // the writer first.
+            Self::Native(session) => {
+                deferred::supersede(&session.id);
+                super::native_publication::save_snapshot(&session)
+            }
+            Self::Legacy { id, json } => {
+                deferred::supersede(&id);
+                write_legacy_snapshot(&id, json.as_bytes())
+            }
+            Self::Disabled { id } => {
+                deferred::supersede(&id);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Turn-end save: the session is serialized here, on the caller's task, and
@@ -254,7 +313,7 @@ pub fn save_session_deferred(session: &Session) -> anyhow::Result<()> {
     session
         .validate_native_persistence()
         .map_err(anyhow::Error::from)?;
-    let json = serialize_bounded_session(session)?;
+    let json = serialize_session_for_storage(session)?;
     deferred::queue(
         &runtime,
         &session.id,
@@ -1335,6 +1394,27 @@ mod readonly_import_tests {
         let expected = serde_json::to_string(&observations.frozen_session(&session)).unwrap();
         let actual = serialize_bounded_session(&session).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    // mini-agent-twon3: a legacy session is captured as the exact bytes
+    // `save_session` would write (borrowed, no Session clone); only a
+    // native-bearing session keeps an owned snapshot.
+    #[test]
+    fn prepared_save_of_a_legacy_session_is_the_exact_serialized_bytes_without_a_clone() {
+        let mut session = Session::new("provider", "model", 32_000, "prepared");
+        session.add_message(crate::session::MessageRole::User, "hello");
+        session.add_tool_call("read", &serde_json::json!({"path": "a"}));
+        session.add_tool_result("read", "contents");
+        let expected = serialize_bounded_session(&session).unwrap();
+        match prepare_save(&session).unwrap() {
+            PreparedSave::Legacy { id, json } => {
+                assert_eq!(id, session.id);
+                assert_eq!(json, expected);
+            }
+            _ => panic!("a legacy session must be captured as bytes, not cloned"),
+        }
+        session.messages[0].content = "x".repeat(MAX_SESSION_BYTES).into();
+        assert!(prepare_save(&session).is_err());
     }
 
     // mini-agent-hf54t: a prefix lookup decodes only the files it can match.

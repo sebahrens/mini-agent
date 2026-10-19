@@ -115,6 +115,37 @@ pub(crate) fn resolve_tool_target(
     }
 }
 
+/// Re-open a workspace-bound mutation target after its permission prompt gave
+/// the exclusive tool lane back (see `concurrency::prompt_unlocked`).
+///
+/// The returned handle and identity replace those captured before the prompt.
+/// If the target was replaced meanwhile, for example by another tool call in
+/// the same batch, this returns the ordinary path-changed error so the model
+/// re-reads and retries instead of publishing against a stale identity.
+pub(crate) async fn recapture_bound_file(
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+    relative: &Path,
+    previous: &crate::fs::CheckedMetadata,
+    regular_only: bool,
+) -> Result<(std::fs::File, crate::fs::CheckedMetadata), ToolError> {
+    let owned = std::sync::Arc::clone(workspace);
+    let owned_relative = relative.to_path_buf();
+    let (file, current) = crate::agent::runner::spawn_blocking_scoped(move || {
+        let file = if regular_only {
+            owned.open_regular_relative(&owned_relative)
+        } else {
+            owned.open_relative(&owned_relative)
+        }?;
+        let current = crate::fs::checked_file_metadata(&file)?;
+        Ok::<_, io::Error>((file, current))
+    })
+    .await
+    .map_err(|_| ToolError::Msg("Target re-open job failed".to_string()))?
+    .map_err(|error| bound_open_error(workspace, relative, error))?;
+    crate::fs::ensure_same_file(relative, previous, &current)?;
+    Ok((file, current))
+}
+
 /// Explain a failed bound-workspace open that was refused because the path is,
 /// or passes through, a symbolic link.
 ///
@@ -440,6 +471,30 @@ use crate::extras::mcp::config::TrustedMcpServer;
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 use crate::permission::checker::{CheckResult, PermCheck};
 
+const USER_GATE_OPEN: &str = "<requires-user-configuration>";
+const USER_GATE_CLOSE: &str = "</requires-user-configuration>";
+
+/// A refusal that only the user can lift by changing their own configuration
+/// (for example `[subagents] allow_write = true`). The typed marker lets the
+/// goal driver park immediately with the setting named instead of nudging the
+/// model to hunt for a way around it (mini-agent-9wq59). `setting` is a short
+/// literal naming the setting to change, never model- or file-derived text.
+#[cfg_attr(not(feature = "subagents"), allow(dead_code))]
+pub(crate) fn requires_user_configuration(setting: &str, message: &str) -> ToolError {
+    ToolError::Msg(format!(
+        "{USER_GATE_OPEN}{setting}{USER_GATE_CLOSE} {message}"
+    ))
+}
+
+/// The setting named by a [`requires_user_configuration`] refusal found in a
+/// tool result, if any.
+#[cfg_attr(not(feature = "goal"), allow(dead_code))]
+pub(crate) fn user_gated_setting(output: &str) -> Option<&str> {
+    let start = output.find(USER_GATE_OPEN)? + USER_GATE_OPEN.len();
+    let len = output[start..].find(USER_GATE_CLOSE)?;
+    Some(&output[start..start + len])
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("{0}")]
@@ -617,7 +672,11 @@ async fn handle_ask_inner(
         suggested => (suggested, additional_allow_patterns),
     };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    crate::permission::ask::send_permission_request(
+    // A mutating tool that opted in gives its exclusive lane lease back while
+    // the user decides; nothing has taken effect yet. It is re-acquired before
+    // the tool continues (see `concurrency::prompt_unlocked`).
+    let suspended = concurrency::suspend_for_prompt();
+    let sent = crate::permission::ask::send_permission_request(
         ask_tx,
         AskRequest {
             diagnostic: Some(diagnostic),
@@ -633,9 +692,17 @@ async fn handle_ask_inner(
             reply: reply_tx,
         },
     )
-    .await
-    .map_err(|_| ToolError::Msg("Permission system unavailable".to_string()))?;
-    let decision = reply_rx.await;
+    .await;
+    let decision = match sent {
+        Ok(()) => Some(reply_rx.await),
+        Err(_) => None,
+    };
+    if let Some(suspended) = suspended {
+        suspended.resume().await;
+    }
+    let Some(decision) = decision else {
+        return Err(ToolError::Msg("Permission system unavailable".to_string()));
+    };
     if let Some(required) = crate::question::required() {
         return Err(ToolError::Msg(required.to_string()));
     }
@@ -876,8 +943,30 @@ async fn check_perm_path_inner(
     additional_allow_patterns: Vec<String>,
     canonicalized: bool,
 ) -> Result<Option<String>, ToolError> {
+    // The protected-Git guard and the checker must judge the same resolved
+    // subject, so resolve once with the checker's resolver and hand the result
+    // to both. The guard still revalidates every retained binding.
+    let mut pre_resolved = None;
     if matches!(tool, "write" | "edit" | "notebook_edit") {
-        crate::git::runtime::check_model_write(Path::new(path)).map_err(ToolError::Msg)?;
+        match permission {
+            Some(perm) if !canonicalized => {
+                if crate::git::runtime::model_write_guard_active() {
+                    let resolved = perm
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .resolve_check_target(path)
+                        .ok_or_else(|| {
+                            ToolError::Msg("model write target cannot be resolved".to_string())
+                        })?;
+                    crate::git::runtime::check_model_write_resolved(&resolved)
+                        .map_err(ToolError::Msg)?;
+                    pre_resolved = Some(Some(resolved));
+                }
+            }
+            _ => {
+                crate::git::runtime::check_model_write(Path::new(path)).map_err(ToolError::Msg)?;
+            }
+        }
     }
     let Some(perm) = permission else {
         return Ok(None);
@@ -888,7 +977,7 @@ async fn check_perm_path_inner(
             if canonicalized {
                 guard.check_canonical_resolved_path(tool, path)
             } else {
-                guard.check_path(tool, path)
+                guard.check_path_with_resolution(tool, path, pre_resolved)
             }
         })
     };

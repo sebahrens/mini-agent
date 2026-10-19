@@ -63,6 +63,11 @@ struct ConcurrentAdmissionBackend {
     artifact: Mutex<Option<SkillArtifact>>,
 }
 
+struct ConcurrentRetireBackend {
+    paths: AppPaths,
+    skill_id: Mutex<Option<String>>,
+}
+
 struct FailingEmbeddingBackend;
 
 struct RevisionEmbeddingBackend;
@@ -177,6 +182,37 @@ impl EmbeddingBackend for ConcurrentAdmissionBackend {
 
     fn model_id(&self) -> &str {
         "concurrent-admission-fixture"
+    }
+
+    fn model_revision(&self) -> &str {
+        "v1"
+    }
+
+    fn dimensions(&self) -> usize {
+        2
+    }
+
+    fn normalized(&self) -> bool {
+        true
+    }
+}
+
+impl EmbeddingBackend for ConcurrentRetireBackend {
+    fn embed_documents(&self, documents: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if let Some(id) = self.skill_id.lock().unwrap().take() {
+            let mut store = SkillStore::open_at(&self.paths).unwrap();
+            let version = store.metadata(&id).unwrap().unwrap().row_version;
+            store.retire(&id, version).unwrap();
+        }
+        Ok(vec![vec![1.0, 0.0]; documents.len()])
+    }
+
+    fn embed_query(&self, _query: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(vec![1.0, 0.0])
+    }
+
+    fn model_id(&self) -> &str {
+        "concurrent-retire-fixture"
     }
 
     fn model_revision(&self) -> &str {
@@ -985,4 +1021,81 @@ fn skill_retrieval_relevance() {
             case["name"]
         );
     }
+}
+
+#[test]
+fn rebuild_scans_artifacts_once_and_decodes_each_blob_at_most_once() {
+    use crate::extras::js::skills::store::{ARTIFACT_SCANS, EMBEDDING_DECODES};
+    let temp = TempPaths::new();
+    let skills = [
+        artifact("scanOne", "First scanned skill.", "scan"),
+        artifact("scanTwo", "Second scanned skill.", "scan"),
+        artifact("scanThree", "Third scanned skill.", "scan"),
+    ];
+    {
+        let mut store = SkillStore::open_at(&temp.paths).unwrap();
+        for skill in &skills {
+            store.insert_verified(skill).unwrap();
+        }
+    }
+    let embedder = Arc::new(Embedder::new().unwrap());
+    let model = embedder.model_metadata().clone();
+    let coordinator = IndexCoordinator::open(&temp.paths, embedder).unwrap();
+
+    // Cold rebuild: nothing stored yet, so nothing is decoded; vectors embedded
+    // during the rebuild are merged from memory instead of read back.
+    let scans = ARTIFACT_SCANS.with(std::cell::Cell::get);
+    let decodes = EMBEDDING_DECODES.with(std::cell::Cell::get);
+    coordinator.rebuild_and_publish().unwrap();
+    assert_eq!(ARTIFACT_SCANS.with(std::cell::Cell::get) - scans, 1);
+    assert_eq!(EMBEDDING_DECODES.with(std::cell::Cell::get) - decodes, 0);
+    let lease = coordinator.lease().unwrap();
+    assert!(skills.iter().all(|skill| lease.contains_id(&skill.id)));
+
+    // Warm rebuild of a new generation: every stored blob is decoded once.
+    SkillStore::open_at(&temp.paths)
+        .unwrap()
+        .request_generation(
+            &model.model_id,
+            &model.model_revision,
+            model.dimensions,
+            model.normalized,
+        )
+        .unwrap();
+    let scans = ARTIFACT_SCANS.with(std::cell::Cell::get);
+    let decodes = EMBEDDING_DECODES.with(std::cell::Cell::get);
+    coordinator.rebuild_and_publish().unwrap();
+    assert_eq!(ARTIFACT_SCANS.with(std::cell::Cell::get) - scans, 1);
+    assert_eq!(
+        EMBEDDING_DECODES.with(std::cell::Cell::get) - decodes,
+        skills.len()
+    );
+    let lease = coordinator.lease().unwrap();
+    assert!(skills.iter().all(|skill| lease.contains_id(&skill.id)));
+}
+
+#[test]
+fn rebuild_still_detects_an_active_row_retired_while_embedding() {
+    let temp = TempPaths::new();
+    let keep = artifact("keepSkill", "Stays active.", "keep");
+    let racing = artifact("racingSkill", "Retired during embedding.", "race");
+    {
+        let mut store = SkillStore::open_at(&temp.paths).unwrap();
+        store.insert_verified(&keep).unwrap();
+        store.insert_verified(&racing).unwrap();
+    }
+    let embedder = Embedder::with_backend(Arc::new(ConcurrentRetireBackend {
+        paths: temp.paths.clone(),
+        skill_id: Mutex::new(Some(racing.id.clone())),
+    }))
+    .unwrap();
+    let coordinator = IndexCoordinator::open(&temp.paths, Arc::new(embedder)).unwrap();
+    let error = coordinator
+        .rebuild_and_publish()
+        .expect_err("a row retired during the rebuild must not be published");
+    assert!(
+        error.to_string().contains("active row disappeared"),
+        "unexpected error: {error}"
+    );
+    assert!(coordinator.lease().unwrap().is_empty());
 }

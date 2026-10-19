@@ -308,9 +308,9 @@ Here is some keybindings to speed up your coding experience:
 | `Ctrl+C` | Interrupt the agent |
 | `Ctrl+Shift+C` | Copy selected text (Windows) |
 | `Ctrl+V` | Paste Unicode clipboard text (Windows) |
-| `PgUp` / `PgDn` | Scroll chat |
+| `PgUp` / `PgDn` / `Alt+Up` / `Alt+Down` | Scroll chat a page (Shift/Ctrl+wheel too; `/top` and `/bottom` need no keys) |
 | `Home` / `End` | Start/end of the input line (empty input: jump to top/bottom) |
-| `Ctrl+Home` / `Ctrl+End` | Jump to top/bottom of chat |
+| `Ctrl+Home` / `Ctrl+End` / `Alt+Shift+Up` / `Alt+Shift+Down` / `Alt+<` / `Alt+>` | Jump to top/bottom of chat |
 | `Shift+Enter` / `Alt+Enter` | Insert a newline |
 | `/` | Open the command picker; Tab inserts the highlight, Enter runs a command or argument typed in full |
 | `@<query>` | Open the file picker; Tab or Enter inserts the highlighted path, a space closes it |

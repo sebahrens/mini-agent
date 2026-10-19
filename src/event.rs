@@ -269,6 +269,9 @@ pub enum UserEvent {
     Key(crossterm::event::KeyEvent),
     ScrollUp,
     ScrollDown,
+    /// Shift/Ctrl + wheel: one transcript page per notch.
+    ScrollPageUp,
+    ScrollPageDown,
     Resize,
     Paste(String),
     LinkOpenFailed(String),

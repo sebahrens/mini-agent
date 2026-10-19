@@ -283,7 +283,7 @@ impl OriginAuthority {
             // the last full verification. Any metadata change, or metadata
             // that cannot be obtained, falls back to the full read below.
             if source.unchanged_since_verified(name) {
-                return source.root.validate().is_ok();
+                return source.root.validate_after(workspace).is_ok();
             }
             let before = source.observe();
             if !source.verify_full(name) {
@@ -294,7 +294,7 @@ impl OriginAuthority {
             {
                 source.remember(name, before);
             }
-            source.root.validate().is_ok()
+            source.root.validate_after(workspace).is_ok()
         })
     }
     fn commitment(&self) -> Vec<(&Path, &Path, &str, SourceKind)> {
@@ -1456,6 +1456,15 @@ mod trust_tests {
             assert!(check());
         }
         assert_eq!(full_source_reads() - reads, 1);
+
+        // One canonicalizing workspace validation per check, however many
+        // sources share that root; every check still runs.
+        let validations = crate::paths::VALIDATE_CALLS.with(std::cell::Cell::get);
+        assert!(check());
+        assert_eq!(
+            crate::paths::VALIDATE_CALLS.with(std::cell::Cell::get) - validations,
+            1
+        );
 
         // An in-place rewrite that keeps the size and restores the mtime is
         // still detected (ctime moves), re-read once and refused.

@@ -1231,6 +1231,7 @@ mod tests {
             token_savings: 10,
             created_at: "2026-10-14T00:00:00Z".into(),
             memory_ref: None,
+            pruned: None,
         });
         let outcomes = [&appended, &compacted].map(|session| {
             let before = serde_json::to_value(session).unwrap();

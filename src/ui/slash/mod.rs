@@ -166,7 +166,7 @@ impl SlashCtx<'_> {
         let next_client = if provider_changed {
             crate::provider::create_client(
                 &session.provider,
-                self.cli.api_key.as_deref(),
+                self.cli.api_key_for(self.cfg, &session.provider),
                 self.cfg.custom_providers_map(),
                 self.cfg.api_keys.as_ref(),
             )?
@@ -211,7 +211,7 @@ impl SlashCtx<'_> {
     pub fn switch_client(&mut self, provider: &str) -> anyhow::Result<()> {
         let client = crate::provider::create_client(
             provider,
-            self.cli.api_key.as_deref(),
+            self.cli.api_key_for(self.cfg, provider),
             self.cfg.custom_providers_map(),
             self.cfg.api_keys.as_ref(),
         )?;
@@ -324,7 +324,7 @@ pub(crate) async fn apply_prompt_model(
     if provider_changed {
         match crate::provider::create_client(
             &qmc.provider,
-            ui.cli.api_key.as_deref(),
+            ui.cli.api_key_for(ui.cfg, &qmc.provider),
             ui.cfg.custom_providers_map(),
             ui.cfg.api_keys.as_ref(),
         ) {
@@ -734,6 +734,8 @@ pub(crate) fn is_readonly_view(text: &str) -> bool {
         ["/help"]
             | ["/help", "keys"]
             | ["/keys"]
+            | ["/top"]
+            | ["/bottom"]
             | ["/sandbox"]
             | ["/model"]
             | ["/sessions"]
@@ -953,7 +955,9 @@ pub(crate) async fn handle_slash(
             content::handle(&parts, &mut ctx).await
         }
         "/cost" | "/reasoning" | "/thinking" | "/mode" | "/sandbox" | "/toggle" | "/mcp"
-        | "/editsys" | "/advisor" | "/keys" | "/vim" => settings::handle(&parts, &mut ctx).await,
+        | "/editsys" | "/advisor" | "/keys" | "/vim" | "/top" | "/bottom" => {
+            settings::handle(&parts, &mut ctx).await
+        }
         "/sessions" | "/fork" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind"
         | "/retry" | "/quit" | "/exit" | "/history" => {
             crate::startup::heap_future(|| session::handle(&parts, &mut ctx)).await

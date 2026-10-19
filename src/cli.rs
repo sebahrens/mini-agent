@@ -1248,6 +1248,18 @@ impl Cli {
         (self.resolve_provider(cfg), self.resolve_model(cfg))
     }
 
+    /// `--api-key`, scoped to the startup provider it was given for.
+    pub(crate) fn scoped_api_key(&self, cfg: &config::Config) -> crate::provider::CliKey<'_> {
+        let (startup, _) = self.resolve_provider_and_model(cfg);
+        crate::provider::CliKey::new(self.api_key.as_deref(), startup.as_str())
+    }
+
+    /// `--api-key` for `target`: the key only when `target` is the startup
+    /// provider, otherwise `None` (the target resolves its own credential).
+    pub(crate) fn api_key_for(&self, cfg: &config::Config, target: &str) -> Option<&str> {
+        self.scoped_api_key(cfg).for_provider(target)
+    }
+
     pub(crate) fn resolve_max_budget_usd(
         &self,
         cfg: &config::Config,

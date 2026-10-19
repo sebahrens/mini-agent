@@ -3658,7 +3658,15 @@ impl AnyAgent {
     pub(crate) async fn context_tool_definitions(
         &self,
     ) -> anyhow::Result<Vec<rig::completion::ToolDefinition>> {
-        Ok(self.tool_server().get_tool_defs(None).await?)
+        // Diagnostics only (not the per-request path): owned copies suit the
+        // bounded `/context` estimator.
+        Ok(self
+            .tool_server()
+            .get_tool_defs(None)
+            .await?
+            .into_iter()
+            .map(std::sync::Arc::unwrap_or_clone)
+            .collect())
     }
 
     /// The tool server every clone and per-turn preparation of this agent
@@ -4879,6 +4887,33 @@ where
     Ok(crate::auth::oauth::official_api_base(
         resolve_base_url_with_env(&config, get_env).as_deref(),
     ))
+}
+
+/// The `--api-key` value together with the one provider it was given for.
+///
+/// The key is scoped: it is handed only to the provider it belongs to (the
+/// session's startup provider). Any other provider -- a persona quick-model,
+/// the advisor, a `/model` switch -- gets `None` and resolves its own
+/// designated credential (`api_key_env`, `api_keys[alias]`, vendor variable),
+/// failing closed without one. This keeps a vendor key from reaching an
+/// isolated third-party `base_url` (mini-agent-zmt7r).
+#[derive(Clone, Debug)]
+pub(crate) struct CliKey<'a> {
+    pub key: Option<&'a str>,
+    pub provider: String,
+}
+
+impl<'a> CliKey<'a> {
+    pub(crate) fn new(key: Option<&'a str>, provider: &str) -> Self {
+        Self {
+            key,
+            provider: provider.to_owned(),
+        }
+    }
+
+    pub(crate) fn for_provider(&self, target: &str) -> Option<&'a str> {
+        self.key.filter(|_| self.provider == target)
+    }
 }
 
 pub fn create_client(

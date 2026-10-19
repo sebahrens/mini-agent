@@ -482,14 +482,58 @@ struct ResolvedPersonaRuntime {
     execution: builder::PersonaExecution,
 }
 
+/// Builds the client for a persona quick-model on a provider other than the
+/// child's current one: `(provider, scoped_cli_key, config)`. The CLI key is
+/// scoped to the session provider (`crate::provider::CliKey`): any other
+/// provider resolves its own designated credential and fails closed.
+type PersonaClientFactory<'a> = &'a dyn Fn(
+    &str,
+    Option<&str>,
+    &crate::config::Config,
+) -> anyhow::Result<crate::provider::AnyClient>;
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_persona_runtime(
     client: crate::provider::AnyClient,
     provider_name: &str,
+    session_provider: &str,
     model_name: String,
     max_turns: usize,
     api_key: Option<&str>,
     config: &crate::config::Config,
     specialization: Option<&ResolvedSpecialization>,
+) -> Result<ResolvedPersonaRuntime, ToolError> {
+    resolve_persona_runtime_with(
+        client,
+        provider_name,
+        session_provider,
+        model_name,
+        max_turns,
+        api_key,
+        config,
+        specialization,
+        &|provider, key, config| {
+            crate::provider::create_client(
+                provider,
+                key,
+                config.custom_providers_map(),
+                config.api_keys.as_ref(),
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_persona_runtime_with(
+    client: crate::provider::AnyClient,
+    provider_name: &str,
+    session_provider: &str,
+    model_name: String,
+    max_turns: usize,
+    api_key: Option<&str>,
+    config: &crate::config::Config,
+    specialization: Option<&ResolvedSpecialization>,
+    make_client: PersonaClientFactory<'_>,
 ) -> Result<ResolvedPersonaRuntime, ToolError> {
     let Some(specialization) = specialization else {
         return Ok(ResolvedPersonaRuntime {
@@ -511,11 +555,11 @@ fn resolve_persona_runtime(
     if let Some(requested_model) = specialization.model.as_deref() {
         if let Some(quick_model) = crate::config::quick_models_map(config).get(requested_model) {
             if quick_model.provider.as_str() != provider_name {
-                client = crate::provider::create_client(
+                client = make_client(
                     &quick_model.provider,
-                    api_key,
-                    config.custom_providers_map(),
-                    config.api_keys.as_ref(),
+                    crate::provider::CliKey::new(api_key, session_provider)
+                        .for_provider(&quick_model.provider),
+                    config,
                 )
                 .map_err(|error| {
                     ToolError::Msg(format!(
@@ -571,6 +615,14 @@ fn resolve_specialization(
     let Some(definition) = crate::context::agents::lookup_for_workspace(agent_type, workspace)
     else {
         let valid = crate::context::agents::available_names_for_workspace(workspace).join(", ");
+        if crate::context::agents::untrusted_project_persona_exists(agent_type, workspace) {
+            return Err(crate::agent::tools::requires_user_configuration(
+                "trust this project's configuration (or install the persona in your global agents directory)",
+                &format!(
+                    "task: agent_type '{agent_type}' is defined only by a project persona that is ignored until the project config is trusted; valid types: {valid}"
+                ),
+            ));
+        }
         return Err(ToolError::Msg(format!(
             "task: unknown agent_type '{agent_type}'; valid types: {valid}"
         )));
@@ -830,11 +882,11 @@ editing in a known location, grepping for a literal you will act on immediately.
         );
         let specialist_names = specialist_entries
             .iter()
-            .map(|(name, _)| name.clone())
+            .map(|(name, _, _)| name.clone())
             .collect::<Vec<_>>();
         let specialist_descriptions = specialist_entries
             .iter()
-            .map(|(name, description)| format!("{name}: {description}"))
+            .map(|(name, annotation, description)| format!("{name}{annotation}: {description}"))
             .collect::<Vec<_>>()
             .join("\n");
         serde_json::json!({
@@ -882,7 +934,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 "agent_type": {
                     "type": "string",
                     "enum": specialist_names,
-                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Specialists are read-only by default. A trusted persona with mode: write requires [subagents] allow_write = true and inherits only eligible parent tools, permissions and sandbox; write children run one at a time, unless the persona sets isolation: worktree, which runs each child in its own git worktree and branch (parallel; the parent workspace is never written; the branch is returned for an explicit merge). Available specialists:\n{specialist_descriptions}")
+                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Specialists are read-only by default. A trusted persona with mode: write requires [subagents] allow_write = true and inherits only eligible parent tools, permissions and sandbox; write children run one at a time, unless the persona sets isolation: worktree, which runs each child in its own git worktree and branch (parallel; the parent workspace is never written; the branch is returned for an explicit merge). The child model and write mode come from the persona definition (frontmatter model: and mode: write); add or edit a persona to change them. Available specialists:\n{specialist_descriptions}")
                 }
             },
             // Exclusivity is stated in the descriptions and enforced by
@@ -898,19 +950,28 @@ editing in a known location, grepping for a literal you will act on immediately.
         if let Some(workspace) = &self.workspace {
             workspace.validate().map_err(ToolError::Msg)?;
         }
-        let (client, provider_name, model_name, api_key, max_turns, config, limits) =
-            with_config(|cfg| {
-                (
-                    cfg.client.clone(),
-                    cfg.provider_name.clone(),
-                    cfg.model_name.clone(),
-                    cfg.api_key.clone(),
-                    cfg.max_turns,
-                    cfg.config.clone(),
-                    TaskLimits::from_config(&cfg.config),
-                )
-            })
-            .map_err(|err| ToolError::Msg(err.to_string()))?;
+        let (
+            client,
+            provider_name,
+            session_provider,
+            model_name,
+            api_key,
+            max_turns,
+            config,
+            limits,
+        ) = with_config(|cfg| {
+            (
+                cfg.client.clone(),
+                cfg.provider_name.clone(),
+                cfg.session_provider.clone(),
+                cfg.model_name.clone(),
+                cfg.api_key.clone(),
+                cfg.max_turns,
+                cfg.config.clone(),
+                TaskLimits::from_config(&cfg.config),
+            )
+        })
+        .map_err(|err| ToolError::Msg(err.to_string()))?;
         let max_report_bytes = config.resolve_task_max_report_bytes();
         let repair_max_tokens = config.resolve_task_report_repair_max_tokens();
         let repair_max_cost_units = config.resolve_task_report_repair_max_cost_units();
@@ -961,8 +1022,9 @@ editing in a known location, grepping for a literal you will act on immediately.
                 .as_ref()
                 .is_some_and(|policy| policy.allow_write)
             {
-                return Err(ToolError::Msg(
-                    "task: write personas require [subagents] allow_write = true".into(),
+                return Err(crate::agent::tools::requires_user_configuration(
+                    "[subagents] allow_write = true",
+                    "task: write personas require [subagents] allow_write = true",
                 ));
             }
             if self.write_tools.is_none() || self.workspace.is_none() {
@@ -1001,6 +1063,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         let runtime = resolve_persona_runtime(
             client,
             &provider_name,
+            &session_provider,
             model_name,
             max_turns,
             api_key.as_deref(),
@@ -3182,6 +3245,7 @@ mod tests {
             let configured = crate::extras::subagents::SubagentConfig {
                 client,
                 provider_name: "report-wire".into(),
+                session_provider: "report-wire".into(),
                 model_name: "fixture".into(),
                 fallback_notice: None,
                 api_key: None,
@@ -3428,6 +3492,22 @@ mod tests {
 
         assert!(resolve_specialization(Some("review"), Some(&first_binding)).is_err());
         assert!(resolve_specialization(Some("review"), Some(&second_binding)).is_err());
+        // The refusal is a user-only gate: trusting the project lifts it.
+        let gated = resolve_specialization(Some("review"), Some(&first_binding))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            crate::agent::tools::user_gated_setting(&gated)
+                .is_some_and(|setting| setting.starts_with("trust this project's configuration")),
+            "{gated}"
+        );
+        // A genuinely unknown name stays an ordinary error.
+        let unknown = resolve_specialization(Some("nonexistent"), Some(&first_binding))
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(crate::agent::tools::user_gated_setting(&unknown), None);
 
         drop(first_binding);
         drop(second_binding);
@@ -3557,6 +3637,7 @@ mod tests {
             let configured = crate::extras::subagents::SubagentConfig {
                 client: client.clone(),
                 provider_name: "preflight-test".into(),
+                session_provider: "preflight-test".into(),
                 model_name: "inert/model".into(),
                 fallback_notice: None,
                 api_key: None,
@@ -3631,6 +3712,7 @@ mod tests {
             let configured = crate::extras::subagents::SubagentConfig {
                 client,
                 provider_name: "openrouter".into(),
+                session_provider: "openrouter".into(),
                 model_name: "test/model".into(),
                 fallback_notice: None,
                 api_key: None,
@@ -3650,6 +3732,11 @@ mod tests {
                 );
             } else {
                 assert!(error.contains("allow_write = true"), "{error}");
+                assert_eq!(
+                    crate::agent::tools::user_gated_setting(&error),
+                    Some("[subagents] allow_write = true"),
+                    "the refusal carries the typed user-gate marker"
+                );
             }
         }
     }
@@ -3683,14 +3770,30 @@ mod tests {
             },
         )]));
 
-        let runtime = resolve_persona_runtime(
+        // The cross-provider client resolves its own designated credential;
+        // injected so the test never touches the process environment.
+        let runtime = resolve_persona_runtime_with(
             client,
+            "openrouter",
             "openrouter",
             "default/model".into(),
             20,
             Some("test-key"),
             &config,
             Some(&runtime_specialization()),
+            &|provider, key, config| {
+                assert_eq!(key, None, "the session key is scoped to its own provider");
+                crate::provider::create_client_with_env(
+                    provider,
+                    key,
+                    config.custom_providers_map(),
+                    config.api_keys.as_ref(),
+                    |name| match name {
+                        "OPENAI_API_KEY" => Ok("env-openai-key".to_string()),
+                        _ => Err(std::env::VarError::NotPresent),
+                    },
+                )
+            },
         )
         .unwrap();
 
@@ -3729,6 +3832,7 @@ mod tests {
         let unspecialized = resolve_persona_runtime(
             client.clone(),
             "openrouter",
+            "openrouter",
             "default/model".into(),
             20,
             None,
@@ -3746,6 +3850,7 @@ mod tests {
         raw_model.model = Some("other/model".into());
         let persona = resolve_persona_runtime(
             client,
+            "openrouter",
             "openrouter",
             "default/model".into(),
             20,

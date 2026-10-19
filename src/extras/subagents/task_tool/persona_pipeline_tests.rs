@@ -106,6 +106,7 @@ fn implementer_runs_on_the_glm_custom_provider_in_write_mode() {
     let runtime = resolve_persona_runtime(
         parent,
         "anthropic",
+        "anthropic",
         "example-opus-model".into(),
         20,
         None,
@@ -149,6 +150,7 @@ fn reviewer_runs_read_only_on_the_review_alias() {
     let runtime = resolve_persona_runtime(
         pipeline.parent_client(&config),
         "anthropic",
+        "anthropic",
         "example-opus-model".into(),
         20,
         None,
@@ -190,6 +192,7 @@ fn raw_model_id_persona_stays_on_the_parent_provider() {
 
     let runtime = resolve_persona_runtime(
         pipeline.parent_client(&config),
+        "anthropic",
         "anthropic",
         "example-opus-model".into(),
         20,
@@ -267,6 +270,7 @@ fn implementer_resolution_fails_closed_without_the_glm_key() {
     let error = resolve_persona_runtime(
         pipeline.parent_client(&config),
         "anthropic",
+        "anthropic",
         "example-opus-model".into(),
         20,
         None,
@@ -281,4 +285,154 @@ fn implementer_resolution_fails_closed_without_the_glm_key() {
         "{error}"
     );
     assert!(!error.contains(VENDOR_OPENAI_KEY), "{error}");
+}
+
+/// Builds persona clients with an injected environment and records the CLI key
+/// each cross-provider build was handed (mini-agent-zmt7r).
+struct RecordingFactory {
+    keys: std::cell::RefCell<Vec<(String, Option<String>)>>,
+}
+
+impl RecordingFactory {
+    fn new() -> Self {
+        Self {
+            keys: Default::default(),
+        }
+    }
+
+    fn build(
+        &self,
+        glm: Option<&'static str>,
+    ) -> impl Fn(&str, Option<&str>, &crate::config::Config) -> anyhow::Result<AnyClient> + '_ {
+        move |provider, key, config| {
+            self.keys
+                .borrow_mut()
+                .push((provider.to_owned(), key.map(str::to_owned)));
+            crate::provider::create_client_with_env(
+                provider,
+                key,
+                config.custom_providers_map(),
+                config.api_keys.as_ref(),
+                move |name| match (name, glm) {
+                    ("OPENAI_API_KEY", _) => Ok(VENDOR_OPENAI_KEY.to_string()),
+                    ("OPENROUTER_API_KEY", _) => Ok("openrouter-key".to_string()),
+                    ("ANTHROPIC_API_KEY", _) => Ok("anthropic-key".to_string()),
+                    ("EXAMPLE_GLM_API_KEY", Some(value)) => Ok(value.to_string()),
+                    _ => Err(std::env::VarError::NotPresent),
+                },
+            )
+        }
+    }
+}
+
+fn cli_key_parent(config: &crate::config::Config) -> AnyClient {
+    crate::provider::create_client_with_env(
+        "anthropic",
+        Some(CLI_KEY),
+        config.custom_providers_map(),
+        config.api_keys.as_ref(),
+        |_| Err(std::env::VarError::NotPresent),
+    )
+    .unwrap()
+}
+
+const CLI_KEY: &str = "sk-ant-cli-key-must-never-reach-glm";
+
+/// A persona pinned to a quick-model alias, built directly so these tests
+/// need neither persona files nor process environment.
+fn alias_persona(alias: &str) -> ResolvedSpecialization {
+    ResolvedSpecialization {
+        write_mode: false,
+        prompt: "persona".into(),
+        result_notice: None,
+        source: "test".into(),
+        tools: None,
+        required_tools: Vec::new(),
+        model: Some(alias.into()),
+        turn_budget: None,
+    }
+}
+
+#[test]
+fn cli_key_for_the_session_provider_never_reaches_a_custom_provider() {
+    let implementer = alias_persona("glm");
+    let config = fixture_config();
+    let factory = RecordingFactory::new();
+
+    let runtime = super::resolve_persona_runtime_with(
+        cli_key_parent(&config),
+        "anthropic",
+        "anthropic",
+        "example-opus-model".into(),
+        20,
+        Some(CLI_KEY),
+        &config,
+        Some(&implementer),
+        &factory.build(Some(GLM_KEY)),
+    )
+    .unwrap();
+
+    assert_eq!(runtime.provider_name, "glm");
+    assert_eq!(
+        *factory.keys.borrow(),
+        vec![("glm".to_owned(), None)],
+        "the glm client resolves its own api_key_env, never the CLI key"
+    );
+}
+
+#[test]
+fn custom_provider_without_its_own_credential_fails_closed_despite_a_cli_key() {
+    let implementer = alias_persona("glm");
+    let config = fixture_config();
+    let factory = RecordingFactory::new();
+
+    let error = super::resolve_persona_runtime_with(
+        cli_key_parent(&config),
+        "anthropic",
+        "anthropic",
+        "example-opus-model".into(),
+        20,
+        Some(CLI_KEY),
+        &config,
+        Some(&implementer),
+        &factory.build(None),
+    )
+    .err()
+    .expect("glm without its own key must not fall back to the CLI key")
+    .to_string();
+
+    assert!(
+        error.contains("could not initialize provider 'glm'"),
+        "{error}"
+    );
+    assert!(!error.contains(CLI_KEY), "{error}");
+    assert!(!error.contains(VENDOR_OPENAI_KEY), "{error}");
+}
+
+#[test]
+fn cli_key_still_reaches_a_persona_on_the_session_provider() {
+    // Session provider openrouter (child currently elsewhere): a persona alias
+    // back on the session provider gets the CLI key; the key is scoped to it.
+    let reviewer = alias_persona("review");
+    let config = fixture_config();
+    let factory = RecordingFactory::new();
+
+    let runtime = super::resolve_persona_runtime_with(
+        cli_key_parent(&config),
+        "anthropic",
+        "openrouter",
+        "example-opus-model".into(),
+        20,
+        Some(CLI_KEY),
+        &config,
+        Some(&reviewer),
+        &factory.build(None),
+    )
+    .unwrap();
+
+    assert_eq!(runtime.provider_name, "openrouter");
+    assert_eq!(
+        *factory.keys.borrow(),
+        vec![("openrouter".to_owned(), Some(CLI_KEY.to_owned()))]
+    );
 }

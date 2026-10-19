@@ -2661,21 +2661,30 @@ pub(super) fn extract_tools_from_additional_params(
     Ok(Vec::new())
 }
 
+/// Borrowed twin of [`ToolDefinition`] with the same field order, so the
+/// serialized bytes are identical while the shared schema is not cloned first.
+#[derive(Serialize)]
+struct ToolDefinitionRef<'a> {
+    name: &'a str,
+    description: Option<&'a str>,
+    input_schema: &'a serde_json::Value,
+}
+
 pub(super) fn build_tool_definitions(
-    tools: Vec<completion::ToolDefinition>,
+    tools: Vec<std::sync::Arc<completion::ToolDefinition>>,
     additional_params_payload: &mut serde_json::Value,
 ) -> Result<Vec<serde_json::Value>, CompletionError> {
     let mut additional_tools = extract_tools_from_additional_params(additional_params_payload)?;
 
     let mut tools = tools
         .into_iter()
-        .map(|tool| ToolDefinition {
-            name: tool.name,
-            description: Some(tool.description),
-            input_schema: tool.parameters,
-            cache_control: None,
+        .map(|tool| {
+            serde_json::to_value(ToolDefinitionRef {
+                name: &tool.name,
+                description: Some(&tool.description),
+                input_schema: &tool.parameters,
+            })
         })
-        .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()?;
     tools.append(&mut additional_tools);
 

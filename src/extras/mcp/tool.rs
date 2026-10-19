@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use compact_str::CompactString;
@@ -246,13 +247,20 @@ impl ToolDyn for McpTool {
 
         Box::pin(async move {
             ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
+            // Set when any wait between the two source checks actually
+            // suspended; only then can the approved source have outlived its
+            // revision unnoticed. Never carried across calls.
+            let suspended = AtomicBool::new(false);
             let perm_key = format!("mcp_tool:{server_name}:{tool_name}");
-            let coaching = check_mcp_perm(
-                &permission,
-                &ask_tx,
-                &perm_key,
-                trusted_identity,
-                &tool_name,
+            let coaching = track_suspension(
+                &suspended,
+                check_mcp_perm(
+                    &permission,
+                    &ask_tx,
+                    &perm_key,
+                    trusted_identity,
+                    &tool_name,
+                ),
             )
             .await
             .map_err(|e| {
@@ -268,7 +276,7 @@ impl ToolDyn for McpTool {
             // Hook/permission waits may also outlive this run's financial or
             // clarification admission. Financial preparation can suspend, so
             // source/client and question admission follow it at actual RPC.
-            crate::spend::run::admit_current_effect()
+            track_suspension(&suspended, crate::spend::run::admit_current_effect())
                 .await
                 .map_err(|error| {
                     ToolError::ToolCallError(Box::new(McpToolError(error.to_string().into())))
@@ -278,7 +286,14 @@ impl ToolDyn for McpTool {
             }
             // Permission/hook waits may outlive the approved source revision.
             // Recheck immediately before the exact retained peer receives RPC.
-            ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
+            // When every wait above completed without suspending, the first
+            // check is still the same synchronous step; the cheap liveness
+            // check always repeats and the source check repeats on suspension.
+            if suspended.load(Ordering::Relaxed) {
+                ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
+            } else if !client_is_live() {
+                return Err(client_retired_error());
+            }
             let proof = source_proof.clone();
             let live = client_is_live.clone();
             let _elicitation_lease = elicitation.enter(
@@ -365,11 +380,28 @@ fn ensure_client_current(
     client_is_live: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<(), ToolError> {
     if !client_is_live() {
-        return Err(ToolError::ToolCallError(Box::new(McpToolError(
-            "MCP connection retired; reconnect before calling tools".into(),
-        ))));
+        return Err(client_retired_error());
     }
     ensure_source_current(proof)
+}
+
+fn client_retired_error() -> ToolError {
+    ToolError::ToolCallError(Box::new(McpToolError(
+        "MCP connection retired; reconnect before calling tools".into(),
+    )))
+}
+
+/// Await `future`, recording in `suspended` whether it ever returned pending.
+async fn track_suspension<F: std::future::Future>(suspended: &AtomicBool, future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let polled = future.as_mut().poll(cx);
+        if polled.is_pending() {
+            suspended.store(true, Ordering::Relaxed);
+        }
+        polled
+    })
+    .await
 }
 
 fn ensure_source_current(
@@ -485,6 +517,40 @@ fn render_structured_content(structured: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspension_tracking_distinguishes_ready_from_pending_waits() {
+        use std::task::{Context, Poll, Waker};
+        let flag = AtomicBool::new(false);
+        let mut ready = std::pin::pin!(track_suspension(&flag, async { 7 }));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(ready.as_mut().poll(&mut cx), Poll::Ready(7));
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "an immediately ready wait is not a suspension"
+        );
+
+        let mut yielded = false;
+        let mut waits = std::pin::pin!(track_suspension(
+            &flag,
+            std::future::poll_fn(move |cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+        ));
+        assert!(waits.as_mut().poll(&mut cx).is_pending());
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(waits.as_mut().poll(&mut cx).is_ready());
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "the flag stays set once a wait suspended"
+        );
+    }
 
     #[test]
     fn malformed_arguments_are_rejected_instead_of_becoming_no_arguments() {

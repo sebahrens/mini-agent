@@ -1594,6 +1594,7 @@ mod tests {
         narrowings.extend(crate::context::agents::embedded_tool_narrowings_for_test());
 
         let root = TempDir::new("tool-name-equivalence");
+        #[cfg_attr(not(feature = "js"), allow(unused_mut))]
         let mut authorizations = vec![
             ("no workspace", SubagentAuthorization::new(None, None, true)),
             ("read-only", parent_authorization(root.path(), None)),

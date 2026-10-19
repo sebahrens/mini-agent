@@ -2206,6 +2206,16 @@ pub mod interactions_api_types {
         }
     }
 
+    impl TryFrom<std::sync::Arc<crate::completion::ToolDefinition>> for Tool {
+        type Error = CompletionError;
+
+        fn try_from(
+            tool: std::sync::Arc<crate::completion::ToolDefinition>,
+        ) -> Result<Self, Self::Error> {
+            Tool::try_from(std::sync::Arc::unwrap_or_clone(tool))
+        }
+    }
+
     impl TryFrom<message::ToolChoice> for ToolChoice {
         type Error = CompletionError;
 

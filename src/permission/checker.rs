@@ -492,6 +492,11 @@ struct HookOneShot {
 }
 
 impl PermissionChecker {
+    #[cfg(test)]
+    pub(crate) fn session_allowlist_is_empty(&self) -> bool {
+        self.session_allowlist.is_empty()
+    }
+
     pub(crate) fn bind_tool_output_session(&mut self, session_id: &str) -> anyhow::Result<()> {
         if crate::paths::artifact_disabled("tool outputs") {
             self.tool_output_binding = None;
@@ -1476,13 +1481,38 @@ impl PermissionChecker {
     }
 
     pub fn check_path(&mut self, tool: &str, path: &str) -> CheckResult {
+        self.check_path_with_resolution(tool, path, None)
+    }
+
+    /// Resolve `path` exactly as [`Self::check_path`] does (tilde expansion,
+    /// anchoring at the checker's working directory, symlink-following walk
+    /// that tolerates a missing tail). A caller that needs the same resolved
+    /// subject for another guard resolves once here and passes the result to
+    /// [`Self::check_path_with_resolution`].
+    pub(crate) fn resolve_check_target(&self, path: &str) -> Option<PathBuf> {
+        let expanded = crate::fs::expand_tilde(path);
+        let unresolved_abs_path = resolve_absolute(&expanded, &self.working_dir);
+        resolve_path_allow_missing(Path::new(&unresolved_abs_path))
+    }
+
+    /// [`Self::check_path`] with the live resolution supplied by
+    /// [`Self::resolve_check_target`] instead of walking the path again.
+    pub(crate) fn check_path_with_resolution(
+        &mut self,
+        tool: &str,
+        path: &str,
+        pre_resolved: Option<Option<PathBuf>>,
+    ) -> CheckResult {
         let tool = canonical_permission_tool(tool);
         tracing::debug!("perm check path: tool={}, path={}", tool, path);
         let expanded = crate::fs::expand_tilde(path);
         let unresolved_abs_path = resolve_absolute(&expanded, &self.working_dir);
         // Resolve the live path once and share it with the external-directory
         // checks; each resolution lstat-walks every component.
-        let resolved = resolve_path_allow_missing(Path::new(&unresolved_abs_path));
+        let resolved = match pre_resolved {
+            Some(resolved) => resolved,
+            None => resolve_path_allow_missing(Path::new(&unresolved_abs_path)),
+        };
         let abs_path = resolved
             .clone()
             .unwrap_or_else(|| normalize_path(Path::new(&unresolved_abs_path)))

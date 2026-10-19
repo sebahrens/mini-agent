@@ -1457,6 +1457,233 @@ pub(crate) fn atomic_write_sync(path: &Path, contents: &[u8]) -> std::io::Result
     )
 }
 
+/// Durably append one record to a private regular file with a single `fsync`.
+///
+/// Unlike `atomic_write_sync` this never copies the existing content. The
+/// parent is canonicalized and opened without following links, its identity is
+/// compared with the pre-canonicalization path, and the leaf is opened
+/// descriptor-relative with `O_NOFOLLOW | O_APPEND` (a symlink or non-regular
+/// leaf is refused). A new file is created `0600` and its directory entry is
+/// synced; an existing file keeps its mode. With `separate`, a `\n` is written
+/// first when the file is non-empty and does not already end in one, so a torn
+/// previous record can never fuse with this one. Callers serialize writers
+/// (the memory store holds its flock). Returns `Unsupported` where the
+/// primitive is unavailable; callers fall back to `atomic_write_sync`.
+#[cfg(feature = "memory")]
+pub(crate) fn private_append_sync(
+    path: &Path,
+    record: &[u8],
+    separate: bool,
+) -> std::io::Result<()> {
+    let path = absolute_lexical(path)?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "append target has no name",
+            )
+        })?
+        .to_os_string();
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "append target has no parent",
+        )
+    })?;
+    let lexical_parent = checked_path_metadata(parent)?;
+    if lexical_parent.file_type().is_symlink() || !lexical_parent.is_dir() {
+        return Err(path_changed_error(parent));
+    }
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    let canonical_metadata = checked_path_metadata(&canonical_parent)?;
+    ensure_same_file(parent, &lexical_parent, &canonical_metadata)?;
+    private_append_platform(
+        &canonical_parent,
+        &canonical_metadata,
+        &leaf,
+        record,
+        separate,
+    )
+}
+
+#[cfg(feature = "memory")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(unsafe_code)]
+fn private_append_platform(
+    parent: &Path,
+    parent_identity: &CheckedMetadata,
+    leaf: &std::ffi::OsStr,
+    record: &[u8],
+    separate: bool,
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_DIRECTORY | OPEN_NOFOLLOW | OPEN_CLOEXEC)
+        .open(parent)?;
+    ensure_same_file(parent, parent_identity, &checked_file_metadata(&directory)?)?;
+    let name = CString::new(leaf.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path component contains NUL",
+        )
+    })?;
+    let open = |flags: std::os::raw::c_int| -> std::io::Result<std::fs::File> {
+        // SAFETY: `name` is NUL-terminated for this call and `directory` owns a
+        // valid descriptor; a successful descriptor is transferred to `File`.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_APPEND | OPEN_NOFOLLOW | OPEN_CLOEXEC | flags,
+                0o600 as std::os::raw::c_uint,
+            )
+        };
+        if descriptor < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+        }
+    };
+    let mut created = false;
+    let mut file = None;
+    for _ in 0..3 {
+        match open(0) {
+            Ok(opened) => {
+                file = Some(opened);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match open(OPEN_CREATE | OPEN_EXCLUSIVE) {
+                    Ok(opened) => {
+                        created = true;
+                        file = Some(opened);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut file = file.ok_or_else(|| path_changed_error(&parent.join(leaf)))?;
+    let metadata = checked_file_metadata(&file)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "append target is not a regular file",
+        ));
+    }
+    {
+        use std::os::unix::fs::MetadataExt;
+        // A shared inode would append to another name's content; the atomic
+        // replacement this primitive stands in for would have unlinked it.
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "append target has multiple hard links",
+            ));
+        }
+    }
+    let length = file.metadata()?.len();
+    let mut buffer = Vec::with_capacity(record.len() + 1);
+    if separate && length > 0 {
+        let mut last = [0_u8; 1];
+        file.read_exact_at(&mut last, length - 1)?;
+        if last[0] != b'\n' {
+            buffer.push(b'\n');
+        }
+    }
+    buffer.extend_from_slice(record);
+    // One write on an `O_APPEND` descriptor lands atomically at the end.
+    file.write_all(&buffer)?;
+    file.sync_all()?;
+    record_durable_sync();
+    if created {
+        sync_directory(&directory)?;
+    }
+    // The parent must still be the directory we validated; otherwise the
+    // record landed somewhere the caller did not approve.
+    ensure_same_file(parent, parent_identity, &checked_path_metadata(parent)?)?;
+    Ok(())
+}
+
+#[cfg(feature = "memory")]
+#[cfg(windows)]
+fn private_append_platform(
+    parent: &Path,
+    parent_identity: &CheckedMetadata,
+    leaf: &std::ffi::OsStr,
+    record: &[u8],
+    separate: bool,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::{FileExt, OpenOptionsExt};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let target = parent.join(leaf);
+    if std::fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(path_changed_error(&target));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&target)?;
+    let metadata = checked_file_metadata(&file)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "append target is not a regular file",
+        ));
+    }
+    ensure_same_file(&target, &metadata, &checked_path_metadata(&target)?)?;
+    if windows_file_link_count(&file)? != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "append target has multiple hard links",
+        ));
+    }
+    let length = file.metadata()?.len();
+    let mut buffer = Vec::with_capacity(record.len() + 1);
+    if separate && length > 0 {
+        let mut last = [0_u8; 1];
+        file.seek_read(&mut last, length - 1)?;
+        if last[0] != b'\n' {
+            buffer.push(b'\n');
+        }
+    }
+    buffer.extend_from_slice(record);
+    file.write_all(&buffer)?;
+    file.sync_all()?;
+    record_durable_sync();
+    ensure_same_file(parent, parent_identity, &checked_path_metadata(parent)?)?;
+    Ok(())
+}
+
+#[cfg(feature = "memory")]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn private_append_platform(
+    _parent: &Path,
+    _parent_identity: &CheckedMetadata,
+    _leaf: &std::ffi::OsStr,
+    _record: &[u8],
+    _separate: bool,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private append is unsupported on this platform",
+    ))
+}
+
 /// Strict private checkpoint replacement bound to a retained parent's
 /// identity. The platform opens and compares that exact directory before
 /// descriptor-relative creation/publication; it never repairs an ambient

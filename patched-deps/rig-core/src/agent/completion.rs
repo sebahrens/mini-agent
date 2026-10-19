@@ -347,7 +347,7 @@ pub(crate) async fn build_prepared_completion_request<M: CompletionModel>(
     // Fetch dynamic (RAG) documents and the real executable tool set first, so we
     // can resolve the output mode (which depends on whether tools exist) before
     // building the preamble and request.
-    let (mut tooldefs, fetched_context): (Vec<crate::completion::ToolDefinition>, Vec<Document>) =
+    let (mut tooldefs, fetched_context): (Vec<Arc<crate::completion::ToolDefinition>>, Vec<Document>) =
         match &rag_text {
             Some(text) => {
                 let search_futures = dynamic_context.iter().map(|(num_sample, index)| {
@@ -564,14 +564,14 @@ pub(crate) async fn build_prepared_completion_request<M: CompletionModel>(
     // `output_tool_name` is only `Some` when `output_schema` is `Some` (Tool mode
     // requires a schema), so this match always fires in Tool mode.
     if let (Some(name), Some(schema)) = (&output_tool_name, output_schema) {
-        tooldefs.push(crate::completion::ToolDefinition {
+        tooldefs.push(Arc::new(crate::completion::ToolDefinition {
             name: name.clone(),
             description: "Call this tool exactly once with your final answer when you are done. \
                           Its arguments are the structured result and must satisfy the output \
                           schema."
                 .to_string(),
             parameters: schema.clone().to_value(),
-        });
+        }));
     }
 
     let mut completion_request = model

@@ -63,10 +63,10 @@ impl AdvisorToolConfig {
         main_provider: &str,
         main_client: &AnyClient,
         cfg: &crate::config::Config,
-        api_key: Option<&str>,
+        cli_key: &crate::provider::CliKey<'_>,
     ) -> anyhow::Result<()> {
         let (provider, model) = resolve_model(name, main_provider, cfg);
-        let client = model_client(&provider, main_provider, main_client, cfg, api_key)?;
+        let client = model_client(&provider, main_provider, main_client, cfg, cli_key)?;
         self.advisor_provider = provider;
         self.advisor_model = model;
         self.client = Some(client);
@@ -107,14 +107,16 @@ pub(crate) fn model_client(
     main_provider: &str,
     main_client: &AnyClient,
     cfg: &crate::config::Config,
-    api_key: Option<&str>,
+    cli_key: &crate::provider::CliKey<'_>,
 ) -> anyhow::Result<AnyClient> {
     if provider == main_provider {
         Ok(main_client.clone())
     } else {
+        // The `--api-key` belongs to the startup provider only; the advisor's
+        // own provider resolves its designated credential.
         crate::provider::create_client(
             provider,
-            api_key,
+            cli_key.for_provider(provider),
             cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )
@@ -1229,14 +1231,26 @@ mod tests {
             ),
         ] {
             advisor
-                .select_model(name, "main_gateway", &main, &config, Some("test-key"))
+                .select_model(
+                    name,
+                    "main_gateway",
+                    &main,
+                    &config,
+                    &crate::provider::CliKey::new(Some("test-key"), "advisor_gateway"),
+                )
                 .unwrap();
             assert_eq!(advisor.advisor_provider, provider);
             assert_eq!(advisor.advisor_model, model);
             assert_eq!(client_url(advisor.client.as_ref().unwrap()), url);
             assert!(
                 advisor
-                    .select_model("broken", "main_gateway", &main, &config, Some("test-key"))
+                    .select_model(
+                        "broken",
+                        "main_gateway",
+                        &main,
+                        &config,
+                        &crate::provider::CliKey::new(Some("test-key"), "advisor_gateway")
+                    )
                     .is_err()
             );
             assert_eq!(advisor.advisor_provider, provider);
@@ -1257,7 +1271,13 @@ mod tests {
         .unwrap();
         let mut advisor = routing_advisor();
         advisor
-            .select_model("consult", "main_gateway", &main, &config, Some("test-key"))
+            .select_model(
+                "consult",
+                "main_gateway",
+                &main,
+                &config,
+                &crate::provider::CliKey::new(Some("test-key"), "advisor_gateway"),
+            )
             .unwrap();
         advisor.refresh_client("main_gateway", main);
         assert_eq!(
