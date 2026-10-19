@@ -534,14 +534,30 @@ Every successful child response is required to use this host-owned structure:
 
 The host checks the section order, confidence label, and both coverage entries.
 If a model returns unstructured text, the host first gives the same child one
-bounded repair turn (a single model reply, no tools, charged to the task
-budget) asking it to restate its own previous response in the required
-sections; a negative result such as "no such capability exists" is a finding.
+bounded repair turn (a single model reply, tools disabled, charged to the task
+budget) that continues the child's own conversation, tool results included, and
+asks it to restate what it established in the required sections; a negative
+result such as "no such capability exists" is a finding.
 The restatement is used only if it passes validation. Otherwise mini-agent
 retains the original text under `Raw child
 response` but wraps it in a machine-checkable partial report with low
 confidence. This keeps malformed output useful without letting it masquerade as
 a complete specialist report.
+
+A child that exhausts its model-turn budget gets one further tool-free turn over
+its full history asking for the contract report. The result opens with
+`[partial: turn budget exhausted after N model turns and M tool calls; ...]`.
+If that turn yields nothing, the child's narration is returned under the same
+header. Both continuations are charged to the repair allocation.
+
+Each child also records a bounded tool log (tool name, truncated arguments,
+result size, error; at most 24 rows per child, extra calls only counted).
+`/tasks <id>` shows it for background tasks (stored with the task result and
+persisted with the session) and for the eight most recent foreground calls
+(in memory, listed by `/tasks`). When the host replaces a child's text with a
+repaired report, the child's raw text (capped at 6 KiB) is kept for the user:
+`/tasks result <id>` prints it marked unverified. Neither the log nor the raw
+text is part of `task_result` output or any other model-visible text.
 
 ### Designer → implementer → reviewer pipeline
 
