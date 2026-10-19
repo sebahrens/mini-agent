@@ -1024,7 +1024,7 @@ fn run_containment_preflight_with_proof_hook(
     executable: PathBuf,
     worker_args: &[&str],
     retain_candidate: bool,
-    after_first_proof: impl FnOnce() -> io::Result<()>,
+    between_launches: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<Option<one_time_image::RetainedWorkerSource>> {
     if !trusted_system_executable(Path::new("/usr/bin/true")) {
         return Err(io::Error::new(
@@ -1034,8 +1034,18 @@ fn run_containment_preflight_with_proof_hook(
     }
     let probes =
         HostedProbePaths::create().map_err(|error| PreflightStage::SentinelSetup.fail(error))?;
+    // The parent-death canary runs concurrently with the first generation's Ready proof, so it
+    // owns a separate set of probe files: neither case can observe the other's sentinel writes.
+    let canary_probes = match HostedProbePaths::create() {
+        Ok(canary_probes) => canary_probes,
+        Err(error) => {
+            probes.cleanup_best_effort();
+            return Err(PreflightStage::SentinelSetup.fail(error));
+        }
+    };
     probes
         .verify_unchanged()
+        .and_then(|()| canary_probes.verify_unchanged())
         .map_err(|error| PreflightStage::SentinelPrecheck.fail(error))?;
     let result = (|| {
         let mut process = launch_executable_with_source(
@@ -1047,36 +1057,67 @@ fn run_containment_preflight_with_proof_hook(
         )
         .map_err(|error| PreflightStage::Launch.fail(io::Error::other(error.to_string())))?;
         let diagnostic_drain = spawn_closed_probe_diagnostic_drain(&process.stderr)?;
-        let authentication = authenticate_ready_and_probe(&mut process, true);
-        if authentication.is_err() {
-            let _ = process.terminate_and_reap(PREFLIGHT_TIMEOUT);
-        }
-        let closed_code = diagnostic_drain.join().ok().flatten();
-        if let Some(code) = closed_code {
-            report_preflight_token(code);
-        }
-        if let Err(error) = authentication {
-            if closed_code.is_none() {
-                report_preflight_token("MACOS_CONTAINMENT_PROBE_FAILED=bootstrap");
+        // The first generation's publication (and its root lock) is complete and its source
+        // digest expectation is persisted, so the second launch reuses that expectation instead
+        // of rehashing the source. Each generation is a distinct clone and still proves its own
+        // full image digest, the child still rehashes it at Ready, and the canary's digest must
+        // equal the first generation's before anything is admitted.
+        between_launches()?;
+        std::thread::scope(|scope| {
+            let canary = std::thread::Builder::new()
+                .name("macos-parent-death-canary".into())
+                .spawn_scoped(scope, || {
+                    probe_guardian_parent_death(&executable, &canary_probes)
+                })
+                .map_err(|error| PreflightStage::ParentDeath.fail(error))?;
+            let first = (|| {
+                let authentication = authenticate_ready_and_probe(&mut process, true);
+                if authentication.is_err() {
+                    let _ = process.terminate_and_reap(PREFLIGHT_TIMEOUT);
+                }
+                let closed_code = diagnostic_drain.join().ok().flatten();
+                if let Some(code) = closed_code {
+                    report_preflight_token(code);
+                }
+                if let Err(error) = authentication {
+                    if closed_code.is_none() {
+                        report_preflight_token("MACOS_CONTAINMENT_PROBE_FAILED=bootstrap");
+                    }
+                    return Err(PreflightStage::WorkerAttestation.fail(error));
+                }
+                probes
+                    .verify_unchanged()
+                    .map_err(|error| PreflightStage::SentinelPostcheck.fail(error))?;
+                Ok(process.process.retained_candidate.take())
+            })();
+            // Always join the canary before leaving the scope's borrows, whatever the first
+            // generation did; its error is reported only when the first generation passed.
+            let canary = canary.join().unwrap_or_else(|_| {
+                Err(io::Error::other(
+                    "macOS parent-death canary thread panicked",
+                ))
+            });
+            let candidate = first?;
+            let canary_digest = canary.map_err(|error| PreflightStage::ParentDeath.fail(error))?;
+            // Generation equality is checked after the canary's exact cleanup so a rejection
+            // cannot strand its publication or workspace sentinel.
+            if candidate
+                .as_ref()
+                .is_some_and(|source| source.digest() != canary_digest)
+            {
+                return Err(PreflightStage::ParentDeath.fail(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "worker executable changed between containment cases",
+                )));
             }
-            return Err(PreflightStage::WorkerAttestation.fail(error));
-        }
-        probes
-            .verify_unchanged()
-            .map_err(|error| PreflightStage::SentinelPostcheck.fail(error))?;
-        let candidate = process.process.retained_candidate.take();
-        after_first_proof()?;
-        probe_guardian_parent_death(
-            &executable,
-            &probes,
-            candidate.as_ref().map(|source| source.digest()),
-        )
-        .map_err(|error| PreflightStage::ParentDeath.fail(error))?;
-        probes.verify_unchanged()?;
-        Ok(candidate)
+            probes.verify_unchanged()?;
+            canary_probes.verify_unchanged()?;
+            Ok(candidate)
+        })
     })();
     let cleanup = probes.cleanup();
-    match (result, cleanup) {
+    let canary_cleanup = canary_probes.cleanup();
+    match (result, cleanup.and(canary_cleanup)) {
         (Ok(candidate), Ok(())) => Ok(candidate),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -1145,8 +1186,7 @@ fn run_hosted_containment_matrix() -> io::Result<()> {
 fn probe_guardian_parent_death(
     executable: &Path,
     probes: &HostedProbePaths,
-    expected_digest: Option<[u8; 32]>,
-) -> io::Result<()> {
+) -> io::Result<[u8; 32]> {
     let publication_root =
         publication_root().map_err(|error| io::Error::other(error.to_string()))?;
     let process_paths =
@@ -1207,20 +1247,14 @@ fn probe_guardian_parent_death(
                     "macOS parent-death publication identity survived recovery",
                 ));
             }
-            // Check generation equality after exact cleanup so rejection cannot strand
-            // the child publication or the parent-death probe's workspace sentinel.
+            // The caller compares this generation's digest after exact cleanup so rejection
+            // cannot strand the child publication or the probe's workspace sentinel.
             probes
                 .restore_workspace_after_parent_death()
                 .inspect_err(|_error| {
                     report_preflight_token("MACOS_PARENT_DEATH_FAILED=workspace_cleanup")
                 })?;
-            if expected_digest.is_some_and(|expected| expected != digest) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "worker executable changed between containment cases",
-                ));
-            }
-            return Ok(());
+            return Ok(digest);
         }
         if Instant::now() >= deadline {
             report_preflight_token("MACOS_PARENT_DEATH_FAILED=group_timeout");
