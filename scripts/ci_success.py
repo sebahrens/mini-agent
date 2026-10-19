@@ -10,6 +10,13 @@ job by design:
   build, lint and test job and the Corresponding Source assembly, and only
   `changes` and `fmt` must still succeed.
 
+* a test-only change (`changes` reported `scope=tests`, see scripts/ci_scope.py)
+  on a pull request or branch push additionally skips TESTS_SCOPE_SKIPPABLE:
+  macOS/Windows rows, platform smokes, packaging, install and VS Code. A job
+  tied to a platform stays required when `changes` reported that platform
+  (`macos`/`windows` output `true`) because a changed test path is specific to
+  it. Tags, the schedule and dispatch never accept these skips.
+
 The heavy native Phase 6 gates (HEAVY_GATES) run only for tag pushes, manual
 dispatch and the weekly schedule, so on pull requests and branch pushes their
 `skipped` result is accepted by design; on a tag push or dispatch they must
@@ -43,6 +50,29 @@ HEAVY_GATES = (
 )
 
 
+# Jobs a `scope=tests` run may skip. The value is the `changes` output that
+# keeps the job required (a platform-specific test path), or None.
+TESTS_SCOPE_SKIPPABLE: dict[str, str | None] = {
+    "corresponding-source": None,
+    "harness-regression": None,
+    "package-compliance-smoke": None,
+    "vscode": None,
+    "platform-paths": None,
+    "platform-path-negative-controls": None,
+    "platform-path-install-smoke": None,
+    "mcp-stdio": None,
+    "lsp-lifecycle": None,
+    "install": None,
+    "windows-msi": None,
+    "package": None,
+    "dependency-policy": None,
+    "windows-default-compile": "windows",
+    "windows-hooks-compile": "windows",
+    "windows-worker-launcher-unit": "windows",
+    "macos-gym-ownership": "macos",
+}
+
+
 def heavy_gates_skipped_by_design(event: str, ref: str) -> bool:
     """True for the fast events: pull requests and pushes to branches."""
 
@@ -69,6 +99,11 @@ def evaluate(needs: dict[str, Any], event: str, ref: str = "") -> list[str]:
         errors.append(f"changes reported an invalid code output {code!r}")
     full_matrix = code != "false"
     fast_event = heavy_gates_skipped_by_design(event, ref)
+    scope = outputs.get("scope", "code")
+    if changes.get("result") == "success" and scope not in ("code", "tests"):
+        errors.append(f"changes reported an invalid scope output {scope!r}")
+    # Fail closed: only a well-formed tests scope on a fast event relaxes anything.
+    tests_scope = full_matrix and scope == "tests" and fast_event
 
     for job in sorted(needs):
         entry = needs[job]
@@ -79,6 +114,10 @@ def evaluate(needs: dict[str, Any], event: str, ref: str = "") -> list[str]:
             continue
         if result == "skipped" and job in HEAVY_GATES and fast_event:
             continue
+        if result == "skipped" and tests_scope and job in TESTS_SCOPE_SKIPPABLE:
+            platform = TESTS_SCOPE_SKIPPABLE[job]
+            if platform is None or outputs.get(platform) == "false":
+                continue
         errors.append(f"{job} finished with {result!r}")
     return errors
 
