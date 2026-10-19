@@ -2016,6 +2016,14 @@ commands that run workspace code (`git status`, `cargo check`/`build`/`test`/
 `fmt`/`clippy`, `pip list`) are withheld and those commands ask first; only
 `pwd` and the deny rules remain. Add an explicit `bash` rule if you want to
 allow them anyway.
+
+In `standard` mode a script whose every command is a read-only allowlisted
+command (`ls`, `cat`, `head`, `tail` without `-f`, `wc`, `grep`, `rg` without
+`--pre`/`-z`, `find` without `-exec`/`-delete`/`-fprint*`, `sed -n 'ADDRp'`, and
+`git log|show|diff|status|blame|rev-parse|ls-files`) runs without a prompt when
+paths stay inside the working directory. Redirections, `$`/backtick expansion,
+subshells, `tee`, `xargs`, env assignments, `&` and any other command still ask.
+Git is withheld in the unsandboxed fallback. See `src/permission/readonly_shell.rs`.
 An `external_directory` deny is a security baseline: it takes precedence over
 matching tool-specific allows and prior session AllowAlways scopes, including
 inherited `read` access used by `lsp_diagnostics`. When several

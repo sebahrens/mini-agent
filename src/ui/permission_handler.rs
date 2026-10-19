@@ -44,6 +44,9 @@ fn permission_options(folder: Option<&std::path::Path>) -> String {
     }
 }
 
+/// Appended last so a narrow terminal truncates it before any answer key.
+const PERMISSION_MODE_HINT: &str = "  [Shift+Tab: yolo mode stops prompts]";
+
 fn prompt_grant_header(offer: &PromptGrantOffer) -> String {
     format!(
         "[permission] prompt '{}' asks for {} access to {} for this session",
@@ -302,6 +305,9 @@ impl PermissionState {
                 "  (w) allow writes/edits in {} for this session",
                 workspace.root().display()
             ));
+        }
+        if self.offer.is_none() {
+            options.push_str(PERMISSION_MODE_HINT);
         }
         let header = match &request.agent_name {
             Some(name) => format!("[subagent: {name}] {header}"),
@@ -688,6 +694,8 @@ mod tests {
         assert!(plain.contains("(a) allow for this session"));
         assert!(!plain.contains("allow always"));
         assert!(!plain.contains("(f)"));
+        assert!(PERMISSION_MODE_HINT.contains("Shift+Tab"));
+        assert!(PERMISSION_MODE_HINT.contains("yolo"));
 
         let folder = std::path::Path::new("/home/me/.config/mini");
         let with_folder = permission_options(Some(folder));

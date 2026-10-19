@@ -409,6 +409,8 @@ const PINNED_HOOK_FILE_DENIAL: &str = "Blocked: this file is a configured hook e
 pub struct PermissionChecker {
     rules: HashMap<String, Vec<(Pattern, Action)>>,
     shell_allow_prefixes: Vec<crate::permission::shell_prefix::ShellPrefix>,
+    /// Read-only git scripts may auto-allow only while the sandbox is enforced.
+    readonly_git_auto_allow: bool,
     default_action: Action,
     ext_dir_rules: Vec<(Pattern, Action)>,
     doom_loop_action: Action,
@@ -601,6 +603,7 @@ impl PermissionChecker {
         Ok(Self {
             rules: self.rules.clone(),
             shell_allow_prefixes: self.shell_allow_prefixes.clone(),
+            readonly_git_auto_allow: self.readonly_git_auto_allow,
             default_action: self.default_action,
             ext_dir_rules: self.ext_dir_rules.clone(),
             doom_loop_action: self.doom_loop_action,
@@ -879,6 +882,8 @@ impl PermissionChecker {
         let checker = PermissionChecker {
             rules,
             shell_allow_prefixes,
+            readonly_git_auto_allow: sandbox
+                != crate::permission::SandboxResolution::DegradedUnavailable,
             default_action,
             ext_dir_rules,
             doom_loop_action,
@@ -1459,6 +1464,21 @@ impl PermissionChecker {
         let mut action = self.resolve_check_action(tool, &matched);
         if Self::resolve_matched(&matched) == Some(Action::Ask) {
             self.ask_cause = AskCause::ConfiguredAskRule;
+        }
+        // Standard mode runs a script made only of read-only allowlisted
+        // commands (see `readonly_shell`) without a prompt; a configured rule
+        // of any action has already decided otherwise.
+        if self.mode == SecurityMode::Standard
+            && tool == "shell"
+            && matched.is_empty()
+            && action == Action::Ask
+            && crate::permission::readonly_shell::is_read_only_script(
+                policy_input,
+                &self.working_dir,
+                self.readonly_git_auto_allow,
+            )
+        {
+            action = Action::Allow;
         }
         // Yolo allows unmatched scripts but still asks before a recognizably
         // destructive one; a configured rule for the script always decides.

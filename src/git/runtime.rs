@@ -411,10 +411,16 @@ fn resolve_model_write_target(path: &Path) -> Result<PathBuf, String> {
             .parent()
             .ok_or("model write target cannot be resolved")?;
     }
-    Ok(existing
+    let canonical = existing
         .canonicalize()
-        .map_err(|_| "model write target cannot be resolved")?
-        .join(suffix))
+        .map_err(|_| "model write target cannot be resolved")?;
+    // An empty suffix means the target exists; joining it would append a
+    // trailing separator that makes later canonicalization fail with ENOTDIR.
+    Ok(if suffix.as_os_str().is_empty() {
+        canonical
+    } else {
+        canonical.join(suffix)
+    })
 }
 
 /// Whether any retained guarded-Git runtime or program binding is alive, i.e.
@@ -792,6 +798,32 @@ mod tests {
             target,
         });
         TrustedProgram::capture_in_state(program, &[], state)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_write_allows_existing_and_new_files_outside_runtime_but_refuses_inside() {
+        let fixture = crate::tests::OwnedTestDirectory::new("model-write-existing-target");
+        let root = fixture.path().canonicalize().unwrap();
+        let protected = root.join("runtime");
+        let work = root.join("work");
+        std::fs::create_dir_all(protected.join("bin")).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(protected.join("bin/git"), b"inert").unwrap();
+        std::fs::write(work.join("existing.txt"), b"old").unwrap();
+        let mut state = ModelRoots::default();
+        let _program = capture_local(&protected.join("bin/git"), &mut state).unwrap();
+
+        let check = |target: &Path| {
+            resolve_model_write_target(target)
+                .and_then(|resolved| check_resolved_against(&state, &resolved))
+        };
+        // Existing target: empty suffix must not yield a trailing separator.
+        let resolved = resolve_model_write_target(&work.join("existing.txt")).unwrap();
+        assert_eq!(resolved, work.join("existing.txt"));
+        assert!(check(&work.join("existing.txt")).is_ok());
+        assert!(check(&work.join("new.txt")).is_ok());
+        assert!(check(&protected.join("bin/git")).is_err());
     }
 
     #[cfg(unix)]
