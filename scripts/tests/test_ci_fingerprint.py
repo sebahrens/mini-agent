@@ -186,6 +186,33 @@ class CommandLineTests(unittest.TestCase):
             self.assertIn("read=false", result.stdout)
 
 
+class OptionValueTests(unittest.TestCase):
+    def run_row(self, *row_args: str) -> subprocess.CompletedProcess:
+        script = REPOSITORY_ROOT / "scripts" / "ci_fingerprint.py"
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "Cargo.lock").write_text("lock")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            return subprocess.run(
+                ["python3", str(script), "compute", "--job=test", "--classes=production+tests",
+                 "--event=push", "--ref=refs/heads/main", *row_args],
+                cwd=repo, capture_output=True, text=True,
+            )
+
+    def test_row_values_starting_with_dashes_parse(self) -> None:
+        for row in ("--no-default-features --features js,sandbox", "--no-default-features", ""):
+            with self.subTest(row=row):
+                result = self.run_row(f"--row={row}")
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertIn("read=true", result.stdout)
+
+    def test_distinct_rows_give_distinct_fingerprints(self) -> None:
+        a = self.run_row("--row=--no-default-features").stdout
+        b = self.run_row("--row=").stdout
+        self.assertNotEqual(a, b)
+
+
 def job_body(name: str) -> str:
     match = re.search(rf"(?ms)^  {re.escape(name)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)", WORKFLOW)
     assert match, name
@@ -234,6 +261,30 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("lookup-only: true", ACTION)
         self.assertRegex(ACTION, r"(?m)^      if: inputs\.mode == 'save' && inputs\.key != ''$")
         self.assertIn("if: inputs.mode == 'check' && steps.compute.outputs.read == 'true'", ACTION)
+
+    def test_fingerprint_steps_are_non_fatal_and_pass_options_as_opt_value(self) -> None:
+        for name in (
+            "Compute the job fingerprint",
+            "Look up the pass marker",
+            "Report the result",
+            "Write the pass marker",
+            "Save the pass marker",
+        ):
+            match = re.search(rf"(?ms)^    - name: {name}\n(?P<body>.*?)(?=^    - name:|\Z)", ACTION)
+            self.assertIsNotNone(match, name)
+            self.assertIn("continue-on-error: true", match.group("body"), name)
+        for option in ("job", "classes", "row"):
+            self.assertIn(f'--{option}="$FP_', ACTION)
+        self.assertNotRegex(ACTION, r'--(?:job|classes|row|event|ref|os|image|arch) "')
+
+    def test_failed_compute_yields_not_a_hit(self) -> None:
+        compute = ACTION.split("- name: Compute the job fingerprint", 1)[1].split("- name:", 1)[0]
+        self.assertIn('echo "read=false"', compute)
+        self.assertIn('echo "key="', compute)
+        self.assertIn("fingerprint unavailable; running the job", compute)
+        # Downstream: an absent skip output is never 'true', so real steps run.
+        self.assertIn("steps.fp.outputs.skip != 'true'", WORKFLOW)
+        self.assertNotIn("steps.fp.outputs.skip == 'false'", WORKFLOW)
 
     def test_save_is_gated_by_the_main_push_policy_in_the_script(self) -> None:
         # The workflow passes only the script's `key`/`write`; tags, schedule,
