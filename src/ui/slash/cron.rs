@@ -182,7 +182,7 @@ fn arm_dynamic(
     if !budget_capped && store.take_budget_warning() {
         write_result(
             renderer,
-            "cron: no max_budget_usd is set, so scheduled turns are unbounded in spend",
+            "cron: no max_budget_usd or session token ceiling is set, so scheduled turns are unbounded in spend",
         );
     }
 }
@@ -353,7 +353,7 @@ fn arm(
     if !budget_capped && store.take_budget_warning() {
         write_result(
             renderer,
-            "cron: no max_budget_usd is set, so scheduled turns are unbounded in spend",
+            "cron: no max_budget_usd or session token ceiling is set, so scheduled turns are unbounded in spend",
         );
     }
 }

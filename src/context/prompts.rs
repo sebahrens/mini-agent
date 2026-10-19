@@ -485,9 +485,13 @@ pub fn ensure_global() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn regen() -> anyhow::Result<()> {
-    let dir = global_dir();
-    crate::context::copy_embedded_to(&EMBEDDED, &dir)
+pub(crate) fn regen() -> anyhow::Result<crate::context::RegenReport> {
+    crate::context::regen_embedded_to(&EMBEDDED, &global_dir())
+}
+
+/// (embedded file count, user-edited file names) for the global directory.
+pub(crate) fn regen_preview() -> (usize, Vec<String>) {
+    crate::context::edited_embedded_files(&EMBEDDED, &global_dir())
 }
 
 #[cfg(test)]

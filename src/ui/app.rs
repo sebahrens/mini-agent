@@ -5706,7 +5706,8 @@ impl<'a> App<'a> {
     }
 
     fn budget_admission_notice(&mut self) -> anyhow::Result<bool> {
-        if self.ui.cli.resolve_max_budget_usd(self.ui.cfg)?.is_none() {
+        let usd_capped = self.ui.cli.resolve_max_budget_usd(self.ui.cfg)?.is_some();
+        if !usd_capped && !self.ui.cfg.has_session_token_ceiling() {
             return Ok(false);
         }
         let run = crate::spend::run::Run::for_session(
@@ -5718,7 +5719,12 @@ impl<'a> App<'a> {
             return Ok(false);
         }
         if self.ui.session.spend_account.take_budget_notice() {
-            self.renderer.write_line("USD budget: further model requests/effects stopped; queued input is retained. Use /cost to inspect recorded estimates.", C_ERROR)?;
+            let label = if usd_capped {
+                "USD budget"
+            } else {
+                "Token budget"
+            };
+            self.renderer.write_line(&format!("{label}: further model requests/effects stopped; queued input is retained. Use /cost to inspect recorded estimates."), C_ERROR)?;
         }
         Ok(true)
     }

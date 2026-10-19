@@ -157,6 +157,14 @@ pub struct Config {
         deserialize_with = "crate::spend::deserialize_cap"
     )]
     pub max_budget_usd: Option<f64>,
+    /// Global owner ceiling on input tokens (cached input included) observed
+    /// across the logical session, subagents and scheduled fires included. It
+    /// needs no price, so it bounds providers whose prices are unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_session_input_tokens: Option<u64>,
+    /// Global owner ceiling on input plus output tokens for the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_session_total_tokens: Option<u64>,
     /// Owner-selected native Anthropic cache TTL. Project layers cannot alter
     /// this billing policy. Omission preserves manual five-minute caching.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -801,6 +809,19 @@ impl Config {
             usage.output_tokens = usage.output_tokens.saturating_add(usage.reasoning_tokens);
         }
         usage
+    }
+
+    pub(crate) fn has_session_token_ceiling(&self) -> bool {
+        self.max_session_input_tokens.is_some() || self.max_session_total_tokens.is_some()
+    }
+
+    /// One-line notice for a model whose context window nothing knows, so the
+    /// 128k fallback is in effect.
+    pub fn context_window_fallback_notice(provider: &str, model: &str) -> String {
+        format!(
+            "notice: no context window is known for {provider}/{model}; assuming 128000 tokens. \
+             Set `context_window` on its quick model so compaction and the context gauge match the model."
+        )
     }
 
     pub fn resolve_context_window(

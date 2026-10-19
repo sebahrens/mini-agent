@@ -129,7 +129,7 @@ pub(crate) fn prepare_default(
         .output()
         .map_err(|error| format!("Cannot start pinned Git bootstrap: {error}"))?;
     if !preflight.status.success() || preflight.stdout.len() > 65536 {
-        return Err("Pinned Git toolchain identity query failed; provision the documented native toolchain or supply MINI_AGENT_GIT_RUNTIME_BUNDLE".into());
+        return Err("Pinned Git toolchain identity query failed; provision the documented native toolchain (Debian/Ubuntu: apt install build-essential libcurl4-openssl-dev zlib1g-dev python3; Fedora: dnf install gcc make libcurl-devel zlib-devel python3; macOS: xcode-select --install) or supply MINI_AGENT_GIT_RUNTIME_BUNDLE".into());
     }
     let text = std::str::from_utf8(&preflight.stdout)
         .map_err(|_| "Git toolchain identity is not UTF-8")?;
@@ -160,7 +160,7 @@ pub(crate) fn prepare_default(
             .status()
             .map_err(|error| format!("Cannot start pinned Git bootstrap: {error}. Install Python 3 or set MINI_AGENT_GIT_PYTHON; cross/Windows builds may supply MINI_AGENT_GIT_RUNTIME_BUNDLE."))?;
         if !status.success() {
-            return Err("Pinned Git bootstrap failed; provision its documented native dependencies or supply MINI_AGENT_GIT_RUNTIME_BUNDLE for the exact target".into());
+            return Err("Pinned Git bootstrap failed; provision its documented native dependencies (Debian/Ubuntu: apt install build-essential libcurl4-openssl-dev zlib1g-dev python3; Fedora: dnf install gcc make libcurl-devel zlib-devel python3; macOS: xcode-select --install) or supply MINI_AGENT_GIT_RUNTIME_BUNDLE for the exact target".into());
         }
     }
     // An existing output is still checked in full. Do not repair or replace it.

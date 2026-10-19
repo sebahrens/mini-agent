@@ -211,6 +211,39 @@ fn history(length: usize) -> Vec<SessionMessage> {
     }]
 }
 
+#[test]
+fn session_token_budget_stops_unpriced_runs_through_the_shared_account() {
+    let root = crate::tests::OwnedTestDirectory::new("token-budget-run");
+    let account = Account::new("native-cost-session", None, 0.0).unwrap();
+    account.set_token_caps(None, Some(100));
+    let run = Run::fixture(
+        account.clone(),
+        Arc::new(Ledger::new(root.path())),
+        "native-cost-session",
+        PriceSnapshot::capture(None, Default::default(), false),
+    );
+    // A subagent run shares the parent's account, so its usage counts.
+    let child = run.with_kind(RequestKind::Subagent);
+    assert!(run.admit().is_ok());
+    child.observe(crate::event::UsageDelta {
+        input_tokens: 70,
+        output_tokens: 20,
+        total_tokens: 90,
+        ..Default::default()
+    });
+    assert!(run.admit().is_ok());
+    run.observe(crate::event::UsageDelta {
+        input_tokens: 5,
+        output_tokens: 5,
+        total_tokens: 10,
+        ..Default::default()
+    });
+    assert!(run.admit().is_err());
+    assert!(child.admit().is_err());
+    assert!(run.admit_effect().is_err());
+    assert!(run.was_refused());
+}
+
 #[tokio::test]
 async fn usd_budget_native_empty_compaction_records_usage_and_blocks_next_request() {
     let root = crate::tests::OwnedTestDirectory::new("cost-native-empty");

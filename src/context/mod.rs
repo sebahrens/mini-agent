@@ -114,6 +114,52 @@ pub(crate) fn load_dir_files_bounded_status(
 }
 
 #[cfg(test)]
+mod regen_tests {
+    use super::*;
+
+    static THEMES: Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/data/themes");
+
+    fn temp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("mini-agent-regen-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn regen_backs_up_edited_files_and_leaves_pristine_ones() {
+        let dir = temp("edit");
+        copy_embedded_to(&THEMES, &dir).unwrap();
+        let (total, edited) = edited_embedded_files(&THEMES, &dir);
+        assert!(total > 0 && edited.is_empty());
+
+        let victim = THEMES
+            .files()
+            .next()
+            .and_then(|f| f.path().file_name()?.to_str().map(String::from))
+            .unwrap();
+        std::fs::write(dir.join(&victim), "my edits").unwrap();
+        let (_, edited) = edited_embedded_files(&THEMES, &dir);
+        assert_eq!(edited, vec![victim.clone()]);
+
+        let report = regen_embedded_to(&THEMES, &dir).unwrap();
+        assert_eq!(report.written, 1);
+        assert_eq!(report.backed_up, vec![victim.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("{victim}.bak"))).unwrap(),
+            "my edits"
+        );
+        assert!(edited_embedded_files(&THEMES, &dir).1.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regen_writes_missing_files_without_backup() {
+        let dir = temp("missing");
+        let report = regen_embedded_to(&THEMES, &dir).unwrap();
+        assert!(report.written > 0 && report.backed_up.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod bounded_directory_file_tests {
     use super::*;
 
@@ -171,6 +217,65 @@ pub(crate) fn copy_embedded_to(embedded: &Dir, dest: &Path) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+/// Outcome of a regeneration: how many embedded files were written and which
+/// differing (user-edited or older-version) files were saved as `<name>.bak`
+/// before being replaced.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RegenReport {
+    pub written: usize,
+    pub backed_up: Vec<String>,
+}
+
+/// Names of embedded files whose on-disk copy exists and differs from the
+/// embedded original, plus the total number of embedded files.
+pub(crate) fn edited_embedded_files(embedded: &Dir, dest: &Path) -> (usize, Vec<String>) {
+    let mut total = 0;
+    let mut edited = Vec::new();
+    for file in embedded.files() {
+        let (Some(name), Some(content)) = (
+            file.path().file_name().and_then(|s| s.to_str()),
+            file.contents_utf8(),
+        ) else {
+            continue;
+        };
+        total += 1;
+        if let Ok(existing) = std::fs::read(dest.join(name))
+            && existing != content.as_bytes()
+        {
+            edited.push(name.to_string());
+        }
+    }
+    edited.sort();
+    (total, edited)
+}
+
+/// Like `copy_embedded_to`, but never silently discards a differing file: it
+/// is first copied to `<name>.bak` (extension no loader reads).
+pub(crate) fn regen_embedded_to(embedded: &Dir, dest: &Path) -> anyhow::Result<RegenReport> {
+    std::fs::create_dir_all(dest)?;
+    let mut report = RegenReport::default();
+    for file in embedded.files() {
+        let (Some(name), Some(content)) = (
+            file.path().file_name().and_then(|s| s.to_str()),
+            file.contents_utf8(),
+        ) else {
+            continue;
+        };
+        let dest_path = dest.join(name);
+        if let Ok(existing) = std::fs::read(&dest_path) {
+            if existing == content.as_bytes() {
+                continue;
+            }
+            std::fs::write(dest.join(format!("{name}.bak")), existing)?;
+            report.backed_up.push(name.to_string());
+        }
+        std::fs::write(&dest_path, content)?;
+        report.written += 1;
+    }
+    report.backed_up.sort();
+    Ok(report)
 }
 
 #[derive(Clone)]

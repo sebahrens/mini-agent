@@ -997,7 +997,7 @@ pub(crate) async fn handle_slash(
         // need more than the three fields the generic split above yields.
         "/memory" => memory::handle(&memory::split_command(text), &mut ctx).await,
         "/cron" => {
-            let budget_capped = ctx.cli.resolve_max_budget_usd(ctx.cfg)?.is_some();
+            let budget_capped = ctx.cli.has_spend_ceiling(ctx.cfg)?;
             cron::handle(
                 &parts,
                 cron_store,

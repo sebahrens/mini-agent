@@ -507,7 +507,9 @@ and stopping only edit the schedule.
 - **Bounded.** At most 16 schedules per session, and each is removed after
   `cron_max_fires` fires (default 24, see [CONFIG.md](CONFIG.md)).
 - **Spend.** When `max_budget_usd` is unset, arming the first schedule prints a
-  one-time warning that scheduled turns are unbounded in spend. When the USD
+  one-time warning that scheduled turns are unbounded in spend (a
+  `max_session_input_tokens`/`max_session_total_tokens` ceiling also counts as a bound).
+  When the USD or token
   budget refuses a fire, every schedule is suspended with one notice and kept
   (`/cron list` shows them; `/cron stop all` removes them).
 - **Saved disarmed.** Schedules are saved with the session (id, interval,

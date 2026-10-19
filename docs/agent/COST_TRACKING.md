@@ -7,7 +7,19 @@ trust is granted. The ceiling is invocation policy and is not saved as a session
 setting. A resumed session keeps its recorded spend. A value of zero admits no
 model request or model-dispatched effect.
 
-The ceiling uses provider-reported usage and captured configured or catalogue
+## Session token ceilings
+
+`max_session_input_tokens` and `max_session_total_tokens` (global config only) bound
+the tokens the logical session observes, with no price required: the main turn,
+repairs, subagents, auxiliary models and `/cron` fires all draw on the same
+account (`Account::admit`/`admit_effect`, the same path as the USD cap). Input
+counts cached and cache-write tokens; total adds output. Observation is in memory
+at once, so unlike the USD cap the token ceiling does not wait for the ledger and
+does not require known prices or complete tracking. A resumed session adds the
+ledger's recorded tokens (conservatively counting cached input on top of reported
+input). As with USD, an admitted request can cross the ceiling.
+
+The USD ceiling uses provider-reported usage and captured configured or catalogue
 prices. An admitted request can itself cross the ceiling. Requests and effects
 already dispatched retain their cancellation and completion ownership; crossing
 the ceiling does not undo their work. This is an estimated-spend admission bound,

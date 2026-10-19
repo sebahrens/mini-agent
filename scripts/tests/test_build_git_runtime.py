@@ -235,7 +235,7 @@ class GitBootstrapTests(unittest.TestCase):
             ), patch.object(MODULE, "read_regular", return_value=b"compiler"), patch.object(
                 MODULE.subprocess, "check_output"
             ) as command:
-                with self.assertRaisesRegex(ValueError, "unavailable: " + missing + "$"):
+                with self.assertRaisesRegex(ValueError, "unavailable: " + missing + r"\. .*(build-essential|libcurl4-openssl-dev)"):
                     MODULE.toolchain_identity({}, "x86_64-unknown-linux-gnu")
                 command.assert_not_called()
 

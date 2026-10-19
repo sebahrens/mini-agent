@@ -461,6 +461,12 @@ impl Receipt {
 struct State {
     session_id: String,
     cap: Option<f64>,
+    token_cap_input: Option<u64>,
+    token_cap_total: Option<u64>,
+    observed_input_tokens: u64,
+    observed_output_tokens: u64,
+    historical_input_tokens: u64,
+    historical_output_tokens: u64,
     legacy_estimate: f64,
     historical_observed_cost: f64,
     observed_cost: f64,
@@ -517,6 +523,15 @@ struct SavedAccount {
 }
 
 impl State {
+    fn token_usage(&self) -> (u64, u64) {
+        let input = self
+            .historical_input_tokens
+            .saturating_add(self.observed_input_tokens);
+        let output = self
+            .historical_output_tokens
+            .saturating_add(self.observed_output_tokens);
+        (input, input.saturating_add(output))
+    }
     fn saved(&self) -> SavedAccount {
         SavedAccount {
             version: 1,
@@ -715,6 +730,31 @@ impl Account {
         self.0.lock().unwrap_or_else(|error| error.into_inner()).cap = validate_cap(cap)?;
         Ok(())
     }
+    /// Session token ceilings. Unlike the USD cap they need no prices and no
+    /// ledger: every observed receipt counts in memory at once.
+    pub(crate) fn set_token_caps(&self, input: Option<u64>, total: Option<u64>) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.token_cap_input = input;
+        state.token_cap_total = total;
+    }
+    /// True when any spend or token ceiling is configured.
+    #[cfg_attr(not(feature = "acp"), allow(dead_code))]
+    pub(crate) fn has_ceiling(&self) -> bool {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.cap.is_some() || state.token_cap_input.is_some() || state.token_cap_total.is_some()
+    }
+    /// Observed (input, input+output) session tokens, ledger history included.
+    #[cfg(test)]
+    pub(crate) fn token_usage(&self) -> (u64, u64) {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.token_usage()
+    }
+    pub(crate) fn tokens_exhausted(&self) -> bool {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let (input, total) = state.token_usage();
+        state.token_cap_input.is_some_and(|cap| input >= cap)
+            || state.token_cap_total.is_some_and(|cap| total >= cap)
+    }
     pub(crate) fn inherit_uncertainty(&self, prior: AccountSnapshot) {
         let mut state = self.edit();
         state.tracking_error |= prior.tracking_error;
@@ -746,6 +786,21 @@ impl Account {
             .max(prior.records.saturating_sub(prior.unreported_records) as u64);
         state.call_history_complete &= prior.unreported_records == 0;
         state.ledger_ready = true;
+        // Conservative for resumed sessions: the ledger totals count cached
+        // input on top of reported input, which only over-counts for
+        // providers whose input already includes it.
+        let prior_input = prior
+            .input_tokens
+            .saturating_add(prior.cached_input_tokens)
+            .saturating_add(prior.cache_creation_input_tokens);
+        state.historical_input_tokens = state
+            .historical_input_tokens
+            .max(prior_input.saturating_sub(state.observed_input_tokens));
+        state.historical_output_tokens = state.historical_output_tokens.max(
+            prior
+                .output_tokens
+                .saturating_sub(state.observed_output_tokens),
+        );
         state.historical_observed_cost = state
             .historical_observed_cost
             .max((prior.known_cost - state.observed_cost).max(0.0));
@@ -820,6 +875,7 @@ impl Account {
             .ledger_ready
     }
     pub(crate) fn admit_effect(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.tokens_exhausted(), "session token budget exhausted");
         let state = self.snapshot();
         if state.cap.is_none() {
             return Ok(());
@@ -859,6 +915,19 @@ impl Account {
         } else {
             state.call_history_complete = false;
         }
+        let usage = row.usage;
+        let input = crate::session::Session::real_input_tokens(
+            row.prices.anthropic_native,
+            usage.input_tokens,
+            usage.total_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+        state.observed_input_tokens = state.observed_input_tokens.saturating_add(input);
+        state.observed_output_tokens = state
+            .observed_output_tokens
+            .saturating_add(usage.output_tokens);
         if let Some(cost) = row.cost {
             let sum = state.observed_cost + cost;
             if sum.is_finite() {
@@ -1178,6 +1247,74 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn session_token_caps_stop_unpriced_sessions_including_subagent_receipts() {
+        let receipt = |kind, input, output| {
+            Receipt::new(
+                "s",
+                "p",
+                "m",
+                kind,
+                UsageDelta {
+                    input_tokens: input,
+                    output_tokens: output,
+                    total_tokens: input + output,
+                    ..Default::default()
+                },
+                prices(None),
+            )
+        };
+        let account = Account::new("s", None, 0.0).unwrap();
+        assert!(!account.has_ceiling());
+        account.set_token_caps(Some(100), Some(130));
+        assert!(account.has_ceiling());
+        assert!(account.admit(prices(None)).is_ok(), "no price is required");
+        account
+            .observe(&receipt(RequestKind::Turn, 60, 10))
+            .unwrap();
+        assert!(account.admit(prices(None)).is_ok());
+        account
+            .observe(&receipt(RequestKind::Subagent, 30, 10))
+            .unwrap();
+        assert_eq!(account.token_usage(), (90, 110));
+        assert!(account.admit(prices(None)).is_ok());
+        // Total cap trips before the input cap does.
+        account
+            .observe(&receipt(RequestKind::Scheduled, 5, 20))
+            .unwrap();
+        assert_eq!(account.token_usage(), (95, 135));
+        assert!(account.admit(prices(None)).is_err());
+        assert!(account.admit_effect().is_err());
+        // The input cap alone stops too, and raising a cap re-admits.
+        account.set_token_caps(Some(95), None);
+        assert!(account.admit_effect().is_err());
+        account.set_token_caps(Some(96), None);
+        assert!(account.admit_effect().is_ok());
+        account.set_token_caps(Some(0), None);
+        assert!(account.admit_effect().is_err());
+        account.set_token_caps(None, None);
+        assert!(account.admit(prices(None)).is_ok());
+    }
+
+    #[test]
+    fn session_token_caps_count_resumed_ledger_history() {
+        let account = Account::new("s", None, 0.0).unwrap();
+        account.set_token_caps(Some(1000), None);
+        account
+            .reconcile(
+                None,
+                &ledger::Totals {
+                    input_tokens: 900,
+                    output_tokens: 50,
+                    cached_input_tokens: 100,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(account.token_usage(), (1000, 1050));
+        assert!(account.admit_effect().is_err());
+    }
+
     #[test]
     fn spend_receipts_charge_once_across_clones_acknowledgement_and_rewind() {
         let account = Account::new("s", Some(2.0), 1.0).unwrap();
