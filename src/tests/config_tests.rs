@@ -1380,6 +1380,7 @@ fn profile100_typed_config_cli_and_explicit_request_precedence() {
     assert!(!saved.contains("sandbox_profile"));
 }
 
+#[cfg(feature = "subagents")]
 #[test]
 fn quick_model_context_window_applies_to_main_session_and_subagents() {
     let cfg: Config = serde_json::from_str(

@@ -1426,9 +1426,10 @@ mod model_pricing_tests {
         assert!(
             ctx.renderer
                 .feed()
-                .block_text(0)
+                .block_text(1)
                 .unwrap()
-                .contains("switched to model")
+                .contains("switched to model"),
+            "block 0 is the 128k fallback notice for the uncatalogued model"
         );
         let model = crate::models_catalog::catalog_entries("anthropic")
             .unwrap()
@@ -1444,7 +1445,7 @@ mod model_pricing_tests {
         );
         assert_eq!(
             ctx.renderer.feed().block_count(),
-            2,
+            3,
             "known model emitted a pricing warning"
         );
         assert!(crate::provider::default_model_for_provider("unpriced-gateway", &cfg).is_none());
@@ -1465,7 +1466,7 @@ mod model_pricing_tests {
         assert!(
             ctx.renderer
                 .feed()
-                .block_text(2)
+                .block_text(4)
                 .unwrap()
                 .contains("switched to provider: unpriced-gateway")
         );
