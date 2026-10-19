@@ -1171,6 +1171,11 @@ fn load_uncached(
     #[cfg(test)]
     UNCACHED_LOADS.with(|loads| loads.set(loads.get() + 1));
     let mut agents = load_base(paths);
+    if !trusted && let Some(notice) = ignored_project_personas_notice(workspace) {
+        // Cache-miss only: an untrusted project's layers are not stamped, so this
+        // is emitted once per workspace and process, not per lookup.
+        tracing::warn!("{notice}");
+    }
     if trusted {
         for layer in PROJECT_AGENT_LAYERS {
             let definitions = workspace.read_relative_definition_layer(
@@ -1206,6 +1211,56 @@ fn load_uncached(
         }
     }
     agents
+}
+
+/// One-line notice naming project persona files ignored because the project is
+/// not trusted (agents-only projects have no approved project config). Lists
+/// file names only: no persona content is read, links are not followed, and
+/// enumeration is bounded. Interactive and headless/ACP behave identically:
+/// the personas stay inert either way.
+pub(crate) fn ignored_project_personas_notice(
+    workspace: &crate::paths::WorkspaceBinding,
+) -> Option<String> {
+    let mut names = Vec::new();
+    for layer in PROJECT_AGENT_LAYERS {
+        let Ok(directory) = workspace.open_dir_relative(Path::new(layer)) else {
+            continue;
+        };
+        let Ok(entries) = directory.read_dir(".") else {
+            continue;
+        };
+        for entry in entries.take(MAX_PROJECT_AGENT_ENTRIES).flatten() {
+            let name = entry.file_name();
+            let path = Path::new(&name);
+            if path.extension().is_some_and(|ext| ext == "md")
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                && valid_agent_name(stem)
+                && !names.iter().any(|existing| existing == stem)
+            {
+                names.push(stem.to_string());
+            }
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    names.sort_unstable();
+    let shown = names
+        .iter()
+        .take(MAX_NOTICE_NAMES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = names
+        .len()
+        .checked_sub(MAX_NOTICE_NAMES)
+        .filter(|more| *more > 0)
+        .map(|more| format!(" (and {more} more)"))
+        .unwrap_or_default();
+    Some(format!(
+        "project personas ignored ({shown}{more}): this project is not trusted; project personas \
+         load only when the workspace's .zerostack/config.toml is approved at the interactive trust prompt"
+    ))
 }
 
 /// Look up the system prompt and its provenance for a named agent type.
@@ -2306,6 +2361,34 @@ pub(crate) mod tests {
         assert!(notice.contains("/workspace/.zerostack/agents/review.md"));
         assert!(notice.contains("exceeds the 8-byte limit"));
         assert!(notice.contains("using compiled-in default"));
+    }
+
+    #[test]
+    fn agents_only_project_is_inert_and_names_ignored_personas() {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-agents-only-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".mini-agent/agents")).unwrap();
+        std::fs::write(root.join(".mini-agent/agents/x.md"), "PERSONA_BODY").unwrap();
+        std::fs::write(root.join(".mini-agent/agents/not-a-persona.txt"), "n").unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&root).unwrap();
+
+        // No config.toml: personas stay ignored (the same decision serves headless and ACP).
+        assert!(lookup_for_workspace("x", Some(&binding)).is_none());
+        let notice = ignored_project_personas_notice(&binding).expect("notice");
+        assert!(notice.contains("(x)"), "{notice}");
+        assert!(notice.contains(".zerostack/config.toml"), "{notice}");
+        assert!(!notice.contains("PERSONA_BODY"));
+
+        let empty =
+            std::env::temp_dir().join(format!("mini-agent-agents-none-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let empty_binding = crate::paths::WorkspaceBinding::capture(&empty).unwrap();
+        assert!(ignored_project_personas_notice(&empty_binding).is_none());
+
+        drop(binding);
+        drop(empty_binding);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(empty).unwrap();
     }
 
     #[test]

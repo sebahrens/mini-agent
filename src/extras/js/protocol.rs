@@ -776,6 +776,7 @@ impl EffectError {
         Self { code, reason: None }
     }
 
+    #[cfg(test)]
     pub(crate) const fn denied(reason: DenialReason) -> Self {
         Self {
             code: EffectErrorCode::Denied,
