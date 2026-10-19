@@ -931,6 +931,50 @@ async fn lsp_process_sync_capacity_preserves_updates_to_tracked_documents() {
 }
 
 #[tokio::test]
+async fn lsp_session_scope_reuses_one_manager_across_agent_builds() {
+    let fixture = FixtureBuild::compile("session-scope");
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+    let lease = fixture.path("session-scope.lease");
+    let mut server = fixture.config("diagnostics", &lease);
+    server.extensions = vec![".rs".into()];
+    let config = LspConfig {
+        servers: HashMap::from([("fixture".into(), server)]),
+        ..Default::default()
+    };
+    let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
+    let session = Arc::new(crate::extras::lsp::SessionLsp::default());
+    let mut managers = Vec::new();
+    for _ in 0..2 {
+        managers.push(
+            session
+                .scope(LspManager::prepare_for_session(&config, binding.clone()))
+                .await
+                .expect("fixture server is discoverable"),
+        );
+    }
+    assert!(managers[0].same_manager(&managers[1]));
+    assert_eq!(
+        session.prepare_count(),
+        1,
+        "PATH is scanned once per session"
+    );
+    // Without a session scope every build prepares its own manager.
+    let unscoped = LspManager::prepare_for_session(&config, binding.clone())
+        .await
+        .unwrap();
+    assert!(!unscoped.same_manager(&managers[0]));
+    // A different workspace binding replaces the entry.
+    let other = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
+    let rebuilt = session
+        .scope(LspManager::prepare_for_session(&config, other))
+        .await
+        .unwrap();
+    assert!(!rebuilt.same_manager(&managers[0]));
+    assert_eq!(session.prepare_count(), 2);
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
     use crate::agent::tools::{
         EditArgs, WriteArgs,

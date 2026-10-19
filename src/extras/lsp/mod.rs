@@ -164,6 +164,88 @@ pub(crate) async fn shutdown_live_managers() {
     }
 }
 
+#[cfg(any(feature = "acp", test))]
+tokio::task_local! {
+    static SESSION_LSP: Arc<SessionLsp>;
+}
+
+/// A session-owned language-server manager for frontends whose agent is
+/// rebuilt every turn (ACP). Without it each turn would re-scan `PATH` and
+/// restart, re-initialize and re-index every language server it uses.
+///
+/// Bind it around agent construction with [`SessionLsp::scope`]; the builder's
+/// [`LspManager::prepare_for_session`] then reuses the manager built by an
+/// earlier turn while the workspace and configuration are unchanged.
+#[cfg(any(feature = "acp", test))]
+#[derive(Default)]
+pub(crate) struct SessionLsp {
+    slot: tokio::sync::Mutex<Option<SessionLspEntry>>,
+    #[cfg(test)]
+    prepares: AtomicUsize,
+}
+
+#[cfg(any(feature = "acp", test))]
+struct SessionLspEntry {
+    workspace: usize,
+    config: serde_json::Value,
+    manager: Option<LspManager>,
+}
+
+#[cfg(any(feature = "acp", test))]
+impl SessionLsp {
+    pub(crate) async fn scope<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
+        SESSION_LSP.scope(Arc::clone(self), future).await
+    }
+
+    async fn get_or_prepare(
+        &self,
+        cfg: &LspConfig,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> Option<LspManager> {
+        let key = (
+            Arc::as_ptr(&workspace) as usize,
+            serde_json::to_value(cfg).ok(),
+        );
+        let mut slot = self.slot.lock().await;
+        if let (Some(entry), (ptr, Some(config))) = (slot.as_ref(), &key)
+            && entry.workspace == *ptr
+            && entry.config == *config
+        {
+            return entry.manager.clone();
+        }
+        #[cfg(test)]
+        self.prepares.fetch_add(1, Ordering::Relaxed);
+        let manager = LspManager::prepare(cfg, workspace).await;
+        // A changed workspace or configuration replaces the entry; its old
+        // servers are stopped rather than left running unowned.
+        let previous = match key {
+            (workspace, Some(config)) => slot.replace(SessionLspEntry {
+                workspace,
+                config,
+                manager: manager.clone(),
+            }),
+            _ => slot.take(),
+        };
+        if let Some(previous) = previous.and_then(|entry| entry.manager) {
+            previous.shutdown().await;
+        }
+        manager
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_count(&self) -> usize {
+        self.prepares.load(Ordering::Relaxed)
+    }
+
+    /// Stop the session's language servers (session close, connection end).
+    pub(crate) async fn shutdown(&self) {
+        let entry = self.slot.lock().await.take();
+        if let Some(manager) = entry.and_then(|entry| entry.manager) {
+            manager.shutdown().await;
+        }
+    }
+}
+
 /// A diagnostic-cache entry bound to the exact regular file that produced it.
 /// The open handle keeps that object alive across an interactive permission
 /// wait; formatting later compares the cache identity to this handle rather
@@ -290,6 +372,19 @@ impl LspManager {
                 .await
             }
         }
+    }
+
+    /// [`Self::prepare`], reusing the manager of the surrounding
+    /// [`SessionLsp`] scope when there is one.
+    pub(crate) async fn prepare_for_session(
+        cfg: &LspConfig,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> Option<Self> {
+        #[cfg(any(feature = "acp", test))]
+        if let Ok(session) = SESSION_LSP.try_with(Arc::clone) {
+            return session.get_or_prepare(cfg, workspace).await;
+        }
+        Self::prepare(cfg, workspace).await
     }
 
     async fn prepare_automatic(

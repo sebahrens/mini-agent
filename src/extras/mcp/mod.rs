@@ -124,6 +124,14 @@ impl McpClientManager {
     pub(crate) fn health_snapshot(&self) -> health::HealthSnapshot {
         self.health.snapshot()
     }
+    /// No connected server's transport has closed (a crashed or exited server
+    /// shows here), so a long-lived manager can tell it must be rebuilt.
+    #[cfg(feature = "acp")]
+    pub(crate) fn all_connections_open(&self) -> bool {
+        self.handles
+            .iter()
+            .all(|handle| !handle.running_service.peer().is_transport_closed())
+    }
     pub(crate) fn configured_count(&self) -> Option<usize> {
         self.configured_count
     }
