@@ -38,6 +38,7 @@ const MAX_BRIEF_ITEM_BYTES: usize = 8 * 1024;
 const TASK_AMBIGUOUS_HANDOFF_ERROR: &str = "task: send only one of prompts or briefs; to use briefs omit prompts entirely (or pass []), and to use prompts omit briefs entirely (or pass [])";
 const TASK_MISSING_HANDOFF_ERROR: &str = "task: send exactly one of prompts (a list of investigation strings) or briefs (a list of {objective, files?, constraints?, expected_sections?} objects)";
 
+#[derive(Debug)]
 pub struct TaskArgs {
     /// One or more exploration prompts. Concurrency and aggregate resources
     /// are bounded by the task-tool configuration.
@@ -59,12 +60,97 @@ pub struct TaskArgs {
 #[serde(deny_unknown_fields)]
 pub struct TaskBrief {
     pub objective: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list")]
     pub files: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list")]
     pub constraints: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list")]
     pub expected_sections: Vec<String>,
+}
+
+/// A list of strings that also accepts one bare string, the common model
+/// mistake for a single-element list. A blank string is an empty list; every
+/// other type keeps serde's usual rejection.
+#[derive(Debug)]
+struct StringList(Vec<String>);
+
+impl<'de> Deserialize<'de> for StringList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StringList;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence of strings (or a single string)")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(StringList(if value.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![value.to_owned()]
+                }))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(StringList(if value.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![value]
+                }))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1024));
+                while let Some(item) = seq.next_element::<String>()? {
+                    items.push(item);
+                }
+                Ok(StringList(items))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    StringList::deserialize(deserializer).map(|list| list.0)
+}
+
+/// Brief as sent on the wire. `agent_type` belongs at the top level, but
+/// models often repeat it per brief; an agreeing value is hoisted rather than
+/// bounced. Other unknown fields stay errors.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTaskBrief {
+    objective: String,
+    #[serde(default, deserialize_with = "string_list")]
+    files: Vec<String>,
+    #[serde(default, deserialize_with = "string_list")]
+    constraints: Vec<String>,
+    #[serde(default, deserialize_with = "string_list")]
+    expected_sections: Vec<String>,
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    run_in_background: Option<serde::de::IgnoredAny>,
+}
+
+struct RawTaskArgsParsed {
+    prompts: Option<Vec<String>>,
+    briefs: Option<Vec<TaskBrief>>,
+    agent_type: Option<String>,
+    run_in_background: bool,
 }
 
 impl<'de> Deserialize<'de> for TaskArgs {
@@ -75,8 +161,8 @@ impl<'de> Deserialize<'de> for TaskArgs {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct RawTaskArgs {
-            prompts: Option<Vec<String>>,
-            briefs: Option<Vec<TaskBrief>>,
+            prompts: Option<StringList>,
+            briefs: Option<Vec<RawTaskBrief>>,
             #[serde(default)]
             agent_type: Option<String>,
             #[serde(default)]
@@ -84,6 +170,46 @@ impl<'de> Deserialize<'de> for TaskArgs {
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
+        let mut raw_briefs = raw.briefs;
+        let mut agent_type = raw.agent_type;
+        if let Some(briefs) = raw_briefs.as_mut() {
+            if briefs.iter().any(|brief| brief.run_in_background.is_some()) {
+                return Err(serde::de::Error::custom(
+                    "task: run_in_background is a top-level field, not a brief field",
+                ));
+            }
+            for brief in briefs.iter() {
+                let Some(named) = brief.agent_type.as_deref() else {
+                    continue;
+                };
+                match agent_type.as_deref() {
+                    Some(existing) if existing != named => {
+                        return Err(serde::de::Error::custom(format!(
+                            "task: agent_type is a top-level field shared by all briefs; briefs named {existing} and {named} — issue one task call per agent_type"
+                        )));
+                    }
+                    Some(_) => {}
+                    None => agent_type = Some(named.to_owned()),
+                }
+            }
+        }
+        let briefs_field = raw_briefs.map(|briefs| {
+            briefs
+                .into_iter()
+                .map(|brief| TaskBrief {
+                    objective: brief.objective,
+                    files: brief.files,
+                    constraints: brief.constraints,
+                    expected_sections: brief.expected_sections,
+                })
+                .collect::<Vec<_>>()
+        });
+        let raw = RawTaskArgsParsed {
+            prompts: raw.prompts.map(|prompts| prompts.0),
+            briefs: briefs_field,
+            agent_type,
+            run_in_background: raw.run_in_background,
+        };
         // Non-strict gateways routinely send `null`, `[]`, or blank
         // placeholders for the handoff form they are not using. Only a
         // populated field counts as a selection; ambiguity is two populated
@@ -1482,7 +1608,7 @@ impl Drop for QueuedChild {
 
 fn indexed_child_future(
     index: usize,
-    prompt: String,
+    prompt_len: usize,
     child: ChildFuture,
     clock: &Arc<BatchClock>,
 ) -> IndexedChildFuture {
@@ -1503,8 +1629,12 @@ fn indexed_child_future(
             Ok(child) => child,
             Err(_) => {
                 let output = Err("subagent panicked".to_string());
+                // Cost estimation only reads the prompt length, so the cold
+                // panic path rebuilds a same-length stand-in instead of every
+                // child holding a second copy of its brief.
+                let stand_in = "\0".repeat(prompt_len);
                 ChildExecution {
-                    cost_units: usage_cost_units(&Usage::new(), false, false, &prompt, &output),
+                    cost_units: usage_cost_units(&Usage::new(), false, false, &stand_in, &output),
                     output,
                 }
             }
@@ -1835,10 +1965,15 @@ async fn execute_tasks_with_budget(
         let index = next_index;
         next_index += 1;
         started[index] = true;
-        let prompt = prompts[index].clone();
-        let child = executor(index, prompt.clone());
+        let prompt_len = prompts[index].len();
+        let child = executor(index, prompts[index].clone());
         cancellation_costs[index] = Some(child.cancellation_cost);
-        in_flight.push(indexed_child_future(index, prompt, child.future, &clock));
+        in_flight.push(indexed_child_future(
+            index,
+            prompt_len,
+            child.future,
+            &clock,
+        ));
     }
 
     while stop_reason.is_none() && !in_flight.is_empty() {
@@ -1936,10 +2071,15 @@ async fn execute_tasks_with_budget(
             let index = next_index;
             next_index += 1;
             started[index] = true;
-            let prompt = prompts[index].clone();
-            let child = executor(index, prompt.clone());
+            let prompt_len = prompts[index].len();
+            let child = executor(index, prompts[index].clone());
             cancellation_costs[index] = Some(child.cancellation_cost);
-            in_flight.push(indexed_child_future(index, prompt, child.future, &clock));
+            in_flight.push(indexed_child_future(
+                index,
+                prompt_len,
+                child.future,
+                &clock,
+            ));
         }
     }
 
@@ -2050,13 +2190,26 @@ fn task_heading(index: usize, prompt: &str, task_count: usize) -> String {
         return String::new();
     }
     let separator = if index > 0 { "\n" } else { "" };
-    let label = prompt
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(60)
-        .collect::<String>();
+    // Stream the whitespace-normalised prompt and stop after 60 characters
+    // instead of normalising a brief of up to 64 KB.
+    let mut label = String::new();
+    let mut chars = 0;
+    'words: for word in prompt.split_whitespace() {
+        if chars > 0 {
+            if chars == 60 {
+                break;
+            }
+            label.push(' ');
+            chars += 1;
+        }
+        for ch in word.chars() {
+            if chars == 60 {
+                break 'words;
+            }
+            label.push(ch);
+            chars += 1;
+        }
+    }
     format!("{separator}## Task {}: {}\n\n", index + 1, label)
 }
 
@@ -5052,7 +5205,7 @@ mod tests {
 
 #[cfg(test)]
 mod response_limit_tests {
-    use super::TaskTool;
+    use super::{MAX_BRIEF_ITEM_BYTES, TaskArgs, TaskTool, render_task_brief, task_heading};
     #[test]
     fn task130_child_response_default_retains_explicit_parent_ceilings() {
         let child = TaskTool::new(None, None, true);
@@ -5105,5 +5258,134 @@ mod response_limit_tests {
             uncapped.effective_response_max_tokens(&Default::default()),
             32_000
         );
+    }
+
+    fn parse_args(value: serde_json::Value) -> Result<TaskArgs, String> {
+        serde_json::from_value::<TaskArgs>(value).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn single_strings_become_one_element_lists_and_blank_strings_become_empty() {
+        let args = parse_args(serde_json::json!({"briefs": [{
+            "objective": "review",
+            "files": "src/lib.rs",
+            "constraints": "READ-ONLY review, no edits.",
+            "expected_sections": "   "
+        }]}))
+        .unwrap();
+        let brief = &args.briefs.unwrap()[0];
+        assert_eq!(brief.files, ["src/lib.rs"]);
+        assert_eq!(brief.constraints, ["READ-ONLY review, no edits."]);
+        assert!(brief.expected_sections.is_empty());
+
+        let args = parse_args(serde_json::json!({"prompts": "trace the parser"})).unwrap();
+        assert_eq!(args.prompts, ["trace the parser"]);
+        let args = parse_args(serde_json::json!({"prompts": ""})).unwrap();
+        assert!(args.prompts.is_empty());
+        assert!(args.briefs.is_none());
+
+        // Other types remain errors.
+        let error = parse_args(serde_json::json!({"briefs": [{"objective": "x", "files": 3}]}))
+            .unwrap_err();
+        assert!(error.contains("sequence of strings"), "{error}");
+    }
+
+    #[test]
+    fn per_brief_agent_type_is_hoisted_when_consistent() {
+        let args = parse_args(serde_json::json!({"briefs": [
+            {"objective": "a", "agent_type": "reviewer"},
+            {"objective": "b", "agent_type": "reviewer"},
+            {"objective": "c"}
+        ]}))
+        .unwrap();
+        assert_eq!(args.agent_type.as_deref(), Some("reviewer"));
+        assert_eq!(args.briefs.unwrap().len(), 3);
+
+        let args = parse_args(serde_json::json!({
+            "agent_type": "reviewer",
+            "briefs": [{"objective": "a", "agent_type": "reviewer"}]
+        }))
+        .unwrap();
+        assert_eq!(args.agent_type.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn conflicting_agent_types_get_the_precise_error() {
+        let expected = "task: agent_type is a top-level field shared by all briefs; briefs named reviewer and implementer — issue one task call per agent_type";
+        let between = parse_args(serde_json::json!({"briefs": [
+            {"objective": "a", "agent_type": "reviewer"},
+            {"objective": "b", "agent_type": "implementer"}
+        ]}))
+        .unwrap_err();
+        assert!(between.contains(expected), "{between}");
+        let against_top = parse_args(serde_json::json!({
+            "agent_type": "reviewer",
+            "briefs": [{"objective": "b", "agent_type": "implementer"}]
+        }))
+        .unwrap_err();
+        assert!(against_top.contains(expected), "{against_top}");
+    }
+
+    #[test]
+    fn other_unknown_brief_fields_stay_errors() {
+        let error = parse_args(serde_json::json!({"briefs": [{"objective": "a", "bogus": 1}]}))
+            .unwrap_err();
+        assert!(error.contains("unknown field `bogus`"), "{error}");
+        let error = parse_args(serde_json::json!({"briefs": [
+            {"objective": "a", "run_in_background": true}
+        ]}))
+        .unwrap_err();
+        assert!(error.contains("top-level field"), "{error}");
+        let error = parse_args(serde_json::json!({"briefs": [{"files": "a"}]})).unwrap_err();
+        assert!(error.contains("objective"), "{error}");
+    }
+
+    #[test]
+    fn coerced_lists_still_obey_the_item_limits() {
+        let too_big = "x".repeat(MAX_BRIEF_ITEM_BYTES + 1);
+        let args = parse_args(serde_json::json!({"briefs": [
+            {"objective": "a", "constraints": too_big}
+        ]}))
+        .unwrap();
+        assert!(render_task_brief(0, &args.briefs.unwrap()[0]).is_err());
+    }
+
+    #[test]
+    fn task_heading_matches_the_normalise_then_truncate_label() {
+        fn reference(index: usize, prompt: &str, count: usize) -> String {
+            if count == 1 {
+                return String::new();
+            }
+            let separator = if index > 0 { "\n" } else { "" };
+            let label = prompt
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(60)
+                .collect::<String>();
+            format!("{separator}## Task {}: {}\n\n", index + 1, label)
+        }
+        let long_word = "w".repeat(80);
+        let cases = [
+            "short".to_string(),
+            "  spaced \n out\t words  ".to_string(),
+            "a ".repeat(100),
+            format!("{} {}", "b".repeat(59), "next"),
+            format!("{} {}", "b".repeat(60), "next"),
+            format!("{} {}", "b".repeat(58), "next"),
+            long_word,
+            "雪".repeat(100),
+            format!("{} tail", "x".repeat(64 * 1024)),
+            String::new(),
+        ];
+        for prompt in &cases {
+            for (index, count) in [(0, 1), (0, 3), (2, 3)] {
+                assert_eq!(
+                    task_heading(index, prompt, count),
+                    reference(index, prompt, count)
+                );
+            }
+        }
     }
 }
