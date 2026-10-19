@@ -302,16 +302,34 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
         super::layers::validate_toml_bounds_diagnostic(content, MAX_PRIVATE_CONFIG_BYTES)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
     }
+    // TOML is tokenised once into a table; its keys supply the spelling list and
+    // the table deserialises into Config. A failure re-parses the text so the
+    // error keeps its line/column wording.
+    let mut toml_table: Option<toml::Table> =
+        if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
+            content.parse::<toml::Table>().ok()
+        } else {
+            None
+        };
+    let toml_keys: Vec<String> = toml_table
+        .as_ref()
+        .map(|table| table.keys().cloned().collect())
+        .unwrap_or_default();
     let mut cfg: Config = match path.extension().and_then(|extension| extension.to_str()) {
-        Some("toml") => toml::from_str(content).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "config is not valid TOML ({})",
-                    keys::describe_toml_error(content, &error)
-                ),
-            )
-        }),
+        Some("toml") => toml_table
+            .take()
+            .and_then(|table| <Config as serde::Deserialize>::deserialize(table).ok())
+            .map(Ok)
+            .unwrap_or_else(|| toml::from_str(content))
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "config is not valid TOML ({})",
+                        keys::describe_toml_error(content, &error)
+                    ),
+                )
+            }),
         _ => serde_yaml_ng::from_str(content).map_err(|error| {
             let message = match error.location() {
                 Some(location) => format!(
@@ -332,14 +350,7 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
     cfg.provenance.global_status = Some("loaded");
     let spellings: Vec<String> =
         if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
-            toml::from_str::<toml::Value>(content)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .as_table()
-                        .map(|table| table.keys().cloned().collect())
-                })
-                .unwrap_or_default()
+            toml_keys
         } else {
             serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content)
                 .ok()
