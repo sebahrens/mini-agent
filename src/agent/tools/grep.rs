@@ -203,6 +203,13 @@ impl GrepTool {
     }
 }
 
+/// True when a per-line match implies a whole-buffer match, so a failed
+/// `is_match` on the buffer may skip the file. Conservative: any anchor
+/// character or escape disables the prefilter.
+fn prefilter_is_line_safe(pattern: &str) -> bool {
+    !(pattern.contains(['^', '$']) || ["\\A", "\\z", "\\Z"].iter().any(|a| pattern.contains(a)))
+}
+
 struct MatchedLines {
     lines: Vec<usize>,
     ranges: BTreeMap<usize, Range<usize>>,
@@ -286,11 +293,21 @@ fn search_bound_directory(
     options: GrepSearchOptions,
     cancellation: Option<crate::agent::runner::AgentWorkCancellation>,
 ) -> Result<GrepSearchResult, ToolError> {
-    let include_root = bound_directory.approved_root().to_path_buf();
     let mut walker = bound_directory
         .walker()?
         .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH)
         .with_cancellation(cancellation);
+    // The include glob is evaluated on the name before a file is opened, so
+    // excluded files cost no open, fstat or read.
+    if let Some((re_include, path_aware)) = include_re {
+        walker = walker.with_file_filter(Box::new(move |relative_path, file_name| {
+            if path_aware {
+                re_include.is_match(&relative_path.to_string_lossy().replace('\\', "/"))
+            } else {
+                re_include.is_match(&file_name.to_string_lossy())
+            }
+        }));
+    }
     let mut file_count = 0;
     let mut files_with_matches = 0;
     let mut results = Vec::with_capacity(options.max_results.min(64));
@@ -303,22 +320,6 @@ fn search_bound_directory(
         if emitted_results >= options.max_results {
             limit_hit = true;
             break;
-        }
-
-        if let Some((re_include, path_aware)) = &include_re {
-            let candidate = if *path_aware {
-                entry
-                    .path
-                    .strip_prefix(&include_root)
-                    .unwrap_or(&entry.path)
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            } else {
-                entry.file_name.to_string_lossy().into_owned()
-            };
-            if !re_include.is_match(&candidate) {
-                continue;
-            }
         }
 
         if entry.metadata.len() > MAX_SEARCH_FILE_BYTES {
@@ -342,6 +343,13 @@ fn search_bound_directory(
         };
         file_count += 1;
         let content = String::from_utf8_lossy(&data);
+        // Whole-buffer rejection of files with no match, without splitting
+        // lines. Per-line search is only a subset of whole-buffer matches when
+        // the pattern has no anchors (line-relative `^`/`$` differ from
+        // buffer-relative ones, and `\r` is stripped by `lines()`).
+        if (options.multiline || prefilter_is_line_safe(re.as_str())) && !re.is_match(&content) {
+            continue;
+        }
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
 
@@ -1612,6 +1620,37 @@ mod tests {
             .find(|line| line.contains("context.txt:1-"))
             .expect("context result line");
         assert!(context_result.ends_with('…'), "{context_result}");
+    }
+
+    #[test]
+    fn prefilter_is_disabled_for_anchored_patterns() {
+        assert!(prefilter_is_line_safe("foo.*bar"));
+        assert!(prefilter_is_line_safe(r"fn\s+\w+"));
+        for anchored in ["^foo", "foo$", r"\Afoo", r"foo\z", r"foo\Z", "[^a]x"] {
+            assert!(!prefilter_is_line_safe(anchored), "{anchored}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prefilter_keeps_line_anchored_and_crlf_matches() {
+        let dir = TempDir::new("grep-prefilter");
+        std::fs::write(dir.path().join("a.txt"), "first\r\nsecond end\r\nthird\r\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "nothing here\n").unwrap();
+        for (pattern, expected) in [
+            ("^second", "a.txt:2:second end"),
+            ("end$", "a.txt:2:second end"),
+            ("second", "a.txt:2:second end"),
+        ] {
+            let mut args = ergonomic_args(dir.path(), None);
+            args.pattern = pattern.to_string();
+            let output = GrepTool::new(None, None, 10).call(args).await.unwrap();
+            assert!(output.contains(expected), "{pattern}: {output}");
+            assert!(!output.contains("b.txt"), "{pattern}: {output}");
+        }
+        let mut args = ergonomic_args(dir.path(), None);
+        args.pattern = "first\\nsecond".to_string();
+        let output = GrepTool::new(None, None, 10).call(args).await.unwrap();
+        assert_eq!(output, "No matches found.");
     }
 
     #[test]
