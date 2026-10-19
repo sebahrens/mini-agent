@@ -7,7 +7,9 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use crate::session::native_replay::{NativeCommitment, RestartReason};
+use crate::session::native_replay::{
+    CaptureSizes, NativeCommitment, NativeHistory, RestartReason, capture_history_size,
+};
 use rig::OneOrMany;
 use rig::agent::{AgentHook, Flow, HookContext, StepEvent, StepEventKind};
 use rig::completion::{AssistantContent, CompletionModel, CompletionRequest, Message};
@@ -71,6 +73,39 @@ struct State {
     actor_pair: Option<crate::session::native_publication::NativeActorPair>,
     prepared_observed: bool,
     host: Option<crate::provider::NativeHostGuard>,
+    /// Serialized sizes of the base and every frame, kept in lockstep with
+    /// `turns` so budgets are arithmetic instead of re-serializing the history.
+    sizes: CaptureSizes,
+}
+
+/// Serialized size of a value for incremental budgets. Saturates when it cannot
+/// be measured within the capture bound, which every limit then rejects.
+fn measured<T: serde::Serialize>(value: &T) -> usize {
+    crate::session::native_replay::bounded_serialized(value, MAX_CAPTURE_BYTES)
+        .unwrap_or(usize::MAX)
+}
+
+impl State {
+    /// Structure and byte budget of the replay capture so far. This accepts and
+    /// rejects exactly what rebuilding the whole `NativeHistory` and serializing
+    /// it against `payload_limit` would, from the tracked sizes.
+    fn replay_budget(&mut self, enforce_frame_limit: bool) -> Result<(), RestartReason> {
+        let Some(replay) = &self.replay else {
+            return Ok(());
+        };
+        let base: &[Message] = replay.initial.as_deref().unwrap_or(&[]);
+        NativeHistory::validate_capture(replay.epoch, base, &self.turns, &self.sizes)?;
+        self.sizes.base_checked = true;
+        self.sizes.checked_frames = self.turns.len();
+        if enforce_frame_limit && self.turns.len() > replay.frame_limit {
+            return Err(RestartReason::Limit);
+        }
+        let total = capture_history_size(replay.epoch, self.sizes.base, &self.sizes.frames);
+        if total > replay.payload_limit {
+            return Err(RestartReason::Limit);
+        }
+        Ok(())
+    }
 }
 
 type NativeBodyFactory = Arc<
@@ -81,7 +116,10 @@ type NativeBodyFactory = Arc<
 struct PreparedInput {
     key: (String, usize),
     request: CompletionRequest,
-    input: Vec<Message>,
+    /// The whole input, only for the first model call of an unbound capture
+    /// (its delta is empty by design). Later calls extend `accepted_history`
+    /// by `delta` instead of cloning the whole prefix every call.
+    full_input: Option<Vec<Message>>,
     delta: Vec<Message>,
 }
 struct ReplayState {
@@ -238,6 +276,11 @@ impl NativeCapture {
         };
         Ok(Self(Arc::new(Mutex::new(State {
             replay: Some(replay),
+            sizes: CaptureSizes {
+                // An absent base serializes as `[]`.
+                base: 2,
+                ..Default::default()
+            },
             ..Default::default()
         }))))
     }
@@ -319,6 +362,12 @@ impl NativeCapture {
             .collect();
         state.bytes =
             crate::session::native_replay::bounded_serialized(history, MAX_CAPTURE_BYTES)?;
+        state.sizes = CaptureSizes {
+            base: measured(&history.base()),
+            base_checked: false,
+            frames: history.frames().iter().map(measured).collect(),
+            checked_frames: 0,
+        };
         let replay = state.replay.as_mut().unwrap();
         replay.epoch = history.epoch();
         replay.frontier = Some(frontier.clone());
@@ -386,25 +435,33 @@ impl NativeCapture {
                     replay.manual_cache_markers,
                 )?;
             }
-            let mut input: Vec<Message> = request.chat_history.iter().cloned().collect();
-            if replay.generated_preamble {
-                if !matches!(input.first(), Some(Message::System { .. })) {
-                    return Err(RestartReason::UnavailableSource);
-                }
-                input.remove(0);
+            // Compare in place; only the new suffix (or, for the first call of
+            // an unbound capture, the whole input) is cloned.
+            let preamble = usize::from(replay.generated_preamble);
+            if replay.generated_preamble
+                && !matches!(
+                    request.chat_history.iter().next(),
+                    Some(Message::System { .. })
+                )
+            {
+                return Err(RestartReason::UnavailableSource);
             }
-            if !input.starts_with(&replay.accepted_history) {
+            let input = || request.chat_history.iter().skip(preamble);
+            let accepted = &replay.accepted_history;
+            if request.chat_history.len() < preamble + accepted.len()
+                || !accepted.iter().zip(input()).all(|(a, b)| a == b)
+            {
                 return Err(RestartReason::ChangedPrefix);
             }
-            let delta = if replay.initial.is_none() && replay.accepted_history.is_empty() {
-                Vec::new()
+            let (full_input, delta) = if replay.initial.is_none() && accepted.is_empty() {
+                (Some(input().cloned().collect()), Vec::new())
             } else {
-                input[replay.accepted_history.len()..].to_vec()
+                (None, input().skip(accepted.len()).cloned().collect())
             };
             replay.pending = Some(PreparedInput {
                 key: (run_id.to_string(), turn),
                 request: request.clone(),
-                input,
+                full_input,
                 delta,
             });
             Ok(())
@@ -469,6 +526,7 @@ impl NativeCapture {
             return;
         }
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let state = &mut *state;
         if state.unavailable.is_some() {
             return;
         }
@@ -528,12 +586,22 @@ impl NativeCapture {
                     .checked_sub(1)
                     .ok_or(RestartReason::UnavailableSource)?;
                 replay.commitment = Some(commitment.clone());
+                let mut input = match prepared.full_input {
+                    Some(full) => full,
+                    None => {
+                        let mut accepted = std::mem::take(&mut replay.accepted_history);
+                        accepted.extend(prepared.delta.iter().cloned());
+                        accepted
+                    }
+                };
+                let mut new_base = None;
                 if replay.initial.is_none() {
-                    replay.initial = Some(prepared.input.clone());
+                    new_base = Some(measured(&input));
+                    replay.initial = Some(input.clone());
                 }
-                replay.accepted_history = prepared.input;
-                replay.accepted_history.push(assistant);
-                Ok((prepared.delta, commitment.only_message(last)))
+                input.push(assistant);
+                replay.accepted_history = input;
+                Ok((prepared.delta, commitment.only_message(last), new_base))
             })();
             match captured {
                 Ok(data) => Some(data),
@@ -545,6 +613,16 @@ impl NativeCapture {
         } else {
             None
         };
+        let (native_input_delta, native_commitment) = match replay_data {
+            Some((delta, commitment, new_base)) => {
+                if let Some(size) = new_base {
+                    state.sizes.base = size;
+                    state.sizes.base_checked = false;
+                }
+                (Some(delta), Some(commitment))
+            }
+            None => (None, None),
+        };
         let projection = NativeTurnProjection {
             sdk_run_id: run_id.to_string(),
             turn,
@@ -552,34 +630,19 @@ impl NativeCapture {
             content: content.clone(),
             advertised_tools: Vec::new(),
             native_tool_results: Vec::new(),
-            native_input_delta: replay_data.as_ref().map(|(delta, _)| delta.clone()),
-            native_commitment: replay_data.map(|(_, commitment)| commitment),
+            native_input_delta,
+            native_commitment,
         };
-        if let Some(base) = state
+        state.sizes.frames.push(measured(&projection));
+        state.turns.push(projection);
+        if state
             .replay
             .as_ref()
-            .and_then(|replay| replay.initial.as_ref())
+            .is_some_and(|replay| replay.initial.is_some())
+            && let Err(reason) = state.replay_budget(true)
         {
-            let mut candidate = state.turns.clone();
-            candidate.push(projection.clone());
-            let replay = state.replay.as_ref().unwrap();
-            let validated = crate::session::native_replay::NativeHistory::from_capture(
-                replay.epoch,
-                base.clone(),
-                candidate,
-            )
-            .and_then(|history| {
-                if history.frames().len() > replay.frame_limit {
-                    return Err(RestartReason::Limit);
-                }
-                crate::session::native_replay::bounded_serialized(&history, replay.payload_limit)
-                    .map(|_| ())
-            });
-            if let Err(reason) = validated {
-                state.replay.as_mut().unwrap().failure.get_or_insert(reason);
-            }
+            state.replay.as_mut().unwrap().failure.get_or_insert(reason);
         }
-        state.turns.push(projection);
         let opaque = content.iter().any(|item| matches!(item,
             AssistantContent::Reasoning(reasoning) if reasoning.content.iter().any(|block| match block {
                 rig::message::ReasoningContent::Text {signature:Some(signature),..} => !signature.is_empty(),
@@ -612,17 +675,19 @@ impl NativeCapture {
             return;
         }
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let state = &mut *state;
         if state.unavailable.is_some() {
             return;
         }
-        let Some(frame) = state
+        let Some(index) = state
             .turns
-            .iter_mut()
-            .find(|frame| frame.sdk_run_id == run_id && frame.turn == turn)
+            .iter()
+            .position(|frame| frame.sdk_run_id == run_id && frame.turn == turn)
         else {
             state.unavailable = Some(Unavailable::MissingCallIdentity);
             return;
         };
+        let frame = &state.turns[index];
         if frame
             .content
             .iter()
@@ -656,38 +721,30 @@ impl NativeCapture {
             state.unavailable = Some(Unavailable::Limit);
             return;
         }
-        // Re-borrow after checking the aggregate capture bound.
         state.bytes += identity_bytes;
-        let frame = state
-            .turns
-            .iter_mut()
-            .find(|frame| frame.sdk_run_id == run_id && frame.turn == turn)
-            .expect("frame already validated");
-        frame.advertised_tools.push(AdvertisedToolIdentity {
+        let identity = AdvertisedToolIdentity {
             tool_id: tool_id.to_string(),
             provider_id: provider_id.map(str::to_string),
             internal_id: internal_id.to_string(),
-        });
+        };
+        // The array always serializes; a later element adds its comma.
+        let separator = usize::from(!state.turns[index].advertised_tools.is_empty());
+        state.sizes.frames[index] = state.sizes.frames[index]
+            .saturating_add(measured(&identity))
+            .saturating_add(separator);
+        state.turns[index].advertised_tools.push(identity);
         // Canonical identity metadata also consumes the captured payload.
         // Refuse the current callback before its effect if it cannot be kept.
-        if let Some(replay) = &state.replay {
-            let budget = crate::session::native_replay::NativeHistory::from_capture(
-                replay.epoch,
-                replay.initial.clone().unwrap_or_default(),
-                state.turns.clone(),
-            )
-            .and_then(|history| {
-                crate::session::native_replay::bounded_serialized(&history, replay.payload_limit)
-                    .map(|_| ())
-            });
-            if let Err(reason) = budget {
-                state.replay.as_mut().unwrap().failure.get_or_insert(reason);
-            }
+        if state.replay.is_some()
+            && let Err(reason) = state.replay_budget(false)
+        {
+            state.replay.as_mut().unwrap().failure.get_or_insert(reason);
         }
     }
 
     fn tool_result(&self, internal_id: &str, result: &rig::message::ToolResult) {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let state = &mut *state;
         if state.unavailable.is_some() {
             return;
         }
@@ -733,12 +790,22 @@ impl NativeCapture {
         state.bytes += result_bytes;
         // Exact membership is established above. The SDK surfaces and commits
         // results in the same prepared-call slot order, after all result hooks.
+        // The field is skipped while empty: the first result adds its key and
+        // brackets, later ones a comma.
+        let framing = if state.turns[index].native_tool_results.is_empty() {
+            r#","native_tool_results":[]"#.len()
+        } else {
+            1
+        };
+        state.sizes.frames[index] = state.sizes.frames[index]
+            .saturating_add(result_bytes)
+            .saturating_add(framing);
         state.turns[index].native_tool_results.push(result.clone());
-        let frame = &state.turns[index];
-        if crate::session::native_replay::bounded_serialized(frame, MAX_TURN_BYTES).is_err() {
+        if state.sizes.frames[index] > MAX_TURN_BYTES {
             state.unavailable = Some(Unavailable::Limit);
             return;
         }
+        let frame = &state.turns[index];
         let calls = frame
             .content
             .iter()
@@ -756,20 +823,11 @@ impl NativeCapture {
             )
             .expect("complete nonempty tool batch"),
         });
-        if let Some(replay) = &state.replay {
-            let validated = crate::session::native_replay::NativeHistory::from_capture(
-                replay.epoch,
-                replay.initial.clone().unwrap_or_default(),
-                state.turns.clone(),
-            )
-            .and_then(|history| {
-                crate::session::native_replay::bounded_serialized(&history, replay.payload_limit)
-                    .map(|_| ())
-            });
-            if let Err(reason) = validated {
-                state.replay.as_mut().unwrap().failure.get_or_insert(reason);
-                return;
-            }
+        if state.replay.is_some()
+            && let Err(reason) = state.replay_budget(false)
+        {
+            state.replay.as_mut().unwrap().failure.get_or_insert(reason);
+            return;
         }
         if let Some(grouped) = grouped
             && let Some(replay) = &mut state.replay
@@ -1085,6 +1143,164 @@ mod tests {
                 usize::from(case == "duplicate")
             );
         }
+    }
+
+    fn plain_commitment() -> NativeCommitment {
+        let endpoint: http::Uri = "https://example.test/v1/messages".parse().unwrap();
+        let body = serde_json::json!({"model":"claude-opus-5-5",
+            "system":[{"type":"text","text":"stable"}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"literal user"}]},
+            {"role":"assistant","content":[{"type":"text","text":"done"}]}]});
+        NativeCommitment::capture(&endpoint, &body, true).unwrap()
+    }
+
+    /// A replay capture with `initial` set, as after its first model call.
+    fn replay_fixture(payload_limit: usize) -> NativeCapture {
+        let endpoint: http::Uri = "https://example.test/v1/messages".parse().unwrap();
+        let initial = vec![Message::user("literal user")];
+        let base = measured(&initial);
+        let replay = ReplayState {
+            endpoint,
+            body: Arc::new(|_| {
+                Err(rig::completion::CompletionError::ProviderError(
+                    "test".into(),
+                ))
+            }),
+            generated_preamble: false,
+            manual_cache_markers: true,
+            epoch: 7,
+            frontier: None,
+            accepted_history: initial.clone(),
+            initial: Some(initial),
+            pending: None,
+            commitment: None,
+            failure: None,
+            payload_limit,
+            frame_limit: MAX_TURNS,
+        };
+        NativeCapture(Arc::new(Mutex::new(State {
+            replay: Some(replay),
+            sizes: CaptureSizes {
+                base,
+                ..Default::default()
+            },
+            ..Default::default()
+        })))
+    }
+
+    /// Appends a completed frame with one tool call, as `record_completed` does.
+    fn push_tool_frame(capture: &NativeCapture, turn: usize) {
+        let mut state = capture.0.lock().unwrap();
+        let projection = NativeTurnProjection {
+            sdk_run_id: "run".into(),
+            turn,
+            configured_model: "native-model".into(),
+            content: OneOrMany::one(AssistantContent::tool_call(
+                format!("call-{turn}"),
+                "read",
+                serde_json::json!({"turn": turn}),
+            )),
+            advertised_tools: Vec::new(),
+            native_tool_results: Vec::new(),
+            native_input_delta: Some(Vec::new()),
+            native_commitment: Some(plain_commitment()),
+        };
+        state.sizes.frames.push(measured(&projection));
+        state.keys.insert(("run".into(), turn));
+        state.turns.push(projection);
+    }
+
+    fn tool_output(turn: usize) -> rig::message::ToolResult {
+        rig::message::ToolResult {
+            id: format!("call-{turn}"),
+            call_id: None,
+            content: OneOrMany::one(rig::message::ToolResultContent::text("x".repeat(8 * 1024))),
+        }
+    }
+
+    fn drive_turn(capture: &NativeCapture, turn: usize) {
+        push_tool_frame(capture, turn);
+        capture.tool(
+            "run",
+            turn,
+            &format!("call-{turn}"),
+            None,
+            &format!("int-{turn}"),
+        );
+        capture.tool_result(&format!("int-{turn}"), &tool_output(turn));
+    }
+
+    fn serialized_during(work: impl FnOnce()) -> usize {
+        use crate::session::native_replay::SERIALIZED_BYTES;
+        let before = SERIALIZED_BYTES.with(|total| total.get());
+        work();
+        SERIALIZED_BYTES.with(|total| total.get()) - before
+    }
+
+    #[test]
+    fn native_capture_tracked_sizes_equal_a_full_serialization_after_many_turns() {
+        let capture = replay_fixture(crate::session::native_replay::MAX_NATIVE_PAYLOAD);
+        for turn in 1..=40 {
+            drive_turn(&capture, turn);
+        }
+        assert_eq!(capture.snapshot().1, None);
+        assert_eq!(capture.replay_failure(), None);
+        let state = capture.0.lock().unwrap();
+        let replay = state.replay.as_ref().unwrap();
+        let history = NativeHistory::from_capture(
+            replay.epoch,
+            replay.initial.clone().unwrap(),
+            state.turns.clone(),
+        )
+        .expect("the fixture is a valid history");
+        let full = crate::session::native_replay::bounded_serialized(&history, usize::MAX).unwrap();
+        assert_eq!(
+            capture_history_size(replay.epoch, state.sizes.base, &state.sizes.frames),
+            full,
+            "incremental total must equal the serialized history"
+        );
+        for (frame, size) in state.turns.iter().zip(&state.sizes.frames) {
+            assert_eq!(*size, measured(frame));
+        }
+    }
+
+    #[test]
+    fn native_capture_budget_boundary_matches_whole_history_serialization() {
+        let probe = replay_fixture(usize::MAX);
+        for turn in 1..=3 {
+            drive_turn(&probe, turn);
+        }
+        let exact = {
+            let state = probe.0.lock().unwrap();
+            capture_history_size(7, state.sizes.base, &state.sizes.frames)
+        };
+        // The last result is the one that crosses: one byte under rejects it,
+        // the exact total accepts it, as the whole-history check did.
+        for (limit, rejected) in [(exact, false), (exact - 1, true)] {
+            let capture = replay_fixture(limit);
+            for turn in 1..=3 {
+                drive_turn(&capture, turn);
+            }
+            assert_eq!(
+                capture.replay_failure() == Some(RestartReason::Limit),
+                rejected
+            );
+        }
+    }
+
+    #[test]
+    fn native_capture_event_serialization_does_not_grow_with_history() {
+        let capture = replay_fixture(crate::session::native_replay::MAX_NATIVE_PAYLOAD);
+        let first = serialized_during(|| drive_turn(&capture, 1));
+        for turn in 2..=99 {
+            drive_turn(&capture, turn);
+        }
+        let last = serialized_during(|| drive_turn(&capture, 100));
+        assert_eq!(capture.replay_failure(), None);
+        assert!(
+            last <= first + first / 4,
+            "event serialized {last} bytes at frame 100 but {first} at frame 1"
+        );
     }
 
     #[test]
