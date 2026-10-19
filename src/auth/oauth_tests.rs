@@ -1038,3 +1038,41 @@ fn login_labels47_doctor_and_setup_use_explicit_saved_account_state_and_actual_r
     assert!(!report.contains("PRIVATE_"));
     assert!(!directory.join("session.lock").exists());
 }
+
+#[tokio::test]
+async fn a_valid_access_token_is_served_without_reopening_the_locked_store() {
+    let roots = crate::tests::OwnedTestDirectory::new("oauth-access-cache");
+    let root = roots.path().join("credentials");
+    let mut store = LockedStore::open(root.clone(), true).unwrap().unwrap();
+    store.data.accounts.push(Account {
+        client_id: "oaiapp_cache".into(),
+        subject: "subject".into(),
+        email: None,
+        tokens: Some(Tokens {
+            access: "cached-access".into(),
+            refresh: "unused-refresh".into(),
+            id: "unused-id".into(),
+            scopes: SCOPES.into(),
+            expires: now().unwrap() + 3600,
+        }),
+    });
+    store.data.active = Some("oaiapp_cache".into());
+    store.save().unwrap();
+    drop(store);
+    let registration = Registration {
+        root: root.clone(),
+        client_id: "oaiapp_cache".into(),
+        endpoints: None,
+    };
+    let opened = store_opens(&root);
+    for _ in 0..5 {
+        assert_eq!(registration.access_token().await.unwrap(), "cached-access");
+    }
+    assert_eq!(store_opens(&root), opened + 1, "one locked open per token");
+    // Signing out rewrites the record, so the cached token is not served.
+    let mut store = LockedStore::open(root.clone(), false).unwrap().unwrap();
+    store.data.active = None;
+    store.save().unwrap();
+    drop(store);
+    assert!(registration.access_token().await.is_err());
+}

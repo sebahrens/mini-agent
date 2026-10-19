@@ -750,7 +750,9 @@ struct NativeSkillReceipt {
 /// never appends instructions to the user's prompt or changes permission state.
 #[derive(Clone)]
 pub(crate) struct InstructionContextHook {
-    base: String,
+    /// The agent's base preamble, shared so the clones rig makes of this hook
+    /// (one set per request) do not copy a prompt of tens of kilobytes.
+    base: Arc<str>,
     turn: Arc<InstructionTurn>,
     query: String,
     protocol: crate::context::instructions::InstructionProtocol,
@@ -759,7 +761,7 @@ pub(crate) struct InstructionContextHook {
 }
 impl InstructionContextHook {
     pub(crate) fn new(
-        base: String,
+        base: impl Into<Arc<str>>,
         turn: Arc<InstructionTurn>,
         query: String,
         protocol: crate::context::instructions::InstructionProtocol,
@@ -768,7 +770,7 @@ impl InstructionContextHook {
         >,
     ) -> Self {
         Self {
-            base,
+            base: base.into(),
             turn,
             query,
             protocol,
@@ -997,7 +999,7 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for Instructi
         let (preamble, digest) = match previous.filter(|prior| {
             prior.block == block
                 && prior.preamble.len() == expected_len
-                && prior.preamble.starts_with(&self.base)
+                && prior.preamble.starts_with(&*self.base)
         }) {
             Some(prior) => (prior.preamble.clone(), prior.digest.clone()),
             None => {

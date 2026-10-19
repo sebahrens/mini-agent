@@ -482,16 +482,104 @@ async fn model_token(profile: &Profile, access: &str) -> anyhow::Result<ModelTok
         origin,
     })
 }
+/// The model token a request used, with the file state it was read from.
+struct CachedContext {
+    directory: PathBuf,
+    generation: String,
+    profile: Profile,
+    fingerprint: super::FileFingerprint,
+    api_key: String,
+    api_base: String,
+    /// Unix second after which the token or its GitHub grant is due for the
+    /// locked refresh path.
+    valid_until: u64,
+}
+const CACHED_CONTEXTS: usize = 8;
+static CONTEXT_CACHE: std::sync::Mutex<Vec<CachedContext>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+thread_local! {
+    /// Test-only: locked store opens by the credential path on this thread.
+    static STORE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 impl Registration {
     pub(crate) async fn auth_context(
         &self,
     ) -> anyhow::Result<rig::providers::copilot::AuthContext> {
+        // A model token that is still valid and whose record has not changed
+        // on disk needs neither the lock nor a parse. The check is one
+        // private-file open and fstat, off the executor.
+        let registration = self.clone();
+        if let Ok(Some(context)) =
+            crate::agent::runner::spawn_blocking_scoped(move || registration.cached_context()).await
+        {
+            return Ok(context);
+        }
         tokio::time::timeout(REQUEST_TIMEOUT, self.auth_context_inner())
             .await
             .map_err(|_| anyhow::anyhow!("Copilot credential acquisition timed out"))?
     }
+    fn cached_context(&self) -> Option<rig::providers::copilot::AuthContext> {
+        let (fingerprint, context, valid_until) = {
+            let cache = CONTEXT_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = cache.iter().find(|entry| {
+                entry.directory == self.directory
+                    && entry.generation == self.generation
+                    && entry.profile == self.profile
+            })?;
+            (
+                entry.fingerprint.clone(),
+                rig::providers::copilot::AuthContext {
+                    api_key: entry.api_key.clone(),
+                    api_base: Some(entry.api_base.clone()),
+                },
+                entry.valid_until,
+            )
+        };
+        (now().ok()? < valid_until
+            && super::FileFingerprint::of_private_file(&self.directory.join("session.json"))?
+                == fingerprint)
+            .then_some(context)
+    }
+    /// Remember the context just returned from the locked path. Called while
+    /// the lock is held, so the fingerprint is that of the final record.
+    fn remember_context(&self, data: &Store) {
+        let (Some(model), Some(tokens)) = (data.model.as_ref(), data.tokens.as_ref()) else {
+            return;
+        };
+        let Some(fingerprint) =
+            super::FileFingerprint::of_private_file(&self.directory.join("session.json"))
+        else {
+            return;
+        };
+        let valid_until = tokens
+            .expires
+            .map_or(u64::MAX, |expires| expires.saturating_sub(60))
+            .min(model.expires.saturating_sub(30));
+        let mut cache = CONTEXT_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|entry| {
+            !(entry.directory == self.directory && entry.generation == self.generation)
+        });
+        if cache.len() >= CACHED_CONTEXTS {
+            cache.remove(0);
+        }
+        cache.push(CachedContext {
+            directory: self.directory.clone(),
+            generation: self.generation.clone(),
+            profile: self.profile.clone(),
+            fingerprint,
+            api_key: model.token.clone(),
+            api_base: model.origin.clone(),
+            valid_until,
+        });
+    }
     async fn auth_context_inner(&self) -> anyhow::Result<rig::providers::copilot::AuthContext> {
         let mut store = loop {
+            #[cfg(test)]
+            STORE_OPENS.with(|opens| opens.set(opens.get() + 1));
             match LockedStore::open(self.directory.clone(), false) {
                 Ok(Some(store)) => break store,
                 Ok(None) => anyhow::bail!("Copilot is signed out; run /login copilot"),
@@ -574,6 +662,7 @@ impl Registration {
                 Some(model_token(&self.profile, &data.tokens.as_ref().unwrap().access).await?);
             store.save()?;
         }
+        self.remember_context(store.data.as_ref().unwrap());
         let model = store.data.as_ref().unwrap().model.as_ref().unwrap();
         Ok(rig::providers::copilot::AuthContext {
             api_key: model.token.clone(),

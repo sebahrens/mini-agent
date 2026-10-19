@@ -39,6 +39,96 @@ pub fn wrap_rows(buffer: &str, width: usize) -> Vec<VisualRow> {
     rows
 }
 
+/// Length of the common byte prefix of `a` and `b`.
+pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    const CHUNK: usize = 64;
+    let limit = a.len().min(b.len());
+    let mut at = 0;
+    while at + CHUNK <= limit && a[at..at + CHUNK] == b[at..at + CHUNK] {
+        at += CHUNK;
+    }
+    while at < limit && a[at] == b[at] {
+        at += 1;
+    }
+    at
+}
+
+/// Length of the common byte suffix of `a` and `b`.
+pub fn common_suffix_len(a: &[u8], b: &[u8]) -> usize {
+    const CHUNK: usize = 64;
+    let limit = a.len().min(b.len());
+    let mut at = 0;
+    while at + CHUNK <= limit
+        && a[a.len() - at - CHUNK..a.len() - at] == b[b.len() - at - CHUNK..b.len() - at]
+    {
+        at += CHUNK;
+    }
+    while at < limit && a[a.len() - 1 - at] == b[b.len() - 1 - at] {
+        at += 1;
+    }
+    at
+}
+
+/// [`wrap_rows`] of `new` computed from the rows of an earlier text that
+/// differs from it only between a common byte prefix and a common byte
+/// suffix (measured by the caller on the two texts; `old_rows` came from
+/// `wrap_rows(old, width)` with `old.len() == old_len`). Only the logical
+/// lines the edit touches are wrapped again; the rows before them are copied
+/// and the rows after them shift by the length change. Returns the rows and
+/// the number of bytes wrapped. The result equals `wrap_rows(new, width)`.
+pub fn rewrap_edit(
+    old_rows: &[VisualRow],
+    old_len: usize,
+    new: &str,
+    width: usize,
+    prefix: usize,
+    suffix: usize,
+) -> (Vec<VisualRow>, usize) {
+    let width = width.max(1);
+    let new_len = new.len();
+    // The edit must not split a character: widen the changed span.
+    let mut prefix = prefix.min(new_len).min(old_len);
+    while !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let mut suffix = suffix.min(new_len - prefix).min(old_len - prefix);
+    while !new.is_char_boundary(new_len - suffix) {
+        suffix -= 1;
+    }
+    let tail_from = new_len - suffix;
+    let line_start = new[..prefix].rfind('\n').map_or(0, |i| i + 1);
+    let line_end_new = new[tail_from..]
+        .find('\n')
+        .map_or(new_len, |i| tail_from + i);
+    // The same line end in the old text: the suffix is identical.
+    let line_end_old = old_len - (new_len - line_end_new);
+    let keep_head = old_rows.partition_point(|row| row.start < line_start);
+    let keep_tail = old_rows.partition_point(|row| row.start <= line_end_old);
+    let mut rows = Vec::with_capacity(old_rows.len() + 8);
+    rows.extend_from_slice(&old_rows[..keep_head]);
+    let mut offset = line_start;
+    for line in new[line_start..line_end_new].split('\n') {
+        wrap_line(line, offset, width, &mut rows);
+        offset += line.len() + 1;
+    }
+    rows.extend(old_rows[keep_tail..].iter().map(|row| VisualRow {
+        start: row.start + new_len - old_len,
+        end: row.end + new_len - old_len,
+    }));
+    if line_end_new == new_len
+        && let Some(last) = rows.last()
+        && last.end == new_len
+        && last.end > last.start
+        && display_width(&new[last.start..last.end]) >= width
+    {
+        rows.push(VisualRow {
+            start: new_len,
+            end: new_len,
+        });
+    }
+    (rows, line_end_new - line_start)
+}
+
 fn wrap_line(line: &str, offset: usize, width: usize, rows: &mut Vec<VisualRow>) {
     let mut row_start = 0;
     let mut row_width = 0;
@@ -192,5 +282,62 @@ mod tests {
         let wide = "日本語";
         let rows = wrap_rows(wide, 10);
         assert_eq!(offset_at_column(wide, rows[0], 3), "日".len());
+    }
+
+    #[test]
+    fn rewrapping_an_edit_equals_wrapping_the_whole_text() {
+        // A small deterministic generator: no dependency, reproducible.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let alphabet = ["a", "bc", " ", "  ", "\n", "日", "é", "word", "xyzxyz"];
+        for width in [1, 2, 5, 8, 20] {
+            let mut text = String::new();
+            for _ in 0..30 {
+                text.push_str(alphabet[next(alphabet.len())]);
+            }
+            for _ in 0..300 {
+                let old = text.clone();
+                let old_rows = wrap_rows(&old, width);
+                // Replace a random span with random pieces (insert, delete
+                // or both), on character boundaries.
+                let mut from = next(old.len() + 1);
+                while !old.is_char_boundary(from) {
+                    from -= 1;
+                }
+                let mut to = (from + next(6)).min(old.len());
+                while !old.is_char_boundary(to) {
+                    to += 1;
+                }
+                let mut insert = String::new();
+                for _ in 0..next(3) {
+                    insert.push_str(alphabet[next(alphabet.len())]);
+                }
+                text = format!("{}{insert}{}", &old[..from], &old[to..]);
+                let prefix = common_prefix_len(old.as_bytes(), text.as_bytes());
+                let suffix = common_suffix_len(old.as_bytes(), text.as_bytes());
+                let (rows, _) = rewrap_edit(&old_rows, old.len(), &text, width, prefix, suffix);
+                assert_eq!(
+                    rows,
+                    wrap_rows(&text, width),
+                    "width {width}: {old:?} -> {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn common_prefix_and_suffix_cover_chunked_and_short_inputs() {
+        let a = "x".repeat(300);
+        let mut b = a.clone();
+        b.replace_range(150..151, "y");
+        assert_eq!(common_prefix_len(a.as_bytes(), b.as_bytes()), 150);
+        assert_eq!(common_suffix_len(a.as_bytes(), b.as_bytes()), 149);
+        assert_eq!(common_prefix_len(a.as_bytes(), a.as_bytes()), 300);
+        assert_eq!(common_suffix_len(b"", b"abc"), 0);
     }
 }

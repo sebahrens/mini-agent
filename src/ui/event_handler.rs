@@ -136,6 +136,47 @@ impl RunningTick {
     }
 }
 
+/// Show a live output preview under the tool call `id`. Display only: never
+/// added to the session or the model context. The feed generation bump from
+/// `set_anchor_progress` already marks the chat dirty, so the row-diffing
+/// painter repaints just the preview rows instead of the whole screen.
+fn show_tool_progress(renderer: &mut Renderer, id: &str, text: &str) -> std::io::Result<()> {
+    let preview = sanitize_output(text)
+        .lines()
+        .map(|line| format!("  │ {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if renderer
+        .feed_mut()
+        .set_anchor_progress(id, crate::ui::feed::BlockStyle::ToolResult, preview)
+    {
+        renderer.render_viewport()?;
+    }
+    Ok(())
+}
+
+/// The `Limited(max_lines)` tool-result display. Output that sanitising would
+/// leave unchanged (the common case) is counted in place, and only the shown
+/// lines are copied, instead of copying and line-splitting a result that can
+/// run to a megabyte for a three-line preview.
+fn limited_result_summary(output: &str, max_lines: usize) -> String {
+    let sanitized;
+    let text: &str = if crate::ui::events::is_terminal_clean(output) {
+        output
+    } else {
+        sanitized = sanitize_output(output);
+        &sanitized
+    };
+    let char_count = text.chars().count();
+    let line_count = text.lines().count();
+    if line_count > max_lines {
+        let shown = text.lines().take(max_lines).collect::<Vec<_>>().join("\n");
+        format!("◈ result ({char_count} chars, {line_count} lines, showing {max_lines}):\n{shown}")
+    } else {
+        format!("◈ result ({char_count} chars):\n{text}")
+    }
+}
+
 pub async fn handle_agent_event(
     event: AgentEvent,
     renderer: &mut Renderer,
@@ -311,27 +352,11 @@ pub async fn handle_agent_event(
                     && matches!(&message.tool,Some(crate::session::PersistedToolMessage::Call { name:called, .. }) if called==name)) {
                 call.recorded_diff=Some(diff.clone());
                 crate::ui::events::push_mutation_diff(renderer.feed_mut(),&id,&diff,ui.cfg);
-                renderer.invalidate();
                 renderer.render_viewport()?;
                 save_session_if_settled(ui.session,ui.cli,run,renderer)?;
             }
         }
-        AgentEvent::ToolProgress { id, text } => {
-            // Display only: never added to the session or the model context.
-            let preview = sanitize_output(&text)
-                .lines()
-                .map(|line| format!("  │ {line}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if renderer.feed_mut().set_anchor_progress(
-                &id,
-                crate::ui::feed::BlockStyle::ToolResult,
-                preview,
-            ) {
-                renderer.invalidate();
-                renderer.render_viewport()?;
-            }
-        }
+        AgentEvent::ToolProgress { id, text } => show_tool_progress(renderer, &id, &text)?,
         AgentEvent::ToolResult {
             id, name, output, images, ..
         } => {
@@ -359,24 +384,8 @@ pub async fn handle_agent_event(
                 match show_details {
                     ResolvedShowToolDetails::Off => {}
                     ResolvedShowToolDetails::Limited(max_lines) => {
-                        let sanitized = sanitize_output(&output);
-                        let char_count = sanitized.chars().count();
-                        let lines: Vec<&str> = sanitized.lines().collect();
-                        if lines.len() > max_lines {
-                            let shown = lines[..max_lines].join("\n");
-                            let summary = format!(
-                                "◈ result ({} chars, {} lines, showing {}):\n{}",
-                                char_count,
-                                lines.len(),
-                                max_lines,
-                                shown
-                            );
-                            renderer.write_line_after(&id, &summary, Color::DarkGrey)?;
-                        } else {
-                            let summary =
-                                format!("◈ result ({} chars):\n{}", char_count, sanitized);
-                            renderer.write_line_after(&id, &summary, Color::DarkGrey)?;
-                        }
+                        let summary = limited_result_summary(&output, max_lines);
+                        renderer.write_line_after(&id, &summary, Color::DarkGrey)?;
                     }
                     ResolvedShowToolDetails::Unlimited => {
                         let sanitized = sanitize_output(&output);
@@ -1207,11 +1216,86 @@ fn finalize_response_segment(
 mod tests {
     use super::{
         RUNNING_TICK_INTERVAL, RunningTick, STREAM_REPAINT_INTERVAL, apply_usage_delta,
-        should_auto_compact_between_turns, stream_repaint_due,
+        limited_result_summary, should_auto_compact_between_turns, show_tool_progress,
+        stream_repaint_due,
     };
     use crate::event::UsageDelta;
     use crate::session::Session;
     use std::time::Duration;
+
+    #[test]
+    fn a_tool_progress_tick_repaints_only_the_changed_preview_rows() {
+        use crate::agent::tools::bash::SHELL_PROGRESS_LINES;
+        use crate::ui::feed::BlockStyle;
+        use crate::ui::renderer::Renderer;
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..40 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("history {line}"));
+        }
+        renderer
+            .feed_mut()
+            .push_anchored_block("call-1", BlockStyle::Tool, "$ cargo test");
+        renderer.render_viewport().unwrap();
+        let tail = |tick: usize| {
+            (0..SHELL_PROGRESS_LINES)
+                .map(|row| format!("tick {tick} row {row}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        show_tool_progress(&mut renderer, "call-1", &tail(0)).unwrap();
+        let visible = renderer.visible_lines();
+        assert!(visible > SHELL_PROGRESS_LINES + 1);
+        for tick in 1..=10 {
+            let before = renderer.frame_stats();
+            show_tool_progress(&mut renderer, "call-1", &tail(tick)).unwrap();
+            let paint = renderer.frame_stats().since(before);
+            assert!(paint.viewport_rows >= 1, "tick {tick}: {paint:?}");
+            assert!(
+                paint.viewport_rows <= SHELL_PROGRESS_LINES + 1,
+                "tick {tick} repainted {} of {visible} rows",
+                paint.viewport_rows
+            );
+        }
+    }
+
+    #[test]
+    fn limited_result_summary_matches_the_sanitise_then_split_reference() {
+        fn reference(output: &str, max_lines: usize) -> String {
+            let sanitized = super::sanitize_output(output);
+            let char_count = sanitized.chars().count();
+            let lines: Vec<&str> = sanitized.lines().collect();
+            if lines.len() > max_lines {
+                let shown = lines[..max_lines].join("\n");
+                format!(
+                    "◈ result ({char_count} chars, {} lines, showing {max_lines}):\n{shown}",
+                    lines.len()
+                )
+            } else {
+                format!("◈ result ({char_count} chars):\n{sanitized}")
+            }
+        }
+        let big = "line of output with ünïcode\n".repeat(40_000);
+        let cases = [
+            "",
+            "one",
+            "a\nb\nc",
+            "a\nb\nc\nd\n",
+            "esc \x1b[31mred\x1b[0m\nnext\r\nthird\rfourth\tfifth\nsixth",
+            big.as_str(),
+        ];
+        for case in cases {
+            for max_lines in [0, 1, 3, 50] {
+                assert_eq!(
+                    limited_result_summary(case, max_lines),
+                    reference(case, max_lines),
+                    "case {:?} max {max_lines}",
+                    &case[..case.len().min(20)]
+                );
+            }
+        }
+    }
 
     #[test]
     fn long_streamed_paragraphs_keep_repainting_without_newlines() {

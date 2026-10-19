@@ -76,6 +76,9 @@ pub(crate) struct BedrockAuth {
     key: Option<http::HeaderValue>,
     sdk: tokio::sync::OnceCell<aws_config::SdkConfig>,
     credentials_http: reqwest::Client,
+    /// What the profile files and selecting environment looked like when
+    /// [`reject_process_profiles`] last passed (see [`profile_state`]).
+    checked_profiles: std::sync::Mutex<Option<ProfileState>>,
 }
 impl std::fmt::Debug for BedrockAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,6 +111,7 @@ impl BedrockAuth {
                 None,
                 None,
             )?,
+            checked_profiles: std::sync::Mutex::new(None),
         })
     }
 
@@ -140,7 +144,7 @@ impl BedrockAuth {
             return Ok(());
         }
         let credentials = tokio::time::timeout(AUTH_TIMEOUT, async {
-            reject_process_profiles().await?;
+            self.check_profiles().await?;
             let sdk = self.sdk.get_or_init(|| async {
                 let connector = CredentialsHttp(self.credentials_http.clone(), AUTH_TIMEOUT);
                 aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -164,6 +168,102 @@ impl BedrockAuth {
         }
         sign_request(request, credentials, &self.region, SystemTime::now())
     }
+}
+
+/// The inputs of the profile check: the environment that selects the
+/// profile and files, and the stat identity of the two profile files.
+#[derive(Clone, PartialEq, Eq)]
+struct ProfileState {
+    env: Vec<Option<std::ffi::OsString>>,
+    files: Vec<Option<FileState>>,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct FileState {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+/// The current [`ProfileState`], or `None` when it cannot be established
+/// cheaply (an unresolvable or `~`-relative path), in which case the profile
+/// files are parsed on every request as before.
+async fn profile_state() -> Option<ProfileState> {
+    const VARIABLES: [&str; 5] = [
+        "AWS_PROFILE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "HOME",
+        "USERPROFILE",
+    ];
+    let env: Vec<_> = VARIABLES.iter().map(std::env::var_os).collect();
+    let home = env[3].clone().or_else(|| env[4].clone());
+    let mut files = Vec::new();
+    for (explicit, default) in [(&env[1], "config"), (&env[2], "credentials")] {
+        let path = match explicit {
+            Some(path) => std::path::PathBuf::from(path),
+            None => std::path::Path::new(home.as_ref()?)
+                .join(".aws")
+                .join(default),
+        };
+        if path.starts_with("~") {
+            return None;
+        }
+        files.push(match tokio::fs::metadata(&path).await {
+            Ok(metadata) => {
+                #[cfg(unix)]
+                let identity = {
+                    use std::os::unix::fs::MetadataExt;
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    )
+                };
+                Some(FileState {
+                    len: metadata.len(),
+                    modified: metadata.modified().ok(),
+                    #[cfg(unix)]
+                    identity,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return None,
+        });
+    }
+    Some(ProfileState { env, files })
+}
+impl BedrockAuth {
+    /// The credential_process policy check, re-run whenever the profile files
+    /// or the environment selecting them change instead of parsing both files
+    /// on every request. The state is read before the check, so an edit made
+    /// while it runs is seen by the next request.
+    async fn check_profiles(&self) -> http_client::Result<()> {
+        let state = profile_state().await;
+        if let Some(state) = &state
+            && self
+                .checked_profiles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                == Some(state)
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        PROFILE_CHECKS.with(|checks| checks.set(checks.get() + 1));
+        reject_process_profiles().await?;
+        *self
+            .checked_profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+        Ok(())
+    }
+}
+#[cfg(test)]
+thread_local! {
+    /// Test-only: full profile parses by the Bedrock auth on this thread.
+    static PROFILE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 async fn reject_process_profiles() -> http_client::Result<()> {

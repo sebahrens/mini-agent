@@ -266,6 +266,8 @@ pub(crate) enum BottomRedrawPlan {
 struct InputLayout {
     width: usize,
     text: Arc<str>,
+    /// Identifies this layout: a new value for every distinct text, so a
+    /// bottom snapshot detects an input change without hashing the text.
     hash: u64,
     rows: Arc<Vec<crate::ui::input::wrap::VisualRow>>,
 }
@@ -641,6 +643,7 @@ pub(crate) struct OutputCounters {
     bottom_statusline_paints: std::sync::atomic::AtomicUsize,
     statusline_fits: std::sync::atomic::AtomicUsize,
     input_layouts: std::sync::atomic::AtomicUsize,
+    input_wrap_bytes: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -672,6 +675,8 @@ pub(crate) struct FrameStats {
     pub(crate) statusline_fits: usize,
     /// Input wrap layouts computed (not served from the memo).
     pub(crate) input_layouts: usize,
+    /// Input bytes soft-wrapped by those layouts.
+    pub(crate) input_wrap_bytes: usize,
 }
 
 #[cfg(test)]
@@ -689,6 +694,7 @@ impl FrameStats {
                 - earlier.bottom_statusline_paints,
             statusline_fits: self.statusline_fits - earlier.statusline_fits,
             input_layouts: self.input_layouts - earlier.input_layouts,
+            input_wrap_bytes: self.input_wrap_bytes - earlier.input_wrap_bytes,
         }
     }
 }
@@ -847,6 +853,8 @@ pub struct Renderer {
     statusline_cache: Option<StatuslineCache>,
     /// Last input wrap layout (see `input_layout`).
     input_layout: std::cell::RefCell<Option<InputLayout>>,
+    /// Counter behind `InputLayout::hash`.
+    input_layout_generation: std::cell::Cell<u64>,
     /// Painted statusline rows by row index (see `draw_statusline`).
     statusline_rows: std::cell::RefCell<Vec<Option<FittedStatusRow>>>,
     #[cfg(test)]
@@ -996,6 +1004,7 @@ impl Renderer {
             statusline_cache: None,
             statusline_rows: std::cell::RefCell::new(Vec::new()),
             input_layout: std::cell::RefCell::new(None),
+            input_layout_generation: std::cell::Cell::new(0),
             #[cfg(test)]
             statusline_builds: 0,
             bottom_cursor: None,
@@ -1188,6 +1197,7 @@ impl Renderer {
             bottom_statusline_paints: c.bottom_statusline_paints.load(Relaxed),
             statusline_fits: c.statusline_fits.load(Relaxed),
             input_layouts: c.input_layouts.load(Relaxed),
+            input_wrap_bytes: c.input_wrap_bytes.load(Relaxed),
         }
     }
 
@@ -1622,20 +1632,51 @@ impl Renderer {
     /// reconciliation, bottom drawing, the redraw snapshot and click
     /// mapping. Validating the memo is one string comparison.
     fn input_layout(&self, input: &str, width: usize) -> InputLayout {
+        /// Below this size a full wrap is as cheap as finding the edit.
+        const INCREMENTAL_WRAP_BYTES: usize = 4096;
         let mut memo = self.input_layout.borrow_mut();
-        if let Some(layout) = memo.as_ref()
-            && layout.width == width
+        let previous = memo.as_ref().filter(|layout| layout.width == width);
+        if let Some(layout) = previous
             && *layout.text == *input
         {
             return layout.clone();
         }
         #[cfg(test)]
         OutputCounters::bump(&self.test_counters.input_layouts, 1);
+        // After a large paste every keystroke is a small edit of a big
+        // buffer: re-wrap only the lines the edit touched.
+        let (rows, wrapped) = match previous {
+            Some(old) if input.len() >= INCREMENTAL_WRAP_BYTES => {
+                let prefix = crate::ui::input::wrap::common_prefix_len(
+                    old.text.as_bytes(),
+                    input.as_bytes(),
+                );
+                let suffix = crate::ui::input::wrap::common_suffix_len(
+                    &old.text.as_bytes()[prefix..],
+                    &input.as_bytes()[prefix..],
+                );
+                crate::ui::input::wrap::rewrap_edit(
+                    &old.rows,
+                    old.text.len(),
+                    input,
+                    width,
+                    prefix,
+                    suffix,
+                )
+            }
+            _ => (crate::ui::input::wrap::wrap_rows(input, width), input.len()),
+        };
+        #[cfg(test)]
+        OutputCounters::bump(&self.test_counters.input_wrap_bytes, wrapped);
+        #[cfg(not(test))]
+        let _ = wrapped;
+        let generation = self.input_layout_generation.get().wrapping_add(1);
+        self.input_layout_generation.set(generation);
         let layout = InputLayout {
             width,
             text: Arc::from(input),
-            hash: hash_value(input),
-            rows: Arc::new(crate::ui::input::wrap::wrap_rows(input, width)),
+            hash: generation,
+            rows: Arc::new(rows),
         };
         *memo = Some(layout.clone());
         layout
@@ -4471,6 +4512,47 @@ mod frame_buffer_tests {
         let base = renderer.input_base_row;
         assert!(renderer.input_cursor_for_click(base, 4, &typed).is_some());
         assert_eq!(renderer.frame_stats().since(before).input_layouts, 0);
+    }
+
+    #[test]
+    fn typing_after_a_large_paste_rewraps_only_the_edited_line() {
+        let mut renderer = filled_renderer();
+        let line = "lorem ipsum dolor sit amet ".repeat(4);
+        let mut text = format!("{line}\n").repeat(512 * 1024 / (line.len() + 1));
+        let refresh = |renderer: &mut Renderer, input: &str| {
+            renderer
+                .frame(|r| {
+                    r.sync_input_height(input)?;
+                    r.render_viewport()?;
+                    r.draw_bottom(input, input.len(), &[], 0, false)
+                })
+                .unwrap();
+        };
+        refresh(&mut renderer, &text);
+        let width = input_text_width(renderer.terminal_size().0);
+        let before = renderer.frame_stats();
+        for ch in "typed after the paste".chars().take(20) {
+            text.push(ch);
+            refresh(&mut renderer, &text);
+        }
+        let typing = renderer.frame_stats().since(before);
+        assert_eq!(typing.input_layouts, 20);
+        assert!(
+            typing.input_wrap_bytes <= 20 * (line.len() + 64),
+            "wrapped {} bytes for 20 keys",
+            typing.input_wrap_bytes
+        );
+        // An edit in the middle rewraps its own line and nothing else.
+        let middle = text.len() / 2;
+        let middle = text[..middle].rfind('\n').unwrap() + 1;
+        text.insert_str(middle + 3, "ZZ");
+        let before = renderer.frame_stats();
+        refresh(&mut renderer, &text);
+        assert!(renderer.frame_stats().since(before).input_wrap_bytes <= line.len() + 64);
+        assert_eq!(
+            *renderer.input_layout(&text, width).rows,
+            crate::ui::input::wrap::wrap_rows(&text, width)
+        );
     }
 
     #[test]

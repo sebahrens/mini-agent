@@ -224,6 +224,14 @@ struct LockedStore {
 }
 impl LockedStore {
     fn open(root: PathBuf, create: bool) -> anyhow::Result<Option<Self>> {
+        #[cfg(test)]
+        {
+            let mut opens = STORE_OPENS.lock().unwrap_or_else(|e| e.into_inner());
+            match opens.iter_mut().find(|(path, _)| *path == root) {
+                Some((_, count)) => *count += 1,
+                None => opens.push((root.clone(), 1)),
+            }
+        }
         if !create && !root.exists() {
             return Ok(None);
         }
@@ -573,6 +581,28 @@ fn accept_tokens(
     ))
 }
 
+/// The access token a request used, with the file state it was read from.
+struct CachedAccess {
+    root: PathBuf,
+    client_id: String,
+    fingerprint: super::FileFingerprint,
+    access: String,
+    /// Unix second after which the token is due for the locked refresh path.
+    valid_until: u64,
+}
+const CACHED_ACCESS_TOKENS: usize = 8;
+static ACCESS_CACHE: std::sync::Mutex<Vec<CachedAccess>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static STORE_OPENS: std::sync::Mutex<Vec<(PathBuf, usize)>> = std::sync::Mutex::new(Vec::new());
+/// Test-only: how many times the locked store of `root` was opened.
+#[cfg(test)]
+pub(crate) fn store_opens(root: &std::path::Path) -> usize {
+    let opens = STORE_OPENS.lock().unwrap_or_else(|e| e.into_inner());
+    opens
+        .iter()
+        .find(|(path, _)| path == root)
+        .map_or(0, |(_, count)| *count)
+}
 impl Registration {
     pub(crate) async fn access_token(&self) -> anyhow::Result<String> {
         let registration = self.clone();
@@ -580,7 +610,51 @@ impl Registration {
             .await
             .context("Provider refresh worker failed")?
     }
+    /// The cached token when it is still valid and the record is unchanged
+    /// on disk (one private-file open and fstat, no lock, no parse). A logout,
+    /// account switch or rotation rewrites the record and so misses.
+    fn cached_access(&self) -> Option<String> {
+        let (fingerprint, access, valid_until) = {
+            let cache = ACCESS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = cache
+                .iter()
+                .find(|entry| entry.root == self.root && entry.client_id == self.client_id)?;
+            (
+                entry.fingerprint.clone(),
+                entry.access.clone(),
+                entry.valid_until,
+            )
+        };
+        (now().ok()? < valid_until
+            && super::FileFingerprint::of_private_file(&self.root.join("openai.json"))?
+                == fingerprint)
+            .then_some(access)
+    }
+    /// Remember `access` while the credential lock is still held, so the
+    /// fingerprint is that of the final record.
+    fn remember_access(&self, access: &str, expires: u64) {
+        let Some(fingerprint) =
+            super::FileFingerprint::of_private_file(&self.root.join("openai.json"))
+        else {
+            return;
+        };
+        let mut cache = ACCESS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|entry| !(entry.root == self.root && entry.client_id == self.client_id));
+        if cache.len() >= CACHED_ACCESS_TOKENS {
+            cache.remove(0);
+        }
+        cache.push(CachedAccess {
+            root: self.root.clone(),
+            client_id: self.client_id.clone(),
+            fingerprint,
+            access: access.to_owned(),
+            valid_until: expires.saturating_sub(60),
+        });
+    }
     fn access_token_blocking(&self) -> anyhow::Result<String> {
+        if let Some(access) = self.cached_access() {
+            return Ok(access);
+        }
         let endpoints = self.endpoints();
         let mut store =
             LockedStore::open(self.root.clone(), false)?.context("ChatGPT is signed out")?;
@@ -597,7 +671,9 @@ impl Registration {
         let token = account.tokens.as_ref().ok_or(ReauthorizationRequired)?;
         let at = now()?;
         if token.expires > at.saturating_add(60) {
-            return Ok(token.access.clone());
+            let (access, expires) = (token.access.clone(), token.expires);
+            self.remember_access(&access, expires);
+            return Ok(access);
         }
         let http = http()?;
         let response: anyhow::Result<TokenResponse> = json_response(
@@ -637,8 +713,10 @@ impl Registration {
             at,
         )?;
         let access = tokens.access.clone();
+        let expires = tokens.expires;
         account.tokens = Some(tokens);
         store.save()?;
+        self.remember_access(&access, expires);
         Ok(access)
     }
     fn endpoints(&self) -> AuthEndpoints {

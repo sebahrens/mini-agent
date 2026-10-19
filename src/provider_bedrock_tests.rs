@@ -435,3 +435,62 @@ async fn bedrock81_credentials_http_has_byte_and_time_limits_without_model_heade
         }
     }
 }
+
+#[tokio::test]
+async fn bedrock_profile_files_are_parsed_once_until_they_or_the_selecting_env_change() {
+    let temp = crate::tests::OwnedTestDirectory::new("bedrock-profile-once");
+    let credentials = temp.path().join("credentials");
+    let config = temp.path().join("config");
+    std::fs::write(
+        &credentials,
+        "[owned]\naws_access_key_id = OWNED_ID\naws_secret_access_key = OWNED_SECRET\n",
+    )
+    .unwrap();
+    std::fs::write(&config, "").unwrap();
+    let _env = crate::tests::ScopedProcessEnv::set(&[
+        ("AWS_ACCESS_KEY_ID", Some("OWNED_ENV_ID".into())),
+        ("AWS_SECRET_ACCESS_KEY", Some("OWNED_ENV_SECRET".into())),
+        ("AWS_PROFILE", Some("owned".into())),
+        (
+            "AWS_SHARED_CREDENTIALS_FILE",
+            Some(credentials.clone().into_os_string()),
+        ),
+        ("AWS_CONFIG_FILE", Some(config.into_os_string())),
+        ("AWS_EC2_METADATA_DISABLED", Some("true".into())),
+    ]);
+    let auth = BedrockAuth::new(
+        ResolvedCredential::AwsDefaultChain,
+        "http://127.0.0.1:1/anthropic",
+        "us-east-1",
+    )
+    .unwrap();
+    async fn prepare(auth: &BedrockAuth) -> http_client::Result<()> {
+        let mut request = http::Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1:1/anthropic/v1/messages")
+            .body(Bytes::from_static(b"body"))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), auth.prepare(&mut request))
+            .await
+            .unwrap()
+    }
+    PROFILE_CHECKS.with(|checks| checks.set(0));
+    prepare(&auth).await.unwrap();
+    prepare(&auth).await.unwrap();
+    prepare(&auth).await.unwrap();
+    assert_eq!(PROFILE_CHECKS.with(std::cell::Cell::get), 1);
+    // An edit that adds a credential_process is still rejected on the next
+    // request, without a restart.
+    std::fs::write(
+        &credentials,
+        "[owned]\naws_access_key_id = OWNED_ID\naws_secret_access_key = OWNED_SECRET\ncredential_process = echo PRIVATE_COMMAND\n",
+    )
+    .unwrap();
+    let error = prepare(&auth).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("credential_process profiles are unsupported")
+    );
+    assert_eq!(PROFILE_CHECKS.with(std::cell::Cell::get), 2);
+}

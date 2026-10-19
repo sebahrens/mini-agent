@@ -470,3 +470,38 @@ async fn copilot81_explicit_bootstrap_refreshes_only_an_expired_model_token_and_
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn copilot_valid_model_token_is_served_without_reopening_the_locked_store() {
+    let temp = crate::tests::OwnedTestDirectory::new("copilot-context-cache");
+    let directory = temp.path().join("credentials");
+    let (listener, profile) = fixture().await;
+    let registration = registration(directory.clone(), profile, false);
+    STORE_OPENS.with(|opens| opens.set(0));
+    let mut tasks = tokio::task::JoinSet::new();
+    let r = registration.clone();
+    tasks.spawn(async move { r.auth_context().await });
+    let (socket, headers, _) = request(&listener).await;
+    assert!(headers.starts_with("get /copilot_internal/v2/token "));
+    answer(socket, 200, model()).await;
+    assert_eq!(
+        tasks.join_next().await.unwrap().unwrap().unwrap().api_key,
+        "OWNED_MODEL_TOKEN"
+    );
+    assert_eq!(STORE_OPENS.with(std::cell::Cell::get), 1);
+    // Later requests reuse the token: no lock, no parse, no network.
+    for _ in 0..5 {
+        let context = registration.auth_context().await.unwrap();
+        assert_eq!(context.api_key, "OWNED_MODEL_TOKEN");
+    }
+    assert_eq!(STORE_OPENS.with(std::cell::Cell::get), 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+    // Logging out removes the record: the cached token is not served.
+    std::fs::remove_file(directory.join("session.json")).unwrap();
+    assert!(registration.auth_context().await.is_err());
+    assert_eq!(STORE_OPENS.with(std::cell::Cell::get), 2);
+}

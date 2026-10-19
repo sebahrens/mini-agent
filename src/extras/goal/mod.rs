@@ -915,6 +915,13 @@ pub fn current_hook_info() -> Option<crate::extras::hooks::GoalHookInfo> {
     })
 }
 
+// Whole-goal copies taken on this thread, so a test can prove a per-frame
+// reader does not take one.
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Shared handle to the session's goal.
 ///
 /// Cloning a live session keeps the same store, so a rebuilt agent and the
@@ -958,7 +965,25 @@ impl GoalStore {
 
     /// A copy of the current goal.
     pub fn snapshot(&self) -> Option<Goal> {
+        #[cfg(test)]
+        SNAPSHOT_CALLS.with(|calls| calls.set(calls.get() + 1));
         self.lock().clone()
+    }
+
+    /// The statusline label of an unfinished goal: `goal round/max`, plus the
+    /// status word whenever the goal is not simply running, so a parked or
+    /// budget-stopped goal is visible at a glance. Formatted under the lock
+    /// from three scalars; the painter runs this every frame and must not
+    /// deep-clone the goal record the way [`GoalStore::snapshot`] does.
+    pub fn status_label(&self) -> Option<String> {
+        let slot = self.lock();
+        let goal = slot.as_ref().filter(|goal| !goal.status.is_terminal())?;
+        let progress = format!("goal {}/{}", goal.progress.rounds, goal.bounds.max_rounds);
+        Some(if goal.status == GoalStatus::Active {
+            progress
+        } else {
+            format!("{progress} {}", goal.status.label())
+        })
     }
 
     /// Whether no goal is stored. Used by `skip_serializing_if` so a session
@@ -1180,6 +1205,25 @@ mod tests {
             g.context_file,
             Some(std::path::PathBuf::from("/elsewhere/PLAN.md"))
         );
+    }
+
+    #[test]
+    fn the_statusline_label_is_built_without_cloning_the_goal() {
+        let store = GoalStore::default();
+        assert_eq!(store.status_label(), None);
+        let mut g = goal();
+        g.progress.rounds = 3;
+        g.bounds.max_rounds = 7;
+        store.set(g, false).unwrap();
+        let before = SNAPSHOT_CALLS.with(std::cell::Cell::get);
+        assert_eq!(store.status_label().as_deref(), Some("goal 3/7"));
+        store.with_mut(|g| g.status = GoalStatus::Paused);
+        assert_eq!(store.status_label().as_deref(), Some("goal 3/7 paused"));
+        store.with_mut(|g| g.status = GoalStatus::Met);
+        assert_eq!(store.status_label(), None);
+        assert_eq!(SNAPSHOT_CALLS.with(std::cell::Cell::get), before);
+        assert!(store.snapshot().is_some());
+        assert_eq!(SNAPSHOT_CALLS.with(std::cell::Cell::get), before + 1);
     }
 
     #[test]
