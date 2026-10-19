@@ -1227,6 +1227,12 @@ fn innermost_child(child: &mut dyn ChildWrapper) -> &mut dyn ChildWrapper {
     }
 }
 
+async fn wait_direct_child(
+    child: &mut dyn ChildWrapper,
+) -> std::io::Result<std::process::ExitStatus> {
+    innermost_child(child).wait().await
+}
+
 async fn supervise_child(
     name: String,
     mut child: Box<dyn ChildWrapper>,
@@ -1253,11 +1259,10 @@ async fn supervise_child(
     // Tokio caches the status, so the wrapper's later `wait`/`try_wait` in
     // `terminate_and_reap` still observe it and reap the remaining group
     // members as before.
-    let direct = innermost_child(child.as_mut());
     tokio::select! {
         _ = shutdown_rx.recv() => {}
-        status = direct.wait() => {
-            if let Err(error) = status {
+        waited = wait_direct_child(child.as_mut()) => {
+            if let Err(error) = waited {
                 tracing::debug!("lsp[{name}]: child status failed: {error}");
             }
         }
