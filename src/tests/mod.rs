@@ -1,9 +1,47 @@
 #![allow(unsafe_code)]
 
 use std::ffi::OsString;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{RwLock, RwLockWriteGuard, TryLockError};
+use std::time::{Duration, Instant};
 
-static PROCESS_ENV_LOCK: Mutex<()> = Mutex::new(());
+/// Writers (`ScopedProcessEnv`) hold this exclusively for their whole scope;
+/// process-path readers take it shared only while snapshotting the environment
+/// (`with_shared_process_env`), so a reader never observes a mutator's
+/// temporary values.
+static PROCESS_ENV_LOCK: RwLock<()> = RwLock::new(());
+
+/// Longest a reader waits for a mutator scope to end before reading anyway.
+/// This only matters when a mutator test waits on a helper thread that itself
+/// resolves paths; the reader then degrades to the old unlocked behaviour
+/// instead of deadlocking.
+const SHARED_ENV_WAIT: Duration = Duration::from_secs(30);
+
+thread_local! {
+    static HOLDS_ENV_WRITER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `read` (an environment snapshot) so it cannot overlap any
+/// `ScopedProcessEnv` scope owned by another test. The thread owning a scope
+/// reads without locking.
+pub(crate) fn with_shared_process_env<T>(read: impl FnOnce() -> T) -> T {
+    if HOLDS_ENV_WRITER.with(std::cell::Cell::get) {
+        return read();
+    }
+    let deadline = Instant::now() + SHARED_ENV_WAIT;
+    loop {
+        match PROCESS_ENV_LOCK.try_read() {
+            Ok(_guard) => return read(),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let _guard = poisoned.into_inner();
+                return read();
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(TryLockError::WouldBlock) => return read(),
+        }
+    }
+}
 
 /// An exclusively owned scratch directory, removed even when a test panics.
 /// Declare it before environment guards and retained filesystem capabilities
@@ -54,14 +92,15 @@ fn owned_test_directory_cleans_up_after_panic() {
 
 pub(crate) struct ScopedProcessEnv {
     previous: Vec<(OsString, Option<OsString>)>,
-    _lock: MutexGuard<'static, ()>,
+    _lock: RwLockWriteGuard<'static, ()>,
 }
 
 impl ScopedProcessEnv {
     pub(crate) fn set(values: &[(&str, Option<OsString>)]) -> Self {
         let lock = PROCESS_ENV_LOCK
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        HOLDS_ENV_WRITER.with(|held| held.set(true));
         let previous = values
             .iter()
             .map(|(name, _)| (OsString::from(name), std::env::var_os(name)))
@@ -83,6 +122,7 @@ impl ScopedProcessEnv {
 
 impl Drop for ScopedProcessEnv {
     fn drop(&mut self) {
+        HOLDS_ENV_WRITER.with(|held| held.set(false));
         for (name, value) in &self.previous {
             unsafe {
                 match value {
@@ -105,6 +145,22 @@ fn scoped_process_environment_restores_after_panic() {
     });
     assert!(result.is_err());
     assert_eq!(std::env::var_os(NAME), before);
+}
+
+#[test]
+fn shared_process_env_reader_never_observes_a_mutator_scope() {
+    const NAME: &str = "ZS_SHARED_READER_TEST";
+    let environment = ScopedProcessEnv::set(&[(NAME, Some(OsString::from("temporary")))]);
+    // The owning thread reads without locking.
+    assert_eq!(
+        with_shared_process_env(|| std::env::var_os(NAME)),
+        Some(OsString::from("temporary"))
+    );
+    let reader = std::thread::spawn(|| with_shared_process_env(|| std::env::var_os(NAME)));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!reader.is_finished(), "reader must wait for the mutator");
+    drop(environment);
+    assert_eq!(reader.join().unwrap(), None);
 }
 
 #[cfg(all(test, feature = "acp"))]
