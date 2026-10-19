@@ -37,6 +37,11 @@ struct State {
     data: Data,
     trusted: bool,
     memory: BTreeMap<String, Vec<u8>>,
+    /// Blob directory whose contents are already merged into `data.blobs`.
+    /// Runtime-only; cleared by any create failure so the next prepare rescans.
+    scanned: Option<PathBuf>,
+    #[cfg(test)]
+    scans: usize,
     #[cfg(feature = "subagents")]
     observation: crate::session::background_observation::ObservationStamp,
 }
@@ -49,6 +54,9 @@ impl Default for FileCheckpoints {
             data: Data::default(),
             trusted: true,
             memory: BTreeMap::new(),
+            scanned: None,
+            #[cfg(test)]
+            scans: 0,
             #[cfg(feature = "subagents")]
             observation: Default::default(),
         })))
@@ -94,6 +102,9 @@ impl<'de> Deserialize<'de> for FileCheckpoints {
             data,
             trusted: false,
             memory: BTreeMap::new(),
+            scanned: None,
+            #[cfg(test)]
+            scans: 0,
             #[cfg(feature = "subagents")]
             observation: Default::default(),
         }))))
@@ -103,8 +114,12 @@ impl<'de> Deserialize<'de> for FileCheckpoints {
 // preimage preparation. Runtime-only blob bytes/trust flags are not serialized.
 struct FileMutation<'a> {
     state: std::sync::MutexGuard<'a, State>,
+    /// Rare whole-inventory edits compare against a snapshot; per-tool-call
+    /// paths set `changed` explicitly through `mark` instead of cloning.
     #[cfg(feature = "subagents")]
-    before: Data,
+    before: Option<Data>,
+    #[cfg(feature = "subagents")]
+    changed: bool,
     #[cfg(feature = "subagents")]
     observation: Option<crate::session::background_observation::JobObservation>,
 }
@@ -119,10 +134,24 @@ impl std::ops::DerefMut for FileMutation<'_> {
         &mut self.state
     }
 }
+impl FileMutation<'_> {
+    /// Records that serialized data changed (observation stamp must advance).
+    fn mark(&mut self) {
+        #[cfg(feature = "subagents")]
+        {
+            self.changed = true;
+        }
+    }
+}
 impl Drop for FileMutation<'_> {
     fn drop(&mut self) {
         #[cfg(feature = "subagents")]
-        if self.before != self.state.data {
+        if self.changed
+            || self
+                .before
+                .as_ref()
+                .is_some_and(|before| *before != self.state.data)
+        {
             self.state.observation.changed(self.observation.as_ref());
         }
     }
@@ -141,6 +170,9 @@ impl FileObservation {
             data: self.data.clone(),
             trusted: false,
             memory: Default::default(),
+            scanned: None,
+            #[cfg(test)]
+            scans: 0,
             observation: Default::default(),
         })))
     }
@@ -171,11 +203,23 @@ impl FileCheckpoints {
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+    /// Whole-inventory edits (rewind, compaction, restore) diff a snapshot.
     fn edit(&self) -> FileMutation<'_> {
+        let mut mutation = self.edit_marked();
+        #[cfg(feature = "subagents")]
+        {
+            mutation.before = Some(mutation.state.data.clone());
+        }
+        mutation
+    }
+    /// Per-tool-call edits call `FileMutation::mark` where data actually changes.
+    fn edit_marked(&self) -> FileMutation<'_> {
         let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         FileMutation {
             #[cfg(feature = "subagents")]
-            before: state.data.clone(),
+            before: None,
+            #[cfg(feature = "subagents")]
+            changed: false,
             state,
             #[cfg(feature = "subagents")]
             observation: None,
@@ -186,7 +230,7 @@ impl FileCheckpoints {
         &self,
         observation: Option<&crate::session::background_observation::JobObservation>,
     ) -> FileMutation<'_> {
-        let mut mutation = self.edit();
+        let mut mutation = self.edit_marked();
         mutation.observation = observation.cloned();
         mutation
     }
@@ -449,7 +493,7 @@ impl Recorder {
         }
         #[cfg(not(feature = "subagents"))]
         {
-            self.store.edit()
+            self.store.edit_marked()
         }
     }
     fn turn(&self) -> usize {
@@ -538,13 +582,16 @@ pub(crate) fn scope<F: std::future::Future>(
 }
 pub(crate) fn skipped() {
     if let Some(recorder) = current() {
-        skip(&mut recorder.edit_store(), recorder.turn());
+        let mut state = recorder.edit_store();
+        skip(&mut state, recorder.turn());
+        state.mark();
     }
 }
 pub(crate) fn published() {
     if let Some(recorder) = current() {
         let mut state = recorder.edit_store();
         state.data.mutations = state.data.mutations.wrapping_add(1);
+        state.mark();
     }
 }
 
@@ -615,13 +662,78 @@ pub(crate) struct Pending {
     record: Record,
     recorded_index: Option<usize>,
 }
-pub(crate) fn prepare(
+/// Preimage bytes with their precomputed lowercase SHA-256 hex.
+pub(crate) struct Preimage {
+    bytes: Vec<u8>,
+    hash: String,
+}
+impl Preimage {
+    pub(crate) fn new(bytes: Vec<u8>, digest: &crate::fs::ContentDigest) -> Self {
+        Self {
+            bytes,
+            hash: digest.hex(),
+        }
+    }
+}
+/// Runs the filesystem work (blob create with durable fsyncs) on the blocking
+/// pool. The task-local recorder is captured here and moved in by value.
+pub(crate) async fn prepare(
+    workspace: &Arc<crate::paths::WorkspaceBinding>,
+    path: &Path,
+    before: Option<Preimage>,
+    read_allowed: bool,
+) -> Option<Pending> {
+    let recorder = current()?;
+    let workspace = Arc::clone(workspace);
+    let path = path.to_path_buf();
+    let task = crate::agent::runner::spawn_blocking_scoped({
+        let recorder = recorder.clone();
+        move || {
+            prepare_with(
+                recorder,
+                &workspace,
+                &path,
+                before
+                    .as_ref()
+                    .map(|p| (p.bytes.as_slice(), p.hash.as_str())),
+                read_allowed,
+            )
+        }
+    });
+    match task.await {
+        Ok(pending) => pending,
+        Err(_) => {
+            let mut state = recorder.edit_store();
+            skip(&mut state, recorder.turn());
+            state.mark();
+            None
+        }
+    }
+}
+#[cfg(test)]
+fn prepare_sync(
     workspace: &crate::paths::WorkspaceBinding,
     path: &Path,
     before: Option<&[u8]>,
     read_allowed: bool,
 ) -> Option<Pending> {
     let recorder = current()?;
+    let hash = before.map(digest);
+    prepare_with(
+        recorder,
+        workspace,
+        path,
+        before.zip(hash.as_deref()),
+        read_allowed,
+    )
+}
+fn prepare_with(
+    recorder: Recorder,
+    workspace: &crate::paths::WorkspaceBinding,
+    path: &Path,
+    before: Option<(&[u8], &str)>,
+    read_allowed: bool,
+) -> Option<Pending> {
     let mut state = recorder.edit_store();
     let make = (|| -> anyhow::Result<Record> {
         anyhow::ensure!(
@@ -640,10 +752,9 @@ pub(crate) fn prepare(
             .to_str()
             .filter(|s| s.len() <= 4096 && relative_path(Path::new(s)))
             .ok_or_else(|| anyhow::anyhow!("checkpoint path is not contained UTF-8"))?;
-        let hash = before.map(digest);
-        if let Some(bytes) = before {
+        let hash = before.map(|(_, hash)| hash.to_owned());
+        if let Some((bytes, hash)) = before {
             anyhow::ensure!(bytes.len() <= MAX_FILE_BYTES, "checkpoint file limit");
-            let hash = hash.as_ref().unwrap();
             if !state.data.blobs.contains_key(hash) {
                 anyhow::ensure!(
                     state.data.blobs.len() < MAX_RECORDS
@@ -657,7 +768,7 @@ pub(crate) fn prepare(
                     "checkpoint session byte limit"
                 );
                 if recorder.ephemeral {
-                    state.memory.insert(hash.clone(), bytes.to_vec());
+                    state.memory.insert(hash.to_owned(), bytes.to_vec());
                 } else {
                     #[cfg(test)]
                     let root = recorder
@@ -666,31 +777,56 @@ pub(crate) fn prepare(
                         .unwrap_or_else(|| blob_root(&recorder.session));
                     #[cfg(not(test))]
                     let root = blob_root(&recorder.session);
-                    crate::paths::ensure_private_directory(&root)?;
-                    let existing = existing_blobs(&root)?;
-                    anyhow::ensure!(
-                        existing.contains_key(hash)
-                            || (existing.len() < MAX_RECORDS
-                                && existing.values().sum::<usize>().saturating_add(bytes.len())
-                                    <= MAX_TOTAL_BYTES),
-                        "physical checkpoint byte limit"
-                    );
-                    state.data.blobs.extend(existing);
-                    match crate::fs::private_atomic_create_sync(
-                        &root.join(format!("{hash}.bin")),
-                        bytes,
-                    ) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                            anyhow::ensure!(
-                                read_blob(root, hash)? == bytes,
-                                "checkpoint blob mismatch"
-                            );
+                    // The directory is scanned once per store and root; afterwards
+                    // `data.blobs` is the authoritative inventory (every create
+                    // inserts into it). A create failure clears the marker so the
+                    // next call rescans the physical directory.
+                    if state.scanned.as_deref() != Some(root.as_path()) {
+                        crate::paths::ensure_private_directory(&root)?;
+                        #[cfg(test)]
+                        {
+                            state.scans += 1;
                         }
-                        Err(e) => return Err(e.into()),
+                        let existing = existing_blobs(&root)?;
+                        anyhow::ensure!(
+                            existing.contains_key(hash)
+                                || (existing.len() < MAX_RECORDS
+                                    && existing
+                                        .values()
+                                        .sum::<usize>()
+                                        .saturating_add(bytes.len())
+                                        <= MAX_TOTAL_BYTES),
+                            "physical checkpoint byte limit"
+                        );
+                        let before_len = state.data.blobs.len();
+                        state.data.blobs.extend(existing);
+                        if state.data.blobs.len() != before_len {
+                            state.mark();
+                        }
+                        state.scanned = Some(root.clone());
+                    }
+                    if !state.data.blobs.contains_key(hash) {
+                        match crate::fs::private_atomic_create_sync(
+                            &root.join(format!("{hash}.bin")),
+                            bytes,
+                        ) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                state.scanned = None;
+                                anyhow::ensure!(
+                                    read_blob(root, hash)? == bytes,
+                                    "checkpoint blob mismatch"
+                                );
+                            }
+                            Err(e) => {
+                                state.scanned = None;
+                                return Err(e.into());
+                            }
+                        }
                     }
                 }
-                state.data.blobs.insert(hash.clone(), bytes.len());
+                state.data.blobs.insert(hash.to_owned(), bytes.len());
+                state.mark();
             }
         }
         Ok(Record {
@@ -716,31 +852,42 @@ pub(crate) fn prepare(
         }
         Err(_) => {
             skip(&mut state, recorder.turn());
+            state.mark();
             None
         }
     }
 }
 impl Pending {
-    pub(crate) fn committed(&mut self, after: &[u8]) {
-        self.record.after = digest(after);
+    pub(crate) fn committed(&mut self, after: &crate::fs::ContentDigest, after_len: usize) {
+        self.record.after = after.hex();
         let mut state = self.recorder.edit_store();
-        if state.data.records.len() >= MAX_RECORDS || after.len() > MAX_FILE_BYTES {
+        if state.data.records.len() >= MAX_RECORDS || after_len > MAX_FILE_BYTES {
             skip(&mut state, self.record.turn);
+            state.mark();
             return;
         }
         self.recorded_index = Some(state.data.records.len());
         state.data.records.push(self.record.clone());
+        state.mark();
     }
     pub(crate) fn formatted(&self, after: Option<&str>) {
         let mut state = self.recorder.edit_store();
+        let mut changed = false;
         if let Some(record) = self
             .recorded_index
             .and_then(|index| state.data.records.get_mut(index))
         {
             // Missing authorized final bytes leaves the original posthash; restore safely conflicts.
             if let Some(after) = after {
-                record.after = digest(after.as_bytes());
+                let after = digest(after.as_bytes());
+                if record.after != after {
+                    record.after = after;
+                    changed = true;
+                }
             }
+        }
+        if changed {
+            state.mark();
         }
     }
 }
@@ -949,7 +1096,7 @@ mod tests {
         let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&work).unwrap());
         let denied = FileCheckpoints::default();
         scope(Some(denied.recorder("session", 0, true)), async {
-            assert!(prepare(&workspace, Path::new("file"), Some(b"old"), false).is_none());
+            assert!(prepare_sync(&workspace, Path::new("file"), Some(b"old"), false).is_none());
         })
         .await;
         assert!(
@@ -962,7 +1109,7 @@ mod tests {
         let large = vec![b'x'; MAX_FILE_BYTES + 1];
         let bounded = FileCheckpoints::default();
         scope(Some(bounded.recorder("session", 0, true)), async {
-            assert!(prepare(&workspace, Path::new("file"), Some(&large), true).is_none());
+            assert!(prepare_sync(&workspace, Path::new("file"), Some(&large), true).is_none());
         })
         .await;
         assert!(bounded.restore("session", 0, &workspace).is_err());
@@ -1320,7 +1467,8 @@ mod tests {
         recorder.blob_root = Some(blobs.clone());
         scope(Some(recorder), async {
             assert!(
-                prepare(&workspace, Path::new("file"), Some(b"one extra byte"), true).is_none()
+                prepare_sync(&workspace, Path::new("file"), Some(b"one extra byte"), true)
+                    .is_none()
             );
         })
         .await;
@@ -1335,5 +1483,61 @@ mod tests {
             existing_blobs(&links).is_err(),
             "hardlink metadata cannot become private checkpoint storage"
         );
+    }
+
+    #[tokio::test]
+    async fn perf_prepare_scans_blob_directory_once_and_syncs_off_the_caller() {
+        let root = crate::tests::OwnedTestDirectory::new("perf-prepare-scan");
+        let blobs = root.path().join("blobs");
+        crate::paths::ensure_private_directory(&blobs).unwrap();
+        let orphan = vec![9u8; 16];
+        crate::fs::private_atomic_create_sync(
+            &blobs.join(format!("{}.bin", digest(&orphan))),
+            &orphan,
+        )
+        .unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let store = FileCheckpoints::default();
+        let mut recorder = store.recorder("session", 1, false);
+        recorder.blob_root = Some(blobs.clone());
+        let syncs_before = crate::fs::DURABLE_SYNCS.with(|count| count.get());
+        scope(Some(recorder), async {
+            for value in 0..5u8 {
+                let bytes = vec![value; 32];
+                let digest = crate::fs::ContentDigest::of(&bytes);
+                let pending = prepare(
+                    &workspace,
+                    Path::new("file"),
+                    Some(Preimage::new(bytes, &digest)),
+                    true,
+                )
+                .await;
+                assert!(pending.is_some());
+            }
+            // A repeated preimage is already inventoried: no scan, no write.
+            let bytes = vec![0u8; 32];
+            let digest = crate::fs::ContentDigest::of(&bytes);
+            assert!(
+                prepare(
+                    &workspace,
+                    Path::new("file"),
+                    Some(Preimage::new(bytes, &digest)),
+                    true
+                )
+                .await
+                .is_some()
+            );
+        })
+        .await;
+        assert_eq!(
+            crate::fs::DURABLE_SYNCS.with(|count| count.get()),
+            syncs_before,
+            "durable fsyncs must run on the blocking pool, not the caller"
+        );
+        let state = store.0.lock().unwrap();
+        assert_eq!(state.scans, 1, "blob directory scanned once per store");
+        assert_eq!(state.data.blobs.len(), 6, "orphan merged plus five new");
+        drop(state);
+        assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 6);
     }
 }

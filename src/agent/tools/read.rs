@@ -32,6 +32,9 @@ fn absorb(
     }
 }
 
+/// Upper bound for the streaming read buffer.
+const READ_BUFFER_BYTES: usize = 256 * 1024;
+
 fn not_utf8(path: &str) -> ToolError {
     ToolError::Msg(format!(
         "Cannot read '{path}' as text because it is not valid UTF-8. Use the shell tool with `strings`, `xxd`, or another binary-aware command to inspect it."
@@ -380,7 +383,13 @@ impl ReadTool {
             });
         }
 
-        let mut reader = BufReader::new(file);
+        // tokio::fs::File costs one blocking-pool hop per buffer fill, so a large
+        // buffer cuts a 1 MiB read from ~128 hops to ~4. Small files keep a
+        // small buffer; one spare byte lets the EOF probe reuse the same fill.
+        let buffer = usize::try_from(metadata.len().saturating_add(1))
+            .unwrap_or(READ_BUFFER_BYTES)
+            .clamp(8 * 1024, READ_BUFFER_BYTES);
+        let mut reader = BufReader::with_capacity(buffer, file);
         #[cfg(not(feature = "multimodal"))]
         if super::read_image::ImageFormat::from_magic(reader.fill_buf().await?).is_some() {
             return Err(ToolError::Msg(
@@ -955,5 +964,29 @@ mod tests {
         assert!(error.to_string().contains("Path changed"));
 
         std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_buffered_read_spans_many_fills_with_exact_window_and_total() {
+        let path =
+            std::env::temp_dir().join(format!("mini-agent-read-large-{}", uuid::Uuid::new_v4()));
+        // ~600 KiB: more than two 256 KiB buffer fills, lines straddling fills.
+        let text: String = (0..20_000)
+            .map(|n| format!("line {n:05} {:-<20}\n", ""))
+            .collect();
+        std::fs::write(&path, &text).unwrap();
+        let output = ReadTool::new(None, None, None, 100)
+            .call(ReadArgs {
+                raw_notebook: false,
+                path: path.to_string_lossy().into_owned(),
+                offset: Some(19_998),
+                limit: Some(2),
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(output.contains("line 19997 "), "{output}");
+        assert!(output.contains("line 19998 "), "{output}");
+        assert!(!output.contains("line 19996 "), "{output}");
     }
 }

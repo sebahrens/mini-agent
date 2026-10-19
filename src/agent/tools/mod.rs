@@ -26,7 +26,7 @@ pub(crate) mod web_http;
 pub(crate) mod web_search;
 pub(crate) mod write;
 
-pub(crate) use normalize::{levenshtein_similarity, normalize_whitespace};
+pub(crate) use normalize::{levenshtein_similarity_chars, normalize_whitespace};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -194,7 +194,9 @@ pub(crate) struct ReadTracker {
     #[cfg(feature = "multimodal")]
     pub(crate) image_support: read_image::ImageReadSupport,
     deny_repeated_reads: bool,
-    tracked: std::sync::Arc<Mutex<Vec<TrackedRead>>>,
+    /// Windows read so far, grouped by path so every lookup, record and
+    /// untrack touches only that path's few windows.
+    tracked: std::sync::Arc<Mutex<std::collections::HashMap<String, Vec<TrackedRead>>>>,
     pub(crate) instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
 }
 
@@ -224,7 +226,6 @@ enum ReadKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TrackedRead {
     kind: ReadKind,
-    path: String,
     offset: usize,
     limit: usize,
     version: ReadVersion,
@@ -240,7 +241,7 @@ impl ReadTracker {
     pub(crate) fn new(deny_repeated_reads: bool) -> Self {
         Self {
             deny_repeated_reads,
-            tracked: std::sync::Arc::new(Mutex::new(Vec::new())),
+            tracked: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             instructions: None,
             #[cfg(feature = "multimodal")]
             image_support: read_image::ImageReadSupport::default(),
@@ -290,12 +291,13 @@ impl ReadTracker {
         }
         let version = ReadVersion::new(metadata, served_content_crc32);
         let tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
-        if !tracked.iter().any(|entry| {
-            entry.kind == kind
-                && entry.path == path
-                && entry.offset == offset
-                && entry.limit == limit
-                && entry.version == version
+        if !tracked.get(path).is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.kind == kind
+                    && entry.offset == offset
+                    && entry.limit == limit
+                    && entry.version == version
+            })
         }) {
             return None;
         }
@@ -346,15 +348,14 @@ impl ReadTracker {
         served_content_crc32: u32,
     ) {
         let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
-        tracked.retain(|entry| {
-            entry.kind != kind
-                || entry.path != path
-                || entry.offset != offset
-                || entry.limit != limit
-        });
-        tracked.push(TrackedRead {
+        let entries = match tracked.get_mut(path) {
+            Some(entries) => entries,
+            None => tracked.entry(path.to_string()).or_default(),
+        };
+        entries
+            .retain(|entry| entry.kind != kind || entry.offset != offset || entry.limit != limit);
+        entries.push(TrackedRead {
             kind,
-            path: path.to_string(),
             offset,
             limit,
             version: ReadVersion::new(metadata, served_content_crc32),
@@ -372,13 +373,14 @@ impl ReadTracker {
         self.tracked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .any(|entry| {
-                entry.kind == ReadKind::Raw
-                    && entry.path == path
-                    && entry.offset == 0
-                    && entry.limit >= total_lines
-                    && entry.version == version
+            .get(path)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.kind == ReadKind::Raw
+                        && entry.offset == 0
+                        && entry.limit >= total_lines
+                        && entry.version == version
+                })
             })
     }
 
@@ -394,7 +396,7 @@ impl ReadTracker {
 
     pub(crate) fn untrack_read_path(&self, path: &str) {
         let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
-        tracked.retain(|entry| entry.path != path);
+        tracked.remove(path);
     }
 
     /// Forget repeated-read history after a conversation mutation changes
@@ -1020,5 +1022,28 @@ pub(crate) async fn check_perm_bound_path(
             handle_ask_inner(tx, perm, tool, logical, None, Vec::new(), diagnostic).await?;
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod read_tracker_index_tests {
+    use super::ReadTracker;
+
+    #[test]
+    fn untrack_clears_only_the_named_path_and_windows_stay_independent() {
+        let tracker = ReadTracker::new(true);
+        assert!(tracker.track_read("a.rs", 0, 10).is_none());
+        assert!(tracker.track_read("a.rs", 10, 10).is_none());
+        assert!(tracker.track_read("b.rs", 0, 10).is_none());
+        assert!(tracker.track_read("a.rs", 0, 10).is_some(), "repeat denied");
+        assert!(tracker.track_read("a.rs", 10, 10).is_some());
+        tracker.untrack_read_path("a.rs");
+        assert!(tracker.track_read("a.rs", 0, 10).is_none());
+        assert!(
+            tracker.track_read("b.rs", 0, 10).is_some(),
+            "other path kept"
+        );
+        tracker.clear();
+        assert!(tracker.track_read("b.rs", 0, 10).is_none());
     }
 }

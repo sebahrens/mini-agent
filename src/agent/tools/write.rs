@@ -255,21 +255,45 @@ impl WriteTool {
             let mut preview_before = None;
             let mut created = false;
             let mut checkpoint;
-            match workspace.open_relative(relative) {
-                Ok(mut existing) => {
-                    if !args.overwrite {
-                        return Err(create_error(
-                            &expanded,
-                            std::io::Error::from(std::io::ErrorKind::AlreadyExists),
-                        ));
+            let mut digests = None;
+            // Open, stat and read run on the blocking pool; the decision logic stays here.
+            enum Probe {
+                Exists,
+                TooLarge,
+                Read(Box<(std::fs::Metadata, crate::fs::CheckedMetadata, Vec<u8>)>),
+            }
+            let probe = {
+                let workspace = std::sync::Arc::clone(workspace);
+                let relative = relative.to_path_buf();
+                let overwrite = args.overwrite;
+                let limit = self.max_text_file_size;
+                crate::agent::runner::spawn_blocking_scoped(move || {
+                    let mut existing = workspace.open_relative(&relative)?;
+                    if !overwrite {
+                        return Ok(Probe::Exists);
                     }
                     let metadata = existing.metadata()?;
-                    if metadata.len() > self.max_text_file_size {
-                        return Err(overwrite_not_authorized(&expanded));
+                    if metadata.len() > limit {
+                        return Ok(Probe::TooLarge);
                     }
                     let expected = crate::fs::checked_file_metadata(&existing)?;
                     let mut current = Vec::with_capacity(metadata.len() as usize);
                     existing.read_to_end(&mut current)?;
+                    Ok::<_, std::io::Error>(Probe::Read(Box::new((metadata, expected, current))))
+                })
+                .await
+                .map_err(|_| ToolError::Msg("Write open job failed".to_string()))?
+            };
+            match probe {
+                Ok(Probe::Exists) => {
+                    return Err(create_error(
+                        &expanded,
+                        std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                    ));
+                }
+                Ok(Probe::TooLarge) => return Err(overwrite_not_authorized(&expanded)),
+                Ok(Probe::Read(read)) => {
+                    let (metadata, expected, current) = *read;
                     let (crc, lines) = full_text_fingerprint(&current)?;
                     if !self
                         .read_tracker
@@ -277,6 +301,7 @@ impl WriteTool {
                     {
                         return Err(overwrite_not_authorized(&expanded));
                     }
+                    let base = crate::fs::ContentDigest::of(&current);
                     if self.diff_options.max_lines > 0
                         && current.len() <= super::mutation_diff::MAX_INPUT_BYTES
                         && super::mutation_diff::preimage_allowed(&self.permission, &expanded, true)
@@ -290,25 +315,44 @@ impl WriteTool {
                     checkpoint = crate::session::file_checkpoints::prepare(
                         workspace,
                         relative,
-                        Some(&current),
+                        Some(crate::session::file_checkpoints::Preimage::new(
+                            current.clone(),
+                            &base,
+                        )),
                         super::mutation_diff::preimage_allowed(&self.permission, &expanded, true),
-                    );
-                    workspace.replace_relative_atomic_expecting(
-                        relative,
-                        args.content.as_bytes(),
-                        &expected,
-                        &crate::fs::ContentDigest::of(&current),
-                    )?;
+                    )
+                    .await;
+                    digests = Some(base);
+                    let workspace = std::sync::Arc::clone(workspace);
+                    let owned_relative = relative.to_path_buf();
+                    let content = args.content.clone().into_bytes();
+                    crate::agent::runner::spawn_blocking_scoped(move || {
+                        workspace.replace_relative_atomic_expecting(
+                            &owned_relative,
+                            &content,
+                            &expected,
+                            &base,
+                        )
+                    })
+                    .await
+                    .map_err(|_| ToolError::Msg("Write publication job failed".to_string()))??;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     checkpoint =
-                        crate::session::file_checkpoints::prepare(workspace, relative, None, true);
-                    workspace
-                        .create_relative_atomic(relative, args.content.as_bytes())
-                        .map_err(|error| match error.kind() {
-                            std::io::ErrorKind::AlreadyExists => create_error(&expanded, error),
-                            _ => crate::agent::tools::bound_open_error(workspace, relative, error),
-                        })?;
+                        crate::session::file_checkpoints::prepare(workspace, relative, None, true)
+                            .await;
+                    let owned = std::sync::Arc::clone(workspace);
+                    let owned_relative = relative.to_path_buf();
+                    let content = args.content.clone().into_bytes();
+                    crate::agent::runner::spawn_blocking_scoped(move || {
+                        owned.create_relative_atomic(&owned_relative, &content)
+                    })
+                    .await
+                    .map_err(|_| ToolError::Msg("Write creation job failed".to_string()))?
+                    .map_err(|error| match error.kind() {
+                        std::io::ErrorKind::AlreadyExists => create_error(&expanded, error),
+                        _ => crate::agent::tools::bound_open_error(workspace, relative, error),
+                    })?;
                     created = true;
                 }
                 Err(error) => {
@@ -318,8 +362,9 @@ impl WriteTool {
                 }
             }
             crate::session::file_checkpoints::published();
+            let after_digest = crate::fs::ContentDigest::of(args.content.as_bytes());
             if let Some(checkpoint) = &mut checkpoint {
-                checkpoint.committed(args.content.as_bytes());
+                checkpoint.committed(&after_digest, args.content.len());
             }
             self.read_tracker.untrack_read_path(&expanded);
             let formatted = match &self.formatter {
@@ -342,24 +387,50 @@ impl WriteTool {
                 Some(formatted) => formatted.content.as_deref(),
                 None => Some(args.content.as_str()),
             };
-            if let Some(checkpoint) = &checkpoint {
-                checkpoint.formatted(final_content);
+            if let Some(checkpoint) = &checkpoint
+                && let Some(content) = formatted.as_ref().and_then(|f| f.content.as_deref())
+            {
+                checkpoint.formatted(Some(content));
             }
+            // Unformatted output is exactly the bytes already digested above.
+            let unformatted = formatted.is_none();
             let mut diff = if created {
                 final_content.and_then(|content| {
-                    MutationDiff::replacement(&expanded, None, content, self.diff_options)
+                    if unformatted {
+                        MutationDiff::replacement_with_digests(
+                            &expanded,
+                            None,
+                            content,
+                            self.diff_options,
+                            None,
+                            after_digest.hex(),
+                        )
+                    } else {
+                        MutationDiff::replacement(&expanded, None, content, self.diff_options)
+                    }
                 })
             } else {
                 preview_before
                     .as_deref()
                     .zip(final_content)
                     .and_then(|(before, content)| {
-                        MutationDiff::replacement(
-                            &expanded,
-                            Some(before),
-                            content,
-                            self.diff_options,
-                        )
+                        if unformatted {
+                            MutationDiff::replacement_with_digests(
+                                &expanded,
+                                Some(before),
+                                content,
+                                self.diff_options,
+                                digests.map(|digest| digest.hex()),
+                                after_digest.hex(),
+                            )
+                        } else {
+                            MutationDiff::replacement(
+                                &expanded,
+                                Some(before),
+                                content,
+                                self.diff_options,
+                            )
+                        }
                     })
             };
             let mut result = format!("Written {} bytes to {}", bytes, expanded);

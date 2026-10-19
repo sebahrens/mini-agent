@@ -6,7 +6,7 @@ use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::normalize::NormalizedText;
 use crate::agent::tools::{
     AskSender, EditArgs, EditBlock, EditOp, PermCheck, ReadTracker, ToolError,
-    check_perm_bound_path, check_perm_path, edit_system, levenshtein_similarity,
+    check_perm_bound_path, check_perm_path, edit_system, levenshtein_similarity_chars,
     normalize_whitespace,
 };
 use crate::config::types::EditSystem;
@@ -229,7 +229,11 @@ fn line_spans(content: &str) -> Vec<LineSpan<'_>> {
     spans
 }
 
-fn find_best_match(content: &str, search: &str) -> MatchResult {
+fn find_best_match(
+    content: &str,
+    search: &str,
+    normalized: &std::sync::OnceLock<NormalizedText>,
+) -> MatchResult {
     // Step 1: exact match in original content
     if let Some(pos) = content.find(search) {
         return MatchResult::Exact(pos);
@@ -239,7 +243,7 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
     // bytes (trailing whitespace, collapsed blank lines, tab expansion), so the
     // match span is translated back through the normalizer's byte map rather
     // than by arithmetic on the original text.
-    let content_norm = NormalizedText::new(content);
+    let content_norm = normalized.get_or_init(|| NormalizedText::new(content));
     let search_norm = normalize_whitespace(search);
     if search_norm.is_empty() {
         return MatchResult::NotFound;
@@ -298,13 +302,14 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
         }
     }
 
+    let search_norm_chars: Vec<char> = search_norm_joined.chars().collect();
     let mut best_sim = 0.0f64;
     let mut best_start = 0usize;
     let mut applicable = None;
 
     for start in 0..=content_lines.len() - search_lines.len() {
         let window_norm = content_norm_lines[start..start + search_lines.len()].join("\n");
-        let sim = levenshtein_similarity(&search_norm_joined, &window_norm);
+        let sim = levenshtein_similarity_chars(&search_norm_chars, &window_norm);
         if sim > best_sim {
             best_sim = sim;
             best_start = start;
@@ -431,6 +436,9 @@ async fn handle_similarity(
     }
 
     let mut resolved: Vec<ResolvedSim> = Vec::new();
+    // Normalizing a large file is the expensive part of a non-exact match;
+    // build it at most once per call and share it across all blocks.
+    let normalized_content = std::sync::OnceLock::<NormalizedText>::new();
 
     for (i, blk) in blocks.iter().enumerate() {
         let label = if blocks.len() > 1 {
@@ -450,7 +458,7 @@ async fn handle_similarity(
                 .match_indices(&search)
                 .map(|(start, _)| (start, start + search.len()))
                 .collect();
-            let normalized = NormalizedText::new(content);
+            let normalized = normalized_content.get_or_init(|| NormalizedText::new(content));
             let normalized_search = normalize_whitespace(&search);
             let mut all = exact.clone();
             if !normalized_search.is_empty() {
@@ -489,10 +497,11 @@ async fn handle_similarity(
                 continue;
             }
         }
-        match find_best_match(content, &search) {
+        match find_best_match(content, &search, &normalized_content) {
             MatchResult::Exact(pos) => {
-                let count = overlapping_match_indices(content, &search).count();
-                if count > 1 {
+                // Stop at the second hit; only the (rare) ambiguous case counts them all.
+                if overlapping_match_indices(content, &search).nth(1).is_some() {
+                    let count = overlapping_match_indices(content, &search).count();
                     if !disclose_source {
                         return Err(ToolError::Msg(format!(
                             "{label}search text matched more than once in {path}. Add more surrounding context to the SEARCH block to make it unique. Source previews require read permission."
@@ -1110,17 +1119,25 @@ impl EditTool {
             .as_deref()
             .unwrap_or(std::path::Path::new(""));
         let bound_workspace = target.bound_relative.as_ref().and(self.workspace.as_ref());
-        let capability_file = bound_workspace
-            .map(|workspace| {
-                workspace.open_relative(relative).map_err(|error| {
-                    crate::agent::tools::bound_open_error(workspace, relative, error)
+        // Bound open + identity stat run on the blocking pool, like notebook publication.
+        let (capability_file, capability_metadata) = match bound_workspace {
+            Some(workspace) => {
+                let owned = std::sync::Arc::clone(workspace);
+                let owned_relative = relative.to_path_buf();
+                let opened = crate::agent::runner::spawn_blocking_scoped(move || {
+                    let file = owned.open_relative(&owned_relative)?;
+                    let metadata = crate::fs::checked_file_metadata(&file);
+                    Ok::<_, std::io::Error>((file, metadata))
                 })
-            })
-            .transpose()?;
-        let capability_metadata = capability_file
-            .as_ref()
-            .map(crate::fs::checked_file_metadata)
-            .transpose()?;
+                .await
+                .map_err(|_| ToolError::Msg("Edit open job failed".to_string()))?
+                .map_err(|error| {
+                    crate::agent::tools::bound_open_error(workspace, relative, error)
+                })?;
+                (Some(opened.0), Some(opened.1?))
+            }
+            None => (None, None),
+        };
         let resolved = if bound_workspace.is_none() {
             Some(tokio::fs::canonicalize(&requested).await?)
         } else {
@@ -1287,12 +1304,18 @@ impl EditTool {
         ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
 
         let mut checkpoint = match bound_workspace {
-            Some(workspace) => crate::session::file_checkpoints::prepare(
-                workspace,
-                relative,
-                Some(content.as_bytes()),
-                disclose_source,
-            ),
+            Some(workspace) => {
+                crate::session::file_checkpoints::prepare(
+                    workspace,
+                    relative,
+                    Some(crate::session::file_checkpoints::Preimage::new(
+                        content.clone().into_bytes(),
+                        &base,
+                    )),
+                    disclose_source,
+                )
+                .await
+            }
             None => {
                 crate::session::file_checkpoints::skipped();
                 None
@@ -1326,12 +1349,20 @@ impl EditTool {
         };
 
         if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
-            workspace.replace_relative_atomic_expecting(
-                relative,
-                output.as_bytes(),
-                expected,
-                &base,
-            )?;
+            let workspace = std::sync::Arc::clone(workspace);
+            let owned_relative = relative.to_path_buf();
+            let owned_output = output.clone().into_bytes();
+            let expected = expected.clone();
+            crate::agent::runner::spawn_blocking_scoped(move || {
+                workspace.replace_relative_atomic_expecting(
+                    &owned_relative,
+                    &owned_output,
+                    &expected,
+                    &base,
+                )
+            })
+            .await
+            .map_err(|_| ToolError::Msg("Edit publication job failed".to_string()))??;
         } else {
             let resolved = resolved.expect("external edit must resolve an ambient path");
             let current = tokio::fs::canonicalize(&requested).await?;
@@ -1350,8 +1381,9 @@ impl EditTool {
             .await?;
         }
         crate::session::file_checkpoints::published();
+        let after_digest = crate::fs::ContentDigest::of(output.as_bytes());
         if let Some(checkpoint) = &mut checkpoint {
-            checkpoint.committed(output.as_bytes());
+            checkpoint.committed(&after_digest, output.len());
         }
         // Publication succeeded against the exact source identity and bytes.
         // Invalidate overwrite proof before optional formatter approval/effects.
@@ -1372,11 +1404,11 @@ impl EditTool {
             }
             None => None,
         };
-        if let Some(checkpoint) = &checkpoint {
-            checkpoint.formatted(match &formatted {
-                Some(f) => f.content.as_deref(),
-                None => Some(&output),
-            });
+        // Without formatter content the committed postimage digest already stands.
+        if let Some(checkpoint) = &checkpoint
+            && let Some(content) = formatted.as_ref().and_then(|f| f.content.as_deref())
+        {
+            checkpoint.formatted(Some(content));
         }
         let excerpts = match &formatted {
             Some(formatted) => formatted
@@ -1396,12 +1428,14 @@ impl EditTool {
                 })
         } else {
             preview_before.as_deref().and_then(|before| {
-                MutationDiff::build(
+                MutationDiff::build_with_digests(
                     &path,
                     Some(before),
                     &output,
                     applied_ranges,
                     self.diff_options,
+                    Some(base.hex()),
+                    Some(after_digest.hex()),
                 )
             })
         };
@@ -1715,5 +1749,67 @@ mod tests {
             std::fs::read_to_string(&swapped_target).unwrap(),
             "original swapped contents\n"
         );
+    }
+
+    #[tokio::test]
+    async fn bound_edit_open_and_publish_run_on_the_scoped_blocking_pool() {
+        let temp = TempDir::new();
+        std::fs::write(temp.path().join("target.txt"), "alpha\nbeta\n").unwrap();
+        let (scope, started, release) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        let tool = EditTool::new(None, None).with_workspace(temp.path());
+        let call = tokio::spawn({
+            let scope = Arc::clone(&scope);
+            async move {
+                scope
+                    .run(async move {
+                        tool.call(EditArgs {
+                            fuzzy: false,
+                            path: "target.txt".into(),
+                            replace_all: false,
+                            block: Some(
+                                "<<<<<<< SEARCH\nalpha\n=======\nALPHA\n>>>>>>> REPLACE".into(),
+                            ),
+                            file_crc: None,
+                            edits: None,
+                        })
+                        .await
+                    })
+                    .await
+            }
+        });
+        // The bound open is the first scoped blocking job; the executor stays free.
+        tokio::task::spawn_blocking(move || {
+            started
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("bound edit open must enter the scoped blocking pool");
+            started
+        })
+        .await
+        .unwrap();
+        assert!(!call.is_finished());
+        release.release();
+        call.await.unwrap().expect("edit succeeds");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("target.txt")).unwrap(),
+            "ALPHA\nbeta\n"
+        );
+    }
+
+    #[test]
+    fn similarity_normalizes_content_lazily_and_once_across_blocks() {
+        let content = "fn a() {\n\tone();  \n}\nfn b() {\n\ttwo();\n}\n";
+        let cache = std::sync::OnceLock::new();
+        assert!(matches!(
+            find_best_match(content, "fn a() {", &cache),
+            MatchResult::Exact(0)
+        ));
+        assert!(cache.get().is_none(), "exact matches never normalize");
+        let first = find_best_match(content, "fn a() {\n    one();\n}", &cache);
+        assert!(matches!(first, MatchResult::Normalized(..)));
+        let built = cache.get().expect("non-exact match builds the cache") as *const _;
+        let second = find_best_match(content, "fn b() {\n    two();\n}", &cache);
+        assert!(matches!(second, MatchResult::Normalized(..)));
+        assert!(std::ptr::eq(built, cache.get().unwrap()));
     }
 }
