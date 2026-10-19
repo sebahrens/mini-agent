@@ -356,6 +356,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     let (mut cfg, is_first_startup) =
         config::load_in_workspace(&app_paths, &workspace, is_interactive);
 
+    // Headless and ACP runs never prompt: personas stay inert, so say so once.
+    if !is_interactive && let Some(notice) = context::agents::untrusted_personas_notice(&workspace)
+    {
+        eprintln!("notice: {notice}");
+    }
+
     let loaded_warning_count = cfg.load_warnings.len();
     config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
     for warning in &cfg.load_warnings[loaded_warning_count..] {

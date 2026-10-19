@@ -22,10 +22,10 @@ use rquickjs::{
 
 use super::memory::Runtime;
 use super::protocol::{
-    AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass,
-    DiagnosticStage, DirectoryEntry, DirectoryEntryKind, EffectErrorCode, EffectOperation,
-    EffectRequest, EffectResponse, EffectResult, GrepMatch, GrepOptions, JsErrorCode,
-    JsExceptionClass, ModelEffectProfile, ParentFrame, ParentWireFrame, ProtocolError,
+    AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, DenialReason, Diagnostic,
+    DiagnosticClass, DiagnosticStage, DirectoryEntry, DirectoryEntryKind, EffectErrorCode,
+    EffectOperation, EffectRequest, EffectResponse, EffectResult, GrepMatch, GrepOptions,
+    JsErrorCode, JsExceptionClass, ModelEffectProfile, ParentFrame, ParentWireFrame, ProtocolError,
     ProtocolFault, ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole, StepOutcome, StepResult,
     VERIFICATION_LOADER_VERSION, VerificationCaseResult, VerificationResult, VerifyArtifact,
     WireFrame, WorkerFrame, WorkerProtocol, WorkerWireFrame, read_frame, source_position_is_valid,
@@ -346,7 +346,7 @@ fn install_model_effect_globals(
             super::memory::ensure_healthy(&ctx)?;
             match read_effects(EffectOperation::ReadFile { path }) {
                 EffectResult::ReadFile { content } => Ok(content),
-                EffectResult::Error(error) => Err(effect_error(&ctx, "read_file", error.code)),
+                EffectResult::Error(error) => Err(effect_error_from(&ctx, "read_file", &error)),
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
@@ -357,7 +357,7 @@ fn install_model_effect_globals(
             super::memory::ensure_healthy(&ctx)?;
             match read_many_effects(EffectOperation::ReadFiles { paths }) {
                 EffectResult::ReadFiles { contents } => Ok(contents),
-                EffectResult::Error(error) => Err(effect_error(&ctx, "read_files", error.code)),
+                EffectResult::Error(error) => Err(effect_error_from(&ctx, "read_files", &error)),
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
@@ -370,7 +370,7 @@ fn install_model_effect_globals(
                 EffectResult::ListDir { entries, truncated } => {
                     Ok(WorkerListDirResult { entries, truncated })
                 }
-                EffectResult::Error(error) => Err(effect_error(&ctx, "list_dir", error.code)),
+                EffectResult::Error(error) => Err(effect_error_from(&ctx, "list_dir", &error)),
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
@@ -387,7 +387,7 @@ fn install_model_effect_globals(
                     EffectResult::Glob { paths, truncated } => {
                         Ok(WorkerGlobResult { paths, truncated })
                     }
-                    EffectResult::Error(error) => Err(effect_error(&ctx, "glob", error.code)),
+                    EffectResult::Error(error) => Err(effect_error_from(&ctx, "glob", &error)),
                     _ => Err(rquickjs::Error::Unknown),
                 }
             },
@@ -409,7 +409,7 @@ fn install_model_effect_globals(
                     EffectResult::Grep { matches, truncated } => {
                         Ok(WorkerGrepResult { matches, truncated })
                     }
-                    EffectResult::Error(error) => Err(effect_error(&ctx, "grep", error.code)),
+                    EffectResult::Error(error) => Err(effect_error_from(&ctx, "grep", &error)),
                     _ => Err(rquickjs::Error::Unknown),
                 }
             },
@@ -425,7 +425,9 @@ fn install_model_effect_globals(
                 super::memory::ensure_healthy(&ctx)?;
                 match write_effects(EffectOperation::WriteFile { path, content }) {
                     EffectResult::WriteFile => Ok(()),
-                    EffectResult::Error(error) => Err(effect_error(&ctx, "write_file", error.code)),
+                    EffectResult::Error(error) => {
+                        Err(effect_error_from(&ctx, "write_file", &error))
+                    }
                     _ => Err(rquickjs::Error::Unknown),
                 }
             },
@@ -450,7 +452,7 @@ fn install_model_effect_globals(
                         EffectResult::Fetch { status, body, .. } => {
                             Ok(WorkerFetchResult { status, text: body })
                         }
-                        EffectResult::Error(error) => Err(effect_error(&ctx, "fetch", error.code)),
+                        EffectResult::Error(error) => Err(effect_error_from(&ctx, "fetch", &error)),
                         _ => Err(rquickjs::Error::Unknown),
                     }
                 },
@@ -488,7 +490,7 @@ fn install_model_effect_globals(
                             stdout_truncated,
                             stderr_truncated,
                         }),
-                        EffectResult::Error(error) => Err(effect_error(&ctx, "spawn", error.code)),
+                        EffectResult::Error(error) => Err(effect_error_from(&ctx, "spawn", &error)),
                         _ => Err(rquickjs::Error::Unknown),
                     }
                 },
@@ -519,7 +521,7 @@ fn install_session_state_globals(
             super::memory::ensure_healthy(&ctx)?;
             match result_effects(EffectOperation::Result { json }) {
                 EffectResult::ResultAccepted { .. } => Ok(()),
-                EffectResult::Error(error) => Err(effect_error(&ctx, "result", error.code)),
+                EffectResult::Error(error) => Err(effect_error_from(&ctx, "result", &error)),
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
@@ -538,7 +540,7 @@ fn install_session_state_globals(
                 match put_effects(EffectOperation::ScratchPut { key, json }) {
                     EffectResult::ScratchPut => Ok(()),
                     EffectResult::Error(error) => {
-                        Err(effect_error(&ctx, "scratch_put", error.code))
+                        Err(effect_error_from(&ctx, "scratch_put", &error))
                     }
                     _ => Err(rquickjs::Error::Unknown),
                 }
@@ -554,7 +556,7 @@ fn install_session_state_globals(
             super::memory::ensure_healthy(&ctx)?;
             match effects(EffectOperation::ScratchGet { key }) {
                 EffectResult::ScratchGet { json } => Ok(json),
-                EffectResult::Error(error) => Err(effect_error(&ctx, "scratch_get", error.code)),
+                EffectResult::Error(error) => Err(effect_error_from(&ctx, "scratch_get", &error)),
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
@@ -606,7 +608,7 @@ fn install_proposal_global(
                     "report_id": report_id,
                 }))
                 .map_err(|_| effect_error(&ctx, "propose_skill", EffectErrorCode::BackendFailure)),
-                EffectResult::Error(error) => Err(effect_error(&ctx, "propose_skill", error.code)),
+                EffectResult::Error(error) => Err(effect_error_from(&ctx, "propose_skill", &error)),
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
@@ -832,7 +834,33 @@ fn fetch_options_error(message: impl Into<String>) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("fetch options", "fetch", message.into())
 }
 
+fn effect_error_from(
+    ctx: &Ctx<'_>,
+    tool: &'static str,
+    error: &super::protocol::EffectError,
+) -> rquickjs::Error {
+    let detail = match error.reason {
+        Some(DenialReason::NoConfiguredRoots) if tool == "write_file" => {
+            Some("no js-write-roots configured")
+        }
+        Some(DenialReason::NoConfiguredRoots) => Some("no js-read-roots configured"),
+        Some(DenialReason::OutsideRoots) => Some("outside configured roots"),
+        Some(DenialReason::PermissionDenied) => Some("permission denied"),
+        None => None,
+    };
+    effect_error_detail(ctx, tool, error.code, detail)
+}
+
 fn effect_error(ctx: &Ctx<'_>, tool: &'static str, code: EffectErrorCode) -> rquickjs::Error {
+    effect_error_detail(ctx, tool, code, None)
+}
+
+fn effect_error_detail(
+    ctx: &Ctx<'_>,
+    tool: &'static str,
+    code: EffectErrorCode,
+    detail: Option<&'static str>,
+) -> rquickjs::Error {
     let code = match code {
         EffectErrorCode::Denied => "denied",
         EffectErrorCode::CapabilityDenied => "capability_denied",
@@ -846,7 +874,10 @@ fn effect_error(ctx: &Ctx<'_>, tool: &'static str, code: EffectErrorCode) -> rqu
         EffectErrorCode::AuditFailure => "audit_failure",
         EffectErrorCode::OutcomeUnknown => "outcome_unknown",
     };
-    let message = format!("{tool}: {code}");
+    let message = match detail {
+        Some(detail) => format!("js/{tool}: {code} ({detail})"),
+        None => format!("{tool}: {code}"),
+    };
     let Ok(exception) = Exception::from_message(ctx.clone(), &message) else {
         return rquickjs::Error::Unknown;
     };
@@ -959,9 +990,9 @@ mod effect_error_tests {
                     }],
                     truncated: false,
                 },
-                _ => EffectResult::Error(super::super::protocol::EffectError {
-                    code: EffectErrorCode::BackendFailure,
-                }),
+                _ => EffectResult::Error(super::super::protocol::EffectError::new(
+                    EffectErrorCode::BackendFailure,
+                )),
             }
         }) as ModelEffectDispatcher;
         install_model_effect_globals(&context, effects, true, ModelEffectProfile::Full)
@@ -1018,9 +1049,9 @@ mod effect_error_tests {
         let observed = calls.clone();
         let effects = Rc::new(move |_| {
             observed.set(observed.get() + 1);
-            EffectResult::Error(super::super::protocol::EffectError {
-                code: EffectErrorCode::BackendFailure,
-            })
+            EffectResult::Error(super::super::protocol::EffectError::new(
+                EffectErrorCode::BackendFailure,
+            ))
         }) as ModelEffectDispatcher;
         install_model_effect_globals(&context, effects, true, ModelEffectProfile::Full)
             .expect("install effect globals");
@@ -1038,6 +1069,43 @@ mod effect_error_tests {
     }
 
     #[test]
+    fn denial_reasons_extend_the_message_without_changing_the_code() {
+        for (reason, tool, expected) in [
+            (
+                DenialReason::NoConfiguredRoots,
+                "read_file",
+                "js/read_file: denied (no js-read-roots configured)",
+            ),
+            (
+                DenialReason::NoConfiguredRoots,
+                "write_file",
+                "js/write_file: denied (no js-write-roots configured)",
+            ),
+            (
+                DenialReason::OutsideRoots,
+                "read_file",
+                "js/read_file: denied (outside configured roots)",
+            ),
+        ] {
+            let runtime = Runtime::new().expect("create runtime");
+            let context = Context::full(&runtime).expect("create context");
+            let effects = Rc::new(move |_| {
+                EffectResult::Error(super::super::protocol::EffectError::denied(reason))
+            }) as ModelEffectDispatcher;
+            install_model_effect_globals(&context, effects, true, ModelEffectProfile::Full)
+                .expect("install effect globals");
+            let observed = context
+                .with(|ctx| {
+                    ctx.eval::<String, _>(format!(
+                        "try {{ {tool}('fixture', 'x'); 'no' }} catch (e) {{ e.message + '|' + e.code }}"
+                    ))
+                })
+                .expect("catch denial");
+            assert_eq!(observed, format!("{expected}|denied"));
+        }
+    }
+
+    #[test]
     fn parent_effect_failures_are_plain_errors_with_stable_codes() {
         for (code, expected) in [
             (EffectErrorCode::Denied, "denied"),
@@ -1047,9 +1115,9 @@ mod effect_error_tests {
         ] {
             let runtime = Runtime::new().expect("create runtime");
             let context = Context::full(&runtime).expect("create context");
-            let effects =
-                Rc::new(move |_| EffectResult::Error(super::super::protocol::EffectError { code }))
-                    as ModelEffectDispatcher;
+            let effects = Rc::new(move |_| {
+                EffectResult::Error(super::super::protocol::EffectError::new(code))
+            }) as ModelEffectDispatcher;
             install_model_effect_globals(&context, effects, true, ModelEffectProfile::Full)
                 .expect("install effect globals");
 
@@ -2303,9 +2371,9 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
                 // denial record. Deny locally instead: no wire frame, no audit churn, and no
                 // effect ordinal consumed, so a post-result loop can never exhaust the quota and
                 // turn the accepted structured result into an effect-limit error.
-                return EffectResult::Error(super::protocol::EffectError {
-                    code: EffectErrorCode::Denied,
-                });
+                return EffectResult::Error(super::protocol::EffectError::new(
+                    EffectErrorCode::Denied,
+                ));
             }
             if effect_limit_reached.load(Ordering::Acquire) {
                 return backend_failure();
@@ -2346,6 +2414,7 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
                         &result,
                         EffectResult::Error(super::protocol::EffectError {
                             code: EffectErrorCode::OutcomeUnknown,
+                            ..
                         })
                     ) {
                         protocol_failed.store(true, Ordering::Release);
@@ -2530,9 +2599,9 @@ impl<R: std::io::Read, W: Write> WorkerTransport<R, W> {
 }
 
 fn backend_failure() -> EffectResult {
-    EffectResult::Error(super::protocol::EffectError {
-        code: EffectErrorCode::BackendFailure,
-    })
+    EffectResult::Error(super::protocol::EffectError::new(
+        EffectErrorCode::BackendFailure,
+    ))
 }
 
 #[cfg(feature = "skills")]

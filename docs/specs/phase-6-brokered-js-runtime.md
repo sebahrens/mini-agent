@@ -1558,3 +1558,18 @@ fixture owns both invocation futures directly and reuses the launch fixture's
 process tracking, so injected failures at the effect, admission, and release
 boundaries settle native work before propagating. Verification scheduler tests
 separately cover priority and queue policy.
+
+## Delivered corrections (2026-10-19 denial reasons)
+
+`mini-agent-62kag`: an `EffectError` on the worker wire now carries an optional, closed
+`reason` (`no_configured_roots`, `outside_roots`, `permission_denied`) beside its unchanged
+`code`; it is omitted from the encoding when absent. The parent broker derives it only from its own
+typed service errors (a file effect with no configured root, a target outside the configured roots,
+or a permission denial), so no path, root list, rule text or policy internals cross the boundary.
+`code` stays `denied`. The worker turns it into a fixed message such as
+`js/read_file: denied (no js-read-roots configured)`; effects without a reason keep
+`<tool>: <code>`. Invariant 6 is unchanged: the reason set is closed, and tool output still never
+echoes exception messages unless the script catches and returns them. Coverage:
+`file_root_denials_carry_a_closed_reason_without_changing_the_code` (broker),
+`denial_reasons_extend_the_message_without_changing_the_code` (worker realm) and
+`contained_worker_read_file_denial_message_names_closed_reason` (contained worker).

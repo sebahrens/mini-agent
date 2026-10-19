@@ -1964,6 +1964,10 @@ impl<'a> App<'a> {
             renderer.write_line(&sanitize_output(notice), Color::DarkGrey)?;
             renderer.write_line("", Color::White)?;
         }
+        if let Some(notice) = crate::context::agents::untrusted_personas_notice(&ui.workspace) {
+            renderer.write_line(&sanitize_output(&notice), Color::DarkGrey)?;
+            renderer.write_line("", Color::White)?;
+        }
         #[cfg(feature = "subagents")]
         if let Some(notice) =
             crate::extras::subagents::with_config(|config| config.fallback_notice.clone())

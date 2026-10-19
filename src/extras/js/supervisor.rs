@@ -73,9 +73,9 @@ pub(crate) trait InvocationEffectHandler: Send {
     /// Implementations backed by durable intent should append `OutcomeUnknown` here. The secure
     /// default is ambiguous rather than implying that an uncooperative effect did not happen.
     fn reconcile_interrupted_effect(&mut self) -> EffectResult {
-        EffectResult::Error(super::protocol::EffectError {
-            code: EffectErrorCode::OutcomeUnknown,
-        })
+        EffectResult::Error(super::protocol::EffectError::new(
+            EffectErrorCode::OutcomeUnknown,
+        ))
     }
 
     #[cfg(feature = "skills")]
@@ -1683,9 +1683,9 @@ impl InvocationEffectHandler for RejectEffects {
         _cancellation: PermCancellation,
     ) -> EffectFuture<'_> {
         Box::pin(async {
-            EffectResult::Error(super::protocol::EffectError {
-                code: super::protocol::EffectErrorCode::Denied,
-            })
+            EffectResult::Error(super::protocol::EffectError::new(
+                super::protocol::EffectErrorCode::Denied,
+            ))
         })
     }
 }
@@ -2029,6 +2029,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     &result,
                     EffectResult::Error(super::protocol::EffectError {
                         code: EffectErrorCode::OutcomeUnknown,
+                        ..
                     })
                 );
                 let interrupted_outcome_unknown = interrupted
@@ -2233,7 +2234,7 @@ fn fit_effect_result_to_frame(
                 EffectErrorCode::TooLarge
             };
             (
-                EffectResult::Error(super::protocol::EffectError { code }),
+                EffectResult::Error(super::protocol::EffectError::new(code)),
                 None,
             )
         }
@@ -2260,6 +2261,7 @@ fn interrupted_effect_requires_unknown(result: &EffectResult) -> bool {
             | EffectResult::ProposalAccepted { .. }
             | EffectResult::Error(super::protocol::EffectError {
                 code: EffectErrorCode::AuditFailure | EffectErrorCode::OutcomeUnknown,
+                ..
             })
     )
 }

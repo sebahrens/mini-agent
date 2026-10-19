@@ -543,6 +543,29 @@ async fn test_spawn_uses_configured_sandbox_wrapper() {
 }
 
 #[tokio::test]
+async fn contained_worker_read_file_denial_message_names_closed_reason() {
+    use rig::tool::Tool;
+    let audit_dirs = TestTempDir::new("js-test-denial-reason");
+    let tool = make_test_tool_with_permissions(
+        &audit_dirs,
+        Sandbox::new(false, "bwrap"),
+        Some(restrictive_permission_allowing_js_entrypoint()),
+        None,
+    );
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "try { read_file('Cargo.toml'); 'read' } catch (e) { e.message }".to_string(),
+        })
+        .await
+        .expect("read call failed");
+    assert!(
+        result.contains("js/read_file: denied (permission denied)"),
+        "unexpected: {result}"
+    );
+    assert!(!result.contains("Cargo.toml"), "reason must not echo paths");
+}
+
+#[tokio::test]
 async fn test_host_globals_enforce_restrictive_permissions() {
     let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;

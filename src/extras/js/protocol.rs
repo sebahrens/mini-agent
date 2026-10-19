@@ -766,6 +766,32 @@ impl ProposalStatus {
 #[serde(deny_unknown_fields)]
 pub(crate) struct EffectError {
     pub(crate) code: EffectErrorCode,
+    /// Closed, non-sensitive refinement of `Denied`. Never carries a path or policy internals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<DenialReason>,
+}
+
+impl EffectError {
+    pub(crate) const fn new(code: EffectErrorCode) -> Self {
+        Self { code, reason: None }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn denied(reason: DenialReason) -> Self {
+        Self {
+            code: EffectErrorCode::Denied,
+            reason: Some(reason),
+        }
+    }
+}
+
+/// Closed denial reasons the model may see. Adding a variant is a wire-protocol change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DenialReason {
+    NoConfiguredRoots,
+    OutsideRoots,
+    PermissionDenied,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1717,6 +1743,7 @@ fn effect_response_is_terminal(response: &EffectResponse) -> bool {
         &response.result,
         EffectResult::Error(EffectError {
             code: EffectErrorCode::OutcomeUnknown,
+            ..
         })
     )
 }

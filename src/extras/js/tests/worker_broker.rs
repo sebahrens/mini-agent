@@ -51,9 +51,9 @@ impl InvocationEffectHandler for NoEffects {
         _cancellation: PermCancellation,
     ) -> crate::extras::js::supervisor::EffectFuture<'_> {
         Box::pin(async {
-            EffectResult::Error(crate::extras::js::protocol::EffectError {
-                code: EffectErrorCode::Denied,
-            })
+            EffectResult::Error(crate::extras::js::protocol::EffectError::new(
+                EffectErrorCode::Denied,
+            ))
         })
     }
 }
@@ -2038,9 +2038,9 @@ async fn worker_broker_records_skill_capability_denials_for_parent_telemetry() {
     let result = broker.handle_effect(effect, PermCancellation::new()).await;
     assert!(matches!(
         result,
-        EffectResult::Error(crate::extras::js::protocol::EffectError {
-            code: EffectErrorCode::CapabilityDenied
-        })
+        EffectResult::Error(crate::extras::js::protocol::EffectError::new(
+            EffectErrorCode::CapabilityDenied
+        ))
     ));
     let snapshot = tracker.snapshot().unwrap();
     assert_eq!(
@@ -2071,9 +2071,9 @@ async fn skill_denial_snapshot(
     assert!(
         matches!(
             result,
-            EffectResult::Error(crate::extras::js::protocol::EffectError {
-                code: EffectErrorCode::CapabilityDenied
-            })
+            EffectResult::Error(crate::extras::js::protocol::EffectError::new(
+                EffectErrorCode::CapabilityDenied
+            ))
         ),
         "{}: both denial classes surface as the same capability denial: {result:?}",
         case.name
