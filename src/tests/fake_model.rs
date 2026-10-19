@@ -126,14 +126,28 @@ pub(crate) mod dispatcher_guard {
         static OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    /// True when another test's guard is live and the calling thread is a
-    /// different libtest test thread: that test must see no dispatcher, as it
-    /// would in isolation, instead of running the owner's hooks. Helper threads
-    /// (runtime workers) cannot be attributed and keep seeing it.
+    /// Whether the calling thread acts for the guard's owner.
+    pub(crate) fn current_is_owner() -> bool {
+        OWNER.with(std::cell::Cell::get)
+    }
+
+    /// Marks a helper thread as acting for the owner (or not) until dropped.
+    pub(crate) fn inherit_owner(owner: bool) -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OWNER.with(|cell| cell.set(self.0));
+            }
+        }
+        Restore(OWNER.with(|cell| cell.replace(owner)))
+    }
+
+    /// True when a guard is live and the calling thread does not act for its
+    /// owner (the owner's test thread and its scoped blocking threads do): every
+    /// other test, and its helper threads, must see no dispatcher, as in
+    /// isolation, instead of running the owner's hooks.
     pub(crate) fn hidden_from_current_thread() -> bool {
-        HELD.load(std::sync::atomic::Ordering::Acquire)
-            && !OWNER.with(std::cell::Cell::get)
-            && crate::tests::is_test_thread()
+        HELD.load(std::sync::atomic::Ordering::Acquire) && !OWNER.with(std::cell::Cell::get)
     }
 
     /// Held for the lifetime of a dispatcher-touching test; resets the
