@@ -27,7 +27,17 @@ pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
     Ok(session)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts whole-session serializations on this test thread so tests can
+    /// pin that per-event paths (tool calls/results) do not re-encode it.
+    pub(crate) static SERIALIZE_BOUNDED_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<String> {
+    #[cfg(test)]
+    SERIALIZE_BOUNDED_CALLS.with(|calls| calls.set(calls.get() + 1));
     // Encode the shared stores' coherent observation cut through a thread-local
     // override instead of deep-cloning the whole Session (mini-agent-hcb3s).
     #[cfg(feature = "subagents")]

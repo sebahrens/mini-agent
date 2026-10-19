@@ -337,6 +337,39 @@ fn save_session_preserves_messages() {
     drop(env);
 }
 
+/// mini-agent-ldyyq: tool events during a pending main turn never encode the
+/// session (the disk snapshot stays at the pre-turn state), however long the
+/// turn is; only the settled save after the turn serializes, once.
+#[test]
+fn tool_events_during_a_pending_turn_perform_no_serialization() {
+    let _env = setup_test_env();
+    let _defer = crate::session::storage::defer_saves_for_test();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let _guard = runtime.enter();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    session.add_message(MessageRole::User, "prior question");
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "long turn");
+    mark_main_turn_started(&mut session, &mut run, pending);
+    let calls = &crate::session::storage::SERIALIZE_BOUNDED_CALLS;
+    calls.with(|c| c.set(0));
+    for index in 0..20 {
+        let id = format!("call-{index}");
+        session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": "a.txt"}));
+        assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+        session.add_tool_result_with_id(&id, "read", "contents");
+        assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+    }
+    assert_eq!(calls.with(std::cell::Cell::get), 0);
+
+    run.pending_turn = None;
+    assert!(persist_session_if_settled(&session, true, &run).unwrap());
+    assert_eq!(calls.with(std::cell::Cell::get), 1);
+    crate::session::storage::flush_deferred_session(&session.id).unwrap();
+}
+
 #[test]
 fn failed_turn_persistence_rollback_keeps_partial_events_off_disk() {
     let env = setup_test_env();
