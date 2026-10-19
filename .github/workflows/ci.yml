@@ -199,6 +199,9 @@ jobs:
       - name: Test CI documentation-only filter
         run: python3 -m unittest scripts.tests.test_ci_docs_filter
 
+      - name: Test target-directory sweep script
+        run: python3 -m unittest scripts.tests.test_sweep_target
+
       - name: Test release workflow policy
         run: |
           python3 -m unittest \
