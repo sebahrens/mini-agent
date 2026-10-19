@@ -28,6 +28,11 @@ fn access_for(name: &str) -> ToolAccess {
     match name {
         "read" | "grep" | "find_files" | "list_dir" | "todo_read" | "memory_read"
         | "memory_search" | "advisor" | "skills_search" => ToolAccess::Read,
+        // Network-only: each call is independently permission-checked and
+        // DNS-bounded, and the only local effect is a private per-call spill.
+        // `lsp_diagnostics` stays exclusive: it syncs documents into the
+        // shared language-server state (didChange/baseline) before querying.
+        "web_fetch" | "web_search" => ToolAccess::Read,
         "job_status" => ToolAccess::JobStatus,
         _ => ToolAccess::Write,
     }
@@ -285,6 +290,27 @@ mod tests {
         first_release.notify_waiters();
         let _ = joined.await.unwrap();
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn web_tools_share_the_lane() {
+        let (first, first_entered, first_release, maximum) = probe("web_fetch");
+        let mut second = first.clone();
+        second.name = "web_search";
+        second.entered = Arc::clone(&first_entered);
+        second.release = Arc::clone(&first_release);
+        let tools = bind(vec![Box::new(first), Box::new(second)]);
+        let joined = tokio::spawn(async move {
+            let one = tools[0].call("{}".to_owned());
+            let two = tools[1].call("{}".to_owned());
+            tokio::join!(one, two)
+        });
+        first_entered.notified().await;
+        first_entered.notified().await;
+        first_release.notify_waiters();
+        let _ = joined.await.unwrap();
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        assert_eq!(access_for("lsp_diagnostics"), ToolAccess::Write);
     }
 
     #[test]

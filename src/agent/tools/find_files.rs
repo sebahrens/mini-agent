@@ -24,9 +24,28 @@ fn path_changed_error(path: &Path) -> std::io::Error {
     )
 }
 
+/// What a directory entry is, as far as `readdir` (d_type) or a no-follow
+/// `fstatat` can tell without opening it. `Unknown` makes the walker fall back
+/// to opening the entry and classifying the descriptor.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+    Unknown,
+}
+
+struct DirectoryName {
+    name: OsString,
+    kind: EntryKind,
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(unsafe_code)]
 mod bound_platform {
+    use super::{DirectoryName, EntryKind};
     use std::ffi::{CStr, CString, OsStr, OsString};
     use std::fs::File;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
@@ -198,7 +217,7 @@ mod bound_platform {
     }
 
     impl Iterator for DirectoryReader {
-        type Item = OsString;
+        type Item = DirectoryName;
 
         fn next(&mut self) -> Option<Self::Item> {
             loop {
@@ -210,10 +229,63 @@ mod bound_platform {
                 // SAFETY: readdir returns a NUL-terminated name within a live entry.
                 let name = unsafe { CStr::from_ptr((*entry).name.as_ptr()) }.to_bytes();
                 if name != b"." && name != b".." {
-                    return Some(OsString::from_vec(name.to_vec()));
+                    // SAFETY: `entry` is the live record read above.
+                    let file_type = unsafe { (*entry).file_type };
+                    let kind = match file_type {
+                        libc::DT_DIR => EntryKind::Directory,
+                        libc::DT_REG => EntryKind::File,
+                        libc::DT_LNK => EntryKind::Symlink,
+                        libc::DT_UNKNOWN => EntryKind::Unknown,
+                        _ => EntryKind::Other,
+                    };
+                    return Some(DirectoryName {
+                        name: OsString::from_vec(name.to_vec()),
+                        kind,
+                    });
                 }
             }
         }
+    }
+
+    fn stat_nofollow(directory: &File, name: &OsStr) -> Option<libc::stat> {
+        let name = CString::new(name.as_bytes()).ok()?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `name` is NUL-terminated, the directory descriptor remains
+        // live, and fstatat initializes `metadata` on success without
+        // following the entry or opening its target.
+        let result = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        // SAFETY: fstatat succeeded and initialized the value.
+        (result == 0).then(|| unsafe { metadata.assume_init() })
+    }
+
+    fn kind_of_mode(mode: libc::mode_t) -> EntryKind {
+        match mode & libc::S_IFMT {
+            libc::S_IFDIR => EntryKind::Directory,
+            libc::S_IFREG => EntryKind::File,
+            libc::S_IFLNK => EntryKind::Symlink,
+            _ => EntryKind::Other,
+        }
+    }
+
+    /// Classify an entry whose d_type was unavailable with one no-follow stat
+    /// relative to the parent descriptor. `Unknown` when it cannot be stat'ed.
+    pub(super) fn kind_nofollow(directory: &File, name: &OsStr) -> EntryKind {
+        stat_nofollow(directory, name).map_or(EntryKind::Unknown, |stat| kind_of_mode(stat.st_mode))
+    }
+
+    /// Kind and size of an entry via one no-follow stat (no open, nothing
+    /// retained): the metadata-only counterpart of `open_child` + `fstat`.
+    pub(super) fn child_info(directory: &File, name: &OsStr) -> std::io::Result<(EntryKind, u64)> {
+        stat_nofollow(directory, name)
+            .map(|stat| (kind_of_mode(stat.st_mode), stat.st_size.max(0) as u64))
+            .ok_or_else(std::io::Error::last_os_error)
     }
 
     pub(super) fn read_directory(directory: &File) -> std::io::Result<DirectoryReader> {
@@ -249,6 +321,8 @@ mod bound_platform {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
     use std::ptr;
+
+    use super::{DirectoryName, EntryKind};
 
     type Handle = *mut c_void;
     type NtStatus = i32;
@@ -389,7 +463,7 @@ mod bound_platform {
     }
 
     impl Iterator for DirectoryReader {
-        type Item = OsString;
+        type Item = DirectoryName;
 
         fn next(&mut self) -> Option<Self::Item> {
             if self.finished {
@@ -447,7 +521,10 @@ mod bound_platform {
                     std::slice::from_raw_parts(bytes.add(64).cast::<u16>(), name_length / 2)
                 };
                 if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
-                    return Some(OsString::from_wide(name));
+                    return Some(DirectoryName {
+                        name: OsString::from_wide(name),
+                        kind: EntryKind::Unknown,
+                    });
                 }
             }
         }
@@ -469,6 +546,27 @@ mod bound_platform {
         false
     }
 
+    /// Windows has no d_type: every entry is classified by opening it.
+    pub(super) fn kind_nofollow(_directory: &File, _name: &OsStr) -> EntryKind {
+        EntryKind::Unknown
+    }
+
+    pub(super) fn child_info(directory: &File, name: &OsStr) -> std::io::Result<(EntryKind, u64)> {
+        let child = open_child(directory, name)?;
+        let metadata = child.metadata()?;
+        if !is_safe_entry(&metadata) {
+            return Err(std::io::Error::other("unsafe directory entry"));
+        }
+        let kind = if metadata.is_dir() {
+            EntryKind::Directory
+        } else if metadata.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Other
+        };
+        Ok((kind, metadata.len()))
+    }
+
     pub(super) fn read_link(
         _directory: &File,
         name: &OsStr,
@@ -488,6 +586,8 @@ mod bound_platform {
     use std::fs::File;
     use std::path::Path;
 
+    use super::{DirectoryName, EntryKind};
+
     fn unsupported() -> std::io::Error {
         std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -506,11 +606,22 @@ mod bound_platform {
     pub(super) struct DirectoryReader;
 
     impl Iterator for DirectoryReader {
-        type Item = OsString;
+        type Item = DirectoryName;
 
         fn next(&mut self) -> Option<Self::Item> {
             None
         }
+    }
+
+    pub(super) fn kind_nofollow(_directory: &File, _name: &OsStr) -> EntryKind {
+        EntryKind::Unknown
+    }
+
+    pub(super) fn child_info(
+        _directory: &File,
+        _name: &OsStr,
+    ) -> std::io::Result<(EntryKind, u64)> {
+        Err(unsupported())
     }
 
     pub(super) fn read_directory(_directory: &File) -> std::io::Result<DirectoryReader> {
@@ -540,6 +651,7 @@ mod bound_platform {
 
 pub(crate) struct BoundFile {
     pub(crate) path: PathBuf,
+    #[cfg_attr(not(feature = "js"), allow(dead_code))]
     pub(crate) file_name: OsString,
     pub(crate) file: File,
     pub(crate) metadata: std::fs::Metadata,
@@ -595,6 +707,7 @@ static PARENT_IGNORE_CACHE: LazyLock<Mutex<HashMap<PathBuf, ParentIgnoreCacheEnt
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl BoundDirectory {
+    #[cfg_attr(not(feature = "js"), allow(dead_code))]
     pub(crate) fn approved_root(&self) -> &Path {
         &self.approved_root
     }
@@ -656,10 +769,7 @@ impl BoundDirectory {
 
     pub(super) fn list_entries(&self) -> std::io::Result<Vec<BoundListEntry>> {
         let mut chain = IgnoreChain::default();
-        let (global, _) = GitignoreBuilder::new(&self.approved_root).build_global();
-        if !global.is_empty() {
-            chain = chain.append(vec![global]);
-        }
+        chain = chain.append(global_ignore_matchers(&self.approved_root));
         chain = chain.append(parent_ignore_matchers(&self.approved_root));
         let mut local_matchers = Vec::new();
         for ignore_name in [".gitignore", ".ignore"] {
@@ -670,20 +780,99 @@ impl BoundDirectory {
             }
         }
         chain = chain.append(local_matchers);
-        if let Ok(exclude) = open_relative(&self.root, Path::new(".git/info/exclude"))
-            && let Some(matcher) = ignore_matcher(
-                exclude,
-                &self.approved_root,
-                self.approved_root.join(".git/info/exclude"),
-            )
-        {
+        if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root) {
             chain = chain.append(vec![matcher]);
         }
 
         let mut entries = Vec::new();
-        for name in bound_platform::read_directory(&self.root)? {
+        for DirectoryName { name, kind } in bound_platform::read_directory(&self.root)? {
             if is_vcs_metadata(name.to_str().unwrap_or("")) {
                 continue;
+            }
+            let kind = if kind == EntryKind::Unknown {
+                bound_platform::kind_nofollow(&self.root, &name)
+            } else {
+                kind
+            };
+            match kind {
+                EntryKind::Symlink => {
+                    let path = self.approved_root.join(&name);
+                    if !is_ignored(&chain, &path, false) && !self.is_hidden(&path, false) {
+                        entries.push(BoundListEntry {
+                            link_target: bound_platform::read_link(
+                                &self.root,
+                                &name,
+                                &self.approved_root,
+                            )
+                            .ok(),
+                            file_name: name,
+                            is_directory: false,
+                            is_link: true,
+                            size: 0,
+                            child_count: 0,
+                        });
+                    }
+                    continue;
+                }
+                EntryKind::Directory | EntryKind::File | EntryKind::Other => {
+                    // Filter on the readdir/stat classification before any
+                    // open; only a surviving entry is stat'ed or opened (still
+                    // no-follow and relative to the parent descriptor).
+                    let is_directory = kind == EntryKind::Directory;
+                    let path = self.approved_root.join(&name);
+                    if is_directory && is_skip_dir(name.to_str().unwrap_or("")) {
+                        continue;
+                    }
+                    if is_ignored(&chain, &path, is_directory)
+                        || self.is_hidden(&path, is_directory)
+                    {
+                        continue;
+                    }
+                    if is_directory {
+                        let Ok(child) = bound_platform::open_child(&self.root, &name) else {
+                            continue;
+                        };
+                        let metadata = match child.metadata() {
+                            Ok(metadata)
+                                if bound_platform::is_safe_entry(&metadata)
+                                    && metadata.is_dir() =>
+                            {
+                                metadata
+                            }
+                            _ => continue,
+                        };
+                        let child_count = bound_platform::read_directory(&child)
+                            .map(|reader| reader.count() as u64)
+                            .unwrap_or(0);
+                        entries.push(BoundListEntry {
+                            link_target: None,
+                            file_name: name,
+                            is_directory: true,
+                            is_link: false,
+                            size: metadata.len(),
+                            child_count,
+                        });
+                    } else {
+                        let size = match bound_platform::child_info(&self.root, &name) {
+                            Ok((found, size))
+                                if !matches!(found, EntryKind::Directory | EntryKind::Symlink) =>
+                            {
+                                size
+                            }
+                            _ => continue,
+                        };
+                        entries.push(BoundListEntry {
+                            link_target: None,
+                            file_name: name,
+                            is_directory: false,
+                            is_link: false,
+                            size,
+                            child_count: 0,
+                        });
+                    }
+                    continue;
+                }
+                EntryKind::Unknown => {}
             }
             let child = match bound_platform::open_child(&self.root, &name) {
                 Ok(child) => child,
@@ -764,10 +953,7 @@ impl BoundDirectory {
         max_entries: usize,
     ) -> std::io::Result<(Vec<BoundDiscoveryEntry>, bool)> {
         let mut chain = IgnoreChain::default();
-        let (global, _) = GitignoreBuilder::new(&self.approved_root).build_global();
-        if !global.is_empty() {
-            chain = chain.append(vec![global]);
-        }
+        chain = chain.append(global_ignore_matchers(&self.approved_root));
         chain = chain.append(parent_ignore_matchers(&self.approved_root));
         let mut local_matchers = Vec::new();
         for ignore_name in [".gitignore", ".ignore"] {
@@ -780,34 +966,64 @@ impl BoundDirectory {
         chain = chain.append(local_matchers);
 
         let mut entries = Vec::with_capacity(max_entries.min(64));
-        for name in bound_platform::read_directory(&self.root)? {
+        for DirectoryName { name, kind } in bound_platform::read_directory(&self.root)? {
             if is_vcs_metadata(name.to_str().unwrap_or("")) {
                 continue;
             }
-            let child = match bound_platform::open_child(&self.root, &name) {
-                Ok(child) => child,
-                Err(_) => continue,
+            let kind = if kind == EntryKind::Unknown {
+                bound_platform::kind_nofollow(&self.root, &name)
+            } else {
+                kind
             };
-            let metadata = match child.metadata() {
-                Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
-                _ => continue,
+            let (is_directory, size) = match kind {
+                // Links and special files were never listed.
+                EntryKind::Symlink | EntryKind::Other => continue,
+                EntryKind::Directory | EntryKind::File => {
+                    let is_directory = kind == EntryKind::Directory;
+                    let path = self.approved_root.join(&name);
+                    if (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
+                        || is_ignored(&chain, &path, is_directory)
+                        || self.is_hidden(&path, is_directory)
+                    {
+                        continue;
+                    }
+                    // One no-follow stat of a surviving entry confirms the
+                    // classification and supplies the size.
+                    match bound_platform::child_info(&self.root, &name) {
+                        Ok((found, size)) if found == kind => {
+                            (is_directory, if is_directory { 0 } else { size })
+                        }
+                        _ => continue,
+                    }
+                }
+                EntryKind::Unknown => {
+                    let child = match bound_platform::open_child(&self.root, &name) {
+                        Ok(child) => child,
+                        Err(_) => continue,
+                    };
+                    let metadata = match child.metadata() {
+                        Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
+                        _ => continue,
+                    };
+                    let path = self.approved_root.join(&name);
+                    let is_directory = metadata.is_dir();
+                    if (!is_directory && !metadata.is_file())
+                        || (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
+                        || is_ignored(&chain, &path, is_directory)
+                        || self.is_hidden(&path, is_directory)
+                    {
+                        continue;
+                    }
+                    (is_directory, if is_directory { 0 } else { metadata.len() })
+                }
             };
-            let path = self.approved_root.join(&name);
-            let is_directory = metadata.is_dir();
-            if (!is_directory && !metadata.is_file())
-                || (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
-                || is_ignored(&chain, &path, is_directory)
-                || self.is_hidden(&path, is_directory)
-            {
-                continue;
-            }
             if entries.len() == max_entries {
                 return Ok((entries, true));
             }
             entries.push(BoundDiscoveryEntry {
                 file_name: name,
                 is_directory,
-                size: if is_directory { 0 } else { metadata.len() },
+                size,
             });
         }
         Ok((entries, false))
@@ -877,7 +1093,13 @@ pub(crate) struct BoundWalker {
     /// turns and subagent children do not keep blocking threads busy.
     cancellation: Option<crate::agent::runner::AgentWorkCancellation>,
     cancelled: bool,
+    /// Optional name filter for regular files, evaluated before the file is
+    /// opened; `false` drops the entry without any syscall.
+    file_filter: Option<FileFilter>,
 }
+
+/// Called with the entry's path relative to the walk root and its file name.
+pub(crate) type FileFilter = Box<dyn FnMut(&Path, &std::ffi::OsStr) -> bool + Send>;
 
 impl BoundWalker {
     fn new(
@@ -886,18 +1108,9 @@ impl BoundWalker {
         hidden: Option<PathFilter>,
     ) -> std::io::Result<Self> {
         let mut matchers = IgnoreChain::default();
-        let (global, _) = GitignoreBuilder::new(&approved_root).build_global();
-        if !global.is_empty() {
-            matchers = matchers.append(vec![global]);
-        }
+        matchers = matchers.append(global_ignore_matchers(&approved_root));
         matchers = matchers.append(parent_ignore_matchers(&approved_root));
-        if let Ok(exclude) = open_relative(&root, Path::new(".git/info/exclude"))
-            && let Some(matcher) = ignore_matcher(
-                exclude,
-                &approved_root,
-                approved_root.join(".git/info/exclude"),
-            )
-        {
+        if let Some(matcher) = root_exclude_matcher(&root, &approved_root) {
             matchers = matchers.append(vec![matcher]);
         }
         let frame = DirectoryFrame::new(root, PathBuf::new(), matchers, &approved_root)?;
@@ -910,6 +1123,7 @@ impl BoundWalker {
             work_limit_hit: false,
             cancellation: None,
             cancelled: false,
+            file_filter: None,
         })
     }
 }
@@ -923,6 +1137,14 @@ impl BoundWalker {
 
     pub(super) fn work_limit_hit(&self) -> bool {
         self.work_limit_hit
+    }
+
+    /// Only yield (and open) regular files for which `filter` returns true.
+    /// Entries still count against the entry budget; directories are
+    /// unaffected. The filter runs after the skip/ignore/hidden rules.
+    pub(super) fn with_file_filter(mut self, filter: FileFilter) -> Self {
+        self.file_filter = Some(filter);
+        self
     }
 
     /// Stop the walk once `cancellation` (captured from the calling task's
@@ -958,7 +1180,7 @@ impl Iterator for BoundWalker {
             }
             let depth = self.stack.len();
             let frame = self.stack.last_mut()?;
-            let Some(name) = frame.names.next() else {
+            let Some(DirectoryName { name, kind }) = frame.names.next() else {
                 self.stack.pop();
                 continue;
             };
@@ -973,30 +1195,68 @@ impl Iterator for BoundWalker {
             if is_vcs_metadata(name.to_str().unwrap_or("")) {
                 continue;
             }
+            let kind = if kind == EntryKind::Unknown {
+                bound_platform::kind_nofollow(&frame.directory, &name)
+            } else {
+                kind
+            };
             let relative_path = frame.relative_path.join(&name);
-            let child = match bound_platform::open_child(&frame.directory, &name) {
-                Ok(child) => child,
-                Err(_) => continue,
-            };
-            let metadata = match child.metadata() {
-                Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
-                _ => continue,
-            };
             let approved_path = self.approved_root.join(&relative_path);
-            let is_directory = metadata.is_dir();
-            if is_directory && is_skip_dir(name.to_str().unwrap_or("")) {
-                continue;
-            }
-            if is_ignored(&frame.matchers, &approved_path, is_directory) {
-                continue;
-            }
-            if self
-                .hidden
-                .as_ref()
-                .is_some_and(|hidden| hidden(&approved_path, is_directory))
-            {
-                continue;
-            }
+            let hidden = self.hidden.as_ref();
+            let mut file_filter = self.file_filter.as_mut();
+            let mut dropped = |is_directory: bool| {
+                (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
+                    || is_ignored(&frame.matchers, &approved_path, is_directory)
+                    || hidden.is_some_and(|hidden| hidden(&approved_path, is_directory))
+                    || (!is_directory
+                        && file_filter
+                            .as_mut()
+                            .is_some_and(|filter| !filter(&relative_path, &name)))
+            };
+            let (child, metadata, is_directory) = match kind {
+                // A link or special file was never yielded: the no-follow open
+                // of a link failed and a non-regular file failed `is_file`.
+                EntryKind::Symlink | EntryKind::Other => continue,
+                EntryKind::Directory | EntryKind::File => {
+                    // Decide from the readdir/stat classification before
+                    // opening anything. Survivors are still opened no-follow
+                    // relative to the parent descriptor and re-classified from
+                    // the descriptor, so a swapped entry is refused.
+                    let is_directory = kind == EntryKind::Directory;
+                    if dropped(is_directory) {
+                        continue;
+                    }
+                    let child = match bound_platform::open_child(&frame.directory, &name) {
+                        Ok(child) => child,
+                        Err(_) => continue,
+                    };
+                    let metadata = match child.metadata() {
+                        Ok(metadata)
+                            if bound_platform::is_safe_entry(&metadata)
+                                && metadata.is_dir() == is_directory =>
+                        {
+                            metadata
+                        }
+                        _ => continue,
+                    };
+                    (child, metadata, is_directory)
+                }
+                EntryKind::Unknown => {
+                    let child = match bound_platform::open_child(&frame.directory, &name) {
+                        Ok(child) => child,
+                        Err(_) => continue,
+                    };
+                    let metadata = match child.metadata() {
+                        Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
+                        _ => continue,
+                    };
+                    let is_directory = metadata.is_dir();
+                    if dropped(is_directory) {
+                        continue;
+                    }
+                    (child, metadata, is_directory)
+                }
+            };
             if is_directory {
                 if self.remaining_entries.is_some() && depth >= self.max_depth {
                     self.work_limit_hit = true;
@@ -1064,24 +1324,202 @@ fn parent_ignore_sources(approved_root: &Path) -> Vec<(PathBuf, PathBuf)> {
     sources
 }
 
+fn ignore_source_stamp(source: &Path) -> IgnoreSourceStamp {
+    match std::fs::metadata(source) {
+        Ok(metadata) => IgnoreSourceStamp {
+            source: source.to_path_buf(),
+            length: Some(metadata.len()),
+            modified: metadata.modified().ok(),
+            is_file: metadata.is_file(),
+        },
+        Err(_) => IgnoreSourceStamp {
+            source: source.to_path_buf(),
+            length: None,
+            modified: None,
+            is_file: false,
+        },
+    }
+}
+
 fn parent_ignore_stamps(sources: &[(PathBuf, PathBuf)]) -> Vec<IgnoreSourceStamp> {
     sources
         .iter()
-        .map(|(_, source)| match std::fs::metadata(source) {
-            Ok(metadata) => IgnoreSourceStamp {
-                source: source.clone(),
-                length: Some(metadata.len()),
-                modified: metadata.modified().ok(),
-                is_file: metadata.is_file(),
-            },
-            Err(_) => IgnoreSourceStamp {
-                source: source.clone(),
-                length: None,
-                modified: None,
-                is_file: false,
-            },
-        })
+        .map(|(_, source)| ignore_source_stamp(source))
         .collect()
+}
+
+struct GlobalIgnoreCacheEntry {
+    /// GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, XDG_CONFIG_HOME and the home
+    /// directory: the inputs that choose which git configs are read.
+    env: Vec<Option<std::ffi::OsString>>,
+    /// Every git config candidate plus the resolved `core.excludesFile`.
+    sources: Vec<PathBuf>,
+    stamps: Vec<IgnoreSourceStamp>,
+    matchers: Arc<[Gitignore]>,
+}
+
+type GlobalIgnoreCache = Mutex<HashMap<PathBuf, GlobalIgnoreCacheEntry>>;
+static GLOBAL_IGNORE_CACHE: LazyLock<GlobalIgnoreCache> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+type RootExcludeCache = Mutex<HashMap<PathBuf, (IgnoreSourceStamp, Option<Gitignore>)>>;
+static ROOT_EXCLUDE_CACHE: LazyLock<RootExcludeCache> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn global_ignore_env() -> Vec<Option<std::ffi::OsString>> {
+    [
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "XDG_CONFIG_HOME",
+        "HOME",
+        "USERPROFILE",
+    ]
+    .iter()
+    .map(std::env::var_os)
+    .collect()
+}
+
+/// The git config files `core.excludesFile` can come from, mirroring the
+/// lookup `ignore` performs in `build_global`.
+fn global_ignore_config_files(env: &[Option<std::ffi::OsString>]) -> Vec<PathBuf> {
+    let nonempty = |value: &Option<std::ffi::OsString>| {
+        value
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let mut files = Vec::with_capacity(4);
+    if let Some(path) = nonempty(&env[0]) {
+        files.push(path);
+    }
+    let home = std::env::home_dir();
+    if let Some(home) = &home {
+        files.push(home.join(".gitconfig"));
+    }
+    if let Some(xdg) = nonempty(&env[2]).or_else(|| home.as_ref().map(|home| home.join(".config")))
+    {
+        files.push(xdg.join("git/config"));
+    }
+    files.push(nonempty(&env[1]).unwrap_or_else(|| PathBuf::from("/etc/gitconfig")));
+    files
+}
+
+fn global_ignore_matchers(approved_root: &Path) -> Arc<[Gitignore]> {
+    let env = global_ignore_env();
+    let config_files = global_ignore_config_files(&env);
+    global_ignore_cached(
+        &GLOBAL_IGNORE_CACHE,
+        approved_root,
+        env,
+        config_files,
+        ignore::gitignore::gitconfig_excludes_path,
+        || {
+            let (global, _) = GitignoreBuilder::new(approved_root).build_global();
+            if global.is_empty() {
+                Arc::from(Vec::new())
+            } else {
+                Arc::from(vec![global])
+            }
+        },
+    )
+}
+
+/// Memoize the global excludes matcher per root, valid while the environment
+/// and the stamps (length, mtime) of every git config candidate and of the
+/// resolved excludes file are unchanged. Misses rebuild exactly as before.
+fn global_ignore_cached(
+    cache: &GlobalIgnoreCache,
+    approved_root: &Path,
+    env: Vec<Option<std::ffi::OsString>>,
+    config_files: Vec<PathBuf>,
+    resolve_excludes: impl Fn() -> Option<PathBuf>,
+    build: impl Fn() -> Arc<[Gitignore]>,
+) -> Arc<[Gitignore]> {
+    let known_sources = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(approved_root)
+        .filter(|entry| entry.env == env)
+        .map(|entry| (entry.sources.clone(), entry.stamps.clone()));
+    if let Some((sources, stamps)) = known_sources {
+        let current: Vec<_> = sources
+            .iter()
+            .map(|source| ignore_source_stamp(source))
+            .collect();
+        if current == stamps
+            && let Some(matchers) = cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(approved_root)
+                .filter(|entry| entry.env == env && entry.stamps == stamps)
+                .map(|entry| Arc::clone(&entry.matchers))
+        {
+            return matchers;
+        }
+    }
+
+    let mut sources = config_files;
+    sources.extend(resolve_excludes());
+    let stamps_of = |sources: &[PathBuf]| -> Vec<IgnoreSourceStamp> {
+        sources
+            .iter()
+            .map(|source| ignore_source_stamp(source))
+            .collect()
+    };
+    let mut stamps = stamps_of(&sources);
+    let mut matchers = build();
+    let after_build = stamps_of(&sources);
+    if after_build != stamps {
+        // A source changed while it was being read; rebuild once and keep
+        // the newer stamps so the next call revalidates.
+        stamps = after_build;
+        matchers = build();
+    }
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if cache.len() >= MAX_PARENT_IGNORE_CACHE_ENTRIES && !cache.contains_key(approved_root) {
+        cache.clear();
+    }
+    cache.insert(
+        approved_root.to_path_buf(),
+        GlobalIgnoreCacheEntry {
+            env,
+            sources,
+            stamps,
+            matchers: Arc::clone(&matchers),
+        },
+    );
+    matchers
+}
+
+/// `.git/info/exclude` of the bound root. The file is still opened relative to
+/// the root descriptor; only the read and parse are skipped while the opened
+/// file's (length, mtime) stamp matches the cached one.
+fn root_exclude_matcher(root: &File, approved_root: &Path) -> Option<Gitignore> {
+    let exclude = open_relative(root, Path::new(".git/info/exclude")).ok()?;
+    let source = approved_root.join(".git/info/exclude");
+    let metadata = exclude.metadata().ok()?;
+    let stamp = IgnoreSourceStamp {
+        source: source.clone(),
+        length: Some(metadata.len()),
+        modified: metadata.modified().ok(),
+        is_file: metadata.is_file(),
+    };
+    if let Some((cached_stamp, matcher)) = ROOT_EXCLUDE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(approved_root)
+        && *cached_stamp == stamp
+    {
+        return matcher.clone();
+    }
+    let matcher = ignore_matcher(exclude, approved_root, source);
+    let mut cache = ROOT_EXCLUDE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if cache.len() >= MAX_PARENT_IGNORE_CACHE_ENTRIES && !cache.contains_key(approved_root) {
+        cache.clear();
+    }
+    cache.insert(approved_root.to_path_buf(), (stamp, matcher.clone()));
+    matcher
 }
 
 fn parse_parent_ignore_matchers(sources: &[(PathBuf, PathBuf)]) -> Arc<[Gitignore]> {
@@ -1250,19 +1688,23 @@ impl FindFilesTool {
     }
 }
 
+fn find_file_rank_time(
+    sort: FindFilesSort,
+    modified: Option<SystemTime>,
+) -> Reverse<Option<SystemTime>> {
+    Reverse(if sort == FindFilesSort::Mtime {
+        modified
+    } else {
+        None
+    })
+}
+
 fn find_file_rank(
     sort: FindFilesSort,
     modified: Option<SystemTime>,
     path: String,
 ) -> (Reverse<Option<SystemTime>>, String) {
-    (
-        Reverse(if sort == FindFilesSort::Mtime {
-            modified
-        } else {
-            None
-        }),
-        path,
-    )
+    (find_file_rank_time(sort, modified), path)
 }
 
 impl Tool for FindFilesTool {
@@ -1370,31 +1812,36 @@ impl Tool for FindFilesTool {
         let cancellation = crate::agent::runner::current_work_cancellation();
         let (first_results, total_matches, work_limit_hit) =
             crate::agent::runner::spawn_blocking_scoped(move || -> Result<_, ToolError> {
-                let traversal_root = bound_directory.approved_root().to_path_buf();
+                // The pattern is evaluated on the name before a file is
+                // opened, so only matching files cost an open and fstat.
                 let mut walker = bound_directory
                     .walker()?
                     .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH)
-                    .with_cancellation(cancellation);
+                    .with_cancellation(cancellation)
+                    .with_file_filter(Box::new(move |relative_path, file_name| {
+                        pattern.is_match(&file_name.to_string_lossy(), relative_path)
+                    }));
                 let mut first_results = BinaryHeap::with_capacity(max_results.min(64));
                 let mut total_matches = 0_usize;
 
                 for entry in walker.by_ref() {
-                    let fname = entry.file_name.to_string_lossy();
-                    let relative_path = entry
-                        .path
-                        .strip_prefix(&traversal_root)
-                        .unwrap_or(&entry.path);
-                    if pattern.is_match(&fname, relative_path) {
-                        total_matches = total_matches.saturating_add(1);
-                        let path = entry.path.to_string_lossy().to_string();
-                        let ranked = find_file_rank(sort, entry.metadata.modified().ok(), path);
-                        if first_results.len() < max_results {
-                            first_results.push(ranked);
-                        } else if let Some(current_last) = first_results.peek()
-                            && ranked < *current_last
-                        {
+                    total_matches = total_matches.saturating_add(1);
+                    let path = entry.path.to_string_lossy();
+                    let modified = entry.metadata.modified().ok();
+                    if first_results.len() < max_results {
+                        first_results.push(find_file_rank(sort, modified, path.into_owned()));
+                    } else if let Some(current_last) = first_results.peek() {
+                        // Compare against the heap top on the borrowed
+                        // path; allocate only for a candidate that wins.
+                        let key = find_file_rank_time(sort, modified);
+                        let wins = match key.cmp(&current_last.0) {
+                            std::cmp::Ordering::Less => true,
+                            std::cmp::Ordering::Equal => *path < *current_last.1,
+                            std::cmp::Ordering::Greater => false,
+                        };
+                        if wins {
                             first_results.pop();
-                            first_results.push(ranked);
+                            first_results.push(find_file_rank(sort, modified, path.into_owned()));
                         }
                     }
                 }
@@ -2267,6 +2714,51 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn file_filter_runs_before_open_and_links_stay_refused() {
+        let directory = crate::tests::OwnedTestDirectory::new("find-files-filter-before-open");
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("keep.rs"), "").unwrap();
+        std::fs::write(root.join("skip.txt"), "").unwrap();
+        std::fs::write(root.join("sub/deep.rs"), "").unwrap();
+        // A link whose name passes the filter must still never be yielded,
+        // and a linked directory must never be descended into.
+        let outside = crate::tests::OwnedTestDirectory::new("find-files-filter-outside");
+        std::fs::write(outside.path().join("secret.rs"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.rs"), root.join("link.rs")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("linked_dir")).unwrap();
+
+        let metadata = crate::fs::checked_path_metadata(root).unwrap();
+        let bound = BoundDirectory::open(root, &metadata).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let walker = bound
+            .walker()
+            .unwrap()
+            .with_file_filter(Box::new(move |relative, name| {
+                recorder.lock().unwrap().push(relative.to_path_buf());
+                name.to_string_lossy().ends_with(".rs")
+            }));
+        let mut names: Vec<_> = walker
+            .map(|entry| {
+                entry
+                    .path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["keep.rs", "sub/deep.rs"]);
+        // Links are classified from d_type and never reach the filter.
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().all(|path| !path.starts_with("linked_dir")));
+        assert!(!seen.iter().any(|path| path == Path::new("link.rs")));
+    }
+
     #[test]
     fn mtime_sort_unavailable_timestamps_sort_last_and_name_ignores_them() {
         let older = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
@@ -2347,6 +2839,57 @@ mod tests {
         std::fs::write(&ignore, "different-length-name.txt\n").unwrap();
         let refreshed = parent_ignore_matchers(&workspace);
         assert!(!Arc::ptr_eq(&cached, &refreshed));
+    }
+
+    #[test]
+    fn global_ignore_matchers_are_cached_until_a_config_or_the_environment_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let container = TempDir::new("global_ignore_cache");
+        let root = container.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = container.path().join("gitconfig");
+        let excludes = container.path().join("global_ignore");
+        std::fs::write(&config, "[core]\n\texcludesfile = x\n").unwrap();
+        std::fs::write(&excludes, "one.txt\n").unwrap();
+        let cache = GlobalIgnoreCache::default();
+        let builds = AtomicUsize::new(0);
+        let call = |env: Vec<Option<std::ffi::OsString>>| {
+            global_ignore_cached(
+                &cache,
+                &root,
+                env,
+                vec![config.clone()],
+                || Some(excludes.clone()),
+                || {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Arc::from(Vec::new())
+                },
+            )
+        };
+        let first = call(vec![None]);
+        let second = call(vec![None]);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "warm call must not rebuild"
+        );
+
+        std::fs::write(&excludes, "different-length.txt\n").unwrap();
+        let third = call(vec![None]);
+        assert!(!Arc::ptr_eq(&second, &third));
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        std::fs::write(&config, "[core]\n\texcludesfile = other-path\n").unwrap();
+        call(vec![None]);
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+
+        call(vec![Some("elsewhere".into())]);
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            4,
+            "environment change rebuilds"
+        );
     }
 
     #[test]
