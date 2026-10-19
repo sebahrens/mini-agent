@@ -930,6 +930,31 @@ impl WorkspaceBinding {
     }
 }
 
+impl WorkspaceBinding {
+    /// Validate this binding right after `validated` (a binding of the same
+    /// workspace) passed `validate()` in the same check. When both name the
+    /// same path and directory identity, the path was just canonicalized and
+    /// compared, so only this binding's own held descriptor is re-checked by
+    /// identity (one fstat). Any difference falls back to the full `validate`,
+    /// and nothing is cached across calls.
+    #[cfg(feature = "mcp")]
+    pub(crate) fn validate_after(&self, validated: &Self) -> Result<(), String> {
+        if self.root != validated.root
+            || crate::fs::ensure_same_file(&self.root, &self.identity, &validated.identity).is_err()
+        {
+            return self.validate();
+        }
+        #[cfg(target_os = "linux")]
+        self.spelling
+            .validate()
+            .map_err(|_| "workspace spelling changed after session creation".to_string())?;
+        let held = crate::fs::checked_file_metadata(&self.directory)
+            .map_err(|error| format!("workspace binding handle is unavailable: {error}"))?;
+        crate::fs::ensure_same_file(&self.root, &self.identity, &held)
+            .map_err(|_| "workspace binding handle identity changed".to_string())
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// `WorkspaceBinding::validate` calls on this thread, for "validated once" tests.

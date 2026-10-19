@@ -582,7 +582,7 @@ impl IndexCoordinator {
                 return Ok(state.applied_generation);
             }
         }
-        let (generation, acknowledge_generation, initial, backfill, database_path) = {
+        let (generation, acknowledge_generation, scan, database_path) = {
             let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
             let state = store.generation_state()?;
             let hydration_only = !self.hydrated.load(Ordering::Acquire)
@@ -605,26 +605,16 @@ impl IndexCoordinator {
                         true,
                     )
                 };
-            let initial = store.snapshot_rows(&model.model_id, &model.model_revision)?;
-            let backfill = store.embedding_backfill_rows(&model.model_id, &model.model_revision)?;
+            let scan = store.rebuild_scan(&model.model_id, &model.model_revision)?;
             (
                 generation,
                 acknowledge_generation,
-                initial,
-                backfill,
+                scan,
                 store.database_path().to_path_buf(),
             )
         };
-
-        let missing = backfill
-            .iter()
-            .filter(|(_, embedding)| {
-                embedding
-                    .as_ref()
-                    .is_none_or(|embedding| !embedding_is_compatible(embedding, &model))
-            })
-            .map(|(artifact, _)| (artifact.id.clone(), skill_document(artifact)))
-            .collect::<Vec<_>>();
+        let (initial, missing) = split_scan(scan, &model);
+        let mut fresh = HashMap::<String, StoredEmbedding>::new();
         for batch in missing.chunks(EMBEDDING_BATCH_SIZE) {
             let documents = batch
                 .iter()
@@ -650,10 +640,12 @@ impl IndexCoordinator {
                 model.normalized,
                 &embeddings,
             )?;
+            drop(store);
+            remember_fresh(&mut fresh, &model, embeddings);
         }
 
         let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
-        let rows = refresh_snapshot_embeddings(&store, &model, initial)?;
+        let rows = refresh_snapshot_embeddings(&store, &model, initial, fresh)?;
         ensure_generation_current(&store, generation)?;
         let snapshot = Arc::new(ImmutableSkillIndex::build_without_ann(
             generation,
@@ -699,24 +691,16 @@ impl IndexCoordinator {
 
     fn build_generation(&self, generation: u64) -> Result<ImmutableSkillIndex, CoordinatorError> {
         let model = self.embedder.model_metadata().clone();
-        let (initial, backfill, database_path) = {
+        let (scan, database_path) = {
             let store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
             ensure_generation_current(&store, generation)?;
             (
-                store.snapshot_rows(&model.model_id, &model.model_revision)?,
-                store.embedding_backfill_rows(&model.model_id, &model.model_revision)?,
+                store.rebuild_scan(&model.model_id, &model.model_revision)?,
                 store.database_path().to_path_buf(),
             )
         };
-        let missing = backfill
-            .iter()
-            .filter(|(_, embedding)| {
-                embedding
-                    .as_ref()
-                    .is_none_or(|embedding| !embedding_is_compatible(embedding, &model))
-            })
-            .map(|(artifact, _)| (artifact.id.clone(), skill_document(artifact)))
-            .collect::<Vec<_>>();
+        let (initial, missing) = split_scan(scan, &model);
+        let mut fresh = HashMap::<String, StoredEmbedding>::new();
         for batch in missing.chunks(EMBEDDING_BATCH_SIZE) {
             let documents = batch
                 .iter()
@@ -744,9 +728,10 @@ impl IndexCoordinator {
                     model.normalized,
                     &embeddings,
                 )?;
+            remember_fresh(&mut fresh, &model, embeddings);
         }
         let store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
-        let rows = refresh_snapshot_embeddings(&store, &model, initial)?;
+        let rows = refresh_snapshot_embeddings(&store, &model, initial, fresh)?;
         ensure_generation_current(&store, generation)?;
         ImmutableSkillIndex::build(generation, model, &database_path, rows).map_err(Into::into)
     }
@@ -894,34 +879,82 @@ fn ensure_generation_current(store: &SkillStore, generation: u64) -> Result<(), 
     }
 }
 
+type ScanRow = (
+    super::SkillArtifact,
+    Option<StoredEmbedding>,
+    SkillRecordMetadata,
+);
+
+/// Split one active+canary scan into the rows that feed the published index
+/// (active only) and the documents whose embedding is absent or incompatible
+/// (active and canary).
+fn split_scan(scan: Vec<ScanRow>, model: &ModelMetadata) -> (Vec<ScanRow>, Vec<(String, String)>) {
+    let missing = scan
+        .iter()
+        .filter(|(_, embedding, _)| {
+            embedding
+                .as_ref()
+                .is_none_or(|embedding| !embedding_is_compatible(embedding, model))
+        })
+        .map(|(artifact, _, _)| (artifact.id.clone(), skill_document(artifact)))
+        .collect();
+    let initial = scan
+        .into_iter()
+        .filter(|(_, _, metadata)| metadata.status == "active")
+        .collect();
+    (initial, missing)
+}
+
+/// Keep just-embedded vectors in memory so the rebuild never re-reads (and
+/// re-decodes) the blobs it stored.
+fn remember_fresh(
+    fresh: &mut HashMap<String, StoredEmbedding>,
+    model: &ModelMetadata,
+    embeddings: Vec<(String, Vec<f32>)>,
+) {
+    for (skill_id, values) in embeddings {
+        fresh.insert(
+            skill_id.clone(),
+            StoredEmbedding {
+                skill_id,
+                model_id: model.model_id.clone(),
+                model_revision: model.model_revision.clone(),
+                dimensions: model.dimensions,
+                normalized: model.normalized,
+                values,
+            },
+        );
+    }
+}
+
+/// Re-check lifecycle state after embedding using a lean metadata-only scan
+/// (no artifact bodies, no vector blobs) and merge the in-memory vectors.
 fn refresh_snapshot_embeddings(
     store: &SkillStore,
     model: &ModelMetadata,
-    initial: Vec<(
-        super::SkillArtifact,
-        Option<StoredEmbedding>,
-        SkillRecordMetadata,
-    )>,
+    initial: Vec<ScanRow>,
+    mut fresh: HashMap<String, StoredEmbedding>,
 ) -> Result<Vec<(super::SkillArtifact, StoredEmbedding, SkillRecordMetadata)>, StoreError> {
-    let mut embeddings = store
-        .snapshot_embeddings_only(&model.model_id, &model.model_revision)?
+    let mut lifecycle = store
+        .snapshot_lifecycle_only()?
         .into_iter()
-        .map(|(skill_id, embedding, metadata)| (skill_id, (embedding, metadata)))
         .collect::<HashMap<_, _>>();
 
     initial
         .into_iter()
-        .map(|(artifact, _, _)| {
-            let (embedding, metadata) =
-                embeddings
+        .map(|(artifact, stored, _)| {
+            let metadata =
+                lifecycle
                     .remove(&artifact.id)
                     .ok_or_else(|| StoreError::MalformedEmbedding {
                         skill_id: artifact.id.clone(),
                         reason: "active row disappeared during rebuild".to_string(),
                     })?;
-            let embedding = embedding.ok_or_else(|| StoreError::MalformedEmbedding {
-                skill_id: artifact.id.clone(),
-                reason: "compatible vector is missing after rebuild".to_string(),
+            let embedding = fresh.remove(&artifact.id).or(stored).ok_or_else(|| {
+                StoreError::MalformedEmbedding {
+                    skill_id: artifact.id.clone(),
+                    reason: "compatible vector is missing after rebuild".to_string(),
+                }
             })?;
             if !embedding_is_compatible(&embedding, model) {
                 return Err(StoreError::MalformedEmbedding {

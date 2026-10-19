@@ -662,6 +662,7 @@ impl SkillStore {
     ///
     /// Snapshot construction uses this joined scan instead of issuing metadata
     /// and embedding queries for every artifact in the corpus.
+    #[cfg(test)]
     pub fn snapshot_rows(
         &self,
         model_id: &str,
@@ -734,68 +735,12 @@ impl SkillStore {
         Ok(snapshot)
     }
 
-    /// Load identity-checked active and canary artifacts that need embeddings.
-    ///
-    /// Canaries remain excluded from the published retrieval snapshot, but
-    /// their vectors must migrate with the active corpus so replacement
-    /// routing continues to work after an embedding model revision changes.
-    pub fn embedding_backfill_rows(
-        &self,
-        model_id: &str,
-        model_revision: &str,
-    ) -> Result<Vec<(SkillArtifact, Option<StoredEmbedding>)>, StoreError> {
-        let mut statement = self.db.prepare(
-            "SELECT r.id, r.identity_version, r.source, r.description, r.tags_json,
-                    r.exports_json, r.tests_json, r.capability_json, r.status,
-                    e.dimensions, e.normalized, e.embedding
-             FROM skill_revisions r
-             LEFT JOIN skill_embeddings e
-               ON e.skill_id = r.id AND e.model_id = ? AND e.model_revision = ?
-             WHERE r.status IN ('active', 'canary') AND r.identity_version = 2
-             ORDER BY r.id",
-        )?;
-        let rows = statement.query_map(params![model_id, model_revision], |row| {
-            Ok((
-                read_artifact_row(row)?,
-                row.get::<_, Option<i64>>(9)?,
-                row.get::<_, Option<i64>>(10)?,
-                row.get::<_, Option<Vec<u8>>>(11)?,
-            ))
-        })?;
-
-        let mut snapshot = Vec::new();
-        for row in rows {
-            let (artifact, dimensions, normalized, bytes) = row?;
-            let Ok(artifact) = artifact else {
-                continue;
-            };
-            if artifact.verify_identity().is_err() {
-                continue;
-            }
-            let embedding = match decode_stored_embedding(
-                &artifact.id,
-                model_id,
-                model_revision,
-                dimensions,
-                normalized,
-                bytes,
-            ) {
-                Ok(embedding) => embedding,
-                Err(error) => {
-                    tracing::warn!(skill_id = %artifact.id, %error, "ignoring corrupt learned-skill embedding row");
-                    None
-                }
-            };
-            snapshot.push((artifact, embedding));
-        }
-        Ok(snapshot)
-    }
-
     /// Load lifecycle and embedding data without fetching artifact bodies.
     ///
     /// Index rebuilds already hold an identity-checked artifact snapshot. This
     /// lean second scan refreshes compatible vectors and lifecycle metadata
     /// without reading source, tests, exports, tags, or capability JSON again.
+    #[cfg(test)]
     pub fn snapshot_embeddings_only(
         &self,
         model_id: &str,
@@ -857,6 +802,125 @@ impl SkillStore {
                 }
             };
             snapshot.push((id, embedding, metadata));
+        }
+        Ok(snapshot)
+    }
+
+    /// One identity-checked scan of the active and canary artifacts with their
+    /// compatible embeddings and lifecycle metadata. Index rebuilds derive both
+    /// the published rows (status `active`) and the embedding backfill (all
+    /// rows) from this single pass, so artifact JSON, identity hashes and
+    /// embedding blobs are each read and decoded once.
+    pub(super) fn rebuild_scan(
+        &self,
+        model_id: &str,
+        model_revision: &str,
+    ) -> Result<Vec<(SkillArtifact, Option<StoredEmbedding>, SkillRecordMetadata)>, StoreError>
+    {
+        #[cfg(test)]
+        ARTIFACT_SCANS.with(|scans| scans.set(scans.get() + 1));
+        let mut statement = self.db.prepare(
+            "SELECT r.id, r.identity_version, r.source, r.description, r.tags_json,
+                    r.exports_json, r.tests_json, r.capability_json, r.status,
+                    r.supersedes_id, r.superseded_by_id, r.row_version,
+                    e.dimensions, e.normalized, e.embedding
+             FROM skill_revisions r
+             LEFT JOIN skill_embeddings e
+               ON e.skill_id = r.id AND e.model_id = ? AND e.model_revision = ?
+             WHERE r.status IN ('active', 'canary') AND r.identity_version = 2
+             ORDER BY r.id",
+        )?;
+        let rows = statement.query_map(params![model_id, model_revision], |row| {
+            Ok((
+                read_artifact_row(row)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+                row.get::<_, Option<Vec<u8>>>(14)?,
+            ))
+        })?;
+
+        let mut snapshot = Vec::new();
+        for row in rows {
+            let (
+                artifact,
+                status,
+                supersedes_id,
+                superseded_by_id,
+                row_version,
+                dimensions,
+                normalized,
+                bytes,
+            ) = row?;
+            let Ok(artifact) = artifact else {
+                continue;
+            };
+            if artifact.verify_identity().is_err() {
+                continue;
+            }
+            let metadata = SkillRecordMetadata {
+                status,
+                quarantine_reason: None,
+                supersedes_id,
+                superseded_by_id,
+                row_version: u64::try_from(row_version).unwrap_or(0),
+            };
+            let embedding = match decode_stored_embedding(
+                &artifact.id,
+                model_id,
+                model_revision,
+                dimensions,
+                normalized,
+                bytes,
+            ) {
+                Ok(embedding) => embedding,
+                Err(error) => {
+                    tracing::warn!(skill_id = %artifact.id, %error, "ignoring corrupt learned-skill embedding row");
+                    None
+                }
+            };
+            snapshot.push((artifact, embedding, metadata));
+        }
+        Ok(snapshot)
+    }
+
+    /// Lifecycle metadata of the active rows, reading no artifact body and no
+    /// embedding blob. Used after embedding to detect lifecycle changes that
+    /// raced with a rebuild.
+    pub(super) fn snapshot_lifecycle_only(
+        &self,
+    ) -> Result<Vec<(String, SkillRecordMetadata)>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT id, status, supersedes_id, superseded_by_id, row_version
+             FROM skill_revisions
+             WHERE status = 'active' AND identity_version = 2
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut snapshot = Vec::new();
+        for row in rows {
+            let (id, status, supersedes_id, superseded_by_id, row_version) = row?;
+            snapshot.push((
+                id,
+                SkillRecordMetadata {
+                    status,
+                    quarantine_reason: None,
+                    supersedes_id,
+                    superseded_by_id,
+                    row_version: u64::try_from(row_version).unwrap_or(0),
+                },
+            ));
         }
         Ok(snapshot)
     }
@@ -4284,6 +4348,14 @@ fn validate_embedding_bytes(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Artifact scans issued by `rebuild_scan` on this thread.
+    pub(crate) static ARTIFACT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Embedding blobs decoded by `decode_stored_embedding` on this thread.
+    pub(crate) static EMBEDDING_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn decode_stored_embedding(
     skill_id: &str,
     model_id: &str,
@@ -4295,6 +4367,8 @@ fn decode_stored_embedding(
     match (dimensions, normalized, bytes) {
         (None, None, None) => Ok(None),
         (Some(dimensions), Some(normalized), Some(bytes)) => {
+            #[cfg(test)]
+            EMBEDDING_DECODES.with(|decodes| decodes.set(decodes.get() + 1));
             let dimensions =
                 usize::try_from(dimensions).map_err(|_| StoreError::MalformedEmbedding {
                     skill_id: skill_id.to_string(),
