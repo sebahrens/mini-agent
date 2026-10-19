@@ -260,11 +260,7 @@ impl WriteTool {
             enum Probe {
                 Exists,
                 TooLarge,
-                Read {
-                    metadata: std::fs::Metadata,
-                    expected: crate::fs::CheckedMetadata,
-                    current: Vec<u8>,
-                },
+                Read(Box<(std::fs::Metadata, crate::fs::CheckedMetadata, Vec<u8>)>),
             }
             let probe = {
                 let workspace = std::sync::Arc::clone(workspace);
@@ -283,11 +279,7 @@ impl WriteTool {
                     let expected = crate::fs::checked_file_metadata(&existing)?;
                     let mut current = Vec::with_capacity(metadata.len() as usize);
                     existing.read_to_end(&mut current)?;
-                    Ok::<_, std::io::Error>(Probe::Read {
-                        metadata,
-                        expected,
-                        current,
-                    })
+                    Ok::<_, std::io::Error>(Probe::Read(Box::new((metadata, expected, current))))
                 })
                 .await
                 .map_err(|_| ToolError::Msg("Write open job failed".to_string()))?
@@ -300,11 +292,8 @@ impl WriteTool {
                     ));
                 }
                 Ok(Probe::TooLarge) => return Err(overwrite_not_authorized(&expanded)),
-                Ok(Probe::Read {
-                    metadata,
-                    expected,
-                    current,
-                }) => {
+                Ok(Probe::Read(read)) => {
+                    let (metadata, expected, current) = *read;
                     let (crc, lines) = full_text_fingerprint(&current)?;
                     if !self
                         .read_tracker

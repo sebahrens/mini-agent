@@ -1282,7 +1282,7 @@ fn same_source(left: &Source, right: &Source) -> bool {
 }
 
 fn source_json(sources: &[Source]) -> Result<String, String> {
-    serde_json::to_string(&sources.iter().map(|source|serde_json::json!({"scope":source.scope,"origin":if source.project{"workspace"}else{"global"},"path":source.path,"instructions":source.text})).collect::<Vec<_>>()).map_err(|_|"Could not encode workspace instructions".into())
+    serde_json::to_string(&sources.iter().map(|source|serde_json::json!({"scope":source.scope,"origin":if source.project{"workspace"}else{"global"},"path":source.path,"instructions":&*source.text})).collect::<Vec<_>>()).map_err(|_|"Could not encode workspace instructions".into())
 }
 fn normal_relative(path: &Path) -> Result<PathBuf, String> {
     if path.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES {
