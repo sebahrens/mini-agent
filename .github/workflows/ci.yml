@@ -596,6 +596,12 @@ jobs:
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
 
+      - name: Show the toolchain in use
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
       - name: Test (${{ matrix.features }}) on Linux
         if: matrix.os != 'macos-latest'
         run: >-

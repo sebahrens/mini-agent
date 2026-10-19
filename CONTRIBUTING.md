@@ -56,6 +56,18 @@ cargo install --path . --debug # the development build/install command
 - Changes under `scripts/`, `.github/workflows/`, `packaging/` or the release documents are covered by
   `python3 -m unittest` suites in `scripts/tests/` and by `python3 scripts/check-package-metadata.py`.
 
+### Toolchain
+
+`rust-toolchain.toml` pins the compiler (currently `1.96.0`, with `rustfmt` and `clippy`) and CI
+honours it through rustup. **Homebrew's `cargo`/`rustc` ignore that file**, so a Homebrew install
+silently builds with whatever version Homebrew ships and Clippy/rustc differences then appear only
+in CI. Check what you are using with `cargo --version` and `rustc --version` (the CI `test` job
+prints both at the start of each row). To get the pinned toolchain, install
+[rustup](https://rustup.rs) and put `~/.cargo/bin` ahead of `/opt/homebrew/bin` in `PATH`; inside
+the repository `cargo --version` then reports the pinned channel (rustup installs it on first use).
+The pin stays for CI reproducibility. Compile-time measurements made on a different compiler are
+only indicative.
+
 Scope local test runs to changed modules and their affected callers. Several libtest filters can
 run together, for example `cargo test --bin mini-agent -- find_files retry --test-threads=1`.
 Choose feature rows that exercise changed cfg boundaries, and retain integration and native
