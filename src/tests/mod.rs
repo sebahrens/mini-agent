@@ -1,14 +1,57 @@
 #![allow(unsafe_code)]
 
 use std::ffi::OsString;
-use std::sync::{RwLock, RwLockWriteGuard, TryLockError};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Writers (`ScopedProcessEnv`) hold this exclusively for their whole scope;
-/// process-path readers take it shared only while snapshotting the environment
+/// process-path readers hold it shared only while snapshotting the environment
 /// (`with_shared_process_env`), so a reader never observes a mutator's
 /// temporary values.
-static PROCESS_ENV_LOCK: RwLock<()> = RwLock::new(());
+///
+/// Readers have priority over *queued* writers: a writer also waits while any
+/// reader is waiting, so back-to-back mutator tests cannot starve a reader
+/// (a polling `try_read` on a std `RwLock` did, stalling it for the full wait).
+struct EnvLockState {
+    writer_active: bool,
+    readers: usize,
+    waiting_readers: usize,
+}
+
+static PROCESS_ENV_LOCK: Mutex<EnvLockState> = Mutex::new(EnvLockState {
+    writer_active: false,
+    readers: 0,
+    waiting_readers: 0,
+});
+static PROCESS_ENV_CHANGED: Condvar = Condvar::new();
+
+fn env_state() -> std::sync::MutexGuard<'static, EnvLockState> {
+    PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct EnvWriteGuard;
+
+impl EnvWriteGuard {
+    fn acquire() -> Self {
+        let mut state = env_state();
+        while state.writer_active || state.readers > 0 || state.waiting_readers > 0 {
+            state = PROCESS_ENV_CHANGED
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.writer_active = true;
+        Self
+    }
+}
+
+impl Drop for EnvWriteGuard {
+    fn drop(&mut self) {
+        env_state().writer_active = false;
+        PROCESS_ENV_CHANGED.notify_all();
+    }
+}
 
 /// Longest a reader waits for a mutator scope to end before reading anyway.
 const SHARED_ENV_WAIT: Duration = Duration::from_secs(30);
@@ -71,19 +114,34 @@ pub(crate) fn with_shared_process_env<T>(read: impl FnOnce() -> T) -> T {
         return read();
     }
     let deadline = Instant::now() + SHARED_ENV_WAIT;
-    loop {
-        match PROCESS_ENV_LOCK.try_read() {
-            Ok(_guard) => return read(),
-            Err(TryLockError::Poisoned(poisoned)) => {
-                let _guard = poisoned.into_inner();
-                return read();
-            }
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(TryLockError::WouldBlock) => return read(),
+    let mut state = env_state();
+    state.waiting_readers += 1;
+    while state.writer_active {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // A mutator scope outlived the bound: read anyway.
+            state.waiting_readers -= 1;
+            drop(state);
+            PROCESS_ENV_CHANGED.notify_all();
+            return read();
+        }
+        state = PROCESS_ENV_CHANGED
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+    state.waiting_readers -= 1;
+    state.readers += 1;
+    drop(state);
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            env_state().readers -= 1;
+            PROCESS_ENV_CHANGED.notify_all();
         }
     }
+    let _release = Release;
+    read()
 }
 
 /// An exclusively owned scratch directory, removed even when a test panics.
@@ -135,14 +193,12 @@ fn owned_test_directory_cleans_up_after_panic() {
 
 pub(crate) struct ScopedProcessEnv {
     previous: Vec<(OsString, Option<OsString>)>,
-    _lock: RwLockWriteGuard<'static, ()>,
+    _lock: EnvWriteGuard,
 }
 
 impl ScopedProcessEnv {
     pub(crate) fn set(values: &[(&str, Option<OsString>)]) -> Self {
-        let lock = PROCESS_ENV_LOCK
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = EnvWriteGuard::acquire();
         ENV_ROLE.with(|cell| cell.set(Some(EnvRole::Writer)));
         let previous = values
             .iter()
