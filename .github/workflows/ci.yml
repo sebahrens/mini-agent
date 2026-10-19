@@ -20,6 +20,16 @@ on:
     tags:
       - 'v*'
   pull_request:
+  # Fast and slow checks are split. The heavy native Phase 6 gates
+  # (macos-worker-containment-gate, windows-worker-containment-gate,
+  # windows-general-sandbox-policy and their phase6-cross-platform-gate
+  # aggregate) run only for tag pushes, the weekly schedule and manual
+  # dispatch; they are skipped on branch pushes and pull requests. The native
+  # Linux gate (linux-sandbox-policy) is the only per-push coverage of
+  # Linux-only code and runs on every event. A tag run still requires every
+  # gate: scripts/ci_success.py accepts their `skipped` result only for
+  # branch-push and pull-request events, and release.yml requires the tag
+  # run's ci-success.
   # The weekly run is drift detection: nothing in the repository changed, so
   # it re-runs only what a hosted-runner image, toolchain or advisory update
   # can break on its own. That is dependency-policy (fresh advisories and
@@ -42,9 +52,15 @@ permissions:
 env:
   RUSTFLAGS: ''
 
+# A newer push to the same pull request or branch supersedes the older run, so
+# its remaining (macOS and Windows) minutes are not spent on a stale commit.
+# Tag pushes, scheduled drift runs and manual dispatches are never cancelled:
+# a tag run is the release's CI evidence. Scheduled and dispatched runs also
+# get their own group, because they share refs/heads/<default> with branch
+# pushes and would otherwise be cancelled by the next push.
 concurrency:
-  group: ci-${{ github.ref }}-${{ inputs.scope || 'full' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.ref }}-${{ inputs.scope || 'full' }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.event_name || 'push-or-pr' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) }}
 
 jobs:
   # Which jobs need to run for this event.
@@ -463,8 +479,24 @@ jobs:
       - name: Prepare guarded Git runtime
         uses: ./.github/actions/prepare-git-runtime
 
+      # The compiled-dependency cache is partitioned by OS, runner image
+      # (ImageOS, so Ubuntu 22 and 24 or macOS 14 and 15 artifacts never mix)
+      # and feature row. setup-rust-toolchain's built-in rust-cache adds the
+      # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
+      # not available to `with:` expressions, so a step derives the key.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.features }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Run Clippy (${{ matrix.features }})
         # Every supported row is strict, including tests. Deliberately retained
@@ -503,6 +535,28 @@ jobs:
           - "--no-default-features --features hooks,js,subagents,skills,sandbox"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
+        # macOS runs only the rows that reach platform code: the default build,
+        # sandbox (Seatbelt), the JS worker rows, and the hooks rows (process
+        # launch and termination). The remaining rows are platform-independent
+        # cfg/feature-graph checks that the Linux rows already prove, and a
+        # macOS minute costs ten Linux minutes. Linux keeps the full matrix.
+        exclude:
+          - os: macos-latest
+            features: "--no-default-features"
+          - os: macos-latest
+            features: "--no-default-features --features memory"
+          - os: macos-latest
+            features: "--no-default-features --features skills"
+          - os: macos-latest
+            features: "--no-default-features --features mcp"
+          - os: macos-latest
+            features: "--no-default-features --features acp"
+          - os: macos-latest
+            features: "--no-default-features --features goal"
+          - os: macos-latest
+            features: "--no-default-features --features js,skills"
+          - os: macos-latest
+            features: "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -523,8 +577,24 @@ jobs:
         shell: bash
         run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
+      # The compiled-dependency cache is partitioned by OS, runner image
+      # (ImageOS, so Ubuntu 22 and 24 or macOS 14 and 15 artifacts never mix)
+      # and feature row. setup-rust-toolchain's built-in rust-cache adds the
+      # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
+      # not available to `with:` expressions, so a step derives the key.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.features }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Test (${{ matrix.features }}) on Linux
         if: matrix.os != 'macos-latest'
@@ -596,8 +666,24 @@ jobs:
       - name: Prepare guarded Git runtime
         uses: ./.github/actions/prepare-git-runtime
 
+      # The compiled-dependency cache is partitioned by OS, runner image
+      # (ImageOS, so Ubuntu 22 and 24 or macOS 14 and 15 artifacts never mix)
+      # and feature row. setup-rust-toolchain's built-in rust-cache adds the
+      # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
+      # not available to `with:` expressions, so a step derives the key.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.features }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Run Clippy (--all-features)
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -643,8 +729,24 @@ jobs:
         if: matrix.os == 'macos-latest'
         shell: bash
         run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
+      # The compiled-dependency cache is partitioned by OS, runner image
+      # (ImageOS, so Ubuntu 22 and 24 or macOS 14 and 15 artifacts never mix)
+      # and feature row. setup-rust-toolchain's built-in rust-cache adds the
+      # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
+      # not available to `with:` expressions, so a step derives the key.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.features }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-key: ${{ steps.cache-key.outputs.key }}
       - name: Test the default suite with the standard parallel runner
         run: cargo test --locked
 
@@ -660,10 +762,25 @@ jobs:
         uses: ./.github/actions/prepare-git-runtime
         with:
           collect-sources: "true"
+      # The compiled-dependency cache is partitioned by OS, runner image
+      # (ImageOS, so Ubuntu 22 and 24 or macOS 14 and 15 artifacts never mix)
+      # and feature row. setup-rust-toolchain's built-in rust-cache adds the
+      # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
+      # not available to `with:` expressions, so a step derives the key.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.features }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           rustflags: ''
+          cache-key: ${{ steps.cache-key.outputs.key }}
       # Runtime policy is sharded into the Windows path, private-storage,
       # process-lifecycle, launcher, sandbox, and containment jobs below. The
       # full libtest also contains Unix-only integration fixtures, so this gate
@@ -855,10 +972,25 @@ jobs:
 
       - name: Prepare guarded Git runtime
         uses: ./.github/actions/prepare-git-runtime
+      # The compiled-dependency cache is partitioned by OS, runner image
+      # (ImageOS, so Ubuntu 22 and 24 or macOS 14 and 15 artifacts never mix)
+      # and feature row. setup-rust-toolchain's built-in rust-cache adds the
+      # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
+      # not available to `with:` expressions, so a step derives the key.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.features }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           rustflags: ''
+          cache-key: ${{ steps.cache-key.outputs.key }}
       # bash, not the default pwsh: PowerShell turns an unquoted
       # `hooks,advisor,...` into an array and passes each name separately.
       - name: Compile the Windows hooks feature suite (${{ matrix.features }})
@@ -1210,7 +1342,7 @@ jobs:
           if-no-files-found: error
 
   macos-worker-containment-gate:
-    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && (github.event_name != 'pull_request' && (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))
     needs: changes
     strategy:
       fail-fast: false
@@ -1228,6 +1360,8 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
+          # Containment evidence is clean-room: no restored build cache.
+          cache: false
           rustflags: ''
 
       - name: Reject a missing macOS production-binary containment matrix
@@ -1543,7 +1677,7 @@ jobs:
         run: python3 -m unittest scripts.tests.test_gym_macos -v
 
   windows-general-sandbox-policy:
-    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox') && (github.event_name != 'pull_request' && (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 90
@@ -1556,6 +1690,8 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
+          # Containment evidence is clean-room: no restored build cache.
+          cache: false
           rustflags: ''
 
       - name: Test AppContainer source and capability policy
@@ -1680,7 +1816,7 @@ jobs:
           }
 
   windows-worker-containment-gate:
-    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && (github.event_name != 'pull_request' && (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))
     needs: changes
     runs-on: windows-latest
     timeout-minutes: 90
@@ -1693,6 +1829,8 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
+          # Containment evidence is clean-room: no restored build cache.
+          cache: false
           rustflags: ''
 
       - name: Install the exact JS binary for Unicode-path containment cases
@@ -2398,7 +2536,7 @@ jobs:
           }
 
   phase6-cross-platform-gate:
-    if: always() && needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: always() && needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && (github.event_name != 'pull_request' && (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))
     needs:
       - changes
       - linux-sandbox-policy
@@ -2431,6 +2569,8 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
+          # Containment evidence is clean-room: no restored build cache.
+          cache: false
           rustflags: ''
 
       - name: Download all Phase 6 worker resource records
@@ -2840,8 +2980,24 @@ jobs:
         shell: bash
         run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
+      # The compiled-dependency cache is partitioned by OS, runner image
+      # (ImageOS, so Ubuntu 22 and 24 or macOS 14 and 15 artifacts never mix)
+      # and feature row. setup-rust-toolchain's built-in rust-cache adds the
+      # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
+      # not available to `with:` expressions, so a step derives the key.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.features }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Test MCP stdio lifecycle and ACP startup cancellation
         run: cargo test --locked --no-default-features --features mcp,acp mcp_stdio
@@ -2864,8 +3020,24 @@ jobs:
       - name: Prepare guarded Git runtime
         uses: ./.github/actions/prepare-git-runtime
 
+      # The compiled-dependency cache is partitioned by OS, runner image
+      # (ImageOS, so Ubuntu 22 and 24 or macOS 14 and 15 artifacts never mix)
+      # and feature row. setup-rust-toolchain's built-in rust-cache adds the
+      # job, rustc version and Cargo.lock hash. ImageOS is a runner variable,
+      # not available to `with:` expressions, so a step derives the key.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.features }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-key: ${{ steps.cache-key.outputs.key }}
 
       - name: Test Windows atomic publication and sharing contracts
         if: matrix.os == 'windows-latest'
@@ -3085,4 +3257,4 @@ jobs:
       - name: Require every gating job to succeed or be skipped by design
         env:
           CI_NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 scripts/ci_success.py --event "$GITHUB_EVENT_NAME"
+        run: python3 scripts/ci_success.py --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF"

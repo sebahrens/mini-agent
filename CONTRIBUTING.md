@@ -33,6 +33,23 @@ cargo install --path . --debug # the development build/install command
 - CI also runs `cargo clippy --locked --all-targets -- -D warnings` across a matrix of feature rows
   (see `.github/workflows/ci.yml`). Code must compile warning-free with default features and with
   `--no-default-features`; gate optional code behind its owning feature.
+- CI cost policy (enforced by `scripts/tests/test_phase6_ci_workflow.py`): the `test` job runs the
+  full feature matrix on Linux but only the platform rows on macOS (default, `sandbox`, `js`,
+  `js,sandbox` and the two `hooks` rows), because a macOS minute costs ten Linux minutes. The plain
+  compile jobs (`clippy`, `test`, `all-features`, `parallel-test-smoke`, `mcp-stdio`,
+  `lsp-lifecycle`, `windows-default-compile`, `windows-hooks-compile`) restore a compiled-dependency
+  cache keyed by OS, runner image (`ImageOS`), feature row, toolchain and `Cargo.lock`. The Phase 6
+  containment gates run with `cache: false` so their evidence is clean-room, and the native Linux
+  gate keeps its own `ubuntu-22.04`-partitioned cache.
+  A newer push to the same pull request or branch cancels the older CI run; tag pushes, the weekly
+  schedule and manual dispatches are never cancelled (they also use their own concurrency group).
+  The heavy Windows and macOS Phase 6 containment gates (`macos-worker-containment-gate`,
+  `windows-worker-containment-gate`, `windows-general-sandbox-policy`, `phase6-cross-platform-gate`)
+  run only on `v*` tag pushes, the weekly schedule and manual dispatch; `ci-success` treats them as
+  skipped-by-design on pull requests and branch pushes and requires them on tag runs. The native
+  Linux gate (`linux-sandbox-policy`) still runs on every push and pull request because Linux-only
+  code cannot be compiled on a Mac, while the macOS gates can be reproduced locally on one. Run
+  the full matrix by hand with `gh workflow run ci.yml` (scope `full`).
 - Dependency changes go only in the root `Cargo.toml` and `Cargo.lock`. Reuse existing dependencies
   instead of adding a second version, and keep optional or platform-specific dependencies behind
   their feature or target.

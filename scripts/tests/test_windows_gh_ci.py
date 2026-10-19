@@ -298,17 +298,19 @@ class WindowsGhCiTests(unittest.TestCase):
 
 
 
-def condition_value(expression: str, event: str, scope: str, code: str) -> bool:
+def condition_value(expression: str, event: str, scope: str, code: str, ref: str = "refs/heads/main") -> bool:
     """Evaluate only the workflow's closed job-selector expression vocabulary."""
     for operator in ("||", "&&"):
         terms = top_level_split(expression, operator)
         if len(terms) > 1:
-            values = [condition_value(term, event, scope, code) for term in terms]
+            values = [condition_value(term, event, scope, code, ref) for term in terms]
             return any(values) if operator == "||" else all(values)
     if expression.startswith("(") and expression.endswith(")"):
-        return condition_value(expression[1:-1], event, scope, code)
+        return condition_value(expression[1:-1], event, scope, code, ref)
     if expression == "always()":
         return True
+    if expression == "startsWith(github.ref, 'refs/tags/')":
+        return ref.startswith("refs/tags/")
     match = re.fullmatch(r"(github\.event_name|inputs\.scope|needs\.changes\.outputs\.code) (==|!=) '([^']*)'", expression)
     if match is None:
         raise AssertionError(f"unsupported selector expression: {expression!r}")
@@ -316,7 +318,7 @@ def condition_value(expression: str, event: str, scope: str, code: str) -> bool:
     return (actual == match[3]) if match[2] == "==" else (actual != match[3])
 
 
-def admitted_jobs(workflow: str, event: str, scope: str, code: str) -> set[str]:
+def admitted_jobs(workflow: str, event: str, scope: str, code: str, ref: str = "refs/heads/main") -> set[str]:
     admitted = set()
     for job in workflow_jobs(workflow):
         first = job_body(workflow, job).splitlines()[0].strip()
@@ -324,7 +326,7 @@ def admitted_jobs(workflow: str, event: str, scope: str, code: str) -> set[str]:
             if job != "changes":
                 raise AssertionError(f"unexpected unconditional job: {job}")
             admitted.add(job)
-        elif condition_value(first[len("if: "):], event, scope, code):
+        elif condition_value(first[len("if: "):], event, scope, code, ref):
             admitted.add(job)
     return admitted
 
@@ -349,9 +351,20 @@ def validate_scope(workflow: str) -> None:
     if any(f"          - {scope}\n" not in header for scope in ("windows-command-family", "windows-session-storage")) or "          SCOPE: ${{ inputs.scope }}\n" not in job_body(workflow, "changes"):
         raise AssertionError("dispatch choice and captured scope environment are required")
     all_jobs = set(workflow_jobs(workflow))
-    for event in ("push", "pull_request", "workflow_dispatch"):
-        if admitted_jobs(workflow, event, "full", "true") != all_jobs:
-            raise AssertionError(f"full code gate changed for {event}")
+    # The heavy Windows/macOS containment gates run only for tag pushes,
+    # schedule and dispatch; branch pushes and pull requests skip them.
+    heavy = {
+        "macos-worker-containment-gate", "windows-worker-containment-gate",
+        "windows-general-sandbox-policy", "phase6-cross-platform-gate",
+    }
+    for event, ref, expected in (
+        ("push", "refs/heads/main", all_jobs - heavy),
+        ("pull_request", "refs/pull/1/merge", all_jobs - heavy),
+        ("push", "refs/tags/v1.0.0", all_jobs),
+        ("workflow_dispatch", "refs/heads/main", all_jobs),
+    ):
+        if admitted_jobs(workflow, event, "full", "true", ref) != expected:
+            raise AssertionError(f"full code gate changed for {event} {ref}")
     for scope in ("windows-command-family", "windows-session-storage", "windows-general-sandbox", "unknown", ""):
         if "ci-success" in admitted_jobs(workflow, "workflow_dispatch", scope, "true"):
             raise AssertionError("partial or unknown manual scope must not publish ci-success")

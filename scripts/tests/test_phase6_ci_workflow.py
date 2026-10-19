@@ -141,6 +141,43 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertEqual(cache_key.group(1), runner)
         self.assertNotIn("cache-shared-key:", rust)
 
+    CACHED_COMPILE_JOBS = (
+        "clippy", "test", "all-features", "parallel-test-smoke",
+        "windows-default-compile", "windows-hooks-compile", "mcp-stdio", "lsp-lifecycle",
+    )
+    CLEAN_ROOM_CONTAINMENT_JOBS = (
+        "macos-worker-containment-gate", "windows-worker-containment-gate",
+        "windows-general-sandbox-policy", "phase6-cross-platform-gate",
+    )
+
+    def test_compile_jobs_cache_dependencies_partitioned_by_image_and_row(self) -> None:
+        for name in self.CACHED_COMPILE_JOBS:
+            with self.subTest(job=name):
+                body = job_body(self.workflow, name)
+                derive = body.split("- name: Derive the compiled-dependency cache key\n", 1)[1]
+                derive = derive.split("\n      - name:", 1)[0]
+                self.assertIn("id: cache-key", derive)
+                # OS, runner image (ImageOS) and the feature row are all in the key.
+                self.assertIn("${RUNNER_OS}-${ImageOS:-unknown}-", derive)
+                self.assertIn("CACHE_ROW: ${{ matrix.features }}", derive)
+                self.assertLess(
+                    body.index("Derive the compiled-dependency cache key"),
+                    body.index("- name: Install Rust"),
+                )
+                rust = body.split("- name: Install Rust\n", 1)[1].split("\n      - name:", 1)[0]
+                self.assertIn("cache-key: ${{ steps.cache-key.outputs.key }}", rust)
+                self.assertNotIn("cache-shared-key:", rust)
+                self.assertNotRegex(rust, r"(?m)^          cache: false")
+
+    def test_containment_gates_stay_uncached_for_clean_room_evidence(self) -> None:
+        for name in self.CLEAN_ROOM_CONTAINMENT_JOBS:
+            with self.subTest(job=name):
+                body = job_body(self.workflow, name)
+                rust = body.split("- name: Install Rust\n", 1)[1].split("\n      - name:", 1)[0]
+                self.assertRegex(rust, r"(?m)^          cache: false$")
+                self.assertNotIn("cache-key:", rust)
+                self.assertNotIn("actions/cache@", body)
+
     def test_native_workspace_names_match_the_actual_defining_sources(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
         step = linux.split("- name: Test native Linux workspace real paths and snapshot authority", 1)[1].split("- name:", 1)[0]
@@ -590,6 +627,89 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     adversarial,
                     r"(?s)(?:for|foreach).+skills.+cargo test",
                 )
+
+    def test_superseded_branch_and_pr_runs_are_cancelled_but_never_tag_runs(self) -> None:
+        block = self.workflow.split("\nconcurrency:\n", 1)[1].split("\njobs:", 1)[0]
+        group = re.search(r"(?m)^  group: (.+)$", block).group(1)
+        cancel = re.search(r"(?m)^  cancel-in-progress: (.+)$", block).group(1)
+        self.assertIn("github.ref", group)
+        self.assertIn("inputs.scope", group)
+        # Scheduled and dispatched runs must not share a group with push runs.
+        self.assertIn("github.event_name == 'schedule'", group)
+        self.assertIn("github.event_name == 'workflow_dispatch'", group)
+        self.assertIn("github.event_name == 'pull_request'", cancel)
+        self.assertIn("github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')", cancel)
+        self.assertNotIn("schedule", cancel)
+        self.assertNotIn("workflow_dispatch", cancel)
+
+    HEAVY_TERM = (
+        "(github.event_name != 'pull_request' && "
+        "(github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')))"
+    )
+    HEAVY_GATES = (
+        "macos-worker-containment-gate", "windows-worker-containment-gate",
+        "windows-general-sandbox-policy", "phase6-cross-platform-gate",
+    )
+
+    def test_heavy_native_gates_run_only_on_tags_schedule_and_dispatch(self) -> None:
+        for job in self.HEAVY_GATES:
+            with self.subTest(job=job):
+                condition = job_body(self.workflow, job).splitlines()[0].strip()
+                self.assertIn(self.HEAVY_TERM, top_level_split(condition[len("if: "):], "&&"))
+        # Everything else, including the native Linux containment gate, keeps
+        # running on every push and pull request.
+        for job in workflow_jobs(self.workflow):
+            if job in self.HEAVY_GATES:
+                continue
+            with self.subTest(light=job):
+                condition = job_body(self.workflow, job).splitlines()[0].strip()
+                self.assertNotIn("startsWith(github.ref", condition)
+        self.assertNotIn(
+            "pull_request", job_body(self.workflow, "linux-sandbox-policy").splitlines()[0]
+        )
+
+    def test_heavy_condition_semantics(self) -> None:
+        def runs(event: str, ref: str) -> bool:
+            return event != "pull_request" and (event != "push" or ref.startswith("refs/tags/"))
+
+        self.assertFalse(runs("pull_request", "refs/pull/1/merge"))
+        self.assertFalse(runs("push", "refs/heads/main"))
+        self.assertTrue(runs("push", "refs/tags/v1.2.3"))
+        self.assertTrue(runs("schedule", "refs/heads/main"))
+        self.assertTrue(runs("workflow_dispatch", "refs/heads/main"))
+
+    def test_ci_success_passes_ref_so_tag_runs_require_the_heavy_gates(self) -> None:
+        body = job_body(self.workflow, "ci-success")
+        self.assertIn('--event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF"', body)
+        # The aggregate depends on every heavy gate, so tag runs cannot skip one.
+        for job in self.HEAVY_GATES:
+            self.assertIn(f"      - {job}\n", body)
+
+    def test_macos_runs_only_platform_feature_rows(self) -> None:
+        header = job_body(self.workflow, "test").split("    steps:\n", 1)[0]
+        self.assertIn("os: [ubuntu-latest, macos-latest]", header)
+        exclude = header.split("        exclude:\n", 1)[1].split("    runs-on:", 1)[0]
+        pairs = re.findall(
+            r'- os: (\S+)\n\s+features: "([^"]*)"', exclude
+        )
+        self.assertTrue(pairs)
+        # Linux keeps the full matrix: nothing may be excluded for it.
+        self.assertEqual({os_name for os_name, _ in pairs}, {"macos-latest"})
+        all_rows = set(self.matrix_features(job_body(self.workflow, "test")))
+        excluded = {features for _, features in pairs}
+        self.assertLess(excluded, all_rows)
+        remaining = all_rows - excluded
+        self.assertEqual(
+            remaining,
+            {
+                "",
+                "--no-default-features --features sandbox",
+                "--no-default-features --features js",
+                "--no-default-features --features js,sandbox",
+                "--no-default-features --features hooks,advisor,lsp,multimodal,pdf",
+                "--no-default-features --features hooks,js,subagents,skills,sandbox",
+            },
+        )
 
     def test_matrix_isolates_process_global_worker_and_skill_tests(self) -> None:
         body = job_body(self.workflow, "test")
@@ -1168,6 +1288,48 @@ class CiSuccessPolicyTests(unittest.TestCase):
         for event in ("push", "pull_request", "workflow_dispatch"):
             with self.subTest(event=event):
                 self.assertEqual([], self.evaluate(self.needs("true"), event))
+
+    HEAVY = (
+        "macos-worker-containment-gate", "windows-worker-containment-gate",
+        "windows-general-sandbox-policy", "phase6-cross-platform-gate",
+    )
+
+    def heavy_needs(self, result: str, **overrides: str) -> dict[str, object]:
+        needs = self.needs("true")
+        for job in self.HEAVY:
+            needs[job] = {"result": overrides.get(job, result), "outputs": {}}
+        return needs
+
+    def test_heavy_gates_may_be_skipped_on_pull_requests_and_branch_pushes(self) -> None:
+        needs = self.heavy_needs("skipped")
+        self.assertEqual([], self.evaluate(needs, "pull_request"))
+        self.assertEqual([], self.evaluate_ref(needs, "push", "refs/heads/main"))
+        # A failed or cancelled heavy gate still fails a fast event.
+        failed = self.heavy_needs("skipped", **{"windows-worker-containment-gate": "failure"})
+        self.assertEqual(
+            ["windows-worker-containment-gate finished with 'failure'"],
+            self.evaluate_ref(failed, "push", "refs/heads/main"),
+        )
+
+    def test_heavy_gates_are_required_on_tag_pushes_and_dispatch(self) -> None:
+        self.assertEqual([], self.evaluate_ref(self.heavy_needs("success"), "push", "refs/tags/v1.0.0"))
+        for event, ref in (("push", "refs/tags/v1.0.0"), ("workflow_dispatch", "refs/heads/main")):
+            with self.subTest(event=event):
+                errors = self.evaluate_ref(self.heavy_needs("skipped"), event, ref)
+                self.assertEqual(
+                    sorted(f"{job} finished with 'skipped'" for job in self.HEAVY), errors
+                )
+
+    def test_other_jobs_are_still_required_on_fast_events(self) -> None:
+        needs = self.heavy_needs("skipped")
+        needs["macos-gym-ownership"] = {"result": "skipped", "outputs": {}}
+        errors = self.evaluate_ref(needs, "pull_request", "refs/pull/1/merge")
+        self.assertEqual(["macos-gym-ownership finished with 'skipped'"], errors)
+
+    def evaluate_ref(self, needs: dict[str, object], event: str, ref: str) -> list[str]:
+        from scripts import ci_success
+
+        return ci_success.evaluate(needs, event, ref)
 
     def test_documentation_only_change_accepts_skipped_matrix(self) -> None:
         self.assertEqual([], self.evaluate(self.needs("false")))

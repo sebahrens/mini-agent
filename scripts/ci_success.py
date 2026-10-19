@@ -10,6 +10,11 @@ job by design:
   build, lint and test job and the Corresponding Source assembly, and only
   `changes` and `fmt` must still succeed.
 
+The heavy native Phase 6 gates (HEAVY_GATES) run only for tag pushes, manual
+dispatch and the weekly schedule, so on pull requests and branch pushes their
+`skipped` result is accepted by design; on a tag push or dispatch they must
+succeed like every other job, which keeps the release's CI evidence complete.
+
 Whenever `changes` reported `code=true` every other gating job must succeed on
 every event, including `harness-regression` on a push (it used to run on pull
 requests only, which left it unexercised because work lands directly on main).
@@ -28,7 +33,25 @@ from typing import Any
 ALWAYS_REQUIRED = ("changes", "fmt")
 
 
-def evaluate(needs: dict[str, Any], event: str) -> list[str]:
+# Slow Windows/macOS containment gates (and the aggregate that needs them),
+# skipped by design outside tag pushes, workflow_dispatch and the schedule.
+HEAVY_GATES = (
+    "macos-worker-containment-gate",
+    "windows-worker-containment-gate",
+    "windows-general-sandbox-policy",
+    "phase6-cross-platform-gate",
+)
+
+
+def heavy_gates_skipped_by_design(event: str, ref: str) -> bool:
+    """True for the fast events: pull requests and pushes to branches."""
+
+    if event == "pull_request":
+        return True
+    return event == "push" and not ref.startswith("refs/tags/")
+
+
+def evaluate(needs: dict[str, Any], event: str, ref: str = "") -> list[str]:
     """Return one error per job whose result does not satisfy the gate."""
 
     errors: list[str] = []
@@ -45,6 +68,7 @@ def evaluate(needs: dict[str, Any], event: str) -> list[str]:
     if changes.get("result") == "success" and code not in ("true", "false"):
         errors.append(f"changes reported an invalid code output {code!r}")
     full_matrix = code != "false"
+    fast_event = heavy_gates_skipped_by_design(event, ref)
 
     for job in sorted(needs):
         entry = needs[job]
@@ -52,6 +76,8 @@ def evaluate(needs: dict[str, Any], event: str) -> list[str]:
         if result == "success":
             continue
         if result == "skipped" and job not in ALWAYS_REQUIRED and not full_matrix:
+            continue
+        if result == "skipped" and job in HEAVY_GATES and fast_event:
             continue
         errors.append(f"{job} finished with {result!r}")
     return errors
@@ -64,6 +90,11 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("GITHUB_EVENT_NAME", ""),
         help="the triggering GitHub event name",
     )
+    parser.add_argument(
+        "--ref",
+        default=os.environ.get("GITHUB_REF", ""),
+        help="the triggering git ref (refs/tags/... for a tag push)",
+    )
     args = parser.parse_args(argv)
     raw = os.environ.get("CI_NEEDS_JSON")
     if not raw:
@@ -75,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"CI_NEEDS_JSON is not valid JSON: {error}", file=sys.stderr)
         return 2
 
-    errors = evaluate(needs, args.event)
+    errors = evaluate(needs, args.event, args.ref)
     for job in sorted(needs):
         entry = needs[job] if isinstance(needs[job], dict) else {}
         print(f"{job}: {entry.get('result')}")
