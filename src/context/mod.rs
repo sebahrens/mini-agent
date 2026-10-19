@@ -28,7 +28,17 @@ pub(crate) fn load_embedded_files(embedded: &Dir, ext: &str) -> Vec<(String, Str
     results
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Count of `prompts` directory reads on this thread (test seam).
+    pub(crate) static PROMPT_DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn load_dir_files(dir: &Path, ext: &str) -> Vec<(String, String)> {
+    #[cfg(test)]
+    if dir.file_name().is_some_and(|name| name == "prompts") {
+        PROMPT_DIR_READS.with(|reads| reads.set(reads.get() + 1));
+    }
     let mut results = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -454,12 +464,58 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
     load_for_workspace_with(no_context_files, workspace_root, true)
 }
 
-/// [`load`] without reading persistent memory: the caller reads it once
-/// after it knows which compaction summary to exclude.
-#[cfg(feature = "memory")]
-pub fn load_deferring_memory(no_context_files: bool) -> ContextFiles {
-    let workspace_root = std::env::current_dir().ok();
-    load_for_workspace_with(no_context_files, workspace_root.as_deref(), false)
+/// Startup load against an already captured workspace binding: the context
+/// walk, prompt directories and agent definitions are each read once (no
+/// cwd-based load followed by a binding-based reload).
+pub(crate) fn load_for_binding(
+    no_context_files: bool,
+    workspace: &crate::paths::WorkspaceBinding,
+    read_memory: bool,
+) -> ContextFiles {
+    #[cfg(not(feature = "memory"))]
+    let _ = read_memory;
+    if let Err(e) = prompts::ensure_global() {
+        tracing::warn!("failed to install default prompts: {e}");
+    }
+    if let Err(e) = themes::ensure_global() {
+        tracing::warn!("failed to install default themes: {e}");
+    }
+    let (agents, arch_candidate, instruction_roots) = if no_context_files {
+        (None, None, Vec::new())
+    } else {
+        walk_bound_context_files(workspace)
+    };
+    #[cfg(feature = "archmd")]
+    let architecture = arch_candidate;
+    #[cfg(not(feature = "archmd"))]
+    let _ = arch_candidate;
+    #[cfg(feature = "memory")]
+    let memory = read_memory
+        .then(|| crate::extras::memory::Mem::open().context_block())
+        .flatten();
+    ContextFiles {
+        #[cfg(feature = "mcp")]
+        mcp_discovery: Default::default(),
+        workspace_root: workspace.root().to_path_buf(),
+        agents,
+        instruction_roots,
+        prompts: prompts::load_for_workspace_binding(workspace),
+        current_prompt: None,
+        current_prompt_name: None,
+        agent_definitions: agents::load_for_workspace_binding(workspace),
+        current_agent_name: None,
+        current_agent_explicit: false,
+        themes: themes::load(),
+        current_theme_name: crate::session::storage::load_theme_name(),
+        extra_files: Vec::new(),
+        extra_file_contents: HashMap::new(),
+        one_shot_restore: None,
+        chain_declined: Vec::new(),
+        #[cfg(feature = "memory")]
+        memory,
+        #[cfg(feature = "archmd")]
+        architecture,
+    }
 }
 
 fn load_for_workspace_with(
@@ -859,5 +915,58 @@ mod file_read_diagnostic_tests {
             "{log}"
         );
         assert!(!log.contains("TARGET_MUST_NOT_BE_READ"));
+    }
+}
+
+#[cfg(test)]
+mod startup_binding_load_tests {
+    use super::*;
+
+    #[test]
+    fn binding_load_reads_prompt_directory_once_and_matches_rebind() {
+        let root = crate::tests::OwnedTestDirectory::new("startup-binding-load");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let environment = [
+            "ZS_CONFIG_DIR",
+            "ZS_DATA_DIR",
+            "ZS_LOCAL_DATA_DIR",
+            "ZS_STATE_DIR",
+            "ZS_CACHE_DIR",
+            "ZS_CREDENTIALS_DIR",
+        ]
+        .map(|name| (name, Some(root.path().join(name).into_os_string())));
+        let _environment = crate::tests::ScopedProcessEnv::set(&environment);
+        let process = crate::paths::process_paths().unwrap();
+        crate::paths::prepare_storage_roots(&process).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap();
+
+        PROMPT_DIR_READS.with(|reads| reads.set(0));
+        let direct = load_for_binding(true, &workspace, false);
+        assert_eq!(PROMPT_DIR_READS.with(|reads| reads.get()), 1);
+
+        let rebound =
+            load_for_workspace(true, Some(&workspace_root)).for_workspace_binding(true, &workspace);
+        assert_eq!(
+            direct
+                .prompts
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            rebound
+                .prompts
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(direct.workspace_root, rebound.workspace_root);
+        assert_eq!(
+            direct
+                .agent_definitions
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            rebound
+                .agent_definitions
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
     }
 }

@@ -1068,11 +1068,9 @@ impl Startup {
         // Persistent memory is read once below, after the session is known,
         // so a resumed session's compaction exclusion is applied in one pass.
         #[cfg(feature = "memory")]
-        let mut context = context::load_deferring_memory(no_context_files)
-            .for_workspace_binding(no_context_files, &workspace);
+        let mut context = context::load_for_binding(no_context_files, &workspace, false);
         #[cfg(not(feature = "memory"))]
-        let context =
-            context::load(no_context_files).for_workspace_binding(no_context_files, &workspace);
+        let context = context::load_for_binding(no_context_files, &workspace, true);
         // Guarded Git global capture overlapped the read-only loading above;
         // it must be complete before any hook, MCP or project effect below.
         crate::git::global_snapshot::wait_initialized().await;
@@ -1648,11 +1646,11 @@ impl Startup {
             }
 
             if regenerated {
-                self.context = context::load(self.cli.resolve_no_context_files(&self.cfg))
-                    .for_workspace_binding(
-                        self.cli.resolve_no_context_files(&self.cfg),
-                        &self.workspace,
-                    );
+                self.context = context::load_for_binding(
+                    self.cli.resolve_no_context_files(&self.cfg),
+                    &self.workspace,
+                    true,
+                );
             }
         }
 
