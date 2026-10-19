@@ -327,7 +327,17 @@ cargo install --path . --locked
 ```
 
 Source builds also need Python 3 and the native C, curl and zlib development
-toolchain for the embedded Git runtime. Windows and cross-target builds supply an
+toolchain for the embedded Git runtime:
+
+| Platform | Packages |
+|---|---|
+| Debian/Ubuntu | `apt install build-essential libcurl4-openssl-dev zlib1g-dev python3` |
+| Fedora/RHEL | `dnf install gcc make patch libcurl-devel zlib-devel python3` |
+| macOS | `xcode-select --install` (system curl and zlib) |
+
+Prebuilt release archives already contain the Git runtime payload and need none of these.
+
+Windows and cross-target builds supply an
 explicit prepared payload. See [Git runtime build prerequisites](docs/development/git-runtime-bootstrap.md)
 and [static Linux builds](docs/development/git-runtime-musl.md). Prebuilt release
 archives already include this payload.

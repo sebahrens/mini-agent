@@ -256,6 +256,14 @@ def validate_bundle(bundle: Path, target: str) -> None:
         raise ValueError("Unexpected file in cached Git bundle")
 
 
+PACKAGE_HINT = {
+    "cc": "Install a C toolchain: Debian/Ubuntu `apt install build-essential`, Fedora/RHEL `dnf install gcc make`, macOS `xcode-select --install`.",
+    "curl-config": "Install the curl development package: Debian/Ubuntu `apt install libcurl4-openssl-dev`, Fedora/RHEL `dnf install libcurl-devel`, macOS ships curl-config with the Xcode command line tools.",
+    "pkg-config": "Install pkg-config: Debian/Ubuntu `apt install pkg-config`, Fedora/RHEL `dnf install pkgconf-pkg-config`.",
+}
+PACKAGE_HINT_TAIL = " Full list: build-essential libcurl4-openssl-dev zlib1g-dev python3 (see docs/development/git-runtime-bootstrap.md), or set MINI_AGENT_GIT_RUNTIME_BUNDLE."
+
+
 def toolchain_identity(env: dict[str, str], target: str, inputs: list[Path] | None = None) -> str:
     # A source-only cache key could silently reuse an OpenSSL build after the
     # publisher selected Mbed TLS. Bind the actual compiler and curl backend.
@@ -267,7 +275,7 @@ def toolchain_identity(env: dict[str, str], target: str, inputs: list[Path] | No
     for program in ["cc", "curl-config"] + (["pkg-config"] if "musl" in target else []):
         executable = shutil.which(program, path=env.get("PATH"))
         if executable is None:
-            raise ValueError(f"Git build toolchain program is unavailable: {program}")
+            raise ValueError(f"Git build toolchain program is unavailable: {program}. {PACKAGE_HINT.get(program, '')}{PACKAGE_HINT_TAIL}")
         path = Path(executable).absolute()
         resolved = path.resolve(strict=True)
         identity.update(hashlib.sha256(read_regular(resolved, 256 * 1024 * 1024)).digest())

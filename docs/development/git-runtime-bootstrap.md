@@ -43,6 +43,11 @@ system dylibs. GNU/Linux uses the native host glibc/curl/zlib toolchain and its
 system library prerequisites; this does not assert compatibility with every
 older glibc distribution or provide a static-musl payload.
 
+Packages: Debian/Ubuntu `apt install build-essential libcurl4-openssl-dev zlib1g-dev python3`
+(`curl-config` comes from `libcurl4-openssl-dev`); Fedora/RHEL
+`dnf install gcc make patch libcurl-devel zlib-devel python3`; macOS
+`xcode-select --install`. Musl targets additionally need `pkg-config`.
+
 The resulting files are passed to `prepare-git-runtime.py`: three independent
 executables (`git`, `git-remote-http`, `git-remote-https`) and the bounded
 `bundle.manifest`. The Rust embedding validator captures and validates the bundle
