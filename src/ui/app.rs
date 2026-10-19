@@ -150,6 +150,7 @@ pub(super) mod test_support {
             run: AgentRunState::default(),
             chain: ChainState::default(),
             slash: SlashState {
+                custom_commands: Default::default(),
                 show_reasoning: false,
                 reasoning_enabled: false,
                 todo_tools_enabled: false,
@@ -187,7 +188,6 @@ pub(super) mod test_support {
             user_rx,
             tui_log_rx: None,
             deferred_user_events: Default::default(),
-            custom_command_cache: Default::default(),
             #[cfg(feature = "subagents")]
             background_requests: Default::default(),
             running: Arc::new(AtomicBool::new(false)),
@@ -1337,7 +1337,6 @@ pub(crate) struct App<'a> {
     deferred_user_events: std::collections::VecDeque<UserEvent>,
     /// Custom slash templates for completion, re-read only when a template
     /// layer directory changed.
-    custom_command_cache: crate::context::commands::CommandCache,
     #[cfg(feature = "subagents")]
     background_requests: std::collections::VecDeque<crate::permission::ask::UserRequest>,
     running: Arc<AtomicBool>,
@@ -1787,6 +1786,7 @@ impl<'a> App<'a> {
         };
         let chain = ChainState::default();
         let slash = SlashState {
+            custom_commands: Default::default(),
             show_reasoning: ui.cfg.resolve_show_reasoning(),
             reasoning_enabled: true,
             todo_tools_enabled: false,
@@ -2215,7 +2215,6 @@ impl<'a> App<'a> {
             user_rx,
             tui_log_rx: crate::logging::take_tui_diagnostics(),
             deferred_user_events: std::collections::VecDeque::new(),
-            custom_command_cache: Default::default(),
             #[cfg(feature = "subagents")]
             background_requests: Default::default(),
             running,
@@ -6523,7 +6522,7 @@ impl<'a> App<'a> {
 
     fn refresh_custom_commands(&mut self) {
         let commands = crate::context::commands::load_cached(
-            &mut self.custom_command_cache,
+            &mut self.slash.custom_commands,
             &self.ui.workspace,
         )
         .into_iter()

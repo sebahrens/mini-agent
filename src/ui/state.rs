@@ -670,6 +670,8 @@ pub(crate) struct ChainState {
 
 /// User-facing feature toggles owned by slash commands.
 pub(crate) struct SlashState {
+    /// Stamped custom-command templates shared by completion and dispatch.
+    pub custom_commands: crate::context::commands::CommandCache,
     pub show_reasoning: bool,
     pub reasoning_enabled: bool,
     pub todo_tools_enabled: bool,
@@ -807,6 +809,7 @@ mod retirement_tests {
                 );
                 let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
                 let slash = super::SlashState {
+                    custom_commands: Default::default(),
                     show_reasoning: false,
                     reasoning_enabled: false,
                     todo_tools_enabled: false,

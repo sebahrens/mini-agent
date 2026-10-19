@@ -68,6 +68,7 @@ pub struct SlashCtx<'a> {
     pub cfg: &'a Config,
     pub context: &'a mut ContextFiles,
     pub workspace: &'a std::sync::Arc<crate::paths::WorkspaceBinding>,
+    pub custom_commands: &'a mut crate::context::commands::CommandCache,
     pub show_reasoning: &'a mut bool,
     pub reasoning_enabled: &'a mut bool,
     pub is_running: &'a mut bool,
@@ -904,6 +905,7 @@ pub(crate) async fn handle_slash(
         cfg: ui.cfg,
         context: ui.context,
         workspace: &ui.workspace,
+        custom_commands: &mut slash.custom_commands,
         show_reasoning: &mut slash.show_reasoning,
         reasoning_enabled: &mut slash.reasoning_enabled,
         is_running: &mut run.is_running,
@@ -1045,7 +1047,8 @@ pub(crate) async fn handle_slash(
         _ => {
             if let Some(name) = parts[0].strip_prefix('/')
                 && let Some(template) =
-                    crate::context::commands::load_for_workspace(ctx.workspace).remove(name)
+                    crate::context::commands::load_cached(ctx.custom_commands, ctx.workspace)
+                        .and_then(|commands| commands.get(name).cloned())
             {
                 let arguments = text
                     .trim_start()

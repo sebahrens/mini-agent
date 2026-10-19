@@ -1361,6 +1361,7 @@ mod model_pricing_tests {
             cfg: &cfg,
             context: &mut context,
             workspace: &workspace,
+            custom_commands: &mut Default::default(),
             show_reasoning: &mut show_reasoning,
             reasoning_enabled: &mut reasoning_enabled,
             is_running: &mut is_running,
