@@ -950,13 +950,12 @@ fn refresh_snapshot_embeddings(
                         skill_id: artifact.id.clone(),
                         reason: "active row disappeared during rebuild".to_string(),
                     })?;
-            let embedding = fresh
-                .remove(&artifact.id)
-                .or(stored)
-                .ok_or_else(|| StoreError::MalformedEmbedding {
+            let embedding = fresh.remove(&artifact.id).or(stored).ok_or_else(|| {
+                StoreError::MalformedEmbedding {
                     skill_id: artifact.id.clone(),
                     reason: "compatible vector is missing after rebuild".to_string(),
-                })?;
+                }
+            })?;
             if !embedding_is_compatible(&embedding, model) {
                 return Err(StoreError::MalformedEmbedding {
                     skill_id: artifact.id,

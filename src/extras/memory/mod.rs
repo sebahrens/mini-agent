@@ -28,6 +28,47 @@ fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     crate::fs::atomic_write_sync(path, content.as_bytes())
 }
 
+/// Read a memory file as text, tolerating a torn final record: when the file
+/// ends in an incomplete UTF-8 sequence (an append interrupted mid-character)
+/// that partial sequence is ignored. Any other invalid UTF-8 is still an error,
+/// exactly like `fs::read_to_string`.
+fn read_text(path: &Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(error) if error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            Ok(String::from_utf8(bytes).expect("prefix up to valid_up_to is valid UTF-8"))
+        }
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn read_text_for_tests(path: &Path) -> std::io::Result<String> {
+    read_text(path)
+}
+
+/// Append one newline-terminated record with a single fsync (no rewrite).
+/// Returns `false` when the platform has no append primitive, so the caller
+/// keeps its read-modify-write fallback.
+fn append_record(path: &Path, content: &str) -> std::io::Result<bool> {
+    let mut record = content.to_string();
+    if !record.ends_with('\n') {
+        record.push('\n');
+    }
+    match crate::fs::private_append_sync(path, record.as_bytes(), true) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Take a single-version backup of `path` before a content-destroying mutation,
 /// so it stays recoverable. Copies the current file to a sibling `.bak` path
 /// (`MEMORY.md` -> `MEMORY.bak`), OVERWRITING any prior `.bak` (one version, not
@@ -417,7 +458,7 @@ impl Mem {
             if !Self::is_daily_log_stem(date) {
                 continue;
             }
-            let Ok(content) = fs::read_to_string(&path) else {
+            let Ok(content) = read_text(&path) else {
                 continue;
             };
             if content.trim().is_empty() {
@@ -500,7 +541,7 @@ impl Mem {
     /// Read a memory file for the model, capping the output so a long file can't
     /// flood the conversation context. Missing/empty reads as "(empty)".
     fn read_capped(p: &Path) -> String {
-        match fs::read_to_string(p) {
+        match read_text(p) {
             Ok(s) if s.is_empty() => "(empty)".to_string(),
             Ok(s) => truncate_cjk(&s, MAX_INJECT_BYTES, "\n…[memory truncated]"),
             Err(_) => "(empty)".to_string(),
@@ -510,7 +551,7 @@ impl Mem {
     /// Like `read_capped`, but an oversized append-only daily log keeps its
     /// newest entries (the tail) instead of its oldest.
     pub(crate) fn read_capped_tail(p: &Path) -> String {
-        match fs::read_to_string(p) {
+        match read_text(p) {
             Ok(s) if s.is_empty() => "(empty)".to_string(),
             Ok(s) => truncate_keep_tail(
                 &s,
@@ -635,7 +676,7 @@ impl Mem {
                 {
                     let existing = fact_existing
                         .clone()
-                        .unwrap_or_else(|| fs::read_to_string(&path).unwrap_or_default());
+                        .unwrap_or_else(|| read_text(&path).unwrap_or_default());
                     let mut seen: HashSet<String> = existing
                         .lines()
                         .map(normalize_line)
@@ -669,12 +710,19 @@ impl Mem {
                         }
                     }
                 }
-                if nothing_written.is_none() {
-                    // Memory files are small; read-modify-write is simpler and clearer
-                    // than seeking to the end to inspect the last byte.
+                // Plain daily/scratchpad/note appends need no dedup read, so
+                // they append in place with one fsync; long-term and fact
+                // appends keep the read-modify-write below.
+                let appended_in_place = nothing_written.is_none()
+                    && matches!(mode, WriteMode::Append)
+                    && !matches!(target, WriteTarget::LongTerm)
+                    && append_record(&path, &append_content)?;
+                if appended_in_place {
+                    appended_len = append_content.len();
+                } else if nothing_written.is_none() {
                     let mut prev = fact_existing
                         .clone()
-                        .unwrap_or_else(|| fs::read_to_string(&path).unwrap_or_default());
+                        .unwrap_or_else(|| read_text(&path).unwrap_or_default());
                     if !prev.is_empty() && !prev.ends_with('\n') {
                         prev.push('\n');
                     }
@@ -778,7 +826,7 @@ impl Mem {
         };
         match old_str {
             Some(old) => {
-                let current = fs::read_to_string(&path)?;
+                let current = read_text(&path)?;
                 let count = current.match_indices(old).count();
                 if count != 1 {
                     return Err(std::io::Error::new(
@@ -976,7 +1024,7 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
         }
 
         let mut scratch = String::new();
-        if let Ok(s) = fs::read_to_string(self.scratchpad()) {
+        if let Ok(s) = read_text(&self.scratchpad()) {
             scratch = s
                 .lines()
                 .filter(|l| {
@@ -1205,7 +1253,7 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
                     None
                 };
 
-                let content = fs::read_to_string(&path).unwrap_or_default();
+                let content = read_text(&path).unwrap_or_default();
                 let lines: Vec<&str> = content.lines().collect();
 
                 // Which distinct terms matched in this file, and every matched line.

@@ -392,10 +392,7 @@ fn client_retired_error() -> ToolError {
 }
 
 /// Await `future`, recording in `suspended` whether it ever returned pending.
-async fn track_suspension<F: std::future::Future>(
-    suspended: &AtomicBool,
-    future: F,
-) -> F::Output {
+async fn track_suspension<F: std::future::Future>(suspended: &AtomicBool, future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     std::future::poll_fn(|cx| {
         let polled = future.as_mut().poll(cx);
@@ -528,7 +525,10 @@ mod tests {
         let mut ready = std::pin::pin!(track_suspension(&flag, async { 7 }));
         let mut cx = Context::from_waker(Waker::noop());
         assert_eq!(ready.as_mut().poll(&mut cx), Poll::Ready(7));
-        assert!(!flag.load(Ordering::Relaxed), "an immediately ready wait is not a suspension");
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "an immediately ready wait is not a suspension"
+        );
 
         let mut yielded = false;
         let mut waits = std::pin::pin!(track_suspension(
@@ -546,7 +546,10 @@ mod tests {
         assert!(waits.as_mut().poll(&mut cx).is_pending());
         assert!(flag.load(Ordering::Relaxed));
         assert!(waits.as_mut().poll(&mut cx).is_ready());
-        assert!(flag.load(Ordering::Relaxed), "the flag stays set once a wait suspended");
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "the flag stays set once a wait suspended"
+        );
     }
 
     #[test]
