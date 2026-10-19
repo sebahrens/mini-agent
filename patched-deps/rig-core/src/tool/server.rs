@@ -305,7 +305,7 @@ impl ToolServerHandle {
     pub async fn get_tool_defs(
         &self,
         prompt: Option<String>,
-    ) -> Result<Vec<ToolDefinition>, ToolServerError> {
+    ) -> Result<Vec<Arc<ToolDefinition>>, ToolServerError> {
         // Snapshot the metadata we need under a brief read lock
         let (static_tool_names, dynamic_tools) = {
             let state = self.0.read().await;
@@ -363,7 +363,7 @@ impl ToolServerHandle {
 
             dynamic_tool_handles
                 .into_iter()
-                .map(|(name, tool)| tool.definition_with_name(name))
+                .map(|(name, tool)| tool.shared_definition_with_name(name))
                 .collect()
         } else {
             Vec::new()
@@ -384,7 +384,7 @@ impl ToolServerHandle {
         };
 
         for (name, tool) in static_tool_handles {
-            tools.push(tool.definition_with_name(name));
+            tools.push(tool.shared_definition_with_name(name));
         }
 
         // One shared toolset backs both lists, so a name appearing in the

@@ -371,6 +371,19 @@ impl TryFrom<completion::ToolDefinition> for Tool {
     }
 }
 
+impl TryFrom<Vec<std::sync::Arc<completion::ToolDefinition>>> for Tool {
+    type Error = CompletionError;
+
+    fn try_from(tools: Vec<std::sync::Arc<completion::ToolDefinition>>) -> Result<Self, Self::Error> {
+        Tool::try_from(
+            tools
+                .into_iter()
+                .map(std::sync::Arc::unwrap_or_clone)
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
 impl TryFrom<Vec<completion::ToolDefinition>> for Tool {
     type Error = CompletionError;
 

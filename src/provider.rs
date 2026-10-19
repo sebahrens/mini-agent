@@ -3658,7 +3658,15 @@ impl AnyAgent {
     pub(crate) async fn context_tool_definitions(
         &self,
     ) -> anyhow::Result<Vec<rig::completion::ToolDefinition>> {
-        Ok(self.tool_server().get_tool_defs(None).await?)
+        // Diagnostics only (not the per-request path): owned copies suit the
+        // bounded `/context` estimator.
+        Ok(self
+            .tool_server()
+            .get_tool_defs(None)
+            .await?
+            .into_iter()
+            .map(std::sync::Arc::unwrap_or_clone)
+            .collect())
     }
 
     /// The tool server every clone and per-turn preparation of this agent

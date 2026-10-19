@@ -40,6 +40,7 @@ use crate::provider_response;
 use crate::streaming::StreamingCompletionResponse;
 use crate::tool::server::ToolServerError;
 use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
+use std::sync::Arc;
 use crate::{OneOrMany, http_client};
 use crate::{
     json_utils,
@@ -811,7 +812,7 @@ pub struct CompletionRequest {
     /// The documents to be sent to the completion model provider
     pub documents: Vec<Document>,
     /// The tools to be sent to the completion model provider
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<Arc<ToolDefinition>>,
     /// The temperature to be sent to the completion model provider
     pub temperature: Option<f64>,
     /// The max tokens to be sent to the completion model provider
@@ -987,7 +988,7 @@ pub struct CompletionRequestBuilder<M: CompletionModel> {
     preamble: Option<String>,
     chat_history: Vec<Message>,
     documents: Vec<Document>,
-    tools: Vec<ToolDefinition>,
+    tools: Vec<Arc<ToolDefinition>>,
     provider_tools: Vec<ProviderToolDefinition>,
     temperature: Option<f64>,
     max_tokens: Option<u64>,
@@ -1067,13 +1068,13 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
     }
 
     /// Adds a tool to the completion request.
-    pub fn tool(mut self, tool: ToolDefinition) -> Self {
-        self.tools.push(tool);
+    pub fn tool(mut self, tool: impl Into<Arc<ToolDefinition>>) -> Self {
+        self.tools.push(tool.into());
         self
     }
 
     /// Adds a list of tools to the completion request.
-    pub fn tools(self, tools: Vec<ToolDefinition>) -> Self {
+    pub fn tools<T: Into<Arc<ToolDefinition>>>(self, tools: Vec<T>) -> Self {
         tools
             .into_iter()
             .fold(self, |builder, tool| builder.tool(tool))

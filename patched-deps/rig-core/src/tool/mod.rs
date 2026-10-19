@@ -310,6 +310,17 @@ pub trait ToolDyn: WasmCompatSend + WasmCompatSync {
     /// JSON Schema for the tool arguments.
     fn parameters(&self) -> serde_json::Value;
 
+    /// An already-built, shareable provider definition for this tool, if the
+    /// implementation keeps one (for example a memoizing wrapper).
+    ///
+    /// When present and its name equals the registered name, request building
+    /// shares this `Arc` instead of calling [`name`](Self::name),
+    /// [`description`](Self::description) and [`parameters`](Self::parameters)
+    /// and deep-cloning the schema on every completion request.
+    fn shared_definition(&self) -> Option<Arc<ToolDefinition>> {
+        None
+    }
+
     /// Calls the tool with JSON-encoded arguments and returns model-facing text.
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>>;
 
@@ -414,6 +425,18 @@ pub(crate) fn tool_definition_with_name(
         name: name.into(),
         description: tool.description(),
         parameters: tool.parameters(),
+    }
+}
+
+/// Like [`tool_definition_with_name`], but shares the tool's own memoized
+/// definition when it has one with a matching name.
+pub(crate) fn shared_tool_definition_with_name(
+    name: String,
+    tool: &dyn ToolDyn,
+) -> Arc<ToolDefinition> {
+    match tool.shared_definition() {
+        Some(definition) if definition.name == name => definition,
+        _ => Arc::new(tool_definition_with_name(name, tool)),
     }
 }
 
@@ -526,6 +549,13 @@ impl ToolType {
         match self {
             ToolType::Simple(tool) => tool_definition_with_name(name, &**tool),
             ToolType::Embedding(tool) => tool_definition_with_name(name, &**tool),
+        }
+    }
+
+    pub fn shared_definition_with_name(&self, name: String) -> Arc<ToolDefinition> {
+        match self {
+            ToolType::Simple(tool) => shared_tool_definition_with_name(name, &**tool),
+            ToolType::Embedding(tool) => shared_tool_definition_with_name(name, &**tool),
         }
     }
 
