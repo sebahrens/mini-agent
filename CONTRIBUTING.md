@@ -70,6 +70,10 @@ only indicative.
 
 ### Compile time and disk use
 
+- A full harness build (`cargo test --no-run`) is dominated by the serial rustc frontend and by
+  monomorphising async/generic dependency code, not by any one test module; the measurements and
+  the parallel-frontend and crate-split evaluation are recorded in
+  [docs/decisions/2026-10-19-crate-split-and-parallel-frontend.md](docs/decisions/2026-10-19-crate-split-and-parallel-frontend.md).
 - `target/` is never pruned by Cargo: every feature row, profile and `RUSTFLAGS` variant keeps its
   own hashed artefacts, and it can reach hundreds of GB. Sweep it periodically. Either use
   `cargo sweep --time 14` (the `cargo-sweep` tool; it also prunes registry dependencies), or run
