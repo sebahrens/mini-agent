@@ -14,6 +14,156 @@ use std::{
 pub(crate) const MAX_JOBS: usize = 32;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
 const MAX_SAVED_RESULT_BYTES: usize = 16 * 1024;
+/// Children whose tool logs are kept per task.
+pub(crate) const MAX_DETAIL_CHILDREN: usize = 8;
+/// Tool-log rows kept per child; later calls are only counted.
+pub(crate) const MAX_TOOL_LOG_ENTRIES: usize = 24;
+const MAX_LOG_NAME_BYTES: usize = 48;
+const MAX_LOG_ARGS_BYTES: usize = 100;
+const MAX_LOG_ERROR_BYTES: usize = 80;
+/// Raw child text kept for the user after a host repair.
+pub(crate) const MAX_UNVERIFIED_BYTES: usize = 6 * 1024;
+/// Foreground task records kept in memory for `/tasks`.
+const MAX_RECENT_FOREGROUND: usize = 8;
+
+/// Cut `text` to at most `cap` bytes on a char boundary, marking the cut.
+pub(crate) fn clip_bytes(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut end = cap.saturating_sub(3);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// One child tool call: bounded, display-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolLogEntry {
+    pub name: String,
+    pub args: String,
+    /// Bytes of text in the result; `None` when no result was observed.
+    #[serde(default)]
+    pub result_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ToolLogEntry {
+    pub(crate) fn new(name: &str, args: &str) -> Self {
+        Self {
+            name: clip_bytes(name, MAX_LOG_NAME_BYTES),
+            args: clip_bytes(args, MAX_LOG_ARGS_BYTES),
+            result_bytes: None,
+            error: None,
+        }
+    }
+    pub(crate) fn with_error(mut self, error: &str) -> Self {
+        self.error = Some(clip_bytes(
+            error.lines().next().unwrap_or(""),
+            MAX_LOG_ERROR_BYTES,
+        ));
+        self
+    }
+    fn within_bounds(&self) -> bool {
+        self.name.len() <= MAX_LOG_NAME_BYTES
+            && self.args.len() <= MAX_LOG_ARGS_BYTES
+            && self
+                .error
+                .as_ref()
+                .is_none_or(|e| e.len() <= MAX_LOG_ERROR_BYTES)
+    }
+}
+
+/// What one child did, kept next to the task result for the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChildDetails {
+    /// Zero-based prompt index within the task call.
+    pub index: usize,
+    pub turns: u32,
+    /// Every tool call made, including those past the log bound.
+    pub tool_calls: u32,
+    pub log: Vec<ToolLogEntry>,
+    /// Raw child text replaced by a host repair. Shown to the user only,
+    /// marked unverified; never part of any model-visible result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskDetails {
+    pub children: Vec<ChildDetails>,
+}
+
+impl TaskDetails {
+    pub(crate) fn within_bounds(&self) -> bool {
+        self.children.len() <= MAX_DETAIL_CHILDREN
+            && self.children.iter().all(|child| {
+                child.log.len() <= MAX_TOOL_LOG_ENTRIES
+                    && child.log.iter().all(ToolLogEntry::within_bounds)
+                    && child
+                        .unverified
+                        .as_ref()
+                        .is_none_or(|text| text.len() <= MAX_UNVERIFIED_BYTES)
+            })
+    }
+
+    /// Display lines for `/tasks <id>`.
+    pub(crate) fn log_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for child in &self.children {
+            lines.push(format!(
+                "child {}: {} turns, {} tool calls",
+                child.index + 1,
+                child.turns,
+                child.tool_calls
+            ));
+            for entry in &child.log {
+                let size = entry
+                    .result_bytes
+                    .map_or("no result".to_string(), |bytes| format!("{bytes} bytes"));
+                let error = entry
+                    .error
+                    .as_ref()
+                    .map_or(String::new(), |e| format!("  ERROR: {e}"));
+                lines.push(format!("  {} {}  -> {size}{error}", entry.name, entry.args));
+            }
+            let hidden = (child.tool_calls as usize).saturating_sub(child.log.len());
+            if hidden > 0 {
+                lines.push(format!("  ... {hidden} more tool calls not logged"));
+            }
+        }
+        lines
+    }
+
+    /// Raw child texts for `/tasks result <id>`, each marked unverified.
+    pub(crate) fn unverified_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for child in &self.children {
+            if let Some(text) = &child.unverified {
+                lines.push(format!(
+                    "[UNVERIFIED raw text of child {}: shown to you only, not sent to the model; the host replaced it in the report]",
+                    child.index + 1
+                ));
+                lines.extend(text.lines().map(|line| format!("  {line}")));
+            }
+        }
+        lines
+    }
+}
+
+/// A foreground `task` call, kept in memory so `/tasks` can show its log.
+#[derive(Debug, Clone)]
+pub(crate) struct RecentTask {
+    pub id: String,
+    pub label: String,
+    pub failed: bool,
+    pub details: TaskDetails,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +199,8 @@ pub(crate) struct SavedTask {
     pub id: String,
     pub status: Status,
     pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<TaskDetails>,
     #[serde(skip)]
     pub notified: bool,
 }
@@ -57,7 +209,10 @@ pub(crate) struct SavedTask {
 /// ignores the runtime-only `notified` flag.
 impl PartialEq for SavedTask {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.status == other.status && self.result == other.result
+        self.id == other.id
+            && self.status == other.status
+            && self.result == other.result
+            && self.details == other.details
     }
 }
 
@@ -83,6 +238,7 @@ pub(crate) fn read_history<'de, D: serde::Deserializer<'de>>(
                         .result
                         .as_ref()
                         .is_some_and(|text| text.len() > MAX_SAVED_RESULT_BYTES)
+                    || item.details.as_ref().is_some_and(|d| !d.within_bounds())
                     || items.iter().any(|prior: &SavedTask| prior.id == item.id)
                 {
                     return Err(serde::de::Error::custom(
@@ -249,6 +405,8 @@ pub(crate) struct Pool {
     /// background jobs cannot serialize the parent turn's own task call.
     pub(crate) foreground: Arc<tokio::sync::Semaphore>,
     pub(crate) write_lane: Arc<tokio::sync::Semaphore>,
+    /// Bounded, in-memory log of recent foreground `task` calls.
+    recent: Mutex<std::collections::VecDeque<RecentTask>>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -361,7 +519,11 @@ impl Pool {
                     && saved
                         .result
                         .as_ref()
-                        .is_none_or(|r| r.len() <= MAX_SAVED_RESULT_BYTES),
+                        .is_none_or(|r| r.len() <= MAX_SAVED_RESULT_BYTES)
+                    && saved
+                        .details
+                        .as_ref()
+                        .is_none_or(TaskDetails::within_bounds),
                 "invalid background task history"
             );
             let mut saved = saved.clone();
@@ -402,6 +564,7 @@ impl Pool {
             concurrency: Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32))),
             foreground: Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32))),
             write_lane: Arc::new(tokio::sync::Semaphore::new(1)),
+            recent: Mutex::default(),
         });
         session.background_pool = Some(pool.clone());
         Ok(pool)
@@ -482,6 +645,7 @@ impl Pool {
                     id: id.clone(),
                     status: Status::Running,
                     result: None,
+                    details: None,
                     notified: false,
                 },
                 result: None,
@@ -661,6 +825,37 @@ impl Pool {
             .map(|entry| entry.saved.clone())
             .collect()
     }
+    /// Remember a finished foreground call's tool log for `/tasks`.
+    pub(crate) fn record_foreground(
+        &self,
+        label: String,
+        failed: bool,
+        details: TaskDetails,
+    ) -> Option<String> {
+        if !details.within_bounds() || details.children.is_empty() {
+            return None;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        if recent.len() == MAX_RECENT_FOREGROUND {
+            recent.pop_front();
+        }
+        recent.push_back(RecentTask {
+            id: id.clone(),
+            label: clip_bytes(&label, 60),
+            failed,
+            details,
+        });
+        Some(id)
+    }
+    pub(crate) fn recent_foreground(&self) -> Vec<RecentTask> {
+        self.recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
     pub(crate) fn result(&self, id: &str) -> anyhow::Result<SavedTask> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let entry = state
@@ -719,10 +914,17 @@ impl Pool {
         // settled observations. Admission is closed; all job permits are now
         // settled, so no later mutation can acquire background provenance.
     }
-    fn terminal(&self, id: &str, status: Status, result: Option<String>) {
+    fn terminal(
+        &self,
+        id: &str,
+        status: Status,
+        result: Option<String>,
+        details: Option<TaskDetails>,
+    ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = state.jobs.get_mut(id) {
             entry.saved.status = status;
+            entry.saved.details = details.filter(TaskDetails::within_bounds);
             entry.saved.result = result
                 .as_ref()
                 .map(|text| clip(text, MAX_SAVED_RESULT_BYTES));
@@ -760,9 +962,20 @@ impl Admission {
     pub(crate) fn observation(&self) -> JobObservation {
         self.observation.clone()
     }
-    pub(crate) fn start<F>(mut self, work: F, run: crate::spend::run::Run) -> anyhow::Result<String>
+    #[cfg(test)]
+    pub(crate) fn start<F>(self, work: F, run: crate::spend::run::Run) -> anyhow::Result<String>
     where
         F: Future<Output = Result<String, String>> + Send + 'static,
+    {
+        self.start_with_details(async move { (work.await, None) }, run)
+    }
+    pub(crate) fn start_with_details<F>(
+        mut self,
+        work: F,
+        run: crate::spend::run::Run,
+    ) -> anyhow::Result<String>
+    where
+        F: Future<Output = (Result<String, String>, Option<TaskDetails>)> + Send + 'static,
     {
         anyhow::ensure!(
             run.belongs_to_account(&self.pool.session, &self.pool.account),
@@ -801,14 +1014,24 @@ impl Admission {
             .await;
             // work is destroyed by select/catch before its actual children join.
             cleanup.settle().await;
-            let (status, result) = match result {
-                Ok(Some(Ok(text))) => (Status::Completed, Some(clip(&text, MAX_RESULT_BYTES))),
-                Ok(Some(Err(text))) => (Status::Failed, Some(clip(&text, MAX_RESULT_BYTES))),
-                Ok(None) => (Status::Cancelled, None),
-                Err(_) => (Status::Failed, Some("background task panicked".into())),
+            let (status, result, details) = match result {
+                Ok(Some((Ok(text), details))) => (
+                    Status::Completed,
+                    Some(clip(&text, MAX_RESULT_BYTES)),
+                    details,
+                ),
+                Ok(Some((Err(text), details))) => {
+                    (Status::Failed, Some(clip(&text, MAX_RESULT_BYTES)), details)
+                }
+                Ok(None) => (Status::Cancelled, None, None),
+                Err(_) => (
+                    Status::Failed,
+                    Some("background task panicked".into()),
+                    None,
+                ),
             };
             if let Some(pool) = weak.upgrade() {
-                pool.terminal(&id, status, result);
+                pool.terminal(&id, status, result, details);
             }
             // The terminal data transition is observed only AFTER effect
             // retirement, while this admitted producer still owns provenance.
@@ -834,7 +1057,7 @@ impl Admission {
 impl Drop for Admission {
     fn drop(&mut self) {
         if !self.started {
-            self.pool.terminal(&self.id, Status::Cancelled, None);
+            self.pool.terminal(&self.id, Status::Cancelled, None, None);
         }
     }
 }
@@ -888,6 +1111,7 @@ mod tests {
             id: id.clone(),
             status,
             result,
+            details: None,
             notified,
         });
         let other_id = SavedTask {
@@ -961,6 +1185,87 @@ mod tests {
         .await
         .expect("background task must actually settle")
     }
+    fn sample_details() -> TaskDetails {
+        let mut entry = ToolLogEntry::new("read", &"x".repeat(500));
+        entry.result_bytes = Some(42);
+        TaskDetails {
+            children: vec![ChildDetails {
+                index: 0,
+                turns: 2,
+                tool_calls: 1,
+                log: vec![entry.with_error("boom")],
+                unverified: Some("RAW_UNVERIFIED".into()),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn task_details_are_stored_persisted_bounded_and_hidden_from_the_model() {
+        let root = crate::tests::OwnedTestDirectory::new("task-details");
+        let (session, pool, workspace, run, recorder) = fixture(&root);
+        let details = sample_details();
+        assert!(
+            details.children[0].log[0].args.len() <= MAX_LOG_ARGS_BYTES,
+            "arguments are truncated"
+        );
+        let expected = details.clone();
+        let id = pool
+            .reserve(&workspace, &run, &recorder)
+            .unwrap()
+            .start_with_details(
+                async move { (Err("child failed".into()), Some(details)) },
+                run,
+            )
+            .unwrap();
+        let task = settled(&pool, &id).await;
+        assert_eq!(task.status, Status::Failed);
+        assert_eq!(task.details.as_ref(), Some(&expected));
+
+        // The model-facing task_result row carries neither log nor raw text.
+        let model_row = serde_json::to_string(&model_visible(task.clone())).unwrap();
+        assert!(!model_row.contains("RAW_UNVERIFIED") && !model_row.contains("details"));
+        assert!(model_row.contains("child failed"));
+
+        // The session file round-trips the details for /tasks.
+        let mut imported: crate::session::Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let reloaded = Pool::for_session(&mut imported, 1).unwrap();
+        assert_eq!(reloaded.result(&id).unwrap().details, Some(expected));
+
+        // Oversized persisted details are refused like oversized results.
+        let mut bloated = sample_details();
+        bloated.children[0].log = vec![ToolLogEntry::new("read", "a"); MAX_TOOL_LOG_ENTRIES + 1];
+        assert!(!bloated.within_bounds());
+        let row = serde_json::json!([{
+            "id": uuid::Uuid::new_v4().to_string(),
+            "status": "completed",
+            "result": null,
+            "details": bloated,
+        }]);
+        assert!(read_history(row).is_err());
+    }
+
+    #[tokio::test]
+    async fn foreground_task_logs_are_kept_in_a_bounded_recent_list() {
+        let root = crate::tests::OwnedTestDirectory::new("recent-foreground");
+        let (_session, pool, _workspace, _run, _recorder) = fixture(&root);
+        assert!(
+            pool.record_foreground("empty".into(), false, TaskDetails::default())
+                .is_none()
+        );
+        let mut ids = Vec::new();
+        for n in 0..MAX_RECENT_FOREGROUND + 2 {
+            ids.push(
+                pool.record_foreground(format!("task {n}"), n % 2 == 0, sample_details())
+                    .unwrap(),
+            );
+        }
+        let recent = pool.recent_foreground();
+        assert_eq!(recent.len(), MAX_RECENT_FOREGROUND);
+        assert_eq!(recent[0].id, ids[2], "oldest entries are dropped first");
+        assert!(recent.iter().all(|task| task.details.within_bounds()));
+    }
+
     #[tokio::test]
     async fn background56_immediate_id_outlives_parent_and_result_is_session_owned() {
         let root = crate::tests::OwnedTestDirectory::new("background56-pool");
@@ -1134,6 +1439,7 @@ mod tests {
                     id: uuid::Uuid::new_v4().to_string(),
                     status: Status::Running,
                     result: None,
+                    details: None,
                     notified: false
                 })
                 .collect::<Vec<_>>()
@@ -1284,6 +1590,12 @@ pub(crate) struct ControlTool<const OP: u8> {
 pub(crate) type ResultTool = ControlTool<0>;
 pub(crate) type ListTool = ControlTool<1>;
 pub(crate) type CancelTool = ControlTool<2>;
+/// The row a tool call may return to the model: user-only details removed.
+fn model_visible(mut saved: SavedTask) -> SavedTask {
+    saved.details = None;
+    saved
+}
+
 impl<const OP: u8> ControlTool<OP> {
     pub(crate) fn new(
         permission: Option<crate::permission::checker::PermCheck>,
@@ -1349,8 +1661,11 @@ impl<const OP: u8> rig::tool::Tool for ControlTool<OP> {
         crate::agent::tools::check_perm(&self.permission, &self.ask, Self::NAME, id).await?;
         validate().map_err(|error| ToolError::Msg(error.to_string()))?;
         let value = match OP {
+            // Tool logs and unverified raw child text are for the user's
+            // `/tasks` view only; the model-facing row never carries them.
             0 => serde_json::to_value(
                 pool.result(id)
+                    .map(model_visible)
                     .map_err(|error| ToolError::Msg(error.to_string()))?,
             ),
             1 => Ok(serde_json::Value::Array(
@@ -1361,6 +1676,7 @@ impl<const OP: u8> rig::tool::Tool for ControlTool<OP> {
             )),
             2 => serde_json::to_value(
                 pool.request_cancel(id)
+                    .map(model_visible)
                     .map_err(|error| ToolError::Msg(error.to_string()))?,
             ),
             _ => unreachable!(),

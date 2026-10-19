@@ -4133,6 +4133,27 @@ impl AnyAgent {
         retry_config: &RetryConfig,
         usage_ledger: runner::SharedUsageLedger,
     ) -> runner::SubagentRunOutput {
+        self.run_subagent_with_history(
+            prompt,
+            Vec::new(),
+            max_turns,
+            event_tx,
+            retry_config,
+            usage_ledger,
+        )
+        .await
+    }
+
+    #[cfg(feature = "subagents")]
+    pub(crate) async fn run_subagent_with_history(
+        &self,
+        prompt: &str,
+        history: Vec<Message>,
+        max_turns: usize,
+        event_tx: Option<&mpsc::Sender<AgentEvent>>,
+        retry_config: &RetryConfig,
+        usage_ledger: runner::SharedUsageLedger,
+    ) -> runner::SubagentRunOutput {
         let future = crate::startup::heap_future(|| async {
             #[cfg(feature = "skills")]
             let _turn_guard = if self.skills.is_some() {
@@ -4146,10 +4167,7 @@ impl AnyAgent {
                 {
                     Ok(inner) => inner,
                     Err(error) => {
-                        return runner::SubagentRunOutput {
-                            response: Err(error),
-                            usage: Default::default(),
-                        };
+                        return runner::SubagentRunOutput::bare(Err(error), Default::default());
                     }
                 };
             let prompt = prompt.to_string();
@@ -4157,9 +4175,10 @@ impl AnyAgent {
             let inner = &self.inner;
             match &inner {
                 AnyAgentInner::OpenRouter(a) => {
-                    runner::run_subagent(
+                    runner::run_subagent_with_history(
                         a,
                         &prompt,
+                        history,
                         max_turns,
                         event_tx,
                         retry_config,
@@ -4169,9 +4188,10 @@ impl AnyAgent {
                 }
                 AnyAgentInner::OpenAI(a) => match a {
                     OpenAiAgent::Responses(a) => {
-                        runner::run_subagent(
+                        runner::run_subagent_with_history(
                             a,
                             &prompt,
+                            history,
                             max_turns,
                             event_tx,
                             retry_config,
@@ -4180,9 +4200,10 @@ impl AnyAgent {
                         .await
                     }
                     OpenAiAgent::Completions(a) => {
-                        runner::run_subagent(
+                        runner::run_subagent_with_history(
                             a,
                             &prompt,
+                            history,
                             max_turns,
                             event_tx,
                             retry_config,
@@ -4192,9 +4213,10 @@ impl AnyAgent {
                     }
                 },
                 AnyAgentInner::Anthropic(a) => {
-                    runner::run_subagent(
+                    runner::run_subagent_with_history(
                         a,
                         &prompt,
+                        history,
                         max_turns,
                         event_tx,
                         retry_config,
@@ -4203,9 +4225,10 @@ impl AnyAgent {
                     .await
                 }
                 AnyAgentInner::Gemini(a) => {
-                    runner::run_subagent(
+                    runner::run_subagent_with_history(
                         a,
                         &prompt,
+                        history,
                         max_turns,
                         event_tx,
                         retry_config,
@@ -4214,9 +4237,10 @@ impl AnyAgent {
                     .await
                 }
                 AnyAgentInner::Ollama(a) => {
-                    runner::run_subagent(
+                    runner::run_subagent_with_history(
                         a,
                         &prompt,
+                        history,
                         max_turns,
                         event_tx,
                         retry_config,
@@ -4225,9 +4249,10 @@ impl AnyAgent {
                     .await
                 }
                 AnyAgentInner::Copilot(a) => {
-                    runner::run_subagent(
+                    runner::run_subagent_with_history(
                         a,
                         &prompt,
+                        history,
                         max_turns,
                         event_tx,
                         retry_config,

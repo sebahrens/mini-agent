@@ -5229,6 +5229,32 @@ pub(crate) fn format_tool_args_summary(args_json: &serde_json::Value) -> String 
 pub(crate) struct SubagentRunOutput {
     pub response: Result<String, String>,
     pub usage: Usage,
+    /// The child's full conversation (prompt, tool calls, tool results, final
+    /// text) when the run reached a point that exposes it.
+    pub history: Vec<Message>,
+    /// Model requests made and tool calls issued by this run.
+    pub turns: u32,
+    pub tool_calls: u32,
+    /// Bounded record of each tool call (name, args, result size, error).
+    pub tool_log: Vec<crate::extras::subagents::background::ToolLogEntry>,
+    /// The run ended because its model-turn budget was exhausted.
+    pub turn_budget_exhausted: bool,
+}
+
+#[cfg(feature = "subagents")]
+impl SubagentRunOutput {
+    /// A run that ended without a child conversation to continue.
+    pub(crate) fn bare(response: Result<String, String>, usage: Usage) -> Self {
+        Self {
+            response,
+            usage,
+            history: Vec::new(),
+            turns: 0,
+            tool_calls: 0,
+            tool_log: Vec::new(),
+            turn_budget_exhausted: false,
+        }
+    }
 }
 
 #[cfg(feature = "subagents")]
@@ -5251,7 +5277,7 @@ fn is_subagent_turn_budget_error(error: &rig::agent::StreamingError) -> bool {
     )
 }
 
-#[cfg(feature = "subagents")]
+#[cfg(all(feature = "subagents", test))]
 pub(crate) async fn run_subagent<M>(
     agent: &Agent<M>,
     prompt: &str,
@@ -5264,13 +5290,57 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    run_subagent_with_history(
+        agent,
+        prompt,
+        Vec::new(),
+        max_turns,
+        event_tx,
+        retry_config,
+        usage_ledger,
+    )
+    .await
+}
+
+/// Messages of text in a tool result, in bytes.
+#[cfg(feature = "subagents")]
+fn tool_result_text_bytes(result: &rig::message::ToolResult) -> u64 {
+    result
+        .content
+        .iter()
+        .map(|content| match content {
+            ToolResultContent::Text(text) => text.text.len() as u64,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// As [`run_subagent`], continuing `history` (a child's earlier conversation)
+/// with `prompt` instead of starting an empty one. The returned `history` is
+/// the whole conversation, so a later tool-free turn can restate its findings.
+#[cfg(feature = "subagents")]
+pub(crate) async fn run_subagent_with_history<M>(
+    agent: &Agent<M>,
+    prompt: &str,
+    history: Vec<Message>,
+    max_turns: usize,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    retry_config: &RetryConfig,
+    usage_ledger: SharedUsageLedger,
+) -> SubagentRunOutput
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    use crate::extras::subagents::background::{MAX_TOOL_LOG_ENTRIES, ToolLogEntry};
     let stream = crate::startup::heap_future(|| {
         retry::retry_stream_chat(retry_config, || {
             let p = prompt.to_string();
+            let history = history.clone();
             let admission = usage_ledger.clone();
             crate::startup::heap_future(|| async move {
                 agent
-                    .stream_chat(p, Vec::<Message>::new())
+                    .stream_chat(p, history)
                     .max_turns(max_turns)
                     .add_hook(admission)
                     .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
@@ -5286,26 +5356,48 @@ where
     let mut stream = match stream {
         Ok(stream) => stream,
         Err(_) if crate::spend::run::Run::current().is_some_and(|run| run.was_refused()) => {
-            return SubagentRunOutput {
-                response: Err(crate::spend::run::BUDGET_STOP.into()),
-                usage: usage_ledger.total(),
-            };
+            return SubagentRunOutput::bare(
+                Err(crate::spend::run::BUDGET_STOP.into()),
+                usage_ledger.total(),
+            );
         }
         Err(error) if is_subagent_turn_budget_error(&error) => {
-            return SubagentRunOutput {
-                response: Ok(SUBAGENT_TURN_BUDGET_PARTIAL.to_string()),
-                usage: usage_ledger.total(),
-            };
+            let mut out = SubagentRunOutput::bare(
+                Ok(SUBAGENT_TURN_BUDGET_PARTIAL.to_string()),
+                usage_ledger.total(),
+            );
+            out.turn_budget_exhausted = true;
+            return out;
         }
         Err(error) => {
-            return SubagentRunOutput {
-                response: Err(format!("subagent error: {error}")),
-                usage: usage_ledger.total(),
-            };
+            return SubagentRunOutput::bare(
+                Err(format!("subagent error: {error}")),
+                usage_ledger.total(),
+            );
         }
     };
 
     let mut full_response = String::new();
+    let mut child_history = Vec::new();
+    let mut turns = 0u32;
+    let mut tool_calls = 0u32;
+    let mut tool_log: Vec<ToolLogEntry> = Vec::new();
+    // Rig call id -> row in `tool_log` (rows past the bound are not tracked).
+    let mut logged: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut turn_budget_exhausted = false;
+    macro_rules! finish {
+        ($response:expr) => {
+            SubagentRunOutput {
+                response: $response,
+                usage: usage_ledger.total(),
+                history: child_history,
+                turns,
+                tool_calls,
+                tool_log,
+                turn_budget_exhausted,
+            }
+        };
+    }
     while let Some(item) = stream.next().await {
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
@@ -5313,8 +5405,16 @@ where
             }
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
                 tool_call,
-                ..
+                internal_call_id,
             })) => {
+                tool_calls = tool_calls.saturating_add(1);
+                if tool_log.len() < MAX_TOOL_LOG_ENTRIES {
+                    logged.insert(internal_call_id, tool_log.len());
+                    tool_log.push(ToolLogEntry::new(
+                        &tool_call.function.name,
+                        &tool_call.function.arguments.to_string(),
+                    ));
+                }
                 if let Some(tx) = event_tx {
                     let _ = tx
                         .send(AgentEvent::SubagentToolCall {
@@ -5324,20 +5424,44 @@ where
                         .await;
                 }
             }
+            Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+                tool_result,
+                internal_call_id,
+            })) => {
+                let failed = take_tool_failure(&internal_call_id);
+                if let Some(entry) = logged
+                    .remove(&internal_call_id)
+                    .and_then(|row| tool_log.get_mut(row))
+                {
+                    entry.result_bytes = Some(tool_result_text_bytes(&tool_result));
+                    if failed {
+                        let text = tool_result
+                            .content
+                            .iter()
+                            .find_map(|content| match content {
+                                ToolResultContent::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            });
+                        *entry = entry.clone().with_error(text.unwrap_or("tool failed"));
+                    }
+                }
+            }
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                 usage_ledger.reconcile_terminal(res.usage());
                 full_response = res.output.to_string();
+                child_history = res.messages().map(<[Message]>::to_vec).unwrap_or_default();
                 break;
             }
             Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                turns = turns.saturating_add(1);
                 usage_ledger.record_completion(call.usage);
             }
             Ok(_) => {}
             Err(_) if crate::spend::run::Run::current().is_some_and(|run| run.was_refused()) => {
-                return SubagentRunOutput {
-                    response: Err(crate::spend::run::BUDGET_STOP.into()),
-                    usage: usage_ledger.total(),
-                };
+                return SubagentRunOutput::bare(
+                    Err(crate::spend::run::BUDGET_STOP.into()),
+                    usage_ledger.total(),
+                );
             }
             Err(_)
                 if usage_ledger
@@ -5350,28 +5474,34 @@ where
             }
             Err(error) if is_subagent_turn_budget_error(&error) => {
                 append_subagent_turn_budget_partial(&mut full_response);
+                turn_budget_exhausted = true;
+                // The error carries the whole conversation, tool results
+                // included, so a tool-free write-up turn can use it.
+                if let rig::agent::StreamingError::Prompt(prompt) = &error
+                    && let rig::completion::PromptError::MaxTurnsError { chat_history, .. } =
+                        prompt.as_ref()
+                {
+                    child_history = chat_history.as_ref().clone();
+                }
                 break;
             }
             Err(e) => {
-                return SubagentRunOutput {
-                    response: Err(format!("subagent error: {e}")),
-                    usage: usage_ledger.total(),
-                };
+                return SubagentRunOutput::bare(
+                    Err(format!("subagent error: {e}")),
+                    usage_ledger.total(),
+                );
             }
         }
     }
 
     if full_response.is_empty() {
-        return SubagentRunOutput {
-            response: Err("subagent returned empty response".to_string()),
-            usage: usage_ledger.total(),
-        };
+        return SubagentRunOutput::bare(
+            Err("subagent returned empty response".to_string()),
+            usage_ledger.total(),
+        );
     }
 
-    SubagentRunOutput {
-        response: Ok(full_response),
-        usage: usage_ledger.total(),
-    }
+    finish!(Ok(full_response))
 }
 
 #[cfg(test)]

@@ -6,15 +6,15 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
-use rig::completion::Usage;
+use rig::completion::{Message, Usage};
 use rig::tool::Tool;
 use serde::{Deserialize, Deserializer};
 use tokio::time::Instant;
 
-#[cfg(feature = "hooks")]
 use crate::agent::runner::SubagentRunOutput;
 use crate::agent::runner::{SharedUsageLedger, SubagentAdmission, usage_saturating_add};
 use crate::agent::tools::{ToolError, check_perm};
+use crate::extras::subagents::background::{ChildDetails, MAX_DETAIL_CHILDREN, TaskDetails};
 use crate::extras::subagents::builder::{self, SubagentAuthorization};
 use crate::extras::subagents::{clone_subagent_event_tx, with_config};
 use crate::permission::ask::AskSender;
@@ -1224,7 +1224,17 @@ editing in a known location, grepping for a literal you will act on immediately.
         let background_run = parent_run.clone();
         let live_budget = LiveTaskBudget::new(limits.max_cost_units);
         let executor_budget = live_budget.clone();
-        let executor: TaskExecutor = Arc::new(move |_index, prompt_text| {
+        let details_sink = DetailsSink::default();
+        let executor_sink = details_sink.clone();
+        let task_label = prompts
+            .first()
+            .map(|prompt| {
+                let head: String = prompt.chars().take(200).collect();
+                head.split_whitespace().collect::<Vec<_>>().join(" ")
+            })
+            .unwrap_or_default();
+        let executor: TaskExecutor = Arc::new(move |index, prompt_text| {
+            let details_sink = executor_sink.clone();
             let task_budget = executor_budget.clone();
             let repair_budget = LiveTaskBudget::new(repair_max_cost_units);
             let child_budget = LiveTaskBudget::new(u64::MAX);
@@ -1279,20 +1289,25 @@ editing in a known location, grepping for a literal you will act on immediately.
             let initial_usage = SharedUsageLedger::default().with_admission(admission(false));
             let retry_usage = SharedUsageLedger::default().with_admission(admission(false));
             let repair_usage = SharedUsageLedger::default().with_admission(admission(true));
+            let writeup_usage = SharedUsageLedger::default().with_admission(admission(true));
             let cancellation_units = child_budget.clone();
             let cancellation_initial_usage = initial_usage.clone();
             let cancellation_retry_usage = retry_usage.clone();
             let cancellation_repair_usage = repair_usage.clone();
+            let cancellation_writeup_usage = writeup_usage.clone();
             let cancellation_cost = Arc::new(move || {
                 // Streaming usage may be known before ModelTurnFinished. Keep
                 // it when cancellation retires an in-flight request, without
                 // charging completed turns twice or losing no-usage estimates.
                 let observed = usage_saturating_add(
                     usage_saturating_add(
-                        cancellation_initial_usage.total(),
-                        cancellation_retry_usage.total(),
+                        usage_saturating_add(
+                            cancellation_initial_usage.total(),
+                            cancellation_retry_usage.total(),
+                        ),
+                        cancellation_repair_usage.total(),
                     ),
-                    cancellation_repair_usage.total(),
+                    cancellation_writeup_usage.total(),
                 );
                 cancellation_units
                     .used
@@ -1402,45 +1417,45 @@ editing in a known location, grepping for a literal you will act on immediately.
                     run = merge_forced_continuation_run(run, retried);
                 }
 
-                // One bounded repair turn when the child broke the report
-                // contract: the same child is asked to restate its own
-                // findings in the required sections, charged to this task's
-                // budget. If the restatement still fails validation, the host
-                // repair below keeps the original text quoted instead.
-                // The validation result of the response finally selected is
-                // carried to the host contract check instead of recomputed.
-                let mut known_violations = None;
-                if !task_budget.exhausted()
-                    && let Ok(response) = run.response.as_ref()
-                {
-                    let violations = report_contract_violations(response);
-                    if violations.is_empty() {
-                        known_violations = Some(violations);
-                    } else {
-                        let repair_agent =
-                            agent.clone().for_subagent_report_repair(repair_max_tokens);
-                        let repair = repair_agent
-                            .run_subagent(
-                                &report_repair_prompt(response, &violations, max_report_bytes),
-                                REPORT_REPAIR_MAX_TURNS,
-                                event_tx.as_ref(),
-                                &config.retry,
-                                repair_usage.clone(),
-                            )
-                            .await;
-                        run.usage = usage_saturating_add(run.usage, repair.usage);
-                        let (selected, selected_violations) =
-                            select_repaired_report_with_violations(
-                                response,
-                                violations,
-                                repair.response.ok(),
-                            );
-                        run.response = Ok(selected);
-                        known_violations = Some(selected_violations);
-                    }
-                }
-
-                let output = run.response.map(|response| match known_violations {
+                // Budget write-up and report repair are tool-free continuations
+                // of this child's own conversation (tool results included).
+                let continuation_agent = agent.clone();
+                let continuation_retry = config.retry.clone();
+                let continuation_events = event_tx.clone();
+                let finished = finish_child_run(
+                    run,
+                    || task_budget.exhausted(),
+                    max_report_bytes,
+                    |stage, prompt, history| {
+                        let ledger = match stage {
+                            Continuation::WriteUp => writeup_usage.clone(),
+                            Continuation::Repair => repair_usage.clone(),
+                        };
+                        let repair_agent = continuation_agent
+                            .clone()
+                            .for_subagent_report_repair(repair_max_tokens);
+                        let retry = continuation_retry.clone();
+                        let events = continuation_events.clone();
+                        async move {
+                            repair_agent
+                                .run_subagent_with_history(
+                                    &prompt,
+                                    history,
+                                    REPORT_REPAIR_MAX_TURNS,
+                                    events.as_ref(),
+                                    &retry,
+                                    ledger,
+                                )
+                                .await
+                        }
+                    },
+                )
+                .await;
+                let mut child_details = finished.details;
+                child_details.index = index;
+                details_sink.record(child_details);
+                let known_violations = finished.known_violations;
+                let output = finished.response.map(|response| match known_violations {
                     Some(violations) => {
                         enforce_validated_report_contract(response, violations, max_report_bytes)
                     }
@@ -1478,7 +1493,7 @@ editing in a known location, grepping for a literal you will act on immediately.
 
         if let Some(admission) = admission {
             let id = admission
-                .start(
+                .start_with_details(
                     async move {
                         let report = execute_tasks_with_budget(
                             prompts,
@@ -1490,7 +1505,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                         .await;
                         let failed = report.stop_reason.is_some();
                         let text = report.render();
-                        if failed { Err(text) } else { Ok(text) }
+                        let details = Some(details_sink.take());
+                        (if failed { Err(text) } else { Ok(text) }, details)
                     },
                     background_run.expect("admitted owning Run"),
                 )
@@ -1502,7 +1518,170 @@ editing in a known location, grepping for a literal you will act on immediately.
         let report =
             execute_tasks_with_budget(prompts, limits, executor, result_notice, Some(live_budget))
                 .await;
+        if let Some(pool) = &task_pool {
+            pool.record_foreground(
+                task_label,
+                report.stop_reason.is_some(),
+                details_sink.take(),
+            );
+        }
         Ok(report.render())
+    }
+}
+
+/// Which tool-free continuation of a child's conversation is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Continuation {
+    /// A child that ran out of turns writes up what it found.
+    WriteUp,
+    /// A child that broke the report contract restates its findings.
+    Repair,
+}
+
+/// Per-call collector of what each child did, keyed by prompt index.
+#[derive(Clone, Default)]
+struct DetailsSink(Arc<std::sync::Mutex<Vec<ChildDetails>>>);
+
+impl DetailsSink {
+    fn record(&self, details: ChildDetails) {
+        let mut children = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if children.len() < MAX_DETAIL_CHILDREN {
+            children.push(details);
+        }
+    }
+
+    fn take(&self) -> TaskDetails {
+        let mut children = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        children.sort_by_key(|child| child.index);
+        TaskDetails { children }
+    }
+}
+
+/// Header for a child that exhausted its model-turn budget.
+fn turn_budget_header(turns: u32, tool_calls: u32, written_up: bool) -> String {
+    let tail = if written_up {
+        "findings written without tools"
+    } else {
+        "no tool-free write-up available"
+    };
+    format!(
+        "[partial: turn budget exhausted after {turns} model turns and {tool_calls} tool calls; {tail}]"
+    )
+}
+
+/// Final prompt for a child out of turns: report from the conversation so far.
+fn turn_budget_writeup_prompt(turns: u32, tool_calls: u32, max_report_bytes: usize) -> String {
+    format!(
+        "Your turn budget is exhausted after {turns} model turns and {tool_calls} tool calls. \
+         You cannot call tools any more and must not try. Using only what your earlier tool \
+         results in this conversation established, write your final report now, in exactly \
+         these sections in this order:\n\n\
+         ## Findings\n\
+         - [confidence: high|medium|low] Evidence-backed finding citing the files or results \
+         it came from, or an explicit no-finding statement.\n\n\
+         ## Unverified\n\
+         - What you did not get to check, or `None`.\n\n\
+         ## Coverage\n\
+         - Covered: files, paths, and checks actually inspected.\n\
+         - Skipped: relevant scope not inspected and why, or `None`.\n\n\
+         Keep the report under {max_report_bytes} bytes."
+    )
+}
+
+/// What a child's run yielded after the optional tool-free write-up and
+/// report-contract repair.
+struct FinishedChild {
+    response: Result<String, String>,
+    /// Contract violations of `response`, when it was validated.
+    known_violations: Option<Vec<&'static str>>,
+    details: ChildDetails,
+}
+
+/// Complete a child's run: write up an exhausted turn budget, then repair a
+/// broken report contract. Both are single tool-free turns that continue the
+/// child's own conversation through `continue_tool_free`; the repair therefore
+/// sees the tool results behind the findings it restates. The raw text of a
+/// report the host ends up replacing is kept in the details, for the user.
+async fn finish_child_run<C, Fut>(
+    mut run: SubagentRunOutput,
+    budget_exhausted: impl Fn() -> bool,
+    max_report_bytes: usize,
+    mut continue_tool_free: C,
+) -> FinishedChild
+where
+    C: FnMut(Continuation, String, Vec<Message>) -> Fut,
+    Fut: Future<Output = SubagentRunOutput>,
+{
+    let mut details = ChildDetails {
+        index: 0,
+        turns: run.turns,
+        tool_calls: run.tool_calls,
+        log: std::mem::take(&mut run.tool_log),
+        unverified: None,
+    };
+    if run.turn_budget_exhausted && run.response.is_ok() {
+        let mut written_up = false;
+        let mut narration = run.response.clone().unwrap_or_default();
+        if !run.history.is_empty() && !budget_exhausted() {
+            let writeup = continue_tool_free(
+                Continuation::WriteUp,
+                turn_budget_writeup_prompt(run.turns, run.tool_calls, max_report_bytes),
+                run.history.clone(),
+            )
+            .await;
+            run.usage = usage_saturating_add(run.usage, writeup.usage);
+            if let Ok(text) = writeup.response
+                && !text.trim().is_empty()
+            {
+                narration = text;
+                run.history = writeup.history;
+                written_up = true;
+            }
+        }
+        run.response = Ok(format!(
+            "{}\n{narration}",
+            turn_budget_header(run.turns, run.tool_calls, written_up)
+        ));
+    }
+
+    let mut known_violations = None;
+    if !budget_exhausted()
+        && let Ok(response) = run.response.as_ref()
+    {
+        let violations = report_contract_violations(response);
+        if violations.is_empty() {
+            known_violations = Some(violations);
+        } else {
+            let repair = continue_tool_free(
+                Continuation::Repair,
+                report_repair_prompt(response, &violations, max_report_bytes),
+                std::mem::take(&mut run.history),
+            )
+            .await;
+            run.usage = usage_saturating_add(run.usage, repair.usage);
+            let (selected, selected_violations) =
+                select_repaired_report_with_violations(response, violations, repair.response.ok());
+            if !selected_violations.is_empty() {
+                details.unverified = Some(crate::extras::subagents::background::clip_bytes(
+                    &selected,
+                    crate::extras::subagents::background::MAX_UNVERIFIED_BYTES,
+                ));
+            }
+            run.response = Ok(selected);
+            known_violations = Some(selected_violations);
+        }
+    } else if let Ok(response) = run.response.as_ref()
+        && !report_contract_violations(response).is_empty()
+    {
+        details.unverified = Some(crate::extras::subagents::background::clip_bytes(
+            response,
+            crate::extras::subagents::background::MAX_UNVERIFIED_BYTES,
+        ));
+    }
+    FinishedChild {
+        response: run.response,
+        known_violations,
+        details,
     }
 }
 
@@ -1512,13 +1691,21 @@ fn merge_forced_continuation_run(
     mut retried: SubagentRunOutput,
 ) -> SubagentRunOutput {
     let combined_usage = usage_saturating_add(original.usage, retried.usage);
-    if retried.response.is_ok() {
-        retried.usage = combined_usage;
+    let turns = original.turns.saturating_add(retried.turns);
+    let tool_calls = original.tool_calls.saturating_add(retried.tool_calls);
+    let mut tool_log = std::mem::take(&mut original.tool_log);
+    tool_log.append(&mut retried.tool_log);
+    tool_log.truncate(crate::extras::subagents::background::MAX_TOOL_LOG_ENTRIES);
+    let mut kept = if retried.response.is_ok() {
         retried
     } else {
-        original.usage = combined_usage;
         original
-    }
+    };
+    kept.usage = combined_usage;
+    kept.turns = turns;
+    kept.tool_calls = tool_calls;
+    kept.tool_log = tool_log;
+    kept
 }
 
 /// Whether a child takes the session's single shared write lane (and so caps
@@ -2487,8 +2674,9 @@ fn report_repair_prompt(response: &str, violations: &[&str], max_report_bytes: u
         .join("\n");
     format!(
         "Your previous response did not follow the required report format ({}). \
-         Do not call tools and do not investigate further. Restate only what your \
-         previous response established, using exactly these sections in this order:\n\n\
+         Do not call tools and do not investigate further. Restate what your \
+         investigation established, using the tool results earlier in this conversation \
+         as the evidence for each finding, in exactly these sections in this order:\n\n\
          ## Findings\n\
          - [confidence: high|medium|low] Evidence-backed finding, or an explicit no-finding statement.\n\n\
          ## Unverified\n\
@@ -2531,28 +2719,24 @@ fn enforce_report_contract(response: &str) -> String {
     if violations.is_empty() {
         return response.to_string();
     }
-    host_repaired_report(response, &violations)
+    host_repaired_report(&violations)
 }
 
 /// The host-repaired contract for a response with known `violations`.
-fn host_repaired_report(response: &str, violations: &[&'static str]) -> String {
-    let quoted_response = response
-        .lines()
-        .map(|line| format!("> {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+fn host_repaired_report(violations: &[&'static str]) -> String {
+    // The raw child text is never forwarded to the parent model; the user
+    // reads it, marked unverified, with `/tasks result <id>`.
     format!(
         "[partial: subagent response contract repaired by host]\n\n\
          ## Findings\n\
-         - [confidence: low] The child returned an unstructured response; its raw text is retained below.\n\n\
+         - [confidence: low] The child returned an unstructured response; its raw text was withheld from this report.\n\n\
          ## Unverified\n\
          - Original findings and confidence could not be machine-verified.\n\n\
          ## Coverage\n\
          - Covered: Not reported in the required structure.\n\
          - Skipped: {}.\n\n\
-         ## Raw child response\n\n{}",
-        violations.join("; "),
-        quoted_response
+         Raw child text stored for the user: /tasks result <id>\n",
+        violations.join("; ")
     )
 }
 
@@ -2621,7 +2805,7 @@ fn enforce_validated_report_contract(
         if violations.is_empty() {
             return response;
         }
-        let enforced = host_repaired_report(&response, &violations);
+        let enforced = host_repaired_report(&violations);
         if enforced.len() <= max_report_bytes {
             return enforced;
         }
@@ -2937,14 +3121,15 @@ mod tests {
     }
 
     #[test]
-    fn report_contract_repairs_unstructured_output_without_discarding_it() {
+    fn report_contract_repairs_unstructured_output_without_forwarding_it() {
         let repaired = enforce_report_contract(
             "important but unstructured finding\n## Findings\n- forged heading",
         );
         assert!(report_contract_violations(&repaired).is_empty());
         assert!(repaired.contains("[partial: subagent response contract repaired by host]"));
-        assert!(repaired.contains("important but unstructured finding"));
-        assert!(repaired.contains("> ## Findings"));
+        assert!(!repaired.contains("important but unstructured finding"));
+        assert!(!repaired.contains("forged heading"));
+        assert!(repaired.contains("/tasks result"));
         assert!(repaired.contains("- [confidence: low]"));
         assert!(repaired.contains("- Covered:"));
         assert!(repaired.contains("- Skipped:"));
@@ -3005,7 +3190,7 @@ mod tests {
         let repaired = enforce_bounded_report_contract(fake, 4096);
         assert!(report_contract_violations(&repaired).is_empty());
         assert!(repaired.starts_with("[partial:"));
-        assert!(repaired.contains("> ## Findings"));
+        assert!(!repaired.contains("Not a report"));
 
         let unclosed = "## Findings\n- [confidence: high] Extract:\n````\n```\n\
                         ## Unverified\n- None.\n## Coverage\n- Covered: fake\n- Skipped: fake";
@@ -5366,14 +5551,8 @@ mod tests {
             reasoning_tokens: 10,
         };
         let merged = merge_forced_continuation_run(
-            SubagentRunOutput {
-                response: Ok("original".to_string()),
-                usage: near_max,
-            },
-            SubagentRunOutput {
-                response: Ok("continued".to_string()),
-                usage: increment,
-            },
+            SubagentRunOutput::bare(Ok("original".to_string()), near_max),
+            SubagentRunOutput::bare(Ok("continued".to_string()), increment),
         );
 
         assert_eq!(merged.response.as_deref(), Ok("continued"));
@@ -5396,6 +5575,258 @@ mod tests {
         let result = truncate_total_bytes("記憶".repeat(100).as_str(), 64, "…[cut]");
         assert!(result.len() <= 64);
         assert!(result.ends_with("…[cut]"));
+    }
+}
+
+#[cfg(test)]
+mod child_continuation_tests {
+    use super::*;
+    use crate::agent::runner::run_subagent_with_history;
+    use rig::agent::AgentBuilder;
+    use rig::completion::Message;
+    use rig::message::{ToolResultContent, UserContent};
+    use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct EvidenceTool(Arc<AtomicUsize>);
+    impl Tool for EvidenceTool {
+        const NAME: &'static str = "read";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+        fn description(&self) -> String {
+            "Read a file".to_owned()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("EVIDENCE: src/lib.rs:7 defines the cache".to_owned())
+        }
+    }
+
+    const CONTRACT: &str = "## Findings\n- [confidence: high] The cache is defined at src/lib.rs:7.\n\n## Unverified\n- None\n\n## Coverage\n- Covered: src/lib.rs\n- Skipped: None\n";
+
+    fn history_has_tool_result(history: &[Message], needle: &str) -> bool {
+        history.iter().any(|message| match message {
+            Message::User { content } => content.iter().any(|item| {
+                match item {
+                UserContent::ToolResult(result) => result.content.iter().any(|part| {
+                    matches!(part, ToolResultContent::Text(text) if text.text.contains(needle))
+                }),
+                _ => false,
+            }
+            }),
+            _ => false,
+        })
+    }
+
+    fn child_turns(tool_turns: usize, then_text: Option<&str>) -> Vec<Vec<MockStreamEvent>> {
+        let mut turns = Vec::new();
+        for n in 0..tool_turns {
+            turns.push(vec![
+                MockStreamEvent::tool_call(
+                    format!("call-{n}"),
+                    EvidenceTool::NAME,
+                    serde_json::json!({"path": "src/lib.rs"}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]);
+        }
+        if let Some(text) = then_text {
+            turns.push(vec![
+                MockStreamEvent::text(text),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]);
+        }
+        turns
+    }
+
+    /// A tool-free continuation over the child's own history, as production
+    /// builds it (`ReportRepairGuard` blocks tools, one model turn).
+    fn continuation(
+        model: MockCompletionModel,
+        executed: Arc<AtomicUsize>,
+    ) -> impl FnMut(
+        Continuation,
+        String,
+        Vec<Message>,
+    ) -> Pin<Box<dyn Future<Output = SubagentRunOutput> + Send>> {
+        move |_, prompt, history| {
+            let agent = AgentBuilder::new(model.clone())
+                .tool(EvidenceTool(executed.clone()))
+                .add_hook(builder::ReportRepairGuard)
+                .build();
+            Box::pin(async move {
+                run_subagent_with_history(
+                    &agent,
+                    &prompt,
+                    history,
+                    REPORT_REPAIR_MAX_TURNS,
+                    None,
+                    &crate::retry::RetryConfig::default(),
+                    SharedUsageLedger::default(),
+                )
+                .await
+            })
+        }
+    }
+
+    async fn run_child(model: MockCompletionModel, max_turns: usize) -> SubagentRunOutput {
+        let agent = AgentBuilder::new(model)
+            .tool(EvidenceTool(Arc::default()))
+            .build();
+        run_subagent_with_history(
+            &agent,
+            "investigate the cache",
+            Vec::new(),
+            max_turns,
+            None,
+            &crate::retry::RetryConfig::default(),
+            SharedUsageLedger::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn repair_continues_the_childs_history_so_it_can_cite_tool_evidence() {
+        let child =
+            MockCompletionModel::from_stream_turns(child_turns(1, Some("looked around, all fine")));
+        let run = run_child(child, 5).await;
+        assert_eq!(run.tool_calls, 1);
+        assert!(history_has_tool_result(
+            &run.history,
+            "EVIDENCE: src/lib.rs:7"
+        ));
+
+        let repair = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text(CONTRACT),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let executed = Arc::new(AtomicUsize::new(0));
+        let finished = finish_child_run(
+            run,
+            || false,
+            4096,
+            continuation(repair.clone(), executed.clone()),
+        )
+        .await;
+
+        let requests = repair.requests();
+        assert_eq!(requests.len(), 1, "repair is exactly one model turn");
+        let seen: Vec<Message> = requests[0].chat_history.iter().cloned().collect();
+        assert!(
+            history_has_tool_result(&seen, "EVIDENCE: src/lib.rs:7"),
+            "the repair turn must see the child's tool results"
+        );
+        assert_eq!(executed.load(Ordering::SeqCst), 0, "repair runs no tools");
+        let response = finished.response.unwrap();
+        assert!(response.contains("src/lib.rs:7"), "{response}");
+        assert_eq!(finished.known_violations, Some(Vec::new()));
+        assert!(finished.details.unverified.is_none());
+        assert_eq!(finished.details.tool_calls, 1);
+        assert_eq!(finished.details.log[0].name, "read");
+        assert_eq!(
+            finished.details.log[0].result_bytes,
+            Some("EVIDENCE: src/lib.rs:7 defines the cache".len() as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_turn_budget_gets_one_tool_free_writeup_over_the_history() {
+        // Two tool turns fill the two-turn budget; the third request never happens.
+        let child = MockCompletionModel::from_stream_turns(child_turns(3, None));
+        let run = run_child(child.clone(), 2).await;
+        assert!(run.turn_budget_exhausted);
+        assert_eq!((run.turns, run.tool_calls), (2, 2));
+        assert_eq!(child.requests().len(), 2);
+
+        let writeup = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text(CONTRACT),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let executed = Arc::new(AtomicUsize::new(0));
+        let finished = finish_child_run(
+            run,
+            || false,
+            4096,
+            continuation(writeup.clone(), executed.clone()),
+        )
+        .await;
+
+        let requests = writeup.requests();
+        assert_eq!(requests.len(), 1, "write-up is exactly one model turn");
+        let seen: Vec<Message> = requests[0].chat_history.iter().cloned().collect();
+        assert!(history_has_tool_result(&seen, "EVIDENCE: src/lib.rs:7"));
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
+        let response = finished.response.unwrap();
+        assert!(
+            response.starts_with(
+                "[partial: turn budget exhausted after 2 model turns and 2 tool calls; findings written without tools]\n## Findings"
+            ),
+            "{response}"
+        );
+        assert!(response.contains("src/lib.rs:7"));
+        assert_eq!(
+            finished.known_violations,
+            Some(Vec::new()),
+            "valid write-up needs no repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_writeup_keeps_the_narration_with_counts_and_user_copy() {
+        let child = MockCompletionModel::from_stream_turns(child_turns(2, None));
+        let run = run_child(child, 1).await;
+        assert!(run.turn_budget_exhausted);
+        // The write-up and repair turns both come back empty.
+        let empty = MockCompletionModel::from_stream_turns(vec![
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+        ]);
+        let finished =
+            finish_child_run(run, || false, 4096, continuation(empty, Arc::default())).await;
+        let response = finished.response.unwrap();
+        assert!(
+            response.starts_with("[partial: turn budget exhausted after 1 model turns and 1 tool calls; no tool-free write-up available]"),
+            "{response}"
+        );
+        assert!(finished.details.unverified.is_some());
+    }
+
+    #[tokio::test]
+    async fn host_repair_keeps_raw_text_for_the_user_and_parent_text_is_unchanged() {
+        let raw = "RAW_CHILD_TEXT unstructured musings";
+        let child = MockCompletionModel::from_stream_turns(child_turns(0, Some(raw)));
+        let run = run_child(child, 3).await;
+        let bad_repair = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("still not a contract"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let finished = finish_child_run(
+            run,
+            || false,
+            4096,
+            continuation(bad_repair, Arc::default()),
+        )
+        .await;
+        let violations = finished.known_violations.clone().unwrap();
+        assert!(!violations.is_empty());
+        let unverified = finished.details.unverified.clone().expect("raw text kept");
+        assert_eq!(unverified, raw);
+        // What the parent model receives is the host-repaired report, produced
+        // with the raw text withheld; the details never enter it.
+        let parent_text =
+            enforce_validated_report_contract(finished.response.unwrap(), violations.clone(), 4096);
+        assert_eq!(parent_text, host_repaired_report(&violations));
+        assert!(parent_text.starts_with("[partial: subagent response contract repaired by host]"));
+        assert!(
+            !parent_text.contains("RAW_CHILD_TEXT"),
+            "raw text must not reach the parent"
+        );
+        assert!(parent_text.contains("/tasks result"));
     }
 }
 

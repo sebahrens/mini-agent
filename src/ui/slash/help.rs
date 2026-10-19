@@ -105,7 +105,7 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     #[cfg(feature = "subagents")]
     emit(
         false,
-        "  /tasks                list background subagents; result <id> / cancel <id>",
+        "  /tasks                list subagent tasks; <id> tool log, result <id>, cancel <id>",
     );
     emit(
         false,
