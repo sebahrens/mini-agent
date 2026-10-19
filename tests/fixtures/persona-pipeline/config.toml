@@ -1,0 +1,36 @@
+# Example designer -> implementer -> reviewer pipeline.
+# Every endpoint, model id and environment variable name below is a placeholder.
+# Only environment variable NAMES appear here; never put a key in this file.
+
+# Main loop starts on the designer's model (the `design` prompt switches to it).
+provider = "anthropic"
+model = "example-opus-model"
+
+# Designer: strongest model, Anthropic-native.
+[quick_models.opus]
+provider = "anthropic"
+model = "example-opus-model"
+
+# Implementer: GLM served by a different OpenAI-compatible endpoint.
+[quick_models.glm]
+provider = "glm"
+model = "example-glm-model"
+
+# Reviewer: a third profile on a separate gateway.
+[quick_models.review]
+provider = "openrouter"
+model = "example-vendor/example-reviewer-model"
+
+[custom_providers.glm]
+provider_type = "openai"
+base_url = "https://glm.example.invalid/v1"
+api_key_env = "EXAMPLE_GLM_API_KEY"
+api_style = "completions"
+
+# Selecting the `design` prompt switches the main loop to the opus alias.
+[prompt_to_model]
+design = "opus"
+
+# Write-mode implementer children are refused without this opt-in.
+[subagents]
+allow_write = true

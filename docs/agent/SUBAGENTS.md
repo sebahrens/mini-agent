@@ -481,6 +481,141 @@ response` but wraps it in a machine-checkable partial report with low
 confidence. This keeps malformed output useful without letting it masquerade as
 a complete specialist report.
 
+### Designer → implementer → reviewer pipeline
+
+Three models, three profiles: the main loop designs on a strong model,
+delegates edits to write-mode children on a cheaper model served by a different
+OpenAI-compatible endpoint, then hands the result to a read-only reviewer on a
+third profile. The complete example lives in
+`tests/fixtures/persona-pipeline/` and its wiring is pinned by
+`src/extras/subagents/task_tool/persona_pipeline_tests.rs` (no network).
+
+**Config** (`config.toml`; endpoints and model ids are placeholders, only
+environment variable names appear):
+
+```toml
+# Main loop starts on the designer's model (the `design` prompt switches to it).
+provider = "anthropic"
+model = "example-opus-model"
+
+# Designer: strongest model, Anthropic-native.
+[quick_models.opus]
+provider = "anthropic"
+model = "example-opus-model"
+
+# Implementer: GLM served by a different OpenAI-compatible endpoint.
+[quick_models.glm]
+provider = "glm"
+model = "example-glm-model"
+
+# Reviewer: a third profile on a separate gateway.
+[quick_models.review]
+provider = "openrouter"
+model = "example-vendor/example-reviewer-model"
+
+[custom_providers.glm]
+provider_type = "openai"
+base_url = "https://glm.example.invalid/v1"
+api_key_env = "EXAMPLE_GLM_API_KEY"
+api_style = "completions"
+
+# Selecting the `design` prompt switches the main loop to the opus alias.
+[prompt_to_model]
+design = "opus"
+
+# Write-mode implementer children are refused without this opt-in.
+[subagents]
+allow_write = true
+```
+
+**Personas**, in the user agents directory (or a trusted project's
+`.zerostack/agents/`):
+
+`designer.md`, a main-loop persona (`mode:` names a prompt):
+
+```markdown
+---
+description: Designs the change, delegates implementation, then requests review
+mode: design
+---
+You are the designer. Study the code, decide the approach, then split the work
+into small, self-contained implementation tasks. For each task call `task` with
+`agent_type: "implementer"` and a prompt that names the files, the exact change
+and how to verify it. When the implementer reports back, inspect the result and
+call `task` with `agent_type: "reviewer"` to review it before you answer.
+```
+
+`implementer.md`, a task child (`mode: write` plus a quick-model alias):
+
+```markdown
+---
+description: Implements one delegated change and verifies it
+mode: write
+model: glm
+tools: Read, Grep, Glob, Edit, Write, Bash
+turn_budget: high
+---
+Implement exactly the delegated change, run the stated verification, and report
+the files you changed and the result. Do not widen the scope.
+```
+
+`reviewer.md`, a read-only task child on the third profile:
+
+```markdown
+---
+description: Read-only review of the implemented change
+model: review
+tools: Read, Grep, Glob
+turn_budget: medium
+---
+Review the delegated change read-only. Report defects first, ordered by
+severity, each with file and line evidence. Do not propose edits you cannot
+justify from the code.
+```
+
+**Design prompt**, `prompts/design.md` in the prompts directory:
+
+```markdown
+You are in design mode. Do not edit files yourself. Produce a short design,
+delegate each implementation step to the `implementer` agent type through the
+`task` tool, and finish by delegating a review to the `reviewer` agent type.
+```
+
+**Start it** with `export EXAMPLE_GLM_API_KEY=...` (plus the Anthropic and
+OpenRouter keys, as environment variables) and run `/agent designer`. That
+activates the `design` prompt, and `[prompt_to_model] design = "opus"` switches
+the main loop to the opus alias. Each `task` call with
+`agent_type: "implementer"` then runs on the `glm` provider and each
+`agent_type: "reviewer"` call on the `review` alias. When a persona's alias
+names a different provider than the parent's, the task tool builds a separate
+client for it (`custom_providers` and `api_keys` from the same config); a raw
+model id in `model:` stays on the parent's provider.
+
+**Gotchas**
+
+- `mode:` has two meanings. In a main-loop persona it is a prompt name
+  (`design`); in a task child it is `write`. Designer and implementer must
+  therefore be separate personas, and `mode: write` on the designer is not a
+  way to make it write.
+- The designer must stay in standard security mode and must not be read-only:
+  write children inherit the parent's eligible tools, permissions and sandbox,
+  so a read-only designer yields read-only implementers. Do not put
+  `%%mode=readonly` in the design prompt.
+- `[subagents] allow_write = true` is required; without it the implementer is
+  refused. Each edit still goes through the parent's permission checker.
+- Write children run one at a time even with `task_max_concurrency` above one,
+  so independent implementation steps are serialized. Parallel isolation is
+  tracked in bead `mini-agent-9pnc5`.
+- The effective model and mode of each child are not yet shown in the task
+  result or `/agent` output; visibility is tracked in `mini-agent-7q04e`.
+- The `glm` provider is credential-isolated (see
+  [Custom provider credentials](CONFIG.md#custom-provider-credentials)): it
+  uses only `EXAMPLE_GLM_API_KEY` or `api_keys.glm`, never `OPENAI_API_KEY`.
+  An explicit `--api-key` takes priority over that isolation for every provider
+  the session starts, including `glm`, so supply the keys through environment
+  variables when the pipeline spans several endpoints. If the key is missing the
+  task fails with `could not initialize provider 'glm'` instead of falling back.
+
 ## What the Subagent Can Do
 
 ### Read tools (always available)
