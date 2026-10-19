@@ -636,13 +636,15 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
     let mut result = String::new();
 
     // Head
-    for i in 0..head_end {
-        if i > 0 {
-            result.push_str("\n\n");
-        }
-        match (&head_truncated, i) {
-            (Some(truncated), 0) => result.push_str(truncated),
-            _ => result.push_str(&head_lines[i]),
+    if let Some(truncated) = &head_truncated {
+        // A truncated oldest message is the whole head (`head_end == 1`).
+        result.push_str(truncated);
+    } else {
+        for (i, line) in head_lines.iter().enumerate().take(head_end) {
+            if i > 0 {
+                result.push_str("\n\n");
+            }
+            result.push_str(line);
         }
     }
 
