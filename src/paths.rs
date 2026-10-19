@@ -2396,25 +2396,31 @@ pub fn migrate_legacy_path(
 ) -> Result<LegacyMigrationStatus, LegacyMigrationError> {
     if path_exists_no_follow(&request.canonical, request.artifact, request.kind)? {
         if !path_exists_no_follow(&request.marker, request.artifact, LegacyArtifactKind::File)? {
-            let canonical_identity = content_identity(&request.canonical).map_err(|source| {
-                LegacyMigrationError::Io {
-                    artifact: request.artifact,
-                    path: request.canonical.clone(),
-                    source,
-                }
-            })?;
-            for candidate in
-                existing_candidates(&request.candidates, request.artifact, request.kind)?
-            {
-                let candidate_identity =
-                    content_identity(&candidate).map_err(|source| LegacyMigrationError::Io {
-                        artifact: request.artifact,
-                        path: candidate.clone(),
-                        source,
+            // Enumerate candidates first (stat only); the canonical tree is
+            // hashed only when a legacy candidate could be compared to it.
+            let candidates =
+                existing_candidates(&request.candidates, request.artifact, request.kind)?;
+            if !candidates.is_empty() {
+                let canonical_identity =
+                    content_identity(&request.canonical).map_err(|source| {
+                        LegacyMigrationError::Io {
+                            artifact: request.artifact,
+                            path: request.canonical.clone(),
+                            source,
+                        }
                     })?;
-                if candidate_identity == canonical_identity {
-                    write_migration_marker(request, &candidate, &canonical_identity)?;
-                    break;
+                for candidate in candidates {
+                    let candidate_identity = content_identity(&candidate).map_err(|source| {
+                        LegacyMigrationError::Io {
+                            artifact: request.artifact,
+                            path: candidate.clone(),
+                            source,
+                        }
+                    })?;
+                    if candidate_identity == canonical_identity {
+                        write_migration_marker(request, &candidate, &canonical_identity)?;
+                        break;
+                    }
                 }
             }
         }
@@ -3897,6 +3903,33 @@ mod tests {
 
         assert!(!is_first_startup);
         assert_eq!(config.provider.as_deref(), Some("openai"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_path_migration_without_candidates_never_reads_canonical_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, paths) = isolated_paths();
+        let canonical = paths.sessions_dir();
+        std::fs::create_dir_all(&canonical).unwrap();
+        let unreadable = canonical.join("big.json");
+        std::fs::write(&unreadable, b"session").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let request = LegacyMigrationRequest {
+            artifact: "sessions",
+            canonical,
+            candidates: vec![paths.data_dir.join("sessions")],
+            marker: paths.migration_markers_dir().join("sessions.json"),
+            requirement: LegacyArtifactRequirement::Optional,
+            kind: LegacyArtifactKind::Directory,
+            selected: None,
+        };
+        // Hashing the canonical tree would fail on the unreadable file (unless root).
+        let result = migrate_legacy_path(&request);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(result.unwrap(), LegacyMigrationStatus::CanonicalPresent);
+        assert!(!request.marker.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
