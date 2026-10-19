@@ -112,8 +112,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
 
         let session_id = self.session_id.to_string();
         let tool_name_owned = tool_name.to_owned();
-        let output = result.to_owned();
-        let output_for_write = output.clone();
+        let output: Arc<str> = Arc::from(result);
+        let output_for_write = Arc::clone(&output);
         let saved = spawn_blocking_scoped(move || {
             crate::session::storage::save_tool_output(
                 &session_id,
@@ -238,6 +238,17 @@ struct ToolLoopState {
     failures: HashMap<ToolCallFingerprint, u32>,
     recent_successful_edits: VecDeque<ToolCallFingerprint>,
     blocked_edit_pair: Option<[ToolCallFingerprint; 2]>,
+    /// Fingerprints computed at `ToolCall`, keyed by the call's internal id and
+    /// tagged with a cheap hash of the raw argument text, so `ToolResult`
+    /// reuses them instead of parsing and canonically hashing the args again.
+    pending: HashMap<String, (u64, ToolCallFingerprint)>,
+}
+
+fn raw_args_hash(args: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    args.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl ToolLoopState {
@@ -319,10 +330,17 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
     async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
             StepEvent::ToolCall {
-                tool_name, args, ..
+                tool_name,
+                args,
+                internal_call_id,
+                ..
             } => {
                 let fingerprint = tool_call_fingerprint(tool_name, args);
+                let raw = raw_args_hash(args);
                 let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                    state
+                        .pending
+                        .insert(internal_call_id.to_owned(), (raw, fingerprint));
                     state.exact_failure_notice(fingerprint).or_else(|| {
                         (tool_name == "edit")
                             .then(|| state.alternating_edit_notice(fingerprint))
@@ -342,7 +360,15 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 if outcome.is_error() || outcome.is_denied() {
                     record_tool_failure(internal_call_id);
                 }
-                let fingerprint = tool_call_fingerprint(tool_name, args);
+                let raw = raw_args_hash(args);
+                let cached = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                    state
+                        .pending
+                        .remove(internal_call_id)
+                        .filter(|(cached_raw, _)| *cached_raw == raw)
+                        .map(|(_, fingerprint)| fingerprint)
+                });
+                let fingerprint = cached.unwrap_or_else(|| tool_call_fingerprint(tool_name, args));
                 let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
                     state.record_result(tool_name, fingerprint, outcome)
                 });
@@ -360,8 +386,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
 }
 
 pub(crate) fn is_tool_loop_notice(output: &str) -> bool {
-    output.starts_with(TOOL_LOOP_NOTICE_PREFIX)
-        || output.contains(&format!("\n\n{TOOL_LOOP_NOTICE_PREFIX}"))
+    const SUFFIX_NEEDLE: &str = concat!("\n\n", "[tool-loop detected]");
+    output.starts_with(TOOL_LOOP_NOTICE_PREFIX) || output.contains(SUFFIX_NEEDLE)
 }
 
 #[derive(Clone)]
@@ -2361,8 +2387,7 @@ fn convert_history_uncached(
     canonical: bool,
 ) -> Vec<Message> {
     let (summary, first_kept) = session.compacted_context();
-    let replay_messages =
-        session.context_messages_with_pruned_tool_results(keep_recent_tool_results);
+    let replay_messages = session.pruned_context(keep_recent_tool_results);
     let remaining = replay_messages.len().saturating_sub(first_kept);
     let extra = if summary.is_some() { 1 } else { 0 };
     let mut messages = Vec::with_capacity(remaining + extra);
@@ -2402,7 +2427,7 @@ fn convert_history_uncached(
     let mut result_counts: HashMap<&str, usize> = HashMap::new();
     let mut call_positions: HashMap<&str, usize> = HashMap::new();
     let mut result_positions: HashMap<&str, usize> = HashMap::new();
-    for (position, msg) in replay_messages[first_kept..].iter().enumerate() {
+    for (position, msg) in replay_messages.iter_from(first_kept).enumerate() {
         let Some(id) = msg.tool_call_id.as_deref().filter(|id| !id.is_empty()) else {
             continue;
         };
@@ -2455,7 +2480,7 @@ fn convert_history_uncached(
     // would put the same `call_id` in the history twice.
     let mut replayed_subagent_ids: HashSet<String> = HashSet::new();
 
-    for msg in &replay_messages[first_kept..] {
+    for msg in replay_messages.iter_from(first_kept) {
         let structured_call_open = open_call_ids.len() > completed_call_ids.len();
         if !structured_call_open && !deferred_subagent_records.is_empty() {
             messages.append(&mut deferred_subagent_records);
@@ -2825,11 +2850,11 @@ where
 }
 
 fn normalized_continuation_bridge(
-    completed_interactions: &[Message],
+    completed_interactions: Vec<Message>,
     uncommitted_interactions: &[Message],
     continuation_instruction: &str,
 ) -> Vec<Message> {
-    let mut bridge = completed_interactions.to_vec();
+    let mut bridge = completed_interactions;
     bridge.extend_from_slice(uncommitted_interactions);
     if matches!(bridge.last(), Some(Message::User { .. })) {
         bridge.push(Message::assistant(String::new()));
@@ -3580,14 +3605,14 @@ where
                             return;
                         }
                     }
-                    Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    Ok(MultiTurnStreamItem::FinalResponse(mut res)) => {
                         terminal_response_seen = true;
                         let expected_prompt = stream_prompt.as_ref().map_or_else(
                             || retry_message.clone(),
                             |prompt| Message::user(prompt.clone()),
                         );
                         let completed_delta = match completed_stream_delta_message(
-                            res.messages.clone(),
+                            res.messages.take(),
                             &expected_prompt,
                         ) {
                             Ok(messages) => messages,
@@ -3947,19 +3972,20 @@ where
             } else {
                 new_interactions.as_slice()
             };
-            let continuation_bridge = normalized_continuation_bridge(
-                &completed_interactions,
+            // The bridge is the new `completed_interactions`: build it by
+            // moving the old one in and lend it to the injector below.
+            completed_interactions = normalized_continuation_bridge(
+                std::mem::take(&mut completed_interactions),
                 uncommitted_interactions,
                 &continuation_instruction,
             );
-            completed_interactions = continuation_bridge.clone();
             stream_prompt = Some(continuation_instruction.clone());
             stream = stream_policy.apply(
                 continue_prompt_message_injector(
                     &agent,
                     &retry_message,
                     &retry_history,
-                    &continuation_bridge,
+                    &completed_interactions,
                     remaining_turns,
                     native_capture.clone(),
                     Some(steering_hook.clone()),
@@ -4731,7 +4757,7 @@ where
             let new_interactions = take_new_interactions(&mut interactions);
             committed_interactions.extend(new_interactions.iter().cloned());
             continuation_bridge = normalized_continuation_bridge(
-                &continuation_bridge,
+                std::mem::take(&mut continuation_bridge),
                 &new_interactions,
                 &continuation_instruction,
             );
@@ -6087,6 +6113,19 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(repeated.to_string().contains("already read"));
+    }
+
+    #[test]
+    fn tool_loop_notice_detection_matches_prefix_and_suffix_forms() {
+        let notice = super::TOOL_LOOP_NOTICE_PREFIX;
+        assert!(super::is_tool_loop_notice(&format!("{notice} stop")));
+        assert!(super::is_tool_loop_notice(&format!(
+            "result\n\n{notice} stop"
+        )));
+        assert!(!super::is_tool_loop_notice(&format!(
+            "result {notice} inline"
+        )));
+        assert!(!super::is_tool_loop_notice("plain result"));
     }
 
     #[test]

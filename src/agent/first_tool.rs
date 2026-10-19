@@ -45,13 +45,7 @@ impl FirstRequestToolHook {
         let Some(tool) = tool else {
             return Self::default();
         };
-        let advertised = match agent.tool_server_handle.get_tool_defs(None).await {
-            Ok(defs) => defs.iter().any(|def| def.name == tool),
-            Err(error) => {
-                tracing::debug!(%error, "tool definitions unavailable; tool_choice not forced");
-                false
-            }
-        };
+        let advertised = agent.tool_server_handle.advertises_static_tool(tool).await;
         if !advertised {
             tracing::debug!(
                 tool,

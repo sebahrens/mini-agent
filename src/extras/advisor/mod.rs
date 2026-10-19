@@ -164,26 +164,26 @@ pub(crate) struct AdvisorContextHook;
 impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for AdvisorContextHook {
     async fn on_event(
         &self,
-        _ctx: &rig::agent::HookContext,
+        ctx: &rig::agent::HookContext,
         event: rig::agent::StepEvent<'_, M>,
     ) -> rig::agent::Flow {
         use rig::agent::StepEvent;
-        crate::agent::runner::with_advisor_messages(|messages| match event {
+        match event {
             StepEvent::CompletionCall {
                 prompt, history, ..
-            } => {
-                // Replace rather than append: retries and continuations carry their own history.
-                messages.clear();
-                for message in history.iter().chain(std::iter::once(prompt)) {
-                    append_message(messages, message);
-                }
+            } => rebuild_or_extend(ctx, history, prompt),
+            StepEvent::ModelTurnFinished { content, .. } => {
+                crate::agent::runner::with_advisor_messages(|messages| {
+                    append_assistant(messages, content)
+                });
             }
-            StepEvent::ModelTurnFinished { content, .. } => append_assistant(messages, content),
             StepEvent::ToolResult { result, .. } => {
-                append_context(messages, MessageRole::ToolResult, result.to_owned());
+                crate::agent::runner::with_advisor_messages(|messages| {
+                    append_context(messages, MessageRole::ToolResult, result.to_owned())
+                });
             }
             _ => {}
-        });
+        }
         rig::agent::Flow::cont()
     }
 
@@ -198,7 +198,97 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for AdvisorCo
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static APPENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What the run's previous `CompletionCall` left in the transcript: how many
+/// history messages it covered, how many transcript entries they produced, and
+/// cheap anchors that detect a replaced history (compaction, a retry carrying
+/// its own history) or a transcript another request rewrote.
+#[derive(Clone)]
+struct AdvisorCursor {
+    history_len: usize,
+    entries: usize,
+    first: u64,
+    last: u64,
+    transcript_anchor: u64,
+}
+
+fn anchor_of(value: &impl serde::Serialize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_vec(value)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn transcript_anchor(messages: &[SessionMessage], entries: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.hash(&mut hasher);
+    if let Some(last) = entries.checked_sub(1).and_then(|index| messages.get(index)) {
+        last.content.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Make the transcript equal `history` followed by `prompt`. When the run's
+/// previous call covered an unchanged prefix of this history, only the new
+/// suffix is converted; anything else is rebuilt from scratch. Either way the
+/// result is what a full rebuild produces.
+fn rebuild_or_extend(
+    ctx: &rig::agent::HookContext,
+    history: &[rig::completion::Message],
+    prompt: &rig::completion::Message,
+) {
+    let cursor = ctx.scratchpad().get::<AdvisorCursor>();
+    let first = history.first().map(anchor_of).unwrap_or_default();
+    let stored = crate::agent::runner::with_advisor_messages(|messages| {
+        let reusable = cursor.filter(|cursor| {
+            cursor.history_len > 0
+                && cursor.history_len <= history.len()
+                && cursor.entries <= messages.len()
+                && cursor.first == first
+                && cursor.last == anchor_of(&history[cursor.history_len - 1])
+                && cursor.transcript_anchor == transcript_anchor(messages, cursor.entries)
+        });
+        let start = match reusable {
+            Some(cursor) => {
+                // Drop what live events appended after the previous call; the
+                // history now carries those messages.
+                messages.truncate(cursor.entries);
+                cursor.history_len
+            }
+            None => {
+                // Retries and continuations carry their own history.
+                messages.clear();
+                0
+            }
+        };
+        for message in &history[start..] {
+            append_message(messages, message);
+        }
+        let entries = messages.len();
+        append_message(messages, prompt);
+        AdvisorCursor {
+            history_len: history.len(),
+            entries,
+            first,
+            last: history.last().map(anchor_of).unwrap_or_default(),
+            transcript_anchor: transcript_anchor(messages, entries),
+        }
+    });
+    if let Some(cursor) = stored {
+        ctx.scratchpad().insert(cursor);
+    }
+}
+
 fn append_context(messages: &mut Vec<SessionMessage>, role: MessageRole, content: String) {
+    #[cfg(test)]
+    APPENDS.with(|appends| appends.set(appends.get() + 1));
     messages.push(SessionMessage {
         user: None,
         recorded_diff: None,
@@ -488,6 +578,8 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
     let mut head_end = 0usize;
     let mut head_chars = 0usize;
     let mut head_truncated = None;
+    // Each kept line is formatted once here and reused when assembling.
+    let mut head_lines: Vec<String> = Vec::new();
     for (i, msg) in msgs.iter().enumerate() {
         let line = format_line(msg);
         let needed = if head_chars > 0 {
@@ -506,6 +598,7 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
         }
         head_chars += needed;
         head_end = i + 1;
+        head_lines.push(line);
     }
 
     // Collect tail (newest messages). The newest message is the most relevant
@@ -513,6 +606,8 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
     let mut tail_start = msgs.len();
     let mut tail_chars = 0usize;
     let mut tail_truncated = None;
+    // Newest first: `tail_lines[k]` is message `msgs.len() - 1 - k`.
+    let mut tail_lines: Vec<String> = Vec::new();
     for (i, msg) in msgs.iter().enumerate().rev() {
         let line = format_line(msg);
         let needed = if tail_chars > 0 {
@@ -531,6 +626,7 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
         }
         tail_chars += needed;
         tail_start = i;
+        tail_lines.push(line);
     }
 
     if msgs.is_empty() {
@@ -540,13 +636,15 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
     let mut result = String::new();
 
     // Head
-    for (i, msg) in msgs.iter().enumerate().take(head_end) {
-        if i > 0 {
-            result.push_str("\n\n");
-        }
-        match (&head_truncated, i) {
-            (Some(truncated), 0) => result.push_str(truncated),
-            _ => result.push_str(&format_line(msg)),
+    if let Some(truncated) = &head_truncated {
+        // A truncated oldest message is the whole head (`head_end == 1`).
+        result.push_str(truncated);
+    } else {
+        for (i, line) in head_lines.iter().enumerate().take(head_end) {
+            if i > 0 {
+                result.push_str("\n\n");
+            }
+            result.push_str(line);
         }
     }
 
@@ -559,13 +657,13 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
 
     // Tail (only messages not already in head)
     let tail_begin = head_end.max(tail_start);
-    for (i, msg) in msgs.iter().enumerate().skip(tail_begin) {
+    for i in tail_begin..msgs.len() {
         if i > tail_begin {
             result.push_str("\n\n");
         }
         match &tail_truncated {
             Some(truncated) if i + 1 == msgs.len() => result.push_str(truncated),
-            _ => result.push_str(&format_line(msg)),
+            _ => result.push_str(&tail_lines[msgs.len() - 1 - i]),
         }
     }
 
@@ -891,6 +989,86 @@ mod tests {
             assert!(!transcript.contains("raw output removed"));
         }
         assert!(snapshots[1].1.contains("[ToolResult]: context captured"));
+    }
+
+    #[tokio::test]
+    async fn advisor_context_extends_the_previous_transcript_instead_of_rebuilding() {
+        use futures::StreamExt;
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let probe_turn = |id: &str| {
+            vec![
+                MockStreamEvent::tool_call(
+                    id,
+                    ContextProbe::NAME,
+                    serde_json::json!({"question": id}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]
+        };
+        let model = MockCompletionModel::from_stream_turns(vec![
+            probe_turn("probe-a"),
+            probe_turn("probe-b"),
+            probe_turn("probe-c"),
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = rig::agent::AgentBuilder::new(model)
+            .tool(ContextProbe {
+                snapshots: Arc::clone(&snapshots),
+                barrier: None,
+            })
+            .add_hook(AdvisorContextHook)
+            .build();
+        let prior: Vec<rig::completion::Message> = (0..40)
+            .flat_map(|i| {
+                [
+                    rig::completion::Message::user(format!("prior user {i}")),
+                    rig::completion::Message::assistant(format!("prior assistant {i}")),
+                ]
+            })
+            .collect();
+        let before = APPENDS.with(std::cell::Cell::get);
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        scope
+            .run(async {
+                let mut stream = agent
+                    .stream_chat("active request", prior)
+                    .max_turns(6)
+                    .tool_concurrency(1)
+                    .await;
+                while let Some(item) = stream.next().await {
+                    item.unwrap();
+                }
+            })
+            .await;
+        let appended = APPENDS.with(std::cell::Cell::get) - before;
+        // Four provider calls over an 80-message prefix: a rebuild per call
+        // would append 320+ entries; the prefix is converted once.
+        assert!(appended < 160, "prefix was reconverted: {appended} appends");
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 3);
+        for (label, transcript) in snapshots.iter() {
+            for i in [0, 17, 39] {
+                for required in [
+                    format!("[User]: prior user {i}\n"),
+                    format!("[Assistant]: prior assistant {i}\n"),
+                ] {
+                    assert_eq!(
+                        transcript.matches(&required).count(),
+                        1,
+                        "{label}: {required}"
+                    );
+                }
+            }
+            assert_eq!(transcript.matches("[User]: active request").count(), 1);
+        }
+        let last = &snapshots[2].1;
+        assert_eq!(last.matches("[ToolCall]: probe-a").count(), 1);
+        assert_eq!(last.matches("[ToolCall]: probe-b").count(), 1);
+        assert_eq!(last.matches("[ToolCall]: probe-c").count(), 1);
     }
 
     #[tokio::test]
