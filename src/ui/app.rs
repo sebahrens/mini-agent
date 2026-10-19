@@ -4029,7 +4029,10 @@ impl<'a> App<'a> {
             self.refresh_custom_commands();
         }
         #[cfg(any(feature = "mcp", feature = "subagents"))]
-        if key.code == KeyCode::Char('@') && !self.run.is_running {
+        if key.code == KeyCode::Char('@')
+            && !self.run.is_running
+            && crate::ui::input::mention_can_start_at(&self.input.buffer, self.input.cursor)
+        {
             self.refresh_custom_commands();
         }
 

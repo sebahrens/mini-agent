@@ -2541,11 +2541,102 @@ pub(crate) fn project_config_relative_is_trusted_at_readonly(
     workspace.validate().is_ok() && store.bindings.contains(&binding)
 }
 
+/// Stat fingerprint of one path (no symlink following): identity, mode,
+/// owner, link count, size and nanosecond mtime/ctime. `ctime` cannot be
+/// restored from user space, so a rewrite that keeps size and mtime still
+/// changes it. `None` means the path is absent or the platform has no such
+/// fields, which disables the trust memo.
+#[cfg(unix)]
+fn stat_fingerprint(path: &Path) -> Option<[i64; 9]> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some([
+        m.dev() as i64,
+        m.ino() as i64,
+        i64::from(m.mode()),
+        i64::from(m.uid()),
+        m.nlink() as i64,
+        m.size() as i64,
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime() ^ m.ctime_nsec().rotate_left(40),
+    ])
+}
+
+#[cfg(not(unix))]
+fn stat_fingerprint(_path: &Path) -> Option<[i64; 9]> {
+    None
+}
+
+type TrustMemoKey = (PathBuf, PathBuf, bool);
+type TrustMemoStamp = Vec<[i64; 9]>;
+
+#[cfg(test)]
+thread_local! {
+    /// Full (content read + trust-store parse) trust evaluations on this thread.
+    static TRUST_FULL_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Memo of the last decision per (workspace, trust store, repair): reused only
+/// while every involved path still has the exact stat fingerprint it had when
+/// the decision was made. Any change, or an unreadable fingerprint, forces the
+/// full evaluation, so revocation and edits are never masked.
 fn project_config_is_trusted_in_workspace_mode(
     paths: &crate::paths::AppPaths,
     workspace: &crate::paths::WorkspaceBinding,
     repair: bool,
 ) -> bool {
+    static MEMO: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<TrustMemoKey, (TrustMemoStamp, bool)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let store = paths.project_config_trust_file();
+    let root = workspace.root();
+    let take_stamp = || {
+        let mut stamp = TrustMemoStamp::new();
+        stamp.push(stat_fingerprint(&root.join(".zerostack"))?);
+        stamp.push(stat_fingerprint(&root.join(".zerostack/config.toml"))?);
+        stamp.push(stat_fingerprint(store.parent()?)?);
+        // An absent store is a valid (empty) trust state; fingerprint it as such.
+        stamp.push(stat_fingerprint(&store).unwrap_or([0; 9]));
+        Some(stamp)
+    };
+    let stamp = take_stamp();
+    let key = (root.to_path_buf(), store.clone(), repair);
+    if let Some(stamp) = &stamp
+        && workspace.validate().is_ok()
+        && let Some((cached, decision)) = MEMO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        && cached == *stamp
+    {
+        return decision;
+    }
+    let decision = project_config_is_trusted_in_workspace_uncached(paths, workspace, repair);
+    // Repair (mode fix-up of the private store) bumps ctime on the store and its
+    // directory. Memoize the post-evaluation stamp only when nothing but ctime
+    // moved during the evaluation; any other difference leaves it unmemoized.
+    let settled = take_stamp().filter(|after| {
+        stamp.as_ref().is_some_and(|before| {
+            before.len() == after.len() && before.iter().zip(after).all(|(a, b)| a[..8] == b[..8])
+        })
+    });
+    if let Some(stamp) = settled {
+        MEMO.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (stamp, decision));
+    }
+    decision
+}
+
+fn project_config_is_trusted_in_workspace_uncached(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    repair: bool,
+) -> bool {
+    #[cfg(test)]
+    TRUST_FULL_EVALUATIONS.with(|n| n.set(n.get() + 1));
     let Ok((_, binding)) =
         read_project_config_in_workspace(workspace, Path::new(".zerostack/config.toml"))
     else {
@@ -4490,6 +4581,37 @@ pub(crate) mod bounded_project_trust_tests {
             credentials_dir: root.join("credentials"),
             project_dir: Some(root.join(".zerostack")),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_decision_is_memoized_on_stat_fingerprint_and_edits_force_full_check() {
+        let root = crate::tests::OwnedTestDirectory::new("trust-memo");
+        let paths = paths(root.path());
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "model='project-model'\n").unwrap();
+        trust_project_config(&config, &paths.project_config_trust_file()).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let count = || TRUST_FULL_EVALUATIONS.with(std::cell::Cell::get);
+
+        let start = count();
+        assert!(project_config_is_trusted_in_workspace(&paths, &workspace));
+        let first = count() - start;
+        assert!(first >= 1);
+        // The first call may repair the store's mode; allow one more settling pass.
+        assert!(project_config_is_trusted_in_workspace(&paths, &workspace));
+        let settled = count();
+        for _ in 0..5 {
+            assert!(project_config_is_trusted_in_workspace(&paths, &workspace));
+        }
+        assert_eq!(count(), settled, "unchanged files are not re-read");
+
+        // Same length, different bytes: the trust binding no longer matches.
+        std::fs::write(&config, "model='project-modeX'\n").unwrap();
+        assert!(!project_config_is_trusted_in_workspace(&paths, &workspace));
+        assert!(count() > settled, "an edited config forces the full check");
     }
 
     #[test]
