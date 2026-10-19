@@ -468,6 +468,58 @@ impl Default for FetchLimits {
     }
 }
 
+/// Small LRU of HTTP clients, each built for exactly one pinned destination
+/// set. A client pinned (via `resolve_to_addrs`) for host `h` and addresses `A`
+/// is only ever returned for the same `h` and the same address set, so every
+/// request still connects only to the answer that was validated and approved
+/// for it. A single shared client with a mutable host-to-address map would let
+/// two concurrent requests for one host observe each other's answer, so the
+/// pin is part of the cache key instead.
+pub(crate) struct PinnedClientCache<C> {
+    capacity: usize,
+    entries: std::sync::Mutex<Vec<(String, Vec<SocketAddr>, C)>>,
+}
+
+impl<C: Clone> PinnedClientCache<C> {
+    pub(crate) const fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn get_or_build<E>(
+        &self,
+        key: &str,
+        addresses: &[SocketAddr],
+        build: impl FnOnce() -> Result<C, E>,
+    ) -> Result<C, E> {
+        let mut pinned = addresses.to_vec();
+        pinned.sort_unstable();
+        pinned.dedup();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = entries.iter().position(|(entry_key, entry_addresses, _)| {
+            entry_key == key && *entry_addresses == pinned
+        }) {
+            // Most recently used last.
+            let entry = entries.remove(index);
+            let client = entry.2.clone();
+            entries.push(entry);
+            return Ok(client);
+        }
+        let client = build()?;
+        if entries.len() >= self.capacity {
+            entries.remove(0);
+        }
+        entries.push((key.to_owned(), pinned, client.clone()));
+        Ok(client)
+    }
+}
+
+#[cfg(all(feature = "js", feature = "sandbox"))]
+static BLOCKING_CLIENTS: PinnedClientCache<reqwest::blocking::Client> = PinnedClientCache::new(4);
+static ASYNC_CLIENTS: PinnedClientCache<reqwest::Client> = PinnedClientCache::new(16);
+
 #[cfg(all(feature = "js", feature = "sandbox"))]
 #[derive(Clone)]
 pub(crate) struct FetchTransport {
@@ -485,26 +537,41 @@ impl FetchTransport {
         limits: FetchLimits,
         resolved_host: Option<(&str, &[SocketAddr])>,
     ) -> Result<Self, FetchError> {
-        let mut builder = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .no_gzip()
-            .no_brotli()
-            .no_zstd()
-            .no_deflate()
-            .pool_max_idle_per_host(0)
-            .connect_timeout(limits.connect_timeout)
-            // The blocking client applies this bound to the initial response
-            // wait and every subsequent body read. `execute` separately owns
-            // the total wall-clock deadline across all successful reads.
-            .timeout(limits.read_timeout)
-            .user_agent(concat!("mini-agent-js-fetch/", env!("CARGO_PKG_VERSION")));
-        if let Some((host, addresses)) = resolved_host {
-            builder = builder.resolve_to_addrs(host, addresses);
-        }
-        let client = builder
-            .build()
-            .map_err(|error| FetchError::ClientBuild(error.to_string()))?;
+        let build = |resolved_host: Option<(&str, &[SocketAddr])>| {
+            let mut builder = reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .no_gzip()
+                .no_brotli()
+                .no_zstd()
+                .no_deflate()
+                .pool_max_idle_per_host(0)
+                .connect_timeout(limits.connect_timeout)
+                // The blocking client applies this bound to the initial response
+                // wait and every subsequent body read. `execute` separately owns
+                // the total wall-clock deadline across all successful reads.
+                .timeout(limits.read_timeout)
+                .user_agent(concat!("mini-agent-js-fetch/", env!("CARGO_PKG_VERSION")));
+            if let Some((host, addresses)) = resolved_host {
+                builder = builder.resolve_to_addrs(host, addresses);
+            }
+            builder
+                .build()
+                .map_err(|error| FetchError::ClientBuild(error.to_string()))
+        };
+        // A blocking client owns a runtime thread and TLS context; reuse the
+        // one pinned to this exact host and destination set.
+        let client = match resolved_host {
+            Some((host, addresses)) => {
+                let key = format!(
+                    "{host}|{}|{}",
+                    limits.connect_timeout.as_nanos(),
+                    limits.read_timeout.as_nanos()
+                );
+                BLOCKING_CLIENTS.get_or_build(&key, addresses, || build(resolved_host))?
+            }
+            None => build(None)?,
+        };
         Ok(Self { client, limits })
     }
 
@@ -720,21 +787,25 @@ pub(crate) async fn send_async(
         return Err(FetchError::RequestBodyTooLarge);
     }
     let host = url.host_str().ok_or(FetchError::MissingHost)?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .no_gzip()
-        .no_brotli()
-        .no_zstd()
-        .no_deflate()
-        .pool_max_idle_per_host(0)
-        .connect_timeout(limits.connect_timeout)
-        .read_timeout(limits.read_timeout)
-        .timeout(limits.total_timeout)
-        .user_agent(concat!("mini-agent-web/", env!("CARGO_PKG_VERSION")))
-        .resolve_to_addrs(host, addresses)
-        .build()
-        .map_err(|e| FetchError::ClientBuild(e.to_string()))?;
+    // Limits are the compile-time defaults, so the client depends only on the
+    // pinned host and destination set.
+    let client = ASYNC_CLIENTS.get_or_build(host, addresses, || {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(limits.connect_timeout)
+            .read_timeout(limits.read_timeout)
+            .timeout(limits.total_timeout)
+            .user_agent(concat!("mini-agent-web/", env!("CARGO_PKG_VERSION")))
+            .resolve_to_addrs(host, addresses)
+            .build()
+            .map_err(|e| FetchError::ClientBuild(e.to_string()))
+    })?;
     let mut builder = client
         .request(request.method.clone(), url.clone())
         .headers(request.headers.clone());
@@ -965,6 +1036,45 @@ fn native_error(error: FetchError) -> super::ToolError {
 #[cfg(test)]
 pub(crate) mod web_http_tests {
     use super::*;
+
+    #[test]
+    fn pinned_client_cache_reuses_only_for_the_exact_host_and_destination_set() {
+        let cache = PinnedClientCache::<u32>::new(2);
+        let a: SocketAddr = "203.0.113.1:443".parse().unwrap();
+        let b: SocketAddr = "198.51.100.2:443".parse().unwrap();
+        let built = std::cell::Cell::new(0);
+        let get = |host: &str, addresses: &[SocketAddr]| -> u32 {
+            cache
+                .get_or_build(host, addresses, || -> Result<u32, ()> {
+                    built.set(built.get() + 1);
+                    Ok(built.get())
+                })
+                .unwrap()
+        };
+        let first = get("example.test", &[a, b]);
+        assert_eq!(
+            get("example.test", &[b, a, a]),
+            first,
+            "same set, any order"
+        );
+        assert_eq!(built.get(), 1);
+        // A different answer for the same host must never reuse the pinned client.
+        assert_ne!(get("example.test", &[a]), first);
+        assert_ne!(get("other.test", &[a, b]), first);
+        assert_eq!(built.get(), 3);
+        // Capacity is bounded: the least recently used entry is evicted.
+        assert_ne!(get("example.test", &[a, b]), first);
+        assert_eq!(built.get(), 4);
+        // A failed build is not cached.
+        let failed: Result<u32, &str> = cache.get_or_build("bad.test", &[a], || Err("no"));
+        assert!(failed.is_err());
+        assert!(
+            cache
+                .get_or_build("bad.test", &[a], || -> Result<u32, ()> { Ok(99) })
+                .is_ok_and(|client| client == 99)
+        );
+    }
+
     use std::io::{Read, Write};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
