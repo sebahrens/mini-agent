@@ -2803,6 +2803,20 @@ impl Sandbox {
             .as_ref()
     }
 
+    /// Test seam: pin this sandbox's cache directory without touching the
+    /// process-global `ZS_CACHE_DIR`, which concurrent readers would observe.
+    #[cfg(test)]
+    fn with_test_cache_dir(self, dir: &Path) -> Self {
+        crate::fs::ensure_private_directory(dir).unwrap();
+        crate::fs::ensure_private_directory(&dir.join("tmp")).unwrap();
+        let canonical = dir.canonicalize().unwrap();
+        *self
+            .cached_cache_dir
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(canonical));
+        self
+    }
+
     fn get_cached_cache_dir(&self) -> Result<Arc<PathBuf>, String> {
         let mut cached = self
             .cached_cache_dir
@@ -6201,21 +6215,19 @@ mod sandbox_tests {
     #[test]
     fn repeated_launches_retain_each_write_root_once() {
         let owned = crate::tests::OwnedTestDirectory::new("retain-roots-once");
-        let _env = crate::tests::ScopedProcessEnv::set(&[(
-            "ZS_CACHE_DIR",
-            Some(owned.path().join("cache").into_os_string()),
-        )]);
         let root = owned.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
         let extra = owned.path().join("extra");
         std::fs::create_dir(&extra).unwrap();
         // One explicit write root equals the workspace, one is distinct.
-        let sandbox = Sandbox::new(true, "__missing_retain_once_backend").with_general_profile(
-            SandboxProfile::Workspace,
-            Vec::new(),
-            vec![root.clone(), extra.clone()],
-        );
+        let sandbox = Sandbox::new(true, "__missing_retain_once_backend")
+            .with_test_cache_dir(&owned.path().join("cache"))
+            .with_general_profile(
+                SandboxProfile::Workspace,
+                Vec::new(),
+                vec![root.clone(), extra.clone()],
+            );
         sandbox.retain_git_write_roots(&root).unwrap();
         let retained = || sandbox.git_write_roots.lock().unwrap().len();
         let first = retained();
@@ -6229,15 +6241,13 @@ mod sandbox_tests {
     #[test]
     fn profile100_admitted_carrier_keeps_write_authority_after_sandbox_drop() {
         let owned = crate::tests::OwnedTestDirectory::new("profile100-command-lease");
-        let _env = crate::tests::ScopedProcessEnv::set(&[(
-            "ZS_CACHE_DIR",
-            Some(owned.path().join("cache").into_os_string()),
-        )]);
         let root = owned.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
-        let sandbox = Sandbox::new(true, "__missing_profile100_backend").with_workspace_binding(
-            Arc::new(crate::paths::WorkspaceBinding::capture(&root).unwrap()),
-        );
+        let sandbox = Sandbox::new(true, "__missing_profile100_backend")
+            .with_test_cache_dir(&owned.path().join("cache"))
+            .with_workspace_binding(Arc::new(
+                crate::paths::WorkspaceBinding::capture(&root).unwrap(),
+            ));
         sandbox.retain_git_write_roots(&root).unwrap();
         let weak = Arc::downgrade(sandbox.git_write_roots.lock().unwrap().first().unwrap());
         let carrier = disabled()
