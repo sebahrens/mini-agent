@@ -10285,7 +10285,7 @@ mod permission_loop_tests {
             app.input.clear_buffer();
             // Same result with a non-empty draft: the chords are not editor keys.
             for c in "draft".chars() {
-                app.input.handle_paste(c.to_string().into());
+                app.input.handle_paste(c.to_string());
             }
             let _ = app
                 .handle_user_event(UserEvent::Key(KeyEvent::new(code, modifiers)))
