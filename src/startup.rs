@@ -211,10 +211,53 @@ mod startup_cache_pricing_tests {
 
 /// Regenerate embedded prompts/themes, printing the actual outcome instead
 /// of claiming success on failure. Returns true when regeneration succeeded.
-fn regen_resource(regen: fn() -> anyhow::Result<()>, what: &str, suffix: &str) -> bool {
+/// " (N edited file(s) saved as <name>.bak: a, b)" or an empty string.
+pub(crate) fn backup_note(report: &context::RegenReport) -> String {
+    if report.backed_up.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} edited file(s) saved as <name>.bak first: {}",
+            report.backed_up.len(),
+            report.backed_up.join(", ")
+        )
+    }
+}
+
+fn regen_prompt_text(
+    what: &str,
+    dir: &std::path::Path,
+    config_key: &str,
+    preview: (usize, Vec<String>),
+) -> String {
+    let (total, edited) = preview;
+    let mut text = format!(
+        "mini-agent was updated. Regenerate {what}? This rewrites {total} bundled file(s) in {}",
+        dir.display()
+    );
+    if edited.is_empty() {
+        text.push_str(" (no local edits detected).");
+    } else {
+        text.push_str(&format!(
+            ". {} differ from the bundled copy and will be saved as <name>.bak before replacement: {}.",
+            edited.len(),
+            edited.join(", ")
+        ));
+    }
+    text.push_str(&format!(
+        " Set {config_key} = true/false to skip this question.\nRegenerate {what}? [y/N] "
+    ));
+    text
+}
+
+fn regen_resource(
+    regen: fn() -> anyhow::Result<context::RegenReport>,
+    what: &str,
+    suffix: &str,
+) -> bool {
     match regen() {
-        Ok(()) => {
-            eprintln!("{} regenerated{}.", what, suffix);
+        Ok(report) => {
+            eprintln!("{} regenerated{}{}.", what, suffix, backup_note(&report));
             true
         }
         Err(e) => {
@@ -1620,7 +1663,15 @@ impl Startup {
                             regen_resource(context::prompts::regen, "Prompts", " (first launch)");
                     } else {
                         let mut input = String::new();
-                        eprint!("Regenerate prompts? [y/N] ");
+                        eprint!(
+                            "{}",
+                            regen_prompt_text(
+                                "prompts",
+                                &prompts_dir,
+                                "auto_update_prompts",
+                                context::prompts::regen_preview(),
+                            )
+                        );
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         std::io::stdin().read_line(&mut input)?;
                         if matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
@@ -1641,7 +1692,15 @@ impl Startup {
                             regen_resource(context::themes::regen, "Themes", " (first launch)");
                     } else {
                         let mut input = String::new();
-                        eprint!("Regenerate themes? [y/N] ");
+                        eprint!(
+                            "{}",
+                            regen_prompt_text(
+                                "themes",
+                                &themes_dir,
+                                "auto_update_themes",
+                                context::themes::regen_preview(),
+                            )
+                        );
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         std::io::stdin().read_line(&mut input)?;
                         if matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {

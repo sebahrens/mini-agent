@@ -318,9 +318,15 @@ async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
 
 async fn handle_regen_prompts(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match context::prompts::regen() {
-        Ok(()) => {
+        Ok(report) => {
             ctx.context.prompts = context::prompts::load();
-            write_ok(ctx.renderer, "default prompts regenerated");
+            write_ok(
+                ctx.renderer,
+                format!(
+                    "default prompts regenerated{}",
+                    crate::startup::backup_note(&report)
+                ),
+            );
         }
         Err(e) => {
             write_error(ctx.renderer, format!("failed to regenerate prompts: {}", e));
@@ -331,9 +337,15 @@ async fn handle_regen_prompts(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 
 async fn handle_regen_themes(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match context::themes::regen() {
-        Ok(()) => {
+        Ok(report) => {
             ctx.context.themes = context::themes::load();
-            write_ok(ctx.renderer, "default themes regenerated");
+            write_ok(
+                ctx.renderer,
+                format!(
+                    "default themes regenerated{}",
+                    crate::startup::backup_note(&report)
+                ),
+            );
         }
         Err(e) => {
             write_error(ctx.renderer, format!("failed to regenerate themes: {}", e));
