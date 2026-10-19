@@ -54,11 +54,18 @@ pub(crate) fn write_rules() -> String {
 
 #[cfg(feature = "memory")]
 pub(crate) fn explore_prompt() -> String {
-    EXPLORE_PROMPT.replacen(
-        "\n## Rules",
-        "\n- **memory_read**: Read persistent memory files (long-term, scratchpad, daily logs, notes).\n- **memory_search**: Keyword search across all memory files.\n\n## Rules",
-        1,
-    )
+    // The text derives from a constant, so build it once per process rather
+    // than once per fanned-out child.
+    static PROMPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROMPT
+        .get_or_init(|| {
+            EXPLORE_PROMPT.replacen(
+                "\n## Rules",
+                "\n- **memory_read**: Read persistent memory files (long-term, scratchpad, daily logs, notes).\n- **memory_search**: Keyword search across all memory files.\n\n## Rules",
+                1,
+            )
+        })
+        .clone()
 }
 
 #[cfg(not(feature = "memory"))]
