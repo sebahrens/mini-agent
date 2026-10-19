@@ -224,8 +224,15 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
 /// Turn-end save: the session is serialized here, on the caller's task, and
 /// the bytes are handed to a per-session single-flight blocking writer
 /// (latest snapshot wins). The write itself is the same atomic, fsynced,
-/// lock-owned publication as [`save_session`]. Without a Tokio runtime, or for
-/// native-bearing sessions, this is exactly [`save_session`].
+/// lock-owned publication as [`save_session`]. Without a Tokio runtime, or
+/// with persistence disabled, this is exactly [`save_session`].
+///
+/// A native-bearing session is not serialized here at all: its exact owner is
+/// checked, then a clone goes to the same writer, which runs the ordinary
+/// native snapshot (digest, revision/phase and lease checks, projection,
+/// fsync) off the UI task. The write-time revision check still refuses to
+/// overwrite a newer checkpoint, and a snapshot an acknowledged newer
+/// checkpoint of the same owner has superseded is dropped (latest wins).
 ///
 /// A failure of an earlier deferred write is returned by the next call (and by
 /// [`flush_deferred_sessions`]), so callers still warn about it.
@@ -233,14 +240,26 @@ pub fn save_session_deferred(session: &Session) -> anyhow::Result<()> {
     let Some(runtime) = deferred::runtime() else {
         return save_session(session);
     };
-    if super::native_publication::is_native_bearing(session) || disabled("sessions") {
+    if super::native_publication::is_native_bearing(session) {
+        super::native_publication::ensure_snapshot_owner(session)?;
+        return deferred::queue(
+            &runtime,
+            &session.id,
+            deferred::Snapshot::Native(Box::new(session.clone())),
+        );
+    }
+    if disabled("sessions") {
         return save_session(session);
     }
     session
         .validate_native_persistence()
         .map_err(anyhow::Error::from)?;
     let json = serialize_bounded_session(session)?;
-    deferred::queue(&runtime, &session.id, json.into_bytes())
+    deferred::queue(
+        &runtime,
+        &session.id,
+        deferred::Snapshot::Legacy(json.into_bytes()),
+    )
 }
 
 /// Join every deferred session write; returns the first failure. Exit paths
@@ -308,9 +327,15 @@ mod deferred {
     use std::collections::HashMap;
     use std::sync::{Condvar, LazyLock, Mutex};
 
+    /// One queued turn-end snapshot. Latest wins, whichever kind it is.
+    pub(super) enum Snapshot {
+        Legacy(Vec<u8>),
+        Native(Box<crate::session::Session>),
+    }
+
     #[derive(Default)]
     struct Slot {
-        queued: Option<Vec<u8>>,
+        queued: Option<Snapshot>,
         writing: bool,
         error: Option<String>,
     }
@@ -349,12 +374,12 @@ mod deferred {
     pub(super) fn queue(
         runtime: &tokio::runtime::Handle,
         session_id: &str,
-        bytes: Vec<u8>,
+        snapshot: Snapshot,
     ) -> anyhow::Result<()> {
         let (start, previous) = {
             let mut slots = slots();
             let slot = slots.entry(session_id.to_string()).or_default();
-            slot.queued = Some(bytes);
+            slot.queued = Some(snapshot);
             let start = !slot.writing;
             slot.writing = true;
             (start, slot.error.take())
@@ -388,14 +413,14 @@ mod deferred {
     fn drain(session_id: &str) {
         let _reset = PanicReset(session_id);
         loop {
-            let bytes = {
+            let snapshot = {
                 let mut slots = slots();
                 let Some(slot) = slots.get_mut(session_id) else {
                     WRITERS.idle.notify_all();
                     return;
                 };
                 match slot.queued.take() {
-                    Some(bytes) => bytes,
+                    Some(snapshot) => snapshot,
                     None => {
                         // Cleared under the same lock `queue` checks, so a
                         // snapshot queued now starts a new writer.
@@ -405,7 +430,12 @@ mod deferred {
                     }
                 }
             };
-            let result = super::write_legacy_snapshot(session_id, &bytes);
+            let result = match snapshot {
+                Snapshot::Legacy(bytes) => super::write_legacy_snapshot(session_id, &bytes),
+                Snapshot::Native(session) => {
+                    super::super::native_publication::save_snapshot_deferred(&session)
+                }
+            };
             let mut slots = slots();
             if let Some(slot) = slots.get_mut(session_id) {
                 slot.error = result.err().map(|error| format!("{error:#}"));
