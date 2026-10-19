@@ -247,6 +247,13 @@ impl TryFrom<UncheckedSessionMessage> for SessionMessage {
 
 impl SessionMessage {
     pub(crate) fn validate_user(&self) -> Result<(), &'static str> {
+        self.validate_user_with(false)
+    }
+    /// Save-time form: user rows were fully validated when built or decoded.
+    pub(crate) fn validate_user_stored(&self) -> Result<(), &'static str> {
+        self.validate_user_with(true)
+    }
+    fn validate_user_with(&self, stored: bool) -> Result<(), &'static str> {
         if let Some(PersistedToolMessage::Result { images, .. }) = &self.tool {
             tool_image::validate_images(images)?;
             if !images.is_empty()
@@ -258,7 +265,11 @@ impl SessionMessage {
             }
         }
         if let Some(user) = &self.user {
-            user.validate()?;
+            if stored {
+                user.validate_stored()?;
+            } else {
+                user.validate()?;
+            }
             if self.role != MessageRole::User
                 || self.tool.is_some()
                 || self.tool_call_id.is_some()
@@ -685,7 +696,8 @@ pub struct Session {
     #[cfg(feature = "subagents")]
     #[serde(
         default,
-        skip_serializing_if = "crate::extras::subagents::background::History::is_empty"
+        skip_serializing_if = "background_observation::background_history_skipped",
+        serialize_with = "background_observation::serialize_background_history"
     )]
     pub(crate) background_history: crate::extras::subagents::background::History,
     pub messages: Vec<SessionMessage>,
@@ -737,9 +749,17 @@ pub struct Session {
     pub input_output_prices_known: Option<bool>,
     /// Monotonic live accounting and a saved observed-spend checkpoint. Pending
     /// receipts are never imported from a session; only the ledger stores them.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::spend::Account::is_uninitialised"
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "subagents",
+        serde(
+            skip_serializing_if = "background_observation::spend_account_skipped",
+            serialize_with = "background_observation::serialize_spend_account"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "subagents"),
+        serde(skip_serializing_if = "crate::spend::Account::is_uninitialised")
     )]
     pub(crate) spend_account: crate::spend::Account,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -787,9 +807,17 @@ pub struct Session {
     /// persisted; startup recreates it from the active configuration.
     #[serde(skip)]
     pub(crate) read_tracker: crate::agent::tools::ReadTracker,
-    #[serde(
-        default,
-        skip_serializing_if = "file_checkpoints::FileCheckpoints::is_empty"
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "subagents",
+        serde(
+            skip_serializing_if = "background_observation::file_checkpoints_skipped",
+            serialize_with = "background_observation::serialize_file_checkpoints"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "subagents"),
+        serde(skip_serializing_if = "file_checkpoints::FileCheckpoints::is_empty")
     )]
     pub(crate) file_checkpoints: file_checkpoints::FileCheckpoints,
     /// Artifact handoff shared by every rebuild of this logical session.
@@ -1530,7 +1558,7 @@ impl Session {
 
     pub(crate) fn validate_user_messages(&self) -> anyhow::Result<()> {
         for message in &self.messages {
-            message.validate_user().map_err(anyhow::Error::msg)?;
+            message.validate_user_stored().map_err(anyhow::Error::msg)?;
         }
         Ok(())
     }

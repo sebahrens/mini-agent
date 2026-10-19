@@ -49,6 +49,37 @@ struct HeldSessionLock {
     name: std::ffi::OsString,
     io: Mutex<()>,
     state: Mutex<LeaseState>,
+    /// Stamp of the legacy snapshot this lease last published. The lease is the
+    /// only writer, so an unchanged stamp means the file is still the bytes
+    /// already classified as legacy and need not be read and parsed again.
+    classified: Mutex<Option<LegacyStamp>>,
+}
+
+/// Physical identity plus size and mtime of a published legacy snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyStamp {
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl LegacyStamp {
+    #[cfg(unix)]
+    fn of(file: &File) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        metadata.is_file().then(|| Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+    #[cfg(not(unix))]
+    fn of(_file: &File) -> Option<Self> {
+        None
+    }
 }
 
 impl HeldSessionLock {
@@ -115,6 +146,16 @@ impl HeldSessionLock {
         }
         #[cfg(not(unix))]
         crate::fs::validate_private_file(&file)?;
+        let known_legacy = LegacyStamp::of(&file).is_some_and(|stamp| {
+            self.classified
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                == Some(&stamp)
+        });
+        if known_legacy {
+            return self.repair_classified_legacy(&file);
+        }
         let identity = crate::fs::checked_file_metadata(&file)?;
         let mut bytes = Vec::new();
         file.by_ref()
@@ -158,9 +199,14 @@ impl HeldSessionLock {
             current_bytes == bytes,
             "saved session changed during classification"
         );
-        self.validate_namespace()?;
-        // Preserve the existing Unix legacy repair contract, on the exact
-        // classified descriptor. No pathname is reopened for mutation.
+        self.repair_classified_legacy(&file)
+    }
+
+    /// Preserve the existing Unix legacy repair contract, on the exact
+    /// classified descriptor. No pathname is reopened for mutation. The final
+    /// namespace check follows the repair; the check before it adds nothing
+    /// because the repair acts on the retained descriptor.
+    fn repair_classified_legacy(&self, file: &File) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -173,18 +219,31 @@ impl HeldSessionLock {
             );
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        crate::fs::validate_private_file(&file)?;
+        crate::fs::validate_private_file(file)?;
         self.validate_namespace()?;
         Ok(())
     }
 
     fn publish(&self, session_id: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.publish_stamped(session_id, bytes, true).map(|_| ())
+    }
+
+    /// `validate_entry` is false only when the caller validated the namespace
+    /// immediately before with nothing in between (legacy prepare + publish).
+    fn publish_stamped(
+        &self,
+        session_id: &str,
+        bytes: &[u8],
+        validate_entry: bool,
+    ) -> anyhow::Result<Option<LegacyStamp>> {
         crate::paths::validate_portable_component(session_id)?;
         anyhow::ensure!(
             self.name == std::ffi::OsStr::new(&format!("{session_id}.lock")),
             "checkpoint does not match its retained session lock"
         );
-        self.validate_namespace()?;
+        if validate_entry {
+            self.validate_namespace()?;
+        }
         let parent = crate::fs::checked_file_metadata(&self.root.try_clone_directory_file()?)?;
         let name = format!("{session_id}.json");
         match self.root.open_regular_relative(std::path::Path::new(&name)) {
@@ -203,7 +262,7 @@ impl HeldSessionLock {
             .open_regular_relative(std::path::Path::new(&name))?;
         crate::fs::validate_private_file(&published)?;
         self.root.validate_private_root()?;
-        Ok(())
+        Ok(LegacyStamp::of(&published))
     }
 }
 
@@ -362,7 +421,6 @@ pub(super) fn publish_legacy_owned_id(session_id: &str, bytes: &[u8]) -> anyhow:
         .io
         .try_lock()
         .map_err(|_| anyhow::anyhow!("saved-session writer is busy"))?;
-    held.validate_namespace()?;
     {
         let state = held.state.lock().unwrap_or_else(|error| error.into_inner());
         anyhow::ensure!(
@@ -370,8 +428,15 @@ pub(super) fn publish_legacy_owned_id(session_id: &str, bytes: &[u8]) -> anyhow:
             "native checkpoint requires its original owner"
         );
     }
+    // `prepare_legacy_target` opens with the namespace check and `publish`
+    // skips its entry check because prepare just ended with one.
     held.prepare_legacy_target(session_id)?;
-    held.publish(session_id, bytes)
+    let stamp = held.publish_stamped(session_id, bytes, false);
+    *held
+        .classified
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = stamp.as_ref().ok().cloned().flatten();
+    stamp.map(|_| ())
 }
 
 /// Result of trying to take ownership of a session id.
@@ -446,6 +511,7 @@ pub fn claim_session(session_id: &str) -> anyhow::Result<SessionClaim> {
             .to_os_string(),
         state: Mutex::default(),
         io: Mutex::default(),
+        classified: Mutex::default(),
     });
     lease.validate_namespace()?;
     match lease.file.try_lock() {

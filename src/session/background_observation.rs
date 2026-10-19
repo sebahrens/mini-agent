@@ -164,6 +164,74 @@ impl ObservationStamp {
     }
 }
 
+struct FrozenStores {
+    account: crate::spend::Account,
+    files: super::file_checkpoints::FileCheckpoints,
+    history: crate::extras::subagents::background::History,
+}
+thread_local! {
+    static FROZEN: std::cell::RefCell<Option<FrozenStores>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// Restores the previous override (normally none) when serialization ends.
+pub(super) struct FrozenSerialization(Option<FrozenStores>);
+impl Drop for FrozenSerialization {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        FROZEN.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+pub(super) fn serialize_spend_account<S: serde::Serializer>(
+    live: &crate::spend::Account,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::Serialize;
+    FROZEN.with(|slot| match &*slot.borrow() {
+        Some(frozen) => frozen.account.serialize(serializer),
+        None => live.serialize(serializer),
+    })
+}
+pub(super) fn spend_account_skipped(live: &crate::spend::Account) -> bool {
+    FROZEN.with(|slot| match &*slot.borrow() {
+        Some(frozen) => frozen.account.is_uninitialised(),
+        None => live.is_uninitialised(),
+    })
+}
+pub(super) fn serialize_file_checkpoints<S: serde::Serializer>(
+    live: &super::file_checkpoints::FileCheckpoints,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::Serialize;
+    FROZEN.with(|slot| match &*slot.borrow() {
+        Some(frozen) => frozen.files.serialize(serializer),
+        None => live.serialize(serializer),
+    })
+}
+pub(super) fn file_checkpoints_skipped(live: &super::file_checkpoints::FileCheckpoints) -> bool {
+    FROZEN.with(|slot| match &*slot.borrow() {
+        Some(frozen) => frozen.files.is_empty(),
+        None => live.is_empty(),
+    })
+}
+pub(super) fn serialize_background_history<S: serde::Serializer>(
+    live: &crate::extras::subagents::background::History,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::Serialize;
+    FROZEN.with(|slot| match &*slot.borrow() {
+        Some(frozen) => frozen.history.serialize(serializer),
+        None => live.serialize(serializer),
+    })
+}
+pub(super) fn background_history_skipped(
+    live: &crate::extras::subagents::background::History,
+) -> bool {
+    FROZEN.with(|slot| match &*slot.borrow() {
+        Some(frozen) => frozen.history.is_empty(),
+        None => live.is_empty(),
+    })
+}
+
 /// Exact old data and runtime identities beside a native publication's whole
 /// Session fingerprint. Never Deserialize; the detached copies grant nothing.
 #[derive(Debug, Clone)]
@@ -193,6 +261,17 @@ impl SharedObservations {
                     })
             })
         }))
+    }
+    /// Serialize the three shared stores as their frozen observation for the
+    /// current thread until the guard drops, so a borrowed `Session` encodes
+    /// exactly as `frozen_session` would without cloning the messages.
+    pub(super) fn install_frozen_serialization(&self) -> FrozenSerialization {
+        let installed = FrozenStores {
+            account: self.account.frozen(),
+            files: self.files.frozen(),
+            history: self.history.frozen(),
+        };
+        FrozenSerialization(FROZEN.with(|slot| slot.replace(Some(installed))))
     }
     pub(super) fn frozen_session(&self, session: &super::Session) -> super::Session {
         let mut frozen = session.clone();

@@ -28,11 +28,11 @@ pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
 }
 
 pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<String> {
+    // Encode the shared stores' coherent observation cut through a thread-local
+    // override instead of deep-cloning the whole Session (mini-agent-hcb3s).
     #[cfg(feature = "subagents")]
-    let snapshot = super::background_observation::SharedObservations::capture(session)
-        .map(|observations| observations.frozen_session(session));
-    #[cfg(feature = "subagents")]
-    let session = snapshot.as_ref().unwrap_or(session);
+    let _frozen = super::background_observation::SharedObservations::capture(session)
+        .map(|observations| observations.install_frozen_serialization());
     session.validate_user_messages()?;
     anyhow::ensure!(
         session.messages.len() <= MAX_SESSION_MESSAGES,
@@ -271,17 +271,86 @@ impl Drop for DeferSavesForTest {
     }
 }
 
+/// What this process last published for a session file. A save whose bytes
+/// are identical and whose file is still the exact inode this process wrote
+/// (same length and mtime) changes nothing on disk, so it skips the claim,
+/// the legacy pre-read and both fsyncs (mini-agent-3bri2). Any difference,
+/// including a deleted or replaced file, falls through to the full write.
+#[derive(Clone, PartialEq, Eq)]
+struct PublishedSnapshot {
+    digest: [u8; 32],
+    file: FileStamp,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    device: u64,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+    })
+}
+
+fn published_snapshots()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, PublishedSnapshot>> {
+    static PUBLISHED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, PublishedSnapshot>>,
+    > = std::sync::LazyLock::new(Default::default);
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn snapshot_digest(json: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(json).into()
+}
+
 fn write_legacy_snapshot(session_id: &str, json: &[u8]) -> anyhow::Result<()> {
     let dir = session_dir();
     crate::paths::ensure_private_directory(&dir)?;
     let path = session_path(session_id)?;
+    let digest = snapshot_digest(json);
+    if let Some(published) = published_snapshots().get(&path).cloned()
+        && published.digest == digest
+        && file_stamp(&path).as_ref() == Some(&published.file)
+    {
+        return Ok(());
+    }
     // The snapshot replaces the whole file, so only the process that owns the
     // session may write it; another owner's turns would otherwise be lost
     // (mini-agent-e42za). Without an established lock, only an atomic
     // create-only publication of a missing target is eligible.
     match crate::session::lock::claim_session(session_id) {
         Ok(crate::session::lock::SessionClaim::Owned) => {
-            super::lock::publish_legacy_owned_id(session_id, json)
+            super::lock::publish_legacy_owned_id(session_id, json)?;
+            match file_stamp(&path) {
+                Some(file) => {
+                    published_snapshots().insert(path, PublishedSnapshot { digest, file });
+                }
+                None => {
+                    published_snapshots().remove(&path);
+                }
+            }
+            Ok(())
         }
         Ok(crate::session::lock::SessionClaim::HeldElsewhere) => {
             Err(crate::session::lock::held_elsewhere_error(session_id))
@@ -593,6 +662,40 @@ fn read_discovered_session(path: &Path, skipped: &mut SkippedEntries) -> Option<
     }
 }
 
+/// Bytes of a session file inspected for its `name`. `id` and `name` are the
+/// first serialized fields, so a few KiB covers every realistic file.
+const NAME_PEEK_BYTES: usize = 4 * 1024;
+
+/// Read the top-level `name` from the head of a session file without reading
+/// or parsing the rest. `None` means "undetermined" (unsafe or unreadable
+/// file, no `name` before the cut), and the caller then decodes the full file.
+fn peek_session_name(path: &Path) -> Option<String> {
+    use serde::de::{Deserializer as _, Error as _, IgnoredAny, MapAccess, Visitor};
+    struct Head<'a>(&'a mut Option<String>);
+    impl<'de> Visitor<'de> for Head<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a session object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if key == "name" {
+                    *self.0 = Some(map.next_value::<String>()?);
+                    // Found; stop before reaching the truncated tail.
+                    return Err(A::Error::custom("name found"));
+                }
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let file = crate::fs::open_private_file(path).ok()?;
+    let (head, _) = crate::paths::read_utf8_prefix(file, NAME_PEEK_BYTES).ok()??;
+    let mut name = None;
+    let _ = serde_json::Deserializer::from_str(&head).deserialize_map(Head(&mut name));
+    name
+}
+
 pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
     if disabled("sessions") {
         return Ok(Vec::new());
@@ -613,10 +716,22 @@ pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
         };
         if path.extension().is_some_and(|e| e == "json")
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            && let Some(session) = read_discovered_session(&path, &mut skipped)
-            && (stem.starts_with(prefix) || session.name.to_lowercase().contains(&lower))
         {
-            sessions.push(session);
+            // The stem alone decides a prefix match. Otherwise the name near
+            // the head of the file decides, so a non-matching session is never
+            // read in full or decoded (mini-agent-hf54t). A name that cannot
+            // be peeked falls back to the full decode below.
+            if !stem.starts_with(prefix)
+                && peek_session_name(&path)
+                    .is_some_and(|name| !name.to_lowercase().contains(&lower))
+            {
+                continue;
+            }
+            if let Some(session) = read_discovered_session(&path, &mut skipped)
+                && (stem.starts_with(prefix) || session.name.to_lowercase().contains(&lower))
+            {
+                sessions.push(session);
+            }
         }
     }
     skipped.finish("prefix search");
@@ -809,6 +924,7 @@ pub fn find_recent_sessions_for_workspace(
         return Ok(matches);
     };
     let mut skipped = SkippedEntries::default();
+    let mut canonical_matches = std::collections::HashMap::<String, bool>::new();
     for path in session_paths_newest_first(&dir)? {
         let json = match read_private_string(&path) {
             Ok(json) => json,
@@ -824,8 +940,17 @@ pub fn find_recent_sessions_for_workspace(
                 continue;
             }
         };
-        let saved = Path::new(peek.working_dir.as_str());
-        if std::fs::canonicalize(saved).ok().as_deref() != Some(workspace.as_path()) {
+        // Many sessions share a few workspaces: resolve each distinct stored
+        // label once per scan.
+        let same_workspace = *canonical_matches
+            .entry(peek.working_dir.clone())
+            .or_insert_with(|| {
+                std::fs::canonicalize(Path::new(peek.working_dir.as_str()))
+                    .ok()
+                    .as_deref()
+                    == Some(workspace.as_path())
+            });
+        if !same_workspace {
             continue;
         }
         match decode_session_json(&json) {
@@ -1113,5 +1238,111 @@ mod readonly_import_tests {
         invalid_projection.messages[0].role = crate::session::MessageRole::Assistant;
         assert!(save_session(&invalid_projection).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+    }
+
+    fn scoped_state(root: &crate::tests::OwnedTestDirectory) -> crate::tests::ScopedProcessEnv {
+        crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ])
+    }
+
+    // mini-agent-3bri2: an unchanged session costs no fsync; any change,
+    // or a vanished file, is still written.
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_save_skips_the_durable_write_but_changes_and_deleted_files_do_not() {
+        let root = crate::tests::OwnedTestDirectory::new("session-unchanged-save");
+        let _environment = scoped_state(&root);
+        let mut session = Session::new("provider", "model", 32_000, "unchanged");
+        session.add_message(crate::session::MessageRole::User, "hello");
+        save_session(&session).unwrap();
+        let syncs = || crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get);
+        let path = session_path(&session.id).unwrap();
+
+        let before = syncs();
+        save_session(&session).unwrap();
+        assert_eq!(syncs(), before, "identical bytes must not be rewritten");
+
+        session.add_message(crate::session::MessageRole::Assistant, "changed");
+        save_session(&session).unwrap();
+        assert!(syncs() > before, "a changed session must be written");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("changed"));
+
+        std::fs::remove_file(&path).unwrap();
+        let before = syncs();
+        save_session(&session).unwrap();
+        assert!(syncs() > before, "a deleted snapshot must be recreated");
+        assert!(path.exists());
+    }
+
+    // mini-agent-hcb3s: the borrowed-session encoding with frozen stores is
+    // identical to encoding a frozen clone, and leaves no override behind.
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn serialization_with_bound_observations_matches_the_frozen_clone_exactly() {
+        let mut session = Session::new("provider", "model", 32_000, "frozen");
+        session.initialize_spend_account(None).unwrap();
+        session.add_message(crate::session::MessageRole::User, "hello");
+        let _owner =
+            super::super::background_observation::ObservationOwner::bind(&mut session).unwrap();
+        let observations =
+            super::super::background_observation::SharedObservations::capture(&session).unwrap();
+        let expected = serde_json::to_string(&observations.frozen_session(&session)).unwrap();
+        let actual = serialize_bounded_session(&session).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    // mini-agent-hf54t: a prefix lookup decodes only the files it can match.
+    #[test]
+    fn prefix_lookup_peeks_names_and_decodes_only_matching_sessions() {
+        let root = crate::tests::OwnedTestDirectory::new("session-prefix-peek");
+        let _environment = scoped_state(&root);
+        let mut wanted = Vec::new();
+        for index in 0..20 {
+            let name = if index == 7 { "Deploy Plan" } else { "other" };
+            let mut session = Session::new("provider", "model", 32_000, name);
+            session.add_message(
+                crate::session::MessageRole::User,
+                "x".repeat(2_000).as_str(),
+            );
+            save_session(&session).unwrap();
+            if index == 7 {
+                wanted.push(session.id.to_string());
+            }
+        }
+        let dir = session_dir();
+        // Not decodable as a session, but its head says the name does not match.
+        let unrelated = dir.join("zz-unrelated.json");
+        std::fs::write(
+            &unrelated,
+            "{\"id\":\"zz-unrelated\",\"name\":\"nothing\",\"messages\":[BROKEN",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(peek_session_name(&unrelated).as_deref(), Some("nothing"));
+        let found = find_sessions_by_prefix("deploy").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id.as_str(), wanted[0]);
+        let by_stem = find_sessions_by_prefix(&wanted[0][..12]).unwrap();
+        assert_eq!(by_stem.len(), 1);
     }
 }
