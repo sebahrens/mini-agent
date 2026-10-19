@@ -146,16 +146,23 @@ fn bounded_baseline(value: &impl serde::Serialize) -> Result<Box<[u8]>, &'static
     Ok(writer.0.into_boxed_slice())
 }
 
-impl OriginAuthority {
-    pub(crate) fn file(
+/// One verified read of a source file, shared by every server it defines so a
+/// config with N servers is read and hashed once instead of 3N+1 times.
+pub(crate) struct SourceCapture {
+    root: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    relative: std::path::PathBuf,
+    expected: String,
+    identity: crate::fs::CheckedMetadata,
+    kind: SourceKind,
+}
+
+impl SourceCapture {
+    pub(crate) fn new(
         root: &crate::paths::WorkspaceBinding,
         relative: &Path,
         expected: &str,
-        baseline: &impl serde::Serialize,
         kind: SourceKind,
-        prior: Option<&std::sync::Arc<Self>>,
-        trust_store: Option<&Path>,
-    ) -> Result<std::sync::Arc<Self>, &'static str> {
+    ) -> Result<Self, &'static str> {
         if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("invalid MCP source digest");
         }
@@ -174,6 +181,63 @@ impl OriginAuthority {
             }
             _ => {}
         }
+        let root = std::sync::Arc::new(root.try_clone().map_err(|_| "MCP source root changed")?);
+        #[cfg(test)]
+        SOURCE_CAPTURES.with(|captures| captures.set(captures.get() + 1));
+        let snapshot = if kind == SourceKind::GlobalConfig {
+            FileSnapshot::read_private(&root, relative)
+        } else {
+            FileSnapshot::read(&root, relative)
+        }
+        .map_err(|_| "MCP source is unavailable")?;
+        if digest(&snapshot.content) != expected {
+            return Err("MCP source changed during capture");
+        }
+        let identity = snapshot.identity.ok_or("MCP source is absent")?;
+        Ok(Self {
+            root,
+            relative: relative.into(),
+            expected: expected.into(),
+            identity,
+            kind,
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Source file captures (read + hash) on this thread.
+    static SOURCE_CAPTURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn source_captures() -> usize {
+    SOURCE_CAPTURES.with(std::cell::Cell::get)
+}
+
+impl OriginAuthority {
+    #[cfg(test)]
+    pub(crate) fn file(
+        root: &crate::paths::WorkspaceBinding,
+        relative: &Path,
+        expected: &str,
+        baseline: &impl serde::Serialize,
+        kind: SourceKind,
+        prior: Option<&std::sync::Arc<Self>>,
+        trust_store: Option<&Path>,
+    ) -> Result<std::sync::Arc<Self>, &'static str> {
+        let capture = SourceCapture::new(root, relative, expected, kind)?;
+        Self::from_capture(&capture, baseline, prior, trust_store)
+    }
+
+    pub(crate) fn from_capture(
+        capture: &SourceCapture,
+        baseline: &impl serde::Serialize,
+        prior: Option<&std::sync::Arc<Self>>,
+        trust_store: Option<&Path>,
+    ) -> Result<std::sync::Arc<Self>, &'static str> {
+        let root = &capture.root;
+        let relative = capture.relative.as_path();
         if prior.is_some_and(|prior| {
             prior
                 .files
@@ -185,26 +249,15 @@ impl OriginAuthority {
             return Err("MCP contributor limit exceeded");
         }
         let baseline = bounded_baseline(baseline)?;
-        let root = std::sync::Arc::new(root.try_clone().map_err(|_| "MCP source root changed")?);
-        let snapshot = if kind == SourceKind::GlobalConfig {
-            FileSnapshot::read_private(&root, relative)
-        } else {
-            FileSnapshot::read(&root, relative)
-        }
-        .map_err(|_| "MCP source is unavailable")?;
-        if digest(&snapshot.content) != expected {
-            return Err("MCP source changed during capture");
-        }
-        let identity = snapshot.identity.ok_or("MCP source is absent")?;
         let mut files = prior.map(|prior| prior.files.clone()).unwrap_or_default();
         files.retain(|old| old.root.root().join(&old.relative) != root.root().join(relative));
         files.push(FileSource {
-            root,
+            root: std::sync::Arc::clone(root),
             relative: relative.into(),
-            expected: expected.into(),
-            identity,
+            expected: capture.expected.clone(),
+            identity: capture.identity.clone(),
             baseline,
-            kind,
+            kind: capture.kind,
             trust_store: trust_store.map(Path::to_path_buf),
             verified: VerifiedCache::default(),
         });
@@ -762,6 +815,19 @@ pub(crate) fn load_in_workspace(
     if !trusted && interactive && !definitions.is_empty() && confirm(&review(&content)?) {
         trusted = crate::config::approve_project_mcp_at(trust_path, workspace, &digest).is_ok();
     }
+    let capture = if trusted && !definitions.is_empty() {
+        Some(
+            SourceCapture::new(
+                workspace,
+                Path::new(".mcp.json"),
+                &digest,
+                SourceKind::ProjectMcp,
+            )
+            .map_err(str::to_owned)?,
+        )
+    } else {
+        None
+    };
     let servers = cfg.mcp_servers.get_or_insert_with(HashMap::new);
     for (name, value) in definitions {
         let prior = cfg
@@ -769,21 +835,12 @@ pub(crate) fn load_in_workspace(
             .get(&name)
             .and_then(|origins| origins.iter().find(|origin| origin.selected))
             .and_then(|origin| origin.authority.as_ref());
-        let authority = if trusted {
-            Some(
-                OriginAuthority::file(
-                    workspace,
-                    Path::new(".mcp.json"),
-                    &digest,
-                    &value,
-                    SourceKind::ProjectMcp,
-                    prior,
-                    Some(trust_path),
-                )
-                .map_err(str::to_owned)?,
-            )
-        } else {
-            None
+        let authority = match &capture {
+            Some(capture) => Some(
+                OriginAuthority::from_capture(capture, &value, prior, Some(trust_path))
+                    .map_err(str::to_owned)?,
+            ),
+            None => None,
         };
         let resolved = if trusted {
             resolve_definition(value, &|name| std::env::var(name).ok())

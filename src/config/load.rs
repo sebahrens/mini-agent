@@ -1044,6 +1044,50 @@ mod doctor_config_tests {
 
     #[cfg(feature = "mcp")]
     #[test]
+    fn config69_mcp_global_source_is_read_once_for_all_servers() {
+        let root = crate::tests::OwnedTestDirectory::new("config69-mcp-once");
+        let paths = paths(root.path());
+        std::fs::create_dir(root.path().join("workspace")).unwrap();
+        let workspace = std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(&root.path().join("workspace")).unwrap(),
+        );
+        let global = paths.config_dir.join("config.toml");
+        let mut text = String::from("provider='ollama'\n");
+        for index in 0..5 {
+            text.push_str(&format!("[mcp_servers.s{index}]\ncommand='cmd{index}'\n"));
+        }
+        atomic_config_write(&global, &text).unwrap();
+        let before = crate::extras::mcp::project::source_captures();
+        let cfg = load_from_path_with_sources(
+            global.clone(),
+            None,
+            &paths.project_config_trust_file(),
+            false,
+            Some(&workspace),
+            None,
+        )
+        .0;
+        assert_eq!(
+            crate::extras::mcp::project::source_captures() - before,
+            1,
+            "five servers share one verified read of the global config"
+        );
+        for index in 0..5 {
+            let origin = cfg.mcp_origins[&format!("s{index}")]
+                .iter()
+                .find(|origin| origin.selected)
+                .unwrap();
+            assert!(crate::extras::mcp::project::server_source_is_current(
+                &workspace,
+                &format!("s{index}"),
+                cfg.mcp_servers.as_ref().unwrap().get(&format!("s{index}")),
+                Some(origin),
+            ));
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
     fn config69_mcp_file_baseline_survives_full_cli_overlay_and_replacement() {
         let root = crate::tests::OwnedTestDirectory::new("config69-mcp-cli");
         let paths = paths(root.path());
@@ -2130,21 +2174,24 @@ fn capture_global_mcp_origins(cfg: &mut Config, path: &Path) -> Result<(), &'sta
         .global_digest
         .as_deref()
         .ok_or("global MCP source bytes are unavailable")?;
-    for (name, server) in servers {
+    for name in servers.keys() {
         if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
             return Err("configured MCP name exceeds bounds");
         }
-        let authority = crate::extras::mcp::project::OriginAuthority::file(
-            &source,
-            Path::new(
-                path.file_name()
-                    .ok_or("global config name is unavailable")?,
-            ),
-            expected,
-            server,
-            crate::extras::mcp::project::SourceKind::GlobalConfig,
-            None,
-            None,
+    }
+    // One read + digest of the global file serves every configured server.
+    let capture = crate::extras::mcp::project::SourceCapture::new(
+        &source,
+        Path::new(
+            path.file_name()
+                .ok_or("global config name is unavailable")?,
+        ),
+        expected,
+        crate::extras::mcp::project::SourceKind::GlobalConfig,
+    )?;
+    for (name, server) in servers {
+        let authority = crate::extras::mcp::project::OriginAuthority::from_capture(
+            &capture, server, None, None,
         )?;
         cfg.mcp_origins.entry(name.clone()).or_default().push(
             crate::extras::mcp::project::ServerOrigin {
@@ -2176,30 +2223,41 @@ fn record_project_mcp_origins(
         return Err("configured MCP server count exceeds bounds".into());
     }
     let source = workspace.root().join(relative).display().to_string();
-    for (name, baseline) in servers {
+    for name in servers.keys() {
         if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
             return Err("configured MCP name exceeds bounds".into());
         }
+    }
+    let capture = if trusted && !servers.is_empty() {
+        Some(
+            crate::extras::mcp::project::SourceCapture::new(
+                workspace,
+                relative,
+                digest,
+                crate::extras::mcp::project::SourceKind::ProjectConfig,
+            )
+            .map_err(str::to_owned)?,
+        )
+    } else {
+        None
+    };
+    for (name, baseline) in servers {
         let prior = cfg
             .mcp_origins
             .get(name)
             .and_then(|origins| origins.iter().find(|origin| origin.selected))
             .and_then(|origin| origin.authority.as_ref());
-        let authority = if trusted {
-            Some(
-                crate::extras::mcp::project::OriginAuthority::file(
-                    workspace,
-                    relative,
-                    digest,
+        let authority = match &capture {
+            Some(capture) => Some(
+                crate::extras::mcp::project::OriginAuthority::from_capture(
+                    capture,
                     baseline,
-                    crate::extras::mcp::project::SourceKind::ProjectConfig,
                     prior,
                     Some(trust_store),
                 )
                 .map_err(str::to_owned)?,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
         let origins = cfg.mcp_origins.entry(name.clone()).or_default();
         origins.retain(|origin| origin.source != source);
