@@ -2594,7 +2594,27 @@ fn is_full_skill_id(id: &str) -> bool {
 }
 
 /// Verify that FTS5 is available in the bundled SQLite build.
+///
+/// Availability is a property of the compiled library, so it is read from the
+/// compile options (a read-only query that touches no schema and takes no write
+/// lock) and remembered for the process. Only when the library does not report
+/// the option does the old create-and-drop probe run, once, as a fallback.
 fn verify_fts5(db: &Connection) -> Result<(), StoreError> {
+    static AVAILABLE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if AVAILABLE.get().is_some() {
+        return Ok(());
+    }
+    let compiled = db
+        .query_row(
+            "SELECT sqlite_compileoption_used('ENABLE_FTS5')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    if compiled == 1 {
+        let _ = AVAILABLE.set(());
+        return Ok(());
+    }
     // Test FTS5 availability by attempting to create a virtual table.
     let test_table = format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS __fts5_test_{} USING fts5(content, tokenize = 'unicode61')",
@@ -2607,6 +2627,7 @@ fn verify_fts5(db: &Connection) -> Result<(), StoreError> {
                 &format!("DROP TABLE IF EXISTS __fts5_test_{}", std::process::id()),
                 [],
             );
+            let _ = AVAILABLE.set(());
             Ok(())
         }
         Err(_) => Err(StoreError::MissingFts5),

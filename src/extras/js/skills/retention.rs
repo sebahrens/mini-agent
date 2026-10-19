@@ -198,6 +198,26 @@ impl<'a> RetentionService<'a> {
         Self { store }
     }
 
+    /// Read-only: whether `compact_before(cutoff, ..)` could change anything,
+    /// i.e. the first uncompacted raw event is expired or an expired turn-loss
+    /// summary exists. Never takes the write lock.
+    pub fn has_expired_work(&self, cutoff: i64) -> Result<bool, RetentionError> {
+        let work: bool = self.store.connection().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM (
+                     SELECT created_at FROM skill_events
+                     WHERE event_id > COALESCE((
+                         SELECT through_event_id FROM skill_compaction_watermarks
+                         WHERE worker_name = 'raw-events'), 0)
+                     ORDER BY event_id LIMIT 1
+                 ) WHERE created_at < ?1
+             ) OR EXISTS(SELECT 1 FROM skill_turn_losses WHERE created_at < ?1)",
+            [cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(work)
+    }
+
     pub fn compact_before(
         &mut self,
         cutoff: i64,

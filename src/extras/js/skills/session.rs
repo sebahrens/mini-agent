@@ -1147,6 +1147,29 @@ mod tests {
         drop(services);
     }
 
+    /// The FTS5 availability check must not write the schema: a probe that
+    /// creates and drops a table bumps the schema cookie on every open, forcing
+    /// every other connection to reload and re-prepare.
+    #[test]
+    fn reopening_an_existing_store_leaves_the_schema_version_unchanged() {
+        use crate::extras::js::skills::store::SkillStore;
+        let (root, paths) = app_paths();
+        let _root = crate::extras::js::tests::TestTempDir::own(root);
+        let version = |store: &SkillStore| -> i64 {
+            store
+                .connection()
+                .query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let first = SkillStore::open_at(&paths).expect("create");
+        let created = version(&first);
+        for _ in 0..3 {
+            let reopened = SkillStore::open_at(&paths).expect("reopen");
+            assert_eq!(version(&reopened), created);
+        }
+        assert_eq!(version(&first), created);
+    }
+
     #[test]
     fn a_proposal_enabled_bundle_initializes_one_embedding_backend() {
         use crate::extras::js::skills::embed::{Embedder, backend_constructions_for_test};

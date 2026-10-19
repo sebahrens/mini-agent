@@ -163,6 +163,13 @@ impl Ord for DenseCandidate {
 }
 
 /// One complete immutable retrieval generation. Construction is off the request path.
+/// Read-only FTS connection plus the corpus size read once when the snapshot
+/// was opened, so a query does not scan the whole `skill_search` table to learn it.
+struct LexicalIndex {
+    connection: Mutex<Connection>,
+    documents: i64,
+}
+
 #[derive(Clone)]
 pub struct ImmutableSkillIndex {
     generation: u64,
@@ -171,7 +178,7 @@ pub struct ImmutableSkillIndex {
     entries: Arc<[SnapshotEntry]>,
     embeddings: Arc<[f32]>,
     ann: Option<Arc<Hnsw<'static, f32, DistDot>>>,
-    lexical: Option<Arc<Mutex<Connection>>>,
+    lexical: Option<Arc<LexicalIndex>>,
     by_id: Arc<HashMap<String, usize>>,
     hidden: Arc<HashSet<usize>>,
     #[cfg(test)]
@@ -557,9 +564,10 @@ impl ImmutableSkillIndex {
             .lexical_queries
             .fetch_add(1, AtomicOrdering::Relaxed);
         let connection = lexical
+            .connection
             .lock()
             .map_err(|_| SkillIndexError::LexicalPoisoned)?;
-        let Some(fts_query) = fts_query(&connection, query)? else {
+        let Some(fts_query) = fts_query(&connection, lexical.documents, query)? else {
             return Ok(Vec::new());
         };
         let mut statement = connection.prepare_cached(
@@ -692,7 +700,7 @@ fn build_ann(
 fn open_durable_lexical_index(
     database_path: &Path,
     entries: &[SnapshotEntry],
-) -> Result<Option<Arc<Mutex<Connection>>>, SkillIndexError> {
+) -> Result<Option<Arc<LexicalIndex>>, SkillIndexError> {
     if entries.is_empty() {
         return Ok(None);
     }
@@ -724,7 +732,13 @@ fn open_durable_lexical_index(
         }
     }
     transaction.commit()?;
-    Ok(Some(Arc::new(Mutex::new(connection))))
+    let documents = connection.query_row("SELECT count(*) FROM skill_search", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(Some(Arc::new(LexicalIndex {
+        connection: Mutex::new(connection),
+        documents,
+    })))
 }
 
 impl SkillIndex for ImmutableSkillIndex {
@@ -831,10 +845,11 @@ pub(crate) fn manifest_size(artifact: &SkillArtifact) -> usize {
 
 pub(crate) use crate::extras::skills::retrieval::lexical_query_terms;
 
-fn fts_query(connection: &Connection, query: &str) -> Result<Option<String>, rusqlite::Error> {
-    let total_documents = connection.query_row("SELECT count(*) FROM skill_search", [], |row| {
-        row.get::<_, i64>(0)
-    })?;
+fn fts_query(
+    connection: &Connection,
+    total_documents: i64,
+    query: &str,
+) -> Result<Option<String>, rusqlite::Error> {
     if total_documents == 0 {
         return Ok(None);
     }
