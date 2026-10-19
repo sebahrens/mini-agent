@@ -539,10 +539,10 @@ budget) that continues the child's own conversation, tool results included, and
 asks it to restate what it established in the required sections; a negative
 result such as "no such capability exists" is a finding.
 The restatement is used only if it passes validation. Otherwise mini-agent
-retains the original text under `Raw child
-response` but wraps it in a machine-checkable partial report with low
-confidence. This keeps malformed output useful without letting it masquerade as
-a complete specialist report.
+withholds the original text from the parent model and returns a fixed
+machine-checkable partial report with low confidence (the user reads the raw text
+with `/tasks result <id>`, marked unverified). Malformed output never
+masquerades as a complete specialist report.
 
 A child that exhausts its model-turn budget gets one further tool-free turn over
 its full history asking for the contract report. The result opens with
