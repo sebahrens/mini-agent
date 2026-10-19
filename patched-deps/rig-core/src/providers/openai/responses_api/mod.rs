@@ -797,6 +797,12 @@ impl ResponsesToolDefinition {
     }
 }
 
+impl From<std::sync::Arc<completion::ToolDefinition>> for ResponsesToolDefinition {
+    fn from(tool: std::sync::Arc<completion::ToolDefinition>) -> Self {
+        std::sync::Arc::unwrap_or_clone(tool).into()
+    }
+}
+
 impl From<completion::ToolDefinition> for ResponsesToolDefinition {
     fn from(value: completion::ToolDefinition) -> Self {
         let completion::ToolDefinition {

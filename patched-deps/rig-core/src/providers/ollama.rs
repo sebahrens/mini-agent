@@ -898,6 +898,12 @@ pub struct ToolDefinition {
     pub function: completion::ToolDefinition,
 }
 
+impl From<std::sync::Arc<crate::completion::ToolDefinition>> for ToolDefinition {
+    fn from(tool: std::sync::Arc<crate::completion::ToolDefinition>) -> Self {
+        std::sync::Arc::unwrap_or_clone(tool).into()
+    }
+}
+
 /// Convert internal ToolDefinition (from the completion module) into Ollama's tool definition.
 impl From<crate::completion::ToolDefinition> for ToolDefinition {
     fn from(tool: crate::completion::ToolDefinition) -> Self {

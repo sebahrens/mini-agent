@@ -268,6 +268,10 @@ impl ToolDyn for HookedTool {
         self.inner.parameters()
     }
 
+    fn shared_definition(&self) -> Option<std::sync::Arc<rig::completion::ToolDefinition>> {
+        self.inner.shared_definition()
+    }
+
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
         // Select before constructing/polling the much larger hook pipeline.
         // Keep inner construction inside the returned future: dropping an

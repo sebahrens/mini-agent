@@ -472,6 +472,12 @@ impl From<completion::ToolDefinition> for ToolDefinition {
     }
 }
 
+impl From<std::sync::Arc<completion::ToolDefinition>> for ToolDefinition {
+    fn from(tool: std::sync::Arc<completion::ToolDefinition>) -> Self {
+        std::sync::Arc::unwrap_or_clone(tool).into()
+    }
+}
+
 impl ToolDefinition {
     /// Apply strict mode to this tool definition.
     /// This sets `strict: true` and sanitizes the schema to meet OpenAI requirements.

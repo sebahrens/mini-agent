@@ -216,6 +216,9 @@ impl ToolDyn for SharedTool {
     fn parameters(&self) -> serde_json::Value {
         self.0.parameters()
     }
+    fn shared_definition(&self) -> Option<Arc<ToolDefinition>> {
+        self.0.shared_definition()
+    }
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
         self.0.call(args)
     }

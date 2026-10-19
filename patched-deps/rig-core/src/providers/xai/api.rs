@@ -363,6 +363,12 @@ pub struct ToolDefinition {
     pub function: completion::ToolDefinition,
 }
 
+impl From<std::sync::Arc<completion::ToolDefinition>> for ToolDefinition {
+    fn from(tool: std::sync::Arc<completion::ToolDefinition>) -> Self {
+        std::sync::Arc::unwrap_or_clone(tool).into()
+    }
+}
+
 impl From<completion::ToolDefinition> for ToolDefinition {
     fn from(tool: completion::ToolDefinition) -> Self {
         Self {

@@ -271,6 +271,12 @@ pub struct Function {
     pub parameters: serde_json::Value,
 }
 
+impl From<std::sync::Arc<completion::ToolDefinition>> for Tool {
+    fn from(tool: std::sync::Arc<completion::ToolDefinition>) -> Self {
+        std::sync::Arc::unwrap_or_clone(tool).into()
+    }
+}
+
 impl From<completion::ToolDefinition> for Tool {
     fn from(tool: completion::ToolDefinition) -> Self {
         Self {

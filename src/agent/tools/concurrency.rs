@@ -117,6 +117,10 @@ impl ToolDyn for ConcurrencyBoundTool {
         self.inner.parameters()
     }
 
+    fn shared_definition(&self) -> Option<std::sync::Arc<rig::completion::ToolDefinition>> {
+        self.inner.shared_definition()
+    }
+
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
         let spend = crate::spend::run::Run::current();
         let future = async move {

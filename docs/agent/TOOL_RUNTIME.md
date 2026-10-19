@@ -3,8 +3,12 @@
 Built-in, optional, and MCP tools are collected as `ToolDyn` instances before
 the main agent is built. After command-line filtering, each registered tool is
 wrapped by `src/agent/tools/memoize.rs`. The wrapper snapshots the tool name,
-description, and JSON parameter schema once, then returns owned clones when Rig
-requests provider definitions on later completion turns. Calls and structured
+description, and JSON parameter schema once as an `Arc<ToolDefinition>` and
+exposes it through `ToolDyn::shared_definition`. The hook, concurrency and
+deferred-MCP wrappers forward it, so `ToolServerHandle::get_tool_defs` and
+`CompletionRequest::tools` carry `Arc` clones of that one definition instead of
+deep-copying the schema on every completion turn; provider request builders
+copy only when their wire type needs ownership. Calls and structured
 results are delegated unchanged to the original tool.
 
 MCP collection rejects names reserved for built-in tools, including optional tools
