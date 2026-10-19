@@ -970,10 +970,13 @@ and search query. These commands affect the input only and remain available
 while a model turn runs. Use `[keys]` in trusted config to replace shortcuts;
 see [Input keyboard settings](input-keybindings.md).
 
-`/config [--global|--project|--local] [key [TOML value]]` opens the known-setting
+`/config [--global|--project|--local|--session] [key [TOML value]]` opens the known-setting
 picker or validates and saves one setting. The picker shows current startup
 values, types, sources and restart requirements. Sensitive project changes require
 approval of the exact candidate; current permission/provider authority is unchanged.
+The save confirmation names the file written. `/config --session <key> <value>` applies a
+live-effective setting (`reasoning_display`, subagent limits) to this process only and
+writes no file.
 See [interactive settings](CONFIG.md#interactive-settings-editor).
 
 With the `multimodal` feature, Ctrl+V can paste a clipboard image into an idle

@@ -71,8 +71,10 @@ pub(crate) fn handle(
     budget_capped: bool,
     now: Instant,
 ) {
+    // A pending permission or question prompt belongs to the running fire.
+    let waiting = renderer.permission_prompt.is_some();
     match parts {
-        ["/cron"] | ["/cron", "list"] => list(store, renderer, max_fires, now),
+        ["/cron"] | ["/cron", "list"] => list(store, renderer, max_fires, now, waiting),
         ["/cron", "resume"] => resume(store, renderer, max_fires, now),
         ["/cron", "stop", "all"] => {
             let count = store.stop_all();
@@ -227,14 +229,16 @@ fn resume(store: &mut CronStore, renderer: &mut Renderer, max_fires: u32, now: I
     }
 }
 
-fn list(store: &CronStore, renderer: &mut Renderer, max_fires: u32, now: Instant) {
+fn list(store: &CronStore, renderer: &mut Renderer, max_fires: u32, now: Instant, waiting: bool) {
     if store.is_empty() && store.disarmed().is_empty() {
         write_ok(renderer, "no cron schedules in this session");
         write_result(renderer, USAGE);
         return;
     }
     for entry in store.entries() {
-        let next = if entry.due {
+        let next = if waiting && store.active_fire() == Some(entry.id.as_str()) {
+            "waiting for approval".to_owned()
+        } else if entry.due {
             "due at next idle".to_owned()
         } else if entry.in_flight {
             "running".to_owned()
@@ -339,16 +343,9 @@ fn arm(
             ),
         );
     }
-    write_ok(
-        renderer,
-        format!(
-            "cron {id}: every {every}, first fire {}; up to {max_fires} fires, only while idle",
-            cron::format_until(now + interval.duration, now)
-        ),
-    );
     renderer.show_notice(
         &format!(
-            "cron {id} armed: first fire {}",
+            "cron {id} armed: every {every}, first fire {}; up to {max_fires} fires, only while idle",
             cron::format_until(now + interval.duration, now)
         ),
         crossterm::style::Color::Cyan,
@@ -382,18 +379,38 @@ mod tests {
             .collect()
     }
 
+    /// The arming confirmation, now an ephemeral notice.
+    fn arm_notice(text: &str, store: &mut CronStore, now: Instant) -> String {
+        let mut renderer = Renderer::new().unwrap();
+        handle(&split_command(text), store, &mut renderer, 24, true, now);
+        renderer.notice_text().unwrap_or_default().to_owned()
+    }
+
     #[test]
     fn cron_arms_and_lists_with_relative_times() {
         let now = Instant::now();
         let mut store = CronStore::default();
-        let lines = run("/cron 5m check the deploy", &mut store, true, now);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with("cron c1: every 5m, first fire in 5m")),
-            "{lines:?}"
+        let mut renderer = Renderer::new().unwrap();
+        handle(
+            &split_command("/cron 5m check the deploy"),
+            &mut store,
+            &mut renderer,
+            24,
+            true,
+            now,
         );
-        assert!(!lines.iter().any(|l| l.contains("unbounded")), "{lines:?}");
+        assert!(
+            renderer
+                .notice_text()
+                .is_some_and(|n| n.starts_with("cron c1 armed: every 5m, first fire in 5m")),
+            "{:?}",
+            renderer.notice_text()
+        );
+        assert_eq!(
+            renderer.feed().block_count(),
+            0,
+            "arming wrote to the transcript"
+        );
 
         for listing in ["/cron", "/cron list"] {
             let lines = run(
@@ -404,6 +421,36 @@ mod tests {
             );
             assert_eq!(lines, ["c1  every 5m  in 4m  0/24  check the deploy"]);
         }
+    }
+
+    #[test]
+    fn cron_list_shows_a_fire_waiting_for_approval() {
+        let now = Instant::now();
+        let mut store = CronStore::default();
+        run("/cron 5m check", &mut store, true, now);
+        store.begin_fire("c1", now, 24).unwrap();
+        let mut renderer = Renderer::new().unwrap();
+        renderer.permission_prompt = Some(crate::ui::renderer::PermissionPrompt {
+            tool: "t".into(),
+            options: "o".into(),
+            expanded: false,
+        });
+        handle(
+            &split_command("/cron list"),
+            &mut store,
+            &mut renderer,
+            24,
+            true,
+            now,
+        );
+        let text = renderer.feed().block_text(0).unwrap().to_string();
+        assert!(text.contains("waiting for approval"), "{text}");
+        // Without a pending prompt, or after the turn ends, it is not waiting.
+        renderer.permission_prompt = None;
+        let lines = run("/cron list", &mut store, true, now);
+        assert!(!lines[0].contains("waiting"), "{lines:?}");
+        store.end_fire();
+        assert!(store.active_fire().is_none());
     }
 
     #[test]
@@ -569,8 +616,8 @@ mod tests {
         let now = Instant::now();
         let mut store = CronStore::default();
         for payload in ["/goal status", "/tasks", "/jobs", "/cost", "  /cost  "] {
-            let lines = run(&format!("/cron 5m {payload}"), &mut store, true, now);
-            assert!(lines[0].contains(": every 5m"), "{payload}: {lines:?}");
+            let notice = arm_notice(&format!("/cron 5m {payload}"), &mut store, now);
+            assert!(notice.contains(": every 5m"), "{payload}: {notice}");
         }
         assert_eq!(store.len(), 5);
         for payload in [
@@ -688,7 +735,9 @@ mod tests {
             ["cron: no saved schedules to resume"]
         );
         // Ids stay monotonic past the restored ones.
-        assert!(run("/cron 5m next", &mut store, true, now)[0].starts_with("cron c4: every 5m"));
+        assert!(
+            arm_notice("/cron 5m next", &mut store, now).starts_with("cron c4 armed: every 5m")
+        );
     }
 
     #[test]

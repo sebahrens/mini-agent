@@ -208,9 +208,21 @@ pub(crate) struct CronStore {
     /// Schedules restored from the saved session, kept disarmed until
     /// `/cron resume` (see [`CronStore::from_saved`]).
     disarmed: Vec<SavedCronEntry>,
+    /// Id of the fire whose turn is still running (cleared when it ends);
+    /// `/cron list` reports it as waiting while a prompt is pending.
+    active_fire: Option<String>,
 }
 
 impl CronStore {
+    pub(crate) fn active_fire(&self) -> Option<&str> {
+        self.active_fire.as_deref()
+    }
+
+    /// The scheduled turn ended (finished, failed or was interrupted).
+    pub(crate) fn end_fire(&mut self) {
+        self.active_fire = None;
+    }
+
     pub(crate) fn entries(&self) -> &[CronEntry] {
         &self.entries
     }
@@ -406,6 +418,7 @@ impl CronStore {
         max_fires: u32,
     ) -> Option<CronFire> {
         let index = self.entries.iter().position(|entry| entry.id == id)?;
+        self.active_fire = Some(id.to_owned());
         let entry = &mut self.entries[index];
         entry.due = false;
         entry.next_at = now + entry.interval;

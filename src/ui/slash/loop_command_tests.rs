@@ -307,7 +307,10 @@ async fn loop_with_an_empty_prompt_prints_usage_and_sets_no_goal() {
     let lines = run_loop_command("/loop   ", &mut session, &mut context, &workspace).await;
     assert_eq!(
         lines,
-        ["no active loop", "usage: /loop <prompt>  |  /loop stop"]
+        [
+            "no active loop",
+            "usage: /loop <prompt>  |  /loop status  |  /loop stop"
+        ]
     );
     assert!(session.goal_store.snapshot().is_none());
 
@@ -316,7 +319,11 @@ async fn loop_with_an_empty_prompt_prints_usage_and_sets_no_goal() {
     // becoming a loop with an empty objective.
     for blank in [" ", "\u{3000}\t"] {
         let lines = run_loop_parts(&["/loop", blank], &mut session, &mut context, &workspace).await;
-        assert_eq!(lines, ["usage: /loop <prompt>"], "{blank:?}");
+        assert_eq!(
+            lines,
+            ["usage: /loop <prompt>  |  /loop status  |  /loop stop"],
+            "{blank:?}"
+        );
         assert!(session.goal_store.snapshot().is_none(), "{blank:?}");
     }
 }

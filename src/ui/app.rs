@@ -4672,6 +4672,7 @@ impl<'a> App<'a> {
         if !self.run.is_running {
             self.run.main_abort = None;
             self.cron_turn = None;
+            self.cron.end_fire();
             if !self.run.pending_inputs.is_empty() && self.budget_admission_notice()? {
                 // Keep queued input visible for the owner to remove/resubmit;
                 // cap exhaustion must never dequeue or start a request.
@@ -4872,6 +4873,7 @@ impl<'a> App<'a> {
         // the user's draft. A self-paced fire keeps it only when its turn
         // already chose a wakeup.
         let scheduled = self.cron_turn.take();
+        self.cron.end_fire();
         self.settle_dynamic_cron_turn().await?;
         if let Some(text) = failed_prompt
             && scheduled.as_deref() != Some(text.as_str())

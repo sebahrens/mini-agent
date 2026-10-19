@@ -5,6 +5,8 @@ use crate::config::editor::{self, Target};
 pub(crate) enum Command<'a> {
     Browse(Target, Option<&'static str>),
     Set(Target, &'static str, &'a str),
+    /// `--session`: apply a live setting for this process only; no file is written.
+    Session(&'static str, &'a str),
 }
 pub(crate) fn parse(text: &str) -> Result<Command<'_>, &'static str> {
     if text.len() > 32 * 1024 {
@@ -14,9 +16,15 @@ pub(crate) fn parse(text: &str) -> Result<Command<'_>, &'static str> {
     let rest = text
         .strip_prefix("/config")
         .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-        .ok_or("usage: /config [--global|--project|--local] [key [TOML value]]")?
+        .ok_or("usage: /config [--global|--project|--local|--session] [key [TOML value]]")?
         .trim_start();
-    let (target, rest) = if let Some(rest) = rest
+    let session = rest
+        .strip_prefix("--session")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim_start);
+    let (target, rest) = if let Some(rest) = session {
+        (Target::Global, rest)
+    } else if let Some(rest) = rest
         .strip_prefix("--global")
         .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
     {
@@ -42,7 +50,13 @@ pub(crate) fn parse(text: &str) -> Result<Command<'_>, &'static str> {
         .filter(|key| key.feature.is_none_or(crate::config::keys::feature_enabled))
         .ok_or("Unknown or unavailable setting (values omitted)")?;
     let value = value.trim();
-    if value.is_empty() {
+    if session.is_some() {
+        if value.is_empty() {
+            Err("usage: /config --session <key> <TOML value>")
+        } else {
+            Ok(Command::Session(key.name, value))
+        }
+    } else if value.is_empty() {
         Ok(Command::Browse(target, Some(key.name)))
     } else {
         Ok(Command::Set(target, key.name, value))
@@ -89,6 +103,54 @@ fn confirm(description: &str) -> std::io::Result<bool> {
     std::io::stdin().lock().take(32).read_line(&mut answer)?;
     Ok(answer.ends_with('\n') && matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
 }
+/// Apply a live-effective setting to this process only; nothing is written.
+fn apply_session(key: &'static str, literal: &str, ctx: &mut SlashCtx<'_>) {
+    if key == "reasoning_display" {
+        let display = match literal {
+            "\"off\"" => crate::config::ReasoningDisplay::Off,
+            "\"collapsed\"" => crate::config::ReasoningDisplay::Collapsed,
+            "\"full\"" => crate::config::ReasoningDisplay::Full,
+            _ => {
+                write_error(
+                    ctx.renderer,
+                    "reasoning_display must be \"off\", \"collapsed\" or \"full\"",
+                );
+                return;
+            }
+        };
+        *ctx.show_reasoning = display != crate::config::ReasoningDisplay::Off;
+        ctx.renderer.feed_mut().set_reasoning_display(display);
+        ctx.renderer.show_notice(
+            "Reasoning display set for this session only; no file was written.",
+            crate::ui::C_AGENT,
+        );
+        return;
+    }
+    #[cfg(feature = "subagents")]
+    if crate::extras::subagents::LIVE_SETTING_KEYS.contains(&key) {
+        match crate::extras::subagents::apply_saved_limit(
+            key,
+            literal,
+            crate::config::ConfigLayer::Cli,
+        ) {
+            Ok(true) => ctx.renderer.show_notice(
+                "Set for this session only (next delegation); no file was written.",
+                crate::ui::C_AGENT,
+            ),
+            Ok(false) => write_error(
+                ctx.renderer,
+                "A higher-precedence override is active; the session value was not applied",
+            ),
+            Err(error) => write_error(ctx.renderer, error),
+        }
+        return;
+    }
+    write_error(
+        ctx.renderer,
+        "--session applies only to live settings (reasoning_display, subagent limits); use --global, --project or --local and restart",
+    );
+}
+
 pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let command = match parse(text) {
         Ok(command) => command,
@@ -114,6 +176,10 @@ pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result
             return Ok(());
         }
         Command::Set(target, key, literal) => (target, key, literal),
+        Command::Session(key, literal) => {
+            apply_session(key, literal, ctx);
+            return Ok(());
+        }
     };
     if *ctx.is_running {
         write_error(
@@ -175,6 +241,7 @@ pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result
     } else {
         true
     };
+    let saved_path = edit.path.clone();
     let result = owned(move || edit.publish(approved)).await;
     match result {
         Ok(Ok(())) => {
@@ -199,9 +266,12 @@ pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result
                 };
                 match crate::extras::subagents::apply_saved_limit(key, literal, layer) {
                     Ok(true) => {
-                        write_ok(
-                            ctx.renderer,
-                            "Saved; applies to the next delegation. Running children retain their captured limits.",
+                        ctx.renderer.show_notice(
+                            &format!(
+                                "Saved to {}; applies to the next delegation. Running children retain their captured limits.",
+                                saved_path.display()
+                            ),
+                            crate::ui::C_AGENT,
                         );
                         return Ok(());
                     }
@@ -228,11 +298,15 @@ pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result
             }
             write_ok(
                 ctx.renderer,
-                if live.is_some() {
-                    "Saved; reasoning display updated. Other startup values and higher CLI/layer overrides remain active."
-                } else {
-                    "Saved. Restart to apply; higher local/CLI overrides still take precedence."
-                },
+                format!(
+                    "{} ({})",
+                    if live.is_some() {
+                        "Saved; reasoning display updated. Other startup values and higher CLI/layer overrides remain active."
+                    } else {
+                        "Saved. Restart to apply; higher local/CLI overrides still take precedence."
+                    },
+                    saved_path.display()
+                ),
             );
         }
         Ok(Err(error)) | Err(error) => write_error(ctx.renderer, error),
@@ -242,6 +316,17 @@ pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_scope_parses_without_a_file_target() {
+        assert!(matches!(
+            parse("/config --session reasoning_display \"off\""),
+            Ok(Command::Session("reasoning_display", "\"off\""))
+        ));
+        assert!(parse("/config --session reasoning_display").is_err());
+        assert!(!needs_tty("/config --session reasoning_display \"off\""));
+        assert!(!is_browse("/config --session reasoning_display \"off\""));
+    }
+
     #[test]
     fn config68_classifier_keeps_busy_writes_and_literal_values_distinct() {
         assert!(is_browse("/config --local"));

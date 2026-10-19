@@ -789,6 +789,8 @@ fn clear_session_mutation(session: &mut crate::session::Session) -> Option<()> {
     session.file_checkpoints = Default::default();
     session.messages.clear();
     session.total_estimated_tokens = 0;
+    session.total_input_tokens = 0;
+    session.total_output_tokens = 0;
     session.reset_calibration();
     session.compactions.clear();
     session.rewind_undo = None;
@@ -1377,6 +1379,8 @@ mod session_persistence_tests {
         )
         .unwrap();
         assert!(session.rewind_undo.is_some());
+        session.total_input_tokens = 7;
+        session.total_output_tokens = 3;
         mutate_and_persist_session(
             &mut session,
             clear_session_mutation,
@@ -1388,6 +1392,14 @@ mod session_persistence_tests {
         )
         .unwrap();
         let mut reloaded_clear = reload(&snapshot);
+        assert_eq!(
+            (
+                reloaded_clear.total_input_tokens,
+                reloaded_clear.total_output_tokens
+            ),
+            (0, 0),
+            "/clear must reset the status-line in:/out: counters"
+        );
         assert!(reloaded_clear.messages.is_empty());
         assert_eq!(reloaded_clear.total_estimated_tokens, 0);
         assert_eq!(reloaded_clear.calibrated_tokens, 0);
