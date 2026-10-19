@@ -1069,6 +1069,40 @@ mod slash_picker_contract {
     /// no detail column, and the description is never matched.
     #[cfg(feature = "subagents")]
     #[test]
+    fn agent_rows_label_write_personas_and_the_agent_picker_names_the_main_agent() {
+        let mut input = InputEditor::new();
+        input.set_agent_mentions(vec![
+            ("editor".into(), "Edits files".into()),
+            ("review".into(), "Reviews".into()),
+        ]);
+        input.set_agent_write_names(vec!["editor".into()]);
+        typed(&mut input, "@");
+        let Some(Picker::File(picker)) = input.picker.as_ref() else {
+            panic!("@ opens the file picker");
+        };
+        let mut bytes = Vec::new();
+        picker.draw(&mut bytes, 100, 20).unwrap();
+        let rows = visible_rows(&String::from_utf8(bytes).unwrap());
+        assert!(
+            rows[0].contains("[write-capable sub-agent] Edits files"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[1].contains("[read-only sub-agent] Reviews"),
+            "{rows:?}"
+        );
+
+        let mut input = InputEditor::new();
+        input.set_agent_names(vec!["review".into()]);
+        typed(&mut input, "/agent ");
+        let Some(Picker::Prefixed(list, _)) = input.picker.as_ref() else {
+            panic!("/agent opens a sub-picker");
+        };
+        assert!(list.display_rows()[0].contains("main-agent persona"));
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
     fn agent_rows_draw_a_dimmed_truncated_description_that_is_never_matched() {
         let mut input = InputEditor::new();
         input.set_agent_mentions(vec![(
@@ -1104,7 +1138,7 @@ mod slash_picker_contract {
         assert_eq!(
             visible_rows(&rendered),
             vec![
-                "▸ @agent:review  Careful code reviewer for subtle regressions",
+                "▸ @agent:review  [read-only sub-agent] Careful code reviewer for subtle regress",
                 "  notes.md",
             ]
         );
@@ -1115,7 +1149,7 @@ mod slash_picker_contract {
         picker.draw(&mut bytes, 30, 20).unwrap();
         assert_eq!(
             visible_rows(&String::from_utf8(bytes).unwrap()),
-            vec!["▸ @agent:review  Careful code", "  notes.md"]
+            vec!["▸ @agent:review  [read-only s", "  notes.md"]
         );
 
         // Too narrow for any description: the name alone is drawn.

@@ -843,6 +843,15 @@ pub struct Renderer {
     /// valid for `painted_geometry`; `None` forces a full chat repaint.
     painted_rows: Vec<u64>,
     painted_geometry: Option<u64>,
+    /// What the scrollbar gutter column shows on each chat row (`GUTTER_*`);
+    /// `GUTTER_UNKNOWN` rows are repainted. Kept apart from `painted_rows`
+    /// so the thumb moving never defeats the terminal-scroll row shift.
+    painted_gutter: Vec<u8>,
+    /// Transcript height when the view was first scrolled back, to notice
+    /// output that arrived while the user was reading older rows.
+    scroll_anchor_total: Option<(usize, u16, usize)>,
+    /// New output arrived while scrolled back (shows the End hint).
+    unseen_output: bool,
     /// Reused allocation for the next frame's row keys.
     row_keys_scratch: Vec<u64>,
     /// The last chat paint used a tail-first layout that does not reach the
@@ -997,6 +1006,9 @@ impl Renderer {
             last_chat_snapshot: None,
             painted_rows: Vec::new(),
             painted_geometry: None,
+            painted_gutter: Vec::new(),
+            scroll_anchor_total: None,
+            unseen_output: false,
             row_keys_scratch: Vec::new(),
             painted_partial: false,
             bottom_dirty: true,
@@ -2036,6 +2048,22 @@ impl Renderer {
         let selected_range = |line: usize| {
             selection.and_then(|(a, b)| selection_byte_range(&buffer[line].text, line, a, b))
         };
+        if self.scroll_offset == 0 {
+            self.scroll_anchor_total = None;
+            self.unseen_output = false;
+        } else if complete {
+            match self.scroll_anchor_total {
+                Some((anchor, c, v)) if (c, v) == (cols, visible) => {
+                    if total > anchor {
+                        self.unseen_output = true;
+                    }
+                }
+                _ => self.scroll_anchor_total = Some((total, cols, visible)),
+            }
+        }
+        let hint = (self.unseen_output && self.scroll_offset > 0 && visible > 1)
+            .then_some(NEW_OUTPUT_HINT);
+        let gutter = gutter_cells(total, visible, start, complete);
         let indicator =
             history_indicator_for(self.scroll_offset, total, visible, complete).map(|indicator| {
                 match indicator {
@@ -2068,6 +2096,9 @@ impl Renderer {
             if row == 0 {
                 indicator.hash(&mut state);
             }
+            if row + 1 == visible && hint.is_some() {
+                hint.hash(&mut state);
+            }
             keys.push(state.finish().max(1));
         }
         let geometry = hash_value((
@@ -2081,9 +2112,16 @@ impl Renderer {
         if self.painted_geometry != Some(geometry) || painted.len() != visible {
             painted.clear();
             painted.resize(visible, UNKNOWN_ROW);
+            self.painted_gutter.clear();
+        }
+        if self.painted_gutter.len() != visible {
+            self.painted_gutter.clear();
+            self.painted_gutter.resize(visible, GUTTER_UNKNOWN);
         }
         let shift = best_row_shift(&painted, &keys);
         shift_rows(&mut painted, shift);
+        // The terminal scroll moves the gutter cells along with the rows.
+        shift_cells(&mut self.painted_gutter, shift);
         let dirty = (0..visible)
             .filter(|&row| painted[row] != keys[row])
             .count();
@@ -2125,7 +2163,7 @@ impl Renderer {
                 if row == 0
                     && let Some((text, color)) = &indicator
                 {
-                    let x = cols.saturating_sub(display_width(text) as u16);
+                    let x = cols.saturating_sub(1 + display_width(text) as u16);
                     stdout.queue(MoveTo(x, 0))?;
                     if let Some(bg) = self.chat_bg {
                         write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
@@ -2134,8 +2172,27 @@ impl Renderer {
                     write!(stdout, "{}", text)?;
                     write!(stdout, "{}", ResetColor)?;
                 }
+                if row + 1 == visible
+                    && let Some(text) = hint
+                {
+                    let x = cols.saturating_sub(1 + display_width(text) as u16);
+                    stdout.queue(MoveTo(x, visual_row))?;
+                    if let Some(bg) = self.chat_bg {
+                        write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+                    }
+                    write!(
+                        stdout,
+                        "{}",
+                        SetForegroundColor(self.color(Color::DarkYellow))
+                    )?;
+                    write!(stdout, "{}", text)?;
+                    write!(stdout, "{}", ResetColor)?;
+                }
+                // The row was cleared to its end, gutter cell included.
+                self.painted_gutter[row] = GUTTER_NONE;
             }
         }
+        self.paint_gutter(&gutter, cols)?;
         painted.clear();
         painted.extend_from_slice(&keys);
         self.painted_rows = painted;
@@ -2150,6 +2207,48 @@ impl Renderer {
         }
         trace.finish(self.frame_len() - frame_start);
         self.record_chat_drawn();
+        Ok(())
+    }
+
+    /// Paint the scrollbar gutter (the last terminal column of the chat
+    /// rows), writing only the cells that differ from the last paint.
+    fn paint_gutter(&mut self, wanted: &[u8], cols: u16) -> io::Result<()> {
+        if cols == 0 || self.painted_gutter.len() != wanted.len() {
+            return Ok(());
+        }
+        let x = cols - 1;
+        let mut stdout = frame_out!(self);
+        let mut hidden = false;
+        for (row, &cell) in wanted.iter().enumerate() {
+            if self.painted_gutter[row] == cell {
+                continue;
+            }
+            if !hidden {
+                write!(stdout, "{}", Hide)?;
+                hidden = true;
+            }
+            stdout.queue(MoveTo(x, row as u16))?;
+            if let Some(bg) = self.chat_bg {
+                write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+            }
+            match cell {
+                GUTTER_THUMB => {
+                    write!(stdout, "{}", SetForegroundColor(self.color(Color::Grey)))?;
+                    write!(stdout, "┃")?;
+                }
+                GUTTER_TRACK => {
+                    write!(
+                        stdout,
+                        "{}",
+                        SetForegroundColor(self.color(Color::DarkGrey))
+                    )?;
+                    write!(stdout, "│")?;
+                }
+                _ => write!(stdout, " ")?,
+            }
+            write!(stdout, "{}", ResetColor)?;
+            self.painted_gutter[row] = cell;
+        }
         Ok(())
     }
 
@@ -2912,6 +3011,49 @@ impl Renderer {
 /// overwritten by something outside the row tracking); row keys are never 0.
 const UNKNOWN_ROW: u64 = 0;
 
+/// Scrollbar gutter cell states for one chat row.
+const GUTTER_NONE: u8 = 0;
+const GUTTER_TRACK: u8 = 1;
+const GUTTER_THUMB: u8 = 2;
+const GUTTER_UNKNOWN: u8 = u8::MAX;
+
+/// Hint painted at the bottom-right chat row while scrolled back after new
+/// output arrived.
+pub(crate) const NEW_OUTPUT_HINT: &str = " ↓ new output — End ";
+
+/// The scrollbar gutter for a viewport of `visible` rows over `total`
+/// transcript rows with the top row at `start`. Empty when everything fits.
+/// An incomplete (tail-first) layout is treated as one row taller than the
+/// viewport at least, with the thumb at the bottom, since earlier history
+/// exists.
+pub(crate) fn gutter_cells(total: usize, visible: usize, start: usize, complete: bool) -> Vec<u8> {
+    let total = if complete {
+        total
+    } else {
+        total.max(visible + 1)
+    };
+    if visible == 0 || total <= visible {
+        return vec![GUTTER_NONE; visible];
+    }
+    let thumb = (visible * visible / total).clamp(1, visible);
+    let max_start = total - visible;
+    let start = if complete {
+        start.min(max_start)
+    } else {
+        max_start
+    };
+    let top = (start * (visible - thumb) + max_start / 2) / max_start;
+    (0..visible)
+        .map(|row| {
+            if (top..top + thumb).contains(&row) {
+                GUTTER_THUMB
+            } else {
+                GUTTER_TRACK
+            }
+        })
+        .collect()
+}
+
 /// Chat rows, counting up from the picker floor, that a picker overlay may
 /// cover: at most ten entries plus a header (the sessions picker's three
 /// header rows are the tallest), with margin. `picker_overlays_stay_in_band`
@@ -2979,6 +3121,18 @@ fn best_row_shift(painted: &[u64], next: &[u64]) -> isize {
 
 /// Apply a terminal scroll of `shift` rows (see [`best_row_shift`]) to the
 /// tracked screen rows; rows scrolled in are unknown.
+fn shift_cells(cells: &mut [u8], shift: isize) {
+    let len = cells.len();
+    let by = shift.unsigned_abs().min(len);
+    if shift > 0 {
+        cells.rotate_left(by);
+        cells[len - by..].fill(GUTTER_UNKNOWN);
+    } else if shift < 0 {
+        cells.rotate_right(by);
+        cells[..by].fill(GUTTER_UNKNOWN);
+    }
+}
+
 fn shift_rows(rows: &mut [u64], shift: isize) {
     let by = shift.unsigned_abs().min(rows.len());
     if shift > 0 {
@@ -4863,7 +5017,18 @@ mod row_diff_tests {
         );
         assert!(renderer.feed().blocks_laid_out() <= visible);
         assert!(renderer.feed_layout_pending());
-        let first = rows_of(&mut renderer, &mut screen, &mut from);
+        // The scrollbar gutter (last column) legitimately differs between a
+        // tail-first and a complete layout.
+        let drop_gutter = |rows: Vec<String>| -> Vec<String> {
+            rows.into_iter()
+                .map(|mut row| {
+                    row.pop();
+                    row.truncate(row.trim_end().len());
+                    row
+                })
+                .collect()
+        };
+        let first = drop_gutter(rows_of(&mut renderer, &mut screen, &mut from));
 
         // Reference: the same feed painted from a complete layout.
         let mut reference = Renderer::for_app_test().unwrap();
@@ -4873,7 +5038,8 @@ mod row_diff_tests {
         assert!(!reference.feed_layout_pending());
         let mut ref_screen = Screen::new(180, 50);
         let mut ref_from = 0;
-        let expected = rows_of(&mut reference, &mut ref_screen, &mut ref_from);
+        let expected_full = rows_of(&mut reference, &mut ref_screen, &mut ref_from);
+        let expected = drop_gutter(expected_full.clone());
         // Identical rows; only the top-row marker lacks the exact count.
         assert_eq!(first[1..], expected[1..]);
         let counted = format!(" ↑ {} ", total - visible);
@@ -4903,7 +5069,7 @@ mod row_diff_tests {
         assert!(!renderer.feed_layout_pending());
         assert!(!renderer.advance_feed_layout(64).unwrap());
         let completed = rows_of(&mut renderer, &mut screen, &mut from);
-        assert_eq!(completed, expected);
+        assert_eq!(completed, expected_full);
         assert_eq!(completed, full_paint_text(&mut renderer));
         // Every block was rendered exactly once across tail and completion.
         assert_eq!(renderer.feed().block_renders(), BLOCKS);
@@ -4958,6 +5124,63 @@ mod row_diff_tests {
         }
         let incremental = rows_of(&mut renderer, &mut screen, &mut from);
         assert_eq!(incremental, full_paint_text(&mut renderer));
+    }
+
+    #[test]
+    fn gutter_cells_track_the_viewport_position() {
+        assert_eq!(gutter_cells(10, 10, 0, true), vec![GUTTER_NONE; 10]);
+        let top = gutter_cells(40, 10, 0, true);
+        assert_eq!(top[0], GUTTER_THUMB);
+        assert_eq!(top[9], GUTTER_TRACK);
+        let bottom = gutter_cells(40, 10, 30, true);
+        assert_eq!(bottom[0], GUTTER_TRACK);
+        assert_eq!(bottom[9], GUTTER_THUMB);
+        // An unfinished tail-first layout still shows the thumb at the end.
+        let partial = gutter_cells(10, 10, 0, false);
+        assert_eq!(partial[9], GUTTER_THUMB);
+        assert!(partial.contains(&GUTTER_TRACK));
+    }
+
+    #[test]
+    fn long_history_shows_a_gutter_and_new_output_shows_the_end_hint() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..200 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("line {line}"));
+        }
+        renderer.render_viewport().unwrap();
+        assert!(renderer.captured_output().contains('┃'));
+        assert!(!renderer.captured_output().contains(NEW_OUTPUT_HINT));
+
+        renderer.scroll_page_up();
+        renderer.render_viewport().unwrap();
+        assert!(!renderer.captured_output().contains(NEW_OUTPUT_HINT));
+        renderer
+            .feed_mut()
+            .push_block(BlockStyle::Agent, "fresh output");
+        renderer.render_viewport().unwrap();
+        assert!(renderer.captured_output().contains(NEW_OUTPUT_HINT));
+
+        renderer.scroll_to_bottom().unwrap();
+        assert!(!renderer.unseen_output);
+    }
+
+    #[test]
+    fn scrolling_repaints_the_gutter_column_without_resetting_row_reuse() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        for line in 0..200 {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, format!("line {line}"));
+        }
+        renderer.render_viewport().unwrap();
+        renderer.scroll_line_up();
+        renderer.render_viewport().unwrap();
+        let before = renderer.frame_stats();
+        renderer.scroll_line_up();
+        renderer.render_viewport().unwrap();
+        assert!(renderer.frame_stats().since(before).viewport_rows <= 2);
     }
 
     #[test]

@@ -24,6 +24,13 @@ const MAX_EDITOR_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(not(windows))]
 const MAX_EDITOR_ARTIFACTS: usize = 128;
 
+/// Row labels telling `@agent:<name>` (a delegated child) apart from
+/// `/agent <name>` (the main agent's own persona).
+#[cfg(feature = "subagents")]
+const AGENT_MENTION_READ_LABEL: &str = "read-only sub-agent";
+#[cfg(feature = "subagents")]
+const AGENT_MENTION_WRITE_LABEL: &str = "write-capable sub-agent";
+
 #[cfg(not(windows))]
 struct EditorTemp {
     path: std::path::PathBuf,
@@ -333,6 +340,9 @@ pub struct InputEditor {
     /// each with its one-line description (shared, built once per refresh).
     #[cfg(feature = "subagents")]
     agent_mentions: Vec<(String, std::sync::Arc<str>)>,
+    /// Personas that declare `mode: write` (labelled in the `@agent:` rows).
+    #[cfg(feature = "subagents")]
+    agent_write_names: Vec<String>,
 
     #[cfg(feature = "agent-skills")]
     skill_commands: Vec<(String, String)>,
@@ -388,6 +398,8 @@ impl InputEditor {
             mcp_resources: Vec::new(),
             #[cfg(feature = "subagents")]
             agent_mentions: Vec::new(),
+            #[cfg(feature = "subagents")]
+            agent_write_names: Vec::new(),
 
             #[cfg(feature = "agent-skills")]
             skill_commands: Vec::new(),
@@ -524,6 +536,13 @@ impl InputEditor {
             .collect();
     }
 
+    /// Names of the write-capable personas among those given to
+    /// [`Self::set_agent_mentions`].
+    #[cfg(feature = "subagents")]
+    pub(crate) fn set_agent_write_names(&mut self, names: Vec<String>) {
+        self.agent_write_names = names;
+    }
+
     pub fn set_quick_model_names(&mut self, names: Vec<String>) {
         self.quick_model_names = names;
     }
@@ -646,9 +665,14 @@ impl InputEditor {
         // in the first window, ahead of MCP operands and walked files.
         #[cfg(feature = "subagents")]
         picker.append_virtual_mentions(self.agent_mentions.iter().map(|(name, description)| {
+            let kind = if self.agent_write_names.contains(name) {
+                AGENT_MENTION_WRITE_LABEL
+            } else {
+                AGENT_MENTION_READ_LABEL
+            };
             (
                 std::path::PathBuf::from(format!("@agent:{name}")),
-                description.clone(),
+                std::sync::Arc::<str>::from(format!("[{kind}] {description}")),
             )
         }));
         #[cfg(feature = "mcp")]
@@ -2120,5 +2144,16 @@ mod settings_history_tests {
         assert!(input.handle_picker_key(KeyCode::Enter.into()));
         assert_eq!(input.buffer, "/config --project sandbox true");
         assert!(!input.picker.as_ref().unwrap().active());
+    }
+
+    #[test]
+    fn clearing_a_multiline_draft_works_from_any_cursor_and_ctrl_y_restores_it() {
+        let mut input = InputEditor::new();
+        input.load_text("first line\nsecond line\nthird");
+        input.set_cursor(14);
+        input.discard_draft();
+        assert_eq!(input.buffer, "");
+        input.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(input.buffer, "first line\nsecond line\nthird");
     }
 }

@@ -979,7 +979,7 @@ impl Config {
     }
 
     pub fn resolve_mouse_scroll_lines(&self) -> usize {
-        usize::from(self.mouse_scroll_lines.unwrap_or(1).clamp(1, 20))
+        usize::from(self.mouse_scroll_lines.unwrap_or(3).clamp(1, 20))
     }
 
     pub fn resolve_terminal_title(&self) -> bool {
@@ -1823,9 +1823,9 @@ mod tests {
     }
 
     #[test]
-    fn toml_mouse_scroll_lines_defaults_to_one_and_is_clamped() {
+    fn toml_mouse_scroll_lines_defaults_to_three_and_is_clamped() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.resolve_mouse_scroll_lines(), 1);
+        assert_eq!(cfg.resolve_mouse_scroll_lines(), 3);
         for (text, expected) in [("5", 5), ("0", 1), ("500", 20)] {
             let cfg: Config = toml::from_str(&format!("mouse_scroll_lines = {text}\n")).unwrap();
             assert_eq!(cfg.resolve_mouse_scroll_lines(), expected, "{text}");

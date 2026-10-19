@@ -1753,6 +1753,9 @@ impl<'a> App<'a> {
             ));
             input.set_agent_names(entries.iter().map(|(name, _)| name.clone()).collect());
             input.set_agent_mentions(entries);
+            input.set_agent_write_names(crate::context::agents::write_persona_names_for_workspace(
+                Some(&ui.workspace),
+            ));
         }
         #[cfg(not(feature = "subagents"))]
         input.set_agent_names(ui.context.agent_definitions.keys().cloned().collect());
@@ -5834,8 +5837,12 @@ impl<'a> App<'a> {
         text: &str,
     ) -> anyhow::Result<Option<(String, Option<String>)>> {
         match crate::context::mentions::parse_agent_mentions(text, Some(&self.ui.workspace)) {
-            Ok(None) => Ok(Some((text.to_owned(), None))),
+            Ok(None) => {
+                self.show_bare_persona_hints(text)?;
+                Ok(Some((text.to_owned(), None)))
+            }
             Ok(Some(mentions)) => {
+                self.show_bare_persona_hints(&mentions.text)?;
                 let directive = crate::context::mentions::routing_directive(&mentions.names);
                 Ok(Some((mentions.text, Some(directive))))
             }
@@ -5847,6 +5854,20 @@ impl<'a> App<'a> {
                 Ok(None)
             }
         }
+    }
+
+    /// A bare `@name` that matches a persona is only a file mention; say how
+    /// to reach the persona.
+    #[cfg(feature = "subagents")]
+    fn show_bare_persona_hints(&mut self, text: &str) -> anyhow::Result<()> {
+        if !text.contains('@') {
+            return Ok(());
+        }
+        for hint in crate::context::mentions::bare_persona_hints(text, Some(&self.ui.workspace)) {
+            self.renderer
+                .write_line(&sanitize_output(&hint), crossterm::style::Color::DarkGrey)?;
+        }
+        Ok(())
     }
 
     /// Arm the routing directive immediately before the turn start that
@@ -6608,6 +6629,9 @@ impl<'a> App<'a> {
             self.input
                 .set_agent_names(entries.iter().map(|(name, _)| name.clone()).collect());
             self.input.set_agent_mentions(entries);
+            self.input.set_agent_write_names(
+                crate::context::agents::write_persona_names_for_workspace(Some(&self.ui.workspace)),
+            );
         }
         self.input.set_custom_commands(commands);
     }
