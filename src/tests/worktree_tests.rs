@@ -1186,6 +1186,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_only_merge_does_not_fetch_unreachable_remotes() {
+        let repo = TempRepo::new("local-only unreachable remote");
+        let missing = repo.path().parent().unwrap().join("missing remote");
+        git(
+            repo.path(),
+            [
+                OsStr::new("remote"),
+                OsStr::new("add"),
+                OsStr::new("dead"),
+                missing.as_os_str(),
+            ],
+        );
+        let worktree = repo.path().parent().unwrap().join("linked worktree");
+        git(
+            repo.path(),
+            vec![
+                OsString::from("worktree"),
+                OsString::from("add"),
+                OsString::from("-b"),
+                OsString::from("feature"),
+                worktree.as_os_str().to_os_string(),
+            ],
+        );
+        std::fs::write(worktree.join("feature.txt"), "local feature\n").unwrap();
+        git(&worktree, ["add", "feature.txt"]);
+        git(&worktree, ["commit", "-m", "feature"]);
+        let info = WorktreeInfo {
+            branch: "feature".into(),
+            worktree_path: worktree.clone(),
+            main_repo_path: repo.path().to_path_buf(),
+        };
+        let (_state, outcome) = try_merge(&info, "main").await;
+        assert_eq!(
+            outcome,
+            MergeOutcome::Success,
+            "a target without upstream configuration must not contact any remote"
+        );
+    }
+
+    #[tokio::test]
     async fn configured_but_incomplete_upstream_still_fails_pull() {
         for (key, value) in [
             ("branch.main.remote", "origin"),
