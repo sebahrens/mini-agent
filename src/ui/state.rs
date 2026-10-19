@@ -280,7 +280,7 @@ impl PendingMainTurn {
             session_before: SessionRollback {
                 messages_len: session.messages.len(),
                 file_checkpoint_revision: session.file_checkpoints.revision(),
-                compactions_len: session.compactions.len(),
+                compactions_len: session.compaction_count(),
                 updated_at: session.updated_at.clone(),
                 total_estimated_tokens: session.total_estimated_tokens,
                 calibrated_tokens: session.calibrated_tokens,
@@ -391,7 +391,7 @@ impl PendingMainTurn {
                     .session_before
                     .messages_len
                     .saturating_add(self.initial_message_count())
-            || session.compactions.len() != self.session_before.compactions_len
+            || session.compaction_count() != self.session_before.compactions_len
             || {
                 #[cfg(feature = "memory")]
                 {
@@ -489,9 +489,7 @@ impl PendingMainTurn {
             }
         }
         session.messages.truncate(self.session_before.messages_len);
-        session
-            .compactions
-            .truncate(self.session_before.compactions_len);
+        session.rollback_compactions_to_count(self.session_before.compactions_len);
         session.mark_history_changed();
         session.updated_at = self.session_before.updated_at;
         session.total_estimated_tokens = self.session_before.total_estimated_tokens;

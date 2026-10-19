@@ -1007,6 +1007,7 @@ async fn native_bound_interactive_turn() {
             token_savings: 10,
             created_at: "2026-10-14T00:00:00Z".into(),
             memory_ref: None,
+            pruned: None,
         });
     assert_eq!(
         candidate()

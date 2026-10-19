@@ -126,7 +126,11 @@ pub(super) async fn checkpoint(history: &super::SessionHistory) -> anyhow::Resul
         lease.writer.load(std::sync::atomic::Ordering::Acquire),
         "ACP session writer was not claimed"
     );
-    let snapshot = history.session.clone();
+    // Legacy sessions are encoded here from the borrow (no deep clone of every
+    // message); only native-bearing ones keep an owned snapshot for the writer.
+    // A validation/size failure is carried into the blocking job so it is
+    // reported (and scoped) exactly like a failed write.
+    let snapshot = crate::session::storage::prepare_save(&history.session);
     let scope = crate::agent::runner::AgentWorkScope::new();
     #[cfg(test)]
     let scope = super::lock_unpoisoned(&lease.owner.storage_scope_for_test)
@@ -141,7 +145,7 @@ pub(super) async fn checkpoint(history: &super::SessionHistory) -> anyhow::Resul
                     !crate::paths::artifact_disabled("sessions"),
                     "ACP session persistence is disabled"
                 );
-                crate::session::storage::save_session(&snapshot)
+                snapshot?.commit()
             })
             .await
         })

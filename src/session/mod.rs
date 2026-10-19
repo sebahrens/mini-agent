@@ -190,7 +190,7 @@ pub enum MessageRole {
     SubagentToolCall,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "UncheckedSessionMessage")]
 pub struct SessionMessage {
     /// Ordered canonical text/image payload; absent for legacy text-only rows.
@@ -220,7 +220,12 @@ struct UncheckedSessionMessage {
     #[serde(default)]
     recorded_diff: Option<crate::agent::tools::mutation_diff::MutationDiff>,
     role: MessageRole,
-    content: CompactString,
+    #[serde(default)]
+    content: Option<CompactString>,
+    /// Storage form of a tool-result row whose `content` is
+    /// `prefix + tool.output`: the shared output is written once.
+    #[serde(default)]
+    content_prefix: Option<CompactString>,
     estimated_tokens: u64,
     #[serde(default)]
     tool_call_id: Option<CompactString>,
@@ -228,14 +233,102 @@ struct UncheckedSessionMessage {
     tool: Option<PersistedToolMessage>,
 }
 
+/// Wire shape of [`SessionMessage`]. The canonical form (what every digest,
+/// export and in-memory comparison sees) always carries `content` and never
+/// `content_prefix`, byte-identical to the former derived encoding.
+#[derive(Serialize)]
+struct SessionMessageRepr<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: &'a Option<user::PersistedUserMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recorded_diff: &'a Option<crate::agent::tools::mutation_diff::MutationDiff>,
+    role: MessageRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_prefix: Option<&'a str>,
+    estimated_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: &'a Option<CompactString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: &'a Option<PersistedToolMessage>,
+}
+
+thread_local! {
+    /// Set only while the session file bytes are produced (see
+    /// [`storage::serialize_session_for_storage`]); every other serialization,
+    /// including all digests, stays canonical.
+    static STORAGE_ENCODING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tool outputs below this size are not worth a second field.
+const STORAGE_DEDUP_MIN_OUTPUT_BYTES: usize = 64;
+
+pub(crate) struct StorageEncodingGuard(bool);
+
+impl StorageEncodingGuard {
+    pub(crate) fn enable() -> Self {
+        Self(STORAGE_ENCODING.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for StorageEncodingGuard {
+    fn drop(&mut self) {
+        STORAGE_ENCODING.with(|flag| flag.set(self.0));
+    }
+}
+
+impl Serialize for SessionMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut content = Some(self.content.as_str());
+        let mut content_prefix = None;
+        if self.role == MessageRole::ToolResult
+            && self.user.is_none()
+            && let Some(PersistedToolMessage::Result { output, .. }) = &self.tool
+            && output.len() >= STORAGE_DEDUP_MIN_OUTPUT_BYTES
+            && STORAGE_ENCODING.with(std::cell::Cell::get)
+            && let Some(prefix) = self.content.strip_suffix(output.as_str())
+        {
+            content = None;
+            content_prefix = Some(prefix);
+        }
+        SessionMessageRepr {
+            user: &self.user,
+            recorded_diff: &self.recorded_diff,
+            role: self.role,
+            content,
+            content_prefix,
+            estimated_tokens: self.estimated_tokens,
+            tool_call_id: &self.tool_call_id,
+            tool: &self.tool,
+        }
+        .serialize(serializer)
+    }
+}
+
 impl TryFrom<UncheckedSessionMessage> for SessionMessage {
     type Error = &'static str;
     fn try_from(value: UncheckedSessionMessage) -> Result<Self, Self::Error> {
+        let content = match (value.content, value.content_prefix) {
+            (Some(content), None) => content,
+            (None, Some(prefix)) => match &value.tool {
+                Some(PersistedToolMessage::Result { output, .. })
+                    if value.role == MessageRole::ToolResult && value.user.is_none() =>
+                {
+                    let mut content = CompactString::new(prefix.as_str());
+                    content.push_str(output);
+                    content
+                }
+                _ => return Err("session row has a content prefix without a tool result"),
+            },
+            (None, None) => return Err("session row has no content"),
+            (Some(_), Some(_)) => return Err("session row has both content and a content prefix"),
+        };
         let message = Self {
             user: value.user,
             recorded_diff: value.recorded_diff,
             role: value.role,
-            content: value.content,
+            content,
             estimated_tokens: value.estimated_tokens,
             tool_call_id: value.tool_call_id,
             tool: value.tool,
@@ -596,7 +689,51 @@ pub struct Compaction {
     /// the tag existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_ref: Option<CompactString>,
+    /// Older compactions dropped from `Session::compactions` ahead of this one
+    /// (mini-agent-3xwfv). Carried on the first retained record so the
+    /// serialized history, and every digest over it, still commits to the full
+    /// sequence. Absent in every session saved before pruning existed, which
+    /// therefore serialize and digest exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pruned: Option<PrunedCompactions>,
 }
+
+/// Count and hash chain of compactions pruned from the front of the history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PrunedCompactions {
+    pub(crate) count: usize,
+    /// Lowercase hex SHA-256 chain: `H(previous_chain || JSON(record))` over
+    /// each pruned record in order.
+    pub(crate) chain: CompactString,
+}
+
+impl PrunedCompactions {
+    /// Extend the chain by one pruned record (which must carry no `pruned`).
+    fn fold(previous: Option<Self>, removed: &Compaction) -> Self {
+        use sha2::Digest;
+        let (count, chain) = previous
+            .map(|pruned| (pruned.count, pruned.chain))
+            .unwrap_or_default();
+        let mut hash = sha2::Sha256::new();
+        hash.update(chain.as_bytes());
+        // Serializing a plain record cannot fail; fold nothing if it did.
+        hash.update(serde_json::to_vec(removed).unwrap_or_default());
+        let chain: String = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self {
+            count: count + 1,
+            chain: chain.into(),
+        }
+    }
+}
+
+/// Full compaction records kept in memory and on disk. Only the last is ever
+/// replayed; the rest are history, so older ones are folded into
+/// [`PrunedCompactions`].
+pub(crate) const MAX_RETAINED_COMPACTIONS: usize = 4;
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
@@ -2423,6 +2560,41 @@ impl Session {
         self.compactions.last()?.memory_ref.as_deref()
     }
 
+    /// Total compactions this session has performed, including pruned ones.
+    /// Use this, not `compactions.len()`, wherever the count is user-visible
+    /// or part of an identity.
+    pub fn compaction_count(&self) -> usize {
+        self.compactions
+            .first()
+            .and_then(|first| first.pruned.as_ref())
+            .map_or(0, |pruned| pruned.count)
+            + self.compactions.len()
+    }
+
+    /// Drop the newest records until `compaction_count()` is at most `count`
+    /// (turn rollback). The record carrying the pruned prefix is never
+    /// dropped, so the count and chain are not lost.
+    pub(crate) fn rollback_compactions_to_count(&mut self, count: usize) {
+        while self.compaction_count() > count {
+            if self.compactions.len() == 1 && self.compactions[0].pruned.is_some() {
+                break;
+            }
+            if self.compactions.pop().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// Fold records beyond [`MAX_RETAINED_COMPACTIONS`] into the first
+    /// retained record's [`PrunedCompactions`].
+    fn prune_compaction_history(&mut self) {
+        while self.compactions.len() > MAX_RETAINED_COMPACTIONS {
+            let mut removed = self.compactions.remove(0);
+            let previous = removed.pruned.take();
+            self.compactions[0].pruned = Some(PrunedCompactions::fold(previous, &removed));
+        }
+    }
+
     pub fn compacted_context(&self) -> (Option<&str>, usize) {
         let c = match self.compactions.last() {
             Some(c) => c,
@@ -2521,7 +2693,9 @@ impl Session {
             token_savings,
             created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
             memory_ref: Some(memory_ref),
+            pruned: None,
         });
+        self.prune_compaction_history();
 
         // Compaction reindexes messages, so the calibration anchor no longer
         // lines up and an older redo snapshot is no longer composable. Drop
@@ -3509,6 +3683,267 @@ mod truncated_output_format_tests {
                 }
             }
             assert_eq!(view.replaced.len(), 6usize.saturating_sub(keep));
+        }
+    }
+}
+
+#[cfg(test)]
+mod compaction_history_tests {
+    use super::*;
+    use crate::session::native_replay::{compaction_digest, feed_digest};
+
+    fn compacted(times: usize) -> Session {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        for round in 0..times {
+            for i in 0..3 {
+                session.add_message(MessageRole::User, &format!("round {round} message {i}"));
+            }
+            session.compress(format!("summary {round}"), 2, 10);
+        }
+        session
+    }
+
+    fn reload(session: &Session) -> Session {
+        let json = storage::serialize_bounded_session(session).unwrap();
+        storage::decode_session_json(&json).unwrap()
+    }
+
+    #[test]
+    fn history_is_bounded_but_the_count_and_active_summary_are_not() {
+        let session = compacted(MAX_RETAINED_COMPACTIONS + 6);
+        assert_eq!(session.compactions.len(), MAX_RETAINED_COMPACTIONS);
+        assert_eq!(session.compaction_count(), MAX_RETAINED_COMPACTIONS + 6);
+        assert_eq!(
+            session
+                .compactions
+                .first()
+                .unwrap()
+                .pruned
+                .as_ref()
+                .unwrap()
+                .count,
+            6
+        );
+        assert!(
+            session
+                .compactions
+                .last()
+                .unwrap()
+                .summary
+                .contains("summary 9")
+        );
+        assert!(session.compacted_context().0.is_some());
+    }
+
+    #[test]
+    fn the_pruned_chain_is_a_deterministic_function_of_the_full_history() {
+        let record = |summary: &str| Compaction {
+            file_requests: Default::default(),
+            summary: summary.into(),
+            first_kept_index: 1,
+            summarized_count: 1,
+            token_savings: 1,
+            created_at: "t".into(),
+            memory_ref: None,
+            pruned: None,
+        };
+        let chain = |summaries: &[&str]| {
+            summaries
+                .iter()
+                .fold(None, |acc, s| {
+                    Some(PrunedCompactions::fold(acc, &record(s)))
+                })
+                .unwrap()
+        };
+        assert_eq!(chain(&["a", "b"]), chain(&["a", "b"]));
+        assert_ne!(chain(&["a", "b"]), chain(&["b", "a"]));
+        assert_ne!(chain(&["a", "b"]), chain(&["a", "b", "c"]));
+        assert_eq!(chain(&["a", "b", "c"]).count, 3);
+        assert_eq!(chain(&["a"]).chain.len(), 64);
+    }
+
+    #[test]
+    fn digests_survive_a_save_load_cycle_with_and_without_pruning() {
+        for times in [0, 2, MAX_RETAINED_COMPACTIONS, MAX_RETAINED_COMPACTIONS + 5] {
+            let session = compacted(times);
+            let loaded = reload(&session);
+            assert_eq!(loaded.compaction_count(), session.compaction_count());
+            assert_eq!(
+                compaction_digest(&loaded.compactions).unwrap(),
+                compaction_digest(&session.compactions).unwrap(),
+                "{times} compactions"
+            );
+            assert_eq!(
+                feed_digest(&loaded.messages, &loaded.compactions).unwrap(),
+                feed_digest(&session.messages, &session.compactions).unwrap()
+            );
+        }
+    }
+
+    /// A record saved before pruning existed has no `pruned` field. It loads
+    /// unchanged, serializes without one, and its digest is the digest of the
+    /// bytes that were always hashed.
+    #[test]
+    fn old_format_compaction_records_load_and_digest_unchanged() {
+        let old = serde_json::json!([{
+            "summary": "old recap", "first_kept_index": 1, "summarized_count": 2,
+            "token_savings": 10, "created_at": "2026-01-01T00:00:00Z", "memory_ref": "abc"
+        }]);
+        let records: Vec<Compaction> = serde_json::from_value(old).unwrap();
+        assert!(records[0].pruned.is_none());
+        let reserialized = serde_json::to_string(&records).unwrap();
+        assert!(!reserialized.contains("pruned"));
+        let expected = {
+            use sha2::Digest;
+            let bytes: [u8; 32] = sha2::Sha256::digest(reserialized.as_bytes()).into();
+            bytes
+        };
+        assert_eq!(compaction_digest(&records).unwrap(), expected);
+        // An old session with more records than the retained cap still loads
+        // whole; it is only folded when the next compaction happens.
+        let many: Vec<_> = (0..MAX_RETAINED_COMPACTIONS + 3)
+            .map(|i| records[0].clone_with_summary(&format!("s{i}")))
+            .collect();
+        let mut session = compacted(0);
+        session.compactions = many;
+        assert_eq!(session.compaction_count(), MAX_RETAINED_COMPACTIONS + 3);
+        assert_eq!(
+            reload(&session).compactions.len(),
+            MAX_RETAINED_COMPACTIONS + 3
+        );
+    }
+
+    #[test]
+    fn rollback_removes_only_compactions_added_after_the_capture() {
+        let mut session = compacted(MAX_RETAINED_COMPACTIONS + 1);
+        let before = session.compaction_count();
+        for i in 0..2 {
+            session.add_message(MessageRole::User, "a");
+            session.add_message(MessageRole::User, "b");
+            session.add_message(MessageRole::User, "c");
+            session.compress(format!("later {i}"), 2, 1);
+        }
+        assert_eq!(session.compaction_count(), before + 2);
+        session.rollback_compactions_to_count(before);
+        assert_eq!(session.compaction_count(), before);
+        assert!(session.compactions[0].pruned.is_some());
+    }
+
+    impl Compaction {
+        fn clone_with_summary(&self, summary: &str) -> Self {
+            Self {
+                summary: summary.into(),
+                ..self.clone()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod storage_encoding_tests {
+    use super::*;
+    use crate::session::native_replay::feed_digest;
+
+    fn tool_heavy() -> Session {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        session.add_message(MessageRole::User, "inspect the files");
+        for i in 0..3 {
+            let id = format!("call-{i}");
+            session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": "a.txt"}));
+            session.add_tool_result_with_id(&id, "read", &format!("line {i}\n").repeat(200));
+        }
+        session.add_tool_call_with_id("tiny", "shell", &serde_json::json!({"command": "true"}));
+        session.add_tool_result_with_id("tiny", "shell", "ok");
+        session
+    }
+
+    /// The canonical (digest) encoding of a message is the byte-for-byte shape
+    /// the derived serializer always produced.
+    #[test]
+    fn canonical_encoding_is_unchanged_and_has_no_storage_fields() {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        session.add_tool_call_with_id("c", "read", &serde_json::json!({}));
+        session.add_tool_result_with_id("c", "read", &"x".repeat(100));
+        let row = serde_json::to_string(&session.messages[1]).unwrap();
+        let expected = format!(
+            "{{\"role\":\"tool_result\",\"content\":\"read:\\n{x}\",\"estimated_tokens\":{t},\"tool_call_id\":\"c\",\"tool\":{{\"kind\":\"result\",\"output\":\"{x}\"}}}}",
+            x = "x".repeat(100),
+            t = session.messages[1].estimated_tokens
+        );
+        assert_eq!(row, expected);
+        assert!(!row.contains("content_prefix"));
+    }
+
+    #[test]
+    fn storage_encoding_writes_each_tool_output_once_and_loads_back_exactly() {
+        let session = tool_heavy();
+        let canonical = storage::serialize_bounded_session(&session).unwrap();
+        let stored = storage::serialize_session_for_storage(&session).unwrap();
+        assert!(
+            stored.len() < canonical.len() * 3 / 4,
+            "{} vs {}",
+            stored.len(),
+            canonical.len()
+        );
+        assert_eq!(
+            stored.matches("content_prefix").count(),
+            3,
+            "tiny result stays whole"
+        );
+        // The flag does not leak into later canonical serialization.
+        assert_eq!(
+            storage::serialize_bounded_session(&session).unwrap(),
+            canonical
+        );
+
+        let loaded = storage::decode_session_json(&stored).unwrap();
+        for (a, b) in session.messages.iter().zip(&loaded.messages) {
+            assert_eq!(a.content, b.content);
+        }
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&session).unwrap()
+        );
+        // Digests are over the canonical form: identical across the cycle.
+        assert_eq!(
+            storage::serialize_bounded_session(&loaded).unwrap(),
+            canonical
+        );
+        assert_eq!(
+            feed_digest(&loaded.messages, &loaded.compactions).unwrap(),
+            feed_digest(&session.messages, &session.compactions).unwrap()
+        );
+        // And a second save of the loaded session is byte-identical.
+        assert_eq!(
+            storage::serialize_session_for_storage(&loaded).unwrap(),
+            stored
+        );
+    }
+
+    #[test]
+    fn old_format_files_with_both_fields_still_load() {
+        let session = tool_heavy();
+        let canonical = storage::serialize_bounded_session(&session).unwrap();
+        let loaded = storage::decode_session_json(&canonical).unwrap();
+        assert_eq!(loaded.messages[2].content, session.messages[2].content);
+        assert_eq!(
+            storage::serialize_bounded_session(&loaded).unwrap(),
+            canonical
+        );
+    }
+
+    #[test]
+    fn rows_that_cannot_expand_are_rejected() {
+        let row = |extra: &str| format!("{{\"role\":\"assistant\",\"estimated_tokens\":1{extra}}}");
+        for json in [
+            row(",\"content_prefix\":\"read:\\n\""),
+            row(",\"content\":\"a\",\"content_prefix\":\"b\""),
+            row(""),
+        ] {
+            assert!(
+                serde_json::from_str::<SessionMessage>(&json).is_err(),
+                "{json}"
+            );
         }
     }
 }

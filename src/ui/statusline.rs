@@ -235,7 +235,7 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
         .hash(&mut state);
     session.name.hash(&mut state);
     session.messages.len().hash(&mut state);
-    session.compactions.len().hash(&mut state);
+    session.compaction_count().hash(&mut state);
     session.created_at.hash(&mut state);
     session.updated_at.hash(&mut state);
     session.total_input_tokens.hash(&mut state);
@@ -837,7 +837,7 @@ fn resolve_item(
             (ctx.background_jobs > 0 || always).then(|| format!("jobs:{}", ctx.background_jobs))
         }
         "compaction" => {
-            (!session.compactions.is_empty()).then(|| format!("cmp:{}", session.compactions.len()))
+            (!session.compactions.is_empty()).then(|| format!("cmp:{}", session.compaction_count()))
         }
         "btw" => {
             if ctx.btw_in == 0 && ctx.btw_out == 0 {

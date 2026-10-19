@@ -182,7 +182,7 @@ impl ContextDiagnostic {
             preamble_parts: actual.map(|value| value.ranges.len()),
             largest,
             live_results,
-            compactions: session.compactions.len(),
+            compactions: session.compaction_count(),
             has_summary: summary.is_some(),
             window: session.context_window,
             threshold: session.context_window.saturating_sub(reserve),

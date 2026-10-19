@@ -48,7 +48,7 @@ pub fn render_session(
             BlockStyle::System,
             format!(
                 "compacted {} times (saved ~{} tokens)",
-                session.compactions.len(),
+                session.compaction_count(),
                 session
                     .compactions
                     .last()
