@@ -103,6 +103,12 @@ pub(crate) struct GitRunner {
     nested_repositories: bool,
     #[cfg(all(test, unix))]
     home_override: Option<Arc<PathBuf>>,
+    /// Canonical absolute `PATH` entries, keyed by the `PATH` string they were
+    /// resolved from. Disjointness from model-writable roots is still checked
+    /// on every command.
+    path_entries: Arc<std::sync::Mutex<Option<(OsString, Arc<Vec<PathBuf>>)>>>,
+    #[cfg(test)]
+    path_canonicalizations: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for GitRunner {
@@ -180,6 +186,9 @@ impl GitRunner {
                 |name| std::env::var_os(name),
             )),
             nested_repositories: false,
+            path_entries: Arc::default(),
+            #[cfg(test)]
+            path_canonicalizations: Arc::default(),
             #[cfg(all(test, unix))]
             home_override: None,
             #[cfg(test)]
@@ -211,6 +220,9 @@ impl GitRunner {
             #[cfg(test)]
             globals: None,
             nested_repositories: false,
+            path_entries: Arc::default(),
+            #[cfg(test)]
+            path_canonicalizations: Arc::default(),
             #[cfg(all(test, unix))]
             home_override: None,
         })
@@ -228,6 +240,9 @@ impl GitRunner {
             #[cfg(test)]
             globals: None,
             nested_repositories: false,
+            path_entries: Arc::default(),
+            #[cfg(test)]
+            path_canonicalizations: Arc::default(),
             #[cfg(all(test, unix))]
             home_override: None,
         })
@@ -269,6 +284,12 @@ impl GitRunner {
         if let Some(runtime) = &self.runtime {
             runtime.validate(&super::runtime::model_write_roots()?)?;
         }
+        self.validate_program()
+    }
+
+    /// Executable identity only. Guarded launches validate the runtime once,
+    /// in [`GitRunner::configure_guarded_command`], right before spawning.
+    fn validate_program(&self) -> Result<(), String> {
         if self.program.as_os_str().is_empty() {
             return Err("Git executable is unavailable or unsupported".to_string());
         }
@@ -323,7 +344,11 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.validate()?;
+        if self.runtime.is_some() {
+            self.validate_program()?;
+        } else {
+            self.validate()?;
+        }
         let args = args
             .into_iter()
             .map(|arg| arg.as_ref().to_os_string())
@@ -491,14 +516,9 @@ impl GitRunner {
         #[cfg(windows)]
         command.env("MSYSTEM", "UCRT64");
         if let Some(original) = original {
-            for path in std::env::split_paths(original) {
-                if !path.is_absolute() {
-                    continue;
-                }
-                if let Ok(path) = path.canonicalize()
-                    && super::runtime::require_disjoint(&path, roots).is_ok()
-                {
-                    paths.push(path);
+            for path in self.canonical_path_entries(original).iter() {
+                if super::runtime::require_disjoint(path, roots).is_ok() {
+                    paths.push(path.clone());
                 }
             }
         }
@@ -508,6 +528,28 @@ impl GitRunner {
                 .map_err(|_| "guarded Git service search path is unsupported")?,
         );
         super::global_snapshot::validate_environment(command)
+    }
+
+    /// Canonical absolute entries of `original`, resolved once per distinct
+    /// `PATH` string (the captured environment never changes).
+    fn canonical_path_entries(&self, original: &OsStr) -> Arc<Vec<PathBuf>> {
+        let mut cache = self.path_entries.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((key, entries)) = cache.as_ref()
+            && key == original
+        {
+            return entries.clone();
+        }
+        #[cfg(test)]
+        self.path_canonicalizations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let entries = Arc::new(
+            std::env::split_paths(original)
+                .filter(|path| path.is_absolute())
+                .filter_map(|path| path.canonicalize().ok())
+                .collect::<Vec<_>>(),
+        );
+        *cache = Some((original.to_os_string(), entries.clone()));
+        entries
     }
 
     /// Fixed, read-only parser query. It cannot execute a Git subcommand chosen
@@ -2987,6 +3029,36 @@ mod guarded_runtime_tests {
             .await
             .unwrap();
         runner.with_test_globals(sources)
+    }
+
+    #[tokio::test]
+    async fn guarded_launch_canonicalizes_the_search_path_once_per_path_string() {
+        let owned = SnapshotDirectory::new(&std::env::temp_dir()).unwrap();
+        let root = owned.path();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let runner = fixture_runner(root, &project, Vec::new(), None).await;
+        let has_path = runner
+            .captured_environment
+            .iter()
+            .any(|(key, _)| key == "PATH");
+        let mut first = None;
+        for _ in 0..3 {
+            let command = runner
+                .internal_command(&project, "status", ["status"], InternalProfile::Local)
+                .await
+                .expect("guarded command");
+            let path = command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == "PATH")
+                .and_then(|(_, value)| value.map(ToOwned::to_owned));
+            assert_eq!(*first.get_or_insert(path.clone()), path, "PATH is stable");
+        }
+        let count = runner
+            .path_canonicalizations
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(count, usize::from(has_path));
     }
 
     fn shell_path(path: &Path) -> String {
