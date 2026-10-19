@@ -173,6 +173,57 @@ impl SubagentAuthorization {
         self
     }
 
+    /// The authorization of a worktree-isolated write child: every tool, the
+    /// sandbox and the permission checker are bound to `worktree` and to
+    /// nothing else. Fails closed when the parent has no permission checker
+    /// (the parent-tree denial lives there) or no write tools.
+    ///
+    /// * The checker is a snapshot rebound to the worktree with all session
+    ///   grants dropped and a hard denial of any mutation under
+    ///   `denied_roots` or of a `.git` entry.
+    /// * The sandbox is rebound to the worktree, so a shell command can write
+    ///   only there. If the sandbox is off, host-wide, or has an extra write
+    ///   root overlapping a denied root, the shell tool is removed instead.
+    /// * Parent-bound read-only JS and workspace instructions are dropped.
+    #[cfg(all(feature = "git-worktree", feature = "subagents"))]
+    pub(crate) fn isolated_to(
+        &self,
+        worktree: std::sync::Arc<crate::paths::WorkspaceBinding>,
+        denied_roots: &[std::path::PathBuf],
+    ) -> Result<Self, String> {
+        let permission = self.permission.as_ref().ok_or_else(|| {
+            "worktree isolation requires permission checks; none are active".to_string()
+        })?;
+        let mut write_tools = self
+            .write_tools
+            .clone()
+            .ok_or_else(|| "worktree isolation requires the parent's write tools".to_string())?;
+        let derived = permission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .derive_isolated_child(worktree.root(), denied_roots)
+            .map_err(|error| error.to_string())?;
+        if denied_roots
+            .iter()
+            .any(|root| write_tools.sandbox.may_write_under(worktree.root(), root))
+        {
+            write_tools.shell_enabled = false;
+        }
+        write_tools.sandbox = write_tools
+            .sandbox
+            .rebind_workspace_binding(worktree.clone())?;
+        let mut isolated = self.clone();
+        isolated.permission = Some(std::sync::Arc::new(std::sync::Mutex::new(derived)));
+        isolated.write_tools = Some(write_tools);
+        isolated.workspace = Some(worktree);
+        isolated.instructions = None;
+        #[cfg(feature = "js")]
+        {
+            isolated.read_only_js = None;
+        }
+        Ok(isolated)
+    }
+
     pub(crate) fn with_workspace_instructions(
         mut self,
         instructions: Option<std::sync::Arc<crate::context::instructions::WorkspaceInstructions>>,

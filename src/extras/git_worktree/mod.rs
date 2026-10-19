@@ -2606,6 +2606,118 @@ pub async fn worktree_auto_commit_all(worktree_path: &Path) -> Result<(), String
     Ok(())
 }
 
+/// What a worktree-isolated subagent produced on its own branch.
+#[cfg(feature = "subagents")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchReport {
+    pub branch: String,
+    /// `git log --oneline <base>..<branch>`, oldest first.
+    pub commits: Vec<String>,
+    /// `git diff --stat <base> <branch>`.
+    pub diff_stat: String,
+}
+
+/// The object id `HEAD` names in `repo_path`.
+#[cfg(feature = "subagents")]
+pub async fn head_oid(repo_path: &Path) -> Result<String, String> {
+    let repo_path = canonical_path(repo_path, "repository")?;
+    revision_oid(&repo_path, "HEAD").await
+}
+
+/// Commit every change in `worktree_path` (tracked, untracked, deleted) with
+/// `message`. Returns whether a commit was created; a clean tree is not an
+/// error. Uses the same hardened runner as every other worktree operation, so
+/// repository hooks and filters do not run.
+#[cfg(feature = "subagents")]
+pub async fn commit_all_if_dirty(worktree_path: &Path, message: &str) -> Result<bool, String> {
+    let worktree_path = canonical_path(worktree_path, "worktree")?;
+    let _guard = acquire_repository(&worktree_path).await?;
+    run_local(&worktree_path, "add-all", ["add", "--all"]).await?;
+    if !has_uncommitted_changes_at(&worktree_path).await? {
+        return Ok(false);
+    }
+    run_local(&worktree_path, "subagent-commit", ["commit", "-m", message]).await?;
+    if has_uncommitted_changes_at(&worktree_path).await? {
+        return Err("worktree remained dirty after the subagent commit".to_string());
+    }
+    Ok(true)
+}
+
+/// Commits and diff stat of `info.branch` relative to `base_oid`.
+#[cfg(feature = "subagents")]
+pub async fn branch_report(info: &WorktreeInfo, base_oid: &str) -> Result<BranchReport, String> {
+    let range = format!("{base_oid}..{}", info.branch);
+    let log = run_query(
+        &info.main_repo_path,
+        "subagent-branch-log",
+        ["log", "--reverse", "--oneline", "--no-color", &range],
+    )
+    .await?;
+    let source_ref = format!("refs/heads/{}", info.branch);
+    let stat = run_query(
+        &info.main_repo_path,
+        "subagent-branch-diff-stat",
+        [
+            "diff",
+            "--stat",
+            "--no-color",
+            "--no-ext-diff",
+            base_oid,
+            &source_ref,
+        ],
+    )
+    .await?;
+    let text = |bytes: &[u8]| String::from_utf8_lossy(trim_line(bytes)).into_owned();
+    Ok(BranchReport {
+        branch: info.branch.clone(),
+        commits: text(&log.stdout)
+            .lines()
+            .map(str::to_string)
+            .filter(|line| !line.is_empty())
+            .collect(),
+        diff_stat: text(&stat.stdout),
+    })
+}
+
+/// Remove a worktree this process created for a subagent, together with its
+/// branch, discarding anything in either. Idempotent: an already-removed
+/// worktree or branch is not an error.
+#[cfg(feature = "subagents")]
+pub async fn discard_worktree(info: &WorktreeInfo) -> Result<(), String> {
+    let main_repo_path = canonical_path(&info.main_repo_path, "main repository")?;
+    validate_branch_name(&main_repo_path, &info.branch).await?;
+    let _guard = acquire_repository(&main_repo_path).await?;
+    ensure_worktree_is_not_process_workspace(&info.worktree_path)?;
+    if info.worktree_path.exists() {
+        run_local(
+            &main_repo_path,
+            "worktree-remove",
+            [
+                OsString::from("worktree"),
+                OsString::from("remove"),
+                OsString::from("--force"),
+                info.worktree_path.as_os_str().to_os_string(),
+            ],
+        )
+        .await?;
+    } else {
+        run_local(&main_repo_path, "worktree-prune", ["worktree", "prune"]).await?;
+    }
+    let source_ref = format!("refs/heads/{}", info.branch);
+    if optional_ref_oid(&main_repo_path, &source_ref)
+        .await?
+        .is_some()
+    {
+        run_local(
+            &main_repo_path,
+            "delete-source-ref",
+            ["update-ref", "-d", &source_ref],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) async fn run_git_with_limits_for_test(
     repo_path: &Path,

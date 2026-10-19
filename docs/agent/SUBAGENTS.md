@@ -302,14 +302,70 @@ tracker, captured workspace, formatter and LSP connection. Shell inherits the
 parent's sandbox, output cap and deadline, and is absent when disabled for the
 parent. A persona's `tools` can only narrow the eligible tool set.
 
-Write children run one at a time within a task call, regardless of
-`task_max_concurrency`; the parent's existing exclusive task lane orders task
-calls with other parent mutations. This does not provide cross-process file
+Write children that share the parent workspace run one at a time within a task
+call, regardless of `task_max_concurrency`; the parent's existing exclusive task
+lane orders task calls with other parent mutations. For parallel implementation
+use [worktree isolation](#worktree-isolated-write-children). This does not provide cross-process file
 locking. Their edits count toward goal-round mutation accounting. They receive
 neither nested task delegation nor memory writes, MCP, or additional JS effect
 authority. Their JS realm remains read-only. The same report contract and
 bounded scheduler cancellation apply. Existing personas without `mode: write`
 keep their read-only tool set even when the global opt-in is enabled.
+
+### Worktree-isolated write children
+
+Add `isolation: worktree` to a `mode: write` persona to run each of its
+children in a private git worktree and branch instead of the parent workspace,
+so implementation steps can run in parallel:
+
+```yaml
+---
+mode: write
+isolation: worktree
+tools: Read, Grep, Edit, Write, Shell
+---
+Implement the delegated change in your worktree and report the result.
+```
+
+Requires the `git-worktree` and `subagents` features (both default), a parent
+workspace that is a git repository, `[subagents] allow_write = true`, and active
+permission checks (without a permission checker the parent-tree denial below
+cannot be enforced, so the call is refused). `isolation: none` is the default;
+any other value makes the definition invalid, never a silent shared-workspace
+run.
+
+For each isolated child the host:
+
+1. Creates a worktree and branch `subagent-<id>` from the parent's current
+   `HEAD` through the same `git_worktree::create` path as `/worktree`, next to
+   the repository or under `wt_base_dir` / `--wt-base-dir`. Uncommitted parent
+   changes are not visible to the child.
+2. Binds the child's workspace capability, file tools, sandbox and permission
+   checker to that worktree only. The checker is a snapshot of the parent's
+   rules and mode with every session grant dropped, plus a hard denial (no rule,
+   grant, hook verdict or approval can lift it) of any mutation under the parent
+   workspace or main repository, and of any `.git` entry. Relative traversal and
+   symlinks are stopped by the workspace capability. The shell tool keeps the
+   parent's sandbox rebound to the worktree, so commands can write only there;
+   if the sandbox is off, host-wide, or has an extra write root overlapping the
+   parent tree, the child gets no shell tool. Parent-bound read-only JS and
+   workspace instructions are not carried over.
+3. Skips the shared write lane, so a batch is bounded only by the normal child
+   concurrency (`task_max_concurrency`). Non-isolated write children keep the
+   serialized lane.
+4. When the child ends, the host (not the model) commits what it left in the
+   worktree and appends an `## Isolated worktree` section to the report: branch,
+   worktree path, base commit, commit list and diff stat. Nothing is applied to
+   the parent. Merge explicitly, for example `git merge subagent-<id>` from the
+   parent or `/worktree <path>` then `/wt-merge`.
+5. Removes the worktree and branch when the child made no changes, and when the
+   child is cancelled, times out or its task call is dropped. Worktrees with
+   commits are kept until you merge and delete them.
+
+Limits: concurrent children editing the same lines produce conflicting
+branches; resolve at merge time. Committing needs a git identity (repository
+or global `user.name`/`user.email`); if the commit fails the worktree is kept
+and the report says so.
 
 A trusted project may also provide `.zerostack/agents/.notes.md`. Unlike a
 same-named definition, this file replaces nothing: the host appends it under a
@@ -418,6 +474,9 @@ mode: review
   `[reasoning] effort`. The older `effort` key is still accepted as a
   deprecated alias and logs a warning; setting both `turn_budget` and `effort`
   rejects the definition.
+- `isolation` is `worktree` or `none` (default). With `mode: write`,
+  `worktree` runs each child in its own git worktree and branch; see
+  [Worktree-isolated write children](#worktree-isolated-write-children).
 - `mode: write` selects an implementation child only with the global opt-in.
   Other `mode` values remain the prompt default used when the persona is selected for the
   main loop through `/agent`. Child-only `tools`, `required_tools`, `model`, and `turn_budget`
@@ -603,9 +662,11 @@ model id in `model:` stays on the parent's provider.
   `%%mode=readonly` in the design prompt.
 - `[subagents] allow_write = true` is required; without it the implementer is
   refused. Each edit still goes through the parent's permission checker.
-- Write children run one at a time even with `task_max_concurrency` above one,
-  so independent implementation steps are serialized. Parallel isolation is
-  tracked in bead `mini-agent-9pnc5`.
+- Write children that share the parent workspace run one at a time even with
+  `task_max_concurrency` above one, so independent implementation steps are
+  serialized. Add `isolation: worktree` to the implementer to run them in
+  parallel, each in its own git worktree and branch (see
+  [Worktree-isolated write children](#worktree-isolated-write-children)).
 - The effective model and mode of each child are not yet shown in the task
   result or `/agent` output; visibility is tracked in `mini-agent-7q04e`.
 - The `glm` provider is credential-isolated (see
@@ -917,6 +978,7 @@ Key files:
 | `src/extras/subagents/mod.rs`                | Module root, static config            |
 | `src/extras/subagents/task_tool.rs`          | `TaskTool` implementation             |
 | `src/extras/subagents/builder.rs`            | Subagent construction (`build_explore_agent`) |
+| `src/extras/subagents/isolation.rs`          | Worktree-isolated write children (`isolation: worktree`) |
 | `src/extras/subagents/prompt.rs`             | Subagent system prompt                |
 | `src/agent/runner.rs` (`run_subagent`)       | Silent agent execution                |
 | `src/agent/builder.rs`                       | Wires `TaskTool` into main agent      |
