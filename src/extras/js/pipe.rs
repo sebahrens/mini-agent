@@ -38,6 +38,10 @@ impl Drop for StopReadOnDrop {
     }
 }
 
+/// Ceiling for the idle `PeekNamedPipe` backoff on Windows (unused on Unix, which blocks in
+/// `poll`). Bounds the added per-frame latency while keeping idle wakeups modest.
+const MAX_IDLE_PEEK_DELAY: Duration = Duration::from_millis(4);
+
 pub(super) struct ControlledReader<'a> {
     file: &'a mut File,
     control: &'a AtomicU8,
@@ -65,7 +69,7 @@ impl Read for ControlledReader<'_> {
                 // retaining an empty pipe must not keep this frame open.
                 return Ok(0);
             }
-            delay = (delay * 2).min(Duration::from_millis(16));
+            delay = (delay * 2).min(MAX_IDLE_PEEK_DELAY);
         }
     }
 }

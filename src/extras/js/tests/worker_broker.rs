@@ -2524,11 +2524,28 @@ async fn worker_effect_cancellation_reconciles_dropped_post_intent_future_as_unk
     .unwrap();
 
     let mut dispatch = Box::pin(broker.dispatch(request, PermCancellation::new()));
-    tokio::select! {
-        biased;
-        result = &mut dispatch => panic!("post-intent service unexpectedly completed: {result:?}"),
-        _ = tokio::task::yield_now() => {}
-    }
+    // The durable intent append runs on the blocking pool, so drive the
+    // dispatch until the service has started executing (post-intent) rather
+    // than assuming it gets there within a single poll.
+    let started = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut dispatch => {
+                    panic!("post-intent service unexpectedly completed: {result:?}")
+                }
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+            if record.lock().unwrap().execute_calls > 0 {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        started.is_ok(),
+        "service never started after durable intent"
+    );
     drop(dispatch);
     assert_eq!(record.lock().unwrap().saw_durable_intent, 1);
 

@@ -1283,53 +1283,75 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             // audit mutex. The authoritative check below still runs after it.
             run.flush().await;
         }
-        let intent_result = self
-            .audit
-            .lock()
-            .map_err(|_| HostEffectError::AuditFailure)
-            .and_then(|mut audit| {
-                // The shared writer can be contended by another invocation. Authority is a
-                // lease, so recheck it after acquiring that lock and before persisting intent.
-                if Instant::now() >= grant.expires_at {
-                    audit
-                        .append_denial(EffectDenial {
-                            effect_id: effect_id.clone(),
-                            invocation_id: self.invocation_id.to_string(),
-                            grant_id: authorized.grant_id.get().to_string(),
-                            sequence: u64::from(request.effect_ordinal) + 1,
-                            timestamp_ms,
-                            artifact_id: artifact_id.clone(),
-                            export: export.clone(),
-                            capability: audit_capability(capability),
-                            result_code: AuditResultCode::Denied,
-                        })
-                        .map_err(HostEffectError::from)?;
-                    return Err(HostEffectError::ExpiredGrant);
-                }
-                // Recheck the explicitly captured parent account after approval
-                // and audit lock waits, immediately before durable effect intent.
-                if match self.spend.as_ref() {
-                    Some(run) => run.admit_effect().is_err(),
-                    None => false,
-                } {
-                    return Err(HostEffectError::SessionDenied);
-                }
-                let normalized_target = sanitize_target(&audit, capability, audit_target)?;
-                audit
-                    .append_intent(EffectIntent {
-                        effect_id: effect_id.clone(),
-                        invocation_id: self.invocation_id.to_string(),
-                        grant_id: authorized.grant_id.get().to_string(),
-                        sequence: u64::from(request.effect_ordinal) + 1,
-                        timestamp_ms,
-                        artifact_id,
-                        export,
-                        capability: audit_capability(capability),
-                        normalized_target,
-                        decision: AuditDecision::Authorized,
+        // The intent append fsyncs, so it runs on the blocking pool; the executor never holds
+        // the std audit mutex across a sync. Ordering is unchanged: the intent is durable
+        // before `execute`, because this await completes first.
+        let intent_result = {
+            let audit_store = Arc::clone(&self.audit);
+            let spend = self.spend.clone();
+            let expires_at = grant.expires_at;
+            let effect_id = effect_id.clone();
+            let invocation_id = self.invocation_id.to_string();
+            let grant_id = authorized.grant_id.get().to_string();
+            let sequence = u64::from(request.effect_ordinal) + 1;
+            let artifact_id = artifact_id.clone();
+            let export = export.clone();
+            let audit_capability = audit_capability(capability);
+            match crate::agent::runner::spawn_blocking_scoped(move || {
+                audit_store
+                    .lock()
+                    .map_err(|_| HostEffectError::AuditFailure)
+                    .and_then(|mut audit| {
+                        // The shared writer can be contended by another invocation. Authority is
+                        // a lease, so recheck it after acquiring that lock and before persisting
+                        // intent.
+                        if Instant::now() >= expires_at {
+                            audit
+                                .append_denial(EffectDenial {
+                                    effect_id: effect_id.clone(),
+                                    invocation_id: invocation_id.clone(),
+                                    grant_id: grant_id.clone(),
+                                    sequence,
+                                    timestamp_ms,
+                                    artifact_id: artifact_id.clone(),
+                                    export: export.clone(),
+                                    capability: audit_capability,
+                                    result_code: AuditResultCode::Denied,
+                                })
+                                .map_err(HostEffectError::from)?;
+                            return Err(HostEffectError::ExpiredGrant);
+                        }
+                        // Recheck the explicitly captured parent account after approval
+                        // and audit lock waits, immediately before durable effect intent.
+                        if match spend.as_ref() {
+                            Some(run) => run.admit_effect().is_err(),
+                            None => false,
+                        } {
+                            return Err(HostEffectError::SessionDenied);
+                        }
+                        let normalized_target = sanitize_target(&audit, capability, audit_target)?;
+                        audit
+                            .append_intent(EffectIntent {
+                                effect_id,
+                                invocation_id,
+                                grant_id,
+                                sequence,
+                                timestamp_ms,
+                                artifact_id,
+                                export,
+                                capability: audit_capability,
+                                normalized_target,
+                                decision: AuditDecision::Authorized,
+                            })
+                            .map_err(HostEffectError::from)
                     })
-                    .map_err(HostEffectError::from)
-            });
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(HostEffectError::AuditFailure),
+            }
+        };
         if let Err(error) = intent_result {
             if error == HostEffectError::SessionDenied {
                 self.service.discard_prepared();
@@ -1353,22 +1375,33 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             .execute(&authorized, &request.operation, cancellation)
             .await;
         let completion_code = audit_result_code(&execution_result);
-        let completion_result = self
-            .audit
-            .lock()
-            .map_err(|_| HostEffectError::AuditFailure)
-            .and_then(|mut audit| {
-                #[cfg(test)]
-                if let Some(failure) = self.fail_completion_durability.take() {
-                    audit.fail_next_durability_for_test(failure);
-                }
-                audit
-                    .append_completion(EffectCompletion {
-                        effect_id,
-                        result_code: completion_code,
+        #[cfg(test)]
+        let injected_failure = self.fail_completion_durability.take();
+        let completion_result = {
+            let audit_store = Arc::clone(&self.audit);
+            match crate::agent::runner::spawn_blocking_scoped(move || {
+                audit_store
+                    .lock()
+                    .map_err(|_| HostEffectError::AuditFailure)
+                    .and_then(|mut audit| {
+                        #[cfg(test)]
+                        if let Some(failure) = injected_failure {
+                            audit.fail_next_durability_for_test(failure);
+                        }
+                        audit
+                            .append_completion(EffectCompletion {
+                                effect_id,
+                                result_code: completion_code,
+                            })
+                            .map_err(HostEffectError::from)
                     })
-                    .map_err(HostEffectError::from)
-            });
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(HostEffectError::AuditFailure),
+            }
+        };
         if completion_result.is_err() {
             self.erase_authority(InvocationState::Terminal);
             return Err(HostEffectError::AuditFailure);
@@ -1777,19 +1810,31 @@ fn path_scope_contains(prefix: &str, target: &str) -> bool {
 pub(crate) fn resolve_program_identity(
     program: &str,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
-    resolve_program_identity_inner(program, None)
+    resolve_program_identity_inner(program, None, true)
 }
 
 pub(crate) fn resolve_program_identity_controlled(
     program: &str,
     control: &ExecutablePreparationControl,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
-    resolve_program_identity_inner(program, Some(control))
+    resolve_program_identity_inner(program, Some(control), true)
+}
+
+/// Resolves the executable's path and platform identity without reading its content. Only
+/// for callers that immediately hash the same file through a sealed snapshot and replace the
+/// placeholder digest via `with_content` (Linux immutable-snapshot spawn).
+#[cfg(target_os = "linux")]
+pub(crate) fn resolve_program_identity_unhashed_controlled(
+    program: &str,
+    control: &ExecutablePreparationControl,
+) -> Result<SpawnExecutableIdentity, EffectServiceError> {
+    resolve_program_identity_inner(program, Some(control), false)
 }
 
 fn resolve_program_identity_inner(
     program: &str,
     control: Option<&ExecutablePreparationControl>,
+    hash_content: bool,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
     executable_identity_checkpoint(control)?;
     let source = Path::new(program);
@@ -1858,13 +1903,20 @@ fn resolve_program_identity_inner(
         #[cfg(not(any(unix, windows)))]
         let platform =
             platform_executable_identity(&metadata).ok_or(EffectServiceError::InvalidTarget)?;
-        let content = match control {
-            Some(control) => {
-                copy_and_hash_executable_controlled(&mut file, &mut std::io::sink(), control)
+        let content = if hash_content {
+            match control {
+                Some(control) => {
+                    copy_and_hash_executable_controlled(&mut file, &mut std::io::sink(), control)
+                }
+                None => copy_and_hash_executable(&mut file, &mut std::io::sink()),
             }
-            None => copy_and_hash_executable(&mut file, &mut std::io::sink()),
-        }
-        .map_err(executable_copy_service_error)?;
+            .map_err(executable_copy_service_error)?
+        } else {
+            ExecutableContent {
+                sha256: String::new(),
+                bytes: 0,
+            }
+        };
         return Ok(SpawnExecutableIdentity {
             canonical_path,
             platform,

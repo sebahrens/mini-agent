@@ -981,7 +981,8 @@ struct BoundedPayload {
 impl BoundedPayload {
     fn new() -> Self {
         Self {
-            bytes: Vec::new(),
+            // Most frames are small; start past the first few doubling reallocations.
+            bytes: Vec::with_capacity(4096),
             exceeded: false,
         }
     }
@@ -1002,42 +1003,10 @@ impl Write for BoundedPayload {
     }
 }
 
-/// Byte counter that stops serialization as soon as a frame would exceed [`MAX_FRAME_BYTES`].
-struct FrameSizeProbe {
-    bytes: usize,
-    exceeded: bool,
-}
-
-impl Write for FrameSizeProbe {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if buffer.len() > MAX_FRAME_BYTES.saturating_sub(self.bytes) {
-            self.exceeded = true;
-            return Err(io::Error::other("wire frame limit exceeded"));
-        }
-        self.bytes += buffer.len();
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Whether [`write_frame`] would reject `frame` with [`FrameError::FrameTooLarge`]. The payload is
-/// counted, not buffered, so callers can check a response before committing to send it.
-pub(crate) fn frame_exceeds_limit<M: Serialize>(frame: &M) -> bool {
-    let mut probe = FrameSizeProbe {
-        bytes: 0,
-        exceeded: false,
-    };
-    let _ = serde_json::to_writer(&mut probe, frame);
-    probe.exceeded
-}
-
-pub(crate) fn write_frame<W: Write, M: Serialize>(
-    writer: &mut W,
-    frame: &M,
-) -> Result<(), FrameError> {
+/// Serializes `frame` once into its bounded wire payload (without the length prefix).
+/// Fails with [`FrameError::FrameTooLarge`] as soon as the payload would exceed the limit, so a
+/// caller can both size-check and send a frame with a single serialization pass.
+pub(crate) fn encode_frame<M: Serialize>(frame: &M) -> Result<Vec<u8>, FrameError> {
     let mut payload = BoundedPayload::new();
     if serde_json::to_writer(&mut payload, frame).is_err() {
         return if payload.exceeded {
@@ -1052,14 +1021,29 @@ pub(crate) fn write_frame<W: Write, M: Serialize>(
     if payload.bytes.is_empty() {
         return Err(FrameError::ZeroLength);
     }
-    let length = u32::try_from(payload.bytes.len()).map_err(|_| FrameError::FrameTooLarge {
-        length: payload.bytes.len(),
+    Ok(payload.bytes)
+}
+
+/// Writes a payload produced by [`encode_frame`] with its length prefix.
+pub(crate) fn write_encoded_frame<W: Write>(
+    writer: &mut W,
+    payload: &[u8],
+) -> Result<(), FrameError> {
+    let length = u32::try_from(payload.len()).map_err(|_| FrameError::FrameTooLarge {
+        length: payload.len(),
         maximum: MAX_FRAME_BYTES,
     })?;
     writer
         .write_all(&length.to_be_bytes())
-        .and_then(|()| writer.write_all(&payload.bytes))
+        .and_then(|()| writer.write_all(payload))
         .map_err(|error| FrameError::Io(error.kind()))
+}
+
+pub(crate) fn write_frame<W: Write, M: Serialize>(
+    writer: &mut W,
+    frame: &M,
+) -> Result<(), FrameError> {
+    write_encoded_frame(writer, &encode_frame(frame)?)
 }
 
 pub(crate) fn read_frame<R: Read, M: DeserializeOwned>(reader: &mut R) -> Result<M, FrameError> {

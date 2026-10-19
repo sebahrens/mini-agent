@@ -20,8 +20,8 @@ use super::protocol::{
     BuildIdentity, DiagnosticClass, EffectErrorCode, EffectRequest, EffectResponse, EffectResult,
     FrameError, InvocationId, JsErrorCode, JsExceptionClass, ParentFrame, ParentProtocol,
     ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult, VERIFICATION_LOADER_VERSION,
-    VerificationResult, WireFrame, WorkerFrame, WorkerWireFrame, frame_exceeds_limit, read_frame,
-    write_frame,
+    VerificationResult, WireFrame, WorkerFrame, WorkerWireFrame, encode_frame, read_frame,
+    write_encoded_frame, write_frame,
 };
 #[cfg(feature = "skills")]
 use super::protocol::{SkillCallRequest, SkillCallResponse};
@@ -266,6 +266,18 @@ impl RetirementTicket {
 
 struct BoundedStderrDrain {
     thread: Option<JoinHandle<()>>,
+    exited: Arc<(Mutex<bool>, Condvar)>,
+}
+
+/// Signals drain-thread exit (including by panic) so teardown can wait without polling.
+struct DrainExitSignal(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for DrainExitSignal {
+    fn drop(&mut self) {
+        let (flag, wake) = &*self.0;
+        *flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        wake.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -401,18 +413,19 @@ impl Drop for BoundedStderrDrain {
 
 impl BoundedStderrDrain {
     fn join_bounded(&mut self, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while self
-            .thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
+        if self.thread.is_none() {
+            return;
         }
-        if self.thread.as_ref().is_some_and(JoinHandle::is_finished)
-            && let Some(thread) = self.thread.take()
-        {
+        let exited = {
+            let (flag, wake) = &*self.exited;
+            let guard = flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (guard, _) = wake
+                .wait_timeout_while(guard, timeout, |exited| !*exited)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard
+        };
+        // The signal fires as the thread's last action, so joining an exited drain returns at once.
+        if exited && let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
@@ -2005,7 +2018,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
                 // The effect already executed and was audited. A result that cannot be framed must
                 // become a bounded effect error, never a worker protocol fault that reads like a
                 // pre-effect failure and invites replay of a mutating effect.
-                let result = fit_effect_result_to_frame(
+                let (result, encoded_response) = fit_effect_result_to_frame(
                     &connection.build,
                     &invocation,
                     connection.sequence,
@@ -2051,10 +2064,24 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     // The durable effect outcome remains unknown even if the poisoned worker can
                     // no longer receive its terminal response. Best-effort delivery closes the
                     // worker state machine; the parent always returns the truthful effect error.
-                    let _ = write_parent(connection, response, cancellation, deadline).await;
+                    let _ = write_parent_encoded(
+                        connection,
+                        response,
+                        encoded_response,
+                        cancellation,
+                        deadline,
+                    )
+                    .await;
                     return Err(WorkerError::EffectOutcomeUnknown);
                 }
-                write_parent(connection, response, cancellation, deadline).await?;
+                write_parent_encoded(
+                    connection,
+                    response,
+                    encoded_response,
+                    cancellation,
+                    deadline,
+                )
+                .await?;
                 connection.sequence = advance(connection.sequence)?;
             }
             #[cfg(feature = "skills")]
@@ -2125,14 +2152,30 @@ async fn write_parent(
     cancellation: &PermCancellation,
     deadline: Instant,
 ) -> Result<(), WorkerError> {
+    write_parent_encoded(connection, frame, None, cancellation, deadline).await
+}
+
+/// Like [`write_parent`], but sends `encoded` (the already-serialized payload of `frame`) when
+/// present instead of serializing the frame again.
+async fn write_parent_encoded(
+    connection: &WorkerConnection,
+    frame: ParentWireFrame,
+    encoded: Option<Vec<u8>>,
+    cancellation: &PermCancellation,
+    deadline: Instant,
+) -> Result<(), WorkerError> {
     let generation = connection.generation;
     let input_handle = connection.input_handle.clone();
     let task = tokio::task::spawn_blocking(move || {
         let mut input = input_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let result = write_frame(&mut *input, &frame)
-            .and_then(|()| input.flush().map_err(|error| FrameError::Io(error.kind())));
+        let written = match &encoded {
+            Some(payload) => write_encoded_frame(&mut *input, payload),
+            None => write_frame(&mut *input, &frame),
+        };
+        let result =
+            written.and_then(|()| input.flush().map_err(|error| FrameError::Io(error.kind())));
         TaggedIo { generation, result }
     });
     let tagged = await_controlled(task, cancellation, deadline)
@@ -2152,7 +2195,8 @@ async fn write_parent(
     Ok(())
 }
 
-/// Return `result` unchanged when its `EffectResponse` frame fits the wire limit. Otherwise
+/// Return `result` unchanged, with its encoded frame payload, when its `EffectResponse` frame
+/// fits the wire limit. Otherwise
 /// replace it with `OutcomeUnknown` for a possibly mutating effect (it ran, but the caller cannot
 /// observe its result) or `TooLarge` for a read-only effect.
 fn fit_effect_result_to_frame(
@@ -2161,7 +2205,7 @@ fn fit_effect_result_to_frame(
     sequence: u64,
     effect_ordinal: u32,
     result: EffectResult,
-) -> EffectResult {
+) -> (EffectResult, Option<Vec<u8>>) {
     let frame = WireFrame::invocation(
         build.clone(),
         invocation.clone(),
@@ -2171,19 +2215,36 @@ fn fit_effect_result_to_frame(
             result,
         }),
     );
-    let exceeds = frame_exceeds_limit(&frame);
-    let ParentFrame::EffectResponse(EffectResponse { result, .. }) = frame.message else {
-        unreachable!("frame was constructed as an effect response");
-    };
-    if !exceeds {
-        return result;
+    // One serialization both enforces the limit and produces the bytes to send.
+    match encode_frame(&frame) {
+        Ok(payload) => {
+            let ParentFrame::EffectResponse(EffectResponse { result, .. }) = frame.message else {
+                unreachable!("frame was constructed as an effect response");
+            };
+            (result, Some(payload))
+        }
+        Err(FrameError::FrameTooLarge { .. }) => {
+            let ParentFrame::EffectResponse(EffectResponse { result, .. }) = frame.message else {
+                unreachable!("frame was constructed as an effect response");
+            };
+            let code = if interrupted_effect_requires_unknown(&result) {
+                EffectErrorCode::OutcomeUnknown
+            } else {
+                EffectErrorCode::TooLarge
+            };
+            (
+                EffectResult::Error(super::protocol::EffectError { code }),
+                None,
+            )
+        }
+        // Not a size problem: keep the result and let the normal send path report the failure.
+        Err(_) => {
+            let ParentFrame::EffectResponse(EffectResponse { result, .. }) = frame.message else {
+                unreachable!("frame was constructed as an effect response");
+            };
+            (result, None)
+        }
     }
-    let code = if interrupted_effect_requires_unknown(&result) {
-        EffectErrorCode::OutcomeUnknown
-    } else {
-        EffectErrorCode::TooLarge
-    };
-    EffectResult::Error(super::protocol::EffectError { code })
 }
 
 /// Cancellation can win the parent select after a mutating service has already completed but
@@ -2450,14 +2511,18 @@ fn start_stderr_drain(process: &WorkerProcess) -> Result<BoundedStderrDrain, Wor
         .stderr
         .try_clone()
         .map_err(|_| WorkerError::Transport)?;
+    let exited = Arc::new((Mutex::new(false), Condvar::new()));
+    let signal = DrainExitSignal(Arc::clone(&exited));
     let thread = std::thread::Builder::new()
         .name("mini-agent-js-worker-stderr".into())
         .spawn(move || {
+            let _signal = signal;
             discard_worker_stderr(&mut stderr);
         })
         .map_err(|_| WorkerError::Transport)?;
     Ok(BoundedStderrDrain {
         thread: Some(thread),
+        exited,
     })
 }
 

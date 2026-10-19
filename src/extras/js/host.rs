@@ -37,7 +37,10 @@ use crate::extras::js::broker::{
     run_executable_preparation,
 };
 #[cfg(target_os = "linux")]
-use crate::extras::js::broker::{ExecutableCopyError, copy_and_hash_executable_controlled};
+use crate::extras::js::broker::{
+    ExecutableCopyError, copy_and_hash_executable_controlled,
+    resolve_program_identity_unhashed_controlled,
+};
 use crate::extras::js::protocol::{
     DirectoryEntry, DirectoryEntryKind, EffectOperation, EffectResult, GrepMatch, GrepOptions,
 };
@@ -2249,6 +2252,15 @@ impl PreparedSpawnEffect {
         control
             .checkpoint()
             .map_err(executable_preparation_service_error)?;
+        // On Linux the sealed snapshot below reads and hashes the executable and supplies the
+        // pinned digest, so identity resolution skips its own full read.
+        #[cfg(target_os = "linux")]
+        let executable = if immutable_snapshot {
+            resolve_program_identity_unhashed_controlled(program, control)?
+        } else {
+            resolve_program_identity_controlled(program, control)?
+        };
+        #[cfg(not(target_os = "linux"))]
         let executable = resolve_program_identity_controlled(program, control)?;
         if immutable_snapshot {
             #[cfg(target_os = "linux")]
@@ -2926,6 +2938,26 @@ fn discovery_output_path(base: &Path, path: &Path) -> Result<String, EffectServi
 
 fn discovery_json_string_upper_bound(value: &str) -> usize {
     value.len().saturating_mul(6).saturating_add(2)
+}
+
+/// Length of `value`'s JSON encoding, counted without materializing it.
+fn json_encoded_len<T: serde::Serialize>(value: &T) -> serde_json::Result<usize> {
+    struct Counter(usize);
+
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 fn execute_discovery(
@@ -3997,9 +4029,8 @@ impl ParentEffectService for ParentHostEffectService {
                             .execute_read(target, bridge.clone())
                             .await
                             .map_err(HostEffectError::from)?;
-                        let item_bytes = serde_json::to_string(&content)
-                            .map_err(|_| HostEffectError::BackendFailure)?
-                            .len();
+                        let item_bytes = json_encoded_len(&content)
+                            .map_err(|_| HostEffectError::BackendFailure)?;
                         encoded_bytes = encoded_bytes
                             .checked_add(item_bytes)
                             .and_then(|bytes| bytes.checked_add(usize::from(!contents.is_empty())))
