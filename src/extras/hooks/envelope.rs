@@ -87,11 +87,15 @@ pub(crate) fn build_envelope(ctx: &HookCtx, hook_event_name: &str, fields: Event
             tool_name,
             tool_input,
             tool_response,
-        } => json!({
-            "tool_name": tool_name,
-            "tool_input": tool_input,
-            "tool_response": tool_response,
-        }),
+        } => {
+            // Move the (potentially large) response and input instead of
+            // letting `json!` serialize copies of them.
+            let mut map = serde_json::Map::new();
+            map.insert("tool_name".to_owned(), Value::String(tool_name));
+            map.insert("tool_input".to_owned(), tool_input);
+            map.insert("tool_response".to_owned(), Value::String(tool_response));
+            Value::Object(map)
+        }
         EventFields::PostToolUseFailure {
             tool_name,
             tool_input,
