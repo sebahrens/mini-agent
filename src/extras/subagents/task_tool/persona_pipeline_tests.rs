@@ -343,6 +343,7 @@ const CLI_KEY: &str = "sk-ant-cli-key-must-never-reach-glm";
 fn alias_persona(alias: &str) -> ResolvedSpecialization {
     ResolvedSpecialization {
         write_mode: false,
+        isolation_worktree: false,
         prompt: "persona".into(),
         result_notice: None,
         source: "test".into(),
