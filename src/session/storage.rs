@@ -35,6 +35,14 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whole-file session reads on this test thread (`read_private_string`),
+    /// so tests can pin that head peeks avoid them.
+    pub(crate) static FULL_SESSION_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Session file bytes. Identical to [`serialize_bounded_session`] except that a
 /// tool-result row whose display `content` is `prefix + tool.output` writes the
 /// output once (`content_prefix`), roughly halving tool-heavy files and the
@@ -179,6 +187,8 @@ pub(super) fn existing_session_dir() -> anyhow::Result<Option<PathBuf>> {
 }
 
 fn read_private_string(path: &Path) -> anyhow::Result<String> {
+    #[cfg(test)]
+    FULL_SESSION_READS.with(|reads| reads.set(reads.get() + 1));
     let mut file = crate::fs::open_private_file(path).map_err(|error| {
         anyhow::anyhow!("refusing unsafe session file {}: {}", path.display(), error)
     })?;
@@ -755,12 +765,13 @@ fn read_discovered_session(path: &Path, skipped: &mut SkippedEntries) -> Option<
 /// first serialized fields, so a few KiB covers every realistic file.
 const NAME_PEEK_BYTES: usize = 4 * 1024;
 
-/// Read the top-level `name` from the head of a session file without reading
-/// or parsing the rest. `None` means "undetermined" (unsafe or unreadable
-/// file, no `name` before the cut), and the caller then decodes the full file.
-fn peek_session_name(path: &Path) -> Option<String> {
+/// Read a top-level string field (`name`, `working_dir`) from the head of a
+/// session file without reading or parsing the rest. `None` means
+/// "undetermined" (unsafe or unreadable file, key absent or not a string before
+/// the cut), and the caller then decodes the full file.
+fn peek_session_string(path: &Path, key: &str) -> Option<String> {
     use serde::de::{Deserializer as _, Error as _, IgnoredAny, MapAccess, Visitor};
-    struct Head<'a>(&'a mut Option<String>);
+    struct Head<'a>(&'a str, &'a mut Option<String>);
     impl<'de> Visitor<'de> for Head<'_> {
         type Value = ();
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -768,10 +779,10 @@ fn peek_session_name(path: &Path) -> Option<String> {
         }
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
             while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-                if key == "name" {
-                    *self.0 = Some(map.next_value::<String>()?);
+                if key == self.0 {
+                    *self.1 = Some(map.next_value::<String>()?);
                     // Found; stop before reaching the truncated tail.
-                    return Err(A::Error::custom("name found"));
+                    return Err(A::Error::custom("key found"));
                 }
                 map.next_value::<IgnoredAny>()?;
             }
@@ -780,9 +791,13 @@ fn peek_session_name(path: &Path) -> Option<String> {
     }
     let file = crate::fs::open_private_file(path).ok()?;
     let (head, _) = crate::paths::read_utf8_prefix(file, NAME_PEEK_BYTES).ok()??;
-    let mut name = None;
-    let _ = serde_json::Deserializer::from_str(&head).deserialize_map(Head(&mut name));
-    name
+    let mut value = None;
+    let _ = serde_json::Deserializer::from_str(&head).deserialize_map(Head(key, &mut value));
+    value
+}
+
+fn peek_session_name(path: &Path) -> Option<String> {
+    peek_session_string(path, "name")
 }
 
 pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
@@ -1015,33 +1030,53 @@ pub fn find_recent_sessions_for_workspace(
     let mut skipped = SkippedEntries::default();
     let mut canonical_matches = std::collections::HashMap::<String, bool>::new();
     for path in session_paths_newest_first(&dir)? {
-        let json = match read_private_string(&path) {
-            Ok(json) => json,
-            Err(error) => {
-                skipped.note(&path, &error);
-                continue;
-            }
-        };
-        let peek = match serde_json::from_str::<WorkspacePeek>(&json) {
-            Ok(peek) => peek,
-            Err(error) => {
-                skipped.note(&path, &error);
-                continue;
+        // `working_dir` serializes right after `name`, so the head normally
+        // answers without reading the file. A legacy file (field written late)
+        // or an unparseable head falls back to the full read (mini-agent-vb5vw.58).
+        let (working_dir, mut json) = match peek_session_string(&path, "working_dir") {
+            Some(working_dir) => (working_dir, None),
+            None => {
+                let json = match read_private_string(&path) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        skipped.note(&path, &error);
+                        continue;
+                    }
+                };
+                let peek = match serde_json::from_str::<WorkspacePeek>(&json) {
+                    Ok(peek) => peek,
+                    Err(error) => {
+                        skipped.note(&path, &error);
+                        continue;
+                    }
+                };
+                (peek.working_dir, Some(json))
             }
         };
         // Many sessions share a few workspaces: resolve each distinct stored
         // label once per scan.
-        let same_workspace = *canonical_matches
-            .entry(peek.working_dir.clone())
-            .or_insert_with(|| {
-                std::fs::canonicalize(Path::new(peek.working_dir.as_str()))
-                    .ok()
-                    .as_deref()
-                    == Some(workspace.as_path())
-            });
+        let same_workspace =
+            *canonical_matches
+                .entry(working_dir)
+                .or_insert_with_key(|working_dir| {
+                    std::fs::canonicalize(Path::new(working_dir.as_str()))
+                        .ok()
+                        .as_deref()
+                        == Some(workspace.as_path())
+                });
         if !same_workspace {
             continue;
         }
+        let json = match json.take() {
+            Some(json) => json,
+            None => match read_private_string(&path) {
+                Ok(json) => json,
+                Err(error) => {
+                    skipped.note(&path, &error);
+                    continue;
+                }
+            },
+        };
         match decode_session_json(&json) {
             Ok(session) => matches.push(session),
             Err(error) => {
@@ -1415,6 +1450,76 @@ mod readonly_import_tests {
         }
         session.messages[0].content = "x".repeat(MAX_SESSION_BYTES).into();
         assert!(prepare_save(&session).is_err());
+    }
+
+    // mini-agent-vb5vw.58: `--continue` answers foreign sessions from the file
+    // head; only the matching file is read whole, and a legacy file that
+    // serialized `working_dir` late still falls back to the full read.
+    #[test]
+    fn workspace_lookup_peeks_working_dir_and_reads_only_matching_files() {
+        let root = crate::tests::OwnedTestDirectory::new("session-workspace-peek");
+        let _environment = scoped_state(&root);
+        let here = root.path().join("here");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let here = std::fs::canonicalize(here).unwrap();
+        let elsewhere = std::fs::canonicalize(elsewhere).unwrap();
+        let big = |name: &str, dir: &Path| {
+            let mut session = Session::new("provider", "model", 32_000, name);
+            session.working_dir = dir.to_string_lossy().into_owned().into();
+            session.add_message(
+                crate::session::MessageRole::User,
+                "x".repeat(3 * NAME_PEEK_BYTES).as_str(),
+            );
+            session
+        };
+        let wanted = big("wanted", &here);
+        save_session(&wanted).unwrap();
+        // A legacy-layout file: `working_dir` far beyond the peeked head.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let legacy = big("legacy", &here);
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        let object = value.as_object_mut().unwrap();
+        let working_dir = object.remove("working_dir").unwrap();
+        let mut late = serde_json::Map::new();
+        late.extend(std::mem::take(object));
+        late.insert("working_dir".into(), working_dir);
+        let legacy_path = session_dir().join(format!("{}.json", legacy.id));
+        atomic_write(&legacy_path, &serde_json::Value::Object(late).to_string()).unwrap();
+        assert!(
+            peek_session_string(&legacy_path, "working_dir").is_none(),
+            "a late working_dir must be undetermined by the head peek"
+        );
+        for index in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            save_session(&big(&format!("foreign-{index}"), &elsewhere)).unwrap();
+        }
+        let head = |session: &Session| {
+            peek_session_string(
+                &session_dir().join(format!("{}.json", session.id)),
+                "working_dir",
+            )
+        };
+        assert_eq!(
+            head(&wanted).as_deref(),
+            Some(here.to_string_lossy().as_ref())
+        );
+
+        FULL_SESSION_READS.with(|reads| reads.set(0));
+        let found = find_recent_sessions_for_workspace(1, &here).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, legacy.id);
+        // 3 foreign heads are peeked (no read), then the legacy file is read
+        // for the fallback and decoded from that same read.
+        assert_eq!(FULL_SESSION_READS.with(|reads| reads.get()), 1);
+
+        FULL_SESSION_READS.with(|reads| reads.set(0));
+        let both = find_recent_sessions_for_workspace(2, &here).unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[1].id, wanted.id);
+        // legacy: one read; wanted: peeked, then read once for the decode.
+        assert_eq!(FULL_SESSION_READS.with(|reads| reads.get()), 2);
     }
 
     // mini-agent-hf54t: a prefix lookup decodes only the files it can match.
