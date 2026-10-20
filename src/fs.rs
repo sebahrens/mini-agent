@@ -3181,34 +3181,12 @@ pub(crate) use private::prepare_new_private_file_from_security_handle;
 mod tests {
     use super::*;
 
-    struct TestDirectory(PathBuf);
-
-    impl TestDirectory {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "mini_agent_fs_{label}_{}_{}",
-                std::process::id(),
-                uuid::Uuid::new_v4().simple()
-            ));
-            std::fs::create_dir(&path).expect("create temporary directory");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tests::support::temp::TempDir;
 
     #[test]
     fn content_digest_file_checks_preserve_shared_cursors() {
         use std::io::{Seek, SeekFrom};
-        let temp = TestDirectory::new("digest-cursor");
+        let temp = TempDir::new("digest-cursor");
         let path = temp.path().join("document");
         let content = vec![b'a'; 128 * 1024];
         std::fs::write(&path, &content).unwrap();
@@ -3290,7 +3268,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_file_identity_preserves_full_kernel_identity_and_link_count() {
-        let directory = TestDirectory::new("windows_identity");
+        let directory = TempDir::new("windows_identity");
         let original = directory.path().join("original.txt");
         let linked = directory.path().join("linked.txt");
         std::fs::write(&original, b"identity").expect("write original");
@@ -3320,7 +3298,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn checked_metadata_keeps_unlinked_approved_object_alive_and_rejects_replacement() {
-        let directory = TestDirectory::new("retained_handle");
+        let directory = TempDir::new("retained_handle");
         let path = directory.path().join("checked.txt");
         let moved = directory.path().join("moved.txt");
         std::fs::write(&path, b"approved object").expect("write original");
@@ -3340,7 +3318,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checked_path_and_open_file_metadata_use_the_same_identity() {
-        let directory = TestDirectory::new("path_and_file_identity");
+        let directory = TempDir::new("path_and_file_identity");
         let path = directory.path().join("checked.txt");
         std::fs::write(&path, b"identity").expect("write checked file");
 
@@ -3378,7 +3356,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_checked_identity_accepts_the_data_volume_alias() {
-        let directory = TestDirectory::new("data_volume_alias");
+        let directory = TempDir::new("data_volume_alias");
         let path = directory.path().join("checked.txt");
         std::fs::write(&path, b"identity").expect("write checked file");
         let relative = path
@@ -3406,7 +3384,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = TestDirectory::new("metadata_handle");
+        let directory = TempDir::new("metadata_handle");
         let fifo = directory.path().join("event.fifo");
         let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: the path is NUL-terminated and points into a live CString.
@@ -3429,7 +3407,7 @@ mod tests {
     async fn stable_path_metadata_reports_nofollow_symlink_as_path_changed() {
         use std::os::unix::fs::symlink;
 
-        let directory = TestDirectory::new("stable_symlink_error");
+        let directory = TempDir::new("stable_symlink_error");
         let target = directory.path().join("target.txt");
         let link = directory.path().join("link.txt");
         std::fs::write(&target, b"target").expect("write symlink target");
@@ -3447,7 +3425,7 @@ mod tests {
     fn private_file_symlink_rejection_preserves_owned_regular_file_error() {
         use std::os::unix::fs::symlink;
 
-        let directory = TestDirectory::new("private_symlink_error");
+        let directory = TempDir::new("private_symlink_error");
         let target = directory.path().join("target.txt");
         let link = directory.path().join("link.txt");
         std::fs::write(&target, b"target").expect("write symlink target");

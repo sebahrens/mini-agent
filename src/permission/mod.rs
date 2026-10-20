@@ -1497,8 +1497,6 @@ mod execution_authority_tests {
 
 #[cfg(test)]
 mod acp_permission_policy_tests {
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use rig::tool::Tool;
 
@@ -1507,31 +1505,7 @@ mod acp_permission_policy_tests {
     use crate::cli::Cli;
     use crate::config::Config;
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "mini_agent_acp_permission_policy_{}_{}",
-                std::process::id(),
-                sequence
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tests::support::temp::TempDir;
 
     fn policy(
         action: &str,
@@ -1623,7 +1597,7 @@ mod acp_permission_policy_tests {
 
     #[tokio::test]
     async fn acp_permission_policy_ask_fails_closed_without_a_side_effect() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("acp-permission-policy");
         let target = temp.path().join("must-not-exist.txt");
         let (permission, ask_tx) = policy("ask");
         assert!(ask_tx.is_none());

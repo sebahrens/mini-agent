@@ -291,40 +291,24 @@ fn is_legacy_json_format(content: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
 
     use super::{ChatHistoryEntry, append_entry_to_path, load_history_from_path};
 
-    struct TempDir(PathBuf);
+    use crate::tests::support::temp::TempDir;
 
-    impl TempDir {
-        fn new() -> Self {
-            // macOS exposes its temp directory through `/var`, which is a symlink
-            // to `/private/var`; persistence intentionally rejects linked parents.
-            let temp_root = std::env::temp_dir()
-                .canonicalize()
-                .expect("failed to resolve the chat-history test temp root");
-            let path = temp_root.join(format!("mini-agent-chat-history-{}", uuid::Uuid::new_v4()));
-            crate::paths::ensure_private_directory(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    /// A canonical private directory: macOS exposes its temp directory through
+    /// `/var`, a symlink to `/private/var`, and persistence rejects linked parents.
+    fn private_temp_dir() -> TempDir {
+        let dir = TempDir::new_canonical("chat-history");
+        crate::paths::ensure_private_directory(dir.path()).unwrap();
+        dir
     }
 
     #[test]
     fn appending_1000_entries_keeps_history_bounded() {
         const TEST_LIMIT: usize = 100;
 
-        let temp = TempDir::new();
+        let temp = private_temp_dir();
         let path = temp.path().join("chat_history.json");
 
         for index in 0..1_000 {
@@ -368,7 +352,7 @@ mod tests {
 
     #[test]
     fn legacy_json_array_migration_preserves_all_entries() {
-        let temp = TempDir::new();
+        let temp = private_temp_dir();
         let path = temp.path().join("chat_history.json");
 
         // Create a legacy JSON array file.
@@ -427,7 +411,7 @@ mod tests {
 
     #[test]
     fn corrupt_jsonl_lines_are_skipped() {
-        let temp = TempDir::new();
+        let temp = private_temp_dir();
         let path = temp.path().join("chat_history.json");
 
         // Create a JSONL file with some corrupted lines.
@@ -462,7 +446,7 @@ mod tests {
     fn jsonl_appends_are_incremental() {
         const TEST_LIMIT: usize = 50;
 
-        let temp = TempDir::new();
+        let temp = private_temp_dir();
         let path = temp.path().join("chat_history.json");
 
         // Append 10 entries and check file size.
@@ -515,7 +499,7 @@ mod tests {
 
     #[test]
     fn external_jsonl_change_is_rescanned_once_then_returns_to_constant_time_appends() {
-        let temp = TempDir::new();
+        let temp = private_temp_dir();
         let path = temp.path().join("chat_history.json");
         let first = ChatHistoryEntry {
             content: "external-entry".into(),

@@ -6,34 +6,23 @@
 //! evidence step opts into those tokens explicitly.
 #![cfg(all(feature = "js", target_os = "macos"))]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+#[path = "../src/tests/support/temp.rs"]
+mod temp;
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const OUTER_PROFILE: &str = "(version 1)(allow default)";
 
-struct TempRoot(PathBuf);
-
-impl TempRoot {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "mini-agent-preflight-stderr-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir(&path).expect("create private app root");
-        let path = std::fs::canonicalize(path).expect("canonicalize private app root");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .expect("make app root private");
-        Self(path)
-    }
-}
-
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// A private (0700), canonical application root removed on drop.
+fn private_root() -> temp::TempDir {
+    let root = temp::TempDir::new_canonical("preflight-stderr");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("make app root private");
+    root
 }
 
 fn nested_command(root: &Path, args: &[&str]) -> Command {
@@ -103,8 +92,8 @@ fn print_config_stays_unprobed_and_explicit_check_fails_without_stderr_tokens() 
         eprintln!("skipping: sandbox-exec cannot apply an outer profile on this host");
         return;
     }
-    let root = TempRoot::new();
-    let output = bounded_output(nested_command(&root.0, &["--print-config"]));
+    let root = private_root();
+    let output = bounded_output(nested_command(&root, &["--print-config"]));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "--print-config failed: {output:?}");
     assert!(
@@ -114,7 +103,7 @@ fn print_config_stays_unprobed_and_explicit_check_fails_without_stderr_tokens() 
         "configuration display must not run the nested worker preflight: {stdout}"
     );
     assert_no_failure_tokens("--print-config", &output);
-    let check = bounded_output(nested_command(&root.0, &["--js-runtime-check"]));
+    let check = bounded_output(nested_command(&root, &["--js-runtime-check"]));
     assert!(
         !check.status.success(),
         "the nested runtime check must fail"
@@ -141,7 +130,7 @@ fn print_mode_emits_no_stderr_tokens_when_nested_preflight_fails() {
         eprintln!("skipping: sandbox-exec cannot apply an outer profile on this host");
         return;
     }
-    let root = TempRoot::new();
+    let root = private_root();
     // A closed local port makes the provider request fail fast after the agent (and with it the
     // JavaScript containment preflight) has been built.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -149,14 +138,14 @@ fn print_mode_emits_no_stderr_tokens_when_nested_preflight_fails() {
         .expect("reserve a local port")
         .port();
     std::fs::write(
-        root.0.join("config.toml"),
+        root.join("config.toml"),
         format!(
             "enable_exa_mcp=false\nenable_context7_mcp=false\n[custom_providers.local-test]\nprovider_type=\"openai\"\nbase_url=\"http://127.0.0.1:{port}/v1\"\napi_key_env=\"PREFLIGHT_LOCAL_TEST_KEY\"\napi_style=\"completions\"\n"
         ),
     )
     .expect("write provider config");
     let mut command = nested_command(
-        &root.0,
+        &root,
         &[
             "--no-context-files",
             "--provider",

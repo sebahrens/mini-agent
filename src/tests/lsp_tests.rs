@@ -17,29 +17,7 @@ use crate::permission::ask::{AskReceiver, UserDecision};
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
-struct TempRoot(PathBuf);
-
-impl TempRoot {
-    fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "mini-agent-lsp-permission-{label}-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::tests::support::temp::TempDir;
 
 fn permission(root: &Path, config: PermissionConfig) -> PermCheck {
     Arc::new(Mutex::new(
@@ -534,7 +512,7 @@ async fn injected_diagnostics_format_errors_first() {
 
 #[tokio::test]
 async fn first_empty_publish_completes_wait_without_deadline_delay() {
-    let root = TempRoot::new("first-empty-publish");
+    let root = TempDir::new("first-empty-publish");
     let file = root.path().join("clean.rs");
     std::fs::write(&file, "fn clean() {}").unwrap();
     let file = file.canonicalize().unwrap();
@@ -560,7 +538,7 @@ async fn first_empty_publish_completes_wait_without_deadline_delay() {
 
 #[tokio::test]
 async fn versionless_initial_publish_and_clear_are_accepted_within_unchanged_epoch() {
-    let root = TempRoot::new("versionless-initial-clear");
+    let root = TempDir::new("versionless-initial-clear");
     let file = root.path().join("main.rs");
     std::fs::write(&file, "fn main() {}").unwrap();
     let file = file.canonicalize().unwrap();
@@ -671,7 +649,7 @@ async fn edit_diagnostics_require_existing_read_authority() {
 
 #[tokio::test]
 async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
-    let root = TempRoot::new("atomic-edit-fresh-publish");
+    let root = TempDir::new("atomic-edit-fresh-publish");
     let file = root.path().join("main.guarded");
     std::fs::write(&file, "old contents").unwrap();
     let file = file.canonicalize().unwrap();
@@ -777,7 +755,7 @@ async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
 
 #[tokio::test]
 async fn clean_project_reports_nothing() {
-    let root = TempRoot::new("clean-project");
+    let root = TempDir::new("clean-project");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
     let query = LspTool::new(manager.clone(), None, None);
     assert_eq!(
@@ -804,7 +782,7 @@ fn publication_during_content_validation_discards_the_old_bound_snapshot() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let root = TempRoot::new("publication-during-validation");
+        let root = TempDir::new("publication-during-validation");
         let source = root.path().join("document.rs");
         std::fs::write(&source, "document").unwrap();
         let uri = crate::extras::lsp::client::file_uri(&source.canonicalize().unwrap()).unwrap();
@@ -858,7 +836,7 @@ fn publication_during_content_validation_discards_the_old_bound_snapshot() {
 async fn cancelled_lsp_validation_remains_owned_until_disk_work_finishes() {
     use futures::FutureExt;
 
-    let root = TempRoot::new("cancelled-validation");
+    let root = TempDir::new("cancelled-validation");
     let source = root.path().join("document.rs");
     std::fs::write(&source, "document").unwrap();
     let source = source.canonicalize().unwrap();
@@ -941,7 +919,7 @@ async fn cancelled_lsp_validation_remains_owned_until_disk_work_finishes() {
 
 #[tokio::test]
 async fn explicit_in_root_path_obeys_read_allow_deny_and_ask() {
-    let root = TempRoot::new("explicit-in-root");
+    let root = TempDir::new("explicit-in-root");
     let file = root.path().join("sample.unknownext");
     std::fs::write(&file, "contents").unwrap();
     let canonical = file.canonicalize().unwrap();
@@ -977,8 +955,8 @@ async fn explicit_in_root_path_obeys_read_allow_deny_and_ask() {
 
 #[tokio::test]
 async fn explicit_external_path_obeys_external_directory_allow_deny_and_ask() {
-    let root = TempRoot::new("external-workspace");
-    let external = TempRoot::new("external-file");
+    let root = TempDir::new("external-workspace");
+    let external = TempDir::new("external-file");
     let file = external.path().join("sample.unknownext");
     std::fs::write(&file, "contents").unwrap();
     let canonical = file.canonicalize().unwrap();
@@ -1032,7 +1010,7 @@ async fn explicit_external_path_obeys_external_directory_allow_deny_and_ask() {
 
 #[tokio::test]
 async fn project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure() {
-    let root = TempRoot::new("project-scope");
+    let root = TempDir::new("project-scope");
     let canonical_root = root.path().canonicalize().unwrap();
 
     let (allow, _, _) = lsp_tool(root.path(), read_permission(Action::Allow));
@@ -1070,7 +1048,7 @@ async fn project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure() {
 
 #[tokio::test]
 async fn project_query_filters_diagnostics_for_denied_files() {
-    let root = TempRoot::new("aggregate-filter");
+    let root = TempDir::new("aggregate-filter");
     let public = root.path().join("public.rs");
     let secret = root.path().join("secret.rs");
     std::fs::write(&public, "public").unwrap();
@@ -1119,7 +1097,7 @@ async fn project_query_filters_diagnostics_for_denied_files() {
 
 #[tokio::test]
 async fn explicit_denial_prevents_sync_or_server_launch_and_cached_disclosure() {
-    let root = TempRoot::new("deny-before-manager");
+    let root = TempDir::new("deny-before-manager");
     let file = root.path().join("secret.guarded");
     std::fs::write(&file, "secret").unwrap();
 
@@ -1159,8 +1137,8 @@ async fn explicit_denial_prevents_sync_or_server_launch_and_cached_disclosure() 
 
 #[tokio::test]
 async fn lsp_allow_always_uses_canonical_path_pattern_and_deny_still_wins() {
-    let root = TempRoot::new("allow-always");
-    let external = TempRoot::new("allow-always-external");
+    let root = TempDir::new("allow-always");
+    let external = TempDir::new("allow-always-external");
     let root_path = root.path().canonicalize().unwrap();
     let public = root.path().join("public.rs");
     let secret = root.path().join("secret.rs");
@@ -1281,7 +1259,7 @@ async fn lsp_allow_always_uses_canonical_path_pattern_and_deny_still_wins() {
 }
 
 async fn assert_aggregate_literal_metachar_scope(project_name: &str, sibling_name: &str) {
-    let parent = TempRoot::new("literal-metachar-scope");
+    let parent = TempDir::new("literal-metachar-scope");
     let project = parent.path().join(project_name);
     let sibling = parent.path().join(sibling_name);
     std::fs::create_dir_all(project.join("src")).unwrap();
@@ -1388,8 +1366,8 @@ async fn aggregate_allow_always_treats_bracket_in_project_root_literally() {
 async fn aggregate_binding_swap_restore_keeps_permission_and_result_on_cached_inode() {
     use std::os::unix::fs::symlink;
 
-    let root = TempRoot::new("binding-swap-root");
-    let external = TempRoot::new("binding-swap-external");
+    let root = TempDir::new("binding-swap-root");
+    let external = TempDir::new("binding-swap-external");
     let cached = root.path().join("cached.rs");
     let backup = root.path().join("cached-backup.rs");
     let allowed_target = external.path().join("allowed.rs");
@@ -1465,7 +1443,7 @@ async fn aggregate_binding_swap_restore_keeps_permission_and_result_on_cached_in
 
 #[tokio::test]
 async fn aggregate_authorization_bounds_open_handles_and_preserves_sorted_results() {
-    let root = TempRoot::new("bounded-bindings");
+    let root = TempDir::new("bounded-bindings");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
     for index in 0..64 {
         let path = root.path().join(format!("file-{index:02}.rs"));
@@ -1507,7 +1485,7 @@ async fn aggregate_authorization_bounds_open_handles_and_preserves_sorted_result
 
 #[tokio::test]
 async fn aggregate_snapshot_caps_high_cardinality_high_volume_diagnostics_before_cloning() {
-    let root = TempRoot::new("bounded-snapshot-volume");
+    let root = TempDir::new("bounded-snapshot-volume");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
     let mut accepted = 0;
     for file_index in 0..96 {
@@ -1572,7 +1550,7 @@ async fn aggregate_snapshot_caps_high_cardinality_high_volume_diagnostics_before
 
 #[tokio::test]
 async fn diagnostic_cache_hard_cap_bounds_candidate_sort_cardinality() {
-    let root = TempRoot::new("diagnostic-cache-cardinality-cap");
+    let root = TempDir::new("diagnostic-cache-cardinality-cap");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
     let cap = crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES;
     for index in 0..(cap + 32) {
@@ -1598,7 +1576,7 @@ async fn diagnostic_cache_hard_cap_bounds_candidate_sort_cardinality() {
 
 #[tokio::test]
 async fn diagnostic_cache_sanitizes_entries_and_enforces_global_byte_budget_on_updates() {
-    let root = TempRoot::new("diagnostic-cache-byte-budget");
+    let root = TempDir::new("diagnostic-cache-byte-budget");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
     let mut accepted_uris = Vec::new();
     let mut rejected_uri = None;
@@ -1670,7 +1648,7 @@ async fn diagnostic_cache_sanitizes_entries_and_enforces_global_byte_budget_on_u
 
 #[tokio::test]
 async fn oversized_existing_publish_invalidates_stale_diagnostics_and_advances_version() {
-    let root = TempRoot::new("oversized-existing-publish");
+    let root = TempDir::new("oversized-existing-publish");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
     let victim = root.path().join("victim.rs");
     std::fs::write(&victim, "contents").unwrap();
@@ -1764,7 +1742,7 @@ async fn oversized_existing_publish_invalidates_stale_diagnostics_and_advances_v
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_aggregate_binding_uses_manager_root_canonical_representation() {
-    let root = TempRoot::new("windows-canonical-binding");
+    let root = TempDir::new("windows-canonical-binding");
     let file = root.path().join("main.rs");
     std::fs::write(&file, "fn main() {}").unwrap();
     let canonical = file.canonicalize().unwrap();
@@ -1792,7 +1770,7 @@ async fn windows_aggregate_binding_uses_manager_root_canonical_representation() 
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_lsp_tool_verbatim_canonical_path_matches_ordinary_configured_deny() {
-    let root = TempRoot::new("windows-verbatim-deny");
+    let root = TempDir::new("windows-verbatim-deny");
     let file = root.path().join("secret.rs");
     std::fs::write(&file, "secret").unwrap();
     let ordinary_policy_path = file.to_string_lossy().into_owned();
@@ -1818,8 +1796,8 @@ async fn windows_lsp_tool_verbatim_canonical_path_matches_ordinary_configured_de
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_lsp_tool_verbatim_external_path_matches_ordinary_external_rule() {
-    let root = TempRoot::new("windows-verbatim-external-root");
-    let external = TempRoot::new("windows-verbatim-external-file");
+    let root = TempDir::new("windows-verbatim-external-root");
+    let external = TempDir::new("windows-verbatim-external-file");
     let file = external.path().join("secret.rs");
     std::fs::write(&file, "secret").unwrap();
     let ordinary_policy_path = file.to_string_lossy().into_owned();
@@ -1844,8 +1822,8 @@ async fn windows_lsp_tool_verbatim_external_path_matches_ordinary_external_rule(
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_lsp_tool_matches_ordinary_and_verbatim_raw_external_regex_denies() {
-    let root = TempRoot::new("windows-verbatim-external-regex-root");
-    let external = TempRoot::new("windows-verbatim-external-regex-file");
+    let root = TempDir::new("windows-verbatim-external-regex-root");
+    let external = TempDir::new("windows-verbatim-external-regex-file");
     let file = external.path().join("secret.rs");
     std::fs::write(&file, "secret").unwrap();
     let ordinary_policy_path = file.to_string_lossy().into_owned();
@@ -1898,7 +1876,7 @@ async fn windows_lsp_tool_matches_ordinary_and_verbatim_raw_external_regex_denie
 
 #[tokio::test]
 async fn explicit_lsp_allow_always_suppresses_later_asks() {
-    let root = TempRoot::new("explicit-allow-always");
+    let root = TempDir::new("explicit-allow-always");
     let file = root.path().join("sample.unknownext");
     std::fs::write(&file, "contents").unwrap();
     let canonical = file.canonicalize().unwrap();
@@ -1944,7 +1922,7 @@ async fn explicit_lsp_allow_always_suppresses_later_asks() {
 
 #[tokio::test]
 async fn dropped_lsp_ask_reply_fails_closed_before_manager_access() {
-    let root = TempRoot::new("dropped-ask");
+    let root = TempDir::new("dropped-ask");
     let file = root.path().join("sample.rs");
     std::fs::write(&file, "contents").unwrap();
     let (tool, mut ask_rx, manager) = lsp_tool(root.path(), read_permission(Action::Ask));
@@ -1974,7 +1952,7 @@ async fn explicit_fifo_is_rejected_promptly_before_lsp_client_access() {
         fn mkfifo(path: *const c_char, mode: u32) -> i32;
     }
 
-    let root = TempRoot::new("explicit-fifo");
+    let root = TempDir::new("explicit-fifo");
     let fifo = root.path().join("blocked.guarded");
     let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     // SAFETY: `fifo_c` is a valid, NUL-terminated path for the duration of
@@ -2015,7 +1993,7 @@ async fn explicit_non_utf8_canonical_path_cannot_reuse_lossy_permission_key() {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
 
-    let root = TempRoot::new("explicit-non-utf8");
+    let root = TempDir::new("explicit-non-utf8");
     let valid = root.path().join("sample-�.guarded");
     let invalid = root
         .path()
@@ -2067,8 +2045,8 @@ async fn explicit_non_utf8_canonical_path_cannot_reuse_lossy_permission_key() {
 async fn aggregate_rejects_symlink_alias_uri_variants_and_stale_retargets() {
     use std::os::unix::fs::symlink;
 
-    let root = TempRoot::new("stale-cache-root");
-    let external = TempRoot::new("stale-cache-external");
+    let root = TempDir::new("stale-cache-root");
+    let external = TempDir::new("stale-cache-external");
     let file = root.path().join("space ü.rs");
     let alias = root.path().join("alias.rs");
     let denied = external.path().join("denied.rs");
@@ -2220,7 +2198,7 @@ fn lsp44_auto_path_admission_preserves_overrides_and_ignores_relative_or_oversiz
 
 #[tokio::test]
 async fn edit_wait_shortens_after_a_missed_publish_and_recovers_after_a_late_one() {
-    let root = TempRoot::new("adaptive-edit-wait");
+    let root = TempDir::new("adaptive-edit-wait");
     let file = root.path().join("quiet.rs");
     std::fs::write(&file, "fn quiet() {}").unwrap();
     let file = file.canonicalize().unwrap();

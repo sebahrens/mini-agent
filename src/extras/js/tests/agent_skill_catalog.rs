@@ -6,37 +6,8 @@ use crate::extras::skills::catalog::AgentSkillCatalog;
 use crate::extras::skills::import_agent_skill;
 use crate::extras::skills::index::AgentSkillSearchPolicy;
 use crate::extras::skills::loader::{load_resource, load_skill_markdown};
-use crate::paths::AppPaths;
 
-struct TempPaths {
-    root: PathBuf,
-    paths: AppPaths,
-}
-
-impl TempPaths {
-    fn new() -> Self {
-        let root =
-            std::env::temp_dir().join(format!("mini-agent-catalog-{}", uuid::Uuid::new_v4()));
-        Self {
-            paths: AppPaths {
-                config_dir: root.join("config"),
-                data_dir: root.join("data"),
-                local_data_dir: root.join("local-data"),
-                state_dir: root.join("state"),
-                cache_dir: root.join("cache"),
-                credentials_dir: root.join("credentials"),
-                project_dir: None,
-            },
-            root,
-        }
-    }
-}
-
-impl Drop for TempPaths {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
+use super::TempPaths;
 
 fn write_skill(temp: &TempPaths, suffix: &str) -> PathBuf {
     let root = temp.root.join("review-code");
@@ -54,7 +25,7 @@ fn write_skill(temp: &TempPaths, suffix: &str) -> PathBuf {
 
 #[tokio::test]
 async fn agent_skill_catalog_preserves_imported_metadata_and_progressive_disclosure() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("catalog");
     let source = write_skill(&temp, "v1");
     let imported = import_agent_skill(&source, &temp.paths).unwrap();
     let embedder = Embedder::new().unwrap();
@@ -90,7 +61,7 @@ async fn agent_skill_catalog_preserves_imported_metadata_and_progressive_disclos
 
 #[test]
 fn agent_skill_catalog_active_digest_switch_is_atomic_and_deterministic() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("catalog");
     let source = write_skill(&temp, "v1");
     let first = import_agent_skill(&source, &temp.paths).unwrap();
     fs::write(
@@ -147,7 +118,7 @@ fn agent_skill_catalog_active_digest_switch_is_atomic_and_deterministic() {
 
 #[test]
 fn catalog_refresh_if_changed_skips_stable_trees_and_detects_imports() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("catalog");
     let source = write_skill(&temp, "v1");
     let first = import_agent_skill(&source, &temp.paths).unwrap();
     let embedder = Embedder::new().unwrap();
@@ -173,7 +144,7 @@ fn catalog_refresh_if_changed_skips_stable_trees_and_detects_imports() {
 
 #[test]
 fn agent_skill_progressive_disclosure_rejects_unmanifested_resources() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("catalog");
     let source = write_skill(&temp, "v1");
     let imported = import_agent_skill(&source, &temp.paths).unwrap();
     let embedder = Embedder::new().unwrap();
@@ -200,7 +171,7 @@ fn agent_skill_progressive_disclosure_rejects_unmanifested_resources() {
 
 #[test]
 fn agent_skill_loader_rejects_same_size_resource_mutation_after_selection() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("catalog");
     let source = write_skill(&temp, "v1");
     let imported = import_agent_skill(&source, &temp.paths).unwrap();
     let embedder = Embedder::new().unwrap();
@@ -257,7 +228,7 @@ fn agent_skill_catalog_omits_corrupt_package_without_hiding_valid_sibling() {
         #[cfg(unix)]
         "dangling-symlink",
     ] {
-        let temp = TempPaths::new();
+        let temp = TempPaths::new("catalog");
         let source = write_skill(&temp, "v1");
         import_agent_skill(&source, &temp.paths).unwrap();
         let other_source = temp.root.join("corrupt-skill");
@@ -362,7 +333,7 @@ fn agent_skill_catalog_omits_corrupt_package_without_hiding_valid_sibling() {
 /// newest, which is exactly the case the old fallback got wrong.
 #[test]
 fn reimporting_an_updated_agent_skill_activates_the_version_just_installed() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("catalog");
     let source = write_skill(&temp, "v1");
     let mut latest = import_agent_skill(&source, &temp.paths).unwrap();
     let mut digests = vec![latest.identity.digest.clone()];
@@ -411,7 +382,7 @@ fn reimporting_an_updated_agent_skill_activates_the_version_just_installed() {
 
 #[test]
 fn agent_skill_catalog_refuses_to_guess_between_digests_without_a_pointer() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("catalog");
     let source = write_skill(&temp, "v1");
     let first = import_agent_skill(&source, &temp.paths).unwrap();
     let name_root = temp.paths.data_dir.join("agent-skills").join("review-code");
@@ -479,7 +450,7 @@ fn agent_skill_catalog_enforces_instruction_and_resource_read_limits() {
         (true, crate::extras::skills::MAX_SKILL_INSTRUCTION_BYTES),
         (false, 16 * 1024 * 1024),
     ] {
-        let temp = TempPaths::new();
+        let temp = TempPaths::new("catalog");
         let source = write_skill(&temp, "v1");
         let small = import_agent_skill(&source, &temp.paths).unwrap();
         let digest = "f".repeat(64);
@@ -559,7 +530,7 @@ fn agent_skill_catalog_enforces_instruction_and_resource_read_limits() {
 #[test]
 fn agent_skill_catalog_scan_limits_include_empty_directories_and_instruction_bytes() {
     for limit in ["depth", "entries", "bytes"] {
-        let temp = TempPaths::new();
+        let temp = TempPaths::new("catalog");
         let source = write_skill(&temp, "v1");
         let small = import_agent_skill(&source, &temp.paths).unwrap();
         let digest = "e".repeat(64);

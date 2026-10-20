@@ -1313,7 +1313,6 @@ mod js_isolation_tests {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use crate::permission::ask::UserDecision;
@@ -1484,30 +1483,7 @@ mod tests {
         assert_eq!(with_none, with_empty);
     }
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "mini-agent-subagent-permission-{}-{tag}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed),
-            ));
-            std::fs::create_dir_all(&path).expect("create subagent permission test directory");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tests::support::temp::TempDir;
 
     fn parent_authorization(
         working_dir: &Path,

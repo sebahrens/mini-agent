@@ -8277,8 +8277,8 @@ mod sandbox_tests {
     }
 
     #[cfg(unix)]
-    fn canonical_scratch() -> (ScratchDir, PathBuf) {
-        let scratch = ScratchDir::new();
+    fn canonical_scratch() -> (TempDir, PathBuf) {
+        let scratch = TempDir::new("sandbox");
         let root = std::fs::canonicalize(scratch.path()).unwrap();
         (scratch, root)
     }
@@ -8638,7 +8638,7 @@ echo COMMITTED"#;
             bwrap_supports_bind_fd(bwrap_path().unwrap()),
             "bubblewrap lacks --ro-bind-fd"
         );
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = host_git_repository(scratch.path());
         // bubblewrap can only bind an existing path (a missing one is a
         // documented gap); Seatbelt's test leaves `modules` missing instead.
@@ -8698,7 +8698,7 @@ echo COMMITTED"#;
         // application paths from the environment on every call.
         let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         assert!(bwrap_exists(), "bubblewrap is unavailable");
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = host_git_repository(scratch.path());
         let sandbox = Sandbox::new(true, "bwrap").with_working_dir(&workspace);
 
@@ -8741,7 +8741,7 @@ echo COMMITTED"#;
         // application paths from the environment on every call.
         let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         assert!(bwrap_exists(), "bubblewrap is unavailable");
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = host_git_repository(scratch.path());
         let sandbox = Sandbox::new(true, "bwrap").with_working_dir(&workspace);
         let hook = workspace.join(".git/hooks/pre-commit");
@@ -8786,7 +8786,7 @@ echo COMMITTED"#;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn assert_gitfile_target_directory_cannot_be_renamed(backend: &str) {
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = host_git_repository(scratch.path());
         std::fs::rename(workspace.join(".git"), workspace.join("gitdir")).unwrap();
         std::fs::write(workspace.join(".git"), "gitdir: gitdir\n").unwrap();
@@ -8818,7 +8818,7 @@ echo COMMITTED"#;
             eprintln!("skipping: Seatbelt is unusable on this host");
             return;
         }
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = host_git_repository(scratch.path());
         let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
         let output = sandbox
@@ -8870,7 +8870,7 @@ echo COMMITTED"#;
             skip_unusable_real_sandbox_test("Seatbelt is unusable on this host");
             return;
         }
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = host_git_repository(scratch.path());
         let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
 
@@ -9115,7 +9115,7 @@ echo COMMITTED"#;
     #[test]
     fn macos_seatbelt_policy_command_matches_capability_matrix() {
         let _env = crate::tests::ScopedProcessEnv::set(&[]);
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = scratch.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         let sandbox = Sandbox::new(true, "seatbelt");
@@ -9815,7 +9815,7 @@ printf {pass_token}
         // application paths from the environment on every call.
         let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
         assert!(seatbelt_exists(), "Seatbelt is unavailable");
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = std::fs::canonicalize(scratch.path()).unwrap();
         let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
         let command = sandbox
@@ -9839,7 +9839,7 @@ printf {pass_token}
     #[tokio::test]
     async fn seatbelt_children_use_private_temp_and_cannot_overwrite_shared_temp() {
         assert!(seatbelt_exists(), "Seatbelt is unavailable");
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let home = scratch.path().join("system-home");
         let app_home = scratch.path().join("app-home");
         let workspace = scratch.path().join("workspace");
@@ -9870,10 +9870,7 @@ printf {pass_token}
         std::fs::write(&credential_secret, "private credential sentinel").unwrap();
         let config_alias = workspace.join("config-alias");
         std::os::unix::fs::symlink(&config_secret, &config_alias).unwrap();
-        let shared = Path::new("/private/tmp")
-            .join(format!("mini-agent-shared-temp-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&shared).unwrap();
-        let shared = ScratchDir(shared);
+        let shared = TempDir::new_in(Path::new("/private/tmp"), "shared-temp");
         let sentinel = shared.path().join("host-sentinel");
         std::fs::write(&sentinel, "host sentinel\n").unwrap();
         let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
@@ -9993,7 +9990,7 @@ echo PRIVATE_TEMP_PASS"#,
     #[cfg(unix)]
     #[test]
     fn macos_runtime_cache_selection_preserves_disjoint_overrides_and_moves_private_overlaps() {
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let root = std::fs::canonicalize(scratch.path()).unwrap();
         let paths = crate::paths::AppPaths {
             config_dir: root.join("config"),
@@ -10029,7 +10026,7 @@ echo PRIVATE_TEMP_PASS"#,
     #[cfg(unix)]
     #[test]
     fn macos_runtime_cache_refuses_private_ancestors_descendants_and_aliases() {
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let root = std::fs::canonicalize(scratch.path()).unwrap();
         let private = root.join("private");
         std::fs::create_dir(&private).unwrap();
@@ -10075,7 +10072,7 @@ echo PRIVATE_TEMP_PASS"#,
         // Keep application path inputs stable across cached and manual builds.
         let _env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "seatbelt");
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = scratch.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         let cache_dir = std::env::temp_dir().join(format!("test-cache-{}", uuid::Uuid::new_v4()));
@@ -10158,7 +10155,7 @@ echo PRIVATE_TEMP_PASS"#,
     #[test]
     fn seatbelt_profile_discovers_git_metadata_once_and_reuses_protected_denies() {
         let _env = crate::tests::ScopedProcessEnv::set(&[]);
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = scratch.path().join("workspace");
         std::fs::create_dir_all(workspace.join(".git/hooks")).unwrap();
         let workspace = workspace.canonicalize().unwrap();
@@ -10187,7 +10184,7 @@ echo PRIVATE_TEMP_PASS"#,
     #[test]
     fn seatbelt_profile_captures_explicit_roots_once_and_revalidates_each_launch() {
         let _env = crate::tests::ScopedProcessEnv::set(&[]);
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = scratch.path().join("workspace");
         let probe = scratch.path().join("probe-root");
         std::fs::create_dir(&workspace).unwrap();
@@ -10258,7 +10255,7 @@ echo PRIVATE_TEMP_PASS"#,
     #[test]
     fn one_launch_validates_runtime_and_explicit_root_bindings_once() {
         let _env = crate::tests::ScopedProcessEnv::set(&[]);
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace = scratch.path().join("workspace");
         let probe = scratch.path().join("probe-root");
         std::fs::create_dir(&workspace).unwrap();
@@ -10313,7 +10310,7 @@ echo PRIVATE_TEMP_PASS"#,
     #[cfg(unix)]
     #[test]
     fn seatbelt_namespace_denies_extension_matches_one_ordered_pass() {
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let first = scratch.path().join("a/b/c");
         let second = scratch.path().join("a/b/d");
         let third = scratch.path().join("x/y");
@@ -10386,7 +10383,7 @@ echo PRIVATE_TEMP_PASS"#,
         // Other tests temporarily replace process-wide application roots.
         let _env = crate::tests::ScopedProcessEnv::set(&[]);
         let sandbox = Sandbox::new(true, "seatbelt");
-        let scratch = ScratchDir::new();
+        let scratch = TempDir::new("sandbox");
         let workspace_a = scratch.path().join("workspace-a");
         let workspace_b = scratch.path().join("workspace-b");
         std::fs::create_dir(&workspace_a).unwrap();
@@ -10487,35 +10484,13 @@ echo PRIVATE_TEMP_PASS"#,
         );
     }
 
-    /// Unique scratch directory removed on drop.
     #[cfg(unix)]
-    struct ScratchDir(PathBuf);
-
-    #[cfg(unix)]
-    impl ScratchDir {
-        fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("mini-agent-sbx-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tests::support::temp::TempDir;
 
     #[cfg(unix)]
     #[test]
     fn seatbelt_private_read_denies_cover_resolved_symlink_spelling() {
-        let root = ScratchDir::new();
+        let root = TempDir::new("sandbox");
         let real_home = root.path().join("real-home");
         std::fs::create_dir_all(real_home.join("config")).unwrap();
         let linked_home = root.path().join("linked-home");

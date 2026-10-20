@@ -9,34 +9,7 @@ use crate::paths::{
     validate_portable_component,
 };
 
-struct TempRoot(PathBuf);
-
-impl TempRoot {
-    fn new(tag: &str) -> Self {
-        #[cfg(unix)]
-        let temp = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
-        #[cfg(not(unix))]
-        let temp = std::env::temp_dir();
-        let path = temp.join(format!(
-            "zerostack-platform-paths-{tag}-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::tests::support::temp::TempDir;
 
 fn linux_environment() -> PathEnvironment {
     PathEnvironment {
@@ -320,7 +293,7 @@ fn app_paths_matrix_zs_overrides_take_precedence_over_the_global_home() {
 
 #[test]
 fn default_layout_probe_keeps_legacy_installs_and_adopts_home_otherwise() {
-    let root = TempRoot::new("layout-probe");
+    let root = TempDir::new_canonical("layout-probe");
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let base = |name: &str| root.path().join(name);
@@ -545,7 +518,7 @@ fn assert_owned_by(path: PathBuf, root: &Path, artifact: &str) {
 
 #[test]
 fn persistent_artifact_ownership_acceptance_covers_every_typed_owner() {
-    let root = TempRoot::new("owners");
+    let root = TempDir::new_canonical("owners");
     let paths = acceptance_paths(root.path());
     let project = paths.project_dir.as_deref().unwrap();
 
@@ -623,7 +596,7 @@ fn persistent_artifact_ownership_acceptance_covers_every_typed_owner() {
 
 #[test]
 fn platform_paths_acceptance_effect_audit_has_one_fixed_state_owner() {
-    let root = TempRoot::new("effect-audit-owner");
+    let root = TempDir::new_canonical("effect-audit-owner");
     let paths = acceptance_paths(root.path());
     let owner = paths.effect_audit();
 
@@ -649,7 +622,7 @@ fn platform_paths_acceptance_effect_audit_has_one_fixed_state_owner() {
 
 #[test]
 fn legacy_path_migration_acceptance_proves_restart_retention_and_conflicts() {
-    let root = TempRoot::new("migration");
+    let root = TempDir::new_canonical("migration");
     let paths = acceptance_paths(root.path());
     let legacy = root.path().join("legacy-sessions");
     std::fs::create_dir_all(&legacy).unwrap();
@@ -750,7 +723,7 @@ fn private_dacl_contract(sddl: &str) -> Result<(), String> {
 
 #[test]
 fn platform_paths_acceptance_real_platform_private_roots() {
-    let root = TempRoot::new("private-roots");
+    let root = TempDir::new_canonical("private-roots");
     let paths = acceptance_paths(root.path());
     prepare_storage_roots(&paths).unwrap();
 
@@ -822,7 +795,7 @@ fn platform_paths_acceptance_real_host_uses_native_base_classes() {
 
 #[test]
 fn platform_paths_acceptance_real_platform_rejects_links_and_reparse_points() {
-    let root = TempRoot::new("link-gate");
+    let root = TempDir::new_canonical("link-gate");
     let contained = root.path().join("contained");
     let outside = root.path().join("outside");
     std::fs::create_dir_all(&contained).unwrap();

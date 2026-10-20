@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::PathBuf;
 
 use crate::extras::js::skills::embed::SkillDocument;
 use crate::extras::js::skills::index::RetrievalPolicy;
@@ -10,7 +9,6 @@ use crate::extras::js::skills::{
 };
 use crate::extras::skills::index::AgentSkillSearchPolicy;
 use crate::extras::skills::{ImportedSkill, import_agent_skill};
-use crate::paths::AppPaths;
 
 fn assert_agent_selection(discovery: &TurnDiscoveryBundle, imported: &ImportedSkill) {
     assert_eq!(
@@ -23,37 +21,7 @@ fn assert_agent_selection(discovery: &TurnDiscoveryBundle, imported: &ImportedSk
     );
 }
 
-struct TempPaths {
-    root: PathBuf,
-    paths: AppPaths,
-}
-
-impl TempPaths {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "mini-agent-turn-discovery-{}",
-            uuid::Uuid::new_v4()
-        ));
-        Self {
-            paths: AppPaths {
-                config_dir: root.join("config"),
-                data_dir: root.join("data"),
-                local_data_dir: root.join("local-data"),
-                state_dir: root.join("state"),
-                cache_dir: root.join("cache"),
-                credentials_dir: root.join("credentials"),
-                project_dir: None,
-            },
-            root,
-        }
-    }
-}
-
-impl Drop for TempPaths {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
+use super::TempPaths;
 
 fn learned_skill() -> SkillArtifact {
     SkillArtifact::new(
@@ -92,7 +60,7 @@ fn retrieval_document(skill: &SkillArtifact) -> String {
 
 #[tokio::test]
 async fn deterministic_backend_reports_lexical_only_retrieval() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let runtime = SkillRuntime::open(&temp.paths, None).unwrap();
 
     assert_eq!(
@@ -110,7 +78,7 @@ async fn deterministic_backend_reports_lexical_only_retrieval() {
 
 #[tokio::test]
 async fn read_only_child_shares_retrieval_but_freezes_only_active_pure_skills() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let pure = learned_skill();
     let effectful = SkillArtifact::new(
         "function effectfulChildSkill(_cap, value) { return value; }".to_string(),
@@ -168,7 +136,7 @@ async fn read_only_child_shares_retrieval_but_freezes_only_active_pure_skills() 
 
 #[tokio::test]
 async fn live_runtime_discovers_an_agent_skill_imported_after_open() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let runtime = SkillRuntime::open(&temp.paths, None)
         .unwrap()
         .with_test_policies(
@@ -202,7 +170,7 @@ async fn live_runtime_discovers_an_agent_skill_imported_after_open() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_turn_keeps_current_thread_executor_responsive_while_sqlite_waits() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let runtime = SkillRuntime::open(&temp.paths, None).unwrap();
     runtime.settle_learned_rebuild_for_test().await;
     let prompt = "keep the async executor responsive";
@@ -219,7 +187,7 @@ async fn prepare_turn_keeps_current_thread_executor_responsive_while_sqlite_wait
 
 #[tokio::test]
 async fn prompt_discovery_reuses_one_query_embedding_for_both_typed_indexes() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let learned = learned_skill();
     SkillStore::open_at(&temp.paths)
         .and_then(|mut store| store.insert_verified(&learned))
@@ -303,7 +271,7 @@ async fn prompt_discovery_reuses_one_query_embedding_for_both_typed_indexes() {
 
 #[tokio::test]
 async fn selected_agent_skill_attaches_its_exact_active_learned_js_identity() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let learned = learned_skill();
     SkillStore::open_at(&temp.paths)
         .and_then(|mut store| store.insert_verified(&learned))
@@ -350,7 +318,7 @@ async fn selected_agent_skill_attaches_its_exact_active_learned_js_identity() {
 
 #[tokio::test]
 async fn agent_skill_learned_js_association_never_bypasses_activation() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let learned = learned_skill();
     let mut store = SkillStore::open_at(&temp.paths).unwrap();
     store.insert_verified(&learned).unwrap();
@@ -405,7 +373,7 @@ async fn agent_skill_learned_js_association_never_bypasses_activation() {
 
 #[test]
 fn agent_skill_import_rejects_an_unverified_learned_js_identity_before_installing() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let missing = "a".repeat(64);
     let agent_source = temp.root.join("missing-bridge");
     fs::create_dir_all(&agent_source).unwrap();
@@ -430,7 +398,7 @@ fn agent_skill_import_rejects_an_unverified_learned_js_identity_before_installin
 
 #[tokio::test]
 async fn unavailable_js_worker_disables_learned_js_but_preserves_agent_skills() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let learned = learned_skill();
     SkillStore::open_at(&temp.paths)
         .and_then(|mut store| store.insert_verified(&learned))
@@ -476,7 +444,7 @@ async fn unavailable_js_worker_disables_learned_js_but_preserves_agent_skills() 
 
 #[tokio::test]
 async fn prepared_turn_keeps_trusted_manifest_separate_from_the_user_prompt() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let learned = learned_skill();
     SkillStore::open_at(&temp.paths)
         .and_then(|mut store| store.insert_verified(&learned))
@@ -503,7 +471,7 @@ async fn prepared_turn_keeps_trusted_manifest_separate_from_the_user_prompt() {
 
 #[tokio::test]
 async fn background_skill_rebuild_returns_early_but_remains_owned() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let learned = learned_skill();
     SkillStore::open_at(&temp.paths)
         .and_then(|mut store| store.insert_verified(&learned))
@@ -569,7 +537,7 @@ async fn background_skill_rebuild_returns_early_but_remains_owned() {
 
 #[tokio::test]
 async fn trusted_skill_context_neutralizes_closing_tags_in_markdown_and_resources() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let agent_source = temp.root.join("hostile-instruction-skill");
     fs::create_dir_all(agent_source.join("references")).unwrap();
     fs::write(
@@ -613,7 +581,7 @@ async fn trusted_skill_context_neutralizes_closing_tags_in_markdown_and_resource
 
 #[tokio::test]
 async fn matching_generation_reuses_the_index_and_mutations_coalesce_one_rebuild() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("turn-discovery");
     let first = SkillRuntime::open(&temp.paths, None).unwrap();
     assert_eq!(first.learned_rebuild_starts_for_test(), 0);
     first.settle_learned_rebuild_for_test().await;

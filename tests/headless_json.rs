@@ -1,5 +1,8 @@
 use std::process::Command;
 
+#[path = "../src/tests/support/temp.rs"]
+mod temp;
+
 #[cfg(all(unix, feature = "lsp"))]
 #[test]
 fn doctor_lsp_executable_metadata_does_not_launch_or_disclose_arguments_environment() {
@@ -246,7 +249,7 @@ fn acp_permission_reply_is_routed_without_unhandled_dispatch_warning() {
     assert_eq!(response(1)["result"]["protocolVersion"], 1);
     send(
         &mut stdin,
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":root.0,"mcpServers":[]}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":root.0.path(),"mcpServers":[]}}),
     );
     let session = response(2)["result"]["sessionId"]
         .as_str()
@@ -301,20 +304,15 @@ fn acp_permission_reply_is_routed_without_unhandled_dispatch_warning() {
     );
 }
 
-struct TempRoot(std::path::PathBuf);
+struct TempRoot(temp::TempDir);
 
 impl TempRoot {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "mini-agent-headless-json-process-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir(&path).expect("create private app root");
-        let path = std::fs::canonicalize(path).expect("canonicalize private app root");
+        let path = temp::TempDir::new_canonical("headless-json-process");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            std::fs::set_permissions(path.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("make app root private");
         }
         Self(path)
@@ -337,7 +335,7 @@ impl TempRoot {
             "ZS_CACHE_DIR",
             "ZS_CREDENTIALS_DIR",
         ] {
-            command.env(name, &self.0);
+            command.env(name, self.0.path());
         }
         command
     }
@@ -853,12 +851,6 @@ fn bounded_output_with_stdin(mut command: Command, stdin: Option<Vec<u8>>) -> st
         String::from_utf8_lossy(&output.stderr)
     );
     output
-}
-
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 #[cfg(feature = "loop")]

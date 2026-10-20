@@ -22,29 +22,15 @@ fn format_size_preserves_unit_boundaries_and_fractional_units() {
     }
 }
 
-struct TestDirectory(std::path::PathBuf);
-
-impl TestDirectory {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("mini-agent-list-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        Self(root)
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::tests::support::temp::TempDir;
 
 #[tokio::test]
 async fn list_dir_reports_actual_child_counts_and_empty_directories() {
-    let root = TestDirectory::new();
-    std::fs::create_dir(root.0.join("empty")).unwrap();
-    std::fs::create_dir_all(root.0.join("populated/nested")).unwrap();
-    std::fs::write(root.0.join("populated/file.txt"), "contents").unwrap();
-    let tool = ListDirTool::new(None, None, None).with_workspace(&root.0);
+    let root = TempDir::new("list");
+    std::fs::create_dir(root.path().join("empty")).unwrap();
+    std::fs::create_dir_all(root.path().join("populated/nested")).unwrap();
+    std::fs::write(root.path().join("populated/file.txt"), "contents").unwrap();
+    let tool = ListDirTool::new(None, None, None).with_workspace(root.path());
 
     let listing = tool.call(ListDirArgs { path: None }).await.unwrap();
     let rows: Vec<Vec<_>> = listing
@@ -68,9 +54,9 @@ async fn list_dir_reports_actual_child_counts_and_empty_directories() {
 
 #[tokio::test]
 async fn list_dir_rejects_missing_directory_instead_of_reporting_empty() {
-    let root = TestDirectory::new();
+    let root = TempDir::new("list");
     let result = ListDirTool::new(None, None, None)
-        .with_workspace(&root.0)
+        .with_workspace(root.path())
         .call(ListDirArgs {
             path: Some("missing".into()),
         })
@@ -85,8 +71,8 @@ async fn list_dir_omits_denied_entries() {
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
     use std::sync::{Arc, Mutex};
 
-    let root = TestDirectory::new();
-    let workspace = root.0.canonicalize().unwrap();
+    let root = TempDir::new("list");
+    let workspace = root.path().canonicalize().unwrap();
     std::fs::create_dir_all(workspace.join("config/secrets")).unwrap();
     std::fs::write(workspace.join("config/.env"), "TOKEN=x").unwrap();
     std::fs::write(workspace.join("config/app.toml"), "").unwrap();
@@ -126,11 +112,11 @@ async fn list_dir_omits_denied_entries() {
 
 #[tokio::test]
 async fn list_dir_sizes_name_padding_by_characters_instead_of_utf8_bytes() {
-    let root = TestDirectory::new();
-    std::fs::write(root.0.join("ééé"), "").unwrap();
-    std::fs::write(root.0.join("x"), "").unwrap();
+    let root = TempDir::new("list");
+    std::fs::write(root.path().join("ééé"), "").unwrap();
+    std::fs::write(root.path().join("x"), "").unwrap();
     let listing = ListDirTool::new(None, None, None)
-        .with_workspace(&root.0)
+        .with_workspace(root.path())
         .call(ListDirArgs { path: None })
         .await
         .unwrap();
