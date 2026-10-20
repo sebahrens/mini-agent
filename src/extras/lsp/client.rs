@@ -598,79 +598,76 @@ impl LspClient {
                         // Requests were answered above.
                         (Some(_), Some(_)) => {}
                         // Server→client notification.
-                        (Some(m), None) => {
-                            if m == "textDocument/publishDiagnostics" && msg.get("params").is_some()
-                            {
-                                let envelope = {
-                                    let params = &msg["params"];
-                                    match validate_diagnostic_envelope(&workspace_uri, params) {
-                                        DiagnosticStoreOutcome::Ignored => {
-                                            validate_diagnostic_envelope(
-                                                &parent_workspace_uri,
-                                                params,
-                                            )
-                                        }
-                                        outcome => outcome,
+                        (Some(m), None)
+                            if m == "textDocument/publishDiagnostics"
+                                && msg.get("params").is_some() =>
+                        {
+                            let envelope = {
+                                let params = &msg["params"];
+                                match validate_diagnostic_envelope(&workspace_uri, params) {
+                                    DiagnosticStoreOutcome::Ignored => {
+                                        validate_diagnostic_envelope(&parent_workspace_uri, params)
                                     }
-                                };
-                                match envelope {
-                                    DiagnosticStoreOutcome::Stored => {
-                                        let Some(uri) = msg["params"]
-                                            .get("uri")
-                                            .and_then(Value::as_str)
-                                            .and_then(|uri| {
-                                                parent_diagnostic_uri(&workspace, &server_root, uri)
-                                            })
-                                        else {
-                                            continue;
-                                        };
-                                        // The frame is owned and not read again:
-                                        // move the params out instead of cloning
-                                        // a possibly large diagnostics array.
-                                        let mut params = msg["params"].take();
-                                        params["uri"] = Value::String(uri);
-                                        let diags = diags.clone();
-                                        let open = open.clone();
-                                        let server = server_name.clone();
-                                        let work = diagnostic_work.clone().lock_owned().await;
-                                        #[cfg(test)]
-                                        let probe = {
-                                            let mut probe = diagnostic_probe.lock().unwrap();
-                                            if probe.as_ref().is_some_and(|probe| {
-                                                params.get("version").and_then(Value::as_i64)
-                                                    == Some(probe.version)
-                                            }) {
-                                                probe.take()
-                                            } else {
-                                                None
-                                            }
-                                        };
-                                        let publish = move || {
-                                            #[cfg(test)]
-                                            if let Some(probe) = probe {
-                                                let _ = probe.entered.send(());
-                                                let _ = probe.release.recv();
-                                            }
-                                            store_diagnostics(&diags, &server, &params, Some(&open))
-                                        };
-                                        if tokio::task::spawn_blocking(move || {
-                                            let _work = work;
-                                            publish()
+                                    outcome => outcome,
+                                }
+                            };
+                            match envelope {
+                                DiagnosticStoreOutcome::Stored => {
+                                    let Some(uri) = msg["params"]
+                                        .get("uri")
+                                        .and_then(Value::as_str)
+                                        .and_then(|uri| {
+                                            parent_diagnostic_uri(&workspace, &server_root, uri)
                                         })
-                                        .await
-                                        .unwrap_or(false)
-                                        {
-                                            diag_notify.notify_waiters();
+                                    else {
+                                        continue;
+                                    };
+                                    // The frame is owned and not read again:
+                                    // move the params out instead of cloning
+                                    // a possibly large diagnostics array.
+                                    let mut params = msg["params"].take();
+                                    params["uri"] = Value::String(uri);
+                                    let diags = diags.clone();
+                                    let open = open.clone();
+                                    let server = server_name.clone();
+                                    let work = diagnostic_work.clone().lock_owned().await;
+                                    #[cfg(test)]
+                                    let probe = {
+                                        let mut probe = diagnostic_probe.lock().unwrap();
+                                        if probe.as_ref().is_some_and(|probe| {
+                                            params.get("version").and_then(Value::as_i64)
+                                                == Some(probe.version)
+                                        }) {
+                                            probe.take()
+                                        } else {
+                                            None
                                         }
+                                    };
+                                    let publish = move || {
+                                        #[cfg(test)]
+                                        if let Some(probe) = probe {
+                                            let _ = probe.entered.send(());
+                                            let _ = probe.release.recv();
+                                        }
+                                        store_diagnostics(&diags, &server, &params, Some(&open))
+                                    };
+                                    if tokio::task::spawn_blocking(move || {
+                                        let _work = work;
+                                        publish()
+                                    })
+                                    .await
+                                    .unwrap_or(false)
+                                    {
+                                        diag_notify.notify_waiters();
                                     }
-                                    DiagnosticStoreOutcome::Ignored => {}
-                                    DiagnosticStoreOutcome::LimitExceeded => {
-                                        tracing::debug!(
-                                            "lsp[{server_name}]: diagnostic storage limit exceeded"
-                                        );
-                                        transport.close();
-                                        break;
-                                    }
+                                }
+                                DiagnosticStoreOutcome::Ignored => {}
+                                DiagnosticStoreOutcome::LimitExceeded => {
+                                    tracing::debug!(
+                                        "lsp[{server_name}]: diagnostic storage limit exceeded"
+                                    );
+                                    transport.close();
+                                    break;
                                 }
                             }
                         }
