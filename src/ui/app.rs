@@ -2441,12 +2441,14 @@ impl<'a> App<'a> {
             #[cfg(feature = "mcp")]
             if let Some(manager) = self.ui.mcp_manager.as_mut() {
                 let notices = manager.take_notices();
-                self.renderer.frame(|renderer| {
-                    for notice in &notices {
-                        renderer.write_line(&sanitize_output(notice), C_ERROR)?;
-                    }
-                    Ok(())
-                })?;
+                if !notices.is_empty() {
+                    self.renderer.frame(|renderer| {
+                        for notice in &notices {
+                            renderer.write_line(&sanitize_output(notice), C_ERROR)?;
+                        }
+                        Ok(())
+                    })?;
+                }
             }
             if (self.permission_prompt.is_none() && self.question_prompt.is_none())
                 && let Some(event) = self.deferred_user_events.pop_front()
@@ -2686,6 +2688,12 @@ impl<'a> App<'a> {
     }
 
     fn drain_tui_diagnostics(&mut self) -> io::Result<()> {
+        // The common idle case opens no frame at all.
+        if self.tui_log_rx.as_ref().is_none_or(|rx| rx.is_empty())
+            && !crate::logging::has_dropped_tui_diagnostics()
+        {
+            return Ok(());
+        }
         let receiver = self.tui_log_rx.as_mut();
         // Every drained line is painted in one frame.
         self.renderer.frame(|renderer| {

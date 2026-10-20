@@ -142,6 +142,11 @@ pub fn take_tui_diagnostics() -> Option<mpsc::Receiver<String>> {
     TUI_LOGS.get()?.lock().ok()?.take()
 }
 
+/// Whether dropped-record warnings are waiting to be taken.
+pub fn has_dropped_tui_diagnostics() -> bool {
+    TUI_LOG_DROPPED.load(Ordering::Relaxed) > 0
+}
+
 pub fn take_dropped_tui_diagnostics() -> usize {
     TUI_LOG_DROPPED.swap(0, Ordering::Relaxed)
 }
