@@ -3066,31 +3066,10 @@ fn is_plan_file(path: &str) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::symlink;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
-                "zerostack_permission_checker_test_{}_{}",
-                std::process::id(),
-                sequence
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tests::support::temp::TempDir;
 
     fn plan_write_checker(
         workspace: &Path,
@@ -3108,8 +3087,8 @@ mod tests {
 
     #[test]
     fn plan_write_path_authorization_allows_workspace_plan_files() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
         let plans = workspace.join("docs/plans");
         std::fs::create_dir_all(&plans).unwrap();
         let mut checker = plan_write_checker(&workspace, PermissionConfig::default(), false);
@@ -3134,10 +3113,10 @@ mod tests {
 
     #[test]
     fn plan_write_path_authorization_rejects_external_lookalikes() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
-        let sibling = temp.0.join("workspace-sibling");
-        let external = temp.0.join("external");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
+        let sibling = temp.path().join("workspace-sibling");
+        let external = temp.path().join("external");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
         std::fs::create_dir_all(&external).unwrap();
@@ -3168,9 +3147,9 @@ mod tests {
 
     #[test]
     fn plan_write_path_authorization_preserves_explicit_external_prompt_policy() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
-        let external = temp.0.join("external");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&external).unwrap();
         let config = PermissionConfig {
@@ -3188,8 +3167,8 @@ mod tests {
 
     #[test]
     fn plan_write_path_authorization_never_overrides_explicit_deny() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let config = PermissionConfig {
             write: Some(ToolPerm::Simple(Action::Deny)),
@@ -3205,9 +3184,9 @@ mod tests {
 
     #[test]
     fn plan_write_path_authorization_rejects_symlink_escapes() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
-        let external = temp.0.join("external");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&external).unwrap();
         let external_plan = external.join("PLAN.md");
@@ -3234,10 +3213,10 @@ mod tests {
 
     #[test]
     fn plan_write_path_authorization_rejects_workspace_root_replacement() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
-        let original_workspace = temp.0.join("original-workspace");
-        let external = temp.0.join("external");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
+        let original_workspace = temp.path().join("original-workspace");
+        let external = temp.path().join("external");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&external).unwrap();
         let mut checker = plan_write_checker(&workspace, PermissionConfig::default(), false);
@@ -3259,9 +3238,9 @@ mod tests {
 
     #[test]
     fn plan_write_path_authorization_accepts_originally_symlinked_workspace() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
-        let workspace_link = temp.0.join("workspace-link");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
+        let workspace_link = temp.path().join("workspace-link");
         std::fs::create_dir_all(&workspace).unwrap();
         symlink(&workspace, &workspace_link).unwrap();
         let mut checker = plan_write_checker(&workspace_link, PermissionConfig::default(), false);
@@ -3274,9 +3253,9 @@ mod tests {
 
     #[test]
     fn external_directory_allow_does_not_follow_workspace_symlink() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
-        let external = temp.0.join("external");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&external).unwrap();
         symlink(&external, workspace.join("evil-link")).unwrap();
@@ -3308,10 +3287,10 @@ mod tests {
 
     #[test]
     fn bound_permission_identity_keeps_denied_root_during_pathname_swap() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
-        let replacement = temp.0.join("replacement");
-        let retained = temp.0.join("workspace-retained");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
+        let replacement = temp.path().join("replacement");
+        let retained = temp.path().join("workspace-retained");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&replacement).unwrap();
         std::fs::write(workspace.join("sentinel.txt"), "denied-original").unwrap();
@@ -3362,8 +3341,8 @@ mod tests {
 
     #[test]
     fn bound_permission_identity_matches_relative_path_rules() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(workspace.join("src/nested")).unwrap();
         let config = PermissionConfig {
             read: Some(ToolPerm::Granular(
@@ -3416,9 +3395,9 @@ mod tests {
 
     #[test]
     fn js_file_tools_inherit_path_rules_and_component_containment() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("safe");
-        let sibling = temp.0.join("safe-a");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("safe");
+        let sibling = temp.path().join("safe-a");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
         let config = PermissionConfig {
@@ -3549,10 +3528,10 @@ mod tests {
 
     #[test]
     fn cwd_cache_invalidates_on_rebind_working_dir() {
-        let temp = TempDir::new();
-        let workspace_a = temp.0.join("workspace_a");
-        let workspace_b = temp.0.join("workspace_b");
-        let external = temp.0.join("external");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace_a = temp.path().join("workspace_a");
+        let workspace_b = temp.path().join("workspace_b");
+        let external = temp.path().join("external");
         std::fs::create_dir_all(&workspace_a).unwrap();
         std::fs::create_dir_all(&workspace_b).unwrap();
         std::fs::create_dir_all(&external).unwrap();
@@ -3590,9 +3569,9 @@ mod tests {
 
     #[test]
     fn is_external_path_cache_produces_same_answer_as_live_resolution() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
-        let external = temp.0.join("external");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&external).unwrap();
 
@@ -3634,8 +3613,8 @@ mod tests {
 
     #[test]
     fn session_allowlist_entries_match_before_and_after_optimization() {
-        let temp = TempDir::new();
-        let workspace = temp.0.join("workspace");
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
 
         let mut checker = PermissionChecker::new(

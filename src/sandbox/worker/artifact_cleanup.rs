@@ -37,25 +37,7 @@ fn retry_sharing_errors(
     }
 }
 
-struct TestDirectory(std::path::PathBuf);
-
-impl TestDirectory {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("artifact-cleanup-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        Self(root)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::tests::support::temp::TempDir;
 
 #[test]
 fn sharing_retry_preserves_errors_and_respects_an_expired_deadline() {
@@ -96,7 +78,7 @@ fn sharing_retry_preserves_errors_and_respects_an_expired_deadline() {
 
 #[test]
 fn artifact_cleanup_can_resume_after_only_the_file_was_removed() {
-    let root = TestDirectory::new();
+    let root = TempDir::new("artifact-cleanup");
     let directory = root.path().join("artifact");
     std::fs::create_dir(&directory).unwrap();
     let executable = directory.join("probe.exe");
@@ -120,7 +102,7 @@ fn native_sharing_holder_must_release_before_artifact_cleanup_succeeds() {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-    let root = TestDirectory::new();
+    let root = TempDir::new("artifact-cleanup");
     let executable = root.path().join("probe.exe");
     std::fs::write(&executable, "fixture").unwrap();
     let holder = std::fs::OpenOptions::new()

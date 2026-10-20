@@ -1912,7 +1912,6 @@ impl Tool for FindFilesTool {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1921,33 +1920,7 @@ mod tests {
     use crate::permission::checker::PermissionChecker;
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let parent = std::env::temp_dir();
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = parent.join(format!(
-                "zerostack_find_files_test_{}_{}_{}",
-                tag,
-                std::process::id(),
-                n
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tests::support::temp::TempDir;
 
     fn restrictive_permission_allowing_pattern() -> PermCheck {
         let config = PermissionConfig {

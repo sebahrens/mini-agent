@@ -676,7 +676,6 @@ impl WriteTool {
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -684,31 +683,7 @@ mod tests {
     use crate::permission::checker::PermissionChecker;
     use crate::permission::{PermissionConfig, PermissionConfigs, SecurityMode};
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "zerostack_write_permission_test_{}_{}",
-                std::process::id(),
-                n
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tests::support::temp::TempDir;
 
     fn plan_write_tool(workspace: &Path) -> WriteTool {
         let checker = PermissionChecker::new(
@@ -724,7 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_write_reports_existing_files_as_an_actionable_tool_error() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("write-permission");
         std::fs::write(temp.path().join("existing.txt"), "original").unwrap();
         let error = WriteTool::new(None, None, None)
             .with_workspace(temp.path())
@@ -748,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     async fn overwrite_requires_and_consumes_a_complete_current_read() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("write-permission");
         let target = temp.path().join("existing.txt");
         std::fs::write(&target, "original\n").unwrap();
         let tracker = ReadTracker::new(true);
@@ -791,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn overwrite_rejects_an_intervening_same_length_change() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("write-permission");
         let target = temp.path().join("existing.txt");
         std::fs::write(&target, "before\n").unwrap();
         let tracker = ReadTracker::new(true);
@@ -837,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_write_external_lookalike_is_denied_without_mutation() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("write-permission");
         let workspace = temp.path().join("workspace");
         let external = temp.path().join("external");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -862,7 +837,7 @@ mod tests {
     async fn plan_write_relative_symlink_parent_cannot_escape_workspace() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("write-permission");
         let workspace = temp.path().join("workspace");
         let external = temp.path().join("external");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -889,7 +864,7 @@ mod tests {
     async fn checks_permission_on_broken_symlink_target_before_write() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("write-permission");
         let allowed_dir = temp.path().join("allowed");
         let restricted_dir = temp.path().join("restricted");
         std::fs::create_dir_all(&allowed_dir).unwrap();
@@ -931,7 +906,7 @@ mod tests {
     async fn checks_permission_on_symlinked_parent_before_write() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("write-permission");
         let allowed_dir = temp.path().join("allowed");
         let restricted_dir = temp.path().join("restricted");
         std::fs::create_dir_all(&allowed_dir).unwrap();
@@ -978,7 +953,7 @@ mod tests {
 
         use crate::permission::ask::UserDecision;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("write-permission");
         let checked_target = temp.path().join("checked.txt");
         let swapped_target = temp.path().join("swapped.txt");
         let link = temp.path().join("input.txt");

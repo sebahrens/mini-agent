@@ -4,32 +4,9 @@
 //! helper launches as test-only rather than production sites.
 
 use crate::sandbox::*;
-#[cfg(target_os = "macos")]
-use std::path::{Path, PathBuf};
-
-/// Unique scratch directory removed on drop.
-#[cfg(target_os = "macos")]
-struct ScratchDir(PathBuf);
 
 #[cfg(target_os = "macos")]
-impl ScratchDir {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("mini-agent-sbx-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::tests::support::temp::TempDir;
 
 /// Regression for mini-agent-v54o6: a credential directory reached through
 /// a symlink (here `/tmp` -> `/private/tmp` style aliasing via an explicit
@@ -43,7 +20,7 @@ fn macos_seatbelt_denies_symlinked_credential_reads() {
         );
         return;
     }
-    let root = ScratchDir::new();
+    let root = TempDir::new("sandbox-platform");
     let real_home = root.path().join("real-home");
     let credentials = real_home.join("credentials");
     std::fs::create_dir_all(&credentials).unwrap();

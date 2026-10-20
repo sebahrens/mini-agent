@@ -4243,7 +4243,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     #[cfg(feature = "sandbox")]
     use std::sync::Condvar;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     #[cfg(any(unix, feature = "skills"))]
     use std::time::Instant;
@@ -4363,31 +4363,7 @@ mod tests {
         assert_eq!(decode_spawn_stream(b"ok \xf0\x9f", false), "ok �");
     }
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "zerostack_js_write_permission_test_{}_{}",
-                std::process::id(),
-                n
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tests::support::temp::TempDir;
 
     #[cfg(feature = "sandbox")]
     fn test_fetch_limits() -> FetchLimits {
@@ -5273,7 +5249,7 @@ mod tests {
     #[cfg(any(unix, feature = "sandbox", feature = "skills"))]
     #[tokio::test]
     async fn brokered_discovery_is_workspace_bound_filtered_bounded_and_audited() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let workspace_root = directory.path().join("workspace");
         std::fs::create_dir_all(workspace_root.join("src/nested")).unwrap();
         std::fs::create_dir_all(workspace_root.join("ignored")).unwrap();
@@ -5540,7 +5516,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn brokered_file_effects_resolve_home_paths_from_the_expanded_path() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let base = directory.path().canonicalize().unwrap();
         let workspace_root = base.join("workspace");
         let home = base.join("home");
@@ -5706,7 +5682,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn brokered_home_path_write_is_checked_against_the_ambient_policy() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let base = directory.path().canonicalize().unwrap();
         let workspace_root = base.join("workspace");
         let home = base.join("home");
@@ -5778,7 +5754,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn brokered_discovery_omits_read_denied_entries() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let base = directory.path().canonicalize().unwrap();
         let workspace_root = base.join("workspace");
         std::fs::create_dir_all(workspace_root.join("config/secrets")).unwrap();
@@ -5974,7 +5950,7 @@ mod tests {
     #[cfg(feature = "skills")]
     #[tokio::test]
     async fn discovery_prefix_denial_precedes_permission_and_traversal() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let workspace_root = directory.path().join("workspace");
         std::fs::create_dir_all(workspace_root.join("allowed")).unwrap();
         std::fs::create_dir_all(workspace_root.join("denied")).unwrap();
@@ -6020,7 +5996,7 @@ mod tests {
     #[cfg(feature = "skills")]
     #[tokio::test]
     async fn read_files_checks_every_manifest_path_before_permission_or_execution() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let workspace_root = directory.path().join("workspace");
         std::fs::create_dir_all(workspace_root.join("allowed")).unwrap();
         std::fs::create_dir_all(workspace_root.join("denied")).unwrap();
@@ -6080,7 +6056,7 @@ mod tests {
                 HostEffectError::SessionDenied,
             ),
         ] {
-            let directory = TempDir::new();
+            let directory = TempDir::new("js-write-permission");
             let permission =
                 host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
             let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
@@ -6125,7 +6101,7 @@ mod tests {
     async fn scoped_capability_intersection_real_host_file_scope_is_symlink_and_race_safe() {
         use std::os::unix::fs::symlink;
 
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let workspace = directory.path().join("workspace");
         let allowed = workspace.join("allowed");
         let denied = workspace.join("denied");
@@ -6225,7 +6201,7 @@ mod tests {
     async fn brokered_spawn_prepares_the_executable_only_after_permission() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let executable = directory.path().join("approved-command");
         let replacement = directory.path().join("replacement-command");
         let marker = directory.path().join("spawned-version");
@@ -6323,7 +6299,7 @@ mod tests {
     async fn linux_spawn_executes_sealed_script_snapshot_after_in_place_overwrite() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let executable = directory.path().join("approved-command");
         std::fs::write(&executable, "#!/bin/sh\nprintf approved").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -6466,7 +6442,7 @@ mod tests {
             BuildIdentity, EffectResponse, MAX_FRAME_BYTES, ParentFrame, WireFrame, write_frame,
         };
 
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let permission =
             host_permission(directory.path().to_path_buf(), Action::Allow, Action::Allow);
         // Build the owner first so the channel's item type is inferred from
@@ -6573,7 +6549,7 @@ mod tests {
     async fn linux_spawn_in_place_overwrite_during_ask_snapshots_post_authorization_bytes() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let executable = directory.path().join("approved-command");
         std::fs::write(&executable, "#!/bin/sh\nprintf original-snapshot").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -6672,7 +6648,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_oversized_snapshot_failure_closes_the_memfd() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let executable = directory.path().join("oversized-command");
         let file = std::fs::File::create(&executable).unwrap();
         file.set_len(crate::extras::js::broker::MAX_SPAWN_EXECUTABLE_BYTES + 1)
@@ -6722,7 +6698,7 @@ mod tests {
     #[cfg(all(feature = "skills", target_os = "linux"))]
     #[tokio::test]
     async fn learned_skill_spawn_fails_closed_on_linux_without_snapshot_backend() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let permission =
             host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
@@ -6763,7 +6739,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn model_authored_spawn_remains_available_without_identity_preserving_dispatch() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let permission =
             host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
@@ -6847,7 +6823,7 @@ mod tests {
     #[cfg(all(feature = "skills", target_os = "macos"))]
     #[tokio::test]
     async fn learned_skill_spawn_fails_closed_on_macos_before_permission() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let permission =
             host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
@@ -6889,7 +6865,7 @@ mod tests {
     #[cfg(all(feature = "skills", windows))]
     #[tokio::test]
     async fn learned_skill_spawn_fails_closed_on_windows_before_permission() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let permission =
             host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
@@ -6931,7 +6907,7 @@ mod tests {
     #[cfg(feature = "sandbox")]
     #[tokio::test]
     async fn js_brokered_fetch_redirect_has_no_unaudited_second_send() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let redirect = Url::parse("https://example.com/redirected").unwrap();
         let (mut broker, request, sender, _owner) = brokered_fetch(
             &directory,
@@ -6978,7 +6954,7 @@ mod tests {
     #[cfg(feature = "sandbox")]
     #[tokio::test]
     async fn js_brokered_fetch_persists_real_outcome_unknown() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let (mut broker, request, sender, _owner) = brokered_fetch(
             &directory,
             "outcome-unknown",
@@ -7880,7 +7856,7 @@ mod tests {
 
     #[test]
     fn js_file_allow_policy_uses_canonical_component_containment() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let safe = temp.path().join("safe");
         let sibling = temp.path().join("safe-evil");
         std::fs::create_dir_all(&safe).unwrap();
@@ -7913,7 +7889,7 @@ mod tests {
 
     #[test]
     fn canonical_authorization_decides_exactly_like_resolving_authorization() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let safe = temp.path().join("safe").canonicalize().unwrap_or_else(|_| {
             std::fs::create_dir_all(temp.path().join("safe")).unwrap();
             temp.path().join("safe").canonicalize().unwrap()
@@ -7972,7 +7948,7 @@ mod tests {
     async fn read_target_swapped_to_symlink_or_other_file_is_rejected_before_authorization() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let root = temp.path().canonicalize().unwrap();
         let target_path = root.join("target.txt");
         let other = root.join("other.txt");
@@ -8006,7 +7982,7 @@ mod tests {
     async fn write_target_swapped_to_symlink_or_other_parent_is_rejected_before_authorization() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let root = temp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join("dir")).unwrap();
         std::fs::write(root.join("dir/file.txt"), "old").unwrap();
@@ -8035,7 +8011,7 @@ mod tests {
     #[cfg(feature = "skills")]
     #[tokio::test]
     async fn read_files_validates_the_workspace_once_per_effect() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("js-write-permission");
         let workspace_root = directory.path().join("workspace");
         std::fs::create_dir_all(workspace_root.join("files")).unwrap();
         std::fs::write(workspace_root.join("files/a.txt"), "a").unwrap();
@@ -8090,7 +8066,7 @@ mod tests {
     fn js_bound_allow_identity_does_not_follow_a_swapped_workspace_path() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let workspace = temp.path().join("workspace");
         let replacement = temp.path().join("replacement");
         let retained = temp.path().join("workspace-retained");
@@ -8124,7 +8100,7 @@ mod tests {
 
     #[test]
     fn js_file_allow_policy_resolves_relative_roots_against_explicit_base() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let configured_base = temp.path().join("policy-base");
         let safe = configured_base.join("safe");
         std::fs::create_dir_all(&safe).unwrap();
@@ -8149,7 +8125,7 @@ mod tests {
 
     #[test]
     fn js_file_allow_policy_keeps_read_and_write_roots_separate() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let read_root = temp.path().join("read");
         let write_root = temp.path().join("write");
         std::fs::create_dir_all(&read_root).unwrap();
@@ -8179,7 +8155,7 @@ mod tests {
 
     #[test]
     fn js_file_allow_policy_nonexistent_write_uses_nearest_canonical_parent() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let safe = temp.path().join("safe");
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&safe).unwrap();
@@ -8200,7 +8176,7 @@ mod tests {
 
     #[test]
     fn js_file_allow_policy_empty_malformed_and_ambiguous_settings_deny() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let empty = Vec::new();
         let empty_policy =
             AllowConfig::from_settings(temp.path(), None, Some(&empty), Some(&empty), false, false);
@@ -8234,7 +8210,7 @@ mod tests {
 
     #[test]
     fn js_file_allow_policy_requires_explicit_unrestricted_opt_in() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let denied = AllowConfig::from_settings(temp.path(), None, None, None, false, false);
         expect_denied(
             denied.authorize_read(temp.path()),
@@ -8251,7 +8227,7 @@ mod tests {
     fn js_file_allow_policy_defines_symlink_behavior() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let safe = temp.path().join("safe");
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&safe).unwrap();
@@ -8297,7 +8273,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn js_file_allow_policy_rejects_alternate_separator_spelling() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let roots = vec![temp.path().to_string_lossy().into_owned()];
         let policy =
             AllowConfig::from_settings(temp.path(), None, Some(&roots), Some(&roots), false, false);
@@ -8343,7 +8319,7 @@ mod tests {
     async fn windows_workspace_authority_native_and_js_relative_gold_eiffel() {
         use rig::tool::Tool;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let ambient_target = std::env::current_dir().unwrap().join("gold-eiffel.js");
         assert!(
             !ambient_target.exists(),
@@ -8437,7 +8413,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_allow_policy_denies_before_mandatory_permission() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let source = workspace.join("source.txt");
@@ -8497,7 +8473,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_allow_enforcement_narrows_allowed_permissions_for_reads_and_writes() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let allowed_root = temp.path().join("safe");
         let sibling_root = temp.path().join("safe-evil");
         std::fs::create_dir_all(&allowed_root).unwrap();
@@ -8566,7 +8542,7 @@ mod tests {
     async fn js_file_allow_enforcement_revalidates_after_permission_wait() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let allowed_root = temp.path().join("safe");
         let write_parent = allowed_root.join("write-parent");
         let outside_root = temp.path().join("outside");
@@ -8682,7 +8658,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_read_allows_paths_within_working_directory() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
         let source = working_dir.join("source.txt");
@@ -8697,7 +8673,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_hosts_resolve_relative_paths_against_the_selected_workspace() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let workspace = temp.path().join("selected-workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("source.txt"), "selected").unwrap();
@@ -8730,7 +8706,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_read_ask_uses_exact_canonical_permission_key() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -8769,7 +8745,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_read_rejects_oversized_and_non_utf8_content() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
         let oversized = working_dir.join("oversized.txt");
@@ -8796,7 +8772,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_read_denies_external_path_without_response() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -8835,7 +8811,7 @@ mod tests {
     async fn js_file_host_permissions_read_denies_symlink_escape() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -8857,7 +8833,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_write_allows_paths_within_working_directory() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
         let target = working_dir.join("created.txt");
@@ -8876,7 +8852,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_write_rejects_oversized_content_before_mutation() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
         let target = working_dir.join("oversized.txt");
@@ -8908,7 +8884,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_write_denies_external_path_without_response() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -8933,7 +8909,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_write_prompts_for_external_directory() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -8977,7 +8953,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_use_js_tool_names_and_honor_denial() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
         let source = working_dir.join("source.txt");
@@ -9075,7 +9051,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_restricted_command_is_denied_before_execution() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
         let target = working_dir.join("must-not-exist.txt");
@@ -9200,7 +9176,7 @@ mod tests {
 
     #[tokio::test]
     async fn js_file_host_permissions_repeated_reads_trigger_doom_loop_detection() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
         let source = working_dir.join("source.txt");
@@ -9228,7 +9204,7 @@ mod tests {
     async fn js_file_host_permissions_write_rejects_broken_final_symlink() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -9261,7 +9237,7 @@ mod tests {
     async fn js_file_host_permissions_write_denies_symlinked_parent_escape() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -9295,7 +9271,7 @@ mod tests {
     async fn js_file_host_permissions_reject_target_and_parent_swaps() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("js-write-permission");
         let workspace = temp.path().join("workspace");
         let parent = workspace.join("parent");
         let external = temp.path().join("external");

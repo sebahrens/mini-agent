@@ -1,38 +1,7 @@
-use std::path::PathBuf;
-
 use crate::extras::js::skills::store::{SkillStore, StoreError};
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
-use crate::paths::AppPaths;
 
-struct TempPaths {
-    root: PathBuf,
-    paths: AppPaths,
-}
-
-impl TempPaths {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "mini-agent-skill-identity-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            local_data_dir: root.join("local-data"),
-            state_dir: root.join("state"),
-            cache_dir: root.join("cache"),
-            credentials_dir: root.join("credentials"),
-            project_dir: None,
-        };
-        Self { root, paths }
-    }
-}
-
-impl Drop for TempPaths {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
+use super::TempPaths;
 
 fn artifact() -> SkillArtifact {
     SkillArtifact::new(
@@ -51,7 +20,7 @@ fn artifact() -> SkillArtifact {
 
 #[test]
 fn skill_store_identity_crud_is_idempotent_and_optimistic() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("skill-identity");
     let mut store = SkillStore::open_at(&temp.paths).expect("open store");
     let artifact = artifact();
 
@@ -76,7 +45,7 @@ fn skill_store_identity_crud_is_idempotent_and_optimistic() {
 
 #[test]
 fn skill_store_duplicate_policy_reads_metadata_without_artifact_bodies() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("skill-identity");
     let mut store = SkillStore::open_at(&temp.paths).expect("open store");
     let existing = artifact();
     store
@@ -112,7 +81,7 @@ fn skill_store_duplicate_policy_reads_metadata_without_artifact_bodies() {
 
 #[test]
 fn skill_store_identity_tamper_and_collision_fail_closed() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("skill-identity");
     let mut store = SkillStore::open_at(&temp.paths).expect("open store");
     let artifact = artifact();
     store.insert_verified(&artifact).expect("insert");
@@ -133,7 +102,7 @@ fn skill_store_identity_tamper_and_collision_fail_closed() {
 
 #[test]
 fn skill_store_identity_purge_tombstones_and_removes_dependencies() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("skill-identity");
     let mut store = SkillStore::open_at(&temp.paths).expect("open store");
     let artifact = artifact();
     store.insert_verified(&artifact).expect("insert");
@@ -166,7 +135,7 @@ fn skill_store_identity_purge_tombstones_and_removes_dependencies() {
 
 #[test]
 fn skill_store_identity_embedding_and_generation_metadata_are_validated() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("skill-identity");
     let mut store = SkillStore::open_at(&temp.paths).expect("open store");
     let artifact = artifact();
     store.insert_verified(&artifact).expect("insert");

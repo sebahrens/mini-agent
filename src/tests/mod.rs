@@ -267,6 +267,10 @@ fn shared_process_env_reader_never_observes_a_mutator_scope() {
     assert_eq!(reader.join().unwrap(), None);
 }
 
+#[cfg(test)]
+pub(crate) mod support {
+    pub(crate) mod temp;
+}
 #[cfg(all(test, feature = "acp"))]
 mod acp_tests;
 #[cfg(all(test, feature = "advisor"))]

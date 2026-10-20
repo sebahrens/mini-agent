@@ -4,8 +4,8 @@
 //! sees a truncated file), permissions are preserved, symlink redirection and
 //! containment escapes are rejected, and no temp-file residue is left behind.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::Ordering;
 
 #[cfg(windows)]
 use crate::fs::atomic_write_resolved_checked_cancellable;
@@ -15,39 +15,7 @@ use crate::fs::{
     atomic_write, atomic_write_with_failure_sync,
 };
 
-/// A unique temp directory per call, removed on drop. Uniqueness (process id +
-/// monotonic counter) keeps parallel test runs from colliding without pulling
-/// in an external temp-dir crate.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "zerostack_atomic_test_{}_{}_{}",
-            tag,
-            std::process::id(),
-            n
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
-
-    fn join(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::tests::support::temp::TempDir;
 
 /// Count leftover temp files created by `atomic_write` in a directory.
 fn temp_residue(dir: &Path) -> usize {
@@ -266,7 +234,7 @@ async fn concurrent_writes_to_distinct_files_leave_no_residue() {
     let dir = TempDir::new("concurrent");
     let mut handles = Vec::new();
     for i in 0..50 {
-        let p = dir.join(&format!("p{i}.txt"));
+        let p = dir.join(format!("p{i}.txt"));
         handles.push(tokio::spawn(async move {
             atomic_write(&p, format!("file {i}").into_bytes())
                 .await
@@ -277,7 +245,7 @@ async fn concurrent_writes_to_distinct_files_leave_no_residue() {
         h.await.unwrap();
     }
     for i in 0..50 {
-        let p = dir.join(&format!("p{i}.txt"));
+        let p = dir.join(format!("p{i}.txt"));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), format!("file {i}"));
     }
     assert_eq!(temp_residue(dir.path()), 0);

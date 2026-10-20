@@ -4,30 +4,9 @@ use crate::extras::mcp::config::{
 use crate::extras::mcp::oauth;
 use crate::paths::AppPaths;
 use rmcp::transport::auth::StoredCredentials;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "mini-agent-mcp-oauth-{label}-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::tests::support::temp::TempDir;
 
 fn test_paths(root: &Path) -> AppPaths {
     AppPaths {

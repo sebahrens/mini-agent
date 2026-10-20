@@ -1711,45 +1711,20 @@ mod matching_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::permission::checker::PermissionChecker;
     use crate::permission::{PermissionConfigs, SecurityMode};
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "zerostack_edit_permission_test_{}_{}",
-                std::process::id(),
-                n
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tests::support::temp::TempDir;
 
     #[tokio::test]
     async fn checks_permission_on_symlink_target_before_edit() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("edit-permission");
         let allowed_dir = temp.path().join("allowed");
         let restricted_dir = temp.path().join("restricted");
         std::fs::create_dir_all(&allowed_dir).unwrap();
@@ -1802,7 +1777,7 @@ mod tests {
 
         use crate::permission::ask::UserDecision;
 
-        let temp = TempDir::new();
+        let temp = TempDir::new("edit-permission");
         let checked_target = temp.path().join("checked.txt");
         let swapped_target = temp.path().join("swapped.txt");
         let link = temp.path().join("input.txt");
@@ -1857,7 +1832,7 @@ mod tests {
 
     #[tokio::test]
     async fn bound_edit_open_and_publish_run_on_the_scoped_blocking_pool() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("edit-permission");
         std::fs::write(temp.path().join("target.txt"), "alpha\nbeta\n").unwrap();
         let (scope, started, release) =
             crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();

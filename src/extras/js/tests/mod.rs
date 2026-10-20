@@ -1,3 +1,27 @@
+/// A uniquely named temporary application root plus the `AppPaths` laid out under it.
+#[cfg(feature = "skills")]
+pub(super) struct TempPaths {
+    pub(super) root: crate::tests::support::temp::TempDir,
+    pub(super) paths: crate::paths::AppPaths,
+}
+
+#[cfg(feature = "skills")]
+impl TempPaths {
+    pub(super) fn new(label: &str) -> Self {
+        let root = crate::tests::support::temp::TempDir::new(label);
+        let paths = crate::paths::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local-data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: None,
+        };
+        Self { root, paths }
+    }
+}
+
 #[cfg(feature = "skills")]
 mod agent_skill_catalog;
 #[cfg(feature = "skills")]

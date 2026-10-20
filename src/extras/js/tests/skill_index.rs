@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,34 +13,7 @@ use crate::extras::js::skills::{
 };
 use crate::paths::AppPaths;
 
-struct TempPaths {
-    root: PathBuf,
-    paths: AppPaths,
-}
-
-impl TempPaths {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("mini-agent-index-{}", uuid::Uuid::new_v4()));
-        Self {
-            paths: AppPaths {
-                config_dir: root.join("config"),
-                data_dir: root.join("data"),
-                local_data_dir: root.join("local-data"),
-                state_dir: root.join("state"),
-                cache_dir: root.join("cache"),
-                credentials_dir: root.join("credentials"),
-                project_dir: None,
-            },
-            root,
-        }
-    }
-}
-
-impl Drop for TempPaths {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
+use super::TempPaths;
 
 fn artifact(name: &str, description: &str, tag: &str) -> SkillArtifact {
     SkillArtifact::new(
@@ -280,7 +252,7 @@ fn built_index(temp: &TempPaths) -> (ImmutableSkillIndex, SkillArtifact, SkillAr
 
 #[test]
 fn skill_index_dense_fts_and_fusion_are_deterministic() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let (index, json, _) = built_index(&temp);
     let results = index
         .search("parse JSON", &[1.0, 0.0], &RetrievalPolicy::default())
@@ -294,7 +266,7 @@ fn skill_index_dense_fts_and_fusion_are_deterministic() {
 
 #[test]
 fn skill_index_natural_language_query_uses_or_bm25_without_dense_candidates() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let (index, json, _) = built_index(&temp);
     let policy = RetrievalPolicy {
         dense_candidate_limit: 0,
@@ -315,7 +287,7 @@ fn skill_index_natural_language_query_uses_or_bm25_without_dense_candidates() {
 
 #[test]
 fn lexical_scores_preserve_bm25_relevance_and_the_floor_filters_candidates() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let (index, json, csv) = built_index(&temp);
     let lexical_only = RetrievalPolicy {
         dense_candidate_limit: 0,
@@ -356,7 +328,7 @@ fn lexical_scores_preserve_bm25_relevance_and_the_floor_filters_candidates() {
 
 #[test]
 fn lexical_search_reads_the_durable_skill_search_table() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let (index, _, _) = built_index(&temp);
     let policy = RetrievalPolicy {
         dense_candidate_limit: 0,
@@ -386,7 +358,7 @@ fn lexical_search_reads_the_durable_skill_search_table() {
 
 #[test]
 fn pure_search_filters_effectful_rows_before_lexical_candidate_limits() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let mut store = SkillStore::open_at(&temp.paths).unwrap();
     let effectful = SkillArtifact::new(
         "function effectfulParser(_cap, value) { return value; }".to_string(),
@@ -472,7 +444,7 @@ fn pure_search_filters_effectful_rows_before_lexical_candidate_limits() {
 
 #[test]
 fn skill_index_lifecycle_floor_and_budgets_can_return_zero() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let (index, _, _) = built_index(&temp);
     let policy = RetrievalPolicy {
         dense_score_floor: 0.9,
@@ -501,7 +473,7 @@ fn skill_index_lifecycle_floor_and_budgets_can_return_zero() {
 
 #[test]
 fn skill_index_concurrent_generation_leases_remain_frozen() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let (index, _, _) = built_index(&temp);
     let index = Arc::new(index);
     let handles = (0..8)
@@ -526,7 +498,7 @@ fn skill_index_concurrent_generation_leases_remain_frozen() {
 
 #[test]
 fn skill_index_generations_publish_complete_snapshots_and_recover() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let skill = artifact("slugify", "Create URL-safe slugs.", "text");
     SkillStore::open_at(&temp.paths)
         .and_then(|mut store| store.insert_verified(&skill))
@@ -566,7 +538,7 @@ fn skill_index_generations_publish_complete_snapshots_and_recover() {
 
 #[test]
 fn process_restart_hydrates_the_applied_generation_without_advancing_it() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let skill = artifact("stableGeneration", "Keep the generation stable.", "index");
     SkillStore::open_at(&temp.paths)
         .and_then(|mut store| store.insert_verified(&skill))
@@ -590,7 +562,7 @@ fn process_restart_hydrates_the_applied_generation_without_advancing_it() {
 
 #[test]
 fn skill_index_rebuild_batches_and_refreshes_embedding_only_rows() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let skill = artifact("slugify", "Create URL-safe slugs.", "text");
     let mut store = SkillStore::open_at(&temp.paths).unwrap();
     store.insert_verified(&skill).unwrap();
@@ -649,7 +621,7 @@ fn skill_index_rebuild_batches_and_refreshes_embedding_only_rows() {
 
 #[test]
 fn skill_index_rebuild_backfills_canaries_for_the_new_model_revision() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let active = artifact("activeRun", "Active skill.", "routing");
     let canary = artifact("canaryRun", "Replacement canary.", "routing");
     let mut store = SkillStore::open_at(&temp.paths).unwrap();
@@ -690,7 +662,7 @@ fn skill_index_rebuild_backfills_canaries_for_the_new_model_revision() {
 
 #[test]
 fn corrupt_embedding_row_is_reported_as_missing_and_repaired_without_hiding_siblings() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let first = artifact("parseJson", "Parse JSON documents.", "json");
     let second = artifact("parseCsv", "Parse CSV documents.", "csv");
     let mut store = SkillStore::open_at(&temp.paths).unwrap();
@@ -783,7 +755,7 @@ fn corrupt_embedding_row_is_reported_as_missing_and_repaired_without_hiding_sibl
 
 #[test]
 fn failed_rebuilds_back_off_before_another_background_attempt() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let skill = artifact("parseJson", "Parse JSON documents.", "json");
     SkillStore::open_at(&temp.paths)
         .and_then(|mut store| store.insert_verified(&skill))
@@ -805,7 +777,7 @@ fn failed_rebuilds_back_off_before_another_background_attempt() {
 
 #[test]
 fn skill_index_rebuild_rejects_generation_advanced_by_concurrent_admission() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let initial = artifact("initialSkill", "Initial searchable skill.", "initial");
     let concurrent = artifact(
         "concurrentSkill",
@@ -838,7 +810,7 @@ fn skill_index_rebuild_rejects_generation_advanced_by_concurrent_admission() {
 
 #[test]
 fn skill_index_rebuild_releases_store_lock_during_embedding_io() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let skill = artifact(
         "blockingSkill",
         "Wait while embedding this skill.",
@@ -881,7 +853,7 @@ fn skill_index_rebuild_releases_store_lock_during_embedding_io() {
 
 #[test]
 fn coordinated_mutation_releases_store_lock_during_embedding_io() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let skill = artifact(
         "activatedBlockingSkill",
         "Activate while embedding this skill.",
@@ -940,7 +912,7 @@ fn coordinated_mutation_releases_store_lock_during_embedding_io() {
 
 #[test]
 fn routing_key_cache_is_scoped_to_the_published_generation() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let coordinator = IndexCoordinator::open(
         &temp.paths,
         Arc::new(Embedder::new().expect("deterministic embedder")),
@@ -992,7 +964,7 @@ fn routing_key_cache_is_scoped_to_the_published_generation() {
 fn skill_retrieval_relevance() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/skill_relevance.json")).unwrap();
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let (index, json, csv) = built_index(&temp);
     for case in fixture["cases"].as_array().unwrap() {
         let vector = case["vector"]
@@ -1026,7 +998,7 @@ fn skill_retrieval_relevance() {
 #[test]
 fn rebuild_scans_artifacts_once_and_decodes_each_blob_at_most_once() {
     use crate::extras::js::skills::store::{ARTIFACT_SCANS, EMBEDDING_DECODES};
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let skills = [
         artifact("scanOne", "First scanned skill.", "scan"),
         artifact("scanTwo", "Second scanned skill.", "scan"),
@@ -1076,7 +1048,7 @@ fn rebuild_scans_artifacts_once_and_decodes_each_blob_at_most_once() {
 
 #[test]
 fn rebuild_still_detects_an_active_row_retired_while_embedding() {
-    let temp = TempPaths::new();
+    let temp = TempPaths::new("index");
     let keep = artifact("keepSkill", "Stays active.", "keep");
     let racing = artifact("racingSkill", "Retired during embedding.", "race");
     {
