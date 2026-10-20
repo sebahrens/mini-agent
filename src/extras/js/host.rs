@@ -4243,6 +4243,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     #[cfg(feature = "sandbox")]
     use std::sync::Condvar;
+    #[cfg(feature = "sandbox")]
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     #[cfg(any(unix, feature = "skills"))]

@@ -903,7 +903,7 @@ fn skill_retrieval_real_backend_relevance() {
         },
     });
     let output = std::env::var_os("MINI_AGENT_SKILL_RELEVANCE_OUTPUT")
-        .map(PathBuf::from)
+        .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("mini-agent-skill-semantic-relevance.json"));
     fs::write(&output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     println!("{}", serde_json::to_string(&report).unwrap());
