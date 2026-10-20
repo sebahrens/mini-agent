@@ -39,13 +39,60 @@ const WORKSPACE_AUTHORITY_FD: i32 = 197;
 
 type EssentialEnvironment = Arc<[(&'static str, String)]>;
 type EssentialEnvironmentCache = Arc<OnceLock<EssentialEnvironment>>;
-type SeatbeltProfileKey = (String, String, String, String, bool);
-type SeatbeltProfileCache = Arc<Mutex<HashMap<SeatbeltProfileKey, Arc<str>>>>;
+/// SHA-256 over every dynamic input of a rendered Seatbelt profile.
+type SeatbeltProfileKey = [u8; 32];
+type SeatbeltProfileCache = Arc<Mutex<SeatbeltProfileMap>>;
 type GeneralRootsCache = Arc<Mutex<Vec<Arc<GeneralRoots>>>>;
 type SeatbeltPrivateCache = Arc<Mutex<Option<Arc<SeatbeltPrivateInputs>>>>;
 
 /// At most this many distinct base directories keep resolved explicit roots.
 const MAX_CACHED_GENERAL_ROOT_BASES: usize = 8;
+
+/// At most this many rendered Seatbelt profiles are kept per `Sandbox`.
+const MAX_CACHED_SEATBELT_PROFILES: usize = 16;
+
+/// Insertion-ordered, bounded map of rendered Seatbelt profiles keyed by a
+/// digest of all their inputs. The oldest entry is evicted first.
+#[derive(Debug, Default)]
+struct SeatbeltProfileMap {
+    profiles: HashMap<SeatbeltProfileKey, Arc<str>>,
+    order: std::collections::VecDeque<SeatbeltProfileKey>,
+}
+
+impl SeatbeltProfileMap {
+    fn get(&self, key: &SeatbeltProfileKey) -> Option<Arc<str>> {
+        self.profiles.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: SeatbeltProfileKey, profile: Arc<str>) {
+        if self.profiles.insert(key, profile).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > MAX_CACHED_SEATBELT_PROFILES {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.profiles.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.profiles.len()
+    }
+}
+
+/// Length-prefixed digest of every input that shapes a rendered profile, so a
+/// hit still requires all of them to match.
+fn seatbelt_profile_key(parts: &[&str], deny_network: bool) -> SeatbeltProfileKey {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.update([u8::from(deny_network)]);
+    hasher.finalize().into()
+}
 
 /// Explicit general-profile roots resolved against one base directory. The
 /// bindings are captured once per `Sandbox` configuration and only
@@ -2112,7 +2159,7 @@ impl Sandbox {
         self.write_roots = write_roots;
         // Clones configured before this call keep their own caches.
         self.cached_general_roots = Arc::new(Mutex::new(Vec::new()));
-        self.cached_seatbelt_profiles = Arc::new(Mutex::new(HashMap::new()));
+        self.cached_seatbelt_profiles = Arc::new(Mutex::new(SeatbeltProfileMap::default()));
         self
     }
 
@@ -2123,7 +2170,7 @@ impl Sandbox {
         self.home_mounts = mounts;
         self.home_masks = masks;
         self.cached_general_roots = Arc::new(Mutex::new(Vec::new()));
-        self.cached_seatbelt_profiles = Arc::new(Mutex::new(HashMap::new()));
+        self.cached_seatbelt_profiles = Arc::new(Mutex::new(SeatbeltProfileMap::default()));
         self.cached_seatbelt_private = Arc::new(Mutex::new(None));
         self
     }
@@ -2296,7 +2343,7 @@ impl Sandbox {
             background_jobs: Arc::new(BackgroundJobsInner::default()),
             cached_essential_env: Arc::new(OnceLock::new()),
             cached_cache_dir: Arc::new(Mutex::new(None)),
-            cached_seatbelt_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            cached_seatbelt_profiles: Arc::new(Mutex::new(SeatbeltProfileMap::default())),
             cached_general_roots: Arc::new(Mutex::new(Vec::new())),
             cached_seatbelt_private: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -2921,16 +2968,20 @@ impl Sandbox {
             metadata_ancestors,
         } = root_inputs.as_ref();
         let namespace_denies = &protected_denies.namespace;
-        let cache_read_identity = format!(
-            "{private_read_denies}|profile={}|reads={extra_reads}|writes={extra_writes}|metadata={metadata_ancestors}",
-            self.profile
-        );
-
-        let cache_key = (
-            workspace_str.clone(),
-            cache_str.clone(),
-            cache_read_identity,
-            format!("{git_write_denies}|storage={protected_storage}|namespace={namespace_denies}"),
+        let profile_name = self.profile.to_string();
+        let cache_key = seatbelt_profile_key(
+            &[
+                &workspace_str,
+                &cache_str,
+                &profile_name,
+                private_read_denies,
+                extra_reads,
+                extra_writes,
+                metadata_ancestors,
+                &git_write_denies,
+                protected_storage,
+                namespace_denies,
+            ],
             deny_network,
         );
         let mut profiles = self
@@ -2939,7 +2990,7 @@ impl Sandbox {
             .unwrap_or_else(|e| e.into_inner());
 
         if let Some(profile) = profiles.get(&cache_key) {
-            return Ok(profile.clone());
+            return Ok(profile);
         }
 
         let profile = seatbelt_profile_ladder(
@@ -10252,6 +10303,41 @@ echo PRIVATE_TEMP_PASS"#,
             .unwrap();
         assert_ne!(profile_a_a, profile_with_network);
         assert!(profile_with_network.contains("(allow network*)"));
+    }
+
+    #[test]
+    fn seatbelt_profile_map_is_bounded_and_keys_cover_every_input() {
+        let mut map = SeatbeltProfileMap::default();
+        for index in 0..(MAX_CACHED_SEATBELT_PROFILES + 1) {
+            let key = seatbelt_profile_key(&["workspace", &index.to_string()], true);
+            map.insert(key, Arc::from("profile"));
+            assert!(map.len() <= MAX_CACHED_SEATBELT_PROFILES);
+        }
+        assert_eq!(map.len(), MAX_CACHED_SEATBELT_PROFILES);
+        let first = seatbelt_profile_key(&["workspace", "0"], true);
+        assert!(map.get(&first).is_none(), "oldest entry is evicted");
+        let last = seatbelt_profile_key(
+            &["workspace", &MAX_CACHED_SEATBELT_PROFILES.to_string()],
+            true,
+        );
+        assert!(map.get(&last).is_some());
+        let base = ["w", "c", "p", "a", "b", "c", "d", "deny-a", "s", "n"];
+        let mut changed = base;
+        changed[7] = "deny-b";
+        assert_ne!(
+            seatbelt_profile_key(&base, false),
+            seatbelt_profile_key(&changed, false),
+            "a changed git_write_denies string must miss the cache"
+        );
+        assert_ne!(
+            seatbelt_profile_key(&base, false),
+            seatbelt_profile_key(&base, true)
+        );
+        // Length prefixes keep field boundaries unambiguous.
+        assert_ne!(
+            seatbelt_profile_key(&["ab", "c"], false),
+            seatbelt_profile_key(&["a", "bc"], false)
+        );
     }
 
     /// Unique scratch directory removed on drop.
