@@ -1,5 +1,8 @@
 use super::tests::{profile, store};
 use super::*;
+use crate::tests::support::loopback_http::asynchronous::{
+    accept_request, read_request_or_empty, respond,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -14,22 +17,9 @@ async fn fixture() -> (tokio::net::TcpListener, Profile) {
 async fn request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String, Value) {
     tokio::time::timeout(Duration::from_secs(4), async {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        while !bytes.ends_with(b"\r\n\r\n") {
-            bytes.push(socket.read_u8().await.unwrap());
-            assert!(bytes.len() < 32768);
-        }
-        let headers = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
-        let len = headers
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("content-length:")
-                    .map(|v| v.trim().parse::<usize>().unwrap())
-            })
-            .unwrap_or(0);
-        assert!(len < 32768);
-        let mut bytes = vec![0; len];
-        socket.read_exact(&mut bytes).await.unwrap();
+        let request = read_request_or_empty(&mut socket).await;
+        let len = request.body.len();
+        let (headers, bytes) = (request.headers, request.body);
         let body = if len == 0 {
             json!({})
         } else if headers.contains("application/x-www-form-urlencoded") {
@@ -51,7 +41,13 @@ async fn request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, 
 }
 async fn answer(mut socket: tokio::net::TcpStream, status: u16, value: Value) {
     let body = value.to_string();
-    socket.write_all(format!("HTTP/1.1 {status} Owned\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    respond(
+        &mut socket,
+        &format!("{status} Owned"),
+        "application/json",
+        &body,
+    )
+    .await;
     socket.shutdown().await.unwrap();
 }
 fn grant() -> Value {
@@ -108,21 +104,8 @@ async fn copilot81_device_flow_obeys_initial_interval_pending_and_slow_down_befo
     answer(socket, 200, json!({"error":"slow_down"})).await;
     // This delay is the protocol's minimum; the test watches real request IO.
     let (socket, _, _) = tokio::time::timeout(Duration::from_secs(9), async {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        while !bytes.ends_with(b"\r\n\r\n") {
-            bytes.push(socket.read_u8().await.unwrap());
-        }
-        let headers = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
-        let len = headers
-            .lines()
-            .find_map(|l| {
-                l.strip_prefix("content-length:")
-                    .map(|v| v.trim().parse::<usize>().unwrap())
-            })
-            .unwrap();
-        let mut bytes = vec![0; len];
-        socket.read_exact(&mut bytes).await.unwrap();
+        let (socket, request) = accept_request(&listener).await;
+        let (headers, bytes) = (request.headers, request.body);
         (socket, headers, bytes)
     })
     .await

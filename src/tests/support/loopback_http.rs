@@ -87,6 +87,16 @@ pub(crate) mod asynchronous {
         request
     }
 
+    /// Like [`read_request`], but a request without `Content-Length` (a GET) has an empty body.
+    pub(crate) async fn read_request_or_empty(socket: &mut TcpStream) -> Request {
+        let mut request = read_head(socket).await;
+        let length = request.content_length().unwrap_or(0);
+        assert!(length < MAX_BODY);
+        request.body = vec![0; length];
+        socket.read_exact(&mut request.body).await.unwrap();
+        request
+    }
+
     /// Accepts the next connection and reads one request from it.
     pub(crate) async fn accept_request(listener: &TcpListener) -> (TcpStream, Request) {
         let (mut socket, _) = listener.accept().await.unwrap();

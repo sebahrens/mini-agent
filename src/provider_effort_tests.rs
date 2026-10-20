@@ -15,10 +15,10 @@ mod startup_tests;
 
 use super::*;
 use crate::tests::support::loopback_http::blocking;
-use std::io::Read;
 use futures::StreamExt;
 use rig::completion::CompletionModel;
 use serde_json::{Value, json};
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
