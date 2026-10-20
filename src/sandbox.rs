@@ -1977,6 +1977,7 @@ impl Sandbox {
     /// Account for the actual grants before publishing a model command. The
     /// Sandbox owner and its existing worker clone retain these capabilities;
     /// runtime accounting itself holds only weak references.
+    #[cfg_attr(not(feature = "js"), allow(dead_code))]
     fn retain_git_write_roots(&self, cwd: &Path) -> Result<Option<PathBuf>, String> {
         self.retain_git_write_roots_for_launch(cwd)
             .map(|(workspace, _)| workspace)
