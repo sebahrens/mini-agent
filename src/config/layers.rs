@@ -86,19 +86,66 @@ pub(super) fn validate_toml_bounds_with_limit(
     text: &str,
     byte_limit: usize,
 ) -> Result<(), &'static str> {
-    validate_toml_bounds_at(text, byte_limit).map_err(|(message, _)| message)
+    validate_toml_bounds_at(text, byte_limit)
+        .map(drop)
+        .map_err(|(message, _)| message)
 }
 
 /// Static diagnostic plus the bounded scanner's exact byte position. Never
 /// parse past a rejected allocation bound or include a caller-supplied value.
-pub(super) fn validate_toml_bounds_diagnostic(text: &str, byte_limit: usize) -> Result<(), String> {
+/// On success it returns the sorted, de-duplicated spellings of the top-level
+/// keys (the first segment of each root key path and `[table]` header), the
+/// same list `toml::Table::keys()` would give for valid TOML.
+pub(super) fn validate_toml_bounds_diagnostic(
+    text: &str,
+    byte_limit: usize,
+) -> Result<Vec<String>, String> {
     validate_toml_bounds_at(text, byte_limit).map_err(|(message, offset)| {
         let (line, column) = super::keys::line_column(text, offset);
         format!("line {line}, column {column}: {message} (values omitted)")
     })
 }
 
-fn validate_toml_bounds_at(text: &str, byte_limit: usize) -> Result<(), (&'static str, usize)> {
+/// First segment of a TOML key path (`a . "b"` -> `a`). Quoted segments with
+/// escapes are decoded by the TOML parser itself so spellings match exactly.
+fn first_key_segment(path: &str) -> Option<String> {
+    let path = path.trim_start();
+    let first = *path.as_bytes().first()?;
+    match first {
+        b'\'' => {
+            let end = path[1..].find('\'')?;
+            Some(path[1..1 + end].to_string())
+        }
+        b'"' => {
+            let bytes = path.as_bytes();
+            let mut index = 1;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'\\' => index += 2,
+                    b'"' => break,
+                    _ => index += 1,
+                }
+            }
+            let quoted = path.get(..=index)?;
+            if !quoted.contains('\\') {
+                return Some(quoted[1..quoted.len() - 1].to_string());
+            }
+            let table: toml::Table = toml::from_str(&format!("{quoted}=0")).ok()?;
+            table.into_iter().next().map(|(key, _)| key)
+        }
+        _ => {
+            let end = path
+                .find(|c: char| c == '.' || c.is_whitespace())
+                .unwrap_or(path.len());
+            Some(path[..end].to_string())
+        }
+    }
+}
+
+fn validate_toml_bounds_at(
+    text: &str,
+    byte_limit: usize,
+) -> Result<Vec<String>, (&'static str, usize)> {
     if text.len() > byte_limit {
         return Err(("config layer exceeds byte limit", 0));
     }
@@ -118,9 +165,28 @@ fn validate_toml_bounds_at(text: &str, byte_limit: usize) -> Result<(), (&'stati
     let mut root_key = true;
     let mut root_dots = 0;
     let mut items = 0;
-    let mut index = 0;
+    // Top-level key spellings, collected from the tokens already walked here.
+    let mut top_keys = std::collections::BTreeSet::new();
+    let mut key_start: Option<usize> = None;
+    let mut header_start = 0;
+    // Keys after the first `[table]` header belong to that table.
+    let mut in_table = false;
+    // A leading byte-order mark is not part of the first key.
+    let mut index = if text.starts_with('\u{feff}') { 3 } else { 0 };
     while index < bytes.len() {
         let byte = bytes[index];
+        if quote.is_none()
+            && key_start.is_none()
+            && stack.is_empty()
+            && root_key
+            && !header
+            && !in_table
+            && !byte.is_ascii_whitespace()
+            && byte != b'#'
+            && byte != b'['
+        {
+            key_start = Some(index);
+        }
         if let Some((delimiter, triple, _)) = quote {
             if delimiter == b'"' && byte == b'\\' {
                 index = index.saturating_add(2);
@@ -155,10 +221,13 @@ fn validate_toml_bounds_at(text: &str, byte_limit: usize) -> Result<(), (&'stati
                 root_key = true;
                 root_dots = 0;
                 header = false;
+                key_start = None;
             }
             b'[' | b'{' => {
                 if byte == b'[' && line_start && stack.is_empty() {
                     header = true;
+                    header_start = index;
+                    in_table = true;
                     items += 1;
                     table_depth = 0;
                 }
@@ -185,12 +254,20 @@ fn validate_toml_bounds_at(text: &str, byte_limit: usize) -> Result<(), (&'stati
                     return Err(("config delimiters are invalid", index));
                 }
                 if header && stack.is_empty() {
+                    let name = text[header_start..index].trim_start_matches('[');
+                    top_keys.extend(first_key_segment(name));
                     table_depth = root_dots + 1;
                     root_dots = 0;
                 }
             }
             b'=' => {
                 items += 1;
+                if stack.is_empty()
+                    && root_key
+                    && let Some(start) = key_start.take()
+                {
+                    top_keys.extend(first_key_segment(&text[start..index]));
+                }
                 root_key = false;
                 if let Some(frame) = stack.last_mut() {
                     frame.key = false;
@@ -244,7 +321,7 @@ fn validate_toml_bounds_at(text: &str, byte_limit: usize) -> Result<(), (&'stati
     if let Some(frame) = stack.first() {
         return Err(("config delimiters are invalid", frame.start));
     }
-    Ok(())
+    Ok(top_keys.into_iter().collect())
 }
 
 /// Parse repeated operator overrides as bounded literal TOML. Diagnostics never
@@ -573,6 +650,33 @@ pub(crate) fn apply_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounds_scanner_top_level_keys_match_toml_table_keys() {
+        let documents = [
+            "model = \"x\"\ntemperature = 0.5\n",
+            "\"quoted key\" = 1\n'literal key' = 2\nbare-key = 3\n",
+            "\"esc\\u0041ped\" = 1\nplain = 2\n",
+            "a.b.c = 1\na.d = 2\nz = 3\n",
+            "  indented = 1\n# comment = 2\n\n  \"a.b\" . c = 3\n",
+            "top = 1\n[a.b]\nx = 1\n[\"q r\".s]\ny = 2\n[[arr.item]]\nz = 3\n[[arr.item]]\nz = 4\n",
+            "list = [\n  1,\n  2,\n]\ninline = { k = 1, \"j\" = [1, 2] }\nmulti = \"\"\"\nnot_a_key = 1\n\"\"\"\n[ spaced . header ]\nv = 1\n",
+            "\u{feff}model = 1\n",
+            "a = 1 # trailing = 2\n[t] # [fake]\nb = 2\n",
+            "mcp_servers.one.command = \"x\"\n[mcp_servers.two]\ncommand = \"y\"\n",
+            "",
+        ];
+        for document in documents {
+            let expected: Vec<String> = document
+                .parse::<toml::Table>()
+                .unwrap_or_else(|error| panic!("{document:?}: {error}"))
+                .keys()
+                .cloned()
+                .collect();
+            let scanned = validate_toml_bounds_diagnostic(document, MAX_LAYER_BYTES).unwrap();
+            assert_eq!(scanned, expected, "{document:?}");
+        }
+    }
 
     #[test]
     fn config69_keyboard_literals_match_schema_and_typed_validation() {
