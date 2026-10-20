@@ -103,10 +103,15 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
             return Flow::cont();
         };
 
-        let output_chars = result.chars().count();
+        // Cheap checks first: self-bounded tools and byte lengths under the
+        // threshold (bytes >= chars) never need the UTF-8 char walk.
         if crate::session::tool_result_is_self_bounded(tool_name)
-            || output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD
+            || result.len() <= crate::session::TOOL_RESULT_SAVE_THRESHOLD
         {
+            return Flow::cont();
+        }
+        let output_chars = result.chars().count();
+        if output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
             return Flow::cont();
         }
 
@@ -1897,13 +1902,78 @@ pub(crate) fn prepared_request_input_estimate(
 }
 
 /// Per-run cache of the character counts of every history message already
-/// measured. A child's history is append-only, so each model call re-measures
-/// only the new suffix; a cached message is reused only while it is equal to
-/// the message at the same index, so an edited or reordered history is
-/// re-measured rather than trusted.
+/// measured, plus those of the request shell (preamble, documents, tool
+/// schemas, sampling parameters). A child's history is append-only, so each
+/// model call re-measures only the new suffix; a cached message is reused only
+/// while its fingerprint equals that of the message at the same index, so an
+/// edited or reordered history is re-measured rather than trusted.
+///
+/// The cache keeps a 64-bit fingerprint per message instead of a `Message`
+/// clone, so a run does not hold a second copy of its own history. The trade
+/// is one hashing pass over the prefix per call (no allocation) instead of a
+/// memcmp, and equality holds up to 64-bit hash collision.
 #[cfg(feature = "subagents")]
 #[derive(Clone, Default)]
-struct HistoryCountCache(std::sync::Arc<std::sync::Mutex<Vec<(Message, u64, u64)>>>);
+struct HistoryCountCache(std::sync::Arc<std::sync::Mutex<CountCacheState>>);
+
+#[cfg(feature = "subagents")]
+#[derive(Default)]
+struct CountCacheState {
+    messages: Vec<CacheEntry>,
+    shell: Option<ShellEntry>,
+}
+
+/// Fingerprint and character counts of one measured history message.
+#[cfg(feature = "subagents")]
+#[derive(Clone, Copy)]
+struct CacheEntry {
+    hash: u64,
+    wide: u64,
+    narrow: u64,
+}
+
+/// Memoized character counts of the request shell. The tool `Arc`s are held so
+/// that a pointer match can never be a freed-and-reused allocation.
+#[cfg(feature = "subagents")]
+struct ShellEntry {
+    model: Option<String>,
+    preamble_len: usize,
+    preamble_hash: u64,
+    tools: Vec<std::sync::Arc<rig::completion::ToolDefinition>>,
+    max_tokens: Option<u64>,
+    temperature_bits: Option<u64>,
+    /// Hash of the serde form of the remaining (normally small or absent)
+    /// fields: documents, tool choice, additional params and output schema.
+    rest_hash: u64,
+    wide: u64,
+    narrow: u64,
+}
+
+/// `io::Write` adapter that feeds bytes to a hasher.
+#[cfg(feature = "subagents")]
+struct HashWriter<'a>(&'a mut std::collections::hash_map::DefaultHasher);
+
+#[cfg(feature = "subagents")]
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::hash::Hasher;
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 64-bit fingerprint of the exact JSON form of `value`, computed without
+/// allocating the serialization.
+#[cfg(feature = "subagents")]
+fn serde_fingerprint<T: serde::Serialize + ?Sized>(value: &T) -> Option<u64> {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_writer(HashWriter(&mut hasher), value).ok()?;
+    Some(hasher.finish())
+}
 
 /// Every `CompletionRequest` field except `chat_history`, serialized under the
 /// same names so that, together with the history framing, the character counts
@@ -1922,6 +1992,67 @@ struct RequestShell<'a, S> {
     output_schema: &'a Option<S>,
 }
 
+/// Character counts of the request shell, reused while the shell is unchanged.
+#[cfg(feature = "subagents")]
+fn shell_char_counts(
+    state: &mut CountCacheState,
+    request: &rig::completion::CompletionRequest,
+) -> Option<(u64, u64)> {
+    use std::hash::{Hash, Hasher};
+    let preamble = request.preamble.as_deref().unwrap_or("");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    preamble.hash(&mut hasher);
+    let preamble_hash = hasher.finish();
+    let rest_hash = serde_fingerprint(&(
+        &request.documents,
+        &request.tool_choice,
+        &request.additional_params,
+        &request.output_schema,
+    ))?;
+    let temperature_bits = request.temperature.map(f64::to_bits);
+    if let Some(entry) = &state.shell
+        && entry.model == request.model
+        && entry.preamble_len == preamble.len()
+        && entry.preamble_hash == preamble_hash
+        && entry.max_tokens == request.max_tokens
+        && entry.temperature_bits == temperature_bits
+        && entry.rest_hash == rest_hash
+        && entry.tools.len() == request.tools.len()
+        && entry
+            .tools
+            .iter()
+            .zip(&request.tools)
+            .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+    {
+        return Some((entry.wide, entry.narrow));
+    }
+    let shell = serde_json::to_string(&RequestShell {
+        model: &request.model,
+        preamble: &request.preamble,
+        documents: &request.documents,
+        tools: &request.tools,
+        temperature: &request.temperature,
+        max_tokens: &request.max_tokens,
+        tool_choice: &request.tool_choice,
+        additional_params: &request.additional_params,
+        output_schema: &request.output_schema,
+    })
+    .ok()?;
+    let (wide, narrow) = crate::session::Session::char_counts(&shell);
+    state.shell = Some(ShellEntry {
+        model: request.model.clone(),
+        preamble_len: preamble.len(),
+        preamble_hash,
+        tools: request.tools.clone(),
+        max_tokens: request.max_tokens,
+        temperature_bits,
+        rest_hash,
+        wide,
+        narrow,
+    });
+    Some((wide, narrow))
+}
+
 /// Exactly `Session::estimate_tokens(&serde_json::to_string(request))`,
 /// serializing only the history messages not seen on an earlier call.
 #[cfg(feature = "subagents")]
@@ -1937,39 +2068,32 @@ pub(crate) fn incremental_request_estimate(
             cache
         }
     };
-    let shell = serde_json::to_string(&RequestShell {
-        model: &request.model,
-        preamble: &request.preamble,
-        documents: &request.documents,
-        tools: &request.tools,
-        temperature: &request.temperature,
-        max_tokens: &request.max_tokens,
-        tool_choice: &request.tool_choice,
-        additional_params: &request.additional_params,
-        output_schema: &request.output_schema,
-    })
-    .ok()?;
-    let (mut wide, mut narrow) = crate::session::Session::char_counts(&shell);
+    let mut state = cache.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut wide, mut narrow) = shell_char_counts(&mut state, request)?;
     // `,"chat_history":[` + `]` and one comma between consecutive messages.
     let history_len = request.chat_history.len();
     narrow += ",\"chat_history\":".len() as u64 + 2 + history_len.saturating_sub(1) as u64;
-    let mut measured = cache.0.lock().unwrap_or_else(|e| e.into_inner());
+    let measured = &mut state.messages;
     let mut keep = 0;
     for (index, message) in request.chat_history.iter().enumerate() {
         match measured.get(index) {
-            Some((cached, ..)) if cached == message => keep = index + 1,
+            Some(cached) if Some(cached.hash) == serde_fingerprint(message) => keep = index + 1,
             _ => break,
         }
     }
     measured.truncate(keep);
     for message in request.chat_history.iter().skip(keep) {
-        let (message_wide, message_narrow) =
-            crate::session::Session::char_counts(&serde_json::to_string(message).ok()?);
-        measured.push((message.clone(), message_wide, message_narrow));
+        let json = serde_json::to_string(message).ok()?;
+        let (message_wide, message_narrow) = crate::session::Session::char_counts(&json);
+        measured.push(CacheEntry {
+            hash: serde_fingerprint(message)?,
+            wide: message_wide,
+            narrow: message_narrow,
+        });
     }
-    for (_, message_wide, message_narrow) in measured.iter() {
-        wide += message_wide;
-        narrow += message_narrow;
+    for entry in measured.iter() {
+        wide += entry.wide;
+        narrow += entry.narrow;
     }
     Some(crate::session::Session::estimate_tokens_from_counts(
         wide, narrow,
@@ -2163,6 +2287,128 @@ fn observed_tokens(usage: Usage) -> u64 {
         .input_tokens
         .saturating_add(usage.output_tokens)
         .max(usage.total_tokens)
+}
+
+/// Consecutive empty terminal responses tolerated before a turn aborts.
+const MAX_EMPTY_RESPONSES: u32 = 3;
+/// Consecutive `Stop`-hook continuations honored before a forced release.
+#[cfg(feature = "hooks")]
+const MAX_STOP_BLOCKS: u32 = 8;
+
+// Per-item state transitions shared by the interactive (`spawn_agent_*`) and
+// headless (`run_print_*`) turn loops. The loops keep their own I/O and
+// ordering; only logic that was identical in both lives here, so a fix lands
+// in one place.
+
+/// Bookkeeping for one observed `CompletionCall`: resets the mid-stream retry
+/// budget, charges the turn and folds the usage into the ledger and the spend
+/// run. Returns the usage delta.
+fn record_completion_call(
+    retry_state: &mut CompletionRetryState,
+    retry_config: &RetryConfig,
+    turns_used: &mut usize,
+    usage_ledger: &mut UsageLedger,
+    usage: Usage,
+) -> UsageDelta {
+    retry_state.reset(retry_config);
+    *turns_used = turns_used.saturating_add(1);
+    let delta = usage_ledger.record(usage);
+    crate::spend::run::observe_current(delta);
+    delta
+}
+
+/// Applies the cumulative token budget after a completion. `Err` carries
+/// `(used, budget)` when tool calls were issued and the turn must fail now;
+/// otherwise an exhausted budget is remembered so a later tool item fails.
+fn note_budget_after_completion(
+    total: Usage,
+    turn_token_budget: Option<u64>,
+    completion_had_tool_call: &mut bool,
+    exhausted_after_completion: &mut Option<(u64, u64)>,
+) -> Result<(), (u64, u64)> {
+    if let Some(exhausted) = exhausted_token_budget(total, turn_token_budget) {
+        if *completion_had_tool_call {
+            return Err(exhausted);
+        }
+        *exhausted_after_completion = Some(exhausted);
+    }
+    *completion_had_tool_call = false;
+    Ok(())
+}
+
+/// Folds the terminal response's aggregate usage into the ledger and the spend
+/// run, returning the correction delta.
+fn reconcile_terminal_usage(usage_ledger: &mut UsageLedger, usage: Usage) -> UsageDelta {
+    let delta = usage_ledger.reconcile_terminal(usage);
+    if delta.has_values() {
+        crate::spend::run::observe_current(delta);
+    }
+    delta
+}
+
+/// Reconciles the terminal response text with what was streamed and records an
+/// unstreamed terminal answer in the transcript. Returns whether the terminal
+/// text had already been streamed.
+fn reconcile_final_output(
+    response: &mut String,
+    response_len_at_stream_start: usize,
+    terminal: &str,
+    interactions: &mut Vec<Message>,
+) -> bool {
+    let terminal_was_streamed = response.len() > response_len_at_stream_start;
+    reconcile_terminal_response(response, response_len_at_stream_start, terminal);
+    if !terminal_was_streamed && !terminal.is_empty() {
+        append_streamed_text(interactions, terminal);
+    }
+    terminal_was_streamed
+}
+
+/// Counts one empty terminal response; `true` once the abort limit is reached.
+fn empty_response_limit_reached(empty_response_count: &mut u32) -> bool {
+    *empty_response_count += 1;
+    *empty_response_count >= MAX_EMPTY_RESPONSES
+}
+
+fn verification_retry_instruction(diagnostic: &str) -> String {
+    format!(
+        "The configured verification command failed. Fix the cause and rerun verification before finishing.\n\n{diagnostic}"
+    )
+}
+
+/// Decides whether a mid-stream provider error is retried; logs the retry.
+fn midstream_retry(
+    completion_retry: &mut CompletionRetryState,
+    retry_config: &RetryConfig,
+    error: &rig::agent::StreamingError,
+) -> Option<(usize, std::time::Duration)> {
+    let (attempt, delay) = completion_retry.retry_delay(retry_config, error)?;
+    tracing::warn!(
+        "agent retry {attempt}/{max} after mid-stream error: {error}",
+        max = retry_config.max_attempts,
+    );
+    Some((attempt, delay))
+}
+
+/// Registers a `Stop`-hook continuation. Returns the instruction to inject, or
+/// `None` once the consecutive-block cap forces a release.
+#[cfg(feature = "hooks")]
+fn stop_block_continuation(
+    consecutive_stop_blocks: &mut u32,
+    stop_hook_active: &mut bool,
+    reason: String,
+) -> Option<String> {
+    *consecutive_stop_blocks += 1;
+    if *consecutive_stop_blocks <= MAX_STOP_BLOCKS {
+        *stop_hook_active = true;
+        tracing::info!(
+            "hooks: Stop hook forced continuation ({consecutive_stop_blocks}/{MAX_STOP_BLOCKS}): {reason}"
+        );
+        return Some(reason);
+    }
+    tracing::warn!(
+        "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
+    );
+    None
 }
 
 fn exhausted_token_budget(usage: Usage, budget: Option<u64>) -> Option<(u64, u64)> {
@@ -3589,7 +3835,6 @@ where
         // small replacement instruction instead of cloning the initial prompt.
         let mut stream_prompt: Option<String> = None;
         let mut empty_response_count: u32 = 0;
-        const MAX_EMPTY_RESPONSES: u32 = 3;
         let mut goal_report_accepted = false;
         let mut workspace_may_have_changed = false;
         let mut verification_attempt = 0u32;
@@ -3629,8 +3874,6 @@ where
         let mut stop_hook_active = false;
         #[cfg(feature = "hooks")]
         let mut consecutive_stop_blocks: u32 = 0;
-        #[cfg(feature = "hooks")]
-        const MAX_STOP_BLOCKS: u32 = 8;
 
         if max_turns == 0 {
             let _ = event_tx
@@ -3977,10 +4220,7 @@ where
                         completed_interactions.extend(completed_delta);
                         let usage = res.usage();
                         let context_complete = !usage_ledger.stream_has_observed_usage();
-                        let terminal_delta = usage_ledger.reconcile_terminal(usage);
-                        if terminal_delta.has_values() {
-                            crate::spend::run::observe_current(terminal_delta);
-                        }
+                        let terminal_delta = reconcile_terminal_usage(&mut usage_ledger, usage);
                         if terminal_delta.has_values() {
                             let _ = event_tx
                                 .send(AgentEvent::UsageDelta {
@@ -3991,15 +4231,12 @@ where
                                 .await;
                         }
                         let response_text = res.output;
-                        let terminal_was_streamed = response.len() > response_len_at_stream_start;
-                        reconcile_terminal_response(
+                        let terminal_was_streamed = reconcile_final_output(
                             &mut response,
                             response_len_at_stream_start,
                             &response_text,
+                            &mut interactions,
                         );
-                        if !terminal_was_streamed && !response_text.is_empty() {
-                            append_streamed_text(&mut interactions, &response_text);
-                        }
                         tracing::info!(
                             "agent done: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}",
                             usage.input_tokens,
@@ -4067,9 +4304,8 @@ where
                                     .await;
                                 if !passed {
                                     if verification_attempt < verification.max_attempts {
-                                        next_instruction = Some(format!(
-                                            "The configured verification command failed. Fix the cause and rerun verification before finishing.\n\n{diagnostic}"
-                                        ));
+                                        next_instruction =
+                                            Some(verification_retry_instruction(&diagnostic));
                                         break;
                                     }
                                     let _ = event_tx
@@ -4092,19 +4328,14 @@ where
                                     goal_hook_info(),
                                 )
                                 .await
+                                && let Some(instruction) = stop_block_continuation(
+                                    &mut consecutive_stop_blocks,
+                                    &mut stop_hook_active,
+                                    reason,
+                                )
                             {
-                                consecutive_stop_blocks += 1;
-                                if consecutive_stop_blocks <= MAX_STOP_BLOCKS {
-                                    stop_hook_active = true;
-                                    tracing::info!(
-                                        "hooks: Stop hook forced continuation ({consecutive_stop_blocks}/{MAX_STOP_BLOCKS}): {reason}"
-                                    );
-                                    next_instruction = Some(reason);
-                                    break;
-                                }
-                                tracing::warn!(
-                                    "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
-                                );
+                                next_instruction = Some(instruction);
+                                break;
                             }
                             #[cfg(feature = "skills")]
                             if !verification_ran
@@ -4121,8 +4352,7 @@ where
                                 .await;
                             return;
                         }
-                        empty_response_count += 1;
-                        if empty_response_count >= MAX_EMPTY_RESPONSES {
+                        if empty_response_limit_reached(&mut empty_response_count) {
                             tracing::warn!(
                                 "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
                             );
@@ -4139,11 +4369,14 @@ where
                         break;
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                        completion_retry.reset(&retry_config);
-                        turns_used = turns_used.saturating_add(1);
                         let usage = call.usage;
-                        let delta = usage_ledger.record(usage);
-                        crate::spend::run::observe_current(delta);
+                        let delta = record_completion_call(
+                            &mut completion_retry,
+                            &retry_config,
+                            &mut turns_used,
+                            &mut usage_ledger,
+                            usage,
+                        );
                         tracing::debug!(
                             "agent completion: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}, cumulative_tokens={}",
                             usage.input_tokens,
@@ -4215,34 +4448,33 @@ where
                             // tool batch. The UI is aborting this run.
                             return;
                         }
-                        if let Some((used, budget)) =
-                            exhausted_token_budget(usage_ledger.total, turn_token_budget)
-                        {
-                            if completion_had_tool_call {
-                                tracing::warn!(
-                                    used,
-                                    budget,
-                                    "agent cumulative token budget exhausted before the next provider call"
-                                );
-                                finalize_interactive_tool_calls(
-                                    &mut tool_calls,
-                                    &mut interactions,
-                                    &event_tx,
-                                )
+                        if let Err((used, budget)) = note_budget_after_completion(
+                            usage_ledger.total,
+                            turn_token_budget,
+                            &mut completion_had_tool_call,
+                            &mut exhausted_budget_after_completion,
+                        ) {
+                            tracing::warn!(
+                                used,
+                                budget,
+                                "agent cumulative token budget exhausted before the next provider call"
+                            );
+                            finalize_interactive_tool_calls(
+                                &mut tool_calls,
+                                &mut interactions,
+                                &event_tx,
+                            )
+                            .await;
+                            let _ = event_tx
+                                .send(AgentEvent::error_with(
+                                    CompactString::from(token_budget_exhaustion_message(
+                                        used, budget,
+                                    )),
+                                    completed_so_far!(),
+                                ))
                                 .await;
-                                let _ = event_tx
-                                    .send(AgentEvent::error_with(
-                                        CompactString::from(token_budget_exhaustion_message(
-                                            used, budget,
-                                        )),
-                                        completed_so_far!(),
-                                    ))
-                                    .await;
-                                return;
-                            }
-                            exhausted_budget_after_completion = Some((used, budget));
+                            return;
                         }
-                        completion_had_tool_call = false;
                     }
                     Err(e) => {
                         finalize_interactive_tool_calls(
@@ -4253,12 +4485,8 @@ where
                         .await;
                         park_question!();
                         if let Some((attempt, delay)) =
-                            completion_retry.retry_delay(&retry_config, &e)
+                            midstream_retry(&mut completion_retry, &retry_config, &e)
                         {
-                            tracing::warn!(
-                                "agent retry {attempt}/{max} after mid-stream error: {e}",
-                                max = retry_config.max_attempts,
-                            );
                             let _ = event_tx
                                 .send(AgentEvent::Retrying {
                                     attempt,
@@ -4750,7 +4978,6 @@ where
     // Bounded retry of empty terminal responses, mirroring `spawn_agent`: an
     // empty response must never be returned (and persisted) as the turn.
     let mut empty_response_count: u32 = 0;
-    const MAX_EMPTY_RESPONSES: u32 = 3;
     let mut goal_report_accepted = false;
     let mut workspace_may_have_changed = false;
     let mut verification_attempt = 0u32;
@@ -4797,8 +5024,6 @@ where
     let mut stop_hook_active = false;
     #[cfg(feature = "hooks")]
     let mut consecutive_stop_blocks: u32 = 0;
-    #[cfg(feature = "hooks")]
-    const MAX_STOP_BLOCKS: u32 = 8;
 
     while continue_turn {
         continue_turn = false;
@@ -4935,10 +5160,13 @@ where
                         }
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                        completion_retry.reset(retry_config);
-                        turns_used = turns_used.saturating_add(1);
-                        let delta = usage_ledger.record(call.usage);
-                        crate::spend::run::observe_current(delta);
+                        let delta = record_completion_call(
+                            &mut completion_retry,
+                            retry_config,
+                            &mut turns_used,
+                            &mut usage_ledger,
+                            call.usage,
+                        );
                         if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
                             fail_turn!(error);
                         }
@@ -4950,40 +5178,36 @@ where
                             call.usage.cache_creation_input_tokens,
                             observed_tokens(usage_ledger.total),
                         );
-                        if let Some((used, budget)) =
-                            exhausted_token_budget(usage_ledger.total, turn_token_budget)
-                        {
-                            if completion_had_tool_call {
-                                tool_calls.finalize_unresolved(&mut interactions);
-                                fail_turn!(token_budget_exhaustion_message(used, budget));
-                            }
-                            exhausted_budget_after_completion = Some((used, budget));
+                        if let Err((used, budget)) = note_budget_after_completion(
+                            usage_ledger.total,
+                            turn_token_budget,
+                            &mut completion_had_tool_call,
+                            &mut exhausted_budget_after_completion,
+                        ) {
+                            tool_calls.finalize_unresolved(&mut interactions);
+                            fail_turn!(token_budget_exhaustion_message(used, budget));
                         }
-                        completion_had_tool_call = false;
                     }
                     Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                         terminal_response_seen = true;
-                        let delta = usage_ledger.reconcile_terminal(res.usage());
-                        if delta.has_values() {
-                            crate::spend::run::observe_current(delta);
-                        }
+                        let delta = reconcile_terminal_usage(&mut usage_ledger, res.usage());
                         if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
                             fail_turn!(error);
                         }
-                        let terminal_was_streamed = full_response.len() > response_len_at_stream_start;
-                        reconcile_terminal_response(
-                            &mut full_response,
-                            response_len_at_stream_start,
-                            &res.output,
-                        );
                         // A terminal answer that was never streamed must still
                         // reach the continuation transcript and the terminal, as
                         // it does interactively (mini-agent-4v2iq).
-                        if !terminal_was_streamed && !res.output.is_empty() {
-                            append_streamed_text(&mut interactions, &res.output);
-                            if let Err(error) = output_policy.assistant_text(&res.output).await {
-                                fail_turn!(error);
-                            }
+                        let terminal_was_streamed = reconcile_final_output(
+                            &mut full_response,
+                            response_len_at_stream_start,
+                            &res.output,
+                            &mut interactions,
+                        );
+                        if !terminal_was_streamed
+                            && !res.output.is_empty()
+                            && let Err(error) = output_policy.assistant_text(&res.output).await
+                        {
+                            fail_turn!(error);
                         }
                         park_question!();
                         if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
@@ -4996,8 +5220,7 @@ where
                             && !goal_report_accepted
                             && !native_capture.completes_without_visible_text()
                         {
-                            empty_response_count += 1;
-                            if empty_response_count >= MAX_EMPTY_RESPONSES {
+                            if empty_response_limit_reached(&mut empty_response_count) {
                                 tracing::warn!(
                                     "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
                                 );
@@ -5040,9 +5263,8 @@ where
                                     fail_turn!(error);
                                 }
                                 if verification_attempt < verification.max_attempts {
-                                    next_instruction = Some(format!(
-                                        "The configured verification command failed. Fix the cause and rerun verification before finishing.\n\n{diagnostic}"
-                                    ));
+                                    next_instruction =
+                                        Some(verification_retry_instruction(&diagnostic));
                                     continue_turn = true;
                                     return Ok(false);
                                 } else {
@@ -5060,20 +5282,14 @@ where
                                 loop_info.map(|info| info.active),
                                 goal_hook_info(),
                             ))
+                            && let Some(instruction) = stop_block_continuation(
+                                &mut consecutive_stop_blocks,
+                                &mut stop_hook_active,
+                                reason,
+                            )
                         {
-                            consecutive_stop_blocks += 1;
-                            if consecutive_stop_blocks <= MAX_STOP_BLOCKS {
-                                stop_hook_active = true;
-                                tracing::info!(
-                                    "hooks: Stop hook forced continuation ({consecutive_stop_blocks}/{MAX_STOP_BLOCKS}): {reason}"
-                                );
-                                next_instruction = Some(reason);
-                                continue_turn = true;
-                            } else {
-                                tracing::warn!(
-                                    "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
-                                );
-                            }
+                            next_instruction = Some(instruction);
+                            continue_turn = true;
                         }
                         #[cfg(feature = "skills")]
                         if !continue_turn
@@ -5088,11 +5304,9 @@ where
                     Err(e) => {
                         tool_calls.finalize_unresolved(&mut interactions);
                         park_question!();
-                        if let Some((attempt, delay)) = completion_retry.retry_delay(retry_config, &e) {
-                            tracing::warn!(
-                                "agent retry {attempt}/{max} after mid-stream error: {e}",
-                                max = retry_config.max_attempts,
-                            );
+                        if let Some((_, delay)) =
+                            midstream_retry(&mut completion_retry, retry_config, &e)
+                        {
                             await_turn!(tokio::time::sleep(delay));
                             next_instruction = Some(TRANSIENT_PROVIDER_CONTINUATION.to_string());
                             retrying_interrupted_completion = true;
@@ -6587,6 +6801,28 @@ mod tests {
         }
     }
 
+    /// 6_000 two-byte chars: 12_000 bytes but only 6_000 chars.
+    struct WideBelowThresholdTool;
+
+    impl Tool for WideBelowThresholdTool {
+        const NAME: &'static str = "wide_below_threshold";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return multi-byte text under the char threshold".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok("é".repeat(6_000))
+        }
+    }
+
     #[derive(Clone)]
     struct AlwaysFailTool(Arc<AtomicUsize>);
 
@@ -6716,6 +6952,56 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("counted".to_string())
         }
+    }
+
+    #[tokio::test]
+    async fn multibyte_result_over_threshold_in_bytes_but_not_chars_is_not_spilled() {
+        let session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "wide-id",
+                    WideBelowThresholdTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(WideBelowThresholdTool)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        while stream.next().await.is_some() {}
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let live_output = requests[1]
+            .chat_history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|content| match content {
+                    UserContent::ToolResult(result) => {
+                        result.content.iter().find_map(|content| match content {
+                            ToolResultContent::Text(text) => Some(text.text.clone()),
+                            ToolResultContent::Image(_) => None,
+                        })
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the next request must contain the tool result");
+        assert_eq!(live_output, "é".repeat(6_000));
     }
 
     #[tokio::test]
@@ -11971,6 +12257,12 @@ mod replay_and_gate_attribution_tests {
             skipped_verification_source(false),
             Some(TaskOutcomeSource::NoVerifyCommand)
         );
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn history_count_cache_entries_hold_no_message() {
+        assert!(std::mem::size_of::<super::CacheEntry>() <= 24);
     }
 
     /// v98t: the skipped-gate turn must be recorded, not dropped. Reusing

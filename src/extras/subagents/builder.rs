@@ -2468,6 +2468,83 @@ mod settings127_context_tests {
         assert_eq!(*probe.0.lock().unwrap(), vec![1, 2, 3]);
     }
 
+    /// Re-runs the incremental estimate against edited copies of each prepared
+    /// request: a mutated middle message and a different preamble must be
+    /// re-measured, and the original must still match afterwards.
+    #[derive(Clone, Default)]
+    struct InvalidationProbe(std::sync::Arc<std::sync::Mutex<u32>>);
+    impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for InvalidationProbe {
+        async fn on_event(
+            &self,
+            ctx: &rig::agent::HookContext,
+            event: rig::agent::StepEvent<'_, M>,
+        ) -> rig::agent::Flow {
+            if let rig::agent::StepEvent::CompletionRequestPrepared { request, .. } = event {
+                let full = |request: &rig::completion::CompletionRequest| {
+                    crate::session::Session::estimate_tokens(
+                        &serde_json::to_string(request).unwrap(),
+                    )
+                };
+                let incremental = |request: &rig::completion::CompletionRequest| {
+                    crate::agent::runner::incremental_request_estimate(ctx, request).unwrap()
+                };
+                assert_eq!(incremental(request), full(request));
+                if request.chat_history.len() >= 3 {
+                    let mut edited = request.clone();
+                    *edited.chat_history.iter_mut().nth(1).unwrap() =
+                        rig::completion::Message::user("edited 日本語 middle message ".repeat(40));
+                    assert_ne!(full(&edited), full(request));
+                    assert_eq!(incremental(&edited), full(&edited));
+                    let mut other_shell = request.clone();
+                    other_shell.preamble = Some("a different, longer preamble 日本".repeat(30));
+                    assert_ne!(full(&other_shell), full(request));
+                    assert_eq!(incremental(&other_shell), full(&other_shell));
+                    assert_eq!(incremental(request), full(request));
+                    *self.0.lock().unwrap() += 1;
+                }
+            }
+            rig::agent::Flow::cont()
+        }
+        fn observes(&self, kind: rig::agent::StepEventKind) -> bool {
+            kind == rig::agent::StepEventKind::CompletionRequestPrepared
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_estimate_remeasures_edited_prefix_and_changed_shell() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("inv-1", "context_probe", serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::tool_call("inv-2", "context_probe", serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .preamble("preamble")
+            .max_tokens(512)
+            .tool(MockExtensionsProbeTool::default())
+            .default_max_turns(6)
+            .build();
+        let probe = InvalidationProbe::default();
+        let mut stream = agent
+            .stream_chat("brief", Vec::<rig::completion::Message>::new())
+            .add_hook(probe.clone())
+            .await;
+        while let Some(item) = stream.next().await {
+            if let Err(error) = item {
+                panic!("unexpected stream error: {error}");
+            }
+        }
+        assert!(*probe.0.lock().unwrap() >= 2);
+    }
+
     #[tokio::test]
     async fn subagent127_prepared_context_counts_history_tools_and_reserved_output_before_dispatch()
     {
