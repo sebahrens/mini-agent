@@ -155,12 +155,9 @@ pub struct Block {
     running: bool,
     /// Memoized markdown layout. Interior mutability keeps `Feed::lines` a
     /// `&self` read; `Feed` mutators that rewrite block text invalidate it.
-    md_cache: RefCell<Option<MdCache>>,
-    syntax_cache: RefCell<super::highlight::TokenCache>,
-    /// Incremental highlight-budget verdict for `text`, computed on first use
-    /// and extended by appends so a repaint never rescans the whole block.
-    /// `None` until a layout needs it, and again after the text is rewritten.
-    highlight_budget: Cell<Option<super::highlight::BudgetScan>>,
+    /// Markdown, syntax and highlight-budget state, allocated on the first
+    /// agent layout so every other block keeps only a pointer-sized slot.
+    agent: std::cell::OnceCell<Box<AgentRender>>,
     revision: u64,
     render_cache: RefCell<Option<BlockRenderCache>>,
     /// Wrapped rows of a plain-text body's completed lines (reasoning bodies
@@ -174,6 +171,19 @@ pub struct Block {
     /// inserted for one anchor in insertion order.
     attached_to: Option<CompactString>,
     reasoning: Option<ReasoningBlock>,
+}
+
+/// Per-block state only agent (markdown) layouts use.
+#[derive(Clone, Debug, Default)]
+struct AgentRender {
+    /// Memoized markdown layout. Interior mutability keeps `Feed::lines` a
+    /// `&self` read; `Feed` mutators that rewrite block text invalidate it.
+    md: RefCell<Option<MdCache>>,
+    syntax: RefCell<super::highlight::TokenCache>,
+    /// Incremental highlight-budget verdict for `text`, computed on first use
+    /// and extended by appends so a repaint never rescans the whole block.
+    /// `None` until a layout needs it, and again after the text is rewritten.
+    budget: Cell<Option<super::highlight::BudgetScan>>,
 }
 
 #[derive(Clone, Debug)]
@@ -272,11 +282,12 @@ impl Block {
     /// Whether the block's text fits the syntax-highlighting budget. Scans the
     /// text once; later appends extend the verdict incrementally.
     fn within_highlight_budget(&self) -> bool {
-        match self.highlight_budget.get() {
+        let agent = self.agent_render();
+        match agent.budget.get() {
             Some(scan) => scan.within(),
             None => {
                 let scan = super::highlight::BudgetScan::of(&self.text);
-                self.highlight_budget.set(Some(scan));
+                agent.budget.set(Some(scan));
                 scan.within()
             }
         }
@@ -284,9 +295,37 @@ impl Block {
 
     /// Record `appended` (already pushed onto `text`) in the budget verdict.
     fn note_appended(&self, appended: &str) {
-        if let Some(mut scan) = self.highlight_budget.get() {
+        if let Some(agent) = self.agent.get()
+            && let Some(mut scan) = agent.budget.get()
+        {
             scan.push(appended);
-            self.highlight_budget.set(Some(scan));
+            agent.budget.set(Some(scan));
+        }
+    }
+
+    /// The agent layout state, allocated on first use.
+    fn agent_render(&self) -> &AgentRender {
+        self.agent.get_or_init(Default::default)
+    }
+
+    /// Drop the memoized markdown layout (a no-op before any agent layout).
+    fn clear_md_cache(&self) {
+        if let Some(agent) = self.agent.get() {
+            *agent.md.borrow_mut() = None;
+        }
+    }
+
+    /// Drop the memoized syntax tokens (a no-op before any agent layout).
+    fn clear_syntax_cache(&self) {
+        if let Some(agent) = self.agent.get() {
+            agent.syntax.borrow_mut().clear();
+        }
+    }
+
+    /// Forget the highlight-budget verdict (a no-op before any agent layout).
+    fn clear_highlight_budget(&self) {
+        if let Some(agent) = self.agent.get() {
+            agent.budget.set(None);
         }
     }
 
@@ -303,9 +342,7 @@ impl Block {
             style,
             text,
             running: false,
-            md_cache: RefCell::new(None),
-            syntax_cache: RefCell::new(super::highlight::TokenCache::default()),
-            highlight_budget: Cell::new(None),
+            agent: std::cell::OnceCell::new(),
             revision: 0,
             render_cache: RefCell::new(None),
             plain_cache: RefCell::new(None),
@@ -509,9 +546,9 @@ impl Feed {
         *self.layout_cache.borrow_mut() = None;
         for block in &self.blocks {
             *block.render_cache.borrow_mut() = None;
-            *block.md_cache.borrow_mut() = None;
+            block.clear_md_cache();
             *block.plain_cache.borrow_mut() = None;
-            block.syntax_cache.borrow_mut().clear();
+            block.clear_syntax_cache();
         }
     }
 
@@ -524,9 +561,9 @@ impl Feed {
         *self.layout_cache.borrow_mut() = None;
         for block in &self.blocks {
             *block.render_cache.borrow_mut() = None;
-            *block.md_cache.borrow_mut() = None;
+            block.clear_md_cache();
             *block.plain_cache.borrow_mut() = None;
-            block.syntax_cache.borrow_mut().clear();
+            block.clear_syntax_cache();
         }
     }
 
@@ -802,8 +839,8 @@ impl Feed {
                 .saturating_sub(old_len)
                 .saturating_add(block.text.len());
             block.revision = block.revision.wrapping_add(1);
-            *block.md_cache.borrow_mut() = None;
-            block.syntax_cache.borrow_mut().clear();
+            block.clear_md_cache();
+            block.clear_syntax_cache();
             *block.render_cache.borrow_mut() = None;
             return true;
         }
@@ -930,7 +967,7 @@ impl Feed {
             // document-level construct the region split cannot reproduce
             // forces the full re-parse; exact syntax rows remain reusable.
             if finalize_needs_full_parse(block) {
-                *block.md_cache.borrow_mut() = None;
+                block.clear_md_cache();
             }
             *block.render_cache.borrow_mut() = None;
         }
@@ -1001,10 +1038,10 @@ impl Feed {
             block.revision = block.revision.wrapping_add(1);
             *block.render_cache.borrow_mut() = None;
             if compacted {
-                block.highlight_budget.set(None);
+                block.clear_highlight_budget();
                 *block.plain_cache.borrow_mut() = None;
-                *block.md_cache.borrow_mut() = None;
-                block.syntax_cache.borrow_mut().clear();
+                block.clear_md_cache();
+                block.clear_syntax_cache();
                 self.retention_generation = self.retention_generation.wrapping_add(1);
             }
             self.prune_completed_prefix();
@@ -1032,10 +1069,10 @@ impl Feed {
             self.total_bytes = self.total_bytes.saturating_add(last.text.len());
             last.running = false;
             last.revision = last.revision.wrapping_add(1);
-            last.highlight_budget.set(None);
+            last.clear_highlight_budget();
             *last.plain_cache.borrow_mut() = None;
-            *last.md_cache.borrow_mut() = None;
-            last.syntax_cache.borrow_mut().clear();
+            last.clear_md_cache();
+            last.clear_syntax_cache();
             *last.render_cache.borrow_mut() = None;
         } else {
             let block = Block::new(style, text);
@@ -1904,11 +1941,13 @@ fn finalize_needs_full_parse(block: &Block) -> bool {
     if block.style != BlockStyle::Agent {
         return false;
     }
-    let forced = block
-        .md_cache
-        .borrow()
-        .as_ref()
-        .is_some_and(|cache| cache.forced_split);
+    let forced = block.agent.get().is_some_and(|agent| {
+        agent
+            .md
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| cache.forced_split)
+    });
     forced
         || contains_global_markdown_definition(&block.text)
         || block.text.lines().any(|line| {
@@ -2020,7 +2059,8 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
     // unfinished tail leaves completed_len unchanged and needs no markdown work.
     if let Some(cached) = cached_agent_lines(block, width, completed_len).filter(|_| {
         block
-            .md_cache
+            .agent_render()
+            .md
             .borrow()
             .as_ref()
             .is_some_and(|cache| cache.highlighting == highlighting)
@@ -2031,7 +2071,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
     // Mutators that can replace text clear md_cache, so a same-width cache with
     // a shorter parsed prefix is known to be an append-only extension.
     let incremental_base = {
-        let cache = block.md_cache.borrow();
+        let cache = block.agent_render().md.borrow();
         cache.as_ref().and_then(|cache| {
             (cache.width == width
                 && cache.parsed_len < completed_len
@@ -2148,7 +2188,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
             forced_split,
         };
         let segments = cache.segments();
-        *block.md_cache.borrow_mut() = Some(cache);
+        *block.agent_render().md.borrow_mut() = Some(cache);
         return segments;
     }
 
@@ -2205,7 +2245,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         forced_split,
     };
     let segments = cache.segments();
-    *block.md_cache.borrow_mut() = Some(cache);
+    *block.agent_render().md.borrow_mut() = Some(cache);
     segments
 }
 
@@ -2257,7 +2297,7 @@ fn parse_agent_markdown(
         feed.palette,
         highlighting,
         entry_code,
-        Some(&block.syntax_cache),
+        Some(&block.agent_render().syntax),
     );
     for row in &mut rendered.lines {
         row.color = super::markdown::palette_color(row.color, feed.palette);
@@ -2300,7 +2340,7 @@ fn cached_agent_lines(
     width: usize,
     parsed_len: usize,
 ) -> Option<Vec<Arc<Vec<LineEntry>>>> {
-    let cache = block.md_cache.borrow();
+    let cache = block.agent_render().md.borrow();
     let cache = cache.as_ref()?;
     if cache.width == width && cache.parsed_len == parsed_len {
         Some(cache.segments())
@@ -2338,6 +2378,15 @@ mod progress_tests {
         assert!(!feed.clear_anchor_progress("call-1"));
         assert!(!feed.set_anchor_progress("missing", BlockStyle::ToolResult, "x"));
         assert!(!feed.set_anchor_progress("", BlockStyle::ToolResult, "x"));
+    }
+
+    #[test]
+    fn block_header_is_small() {
+        assert!(
+            std::mem::size_of::<Block>() <= 256,
+            "Block is {} bytes",
+            std::mem::size_of::<Block>()
+        );
     }
 
     #[test]
