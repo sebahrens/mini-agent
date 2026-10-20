@@ -19,7 +19,7 @@ fn test_command_picker_paste_keeps_query_and_buffer_coherent() {
         panic!("command picker should remain active");
     };
     assert_eq!(picker.query, "mod");
-    assert!(picker.matches.contains(&"/model".to_string()));
+    assert!(picker.matches().any(|m| m == "/model"));
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn test_prefixed_picker_paste_keeps_unicode_query_and_cursor_coherent() {
         panic!("prompt picker should remain active");
     };
     assert_eq!(picker.query, "café");
-    assert_eq!(picker.matches, vec!["café"]);
+    assert_eq!(picker.match_names(), vec!["café"]);
 }
 
 #[test]
@@ -297,13 +297,13 @@ fn test_list_picker_filter() {
         "gamma".to_string(),
     ]);
     picker.activate();
-    assert_eq!(picker.matches.len(), 3);
+    assert_eq!(picker.len(), 3);
 
     picker.char_input('a');
-    assert_eq!(picker.matches, vec!["alpha", "beta", "gamma"]);
+    assert_eq!(picker.match_names(), vec!["alpha", "beta", "gamma"]);
 
     picker.char_input('l');
-    assert_eq!(picker.matches, vec!["alpha"]);
+    assert_eq!(picker.match_names(), vec!["alpha"]);
 }
 
 #[test]
@@ -371,12 +371,12 @@ fn test_list_picker_reactivate_resets_state() {
 fn test_static_commands_prepopulated() {
     let mut picker = ListPicker::with_static_commands();
     picker.activate();
-    assert!(picker.matches.len() > 5);
+    assert!(picker.len() > 5);
 
     picker.char_input('m');
     picker.char_input('o');
     picker.char_input('d');
-    assert!(picker.matches.contains(&"/model".to_string()));
+    assert!(picker.matches().any(|m| m == "/model"));
 }
 
 // ── walk_files tests ────────────────────────────────────────────────
@@ -987,7 +987,7 @@ mod slash_picker_contract {
             let Some(Picker::Prefixed(picker, "/agent ")) = input.picker.as_ref() else {
                 panic!("/agent opens its persona picker");
             };
-            let names = picker.matches.clone();
+            let names = picker.matches().map(str::to_string).collect::<Vec<_>>();
             input.load_text("");
             input.picker = None;
             (mentions, names)
@@ -1309,7 +1309,7 @@ mod slash_picker_contract {
         let Some(Picker::Command(picker)) = input.picker.as_ref() else {
             panic!("command picker open");
         };
-        assert_eq!(picker.matches, ["/compress"]);
+        assert_eq!(picker.match_names(), ["/compress"]);
         for alias in ["/exit", "/compact", "/thinking", "/tutorial"] {
             let mut input = InputEditor::new();
             typed(&mut input, alias);
@@ -1465,7 +1465,7 @@ mod slash_picker_contract {
             panic!("/mode should open its argument picker");
         };
         assert!(picker.active);
-        assert_eq!(picker.matches, SecurityMode::NAMES);
+        assert_eq!(picker.match_names(), SecurityMode::NAMES);
         assert_eq!(picker.selected_name(), Some("guarded"));
 
         let rows = picker.display_rows();
@@ -1570,7 +1570,7 @@ mod slash_picker_contract {
             picker.char_input(c);
         }
         assert_eq!(picker.selected_name(), Some("/reasoning"));
-        let position = |name: &str| picker.matches.iter().position(|m| m == name).unwrap();
+        let position = |name: &str| picker.matches().position(|m| m == name).unwrap();
         assert!(position("/rewind") < position("/compress"));
 
         let mut picker = ListPicker::with_static_commands();
@@ -1578,7 +1578,7 @@ mod slash_picker_contract {
         for c in "mod".chars() {
             picker.char_input(c);
         }
-        assert_eq!(&picker.matches[..2], ["/mode", "/model"]);
+        assert_eq!(&picker.match_names()[..2], ["/mode", "/model"]);
     }
 
     #[test]
@@ -1597,7 +1597,7 @@ mod slash_picker_contract {
         let mut picker = ListPicker::new();
         picker.set_items(vec!["zeta".to_string(), "alpha".to_string()]);
         picker.activate();
-        assert_eq!(picker.matches, ["zeta", "alpha"]);
+        assert_eq!(picker.match_names(), ["zeta", "alpha"]);
     }
 
     #[test]
@@ -1701,7 +1701,9 @@ mod bang_history_picker {
 
     fn suggestions(input: &InputEditor) -> Option<Vec<String>> {
         match input.picker.as_ref() {
-            Some(Picker::Bang(p)) if p.active => Some(p.matches.clone()),
+            Some(Picker::Bang(p)) if p.active => {
+                Some(p.matches().map(str::to_string).collect::<Vec<_>>())
+            }
             _ => None,
         }
     }

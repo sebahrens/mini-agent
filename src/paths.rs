@@ -908,7 +908,7 @@ impl WorkspaceBinding {
         self.directory.try_clone()
     }
 
-    #[cfg(all(test, feature = "skills"))]
+    #[cfg(test)]
     pub(crate) fn validation_count(&self) -> usize {
         self.validations.load(std::sync::atomic::Ordering::SeqCst)
     }

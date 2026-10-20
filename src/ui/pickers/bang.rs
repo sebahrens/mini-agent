@@ -23,7 +23,7 @@ const MAX_BANG_COMMANDS: usize = 200;
 /// once at its most recent position. Empty and multi-line commands are
 /// skipped because they cannot be shown or completed on one line.
 pub(crate) fn bang_history<S: AsRef<str>>(history: &[S]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut commands = Vec::new();
     for entry in history.iter().rev() {
         let Some(command) = entry.as_ref().strip_prefix(BANG_PREFIX) else {
@@ -33,7 +33,7 @@ pub(crate) fn bang_history<S: AsRef<str>>(history: &[S]) -> Vec<String> {
         if command.is_empty() || command.contains(['\n', '\r']) {
             continue;
         }
-        if seen.insert(command.to_string()) {
+        if seen.insert(command) {
             commands.push(command.to_string());
             if commands.len() >= MAX_BANG_COMMANDS {
                 break;
@@ -86,5 +86,36 @@ pub fn handle_bang_key(
             }
         }
         _ => handle_prefixed_key(buffer, cursor, picker, BANG_PREFIX, key),
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn bang_history_is_newest_first_deduplicated_and_skips_unshowable_entries() {
+        let history = [
+            "!ls",
+            "plain",
+            "!make",
+            "!",
+            "!  ",
+            "!a\nb",
+            "!ls",
+            " !x",
+            "!git status ",
+        ];
+        assert_eq!(bang_history(&history), vec!["git status", "ls", "make"]);
+    }
+
+    #[test]
+    fn bang_history_caps_distinct_commands() {
+        let history: Vec<String> = (0..MAX_BANG_COMMANDS + 50)
+            .map(|index| format!("!cmd{index}"))
+            .collect();
+        let commands = bang_history(&history);
+        assert_eq!(commands.len(), MAX_BANG_COMMANDS);
+        assert_eq!(commands[0], format!("cmd{}", MAX_BANG_COMMANDS + 49));
     }
 }

@@ -966,11 +966,17 @@ pub(crate) fn rewind_targets(session: &Session) -> Vec<(usize, String)> {
         .enumerate()
         .filter(|(_, m)| m.role == MessageRole::User)
         .map(|(idx, m)| {
-            let text = crate::session::shell_interaction_command(&m.content)
-                .map(|command| format!("[shell] {command}"))
-                .unwrap_or_else(|| m.content.to_string());
-            let preview: String = text.chars().take(80).collect();
-            (idx, preview.replace('\n', " "))
+            let text: std::borrow::Cow<str> =
+                match crate::session::shell_interaction_command(&m.content) {
+                    Some(command) => format!("[shell] {command}").into(),
+                    None => std::borrow::Cow::Borrowed(&*m.content),
+                };
+            let preview: String = text
+                .chars()
+                .take(80)
+                .map(|c| if c == '\n' { ' ' } else { c })
+                .collect();
+            (idx, preview)
         })
         .collect()
 }

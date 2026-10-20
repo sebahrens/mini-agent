@@ -53,6 +53,13 @@ const MAX_MATCHES: usize = 50;
 /// A finished walk up to this old is shown at once while a background walk
 /// revalidates it; an older one is dropped and the picker walks from scratch.
 const WALK_REUSE_STALE: std::time::Duration = std::time::Duration::from_secs(600);
+/// A cached walk younger than this is shown as is, without a background
+/// re-walk: files created in the last couple of seconds appear on the next
+/// activation after the window.
+const WALK_REVALIDATE_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+/// Batches between workspace-binding checks inside a walk (40 x 25 = 1000
+/// entries). The first batch and the end of the walk are always checked.
+const VALIDATE_EVERY_BATCHES: usize = 40;
 /// Walk results kept, one per root.
 const WALK_SNAPSHOTS: usize = 4;
 
@@ -120,7 +127,9 @@ fn remember_walk(root: PathBuf, entries: Vec<CacheEntry>) {
     let mut cache = WALK_SNAPSHOT_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.retain(|snapshot| snapshot.root != root);
+    cache.retain(|snapshot| {
+        snapshot.root != root && snapshot.finished.elapsed() <= WALK_REUSE_STALE
+    });
     if cache.len() >= WALK_SNAPSHOTS {
         cache.remove(0);
     }
@@ -131,13 +140,35 @@ fn remember_walk(root: PathBuf, entries: Vec<CacheEntry>) {
     });
 }
 
+/// Drops walk snapshots too old to be shown, releasing their lists.
+fn evict_stale_walks() {
+    WALK_SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|snapshot| snapshot.finished.elapsed() <= WALK_REUSE_STALE);
+}
+
+/// Test-only: pretend the remembered walk of `root` finished `by` earlier.
+#[cfg(test)]
+fn backdate_snapshot(root: &Path, by: std::time::Duration) {
+    let mut cache = WALK_SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(snapshot) = cache.iter_mut().find(|snapshot| snapshot.root == root) {
+        snapshot.finished -= by;
+    }
+}
+
 /// One walked (or virtual) entry. The lowercase form and the directory flag
 /// are computed once, in the walk thread, so filtering is an allocation-free
-/// `contains` and drawing never touches the filesystem.
+/// `contains` and drawing never touches the filesystem. Text is shared, so
+/// cloning an entry (snapshot, picker, walk accumulator) is refcount bumps.
 #[derive(Clone)]
 pub(crate) struct CacheEntry {
-    path: PathBuf,
-    lower: String,
+    /// The path as shown (relative for walked entries).
+    text: Arc<str>,
+    /// Lowercase form; `None` when `text` is already lowercase.
+    lower: Option<Arc<str>>,
     is_dir: bool,
     kind: EntryKind,
     /// Display-only detail drawn dimmed after a mention row (a persona's
@@ -161,14 +192,21 @@ pub(crate) enum EntryKind {
 }
 
 impl CacheEntry {
+    #[cfg(test)]
     fn new(path: PathBuf, is_dir: bool) -> Self {
         Self::with_kind(path, is_dir, EntryKind::Path)
     }
 
+    #[cfg(any(test, feature = "mcp", feature = "subagents"))]
     fn with_kind(path: PathBuf, is_dir: bool, kind: EntryKind) -> Self {
-        let lower = path.to_string_lossy().to_lowercase();
+        Self::from_text(Arc::from(path.to_string_lossy().as_ref()), is_dir, kind)
+    }
+
+    fn from_text(text: Arc<str>, is_dir: bool, kind: EntryKind) -> Self {
+        let lowered = text.to_lowercase();
+        let lower = (lowered != *text).then(|| Arc::from(lowered));
         CacheEntry {
-            path,
+            text,
             lower,
             is_dir,
             kind,
@@ -383,6 +421,10 @@ impl FilePicker {
                     self.loading = true;
                     return;
                 }
+                if finished.elapsed() < WALK_REVALIDATE_MIN {
+                    self.loading = false;
+                    return;
+                }
                 self.refresh = Some(Vec::new());
             }
             #[cfg(test)]
@@ -399,11 +441,16 @@ impl FilePicker {
                 let _running = running;
                 let mut all = Vec::new();
                 let finished = if let Some(workspace) = workspace {
+                    let mut batches = 0usize;
                     workspace.validate().is_ok()
                         && walk_entries_streaming(workspace.root(), &cancel, |batch| {
                             all.extend(batch.iter().cloned());
-                            workspace.validate().is_ok() && tx.send(batch).is_ok()
+                            batches += 1;
+                            (!batches.is_multiple_of(VALIDATE_EVERY_BATCHES) || workspace.validate().is_ok())
+                                && tx.send(batch).is_ok()
                         })
+                        // A replaced root is never remembered or completed.
+                        && workspace.validate().is_ok()
                 } else {
                     walk_entries_streaming(Path::new("."), &cancel, |batch| {
                         all.extend(batch.iter().cloned());
@@ -423,10 +470,12 @@ impl FilePicker {
     fn load_files_sync(&mut self) {
         if let Some(workspace) = &self.walk_workspace {
             let mut files = Vec::new();
+            let mut batches = 0usize;
             walk_entries_streaming(workspace.root(), &AtomicBool::new(false), |batch| {
-                if workspace.validate().is_err() {
+                if batches.is_multiple_of(VALIDATE_EVERY_BATCHES) && workspace.validate().is_err() {
                     return false;
                 }
+                batches += 1;
                 files.extend(batch);
                 true
             });
@@ -452,6 +501,7 @@ impl FilePicker {
         self.loading = false;
         self.refresh = None;
         self.waiting = None;
+        evict_stale_walks();
     }
 
     /// Whether the background walk is still streaming paths.
@@ -611,8 +661,13 @@ impl FilePicker {
         for entry in self.file_cache.iter().skip(start) {
             #[cfg(test)]
             count_filter(1, false);
-            if entry.lower.contains(query) {
-                self.matches.push(entry.path.clone());
+            if entry
+                .lower
+                .as_deref()
+                .unwrap_or(&entry.text)
+                .contains(query)
+            {
+                self.matches.push(PathBuf::from(&*entry.text));
                 self.match_dirs.push(entry.is_dir);
                 self.match_kinds.push(entry.kind);
                 self.match_descriptions.push(entry.description.clone());
@@ -733,7 +788,12 @@ pub(crate) fn walk_files_streaming(
     mut emit: impl FnMut(Vec<PathBuf>) -> bool,
 ) {
     let _ = walk_entries_streaming(Path::new(root), cancel, |batch| {
-        emit(batch.into_iter().map(|entry| entry.path).collect())
+        emit(
+            batch
+                .into_iter()
+                .map(|entry| PathBuf::from(&*entry.text))
+                .collect(),
+        )
     });
 }
 
@@ -776,14 +836,16 @@ fn walk_entries_streaming(
             _ => continue,
         };
         let rel = path.strip_prefix(root).unwrap_or(path);
-        let rel = rel
-            .to_string_lossy()
-            .trim_start_matches(['/', '\\'])
-            .to_string();
+        let rel = rel.to_string_lossy();
+        let rel = rel.trim_start_matches(['/', '\\']);
         if rel.is_empty() {
             continue;
         }
-        batch.push(CacheEntry::new(PathBuf::from(rel), !is_file));
+        batch.push(CacheEntry::from_text(
+            Arc::from(rel),
+            !is_file,
+            EntryKind::Path,
+        ));
         entries += 1;
         if is_file {
             files += 1;
@@ -895,6 +957,12 @@ mod cache_tests {
         assert_eq!(take_walks_started(), 1);
 
         std::fs::write(root.path().join("second.txt"), "").unwrap();
+        // Inside the revalidation window a press only shows the snapshot.
+        let mut young = FilePicker::new();
+        young.activate_for_add(Some(binding.clone()));
+        assert_eq!(take_walks_started(), 0, "young snapshot starts no walk");
+        assert!(!young.is_loading());
+        backdate_snapshot(binding.root(), WALK_REVALIDATE_MIN * 2);
         // The next press shows the cached list at once and starts exactly
         // one background walk.
         let mut second = FilePicker::new();
@@ -918,6 +986,53 @@ mod cache_tests {
             picker.set_add_argument(5, "second");
             assert_eq!(picker.matches, vec![PathBuf::from("second.txt")]);
         }
+    }
+
+    #[tokio::test]
+    async fn a_large_add_walk_validates_the_workspace_rarely_and_shares_entry_text() {
+        let root = crate::tests::OwnedTestDirectory::new("file-picker-validate-rarely");
+        for index in 0..2_000 {
+            std::fs::write(root.path().join(format!("f{index}.txt")), "").unwrap();
+        }
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let before = binding.validation_count();
+        let mut picker = FilePicker::new();
+        picker.activate_for_add(Some(binding.clone()));
+        // Wait on the walk thread's completion flag, not on UI polls (each
+        // poll validates the binding by design).
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !picker.walk_complete.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("walk finishes");
+        // activate + walk start + one per 1000 entries + the end.
+        let walk_validates = binding.validation_count() - before;
+        assert!(walk_validates <= 6, "validated {walk_validates} times");
+        finish_walk(&mut picker).await;
+        let (snapshot, _) = cached_walk(binding.root()).expect("walk remembered");
+        assert_eq!(snapshot.len(), 2_000);
+        let mut second = FilePicker::new();
+        second.file_cache = snapshot.clone();
+        assert!(Arc::ptr_eq(&snapshot[0].text, &second.file_cache[0].text));
+    }
+
+    #[test]
+    fn stale_snapshots_are_evicted_when_another_root_is_remembered() {
+        let stale = PathBuf::from("/nonexistent/stale-root-vb5vw33");
+        let fresh = PathBuf::from("/nonexistent/fresh-root-vb5vw33");
+        remember_walk(
+            stale.clone(),
+            vec![CacheEntry::new(PathBuf::from("a"), false)],
+        );
+        backdate_snapshot(&stale, WALK_REUSE_STALE * 2);
+        remember_walk(fresh.clone(), Vec::new());
+        let cache = WALK_SNAPSHOT_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(cache.iter().all(|snapshot| snapshot.root != stale));
+        assert!(cache.iter().any(|snapshot| snapshot.root == fresh));
     }
 
     #[tokio::test]
