@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 const DIRS_ASKED_FILE: &str = "dirs_asked_architecture.txt";
 
 fn dirs_asked_path() -> PathBuf {
-    let dir = crate::paths::process_paths()
+    let dir = crate::paths::process_paths_ref()
         .expect("startup must initialize application paths")
         .archmd_state_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {

@@ -6,7 +6,7 @@ use include_dir::{Dir, include_dir};
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/data/prompts");
 
 pub fn global_dir() -> PathBuf {
-    crate::paths::process_paths()
+    crate::paths::process_paths_ref()
         .expect("startup must initialize application paths")
         .prompts_dir()
 }
@@ -407,14 +407,16 @@ fn readable_project_prompts(
 }
 
 pub fn load() -> HashMap<String, String> {
-    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
-    load_with_paths(&paths)
+    let paths =
+        crate::paths::process_paths_ref().expect("startup must initialize application paths");
+    load_with_paths(paths)
 }
 
 pub(crate) fn load_for_workspace_binding(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> HashMap<String, String> {
-    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
+    let paths =
+        crate::paths::process_paths_ref().expect("startup must initialize application paths");
     let user = crate::context::load_dir_files(&paths.prompts_dir(), "md");
     let project_dir = std::path::Path::new(".zerostack/prompts");
     let project = workspace.validate().map_err(std::io::Error::other)
@@ -430,7 +432,7 @@ pub(crate) fn load_for_workspace_binding(
     let project_trusted = workspace_paths
         .as_ref()
         .is_some_and(|paths| project_prompts_trusted(paths, workspace));
-    let variables = PromptVariables::from_paths(workspace_paths.as_ref().unwrap_or(&paths));
+    let variables = PromptVariables::from_paths(workspace_paths.as_ref().unwrap_or(paths));
     finalize_prompts(
         merge_sources(
             user,

@@ -940,7 +940,7 @@ async fn usd_budget_native_actual_task_batch_held_children_keep_independent_prof
     let _env = crate::tests::ScopedProcessEnv::set(&bindings);
     std::fs::write(root.path().join("read-a.txt"), "OWNED_CHILD_READ_A").unwrap();
     std::fs::write(root.path().join("read-b.txt"), "OWNED_CHILD_READ_B").unwrap();
-    let paths = crate::paths::process_paths().unwrap();
+    let paths = crate::paths::process_paths_ref().unwrap();
     std::fs::create_dir_all(paths.agents_dir()).unwrap();
     std::fs::write(
         paths.agents_dir().join("cost-fixture.md"),
@@ -1108,7 +1108,7 @@ async fn usd_budget_actual_saved_session_fork_preserves_uncertainty_without_impo
             source.set_input_output_prices(Some((1.0, 2.0)));
             source.initialize_spend_account(None).unwrap();
             let original_id = source.id.clone();
-            let ledger = Ledger::new(&crate::paths::process_paths().unwrap().state_dir);
+            let ledger = Ledger::new(&crate::paths::process_paths_ref().unwrap().state_dir);
             if case == "unread" {
                 source.spend_account.tracking_failed();
             } else {
@@ -1201,7 +1201,7 @@ fn held_ledger_flush_child(root: &std::path::Path) -> ! {
         cfg["model"] = serde_json::json!("cost-fixture");
         cfg["session_title_model"] = serde_json::json!("off");
         cfg["no_tools"] = serde_json::json!(true);
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
         let cfg: Config = serde_json::from_value(cfg).unwrap();
         crate::fs::atomic_create_sync(&paths.config_file(), toml::to_string(&cfg).unwrap().as_bytes()).unwrap();

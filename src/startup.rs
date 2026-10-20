@@ -5570,7 +5570,7 @@ mod tests {
         ]);
         let workspace =
             std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         for continue_session in [false, true] {
             let mut saved = Session::new("openrouter", "saved-model", 128_000, "original");
             saved.working_dir = workspace.root().to_string_lossy().into();
@@ -5703,7 +5703,7 @@ mod tests {
         ]);
         let workspace =
             std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         for continue_session in [false, true] {
             for ephemeral in [false, true] {
                 let mut saved = Session::new("openrouter", "saved-model", 128_000, "old-name");
@@ -5899,7 +5899,7 @@ mod native_publication_startup_tests {
                 let workspace = std::sync::Arc::new(
                     crate::paths::WorkspaceBinding::capture(root.path()).unwrap(),
                 );
-                let paths = crate::paths::process_paths().unwrap();
+                let paths = crate::paths::process_paths_ref().unwrap();
                 let mut saved = Session::new("anthropic", "claude-fixture", 32_000, "old");
                 saved.working_dir = workspace.root().to_string_lossy().into();
                 saved.add_message(crate::session::MessageRole::User, "unchanged prior turn");

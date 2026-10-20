@@ -143,8 +143,8 @@ pub(crate) fn arm_prompt_grant(name: &str, context: &ContextFiles, permission: &
     let Some(perm) = permission else {
         return;
     };
-    let offer = crate::paths::process_paths().ok().and_then(|paths| {
-        crate::context::prompts::prompt_grant_offer(&context.prompts, name, &paths)
+    let offer = crate::paths::process_paths_ref().ok().and_then(|paths| {
+        crate::context::prompts::prompt_grant_offer(&context.prompts, name, paths)
     });
     perm.lock()
         .unwrap_or_else(|e| e.into_inner())

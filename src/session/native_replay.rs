@@ -1651,7 +1651,7 @@ mod refusal_storage_tests {
             .native_frontier
             .refuse_expected(0, RestartReason::UnavailableSource)
             .unwrap();
-        let sessions = crate::paths::process_paths().unwrap().sessions_dir();
+        let sessions = crate::paths::process_paths_ref().unwrap().sessions_dir();
         crate::paths::ensure_private_directory(&sessions).unwrap();
         let target = sessions.join(format!("{}.json", session.id));
         std::fs::create_dir(&target).unwrap();

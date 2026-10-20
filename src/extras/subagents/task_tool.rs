@@ -3778,7 +3778,7 @@ mod tests {
                 Some(root.path().join("config").into_os_string()),
             ),
         ]);
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         crate::paths::ensure_private_directory(&paths.agents_dir()).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -3876,7 +3876,7 @@ mod tests {
                 Some(root.path().join("config").into_os_string()),
             ),
         ]);
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         crate::paths::ensure_private_directory(&paths.agents_dir()).unwrap();
         crate::fs::private_atomic_write_sync(&paths.agents_dir().join("implementer.md"),
             b"---\nmode: write\ntools: Read, Edit, Write, Bash\n---\nImplement the delegated objective.").unwrap();

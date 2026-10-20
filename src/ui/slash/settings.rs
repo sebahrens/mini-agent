@@ -58,7 +58,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                 write_error(ctx.renderer, "usage: /cost");
                 return Ok(());
             }
-            let result = match crate::paths::process_paths() {
+            let result = match crate::paths::process_paths_ref() {
                 Ok(paths) => {
                     crate::spend::cost_lines(
                         ctx.session,

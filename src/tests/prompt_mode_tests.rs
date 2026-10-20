@@ -353,7 +353,10 @@ fn prompt_activation_arms_and_switching_clears_the_grant_offer() {
         ("code", "Body."),
     ]);
     let perm = make_perm(SecurityMode::Standard);
-    let config_dir = crate::paths::process_paths().unwrap().config_dir;
+    let config_dir = crate::paths::process_paths_ref()
+        .unwrap()
+        .config_dir
+        .clone();
     let config_file = config_dir
         .join("config.toml")
         .to_string_lossy()

@@ -56,7 +56,7 @@ impl Pipeline {
             ("OPENAI_API_KEY", Some(OsString::from(VENDOR_OPENAI_KEY))),
             ("EXAMPLE_GLM_API_KEY", glm_key.map(OsString::from)),
         ]);
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         crate::paths::ensure_private_directory(&paths.agents_dir()).unwrap();
         for (name, body) in [
             ("designer", DESIGNER),

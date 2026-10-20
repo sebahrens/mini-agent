@@ -377,7 +377,7 @@ impl Mem {
     /// and a project slug derived from the startup workspace.
     pub fn open() -> Self {
         let paths =
-            crate::paths::process_paths().expect("startup must initialize application paths");
+            crate::paths::process_paths_ref().expect("startup must initialize application paths");
         let root = paths.memory_dir();
         let project_root = paths
             .project_dir

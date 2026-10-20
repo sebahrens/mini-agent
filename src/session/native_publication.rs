@@ -3203,7 +3203,7 @@ mod tests {
             assert!(restored.spend_account.snapshot().tracking_error);
             assert_eq!(restored.recorded_total_cost(), 0.0);
             let ledger =
-                crate::spend::Ledger::new(&crate::paths::process_paths().unwrap().state_dir);
+                crate::spend::Ledger::new(&crate::paths::process_paths_ref().unwrap().state_dir);
             assert_eq!(
                 ledger
                     .summary_for_session(&restored.id)

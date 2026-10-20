@@ -53,7 +53,7 @@ pub struct ChatHistoryEntry {
 }
 
 fn chat_history_path() -> PathBuf {
-    crate::paths::process_paths()
+    crate::paths::process_paths_ref()
         .expect("startup must initialize application paths")
         .chat_history_file()
 }

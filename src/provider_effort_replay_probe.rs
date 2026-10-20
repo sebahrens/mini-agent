@@ -2747,7 +2747,7 @@ async fn native_refused_checkpoint_controls(interactive: bool) {
     loaded.initialize_spend_account(Some(1.0)).unwrap();
     assert!(loaded.spend_account.snapshot().tracking_error);
     assert!((loaded.recorded_total_cost() - 0.000028).abs() < 1e-12);
-    let ledger = crate::spend::Ledger::new(&crate::paths::process_paths().unwrap().state_dir);
+    let ledger = crate::spend::Ledger::new(&crate::paths::process_paths_ref().unwrap().state_dir);
     let summary = ledger.summary_for_session(&loaded.id).unwrap();
     assert_eq!(summary.session.records, 1);
     assert!((summary.session.known_cost - 0.000028).abs() < 1e-12);
@@ -2868,7 +2868,7 @@ async fn effort46_restored_inflight_after_opened_unobserved_http_keeps_account_i
         (restored.total_input_tokens, restored.total_output_tokens),
         (0, 0)
     );
-    let ledger = crate::spend::Ledger::new(&crate::paths::process_paths().unwrap().state_dir);
+    let ledger = crate::spend::Ledger::new(&crate::paths::process_paths_ref().unwrap().state_dir);
     assert_eq!(
         ledger
             .summary_for_session(&restored.id)
@@ -3027,7 +3027,7 @@ async fn native_headless_frontend_control(
         "quick_models":{"native-test":{"provider":"effort-probe","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
     })).unwrap();
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
-    let paths = crate::paths::process_paths().unwrap();
+    let paths = crate::paths::process_paths_ref().unwrap();
     let mut id = None;
     for (round, prompt) in ["first literal user input", "second literal user input"]
         .into_iter()
@@ -3609,7 +3609,7 @@ async fn native_tui_frontend_control(
         ..Default::default()
     };
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
-    let paths = crate::paths::process_paths().unwrap();
+    let paths = crate::paths::process_paths_ref().unwrap();
     #[cfg(feature = "agent-skills")]
     let _immutable_cleanup =
         crate::extras::skills::session::ImmutableFixtureCleanup(roots.path().to_path_buf());
@@ -3970,7 +3970,7 @@ async fn effort46_actual_session_start_context_resumes_saved_native_prefix() {
         "quick_models":{"startup-test":{"provider":"native-startup","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
     })).unwrap();
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
-    let paths = crate::paths::process_paths().unwrap();
+    let paths = crate::paths::process_paths_ref().unwrap();
     struct Release(Option<String>);
     impl Drop for Release {
         fn drop(&mut self) {
@@ -4228,7 +4228,7 @@ async fn native_steering79_case(stop_at_boundary: bool) {
         );
     }
     assert_eq!(
-        crate::spend::Ledger::new(&crate::paths::process_paths().unwrap().state_dir)
+        crate::spend::Ledger::new(&crate::paths::process_paths_ref().unwrap().state_dir)
             .summary_for_session(&sid)
             .unwrap()
             .session
@@ -4285,7 +4285,7 @@ async fn effort46_live_headless_resume_uses_persisted_main_override() {
         "quick_models":{"effort-model":{"provider":"effort-headless","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
     })).unwrap();
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
-    let paths = crate::paths::process_paths().unwrap();
+    let paths = crate::paths::process_paths_ref().unwrap();
     let mut seed = crate::session::Session::new("effort-headless", "claude-opus-5-5", 128_000, "");
     seed.working_dir = workspace.root().to_string_lossy().into_owned().into();
     seed.reasoning_controls.effort = Some(crate::config::types::ReasoningEffort::Max);
@@ -4544,7 +4544,7 @@ async fn cache71_memory_native_roundtrip(legacy: bool) {
         "quick_models":{"cache71-model":{"provider":"cache71-memory","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
     })).unwrap();
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
-    let paths = crate::paths::process_paths().unwrap();
+    let paths = crate::paths::process_paths_ref().unwrap();
     let mut seed = crate::session::Session::new("cache71-memory", "claude-opus-5-5", 128_000, "");
     seed.working_dir = workspace.root().to_string_lossy().into_owned().into();
     if legacy {

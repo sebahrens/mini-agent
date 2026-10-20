@@ -11,7 +11,7 @@ use crate::ui::utils::{parse_color, to_ansi_256};
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/data/themes");
 
 pub fn global_dir() -> PathBuf {
-    crate::paths::process_paths()
+    crate::paths::process_paths_ref()
         .expect("startup must initialize application paths")
         .themes_dir()
 }

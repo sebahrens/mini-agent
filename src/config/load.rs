@@ -483,7 +483,8 @@ pub(crate) fn pick_existing(dir: &Path) -> PathBuf {
 }
 
 fn resolve_config_path() -> PathBuf {
-    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
+    let paths =
+        crate::paths::process_paths_ref().expect("startup must initialize application paths");
     pick_existing(&paths.config_dir)
 }
 
@@ -4950,8 +4951,8 @@ pub(crate) mod bounded_project_trust_tests {
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&environment);
-        let process = crate::paths::process_paths().unwrap();
-        crate::paths::prepare_storage_roots(&process).unwrap();
+        let process = crate::paths::process_paths_ref().unwrap();
+        crate::paths::prepare_storage_roots(process).unwrap();
         let paths = process.with_workspace_root(&workspace_root).unwrap();
         std::fs::create_dir_all(workspace_root.join(".zerostack/prompts")).unwrap();
         std::fs::create_dir_all(workspace_root.join(".zerostack/agents")).unwrap();

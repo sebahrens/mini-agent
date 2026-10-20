@@ -6,7 +6,7 @@ pub(crate) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         super::write_error(ctx.renderer, "usage: /doctor");
         return Ok(());
     }
-    let Ok(paths) = crate::paths::process_paths() else {
+    let Ok(paths) = crate::paths::process_paths_ref() else {
         super::write_error(ctx.renderer, "application paths are unavailable");
         return Ok(());
     };
@@ -19,7 +19,7 @@ pub(crate) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
     let mut report = crate::diagnostics::DoctorReport::capture_with_mcp_count(
         ctx.cli,
         ctx.cfg,
-        &paths,
+        paths,
         Some(ctx.session),
         Some(ctx.sandbox),
         false,

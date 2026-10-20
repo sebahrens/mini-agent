@@ -2065,7 +2065,8 @@ fn sandbox_profile_entry(cli: &cli::Cli, cfg: &config::Config) -> (&'static str,
 pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<()> {
     let rules_cfg =
         crate::permission::cli_rules::report_config(cli, cfg).map_err(io::Error::other)?;
-    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
+    let paths =
+        crate::paths::process_paths_ref().expect("startup must initialize application paths");
     let config_dir = paths.config_dir.clone();
     let data_dir = paths.data_dir.clone();
     let sessions_dir = paths.sessions_dir();

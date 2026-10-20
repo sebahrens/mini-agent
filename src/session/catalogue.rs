@@ -175,7 +175,7 @@ fn list_mode(
         return Ok(catalogue);
     }
     let directory = if readonly {
-        let directory = crate::paths::process_paths()
+        let directory = crate::paths::process_paths_ref()
             .expect("startup captures paths")
             .sessions_dir();
         match std::fs::symlink_metadata(&directory) {
@@ -433,7 +433,7 @@ mod tests {
         let root = crate::tests::OwnedTestDirectory::new("readonly-catalogue67");
         let _env = environment(&root);
         let binding = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
-        let directory = crate::paths::process_paths().unwrap().sessions_dir();
+        let directory = crate::paths::process_paths_ref().unwrap().sessions_dir();
         assert!(list_readonly(&binding, false).unwrap().rows.is_empty());
         assert!(!directory.exists());
         let session = stored(root.path(), "Saved bounded title");

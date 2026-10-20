@@ -958,7 +958,7 @@ mod file_read_diagnostic_tests {
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         let workspace_dir = root.path().join("workspace");
         let project_prompts = workspace_dir.join(".zerostack/prompts");
         for directory in [
@@ -1074,8 +1074,8 @@ mod startup_binding_load_tests {
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&environment);
-        let process = crate::paths::process_paths().unwrap();
-        crate::paths::prepare_storage_roots(&process).unwrap();
+        let process = crate::paths::process_paths_ref().unwrap();
+        crate::paths::prepare_storage_roots(process).unwrap();
         let workspace = crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap();
 
         PROMPT_DIR_READS.with(|reads| reads.set(0));

@@ -548,7 +548,7 @@ fn production_worker_args() -> &'static [&'static str] {
 }
 
 fn publication_root() -> Result<PathBuf, WorkerLaunchError> {
-    let paths = crate::paths::process_paths().map_err(|error| WorkerLaunchError::Io {
+    let paths = crate::paths::process_paths_ref().map_err(|error| WorkerLaunchError::Io {
         backend: BACKEND,
         source: io::Error::other(error.to_string()),
     })?;
@@ -1190,9 +1190,9 @@ fn probe_guardian_parent_death(
     let publication_root =
         publication_root().map_err(|error| io::Error::other(error.to_string()))?;
     let process_paths =
-        crate::paths::process_paths().map_err(|error| io::Error::other(error.to_string()))?;
+        crate::paths::process_paths_ref().map_err(|error| io::Error::other(error.to_string()))?;
     let mut command = Command::new(executable);
-    configure_parent_death_canary_command(&mut command, probes, &process_paths);
+    configure_parent_death_canary_command(&mut command, probes, process_paths);
     let output = command
         .output()
         .inspect_err(|_error| report_preflight_token("MACOS_PARENT_DEATH_FAILED=child_spawn"))?;

@@ -16,14 +16,14 @@ pub(super) struct HostFilesystem {
 }
 
 pub(super) fn private_paths() -> Result<Vec<PathBuf>, String> {
-    let paths = crate::paths::process_paths()
+    let paths = crate::paths::process_paths_ref()
         .map_err(|_| "sandbox profile: private application paths are unavailable")?;
     let mut denied = vec![
-        paths.config_dir,
-        paths.credentials_dir,
-        paths.state_dir,
-        paths.data_dir,
-        paths.local_data_dir,
+        paths.config_dir.clone(),
+        paths.credentials_dir.clone(),
+        paths.state_dir.clone(),
+        paths.data_dir.clone(),
+        paths.local_data_dir.clone(),
     ];
     let home =
         crate::paths::process_home_dir().ok_or("sandbox profile: home directory is unavailable")?;
@@ -333,7 +333,7 @@ pub(super) fn protected_host_paths() -> Result<Vec<PathBuf>, String> {
 pub(super) fn protected_host_paths_from(
     mut protected: Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
-    let paths = crate::paths::process_paths()
+    let paths = crate::paths::process_paths_ref()
         .map_err(|_| "sandbox profile: private application paths are unavailable")?;
     protected.push(
         paths

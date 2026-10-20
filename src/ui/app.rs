@@ -1826,7 +1826,7 @@ impl<'a> App<'a> {
         }
 
         render_session(&mut renderer, ui.session, ui.cli, ui.cfg, ui.context)?;
-        let marker_path = crate::paths::process_paths()
+        let marker_path = crate::paths::process_paths_ref()
             .expect("startup must initialize application paths")
             .welcome_marker_file();
         if ui.cfg.resolve_always_show_welcome() || !marker_path.exists() {
@@ -10541,7 +10541,7 @@ mod permission_loop_tests {
         }
         crate::session::storage::save_session(&session).unwrap();
         let original_id = session.id.clone();
-        let original_path = crate::paths::process_paths()
+        let original_path = crate::paths::process_paths_ref()
             .unwrap()
             .sessions_dir()
             .join(format!("{original_id}.json"));
@@ -11924,7 +11924,7 @@ mod custom_command_tests {
             .prompts
             .insert("plan".into(), "ONE_SHOT_PLAN".into());
         let original = context.active_selection();
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         std::fs::create_dir_all(paths.config_dir.join("commands")).unwrap();
         std::fs::write(paths.config_dir.join("commands/fix-issue.md"), "---\ndescription: Fix an issue\nmode: plan\nmodel: same\n---\n%%mode=readonly\n/clear !touch injected $1\n$ARGUMENTS").unwrap();
         std::fs::write(
@@ -12705,7 +12705,7 @@ mod usd_budget_app_tests {
             session.initialize_spend_account(None).unwrap();
             let checkpoint = serde_json::to_vec(&session).unwrap();
             let ledger =
-                crate::spend::Ledger::new(&crate::paths::process_paths().unwrap().state_dir);
+                crate::spend::Ledger::new(&crate::paths::process_paths_ref().unwrap().state_dir);
             if case == "ledger-only" {
                 session
                     .spend_account
@@ -12728,14 +12728,14 @@ mod usd_budget_app_tests {
                     .unwrap();
                 ledger.flush(&session.spend_account).unwrap();
             } else if case == "corrupt" {
-                let path = crate::paths::process_paths()
+                let path = crate::paths::process_paths_ref()
                     .unwrap()
                     .state_dir
                     .join("usage.jsonl");
                 crate::fs::private_atomic_create_sync(&path, b"{\"crash\":").unwrap();
             }
             let bytes_before = std::fs::read(
-                crate::paths::process_paths()
+                crate::paths::process_paths_ref()
                     .unwrap()
                     .state_dir
                     .join("usage.jsonl"),
@@ -12789,7 +12789,7 @@ mod usd_budget_app_tests {
             assert!(!app.run.is_running && app.ui.session.messages.is_empty());
             assert_eq!(
                 std::fs::read(
-                    crate::paths::process_paths()
+                    crate::paths::process_paths_ref()
                         .unwrap()
                         .state_dir
                         .join("usage.jsonl")
@@ -12832,7 +12832,7 @@ mod usd_budget_app_tests {
             Session::new("local-test", "test", 128_000, root.path().to_str().unwrap());
         session.set_input_output_prices(Some((2.0, 4.0)));
         session.total_cost = 10.0;
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         let ledger = crate::spend::Ledger::new(&paths.state_dir);
         session.configure_spend(Some(2.0), &ledger).unwrap();
         let receipt = crate::spend::Receipt::new(
@@ -13730,7 +13730,7 @@ mod context_diagnostic_tests {
         context
             .extra_file_contents
             .insert(added.clone(), Arc::new("CAPTURED_EXTRA_界".into()));
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         let suffix = paths.suffix_file();
         std::fs::create_dir_all(suffix.parent().unwrap()).unwrap();
         std::fs::write(&suffix, "CAPTURED_SUFFIX_界").unwrap();
@@ -14540,7 +14540,7 @@ mod plan_approval_tests {
             );
         }
         let sessions = crate::paths::WorkspaceBinding::capture(
-            &crate::paths::process_paths().unwrap().sessions_dir(),
+            &crate::paths::process_paths_ref().unwrap().sessions_dir(),
         )
         .unwrap();
         let saved = crate::session::storage::load_session_exact_read_only(
@@ -14981,7 +14981,7 @@ mod plan_approval_tests {
                 "completed literal turn did not settle"
             );
             let sessions = crate::paths::WorkspaceBinding::capture(
-                &crate::paths::process_paths().unwrap().sessions_dir(),
+                &crate::paths::process_paths_ref().unwrap().sessions_dir(),
             )
             .unwrap();
             saved.push(
@@ -14996,7 +14996,7 @@ mod plan_approval_tests {
         }
         #[cfg(feature = "hooks")]
         if stale_end {
-            let path = crate::paths::process_paths()
+            let path = crate::paths::process_paths_ref()
                 .unwrap()
                 .sessions_dir()
                 .join(format!("{}.json", app.ui.session.id));
@@ -15026,7 +15026,7 @@ mod plan_approval_tests {
         let mut app = owned_app(ui);
         let load = |app: &App<'_>| {
             let sessions = crate::paths::WorkspaceBinding::capture(
-                &crate::paths::process_paths().unwrap().sessions_dir(),
+                &crate::paths::process_paths_ref().unwrap().sessions_dir(),
             )
             .unwrap();
             crate::session::storage::load_session_exact_read_only(
@@ -15212,7 +15212,7 @@ mod plan_approval_tests {
             assert_eq!(selected.selected.len(), 1);
             generations.push(selected.generation);
             let sessions = crate::paths::WorkspaceBinding::capture(
-                &crate::paths::process_paths().unwrap().sessions_dir(),
+                &crate::paths::process_paths_ref().unwrap().sessions_dir(),
             )
             .unwrap();
 
@@ -15741,7 +15741,7 @@ mod plan_approval_tests {
                 let cfg = provider.config();
                 let cli = crate::cli::Cli { no_session: true, no_tools: true, no_context_files: true, api_key: Some("unused-local-key".into()), ..Default::default() };
                 let workspace = roots.workspace();
-                let paths = crate::paths::process_paths().unwrap();
+                let paths = crate::paths::process_paths_ref().unwrap();
                 let config = workspace.root().join(".zerostack/config.toml");
                 std::fs::create_dir_all(config.parent().unwrap()).unwrap();
                 std::fs::write(&config, "model='fixture'\n").unwrap();
@@ -15816,7 +15816,7 @@ mod plan_approval_tests {
                 ..Default::default()
             };
             let workspace = roots.workspace();
-            let paths = crate::paths::process_paths().unwrap();
+            let paths = crate::paths::process_paths_ref().unwrap();
             let package = roots.directory.path().join("reviewer");
             std::fs::create_dir_all(&package).unwrap();
             std::fs::write(
@@ -15824,7 +15824,7 @@ mod plan_approval_tests {
                 "---\nname: reviewer\ndescription: code review\n---\nSEARCH_SELECTED_INSTRUCTION\n",
             )
             .unwrap();
-            crate::extras::skills::import_agent_skill(&package, &paths).unwrap();
+            crate::extras::skills::import_agent_skill(&package, paths).unwrap();
             let mut files = crate::context::load(true).for_workspace_binding(true, &workspace);
             let mut session = Session::new(
                 "plan80",
@@ -15922,7 +15922,7 @@ mod plan_approval_tests {
             ..Default::default()
         };
         let workspace = roots.workspace();
-        let paths = crate::paths::process_paths().unwrap();
+        let paths = crate::paths::process_paths_ref().unwrap();
         let package = roots.directory.path().join("reviewer");
         std::fs::create_dir_all(&package).unwrap();
         std::fs::write(
@@ -15930,7 +15930,7 @@ mod plan_approval_tests {
             "---\nname: reviewer\ndescription: code review\n---\nPIN_RAW_GUARDED\n",
         )
         .unwrap();
-        crate::extras::skills::import_agent_skill(&package, &paths).unwrap();
+        crate::extras::skills::import_agent_skill(&package, paths).unwrap();
         let mut files = crate::context::load(true).for_workspace_binding(true, &workspace);
         let mut session = Session::new(
             "plan80",
@@ -18675,7 +18675,7 @@ mod config_editor68_tests {
                 let _environment=crate::tests::ScopedProcessEnv::set(&environment);
                 let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
                 let mut cfg:crate::config::Config=serde_json::from_value(serde_json::json!({"max_tokens":51,"custom_providers":{"editor68":{"provider_type":"openai","base_url":format!("http://{address}/v1"),"api_style":"completions"}}})).unwrap();
-                let paths=crate::paths::process_paths().unwrap();let global=paths.config_dir.join("config.toml");
+                let paths=crate::paths::process_paths_ref().unwrap();let global=paths.config_dir.join("config.toml");
                 crate::fs::private_atomic_write_sync(&global,b"model='disk-model'\nmax_tokens=51\n").unwrap();cfg.provenance.global_file=Some(global.clone());
                 let cli=crate::cli::Cli {no_session:true,no_context_files:true,max_tokens:Some(999),..Default::default()};
                 let workspace=Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());

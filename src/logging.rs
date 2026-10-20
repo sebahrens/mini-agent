@@ -15,7 +15,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::cli::Cli;
 
 pub fn crash_log_dir() -> PathBuf {
-    crate::paths::process_paths()
+    crate::paths::process_paths_ref()
         .expect("startup must initialize application paths")
         .crash_logs_dir()
 }
@@ -89,7 +89,7 @@ pub fn resolve_log_path(cli: &Cli) -> Option<PathBuf> {
         return None;
     }
     if cli.verbose {
-        let logs_dir = crate::paths::process_paths()
+        let logs_dir = crate::paths::process_paths_ref()
             .expect("startup must initialize application paths")
             .logs_dir();
         ensure_private_log_directory(&logs_dir).ok();

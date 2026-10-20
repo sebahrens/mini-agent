@@ -1304,7 +1304,7 @@ impl SkillSessionServices {
         embedding: Option<EmbeddingConfig>,
         enable_proposals: bool,
     ) -> Result<Arc<Self>, String> {
-        let paths = match crate::paths::process_paths()
+        let paths = match crate::paths::process_paths_ref()
             .and_then(|paths| paths.with_workspace_root(&workspace_root))
         {
             Ok(paths) => paths,
