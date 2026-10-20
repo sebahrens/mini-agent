@@ -188,7 +188,7 @@ pub(crate) async fn handle(text: &str, ctx: &mut SlashCtx<'_>) -> anyhow::Result
         );
         return Ok(());
     }
-    let paths = match crate::paths::process_paths() {
+    let paths = match crate::paths::process_paths_ref() {
         Ok(paths) => paths,
         Err(_) => {
             write_error(ctx.renderer, editor::ERROR);

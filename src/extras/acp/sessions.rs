@@ -193,7 +193,7 @@ pub(super) async fn handle_load(
                     super::canonical_session_workspace(&requested_cwd)
                         .map_err(|_| anyhow::anyhow!("invalid ACP load workspace"))?,
                 );
-                let paths = crate::paths::process_paths()?;
+                let paths = crate::paths::process_paths_ref()?;
                 let sessions = crate::paths::WorkspaceBinding::capture(&paths.sessions_dir())
                     .map_err(anyhow::Error::msg)?;
                 let session = crate::session::storage::load_session_exact_read_only(

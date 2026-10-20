@@ -138,7 +138,7 @@ fn now() -> anyhow::Result<u64> {
         .as_secs())
 }
 fn root() -> anyhow::Result<PathBuf> {
-    Ok(crate::paths::process_paths()?
+    Ok(crate::paths::process_paths_ref()?
         .credentials_dir
         .join("copilot"))
 }

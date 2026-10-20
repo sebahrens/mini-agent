@@ -451,7 +451,7 @@ pub enum SessionClaim {
 /// The advisory lock file guarding one session's snapshot.
 pub(crate) fn lock_path(session_id: &str) -> anyhow::Result<PathBuf> {
     crate::paths::validate_portable_component(session_id)?;
-    Ok(crate::paths::process_paths()
+    Ok(crate::paths::process_paths_ref()
         .expect("startup must initialize application paths")
         .sessions_dir()
         .join(format!("{session_id}.lock")))

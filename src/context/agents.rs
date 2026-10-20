@@ -795,7 +795,7 @@ pub(crate) fn project_personas_trusted(
 pub(crate) fn untrusted_personas_notice(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> Option<String> {
-    let paths = crate::paths::process_paths().ok()?;
+    let paths = crate::paths::process_paths_ref().ok()?;
     let paths = paths.with_workspace_root(workspace.root()).ok()?;
     if project_definitions_trusted(&paths, workspace) {
         return None;
@@ -977,13 +977,14 @@ fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition>
 ///   → compiled-in default (data/agents/<name>.md)
 #[cfg(any(test, feature = "subagents"))]
 pub fn load() -> HashMap<String, AgentDefinition> {
-    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
+    let paths =
+        crate::paths::process_paths_ref().expect("startup must initialize application paths");
     if let Some(root) = paths.project_dir.as_deref().and_then(Path::parent)
         && let Ok(workspace) = crate::paths::WorkspaceBinding::capture(root)
     {
-        return (*load_for_paths_and_workspace(&paths, &workspace)).clone();
+        return (*load_for_paths_and_workspace(paths, &workspace)).clone();
     }
-    load_base(&paths)
+    load_base(paths)
 }
 
 /// Load agent definitions while resolving project overrides through the same
@@ -1000,8 +1001,9 @@ pub(crate) fn load_for_workspace_binding(
 fn shared_for_workspace_binding(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> std::sync::Arc<HashMap<String, AgentDefinition>> {
-    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
-    load_for_paths_and_workspace(&paths, workspace)
+    let paths =
+        crate::paths::process_paths_ref().expect("startup must initialize application paths");
+    load_for_paths_and_workspace(paths, workspace)
 }
 
 /// Bounded number of (agents directory, workspace root) pairs kept.
@@ -1479,7 +1481,7 @@ pub(crate) fn untrusted_project_persona_exists(
     let (Some(workspace), true) = (workspace, valid_agent_name(name)) else {
         return false;
     };
-    let Ok(paths) = crate::paths::process_paths() else {
+    let Ok(paths) = crate::paths::process_paths_ref() else {
         return false;
     };
     let trusted = paths
@@ -1501,7 +1503,8 @@ pub(crate) fn source_hint_for_workspace(
     name: &str,
     workspace: Option<&crate::paths::WorkspaceBinding>,
 ) -> String {
-    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
+    let paths =
+        crate::paths::process_paths_ref().expect("startup must initialize application paths");
     if !valid_agent_name(name) {
         return "unresolved agent type".to_string();
     }

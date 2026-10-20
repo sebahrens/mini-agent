@@ -2949,12 +2949,12 @@ impl Sandbox {
         if let Some(cache_dir) = cached.as_ref() {
             return Ok(cache_dir.clone());
         }
-        let paths = crate::paths::process_paths()
+        let paths = crate::paths::process_paths_ref()
             .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
         let sandbox_cache = paths.cache_dir.join("sandbox-runtime");
         #[cfg(target_os = "macos")]
         let sandbox_cache =
-            select_macos_runtime_cache(sandbox_cache, &paths, dirs::cache_dir().as_deref())?;
+            select_macos_runtime_cache(sandbox_cache, paths, dirs::cache_dir().as_deref())?;
         crate::fs::ensure_private_directory(&sandbox_cache).map_err(|error| {
             format!(
                 "sandbox: failed to create dedicated sandbox cache {}: {error}",
@@ -2969,7 +2969,7 @@ impl Sandbox {
             "dedicated sandbox cache",
         )?);
         #[cfg(target_os = "macos")]
-        validate_macos_runtime_cache(&cache_dir, &paths)?;
+        validate_macos_runtime_cache(&cache_dir, paths)?;
         *cached = Some(cache_dir.clone());
         Ok(cache_dir)
     }
@@ -3005,7 +3005,7 @@ impl Sandbox {
         let validated_metadata = git_metadata::validate_workspace_aliases(workspace)?;
         let workspace_str = seatbelt_string_literal(workspace, "working directory")?;
         let cache_str = seatbelt_string_literal(cache, "application cache")?;
-        let app_paths = crate::paths::process_paths().map_err(|error| {
+        let app_paths = crate::paths::process_paths_ref().map_err(|error| {
             format!("sandbox: failed to resolve private application paths: {error}")
         })?;
         let private = self.seatbelt_private_inputs()?;
@@ -3020,7 +3020,7 @@ impl Sandbox {
         let mut protected = crate::git::runtime::protected_runtime_paths_reusing(
             launch.and_then(|launch| launch.protected.as_ref()),
         )?;
-        protected.push(app_paths.cache_dir);
+        protected.push(app_paths.cache_dir.clone());
         let protected_denies = private.protected_denies(&protected)?;
         let protected_storage = &protected_denies.storage;
         let roots = match launch {
@@ -10094,13 +10094,13 @@ echo PRIVATE_TEMP_PASS"#,
             .map(|path| (path.as_path(), "private"))
             .collect::<Vec<_>>();
         let private_read_denies = seatbelt_private_read_denies(&private_refs).unwrap();
-        let app_paths = crate::paths::process_paths().unwrap();
+        let app_paths = crate::paths::process_paths_ref().unwrap();
         let credentials_str =
             seatbelt_string_literal(&app_paths.credentials_dir, "credential directory").unwrap();
         let config_str =
             seatbelt_string_literal(&app_paths.config_dir, "configuration directory").unwrap();
         let mut protected = crate::git::runtime::protected_runtime_paths().unwrap();
-        protected.push(app_paths.cache_dir);
+        protected.push(app_paths.cache_dir.clone());
         let storage = seatbelt_private_read_denies(
             &protected
                 .iter()

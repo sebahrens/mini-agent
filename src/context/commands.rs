@@ -288,10 +288,10 @@ fn parse_segments(body: &str) -> Result<Vec<Segment>, String> {
 pub(crate) fn load_for_workspace(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> BTreeMap<String, CommandTemplate> {
-    let Ok(paths) = crate::paths::process_paths() else {
+    let Ok(paths) = crate::paths::process_paths_ref() else {
         return BTreeMap::new();
     };
-    load_for_paths(&paths, workspace)
+    load_for_paths(paths, workspace)
 }
 
 pub(crate) fn load_for_paths(
@@ -389,11 +389,11 @@ pub(crate) fn load_cached<'a>(
     cache: &'a mut CommandCache,
     workspace: &crate::paths::WorkspaceBinding,
 ) -> Option<&'a BTreeMap<String, CommandTemplate>> {
-    let Ok(paths) = crate::paths::process_paths() else {
+    let Ok(paths) = crate::paths::process_paths_ref() else {
         cache.loaded = None;
         return None;
     };
-    Some(load_cached_for_paths(cache, &paths, workspace))
+    Some(load_cached_for_paths(cache, paths, workspace))
 }
 
 /// `(name, description)` of every template, from the stamped cache (the

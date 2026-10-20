@@ -158,7 +158,7 @@ impl GitRunner {
     pub(super) fn discover_guarded() -> Result<Self, String> {
         let approval = super::runtime::bundled_approval()
             .ok_or("publisher-approved Git runtime is unavailable in this build")?;
-        let paths = crate::paths::process_paths()
+        let paths = crate::paths::process_paths_ref()
             .map_err(|_| "guarded Git application paths are unavailable")?;
         let mut roots = super::runtime::model_write_roots()?;
         add_sandbox_cache_root(&mut roots, "runtime startup")?;
@@ -1750,10 +1750,10 @@ fn output_path_bytes(bytes: &[u8]) -> PathBuf {
 }
 
 fn add_sandbox_cache_root(roots: &mut Vec<PathBuf>, operation: &str) -> Result<(), String> {
-    let paths = crate::paths::process_paths()
+    let paths = crate::paths::process_paths_ref()
         .map_err(|_| format!("refusing git {operation}: application paths are unavailable"))?;
     roots.extend(sandbox_cache_roots(
-        &paths,
+        paths,
         dirs::cache_dir().as_deref(),
         operation,
     )?);

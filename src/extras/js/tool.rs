@@ -911,7 +911,8 @@ fn shared_effect_audit() -> Result<SharedEffectAudit, AuditError> {
                 }
             };
             #[cfg(not(test))]
-            let paths = crate::paths::process_paths().map_err(|_| AuditError::PathUnavailable)?;
+            let paths =
+                crate::paths::process_paths_ref().map_err(|_| AuditError::PathUnavailable)?;
             EffectAudit::open(paths.effect_audit())
                 .map(|audit| Arc::new(std::sync::Mutex::new(audit)))
         })

@@ -61,7 +61,7 @@ async fn mcp_http_initialization_honors_deadlines_and_scope_cancellation() {
     ]
     .map(|name| (name, Some(root.0.join(name).into_os_string())));
     let _environment = crate::tests::ScopedProcessEnv::set(&overrides);
-    let paths = crate::paths::process_paths().unwrap();
+    let paths = crate::paths::process_paths_ref().unwrap();
     assert!(paths.credentials_dir.starts_with(&root.0));
     assert!(paths.data_dir.starts_with(&root.0));
     for oauth_enabled in [false, true] {
@@ -71,7 +71,7 @@ async fn mcp_http_initialization_honors_deadlines_and_scope_cancellation() {
                 oauth_enabled.then_some(crate::extras::mcp::config::OAuthConfig::Enabled(true));
             if let Some(oauth) = &oauth {
                 let store = crate::extras::mcp::oauth::FileCredentialStore::for_paths(
-                    &paths,
+                    paths,
                     "silent-server",
                     &url,
                     &oauth.settings().unwrap(),

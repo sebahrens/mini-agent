@@ -80,7 +80,7 @@ pub fn save_round(
     if crate::paths::artifact_disabled("goal transcripts") {
         return;
     }
-    let Ok(paths) = crate::paths::process_paths() else {
+    let Ok(paths) = crate::paths::process_paths_ref() else {
         return;
     };
 

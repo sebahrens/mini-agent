@@ -24,7 +24,7 @@ const EMBEDDED_TOP_LEVEL: &[(&str, &str)] = &[(
 )];
 
 pub fn global_docs_dir() -> PathBuf {
-    crate::paths::process_paths()
+    crate::paths::process_paths_ref()
         .expect("startup must initialize application paths")
         .docs_dir()
 }
