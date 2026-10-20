@@ -247,17 +247,28 @@ fn cached_or_baked(provider: &str, is_custom: bool, key: &ListingKey) -> Option<
     if let Some(hit) = MODEL_CACHE.lock().unwrap().get(key) {
         return Some(hit.models.clone());
     }
-    let entries = (!is_custom)
-        .then(|| crate::models_catalog::catalog_entries(provider))
-        .flatten()?;
-    Some(Arc::from(
-        entries
-            .iter()
-            .filter(|m| crate::provider::is_agent_model(m))
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-    ))
+    if is_custom {
+        return None;
+    }
+    baked_agent_models(provider)
+}
+/// The provider's baked agent models, filtered and cloned once per process:
+/// every listing-cache miss shares the same `Arc`.
+fn baked_agent_models(provider: &str) -> Option<Arc<[ModelEntry]>> {
+    static BAKED: LazyLock<Mutex<HashMap<String, Arc<[ModelEntry]>>>> =
+        LazyLock::new(Default::default);
+    let mut baked = BAKED.lock().unwrap();
+    if let Some(hit) = baked.get(provider) {
+        return Some(hit.clone());
+    }
+    let entries = crate::models_catalog::catalog_entries(provider)?;
+    let shared: Arc<[ModelEntry]> = entries
+        .iter()
+        .filter(|m| crate::provider::is_agent_model(m))
+        .cloned()
+        .collect();
+    baked.insert(provider.to_owned(), shared.clone());
+    Some(shared)
 }
 pub(crate) async fn fetch_models_cached(
     provider: &str,
@@ -1169,6 +1180,14 @@ mod model_cache_tests {
             None,
         )
         .unwrap()
+    }
+    #[test]
+    fn baked_listing_is_built_once_per_provider() {
+        let first = baked_agent_models("anthropic").expect("anthropic is baked");
+        let second = baked_agent_models("anthropic").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!first.is_empty());
+        assert!(baked_agent_models("no-such-provider").is_none());
     }
     #[tokio::test]
     async fn a_failed_listing_is_not_retried_until_refresh_or_ttl() {

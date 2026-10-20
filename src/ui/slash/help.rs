@@ -58,13 +58,14 @@ pub fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) {
     if *ctx.is_running {
         return;
     }
-    let commands = crate::context::commands::load_for_workspace(ctx.workspace);
+    // The stamped cache dispatch already uses: a few stats when nothing changed.
+    let commands = crate::context::commands::described_cached(ctx.custom_commands, ctx.workspace);
     if !commands.is_empty() {
         write_ok(ctx.renderer, "custom prompt commands:");
-        for (name, command) in commands {
+        for (name, description) in commands {
             write_result(
                 ctx.renderer,
-                format!("  /{name} [arguments]  {}", command.description),
+                format!("  /{name} [arguments]  {description}"),
             );
         }
     }

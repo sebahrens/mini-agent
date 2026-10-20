@@ -396,6 +396,24 @@ pub(crate) fn load_cached<'a>(
     Some(load_cached_for_paths(cache, &paths, workspace))
 }
 
+/// `(name, description)` of every template, from the stamped cache (the
+/// `/help` listing); empty when the process paths cannot be resolved.
+pub(crate) fn described_cached(
+    cache: &mut CommandCache,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> Vec<(String, String)> {
+    load_cached(cache, workspace)
+        .map(described)
+        .unwrap_or_default()
+}
+
+fn described(commands: &BTreeMap<String, CommandTemplate>) -> Vec<(String, String)> {
+    commands
+        .iter()
+        .map(|(name, template)| (name.clone(), template.description.clone()))
+        .collect()
+}
+
 fn load_cached_for_paths<'a>(
     cache: &'a mut CommandCache,
     paths: &crate::paths::AppPaths,
@@ -556,6 +574,10 @@ mod tests {
         reads();
         // A second `/` with unchanged directories reads no template.
         load_cached_for_paths(&mut cache, &paths, &workspace);
+        assert_eq!(reads(), 0);
+        // The `/help` listing derives from the same cache and re-reads nothing.
+        let listed = described(load_cached_for_paths(&mut cache, &paths, &workspace));
+        assert_eq!(listed, vec![("fix-issue".to_owned(), "One".to_owned())]);
         assert_eq!(reads(), 0);
         // Adding a template changes the layer and reloads it.
         std::fs::write(commands.join("ship-it.md"), "Ship").unwrap();

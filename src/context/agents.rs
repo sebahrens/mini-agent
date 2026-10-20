@@ -1378,22 +1378,21 @@ pub(crate) fn available_names_for_paths_and_workspace(
     names
 }
 
-/// Sorted `(name, one-line description)` pairs from the same trusted source
-/// as [`available_names_for_workspace`]. The TUI feeds both the `/agent`
-/// sub-picker (names) and the `@agent:` rows (names and descriptions) from
-/// one call so the two never disagree.
+/// The `(name, description)` rows and the write-capable persona names for the
+/// TUI pickers, from one load: the trust check and directory fingerprint run
+/// once instead of once per list.
 #[cfg(feature = "subagents")]
-pub(crate) fn available_described_names_for_workspace(
+pub(crate) fn persona_picker_lists(
     workspace: Option<&crate::paths::WorkspaceBinding>,
-) -> Vec<(String, String)> {
+) -> (Vec<(String, String)>, Vec<String>) {
     let agents = match workspace {
         Some(workspace) => shared_for_workspace_binding(workspace),
         None => std::sync::Arc::new(load()),
     };
-    described_names(&agents)
+    (described_names(&agents), write_names(&agents))
 }
 
-/// [`available_described_names_for_workspace`] against explicit application
+/// [`persona_picker_lists`] rows against explicit application
 /// paths, so tests can change project trust without touching process paths.
 #[cfg(all(test, feature = "subagents"))]
 pub(crate) fn available_described_names_for_paths_and_workspace(
@@ -1403,16 +1402,8 @@ pub(crate) fn available_described_names_for_paths_and_workspace(
     described_names(&load_for_paths_and_workspace(paths, workspace))
 }
 
-/// Sorted names of the personas that declare `mode: write`, so pickers can
-/// label them as write-capable rather than read-only sub-agents.
 #[cfg(feature = "subagents")]
-pub(crate) fn write_persona_names_for_workspace(
-    workspace: Option<&crate::paths::WorkspaceBinding>,
-) -> Vec<String> {
-    let agents = match workspace {
-        Some(workspace) => shared_for_workspace_binding(workspace),
-        None => std::sync::Arc::new(load()),
-    };
+fn write_names(agents: &HashMap<String, AgentDefinition>) -> Vec<String> {
     let mut names: Vec<String> = agents
         .iter()
         .filter(|(_, definition)| definition.mode.as_deref() == Some("write"))

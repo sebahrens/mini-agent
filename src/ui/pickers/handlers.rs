@@ -503,152 +503,160 @@ fn typed_argument(
         && selected.is_none_or(|name| name == query)
 }
 
-pub fn handle_prefixed_key(
-    buffer: &mut CompactString,
-    cursor: &mut usize,
-    picker: &mut ListPicker,
-    prefix: &str,
-    key: KeyEvent,
-) -> bool {
-    let prefix_len = prefix.len();
-    match key.code {
-        KeyCode::Enter
-            if typed_argument(
-                buffer,
-                *cursor,
-                prefix,
-                &picker.query,
-                picker.selected_name(),
-            ) =>
-        {
-            picker.deactivate();
-            false
-        }
+/// How Tab behaves in a query picker: the slash/list pickers insert the
+/// highlighted item, the models picker flips between its two groups.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabBehaviour {
+    Select,
+    ToggleGroup,
+}
 
-        KeyCode::Char(c)
-            if c == '\x08' || (c == 'h' && key.modifiers.contains(KeyModifiers::CONTROL)) =>
-        {
-            if picker.cursor > 0 {
-                picker.backspace();
-                let byte_in_query = picker
-                    .query
-                    .char_indices()
-                    .nth(picker.cursor)
-                    .map(|(i, _)| i)
-                    .unwrap_or(picker.query.len());
-                let remove_pos = prefix_len + byte_in_query;
-                if remove_pos < buffer.len() {
-                    buffer.remove(remove_pos);
-                }
-                *cursor = prev_char_boundary(buffer, *cursor);
-            } else {
-                let after_offset = prefix_len + picker.query.chars().count();
-                if buffer.len() >= after_offset {
-                    let before: String = buffer.chars().take(prefix_len).collect();
-                    let after: String = buffer.chars().skip(after_offset).collect();
-                    *buffer = format!("{}{}", before, after).into();
-                    *cursor = prefix_len;
-                }
-                picker.deactivate();
-            }
-            true
-        }
-        _ if is_ctrl_w(key) => {
-            if picker.cursor == 0 {
-                return handle_prefixed_key(buffer, cursor, picker, prefix, BACKSPACE);
-            }
-            while picker.cursor > 0 && !picker.query.is_empty() {
-                handle_prefixed_key(buffer, cursor, picker, prefix, BACKSPACE);
-            }
-            true
-        }
-        KeyCode::Char(_) if is_modifier_chord(key) => true,
-        KeyCode::Char(c) => {
-            picker.char_input(c);
-            let byte_in_query = picker
-                .query
-                .char_indices()
-                .nth(picker.cursor.saturating_sub(1))
-                .map(|(i, _)| i)
-                .unwrap_or(picker.query.len());
-            let insert_pos = prefix_len + byte_in_query;
-            buffer.insert(insert_pos, c);
-            *cursor += c.len_utf8();
-            true
-        }
-        KeyCode::Backspace => {
-            if picker.cursor > 0 {
-                picker.backspace();
-                let byte_in_query = picker
-                    .query
-                    .char_indices()
-                    .nth(picker.cursor)
-                    .map(|(i, _)| i)
-                    .unwrap_or(picker.query.len());
-                let remove_pos = prefix_len + byte_in_query;
-                if remove_pos < buffer.len() {
-                    buffer.remove(remove_pos);
-                }
-                *cursor = prev_char_boundary(buffer, *cursor);
-                true
-            } else {
-                let after_offset = prefix_len + picker.query.chars().count();
-                if buffer.len() >= after_offset {
-                    let before: String = buffer.chars().take(prefix_len).collect();
-                    let after: String = buffer.chars().skip(after_offset).collect();
-                    *buffer = format!("{}{}", before, after).into();
-                    *cursor = prefix_len;
-                }
-                picker.deactivate();
-                true
-            }
-        }
-        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            picker.select_prev();
-            true
-        }
-        KeyCode::BackTab | KeyCode::Up => {
-            picker.select_prev();
-            true
-        }
-        KeyCode::Down => {
-            picker.select_next();
-            true
-        }
-        KeyCode::Tab if picker.matches.is_empty() => true,
-        KeyCode::Enter | KeyCode::Tab => {
-            if let Some(name) = picker.selected_name() {
-                let after_offset = prefix_len + picker.query.chars().count();
-                let before: String = buffer.chars().take(prefix_len).collect();
-                let after: String = buffer.chars().skip(after_offset).collect();
-                *buffer = format!("{}{}{}", before, name, after).into();
-                *cursor = prefix_len + name.len();
-            }
-            picker.deactivate();
-            true
-        }
-        KeyCode::Esc => {
-            let after_offset = prefix_len + picker.query.chars().count();
-            if buffer.len() >= after_offset {
-                let before: String = buffer.chars().take(prefix_len).collect();
-                let after: String = buffer.chars().skip(after_offset).collect();
-                *buffer = format!("{}{}", before, after).into();
-                *cursor = prefix_len;
-            }
-            picker.deactivate();
-            true
-        }
-        _ => false,
+/// The operations [`handle_query_key`] needs from a picker that mirrors a
+/// typed query into the input buffer after a fixed prefix.
+trait QueryPicker {
+    fn query(&self) -> &str;
+    fn query_cursor(&self) -> usize;
+    fn char_input(&mut self, c: char);
+    fn backspace(&mut self);
+    fn select_prev(&mut self);
+    fn select_next(&mut self);
+    fn toggle_group(&mut self);
+    fn selected_name(&self) -> Option<&str>;
+    fn deactivate(&mut self);
+    fn has_matches(&self) -> bool;
+}
+
+impl QueryPicker for ListPicker {
+    fn query(&self) -> &str {
+        &self.query
+    }
+    fn query_cursor(&self) -> usize {
+        self.cursor
+    }
+    fn char_input(&mut self, c: char) {
+        ListPicker::char_input(self, c)
+    }
+    fn backspace(&mut self) {
+        ListPicker::backspace(self)
+    }
+    fn select_prev(&mut self) {
+        ListPicker::select_prev(self)
+    }
+    fn select_next(&mut self) {
+        ListPicker::select_next(self)
+    }
+    fn toggle_group(&mut self) {}
+    fn selected_name(&self) -> Option<&str> {
+        ListPicker::selected_name(self)
+    }
+    fn deactivate(&mut self) {
+        ListPicker::deactivate(self)
+    }
+    fn has_matches(&self) -> bool {
+        !self.matches.is_empty()
     }
 }
 
-pub fn handle_models_key(
+impl QueryPicker for ModelsPicker {
+    fn query(&self) -> &str {
+        &self.query
+    }
+    fn query_cursor(&self) -> usize {
+        self.cursor
+    }
+    fn char_input(&mut self, c: char) {
+        ModelsPicker::char_input(self, c)
+    }
+    fn backspace(&mut self) {
+        ModelsPicker::backspace(self)
+    }
+    fn select_prev(&mut self) {
+        ModelsPicker::select_prev(self)
+    }
+    fn select_next(&mut self) {
+        ModelsPicker::select_next(self)
+    }
+    fn toggle_group(&mut self) {
+        ModelsPicker::toggle_group(self)
+    }
+    fn selected_name(&self) -> Option<&str> {
+        ModelsPicker::selected_name(self)
+    }
+    fn deactivate(&mut self) {
+        ModelsPicker::deactivate(self)
+    }
+    fn has_matches(&self) -> bool {
+        !self.matches.is_empty()
+    }
+}
+
+/// Replace the `query_len`-byte query that follows the `prefix_len`-byte
+/// prefix with `replacement` and return the byte cursor after the inserted
+/// text. One allocation; every offset is a byte offset.
+fn replace_query_span(
+    buffer: &mut CompactString,
+    prefix_len: usize,
+    query_len: usize,
+    replacement: &str,
+) -> usize {
+    let before = buffer.get(..prefix_len).unwrap_or("");
+    let after = buffer.get(prefix_len + query_len..).unwrap_or("");
+    let mut next = String::with_capacity(before.len() + replacement.len() + after.len());
+    next.push_str(before);
+    next.push_str(replacement);
+    next.push_str(after);
+    *buffer = next.into();
+    prefix_len + replacement.len()
+}
+
+/// Remove the query span (when the buffer still holds it) and close the picker.
+fn cancel_query<P: QueryPicker>(
     buffer: &mut CompactString,
     cursor: &mut usize,
-    picker: &mut ModelsPicker,
+    picker: &mut P,
+    prefix_len: usize,
+) {
+    let query_len = picker.query().len();
+    if buffer.len() >= prefix_len + query_len {
+        *cursor = replace_query_span(buffer, prefix_len, query_len, "");
+    }
+    picker.deactivate();
+}
+
+/// Backspace: delete the char before the query caret, or, on an empty query,
+/// drop the trigger prefix span and close the picker.
+fn query_backspace<P: QueryPicker>(
+    buffer: &mut CompactString,
+    cursor: &mut usize,
+    picker: &mut P,
+    prefix_len: usize,
+) {
+    if picker.query_cursor() > 0 {
+        picker.backspace();
+        let byte_in_query = picker
+            .query()
+            .char_indices()
+            .nth(picker.query_cursor())
+            .map(|(i, _)| i)
+            .unwrap_or(picker.query().len());
+        let remove_pos = prefix_len + byte_in_query;
+        if remove_pos < buffer.len() {
+            buffer.remove(remove_pos);
+        }
+        *cursor = prev_char_boundary(buffer, *cursor);
+    } else {
+        cancel_query(buffer, cursor, picker, prefix_len);
+    }
+}
+
+fn handle_query_key<P: QueryPicker>(
+    buffer: &mut CompactString,
+    cursor: &mut usize,
+    picker: &mut P,
+    prefix: &str,
     key: KeyEvent,
+    tab: TabBehaviour,
 ) -> bool {
-    let prefix = picker.prefix;
     let prefix_len = prefix.len();
     match key.code {
         KeyCode::Enter
@@ -656,7 +664,7 @@ pub fn handle_models_key(
                 buffer,
                 *cursor,
                 prefix,
-                &picker.query,
+                picker.query(),
                 picker.selected_name(),
             ) =>
         {
@@ -667,37 +675,15 @@ pub fn handle_models_key(
         KeyCode::Char(c)
             if c == '\x08' || (c == 'h' && key.modifiers.contains(KeyModifiers::CONTROL)) =>
         {
-            if picker.cursor > 0 {
-                picker.backspace();
-                let byte_in_query = picker
-                    .query
-                    .char_indices()
-                    .nth(picker.cursor)
-                    .map(|(i, _)| i)
-                    .unwrap_or(picker.query.len());
-                let remove_pos = prefix_len + byte_in_query;
-                if remove_pos < buffer.len() {
-                    buffer.remove(remove_pos);
-                }
-                *cursor = prev_char_boundary(buffer, *cursor);
-            } else {
-                let after_offset = prefix_len + picker.query.chars().count();
-                if buffer.len() >= after_offset {
-                    let before: String = buffer.chars().take(prefix_len).collect();
-                    let after: String = buffer.chars().skip(after_offset).collect();
-                    *buffer = format!("{}{}", before, after).into();
-                    *cursor = prefix_len;
-                }
-                picker.deactivate();
-            }
+            query_backspace(buffer, cursor, picker, prefix_len);
             true
         }
         _ if is_ctrl_w(key) => {
-            if picker.cursor == 0 {
-                return handle_models_key(buffer, cursor, picker, BACKSPACE);
+            if picker.query_cursor() == 0 {
+                return handle_query_key(buffer, cursor, picker, prefix, BACKSPACE, tab);
             }
-            while picker.cursor > 0 && !picker.query.is_empty() {
-                handle_models_key(buffer, cursor, picker, BACKSPACE);
+            while picker.query_cursor() > 0 && !picker.query().is_empty() {
+                handle_query_key(buffer, cursor, picker, prefix, BACKSPACE, tab);
             }
             true
         }
@@ -705,44 +691,30 @@ pub fn handle_models_key(
         KeyCode::Char(c) => {
             picker.char_input(c);
             let byte_in_query = picker
-                .query
+                .query()
                 .char_indices()
-                .nth(picker.cursor.saturating_sub(1))
+                .nth(picker.query_cursor().saturating_sub(1))
                 .map(|(i, _)| i)
-                .unwrap_or(picker.query.len());
-            let insert_pos = prefix_len + byte_in_query;
-            buffer.insert(insert_pos, c);
+                .unwrap_or(picker.query().len());
+            buffer.insert(prefix_len + byte_in_query, c);
             *cursor += c.len_utf8();
             true
         }
         KeyCode::Backspace => {
-            if picker.cursor > 0 {
-                picker.backspace();
-                let byte_in_query = picker
-                    .query
-                    .char_indices()
-                    .nth(picker.cursor)
-                    .map(|(i, _)| i)
-                    .unwrap_or(picker.query.len());
-                let remove_pos = prefix_len + byte_in_query;
-                if remove_pos < buffer.len() {
-                    buffer.remove(remove_pos);
-                }
-                *cursor = prev_char_boundary(buffer, *cursor);
-                true
-            } else {
-                let after_offset = prefix_len + picker.query.chars().count();
-                if buffer.len() >= after_offset {
-                    let before: String = buffer.chars().take(prefix_len).collect();
-                    let after: String = buffer.chars().skip(after_offset).collect();
-                    *buffer = format!("{}{}", before, after).into();
-                    *cursor = prefix_len;
-                }
-                picker.deactivate();
-                true
-            }
+            query_backspace(buffer, cursor, picker, prefix_len);
+            true
         }
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Tab
+            if tab == TabBehaviour::Select && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            picker.select_prev();
+            true
+        }
+        KeyCode::BackTab if tab == TabBehaviour::Select => {
+            picker.select_prev();
+            true
+        }
+        KeyCode::Tab | KeyCode::BackTab if tab == TabBehaviour::ToggleGroup => {
             picker.toggle_group();
             true
         }
@@ -754,30 +726,49 @@ pub fn handle_models_key(
             picker.select_next();
             true
         }
-        KeyCode::Enter => {
+        KeyCode::Tab if !picker.has_matches() => true,
+        KeyCode::Enter | KeyCode::Tab => {
             if let Some(name) = picker.selected_name() {
-                let after_offset = prefix_len + picker.query.chars().count();
-                let before: String = buffer.chars().take(prefix_len).collect();
-                let after: String = buffer.chars().skip(after_offset).collect();
-                *buffer = format!("{}{}{}", before, name, after).into();
-                *cursor = prefix_len + name.len();
+                let name = name.to_owned();
+                let query_len = picker.query().len();
+                *cursor = replace_query_span(buffer, prefix_len, query_len, &name);
             }
             picker.deactivate();
             true
         }
         KeyCode::Esc => {
-            let after_offset = prefix_len + picker.query.chars().count();
-            if buffer.len() >= after_offset {
-                let before: String = buffer.chars().take(prefix_len).collect();
-                let after: String = buffer.chars().skip(after_offset).collect();
-                *buffer = format!("{}{}", before, after).into();
-                *cursor = prefix_len;
-            }
-            picker.deactivate();
+            cancel_query(buffer, cursor, picker, prefix_len);
             true
         }
         _ => false,
     }
+}
+
+pub fn handle_prefixed_key(
+    buffer: &mut CompactString,
+    cursor: &mut usize,
+    picker: &mut ListPicker,
+    prefix: &str,
+    key: KeyEvent,
+) -> bool {
+    handle_query_key(buffer, cursor, picker, prefix, key, TabBehaviour::Select)
+}
+
+pub fn handle_models_key(
+    buffer: &mut CompactString,
+    cursor: &mut usize,
+    picker: &mut ModelsPicker,
+    key: KeyEvent,
+) -> bool {
+    let prefix = picker.prefix;
+    handle_query_key(
+        buffer,
+        cursor,
+        picker,
+        prefix,
+        key,
+        TabBehaviour::ToggleGroup,
+    )
 }
 
 #[cfg(test)]
@@ -803,5 +794,80 @@ mod busy67_file_argument_tests {
             );
         }
         assert!(quote_add_path("control\x1b.txt").is_none());
+    }
+}
+
+#[cfg(test)]
+mod query_picker_parity_tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_w() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+    }
+
+    /// Drive both pickers through the same keys with a multi-byte query and
+    /// assert the buffer and cursor evolve identically at every step.
+    #[test]
+    fn list_and_models_pickers_edit_the_buffer_identically() {
+        let items = vec!["héllo".to_string(), "héllo-two".to_string()];
+        let script = [
+            key(KeyCode::Char('h')),
+            key(KeyCode::Char('é')),
+            key(KeyCode::Char('雪')),
+            key(KeyCode::Backspace),
+            key(KeyCode::Char('l')),
+            ctrl_w(),
+            key(KeyCode::Char('h')),
+            key(KeyCode::Char('é')),
+            key(KeyCode::Esc),
+        ];
+        for tail in ["", " trailing 雪"] {
+            let mut list_buf = CompactString::from(format!("/m {tail}"));
+            let mut models_buf = list_buf.clone();
+            // Cursor sits right after the prefix, before the tail.
+            let mut list_cur = 3;
+            let mut models_cur = 3;
+            let mut list = ListPicker::new();
+            list.set_items(items.clone());
+            list.activate();
+            let mut models = ModelsPicker::for_command("/m ", None);
+            models.set_groups(items.clone(), items.clone());
+            models.activate();
+            for k in script {
+                let a = handle_prefixed_key(&mut list_buf, &mut list_cur, &mut list, "/m ", k);
+                let b = handle_models_key(&mut models_buf, &mut models_cur, &mut models, k);
+                assert_eq!(a, b, "handled differs for {k:?}");
+                assert_eq!(list_buf, models_buf, "buffer differs after {k:?}");
+                assert_eq!(list_cur, models_cur, "cursor differs after {k:?}");
+                assert_eq!(list.query, models.query);
+            }
+            assert_eq!(list_buf.as_str(), format!("/m {tail}"));
+            assert!(!list.active && !models.active);
+        }
+    }
+
+    #[test]
+    fn enter_inserts_selection_in_place_of_a_multibyte_query() {
+        let mut buf = CompactString::from("/m ");
+        let mut cur = 3;
+        let mut list = ListPicker::new();
+        list.set_items(vec!["héllo".to_string()]);
+        list.activate();
+        for c in "hé".chars() {
+            handle_prefixed_key(&mut buf, &mut cur, &mut list, "/m ", key(KeyCode::Char(c)));
+        }
+        assert!(handle_prefixed_key(
+            &mut buf,
+            &mut cur,
+            &mut list,
+            "/m ",
+            key(KeyCode::Tab)
+        ));
+        assert_eq!(buf.as_str(), "/m héllo");
+        assert_eq!(cur, buf.len());
     }
 }
