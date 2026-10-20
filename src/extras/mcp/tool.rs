@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -36,8 +37,8 @@ pub struct McpTool {
     pub(crate) client_is_live: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     pub(crate) elicitation: super::elicitation::Handler,
     pub definition: rmcp::model::Tool,
-    pub(super) model_description: String,
-    pub(super) model_parameters: serde_json::Value,
+    pub(super) model_description: Arc<str>,
+    pub(super) model_parameters: Arc<serde_json::Value>,
     pub peer: Peer<RoleClient>,
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -225,11 +226,11 @@ impl ToolDyn for McpTool {
     }
 
     fn description(&self) -> String {
-        self.model_description.clone()
+        self.model_description.to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
-        self.model_parameters.clone()
+        (*self.model_parameters).clone()
     }
 
     fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, ToolError>> {

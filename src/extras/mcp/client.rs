@@ -44,6 +44,63 @@ pub(crate) const MCP_LIST_TOOLS_MAX_TOOLS: usize = 128;
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
 const MCP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// One listed tool plus its model-facing metadata, bounded once when the
+/// listing is cached. `bounded` is `None` when the input schema was rejected.
+pub struct ListedTool {
+    pub definition: Tool,
+    pub(crate) bounded: Option<BoundedModelMetadata>,
+}
+
+#[derive(Clone)]
+pub(crate) struct BoundedModelMetadata {
+    pub(crate) description: Arc<str>,
+    pub(crate) parameters: Arc<serde_json::Value>,
+    pub(crate) description_truncated: bool,
+}
+
+/// A successful `tools/list` of one connection generation with every tool's
+/// bounded model metadata. It depends only on the listed definitions, so it
+/// is valid exactly as long as the cell holding it (a reconnect is a new
+/// handle and a new cell).
+pub struct ListedTools {
+    pub entries: Vec<ListedTool>,
+    pub(crate) reached_tool_cap: bool,
+}
+
+pub(crate) async fn list_bounded_tools(
+    peer: &Peer<RoleClient>,
+    timeout: Duration,
+) -> Result<Arc<ListedTools>, ServiceError> {
+    let tools = list_all_tools_bounded(peer, timeout).await?;
+    Ok(Arc::new(bound_listed_tools(tools)))
+}
+
+pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
+    let reached_tool_cap = tools.len() == MCP_LIST_TOOLS_MAX_TOOLS;
+    let entries = tools
+        .into_iter()
+        .map(|definition| {
+            let bounded = super::tool::McpTool::bounded_model_metadata(&definition)
+                .ok()
+                .map(
+                    |(description, parameters, description_truncated)| BoundedModelMetadata {
+                        description: Arc::from(description),
+                        parameters: Arc::new(parameters),
+                        description_truncated,
+                    },
+                );
+            ListedTool {
+                definition,
+                bounded,
+            }
+        })
+        .collect();
+    ListedTools {
+        entries,
+        reached_tool_cap,
+    }
+}
+
 pub struct McpClientHandle {
     pub server_name: CompactString,
     pub trusted_identity: Option<TrustedMcpServer>,
@@ -56,7 +113,7 @@ pub struct McpClientHandle {
     /// new handle (and cell); failures are not cached. Without a
     /// `notifications/tools/list_changed` subscription, re-listing on every
     /// agent rebuild could not observe anything this cache hides.
-    pub(crate) tools: Arc<tokio::sync::OnceCell<Vec<Tool>>>,
+    pub(crate) tools: Arc<tokio::sync::OnceCell<Arc<ListedTools>>>,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -691,6 +748,16 @@ impl McpClientHandle {
     /// [`MCP_LIST_TOOLS_TIMEOUT`] and [`MCP_LIST_TOOLS_MAX_PAGES`].
     pub async fn list_tools(&self) -> Result<Vec<Tool>, ServiceError> {
         list_all_tools_bounded(self.running_service.peer(), MCP_LIST_TOOLS_TIMEOUT).await
+    }
+
+    /// The cached listing of this connection generation, listing (and
+    /// bounding) once on first use. Same cell the agent build fills.
+    pub async fn cached_tools(&self) -> Result<Arc<ListedTools>, ServiceError> {
+        let peer = self.running_service.peer();
+        self.tools
+            .get_or_try_init(|| list_bounded_tools(peer, MCP_LIST_TOOLS_TIMEOUT))
+            .await
+            .cloned()
     }
 }
 

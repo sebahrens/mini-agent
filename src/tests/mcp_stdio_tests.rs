@@ -1661,6 +1661,18 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
             .all(|handle| handle.tools.initialized())
     );
     let cached = Arc::as_ptr(&manager.handles[0].tools);
+    // Bounded model metadata is computed once with the cached listing and
+    // shared (not re-serialized or re-cloned) by every built McpTool.
+    let listed_before = manager.handles[0].tools.get().unwrap().clone();
+    let shared_parameters = &listed_before.entries[0]
+        .bounded
+        .as_ref()
+        .unwrap()
+        .parameters;
+    assert!(
+        Arc::strong_count(shared_parameters) >= 2,
+        "built tools must share the cached schema Arc"
+    );
     let mut rebuilt: Vec<String> = manager
         .collect_tools_with_timeouts(None, None, McpToolTimeouts::default())
         .await
@@ -1670,6 +1682,10 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
     rebuilt.sort();
     assert_eq!(rebuilt, names);
     assert_eq!(Arc::as_ptr(&manager.handles[0].tools), cached);
+    assert!(Arc::ptr_eq(
+        &listed_before,
+        manager.handles[0].tools.get().unwrap()
+    ));
 
     let alpha_output = tools
         .iter_mut()

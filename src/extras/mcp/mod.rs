@@ -427,7 +427,7 @@ impl McpClientManager {
                 async move {
                     let _permit = sem.acquire_owned().await;
                     let result = listed
-                        .get_or_try_init(|| client::list_all_tools_bounded(&peer, timeouts.list))
+                        .get_or_try_init(|| client::list_bounded_tools(&peer, timeouts.list))
                         .await
                         .cloned();
                     let outcome = match &result {
@@ -464,20 +464,21 @@ impl McpClientManager {
         {
             match result {
                 Ok(tools) => {
-                    tracing::debug!("MCP server '{}': {} tools listed", server_name, tools.len(),);
-                    let reached_tool_cap = tools.len() == client::MCP_LIST_TOOLS_MAX_TOOLS;
+                    tracing::debug!(
+                        "MCP server '{}': {} tools listed",
+                        server_name,
+                        tools.entries.len(),
+                    );
+                    let reached_tool_cap = tools.reached_tool_cap;
                     let mut truncated_descriptions = 0usize;
                     let mut rejected_schemas = 0usize;
-                    for definition in tools {
-                        let (model_description, model_parameters, description_truncated) =
-                            match McpTool::bounded_model_metadata(&definition) {
-                                Ok(metadata) => metadata,
-                                Err(_) => {
-                                    rejected_schemas += 1;
-                                    continue;
-                                }
-                            };
-                        truncated_descriptions += usize::from(description_truncated);
+                    for listed in &tools.entries {
+                        let Some(bounded) = &listed.bounded else {
+                            rejected_schemas += 1;
+                            continue;
+                        };
+                        let definition = listed.definition.clone();
+                        truncated_descriptions += usize::from(bounded.description_truncated);
                         all_tools.push(McpTool {
                             server_name: server_name.clone(),
                             trusted_identity,
@@ -486,8 +487,8 @@ impl McpClientManager {
                             elicitation: elicitation.clone(),
                             registered_name: CompactString::new(definition.name.as_ref()),
                             definition,
-                            model_description,
-                            model_parameters,
+                            model_description: Arc::clone(&bounded.description),
+                            model_parameters: Arc::clone(&bounded.parameters),
                             peer: peer.clone(),
                             permission: permission.clone(),
                             ask_tx: ask_tx.clone(),
