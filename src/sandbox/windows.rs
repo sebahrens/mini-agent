@@ -3449,12 +3449,20 @@ fn grant_access_root(
 }
 
 fn validate_write_root_tree(root: &Path, parent: &Handle) -> Result<(), String> {
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
+    // Entries found by enumeration carry their (non-following) attributes from
+    // the directory listing itself, so a regular file needs no separate
+    // `symlink_metadata` stat before it is opened and link-counted below.
+    // Directories are pushed without them and re-inspected when popped, which
+    // keeps the reparse-point check immediately before descending into them.
+    let mut pending: Vec<(PathBuf, Option<std::fs::Metadata>)> = vec![(root.to_path_buf(), None)];
+    while let Some((path, listed)) = pending.pop() {
         ensure_parent_alive(parent)?;
-        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-            format!("sandbox: inspect writable tree {}: {error}", path.display())
-        })?;
+        let metadata = match listed {
+            Some(metadata) => metadata,
+            None => std::fs::symlink_metadata(&path).map_err(|error| {
+                format!("sandbox: inspect writable tree {}: {error}", path.display())
+            })?,
+        };
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(format!(
                 "sandbox: writable tree contains reparse point: {}",
@@ -3465,11 +3473,17 @@ fn validate_write_root_tree(root: &Path, parent: &Handle) -> Result<(), String> 
             for entry in std::fs::read_dir(&path)
                 .map_err(|error| format!("sandbox: enumerate writable tree: {error}"))?
             {
-                pending.push(
-                    entry
-                        .map_err(|error| format!("sandbox: enumerate writable entry: {error}"))?
-                        .path(),
-                );
+                let entry =
+                    entry.map_err(|error| format!("sandbox: enumerate writable entry: {error}"))?;
+                let entry_path = entry.path();
+                let entry_metadata = entry.metadata().map_err(|error| {
+                    format!(
+                        "sandbox: inspect writable tree {}: {error}",
+                        entry_path.display()
+                    )
+                })?;
+                let listed = (!entry_metadata.is_dir()).then_some(entry_metadata);
+                pending.push((entry_path, listed));
             }
             continue;
         }

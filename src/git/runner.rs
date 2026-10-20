@@ -102,7 +102,9 @@ pub(crate) struct GitRunner {
     globals: Option<Arc<super::global_snapshot::GlobalSources>>,
     /// Whether internal commands also neutralise the executable
     /// configuration of repositories nested in the work tree (see
-    /// [`GitRunner::probing_nested_repositories`]).
+    /// [`GitRunner::probing_nested_repositories`]). Only test runners, which
+    /// neutralise repository configuration in-process, consult it.
+    #[cfg(test)]
     nested_repositories: bool,
     #[cfg(all(test, unix))]
     home_override: Option<Arc<PathBuf>>,
@@ -188,6 +190,7 @@ impl GitRunner {
                 InternalProfile::Network,
                 |name| std::env::var_os(name),
             )),
+            #[cfg(test)]
             nested_repositories: false,
             path_entries: Arc::default(),
             #[cfg(test)]
@@ -222,6 +225,7 @@ impl GitRunner {
             captured_environment: Arc::new(Vec::new()),
             #[cfg(test)]
             globals: None,
+            #[cfg(test)]
             nested_repositories: false,
             path_entries: Arc::default(),
             #[cfg(test)]
@@ -242,6 +246,7 @@ impl GitRunner {
             captured_environment: Arc::new(Vec::new()),
             #[cfg(test)]
             globals: None,
+            #[cfg(test)]
             nested_repositories: false,
             path_entries: Arc::default(),
             #[cfg(test)]
@@ -258,9 +263,20 @@ impl GitRunner {
     /// they descend into nested repositories that the model may have
     /// created. Callers that pass `--ignore-submodules` never descend and
     /// skip the extra `ls-files` per command.
-    pub(crate) fn probing_nested_repositories(mut self) -> Self {
-        self.nested_repositories = true;
-        self
+    ///
+    /// A no-op in production builds: guarded runners enforce repository
+    /// configuration policy through the guarded runtime instead.
+    pub(crate) fn probing_nested_repositories(self) -> Self {
+        #[cfg(test)]
+        {
+            let mut this = self;
+            this.nested_repositories = true;
+            this
+        }
+        #[cfg(not(test))]
+        {
+            self
+        }
     }
 
     #[cfg(all(test, unix))]
@@ -382,29 +398,38 @@ impl GitRunner {
             self.configure_guarded_command(&mut command, &snapshot, &roots, profile)?;
             return Ok(command);
         }
-        // `git init` must also work before there is a repository to ask for
-        // its administration paths. Select this narrow case from the actual
-        // argv, never from the caller's diagnostic operation label.
-        let initializing =
-            profile == InternalProfile::Local && args.first().is_some_and(|arg| arg == "init");
-        #[cfg(test)]
-        let repository_execution = repository_execution_allowed_for_test(repo_path);
+        // Production runners always carry a guarded runtime (handled above) or
+        // are the `unavailable()` runner, whose empty program fails
+        // `validate()` before this point. Only test runners over a plain Git
+        // executable neutralise repository configuration in-process.
         #[cfg(not(test))]
-        let repository_execution = false;
-        let mut config = hardened_config(profile, repository_execution);
-        if !repository_execution {
-            config.extend(
-                self.repository_config_overrides(repo_path, operation, profile, initializing)
-                    .await?,
-            );
-            if self.nested_repositories {
-                let nested = self
-                    .nested_repository_overrides(repo_path, operation, &config)
-                    .await?;
-                config.extend(nested);
-            }
+        {
+            let _ = (operation, profile);
+            Err("publisher-approved Git runtime is unavailable".to_string())
         }
-        Ok(self.build_internal_command(repo_path, args, profile, &config))
+        #[cfg(test)]
+        {
+            // `git init` must also work before there is a repository to ask for
+            // its administration paths. Select this narrow case from the actual
+            // argv, never from the caller's diagnostic operation label.
+            let initializing =
+                profile == InternalProfile::Local && args.first().is_some_and(|arg| arg == "init");
+            let repository_execution = repository_execution_allowed_for_test(repo_path);
+            let mut config = hardened_config(profile, repository_execution);
+            if !repository_execution {
+                config.extend(
+                    self.repository_config_overrides(repo_path, operation, profile, initializing)
+                        .await?,
+                );
+                if self.nested_repositories {
+                    let nested = self
+                        .nested_repository_overrides(repo_path, operation, &config)
+                        .await?;
+                    config.extend(nested);
+                }
+            }
+            Ok(self.build_internal_command(repo_path, args, profile, &config))
+        }
     }
 
     fn build_internal_command<I, S>(
@@ -695,6 +720,7 @@ impl GitRunner {
     /// scope, and returns the overrides that neutralise the repository-scoped
     /// ones. `git config` only reads configuration: it runs no hooks,
     /// fsmonitor, or drivers.
+    #[cfg(test)]
     async fn repository_config_overrides(
         &self,
         repo_path: &Path,
@@ -710,6 +736,7 @@ impl GitRunner {
 
     /// Every command-executing key the configuration visible from
     /// `repo_path` sets, with its scope.
+    #[cfg(test)]
     async fn executable_config_entries(
         &self,
         repo_path: &Path,
@@ -871,6 +898,7 @@ impl GitRunner {
     /// probed, recursively, and its repository-scoped filter/diff/merge
     /// commands are overridden too. Too many or too deeply nested
     /// repositories refuse the operation instead.
+    #[cfg(test)]
     async fn nested_repository_overrides(
         &self,
         repo_path: &Path,
@@ -943,6 +971,7 @@ impl GitRunner {
     /// directory holds a `.git`, i.e. repositories Git would descend into.
     /// `ls-files` reads only the index; it runs under the fixed hardened
     /// configuration so reading the index cannot start a fsmonitor.
+    #[cfg(test)]
     async fn populated_gitlinks(
         &self,
         repo_path: &Path,
@@ -1656,6 +1685,7 @@ fn hardened_config(profile: InternalProfile, repository_execution: bool) -> Vec<
 /// Classifies Git's canonical (lower-case section and variable) key bytes.
 /// Do not ask Git to filter with a regex: locale-aware matching can skip a
 /// subsection containing non-UTF8 bytes even though Git executes that driver.
+#[cfg(test)]
 fn executable_config_key(key: &[u8]) -> bool {
     matches!(
         key,
@@ -1675,11 +1705,14 @@ fn executable_config_key(key: &[u8]) -> bool {
 
 /// Bounds for the nested-repository probe: nested repositories beyond these
 /// refuse the operation rather than run unprobed.
+#[cfg(test)]
 const MAX_NESTED_REPOSITORIES: usize = 64;
+#[cfg(test)]
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 8;
 
 /// `ls-files --stage` prints one record per index entry, so the output limit
 /// is sized for large repositories rather than for a status query.
+#[cfg(test)]
 const GITLINK_PROBE_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_secs(30),
     stdout_bytes: 64 * 1024 * 1024,
@@ -1689,6 +1722,7 @@ const GITLINK_PROBE_LIMITS: CommandLimits = CommandLimits {
 
 /// Paths of gitlink (mode `160000`) entries in `git ls-files --stage -z`
 /// output: `<mode> SP <oid> SP <stage> TAB <path> NUL` per entry.
+#[cfg(test)]
 fn parse_gitlinks(bytes: &[u8]) -> Vec<PathBuf> {
     bytes
         .split(|byte| *byte == 0)
@@ -1763,10 +1797,12 @@ fn sandbox_cache_roots(
 
 /// Nested repositories contribute only the keys a dirty check inside them
 /// can execute: content filters and diff/merge drivers.
+#[cfg(test)]
 fn nested_override_applies(key: &str) -> bool {
     key.starts_with("filter.") || key.starts_with("diff.") || key.starts_with("merge.")
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 struct ScopedConfigEntry {
     scope: String,
@@ -1779,6 +1815,7 @@ struct ScopedConfigEntry {
 /// Selects executable keys from `git config --show-scope --show-origin --null
 /// --list` output: `scope NUL origin NUL key LF value NUL` per entry, with no
 /// `LF value` for a value-less boolean key.
+#[cfg(test)]
 fn parse_scoped_config(bytes: &[u8]) -> Result<Vec<ScopedConfigEntry>, String> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -1829,6 +1866,7 @@ fn parse_scoped_config(bytes: &[u8]) -> Result<Vec<ScopedConfigEntry>, String> {
 /// have a writable workspace alias despite its outside path, so it is not
 /// trusted either. An unknown or vanished origin is not trusted. This
 /// classifies the probed config; it does not freeze later edits.
+#[cfg(test)]
 fn origin_is_outside_untrusted_roots(origin: &str, repo_path: &Path, roots: &[PathBuf]) -> bool {
     let Some(file) = origin.strip_prefix("file:") else {
         return false;
@@ -1881,6 +1919,7 @@ fn origin_is_outside_untrusted_roots(origin: &str, repo_path: &Path, roots: &[Pa
 /// sets. Only the user's `global` (and, if ever enabled, `system`) scope is
 /// trusted; `local`, `worktree`, `command`, and unknown scopes are
 /// model-writable or unexplained.
+#[cfg(test)]
 fn untrusted_config_overrides(
     entries: &[ScopedConfigEntry],
     profile: InternalProfile,
@@ -1950,6 +1989,7 @@ fn untrusted_config_overrides(
 /// Keys for which Git keeps the first value read (with an error for later
 /// ones) instead of the last: `core.gitProxy` and a remote's upload/receive
 /// pack, which a local-path remote executes on this host.
+#[cfg(test)]
 fn first_value_wins(key: &str) -> bool {
     key == "core.gitproxy"
         || (key.starts_with("remote.")
