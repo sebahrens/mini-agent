@@ -103,3 +103,25 @@ fn mapped_range_handles_multibyte_chars() {
     let (start, end) = norm.source_range(pos, search.len());
     assert_eq!(&src[start..end], "\twörld");
 }
+
+#[test]
+fn normalize_line_matches_normalize_whitespace() {
+    use crate::agent::tools::normalize::normalize_line;
+    for line in [
+        "",
+        " ",
+        "\t\t",
+        "abc",
+        "abc  \t ",
+        "\tfn foo() {",
+        "x\ty\t",
+        "  indented",
+        "héllo\u{2003}",
+        "trailing cr\r",
+        "\r",
+        "mid\rdle",
+        "with\nnewline  \n\n",
+    ] {
+        assert_eq!(normalize_line(line), normalize_whitespace(line), "{line:?}");
+    }
+}

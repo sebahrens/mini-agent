@@ -26,7 +26,9 @@ pub(crate) mod web_http;
 pub(crate) mod web_search;
 pub(crate) mod write;
 
-pub(crate) use normalize::{levenshtein_similarity_chars, normalize_whitespace};
+pub(crate) use normalize::{
+    levenshtein_similarity_chars, normalize_line_into, normalize_whitespace,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
