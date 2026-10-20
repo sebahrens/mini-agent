@@ -237,6 +237,53 @@ pub(crate) fn take_walks_started() -> usize {
     WALKS_STARTED.with(|walks| walks.replace(0))
 }
 
+/// Test-only: roots whose background walks wait until released, so a test
+/// can observe a walk that is deterministically still in flight.
+#[cfg(test)]
+static HELD_WALKS: (std::sync::Mutex<Vec<PathBuf>>, std::sync::Condvar) =
+    (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+#[cfg(test)]
+struct WalkHold(PathBuf);
+
+#[cfg(test)]
+impl WalkHold {
+    fn new(root: &Path) -> Self {
+        HELD_WALKS
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(root.to_path_buf());
+        WalkHold(root.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+impl Drop for WalkHold {
+    fn drop(&mut self) {
+        let mut held = HELD_WALKS
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|root| *root != self.0);
+        HELD_WALKS.1.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn wait_while_walk_held(root: &Path) {
+    let held = HELD_WALKS
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    drop(
+        HELD_WALKS
+            .1
+            .wait_while(held, |held| held.iter().any(|held| held == root))
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+}
+
 #[cfg(test)]
 fn count_filter(scanned: usize, rescan: bool) {
     FILTER_COUNTS.with(|counts| {
@@ -437,8 +484,12 @@ impl FilePicker {
             let (tx, rx) = mpsc::channel();
             self.walk_rx = Some(rx);
             let running = InFlight::begin(&root);
+            #[cfg(test)]
+            let held_root = root.clone();
             handle.spawn_blocking(move || {
                 let _running = running;
+                #[cfg(test)]
+                wait_while_walk_held(&held_root);
                 let mut all = Vec::new();
                 let finished = if let Some(workspace) = workspace {
                     let mut batches = 0usize;
@@ -963,6 +1014,8 @@ mod cache_tests {
         assert_eq!(take_walks_started(), 0, "young snapshot starts no walk");
         assert!(!young.is_loading());
         backdate_snapshot(binding.root(), WALK_REVALIDATE_MIN * 2);
+        // Keep the revalidating walk in flight until both presses observed it.
+        let hold = WalkHold::new(binding.root());
         // The next press shows the cached list at once and starts exactly
         // one background walk.
         let mut second = FilePicker::new();
@@ -979,6 +1032,7 @@ mod cache_tests {
         assert!(third.is_loading());
         third.set_add_argument(5, ".txt");
         assert_eq!(third.matches, vec![PathBuf::from("first.txt")]);
+        drop(hold);
         // When the walk finishes, both open pickers pick up the new file.
         finish_walk(&mut second).await;
         finish_walk(&mut third).await;
