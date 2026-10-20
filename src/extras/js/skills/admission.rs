@@ -32,7 +32,61 @@ const LEASE_SECONDS: i64 = 30;
 const EVALUATION_LEASE_SECONDS: i64 = 40 * 60;
 const MAX_RETRY_BACKOFF_SECONDS: i64 = 300;
 const MAX_AUTH_AGE_SECONDS: i64 = 300;
-const WORKER_IDLE_POLL: Duration = Duration::from_millis(100);
+/// Upper bound on an idle sleep. Rows imported by another process, lease
+/// expiries and exhausted-attempt sweeps are all noticed within this period
+/// even if no wake arrives, so a missed wake cannot stall admission.
+const WORKER_FALLBACK_RECHECK: Duration = Duration::from_secs(5);
+/// Floor on a sleep after an unproductive pass, so a persistent error or an
+/// already-due row that cannot be claimed never becomes a busy loop.
+const WORKER_MIN_RECHECK: Duration = Duration::from_millis(100);
+
+/// Explicit wake handle for the admission worker. `notify` is level-triggered:
+/// a wake delivered while the worker is evaluating is remembered and consumed
+/// by its next wait, so no enqueue is lost between the claim and the sleep.
+#[derive(Clone, Default)]
+pub(crate) struct AdmissionWake {
+    inner: Arc<WakeInner>,
+}
+
+#[derive(Default)]
+struct WakeInner {
+    pending: std::sync::Mutex<bool>,
+    condvar: std::sync::Condvar,
+    #[cfg(test)]
+    passes: std::sync::atomic::AtomicUsize,
+}
+
+impl AdmissionWake {
+    pub(crate) fn notify(&self) {
+        let mut pending = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending = true;
+        self.inner.condvar.notify_all();
+    }
+
+    /// Block until notified or `timeout` elapses; consumes any pending wake.
+    fn wait(&self, timeout: Duration) {
+        let guard = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut guard, _) = self
+            .inner
+            .condvar
+            .wait_timeout_while(guard, timeout, |pending| !*pending)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn passes_for_test(&self) -> usize {
+        self.inner.passes.load(Ordering::Relaxed)
+    }
+}
 
 /// Reject an awaiting proposal without depending on evaluation infrastructure.
 /// The local-owner capability and optimistic transaction guard this action;
@@ -98,6 +152,18 @@ impl AdmissionEvaluator {
         })
     }
 
+    /// How long the worker may sleep before a claimable row becomes due,
+    /// bounded by the fallback re-check period and floored to avoid spinning.
+    fn idle_timeout(&self, now: i64) -> Duration {
+        let wait = match self.store.earliest_proposal_due_at(now) {
+            Ok(Some(due)) => {
+                Duration::from_secs(u64::try_from(due.saturating_sub(now)).unwrap_or(0))
+            }
+            Ok(None) | Err(_) => WORKER_FALLBACK_RECHECK,
+        };
+        wait.clamp(WORKER_MIN_RECHECK, WORKER_FALLBACK_RECHECK)
+    }
+
     pub(crate) fn evaluate_next(
         &mut self,
         now: i64,
@@ -108,17 +174,20 @@ impl AdmissionEvaluator {
         // `evaluating` forever with no report and no reason code, invisible to
         // an authenticated reevaluation request. Park it as deferred instead:
         // the immutable identity is never rejected and stays recoverable.
-        for proposal_id in self.store.sweep_exhausted_proposals(now)? {
-            tracing::warn!(
-                proposal_id = %proposal_id,
-                reason_code = EVALUATION_ATTEMPTS_EXHAUSTED,
-                "skill proposal exhausted its evaluation attempt budget and was deferred"
-            );
-        }
+        //
+        // The sweep only matters when nothing is claimable, so it runs after an
+        // empty claim instead of costing a write transaction on every pass.
         let Some(mut lease) = self
             .store
             .claim_due_proposal(&self.worker_id, now, LEASE_SECONDS)?
         else {
+            for proposal_id in self.store.sweep_exhausted_proposals(now)? {
+                tracing::warn!(
+                    proposal_id = %proposal_id,
+                    reason_code = EVALUATION_ATTEMPTS_EXHAUSTED,
+                    "skill proposal exhausted its evaluation attempt budget and was deferred"
+                );
+            }
             return Ok(None);
         };
         lease.row_version = self.store.renew_lease(
@@ -635,24 +704,37 @@ impl AdmissionEvaluator {
 
 pub(crate) struct AdmissionWorker {
     shutdown: Arc<AtomicBool>,
+    wake: AdmissionWake,
     join: Option<std::thread::JoinHandle<()>>,
     runtime: Option<tokio::runtime::Handle>,
 }
 
 impl AdmissionWorker {
     pub(crate) fn start_session_scoped(
+        evaluator: AdmissionEvaluator,
+    ) -> Result<Self, AdmissionError> {
+        Self::start_session_scoped_with_wake(evaluator, AdmissionWake::default())
+    }
+
+    /// Start the worker on a caller-supplied wake handle so the proposal
+    /// enqueue path can wake it the moment a row is committed.
+    pub(crate) fn start_session_scoped_with_wake(
         mut evaluator: AdmissionEvaluator,
+        wake: AdmissionWake,
     ) -> Result<Self, AdmissionError> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let worker_wake = wake.clone();
         let join = std::thread::Builder::new()
             .name("skill-admission".to_string())
             .spawn(move || {
                 while !worker_shutdown.load(Ordering::Acquire) {
+                    #[cfg(test)]
+                    worker_wake.inner.passes.fetch_add(1, Ordering::Relaxed);
                     let now = match super::store::current_timestamp() {
                         Ok(now) => now,
                         Err(_) => {
-                            std::thread::sleep(WORKER_IDLE_POLL);
+                            worker_wake.wait(WORKER_MIN_RECHECK);
                             continue;
                         }
                     };
@@ -668,14 +750,15 @@ impl AdmissionWorker {
                             );
                         }
                         Ok(None) | Err(AdmissionError::Retryable(_)) => {
-                            std::thread::sleep(WORKER_IDLE_POLL);
+                            let timeout = evaluator.idle_timeout(now);
+                            worker_wake.wait(timeout);
                         }
                         Err(error) => {
                             tracing::warn!(
                                 error_kind = %admission_error_kind(&error),
                                 "skill admission worker encountered a recoverable error"
                             );
-                            std::thread::sleep(WORKER_IDLE_POLL);
+                            worker_wake.wait(WORKER_MIN_RECHECK);
                         }
                     }
                 }
@@ -683,6 +766,7 @@ impl AdmissionWorker {
             .map_err(|_| AdmissionError::WorkerUnavailable)?;
         Ok(Self {
             shutdown,
+            wake,
             join: Some(join),
             runtime: tokio::runtime::Handle::try_current().ok(),
         })
@@ -692,6 +776,7 @@ impl AdmissionWorker {
 impl Drop for AdmissionWorker {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.wake.notify();
         if let Some(join) = self.join.take() {
             if join.is_finished() {
                 let _ = join.join();

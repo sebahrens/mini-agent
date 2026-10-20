@@ -1,7 +1,8 @@
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::skills::SkillExport;
 use crate::extras::js::skills::admission::{
-    AdmissionEvaluator, AdmissionWorker, AuthenticatedHumanDecision, HumanApprover, ReviewPacket,
+    AdmissionEvaluator, AdmissionWake, AdmissionWorker, AuthenticatedHumanDecision, HumanApprover,
+    ReviewPacket,
 };
 use crate::extras::js::skills::embed::Embedder;
 use crate::extras::js::skills::held_out::{
@@ -343,5 +344,95 @@ async fn auto_admission_failure_matrix_rejects_bypasses_and_reproposal_is_termin
     );
     assert_eq!(store.count_proposals().unwrap(), 1);
     assert_eq!(store.desired_generation().unwrap(), 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn idle_worker(paths: &AppPaths, wake: AdmissionWake) -> AdmissionWorker {
+    let evaluator = AdmissionEvaluator::new(
+        SkillStore::open_at(paths).expect("evaluator store"),
+        std::sync::Arc::new(Embedder::new().unwrap()),
+        "idle-worker",
+    )
+    .unwrap();
+    AdmissionWorker::start_session_scoped_with_wake(evaluator, wake).expect("admission worker")
+}
+
+#[test]
+fn idle_admission_worker_does_not_poll_the_store() {
+    let (root, paths) = paths();
+    let wake = AdmissionWake::default();
+    let worker = idle_worker(&paths, wake.clone());
+    std::thread::sleep(Duration::from_secs(2));
+    // The old 100 ms poll ran ~20 passes in 2 s; an idle worker parks on the
+    // wake handle (fallback re-check every 5 s).
+    assert!(
+        wake.passes_for_test() <= 2,
+        "idle worker made {} passes",
+        wake.passes_for_test()
+    );
+    let started = Instant::now();
+    drop(worker);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "shutdown must wake the parked worker"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn enqueue_wakes_a_parked_admission_worker_without_polling() {
+    let (root, paths) = paths();
+    let mut setup = SkillStore::open_at(&paths).expect("setup store");
+    import_suite(&mut setup);
+    drop(setup);
+
+    let wake = AdmissionWake::default();
+    let admission = idle_worker(&paths, wake.clone());
+    // Let the worker finish its first pass and park for the 5 s fallback.
+    std::thread::sleep(Duration::from_millis(500));
+    let parked_passes = wake.passes_for_test();
+
+    let worker = ProposalQueue::start_store_worker_with_wake(
+        SkillStore::open_at(&paths).expect("host store"),
+        4,
+        Duration::from_secs(1),
+        Some(wake.clone()),
+    )
+    .expect("worker");
+    let tool = JsTool::new_with_proposals(
+        Sandbox::new(false, "bwrap"),
+        None,
+        None,
+        AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        worker,
+    );
+    let response = tool
+        .call(JsArgs {
+            code: format!(
+                "propose_skill({})",
+                payload(
+                    "function normalize(_cap, v) { return String(v).trim(); }",
+                    "normalize(' x ') === 'x'"
+                )
+            ),
+        })
+        .await
+        .expect("proposal host");
+    let response: serde_json::Value = serde_json::from_str(&response).expect("response");
+    let skill_id = response["id"].as_str().unwrap().to_string();
+    drop(tool);
+
+    let inspector = SkillStore::open_at(&paths).expect("inspector");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while inspector.get_proposal(&skill_id).unwrap().unwrap().status == ProposalStatus::Pending {
+        assert!(
+            Instant::now() < deadline,
+            "the enqueue wake did not start evaluation before the 5 s fallback"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(wake.passes_for_test() > parked_passes);
+    drop(inspector);
+    drop(admission);
     let _ = std::fs::remove_dir_all(root);
 }

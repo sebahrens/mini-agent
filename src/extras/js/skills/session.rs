@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
-use super::admission::{AdmissionEvaluator, AdmissionWorker};
+use super::admission::{AdmissionEvaluator, AdmissionWake, AdmissionWorker};
 use super::embed::Embedder;
 use super::proposal::{
     AttemptBudget, DEFAULT_SESSION_ATTEMPTS, ProposalEffectService, ProposalHost, ProposalQueue,
@@ -1436,10 +1436,12 @@ impl SkillSessionServices {
         paths: &crate::paths::AppPaths,
         embedder: Arc<Embedder>,
     ) -> Result<ProposalServices, String> {
-        let proposal_worker = ProposalQueue::start_store_worker(
+        let wake = AdmissionWake::default();
+        let proposal_worker = ProposalQueue::start_store_worker_with_wake(
             SkillStore::open_at(paths).map_err(|error| error.to_string())?,
             32,
             std::time::Duration::from_secs(2),
+            Some(wake.clone()),
         )
         .map_err(|error| error.to_string())?;
         let evaluator = AdmissionEvaluator::new(
@@ -1448,8 +1450,8 @@ impl SkillSessionServices {
             format!("session-{}", uuid::Uuid::new_v4()),
         )
         .map_err(|error| error.to_string())?;
-        let admission_worker =
-            AdmissionWorker::start_session_scoped(evaluator).map_err(|error| error.to_string())?;
+        let admission_worker = AdmissionWorker::start_session_scoped_with_wake(evaluator, wake)
+            .map_err(|error| error.to_string())?;
         let service = ProposalEffectService::new(ProposalHost::new(
             proposal_worker.sender(),
             AttemptBudget::new(DEFAULT_SESSION_ATTEMPTS),

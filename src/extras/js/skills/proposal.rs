@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use super::admission::AdmissionWake;
 use super::store::{EnqueueResult, ProposalRecord, SkillStore, StoreError, current_timestamp};
 use super::{
     CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod, IdentityError, SkillArtifact,
@@ -1084,9 +1085,20 @@ impl ProposalQueue {
     }
 
     pub(crate) fn start_store_worker(
+        store: SkillStore,
+        capacity: usize,
+        response_timeout: Duration,
+    ) -> Result<ProposalWorker, ProposalError> {
+        Self::start_store_worker_with_wake(store, capacity, response_timeout, None)
+    }
+
+    /// As `start_store_worker`, additionally waking the admission worker after
+    /// every enqueue that committed a row so evaluation starts without polling.
+    pub(crate) fn start_store_worker_with_wake(
         mut store: SkillStore,
         capacity: usize,
         response_timeout: Duration,
+        wake: Option<AdmissionWake>,
     ) -> Result<ProposalWorker, ProposalError> {
         let (sender, receiver) = Self::bounded(capacity, response_timeout);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1095,7 +1107,11 @@ impl ProposalQueue {
             .name("skill-proposal-store".to_string())
             .spawn(move || {
                 while !worker_shutdown.load(Ordering::Acquire) {
-                    match receiver.receiver.recv_timeout(Duration::from_millis(50)) {
+                    // Idle wait is a blocking receive; the timeout is only a
+                    // bounded safety net for the shutdown flag when a stray
+                    // sender clone outlives the worker. Dropping the worker's
+                    // own sender disconnects the channel and ends the loop.
+                    match receiver.receiver.recv_timeout(Duration::from_secs(1)) {
                         Ok(ProposalCommand::Enqueue {
                             artifact,
                             predecessor_id,
@@ -1108,7 +1124,11 @@ impl ProposalQueue {
                                         .enqueue_proposal(&artifact, predecessor_id.as_deref(), now)
                                         .map_err(map_store_error)
                                 });
+                            let enqueued = result.is_ok();
                             let _ = reply.send(result);
+                            if enqueued && let Some(wake) = &wake {
+                                wake.notify();
+                            }
                         }
                         Ok(ProposalCommand::Observe { proposal_id, reply }) => {
                             let result = store

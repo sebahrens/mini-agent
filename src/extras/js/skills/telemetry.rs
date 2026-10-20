@@ -748,6 +748,14 @@ impl TelemetryDispatcher {
             .connection()
             .busy_timeout(Duration::ZERO)
             .map_err(super::store::StoreError::from)?;
+        // WAL + NORMAL stays consistent across application crashes and only
+        // risks the newest batches on power loss, which telemetry already
+        // tolerates. Only this connection is relaxed; admission and lifecycle
+        // connections keep FULL.
+        store
+            .connection()
+            .pragma_update(None, "synchronous", "NORMAL")
+            .map_err(super::store::StoreError::from)?;
         let (tx, rx) = std::sync::mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
         let observability_lost = Arc::new(AtomicU64::new(0));
         let worker_observability_lost = Arc::clone(&observability_lost);
