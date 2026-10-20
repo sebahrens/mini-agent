@@ -568,8 +568,11 @@ impl GuardedRuntime {
             let file = directory
                 .open_regular_relative(relative)
                 .map_err(|_| "guarded Git runtime file cannot be opened")?;
-            let bytes = read_bounded(&file, MAX_FILE_BYTES)?;
-            if hex_digest(&bytes) != item.sha256 {
+            // The embedded contents were proven to match `item.sha256` by
+            // `validate_approval`, so byte equality with them implies the
+            // digest equality without buffering or hashing the on-disk file.
+            // This comparison is never memoized.
+            if !file_equals_contents(&file, item.contents)? {
                 return Err("guarded Git runtime file disagrees with publisher approval".into());
             }
             #[cfg(unix)]
@@ -721,6 +724,39 @@ fn record_embedded_payload(files: &'static [RuntimeFile]) {
     }
 }
 
+/// Streams `file` in 64 KiB chunks and reports whether it holds exactly
+/// `expected`. Rejects on the first mismatch, a short read or trailing bytes.
+fn file_equals_contents(file: &std::fs::File, expected: &[u8]) -> Result<bool, String> {
+    use std::io::Read;
+    const CHUNK: usize = 64 * 1024;
+    let length = file
+        .metadata()
+        .map_err(|_| "guarded Git authority could not be read")?
+        .len();
+    if length != expected.len() as u64 {
+        return Ok(false);
+    }
+    let mut reader = file;
+    let mut buffer = vec![0u8; CHUNK.min(expected.len().max(1))];
+    let mut offset = 0usize;
+    while offset < expected.len() {
+        let want = buffer.len().min(expected.len() - offset);
+        let read = reader
+            .read(&mut buffer[..want])
+            .map_err(|_| "guarded Git authority could not be read")?;
+        if read == 0 || buffer[..read] != expected[offset..offset + read] {
+            return Ok(false);
+        }
+        offset += read;
+    }
+    // Reject a file that grew after the length check.
+    let mut extra = [0u8; 1];
+    let trailing = reader
+        .read(&mut extra)
+        .map_err(|_| "guarded Git authority could not be read")?;
+    Ok(trailing == 0)
+}
+
 pub(crate) fn read_bounded(file: &std::fs::File, limit: usize) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut bytes = Vec::new();
@@ -788,6 +824,49 @@ mod tests {
         std::fs::remove_file(&helper).unwrap();
         std::fs::write(&helper, b"replacement").unwrap();
         assert!(runtime.validate(&[]).is_err());
+    }
+
+    #[test]
+    fn materialize_refuses_modified_published_file_without_rehashing() {
+        let fixture =
+            super::super::global_snapshot::SnapshotDirectory::new(&std::env::temp_dir()).unwrap();
+        let storage = fixture.path().join("runtime");
+        let approval = bundled_approval().expect("test requires approved bundle");
+        GuardedRuntime::materialize(approval, &storage, &[]).unwrap();
+        // An unmodified published directory is accepted again.
+        GuardedRuntime::materialize(approval, &storage, &[]).unwrap();
+        let item = approval
+            .files
+            .iter()
+            .find(|file| {
+                file.relative_path == "git-remote-http"
+                    || file.relative_path == "git-remote-http.exe"
+            })
+            .expect("helper in payload");
+        let path = storage.join(item.relative_path);
+        let original = std::fs::read(&path).unwrap();
+        for mutate in [
+            Box::new(|bytes: &mut Vec<u8>| bytes.push(0)) as Box<dyn Fn(&mut Vec<u8>)>,
+            Box::new(|bytes: &mut Vec<u8>| {
+                let mid = bytes.len() / 2;
+                bytes[mid] ^= 1;
+            }),
+            Box::new(|bytes: &mut Vec<u8>| {
+                bytes.pop();
+            }),
+        ] {
+            let mut changed = original.clone();
+            mutate(&mut changed);
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, &changed).unwrap();
+            let error = GuardedRuntime::materialize(approval, &storage, &[])
+                .err()
+                .expect("modified file must be refused");
+            assert_eq!(
+                error,
+                "guarded Git runtime file disagrees with publisher approval"
+            );
+        }
     }
 
     fn capture_local(path: &Path, state: &mut ModelRoots) -> Result<Arc<TrustedProgram>, String> {
