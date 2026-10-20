@@ -455,6 +455,10 @@ pub struct Feed {
     /// Lowest block index mutated since `layout_cache` was built
     /// (`usize::MAX` when none). Rows of the blocks before it are reused.
     layout_dirty_from: Cell<usize>,
+    /// Index of the running reasoning block (there is at most one), kept
+    /// exact at every index-shifting site so ticks, deltas and finishing
+    /// touch one block instead of scanning the feed.
+    running_reasoning: Option<usize>,
     /// Number of full layout passes; test-only proof that queries reuse the
     /// pre-wrapped rows.
     #[cfg(test)]
@@ -516,6 +520,7 @@ impl Feed {
             reasoning_display: ReasoningDisplay::Collapsed,
             layout_cache: RefCell::new(None),
             layout_dirty_from: Cell::new(usize::MAX),
+            running_reasoning: None,
             #[cfg(test)]
             layout_computes: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -635,23 +640,56 @@ impl Feed {
     /// Update live headers at most once per elapsed second. Completed durations
     /// are frozen, and unchanged blocks retain their layout allocations.
     pub(crate) fn tick_reasoning_at(&mut self, now: Instant) {
-        for (index, block) in self.blocks.iter_mut().enumerate() {
-            if !block.running {
-                continue;
-            }
-            let Some(reasoning) = block.reasoning.as_mut() else {
-                continue;
+        let Some(index) = self.live_reasoning() else {
+            return;
+        };
+        let block = &mut self.blocks[index];
+        let Some(reasoning) = block.reasoning.as_mut() else {
+            return;
+        };
+        let Some(started) = reasoning.started else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(started).as_secs();
+        if reasoning.elapsed_secs != Some(elapsed) {
+            reasoning.elapsed_secs = Some(elapsed);
+            *block.render_cache.borrow_mut() = None;
+            self.generation = self.generation.wrapping_add(1);
+            mark_dirty(&self.layout_dirty_from, index);
+        }
+    }
+
+    /// Index of the running reasoning block, from the tracked slot. Tests
+    /// check it against a full scan on every use.
+    fn live_reasoning(&self) -> Option<usize> {
+        #[cfg(test)]
+        assert_eq!(
+            self.running_reasoning,
+            self.blocks
+                .iter()
+                .rposition(|block| block.running && block.reasoning.is_some()),
+            "running_reasoning drifted"
+        );
+        self.running_reasoning
+    }
+
+    /// A block was inserted at `position`: later indices move up.
+    fn note_inserted_at(&mut self, position: usize) {
+        if let Some(index) = self.running_reasoning.as_mut()
+            && *index >= position
+        {
+            *index += 1;
+        }
+    }
+
+    /// The block at `position` was removed: later indices move down.
+    fn note_removed_at(&mut self, position: usize) {
+        if let Some(index) = self.running_reasoning {
+            self.running_reasoning = match index.cmp(&position) {
+                std::cmp::Ordering::Less => Some(index),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(index - 1),
             };
-            let Some(started) = reasoning.started else {
-                continue;
-            };
-            let elapsed = now.saturating_duration_since(started).as_secs();
-            if reasoning.elapsed_secs != Some(elapsed) {
-                reasoning.elapsed_secs = Some(elapsed);
-                *block.render_cache.borrow_mut() = None;
-                self.generation = self.generation.wrapping_add(1);
-                mark_dirty(&self.layout_dirty_from, index);
-            }
         }
     }
 
@@ -669,11 +707,7 @@ impl Feed {
 
     /// Index of the running reasoning block, pushing one when none is live.
     fn reasoning_index(&mut self) -> usize {
-        match self
-            .blocks
-            .iter()
-            .rposition(|block| block.running && block.reasoning.is_some())
-        {
+        match self.live_reasoning() {
             Some(index) => index,
             None => {
                 self.push_streaming_block(BlockStyle::Reasoning);
@@ -683,11 +717,7 @@ impl Feed {
     }
 
     pub(crate) fn finish_reasoning(&mut self) {
-        if let Some(index) = self
-            .blocks
-            .iter()
-            .rposition(|block| block.running && block.reasoning.is_some())
-        {
+        if let Some(index) = self.live_reasoning() {
             self.finalize_block(index);
         }
     }
@@ -695,6 +725,7 @@ impl Feed {
     pub fn clear(&mut self) {
         self.touch(0);
         self.blocks.clear();
+        self.running_reasoning = None;
         self.total_bytes = 0;
         self.pruned_blocks = 0;
         self.retention_generation = self.retention_generation.wrapping_add(1);
@@ -758,6 +789,7 @@ impl Feed {
         self.touch(position);
         self.total_bytes = self.total_bytes.saturating_add(block.text.len());
         self.blocks.insert(position, block);
+        self.note_inserted_at(position);
         self.prune_completed_prefix();
         true
     }
@@ -802,6 +834,7 @@ impl Feed {
             block.attached_to = Some(CompactString::from(anchor));
             self.total_bytes = self.total_bytes.saturating_add(block.text.len());
             self.blocks.insert(position, block);
+            self.note_inserted_at(position);
             position += 1;
         }
         self.prune_completed_prefix();
@@ -852,6 +885,7 @@ impl Feed {
         self.generation += 1;
         self.total_bytes = self.total_bytes.saturating_add(block.text.len());
         self.blocks.insert(position, block);
+        self.note_inserted_at(position);
         self.prune_completed_prefix();
         true
     }
@@ -878,6 +912,7 @@ impl Feed {
             return false;
         }
         if let Some(block) = self.blocks.remove(index) {
+            self.note_removed_at(index);
             self.generation += 1;
             self.total_bytes = self.total_bytes.saturating_sub(block.text.len());
         }
@@ -932,6 +967,9 @@ impl Feed {
             reasoning.started = Some(Instant::now());
             reasoning.elapsed_secs = Some(0);
         }
+        if block.reasoning.is_some() {
+            self.running_reasoning = Some(self.blocks.len());
+        }
         self.blocks.push_back(block);
     }
 
@@ -956,6 +994,9 @@ impl Feed {
             self.generation = self.generation.wrapping_add(1);
             mark_dirty(&self.layout_dirty_from, idx);
             block.running = false;
+            if self.running_reasoning == Some(idx) {
+                self.running_reasoning = None;
+            }
             if let Some(reasoning) = block.reasoning.as_mut()
                 && let Some(started) = reasoning.started.take()
             {
@@ -1054,7 +1095,8 @@ impl Feed {
     /// Replace the last block, or push a new one if the feed is empty.
     #[cfg(test)]
     pub fn replace_last(&mut self, style: BlockStyle, text: impl Into<String>) {
-        self.touch(self.blocks.len().saturating_sub(1));
+        let last_index = self.blocks.len().saturating_sub(1);
+        self.touch(last_index);
         if let Some(last) = self.blocks.back_mut() {
             self.total_bytes = self.total_bytes.saturating_sub(last.text.len());
             last.style = style;
@@ -1068,6 +1110,9 @@ impl Feed {
             compact_oversized_block(&mut last.text);
             self.total_bytes = self.total_bytes.saturating_add(last.text.len());
             last.running = false;
+            if self.running_reasoning == Some(last_index) {
+                self.running_reasoning = None;
+            }
             last.revision = last.revision.wrapping_add(1);
             last.clear_highlight_budget();
             *last.plain_cache.borrow_mut() = None;
@@ -1094,6 +1139,9 @@ impl Feed {
             .map(|block| block.text.len())
             .sum();
         self.blocks.truncate(len);
+        if self.running_reasoning.is_some_and(|index| index >= len) {
+            self.running_reasoning = None;
+        }
     }
 
     /// Return the fully laid-out chat lines for the given width.
@@ -1494,11 +1542,12 @@ impl Feed {
                     .enumerate()
                     .skip(running + 1)
                     .find_map(|(index, block)| (!block.running).then_some(index))
-                    .and_then(|index| self.blocks.remove(index))
+                    .and_then(|index| self.blocks.remove(index).map(|block| (index, block)))
             } else {
-                self.blocks.pop_front()
+                self.blocks.pop_front().map(|block| (0, block))
             };
-            if let Some(block) = block {
+            if let Some((index, block)) = block {
+                self.note_removed_at(index);
                 self.total_bytes = self.total_bytes.saturating_sub(block.text.len());
                 self.pruned_blocks = self.pruned_blocks.saturating_add(1);
                 removed = true;
@@ -2378,6 +2427,49 @@ mod progress_tests {
         assert!(!feed.clear_anchor_progress("call-1"));
         assert!(!feed.set_anchor_progress("missing", BlockStyle::ToolResult, "x"));
         assert!(!feed.set_anchor_progress("", BlockStyle::ToolResult, "x"));
+    }
+
+    #[test]
+    fn running_reasoning_slot_survives_inserts_removals_and_pruning() {
+        let (max_blocks, _, _) = Feed::retention_limits_for_test();
+        let mut feed = Feed::new();
+        for index in 0..max_blocks - 6 {
+            feed.push_block(BlockStyle::System, format!("done {index}"));
+        }
+        feed.push_streaming_block(BlockStyle::Reasoning);
+        feed.append_reasoning("thinking hard\n");
+        let start = Instant::now();
+        let generation = feed.generation();
+        feed.tick_reasoning_at(start + std::time::Duration::from_secs(3));
+        assert!(feed.generation() > generation, "the live header updates");
+        feed.push_anchored_block("c2", BlockStyle::Tool, "call");
+        feed.push_streaming_block(BlockStyle::Agent);
+        assert!(!feed.place_after_anchor("c2", BlockStyle::ToolResult, "result"));
+        feed.set_anchor_progress("c2", BlockStyle::ToolResult, "progress");
+        feed.clear_anchor_progress("c2");
+        // Overflow the cap while the reasoning block runs.
+        for index in 0..40 {
+            feed.push_block(BlockStyle::System, format!("later {index}"));
+        }
+        feed.tick_reasoning_at(start + std::time::Duration::from_secs(9));
+        feed.append_reasoning("more");
+        feed.finish_reasoning();
+        let reasoning = (0..feed.block_count())
+            .find(|index| feed.block_text(*index) == Some("thinking hard\nmore"))
+            .expect("the reasoning block is retained");
+        assert!(!feed.is_streaming(reasoning));
+        // A new reasoning block after pruning is found and finished again.
+        feed.finalize_last();
+        for index in 0..40 {
+            feed.push_block(BlockStyle::System, format!("again {index}"));
+        }
+        feed.append_reasoning("second");
+        feed.tick_reasoning_at(Instant::now() + std::time::Duration::from_secs(2));
+        feed.finish_reasoning();
+        let second = (0..feed.block_count())
+            .find(|index| feed.block_text(*index) == Some("second"))
+            .expect("the second reasoning block is retained");
+        assert!(!feed.is_streaming(second));
     }
 
     #[test]
