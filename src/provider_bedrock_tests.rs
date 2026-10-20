@@ -1,5 +1,8 @@
 use super::*;
 use crate::auth::{AuthResolver, CredentialSource, ProviderKind};
+use crate::tests::support::loopback_http::asynchronous::{
+    bind, read_head, read_request, respond_sse,
+};
 use futures::StreamExt;
 use rig::completion::Message;
 use rig::streaming::StreamingChat;
@@ -7,7 +10,7 @@ use rig::tool::Tool;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env::VarError;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 #[test]
 fn bedrock81_region_endpoint_and_typed_chain_isolation() {
@@ -145,26 +148,6 @@ impl Tool for Probe {
         Ok("OWNED_BEDROCK_TOOL_OK".into())
     }
 }
-async fn request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>, Value) {
-    let mut header = Vec::new();
-    while !header.ends_with(b"\r\n\r\n") {
-        assert!(header.len() < 32768);
-        header.push(socket.read_u8().await.unwrap());
-    }
-    let header = String::from_utf8(header).unwrap().to_ascii_lowercase();
-    let length: usize = header
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("content-length:")
-                .map(|v| v.trim().parse().unwrap())
-        })
-        .unwrap();
-    assert!(length < 1024 * 1024);
-    let mut bytes = vec![0; length];
-    socket.read_exact(&mut bytes).await.unwrap();
-    let body = serde_json::from_slice(&bytes).unwrap();
-    (header, bytes, body)
-}
 fn response(step: usize) -> String {
     let event = |kind: &str, value: Value| format!("event: {kind}\ndata: {value}\n\n");
     let mut body = event(
@@ -232,8 +215,8 @@ async fn bedrock81_real_sdk_key_env_profile_chain_streams_tools_and_usage_withou
             ("AWS_CONFIG_FILE", Some(empty_config.into_os_string())),
             ("AWS_EC2_METADATA_DISABLED", Some("true".into())),
         ]);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}/anthropic", listener.local_addr().unwrap());
+        let (listener, base) = bind().await;
+        let endpoint = format!("{base}/anthropic");
         let custom=HashMap::from([("owned-bedrock".into(),serde_json::from_value::<crate::config::CustomProviderConfig>(json!({"provider_type":"bedrock","base_url":endpoint,"inherit_builtin_key":true,"headers":{"authorization":"MUST_NOT_MERGE","x-api-key":"MUST_NOT_MERGE","x-amz-security-token":"MUST_NOT_MERGE"}})).unwrap())]);
         let client =
             crate::provider::create_client_with_env("owned-bedrock", None, &custom, None, |name| {
@@ -256,7 +239,8 @@ async fn bedrock81_real_sdk_key_env_profile_chain_streams_tools_and_usage_withou
         let server = async {
             for step in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let (headers, bytes, body) = request(&mut socket).await;
+                let req = read_request(&mut socket).await;
+                let (headers, body) = (req.headers.clone(), req.json());
                 assert!(headers.starts_with("post /anthropic/v1/messages http/1.1"));
                 assert!(headers.contains("\r\nanthropic-version: 2023-06-01\r\n"));
                 assert!(!headers.contains("must_not_merge"));
@@ -275,7 +259,7 @@ async fn bedrock81_real_sdk_key_env_profile_chain_streams_tools_and_usage_withou
                     assert!(!headers.contains("\r\nx-api-key:"));
                     assert!(headers.contains(&format!(
                             "x-amz-content-sha256: {}",
-                            sha2::Sha256::digest(&bytes)
+                            sha2::Sha256::digest(&req.body)
                                 .iter()
                                 .map(|byte| format!("{byte:02x}"))
                                 .collect::<String>()
@@ -291,7 +275,7 @@ async fn bedrock81_real_sdk_key_env_profile_chain_streams_tools_and_usage_withou
                     assert!(body.to_string().contains("toolu_bedrock"));
                 }
                 let body = response(step);
-                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                respond_sse(&mut socket, &body).await;
             }
         };
         let task = crate::startup::heap_future(|| async move {
@@ -387,20 +371,15 @@ async fn bedrock81_process_profiles_are_rejected_before_env_fallback_or_dispatch
 #[tokio::test]
 async fn bedrock81_credentials_http_has_byte_and_time_limits_without_model_headers() {
     for case in ["ok", "oversize", "timeout"] {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let uri = format!("http://{}/credential", listener.local_addr().unwrap());
+        let (listener, base) = bind().await;
+        let uri = format!("{base}/credential");
         let connector = CredentialsHttp(
             crate::provider::build_http_client("owned credentials", false, None, None).unwrap(),
             Duration::from_millis(50),
         );
         let server = async {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut header = Vec::new();
-            while !header.ends_with(b"\r\n\r\n") {
-                header.push(socket.read_u8().await.unwrap());
-                assert!(header.len() < 32768);
-            }
-            let header = String::from_utf8(header).unwrap().to_lowercase();
+            let header = read_head(&mut socket).await.headers;
             assert!(!header.contains("x-api-key:") && !header.contains("must_not_merge"));
             if case == "timeout" {
                 tokio::time::sleep(Duration::from_millis(100)).await;

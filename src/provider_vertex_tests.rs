@@ -1,5 +1,8 @@
 use super::*;
 use crate::auth::{AuthResolver, CredentialSource, ProviderKind};
+use crate::tests::support::loopback_http::asynchronous::{
+    bind, read_request, respond_json, respond_sse,
+};
 use futures::StreamExt;
 use rig::completion::{CompletionModel, Message};
 use rig::streaming::StreamingChat;
@@ -7,7 +10,7 @@ use rig::tool::Tool;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env::VarError;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 fn env(name: &str) -> Result<String, VarError> {
     match name {
@@ -168,26 +171,6 @@ impl Tool for Probe {
         Ok("OWNED_VERTEX_TOOL_OK".into())
     }
 }
-async fn request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>, Value) {
-    let mut header = Vec::new();
-    while !header.ends_with(b"\r\n\r\n") {
-        assert!(header.len() < 32768);
-        header.push(socket.read_u8().await.unwrap());
-    }
-    let header = String::from_utf8(header).unwrap().to_ascii_lowercase();
-    let length: usize = header
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("content-length:")
-                .map(|v| v.trim().parse().unwrap())
-        })
-        .unwrap();
-    assert!(length < 1024 * 1024);
-    let mut bytes = vec![0; length];
-    socket.read_exact(&mut bytes).await.unwrap();
-    let body = serde_json::from_slice(&bytes).unwrap();
-    (header, bytes, body)
-}
 fn response(step: usize) -> String {
     let event = |kind: &str, value: Value| format!("event: {kind}\ndata: {value}\n\n");
     let mut body = event(
@@ -240,8 +223,7 @@ async fn vertex81_real_sdk_adc_and_declared_token_stream_tools_usage_and_exact_n
             ("NO_PROXY", Some("*".into())),
             ("no_proxy", Some("*".into())),
         ]);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (listener, endpoint) = bind().await;
         let custom=HashMap::from([("owned-vertex".into(),serde_json::from_value::<crate::config::CustomProviderConfig>(json!({"provider_type":"vertex","base_url":endpoint,"inherit_builtin_key":true,"headers":{"authorization":"MUST_NOT_MERGE","x-api-key":"MUST_NOT_MERGE","x-goog-user-project":"MUST_NOT_MERGE"}})).unwrap())]);
         let client =
             crate::provider::create_client_with_env("owned-vertex", None, &custom, None, |name| {
@@ -279,19 +261,21 @@ async fn vertex81_real_sdk_adc_and_declared_token_stream_tools_usage_and_exact_n
         let token_server = async {
             if adc {
                 let (mut socket, _) = tokens.accept().await.unwrap();
-                let (headers, _, body) = request(&mut socket).await;
+                let req = read_request(&mut socket).await;
+                let (headers, body) = (req.headers.clone(), req.json());
                 assert!(headers.starts_with("post /token http/1.1"));
                 assert_eq!(body["grant_type"], "refresh_token");
                 let body =
                     json!({"access_token":"OWNED_TOKEN","token_type":"Bearer","expires_in":3600})
                         .to_string();
-                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                respond_json(&mut socket, &body).await;
             }
         };
         let server = async {
             for step in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let (headers, _, body) = request(&mut socket).await;
+                let req = read_request(&mut socket).await;
+                let (headers, body) = (req.headers.clone(), req.json());
                 assert!(headers.starts_with("post /v1/projects/owned-project/locations/us-east5/publishers/anthropic/models/claude-owned@20260101:streamrawpredict http/1.1"));
                 assert!(headers.contains("authorization: bearer owned_token"));
                 assert!(!headers.contains("must_not_merge"));
@@ -307,7 +291,7 @@ async fn vertex81_real_sdk_adc_and_declared_token_stream_tools_usage_and_exact_n
                     assert!(body.to_string().contains("OWNED_VERTEX_TOOL_OK"));
                 }
                 let body = response(step);
-                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                respond_sse(&mut socket, &body).await;
             }
         };
         let task = crate::startup::heap_future(|| async move {
@@ -343,8 +327,7 @@ async fn vertex81_real_sdk_adc_and_declared_token_stream_tools_usage_and_exact_n
 
 #[tokio::test]
 async fn vertex81_blocking_sdk_uses_raw_predict_and_same_typed_body_contract() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (listener, endpoint) = bind().await;
     let client = build_client(
         ResolvedCredential::Bearer("OWNED_TOKEN".into()),
         &endpoint,
@@ -365,11 +348,12 @@ async fn vertex81_blocking_sdk_uses_raw_predict_and_same_typed_body_contract() {
     expected.as_object_mut().unwrap().remove("stream");
     let server = async {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let (headers, _, body) = self::request(&mut socket).await;
+        let req = read_request(&mut socket).await;
+        let (headers, body) = (req.headers.clone(), req.json());
         assert!(headers.starts_with("post /v1/projects/owned-project/locations/us-east5/publishers/anthropic/models/claude-owned@20260101:rawpredict http/1.1"));
         assert_eq!(body, expected);
         let body=json!({"id":"owned-blocking","type":"message","role":"assistant","model":"claude-owned@20260101","content":[{"type":"text","text":"BLOCKING_OK"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":2}}).to_string();
-        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        respond_json(&mut socket, &body).await;
     };
     let task = async {
         let result = model.completion(request).await.unwrap();
@@ -392,8 +376,7 @@ async fn vertex81_blocking_sdk_uses_raw_predict_and_same_typed_body_contract() {
 
 #[tokio::test]
 async fn vertex81_same_origin_redirect_cannot_bypass_project_binding() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (listener, endpoint) = bind().await;
     let custom = HashMap::from([(
         "owned-vertex".into(),
         serde_json::from_value::<crate::config::CustomProviderConfig>(
@@ -416,7 +399,7 @@ async fn vertex81_same_origin_redirect_cannot_bypass_project_binding() {
     };
     let server = async {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let (headers, _, _) = request(&mut socket).await;
+        let headers = read_request(&mut socket).await.headers;
         assert!(headers.contains("authorization: bearer owned_token"));
         socket.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /v1/projects/other/locations/us-east5/publishers/anthropic/models/claude-owned:rawPredict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
         assert!(

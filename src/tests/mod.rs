@@ -396,6 +396,8 @@ mod subagents_tests;
 #[cfg(test)]
 mod subprocess_inventory_tests;
 #[cfg(test)]
+pub(crate) mod support;
+#[cfg(test)]
 mod todo_tests;
 #[cfg(test)]
 mod tools_filter_tests;

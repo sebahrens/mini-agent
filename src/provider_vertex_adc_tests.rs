@@ -1,7 +1,8 @@
+use crate::tests::support::loopback_http::asynchronous::{read_request, respond_json};
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder};
 use serde_json::json;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 async fn held_fetch() -> (
     AccessTokenCredentials,
@@ -30,25 +31,9 @@ async fn held_fetch() -> (
     (credentials, socket, temp, env)
 }
 async fn read_fetch(socket: &mut tokio::net::TcpStream) {
-    let mut bytes = Vec::new();
-    while !bytes.ends_with(b"\r\n\r\n") {
-        assert!(bytes.len() < 32768);
-        bytes.push(socket.read_u8().await.unwrap());
-    }
-    let headers = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
-    assert!(headers.starts_with("post /token http/1.1"));
-    let len: usize = headers
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("content-length:")
-                .map(|v| v.trim().parse().unwrap())
-        })
-        .unwrap();
-    assert!(len < 32768);
-    let mut body = vec![0; len];
-    socket.read_exact(&mut body).await.unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["grant_type"], "refresh_token");
+    let request = read_request(socket).await;
+    assert!(request.headers.starts_with("post /token http/1.1"));
+    assert_eq!(request.json()["grant_type"], "refresh_token");
 }
 async fn closed(socket: &mut tokio::net::TcpStream) {
     let mut byte = [0];
@@ -155,7 +140,7 @@ async fn vertex81_adc_standard_user_refresh_replaces_bearer_and_retains_quota() 
             .unwrap();
         read_fetch(&mut socket).await;
         let body = json!({"access_token":token,"token_type":"Bearer","expires_in":300}).to_string();
-        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        respond_json(&mut socket, &body).await;
         let headers = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let CacheableResource::New { data, .. } =
