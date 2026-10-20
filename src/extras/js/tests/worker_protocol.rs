@@ -220,6 +220,35 @@ fn encode<M: serde::Serialize>(frame: &M) -> Vec<u8> {
 }
 
 #[test]
+fn worker_protocol_frame_is_written_with_one_write_call_and_a_matching_prefix() {
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let frame = run(3);
+    let mut writer = CountingWriter {
+        writes: 0,
+        bytes: Vec::new(),
+    };
+    write_frame(&mut writer, &frame).unwrap();
+    assert_eq!(writer.writes, 1, "header and payload must share one write");
+    let prefix = u32::from_be_bytes(writer.bytes[..4].try_into().unwrap()) as usize;
+    assert_eq!(prefix, writer.bytes.len() - 4);
+    let actual: ParentWireFrame = read_frame(&mut Cursor::new(writer.bytes)).unwrap();
+    assert_eq!(actual, frame);
+}
+
+#[test]
 fn worker_protocol_codec_round_trips_a_frame() {
     let current = BuildIdentity::current();
     let fingerprint = current

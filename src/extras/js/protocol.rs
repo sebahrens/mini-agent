@@ -16,6 +16,12 @@ pub(crate) const PROTOCOL_VERSION: u16 = 11;
 pub(crate) const VERIFICATION_LOADER_VERSION: u16 = 1;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
+/// Step-output bounds shared by the worker (which enforces them) and the
+/// parent (which re-validates the worker's output against the same values).
+pub(crate) const MAX_RESULT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_CONSOLE_RECORDS: usize = 256;
+pub(crate) const MAX_CONSOLE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_CONSOLE_RECORD_BYTES: usize = 8 * 1024;
 #[cfg(feature = "skills")]
 pub(crate) const MAX_SKILL_CALLS_PER_STEP: u32 = 256;
 #[cfg(feature = "skills")]
@@ -999,6 +1005,8 @@ pub(crate) enum FrameError {
     Io(io::ErrorKind),
 }
 
+const FRAME_HEADER_BYTES: usize = 4;
+
 struct BoundedPayload {
     bytes: Vec<u8>,
     exceeded: bool,
@@ -1008,7 +1016,12 @@ impl BoundedPayload {
     fn new() -> Self {
         Self {
             // Most frames are small; start past the first few doubling reallocations.
-            bytes: Vec::with_capacity(4096),
+            // The first `FRAME_HEADER_BYTES` are a placeholder for the length prefix.
+            bytes: {
+                let mut bytes = Vec::with_capacity(4096);
+                bytes.extend_from_slice(&[0_u8; FRAME_HEADER_BYTES]);
+                bytes
+            },
             exceeded: false,
         }
     }
@@ -1016,7 +1029,8 @@ impl BoundedPayload {
 
 impl Write for BoundedPayload {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if buffer.len() > MAX_FRAME_BYTES.saturating_sub(self.bytes.len()) {
+        let payload_len = self.bytes.len() - FRAME_HEADER_BYTES;
+        if buffer.len() > MAX_FRAME_BYTES.saturating_sub(payload_len) {
             self.exceeded = true;
             return Err(io::Error::other("wire frame limit exceeded"));
         }
@@ -1029,7 +1043,8 @@ impl Write for BoundedPayload {
     }
 }
 
-/// Serializes `frame` once into its bounded wire payload (without the length prefix).
+/// Serializes `frame` once into a ready-to-send wire buffer: the 4-byte big-endian length prefix
+/// followed by the bounded payload.
 /// Fails with [`FrameError::FrameTooLarge`] as soon as the payload would exceed the limit, so a
 /// caller can both size-check and send a frame with a single serialization pass.
 pub(crate) fn encode_frame<M: Serialize>(frame: &M) -> Result<Vec<u8>, FrameError> {
@@ -1044,24 +1059,27 @@ pub(crate) fn encode_frame<M: Serialize>(frame: &M) -> Result<Vec<u8>, FrameErro
             Err(FrameError::Serialization)
         };
     }
-    if payload.bytes.is_empty() {
+    let length = payload.bytes.len() - FRAME_HEADER_BYTES;
+    if length == 0 {
         return Err(FrameError::ZeroLength);
     }
+    // Bounded by MAX_FRAME_BYTES above, so the cast cannot truncate.
+    let prefix = u32::try_from(length).map_err(|_| FrameError::FrameTooLarge {
+        length,
+        maximum: MAX_FRAME_BYTES,
+    })?;
+    payload.bytes[..FRAME_HEADER_BYTES].copy_from_slice(&prefix.to_be_bytes());
     Ok(payload.bytes)
 }
 
-/// Writes a payload produced by [`encode_frame`] with its length prefix.
+/// Writes a buffer produced by [`encode_frame`] (length prefix already in place) with one
+/// `write_all`, so a frame costs one pipe write instead of two.
 pub(crate) fn write_encoded_frame<W: Write>(
     writer: &mut W,
-    payload: &[u8],
+    frame: &[u8],
 ) -> Result<(), FrameError> {
-    let length = u32::try_from(payload.len()).map_err(|_| FrameError::FrameTooLarge {
-        length: payload.len(),
-        maximum: MAX_FRAME_BYTES,
-    })?;
     writer
-        .write_all(&length.to_be_bytes())
-        .and_then(|()| writer.write_all(payload))
+        .write_all(frame)
         .map_err(|error| FrameError::Io(error.kind()))
 }
 

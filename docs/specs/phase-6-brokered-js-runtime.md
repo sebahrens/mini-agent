@@ -617,8 +617,15 @@ The broker owns one closed ordering for every typed operation:
 4. normalize and authorize the exact target, and retain the prepared parent target;
 5. derive redacted metadata from that prepared target, append the intent, and successfully sync it;
 6. execute the prepared effect exactly once;
-7. append and sync a bounded completion or explicit `outcome_unknown` record; and
-8. only then return the effect response to the worker.
+7. append a bounded completion or explicit `outcome_unknown` record. The completion is
+   group-committed under delivered amendment 5 (batched effects): it need not be synced
+   individually, because the next intent, denial or rotation sync of the same writer, or the
+   invocation's terminal flush, makes it durable; and
+8. return the effect response to the worker. The step result is released to the model only after
+   the terminal flush (`EffectAudit::sync_pending`, run by `JsTool::call` before rendering) has
+   made every completion of the step durable; a failed flush replaces the step result with the
+   closed audit error and retires the invocation. `reconcile_interrupted_effect` syncs its
+   `outcome_unknown` record before reporting it.
 
 Wire effect ordinals are zero-based. Audit sequences are the checked, one-based representation of
 those ordinals, while replay identity is derived from the parent invocation identity plus the
@@ -1408,7 +1415,9 @@ bead is closed with its required regression tests, so all items are part of the 
    before any content is read. It accepts 1–256 paths with at most 1 MiB aggregate path text and
    returns ordered contents capped at 6 MiB after JSON encoding. A single denied path fails the
    batch closed before any read. Audit records within one step may be group-committed as long as
-   intent still precedes the first byte of the effect.
+   intent still precedes the first byte of the effect. Implemented (mini-agent-vb5vw.66): completion
+   appends no longer sync; N effects cost N intent syncs plus one terminal flush. A completion lost to
+   a crash before its sync leaves the intent active, which recovery records as `outcome_unknown`.
 6. **Closed denial codes** (mini-agent-dr93, delivered). `EffectErrorCode` gains `not_found`,
    `is_directory`, `denied`, and `too_large`. Codes are chosen by the parent from its own
    observations and remain free of target text. A host global throws a plain `Error` with the

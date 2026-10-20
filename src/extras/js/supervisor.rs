@@ -185,10 +185,27 @@ struct WorkerConnection {
     skill_cache_turn: Option<String>,
     #[cfg(feature = "skills")]
     skill_cache_ids: Vec<String>,
-    retirement: Option<Arc<RetirementTicket>>,
+    retirement: Option<IdleRetirement>,
     /// Dedicated protocol handles cloned once when the connection is established.
     input_handle: Arc<Mutex<std::fs::File>>,
     output_handle: Arc<Mutex<std::fs::File>>,
+}
+
+/// Handle that cancels a parked generation's pending idle retirement.
+enum IdleRetirement {
+    /// Tokio timer task (the normal case: the supervisor always runs inside a runtime).
+    Task(tokio::task::AbortHandle),
+    /// Dedicated thread, used only when no runtime handle is available.
+    Thread(Arc<RetirementTicket>),
+}
+
+impl IdleRetirement {
+    fn cancel(&self) {
+        match self {
+            Self::Task(handle) => handle.abort(),
+            Self::Thread(ticket) => ticket.cancel(),
+        }
+    }
 }
 
 struct RetirementTicket {
@@ -433,7 +450,7 @@ impl BoundedStderrDrain {
 
 impl Drop for WorkerConnection {
     fn drop(&mut self) {
-        if let Some(retirement) = &self.retirement {
+        if let Some(retirement) = self.retirement.take() {
             retirement.cancel();
         }
         let _ = self.process.terminate_and_reap(PROCESS_REAP_TIMEOUT);
@@ -1626,16 +1643,60 @@ fn store_idle_with_retirement(
         .created_at
         .checked_add(inner.reuse_policy.max_age)
         .unwrap_or(connection.created_at);
+    let weak = Arc::downgrade(inner);
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let task = tokio::spawn(retire_idle_generation_task(weak, generation, retire_at));
+        connection.retirement = Some(IdleRetirement::Task(task.abort_handle()));
+        state.idle = Some(connection);
+        return;
+    }
     let ticket = Arc::new(RetirementTicket::new());
     let waiting_ticket = ticket.clone();
-    let weak = Arc::downgrade(inner);
-    connection.retirement = Some(ticket);
+    connection.retirement = Some(IdleRetirement::Thread(ticket));
     let retirement = std::thread::Builder::new()
         .name(format!("mini-agent-js-idle-retire-{generation}"))
         .spawn(move || retire_idle_generation(weak, generation, retire_at, waiting_ticket));
     if retirement.is_ok() {
         state.idle = Some(connection);
     }
+}
+
+/// Timer-task form of [`retire_idle_generation`]: sleeps until `retire_at`, then drops the
+/// matching idle generation through the usual `terminate_and_reap` path. The blocking teardown
+/// runs on the blocking pool so it never stalls an executor thread.
+async fn retire_idle_generation_task(
+    weak: Weak<SupervisorInner>,
+    generation: u64,
+    retire_at: Instant,
+) {
+    tokio::time::sleep_until(tokio::time::Instant::from_std(retire_at)).await;
+    let Some(inner) = weak.upgrade() else {
+        return;
+    };
+    let retired = {
+        let mut state = inner.transport.lock().await;
+        if state
+            .idle
+            .as_ref()
+            .is_some_and(|connection| connection.generation == generation)
+        {
+            state.idle.take()
+        } else {
+            None
+        }
+    };
+    let Some(mut retired) = retired else {
+        return;
+    };
+    // Detach the cancel handle first: dropping the connection must not abort this very task
+    // before the teardown and the test notification complete.
+    retired.retirement = None;
+    let _ = tokio::task::spawn_blocking(move || {
+        drop(retired);
+        #[cfg(test)]
+        inner.idle_retirement.notify_one();
+    })
+    .await;
 }
 
 fn retire_idle_generation(

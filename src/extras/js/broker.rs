@@ -1672,6 +1672,9 @@ impl<S: ParentEffectService> InvocationBroker<S> {
                         effect_id,
                         result_code: AuditResultCode::OutcomeUnknown,
                     })
+                    // The interrupted invocation may never reach its terminal flush, so the
+                    // truthful unknown record is made durable before it is reported.
+                    .and_then(|record| audit.sync_pending().map(|()| record))
                     .map_err(HostEffectError::from)
             });
         match completion {

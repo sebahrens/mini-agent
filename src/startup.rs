@@ -1432,6 +1432,12 @@ impl Startup {
         let no_model_rounds = false;
         #[cfg(feature = "js")]
         let worker_probe = if cli.tool_is_eligible(&cfg, "js") && !no_model_rounds {
+            // Open the process-wide effect audit (segment validation, marker) on the blocking
+            // pool so the later agent prebuild does not do that disk work on an executor thread.
+            // `JsTool::new` still falls back to the same `get_or_init`.
+            drop(tokio::task::spawn_blocking(
+                crate::extras::js::tool::warm_shared_effect_audit,
+            ));
             Some(heap_future(crate::sandbox::worker::StartupWorkerProbe::start).await)
         } else {
             None
