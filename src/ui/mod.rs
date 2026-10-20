@@ -252,6 +252,9 @@ fn draw_main_frame(
     // input shrinks, or chat text hidden under it when the input grows).
     renderer.sync_input_height(&input.buffer)?;
     input.set_wrap_width(renderer.input_wrap_width());
+    if let Some((width, text, rows)) = renderer.input_rows() {
+        input.adopt_wrap_rows(width, text, rows);
+    }
     renderer.set_activity(if run.is_running && renderer.permission_prompt.is_some() {
         crate::ui::terminal::AgentActivity::WaitingForApproval
     } else if run.is_running {

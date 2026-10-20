@@ -1694,6 +1694,16 @@ impl Renderer {
         layout
     }
 
+    /// The memoized wrap layout of the last input laid out: its width, text
+    /// and rows, for the editor to adopt as its Up/Down memo.
+    pub(crate) fn input_rows(
+        &self,
+    ) -> Option<(usize, Arc<str>, Arc<Vec<crate::ui::input::wrap::VisualRow>>)> {
+        let memo = self.input_layout.borrow();
+        let layout = memo.as_ref()?;
+        Some((layout.width, layout.text.clone(), layout.rows.clone()))
+    }
+
     /// Display width the input text soft-wraps at (the terminal width less
     /// the prompt), for the editor's Up/Down row movement.
     pub fn input_wrap_width(&self) -> usize {
@@ -4707,6 +4717,31 @@ mod frame_buffer_tests {
             *renderer.input_layout(&text, width).rows,
             crate::ui::input::wrap::wrap_rows(&text, width)
         );
+    }
+
+    #[test]
+    fn row_movement_after_a_frame_reuses_the_renderer_wrap_layout() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut renderer = filled_renderer();
+        let mut input = crate::ui::input::InputEditor::new();
+        input.load_text(&"word ".repeat(20_000));
+        renderer
+            .frame(|r| {
+                r.sync_input_height(&input.buffer)?;
+                Ok(())
+            })
+            .unwrap();
+        input.set_wrap_width(renderer.input_wrap_width());
+        let (width, text, rows) = renderer.input_rows().unwrap();
+        input.adopt_wrap_rows(width, text, rows);
+        assert_eq!(renderer.frame_stats().input_layouts, 1);
+        let before = input.buffer.clone();
+        for code in [KeyCode::Up, KeyCode::Up, KeyCode::Down] {
+            input.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        assert_eq!(input.buffer, before);
+        assert_eq!(input.wrap_layouts(), 0);
+        assert_eq!(renderer.frame_stats().input_layouts, 1);
     }
 
     #[test]
