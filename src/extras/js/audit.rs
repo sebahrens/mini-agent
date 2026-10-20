@@ -487,6 +487,11 @@ pub(crate) struct EffectAudit {
     terminal: HashSet<String>,
     rotation_anchors: usize,
     poisoned: bool,
+    /// Completion records appended since the last file sync (group commit). Every later
+    /// intent, denial, rotation or terminal `sync_pending` makes them durable.
+    pending_sync: bool,
+    #[cfg(test)]
+    file_syncs: u64,
     target_key: [u8; TARGET_KEY_BYTES],
 }
 
@@ -537,6 +542,9 @@ impl EffectAudit {
                 terminal: HashSet::new(),
                 rotation_anchors: 0,
                 poisoned: false,
+                pending_sync: false,
+                #[cfg(test)]
+                file_syncs: 0,
                 target_key,
             };
             audit.sync_directory()?;
@@ -569,6 +577,9 @@ impl EffectAudit {
                 terminal: HashSet::new(),
                 rotation_anchors: 0,
                 poisoned: false,
+                pending_sync: false,
+                #[cfg(test)]
+                file_syncs: 0,
                 target_key,
             }
         };
@@ -614,7 +625,7 @@ impl EffectAudit {
             decision: intent.decision.as_str().into(),
             result_code: None,
         };
-        let record = self.append_effect(body)?;
+        let record = self.append_effect(body, true)?;
         self.active.insert(record.effect_id.clone(), record.clone());
         Ok(record)
     }
@@ -640,7 +651,11 @@ impl EffectAudit {
             AuditState::Completed
         };
         let body = body_from_record(&intent, state, Some(completion.result_code.as_str().into()));
-        let record = self.append_effect(body)?;
+        // Group commit: the completion is appended but not synced here. Intent still precedes
+        // the first byte of every effect; an unsynced completion lost to a crash leaves its
+        // intent active, which recovery records as `outcome_unknown`.
+        let record = self.append_effect(body, false)?;
+        self.pending_sync = true;
         self.active.remove(&completion.effect_id);
         self.terminal.insert(completion.effect_id);
         Ok(record)
@@ -666,20 +681,23 @@ impl EffectAudit {
             return Err(AuditError::ReplayedEffect);
         }
         let effect_id = denial.effect_id.clone();
-        let record = self.append_effect(EffectBody {
-            effect_id,
-            invocation_id: denial.invocation_id,
-            grant_id: denial.grant_id,
-            sequence: denial.sequence,
-            timestamp_ms: denial.timestamp_ms,
-            artifact_id: denial.artifact_id,
-            export: denial.export,
-            capability: denial.capability.as_str().into(),
-            normalized_target: SanitizedTarget::denied(),
-            state: AuditState::Completed,
-            decision: AuditDecision::Denied.as_str().into(),
-            result_code: Some(denial.result_code.as_str().into()),
-        })?;
+        let record = self.append_effect(
+            EffectBody {
+                effect_id,
+                invocation_id: denial.invocation_id,
+                grant_id: denial.grant_id,
+                sequence: denial.sequence,
+                timestamp_ms: denial.timestamp_ms,
+                artifact_id: denial.artifact_id,
+                export: denial.export,
+                capability: denial.capability.as_str().into(),
+                normalized_target: SanitizedTarget::denied(),
+                state: AuditState::Completed,
+                decision: AuditDecision::Denied.as_str().into(),
+                result_code: Some(denial.result_code.as_str().into()),
+            },
+            true,
+        )?;
         self.terminal.insert(denial.effect_id);
         Ok(record)
     }
@@ -731,6 +749,12 @@ impl EffectAudit {
     #[cfg(any(test, feature = "skills"))]
     pub(crate) const fn proposal_target(&self) -> SanitizedTarget {
         SanitizedTarget::proposal()
+    }
+
+    /// Number of successful segment-file syncs since open (test observability for group commit).
+    #[cfg(test)]
+    pub(crate) fn file_sync_count(&self) -> u64 {
+        self.file_syncs
     }
 
     #[cfg(test)]
@@ -889,18 +913,37 @@ impl EffectAudit {
                 AuditState::OutcomeUnknown,
                 Some("outcome_unknown".into()),
             );
-            self.append_effect(body)?;
+            self.append_effect(body, true)?;
             self.active.remove(&effect_id);
             self.terminal.insert(effect_id);
         }
         Ok(())
     }
 
-    fn append_effect(&mut self, body: EffectBody) -> Result<EffectAuditRecord, AuditError> {
+    /// Makes every group-committed completion durable. A no-op when nothing is pending.
+    pub(crate) fn sync_pending(&mut self) -> Result<(), AuditError> {
+        if !self.pending_sync {
+            return Ok(());
+        }
         if self.poisoned {
             return Err(AuditError::Unavailable);
         }
-        let result = self.append_effect_unpoisoned(body);
+        let result = self.sync_file();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn append_effect(
+        &mut self,
+        body: EffectBody,
+        sync: bool,
+    ) -> Result<EffectAuditRecord, AuditError> {
+        if self.poisoned {
+            return Err(AuditError::Unavailable);
+        }
+        let result = self.append_effect_unpoisoned(body, sync);
         if matches!(
             result,
             Err(AuditError::PathUnavailable | AuditError::SyncFailed | AuditError::RetentionLimit)
@@ -913,6 +956,7 @@ impl EffectAudit {
     fn append_effect_unpoisoned(
         &mut self,
         body: EffectBody,
+        sync: bool,
     ) -> Result<EffectAuditRecord, AuditError> {
         validate_effect_body(&body)?;
         // Hash and encode once; only a rotation (which changes `previous_hash`) rebuilds them.
@@ -927,7 +971,9 @@ impl EffectAudit {
             encoded = encode_record(&stored)?;
         }
         self.append_encoded(&stored.record_hash, &encoded)?;
-        self.sync_file()?;
+        if sync {
+            self.sync_file()?;
+        }
         self.current_effect_records += 1;
         let StoredKind::Effect(body) = &stored.kind else {
             unreachable!("effect record was constructed as an effect");
@@ -999,8 +1045,14 @@ impl EffectAudit {
         Ok(())
     }
 
-    fn sync_file(&self) -> Result<(), AuditError> {
-        sync_file(&self.current_file, self.options.failure)
+    fn sync_file(&mut self) -> Result<(), AuditError> {
+        sync_file(&self.current_file, self.options.failure)?;
+        #[cfg(test)]
+        {
+            self.file_syncs += 1;
+        }
+        self.pending_sync = false;
+        Ok(())
     }
 
     fn sync_directory(&self) -> Result<(), AuditError> {
@@ -1008,14 +1060,17 @@ impl EffectAudit {
     }
 
     fn ensure_initialization_marker(&self) -> Result<(), AuditError> {
-        let path = self.owner.initialization_marker();
-        if !initialization_marker_exists(&self.owner)? {
-            crate::fs::private_atomic_create_sync(&path, INITIALIZATION_MARKER)
-                .map_err(|_| AuditError::PathUnavailable)?;
+        if initialization_marker_exists(&self.owner)? {
+            // A clean reopen has nothing new to make durable: the marker was synced when it
+            // was created, so skip the two barriers (file and state root).
+            return Ok(());
         }
-        let marker =
-            open_private_rw(&path, false, false).map_err(|_| AuditError::PathUnavailable)?;
-        sync_file(&marker, self.options.failure)?;
+        // `private_atomic_create_sync` syncs the marker file; only the directory entry remains.
+        crate::fs::private_atomic_create_sync(
+            &self.owner.initialization_marker(),
+            INITIALIZATION_MARKER,
+        )
+        .map_err(|_| AuditError::PathUnavailable)?;
         sync_directory(&self.owner.state_root(), self.options.failure)
     }
 }

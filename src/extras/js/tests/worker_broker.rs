@@ -3428,6 +3428,90 @@ fn js_effect_audit_storage_retention_limit_poisoning_is_fail_closed() {
 }
 
 #[test]
+fn js_effect_audit_group_commit_n_effects_cost_n_plus_one_file_syncs() {
+    let root = AuditTempRoot::new("group-commit-count");
+    let mut audit = EffectAudit::open(root.owner()).unwrap();
+    let opened = audit.file_sync_count();
+    const EFFECTS: u64 = 5;
+    for index in 0..EFFECTS {
+        let id = format!("effect-group-{index}");
+        let target = audit.file_target(&format!("safe/path-{index}"));
+        audit.append_intent(audit_intent(&id, target)).unwrap();
+        audit
+            .append_completion(EffectCompletion {
+                effect_id: id,
+                result_code: AuditResultCode::Succeeded,
+            })
+            .unwrap();
+    }
+    // Every intent syncs (and carries the previous completion); the last completion is
+    // made durable by the single terminal flush.
+    assert_eq!(audit.file_sync_count() - opened, EFFECTS);
+    audit.sync_pending().unwrap();
+    assert_eq!(audit.file_sync_count() - opened, EFFECTS + 1);
+    // Nothing pending: a second flush performs no sync.
+    audit.sync_pending().unwrap();
+    assert_eq!(audit.file_sync_count() - opened, EFFECTS + 1);
+    drop(audit);
+
+    let reopened = EffectAudit::open(root.owner()).unwrap();
+    assert_eq!(
+        reopened
+            .records()
+            .iter()
+            .filter(|record| record.state == AuditState::Completed)
+            .count() as u64,
+        EFFECTS
+    );
+}
+
+#[test]
+fn js_effect_audit_group_commit_terminal_flush_sync_failure_is_typed_and_poisons() {
+    let root = AuditTempRoot::new("group-commit-flush-failure");
+    let mut audit = EffectAudit::open(root.owner()).unwrap();
+    let target = audit.file_target("safe/path");
+    audit
+        .append_intent(audit_intent("effect-flush-failure", target))
+        .unwrap();
+    audit
+        .append_completion(EffectCompletion {
+            effect_id: "effect-flush-failure".into(),
+            result_code: AuditResultCode::Succeeded,
+        })
+        .unwrap();
+    audit.fail_next_durability_for_test(AuditFailurePoint::FileSync);
+    assert!(matches!(audit.sync_pending(), Err(AuditError::SyncFailed)));
+    let target = audit.file_target("safe/other");
+    assert!(matches!(
+        audit.append_intent(audit_intent("effect-after-flush-failure", target)),
+        Err(AuditError::Unavailable)
+    ));
+    assert!(matches!(audit.sync_pending(), Err(AuditError::Unavailable)));
+}
+
+#[test]
+fn js_effect_audit_reopen_skips_marker_syncs_while_first_open_still_requires_them() {
+    let root = AuditTempRoot::new("reopen-no-sync");
+    drop(EffectAudit::open(root.owner()).unwrap());
+    // A clean reopen performs no file sync for the marker or segments.
+    let reopened = EffectAudit::open_with_options(
+        root.owner(),
+        AuditOpenOptions::for_test(4_096).with_failure(AuditFailurePoint::FileSync),
+    );
+    assert!(reopened.is_ok(), "reopen must not fsync the marker");
+    drop(reopened);
+
+    let fresh = AuditTempRoot::new("first-open-sync");
+    assert!(matches!(
+        EffectAudit::open_with_options(
+            fresh.owner(),
+            AuditOpenOptions::for_test(4_096).with_failure(AuditFailurePoint::FileSync),
+        ),
+        Err(AuditError::SyncFailed)
+    ));
+}
+
+#[test]
 fn js_effect_audit_storage_required_path_and_sync_failures_are_typed() {
     for failure in [
         AuditFailurePoint::FileSync,

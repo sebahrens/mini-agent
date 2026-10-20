@@ -25,11 +25,12 @@ use super::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, DenialReason, Diagnostic,
     DiagnosticClass, DiagnosticStage, DirectoryEntry, DirectoryEntryKind, EffectErrorCode,
     EffectOperation, EffectRequest, EffectResponse, EffectResult, GrepMatch, GrepOptions,
-    JsErrorCode, JsExceptionClass, ModelEffectProfile, ParentFrame, ParentWireFrame, ProtocolError,
-    ProtocolFault, ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole, StepOutcome, StepResult,
-    VERIFICATION_LOADER_VERSION, VerificationCaseResult, VerificationResult, VerifyArtifact,
-    WireFrame, WorkerFrame, WorkerProtocol, WorkerWireFrame, read_frame, source_position_is_valid,
-    write_frame,
+    JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES, MAX_CONSOLE_RECORD_BYTES,
+    MAX_CONSOLE_RECORDS, MAX_RESULT_BYTES, ModelEffectProfile, ParentFrame, ParentWireFrame,
+    ProtocolError, ProtocolFault, ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole,
+    StepOutcome, StepResult, VERIFICATION_LOADER_VERSION, VerificationCaseResult,
+    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerWireFrame,
+    read_frame, source_position_is_valid, write_frame,
 };
 #[cfg(feature = "sandbox")]
 use super::protocol::{HttpHeader, HttpMethod};
@@ -55,10 +56,6 @@ use crate::sandbox::worker::{
 
 const EXIT_FAILURE: i32 = 1;
 const MAX_PENDING_JOBS: usize = 10_000;
-const MAX_RESULT_BYTES: usize = 64 * 1024;
-const MAX_CONSOLE_RECORDS: usize = 256;
-const MAX_CONSOLE_BYTES: usize = 256 * 1024;
-const MAX_CONSOLE_RECORD_BYTES: usize = 8 * 1024;
 const MAX_VERIFICATION_CASES: usize = 4_096;
 const MAX_VERIFICATION_CASE_ID_BYTES: usize = 128;
 const EFFECT_PATH_MAX_BYTES: usize = READ_FILE_MAX_BYTES;

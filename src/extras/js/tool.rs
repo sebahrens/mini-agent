@@ -33,8 +33,9 @@ use crate::extras::js::host::{
 };
 use crate::extras::js::protocol::{
     ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass, DiagnosticStage, InvocationId,
-    JsErrorCode, JsExceptionClass, MAX_EFFECTS_PER_STEP, ModelEffectProfile, RunStep, ScriptRole,
-    StepOutcome, StepResult, source_position_is_valid,
+    JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES, MAX_CONSOLE_RECORD_BYTES,
+    MAX_CONSOLE_RECORDS, MAX_EFFECTS_PER_STEP, MAX_RESULT_BYTES, ModelEffectProfile, RunStep,
+    ScriptRole, StepOutcome, StepResult, source_position_is_valid,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::protocol::{
@@ -867,6 +868,27 @@ impl JsTool {
     }
 }
 
+/// Populates the process-wide effect audit now, so the first `JsTool::new` finds it ready.
+/// Intended for a blocking-pool thread; a concurrent `JsTool::new` waits on the same `OnceLock`.
+pub(crate) fn warm_shared_effect_audit() {
+    let _ = shared_effect_audit();
+}
+
+/// Terminal group-commit barrier for one invocation: one `fsync` (on the blocking pool, never
+/// under the executor) covers every completion appended since the last intent/denial sync.
+async fn flush_pending_audit(audit: SharedEffectAudit) -> Result<(), ToolError> {
+    let unavailable = || ToolError::Msg("JS effect audit unavailable".into());
+    crate::agent::runner::spawn_blocking_scoped(move || {
+        audit
+            .lock()
+            .map_err(|_| AuditError::Unavailable)
+            .and_then(|mut audit| audit.sync_pending())
+    })
+    .await
+    .map_err(|_| unavailable())?
+    .map_err(|_| unavailable())
+}
+
 fn shared_effect_audit() -> Result<SharedEffectAudit, AuditError> {
     static SHARED: OnceLock<Result<SharedEffectAudit, AuditError>> = OnceLock::new();
     SHARED
@@ -1168,6 +1190,7 @@ impl Tool for JsTool {
             .clone()
             .map_err(|_| ToolError::Msg("JS effect audit unavailable".into()))?;
         let structured_result_receipt = super::session::StructuredResultReceipt::default();
+        let terminal_audit = Arc::clone(&audit);
         let broker = InvocationBroker::new(
             invocation_id.clone(),
             grants,
@@ -1219,7 +1242,11 @@ impl Tool for JsTool {
             cancellation,
             Some(call_deadline),
         );
-        let response = match execution.await {
+        let execution_result = execution.await;
+        // Effect completions are group-committed (phase-6 spec, effect-audit ordering): make any
+        // still-unsynced completion durable before the step result is released. Fail closed.
+        flush_pending_audit(terminal_audit).await?;
+        let response = match execution_result {
             Ok(response) => response,
             Err(error) => {
                 return render_worker_execution_error(
@@ -1534,15 +1561,10 @@ fn render_worker_execution_error(
 
 /// Parent-side ceilings for worker-supplied result and console payloads.
 ///
-/// They mirror the worker's own bounds (`MAX_RESULT_BYTES`, `MAX_CONSOLE_*`
-/// in `worker.rs`). The parent never trusts the worker to have applied them:
+/// They are the same constants the worker enforces (`MAX_RESULT_BYTES`,
+/// `MAX_CONSOLE_*` in `protocol.rs`). The parent never trusts the worker to have applied them:
 /// a step result that exceeds them is a protocol violation and is rejected
 /// instead of being forwarded to the model.
-const MAX_RESULT_BYTES: usize = 64 * 1024;
-const MAX_CONSOLE_RECORDS: usize = 256;
-const MAX_CONSOLE_BYTES: usize = 256 * 1024;
-const MAX_CONSOLE_RECORD_BYTES: usize = 8 * 1024;
-
 fn validate_step_result_bounds(result: &StepResult, model_source: &str) -> Result<(), ToolError> {
     let violation = || worker_tool_error(WorkerError::Protocol);
     match &result.outcome {
@@ -2945,6 +2967,45 @@ mod js_permission_bridge {
             after_result <= 2,
             "post-result effects must not reach the parent audit: {after_result} records after the result"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_audit_flush_failure_is_the_closed_audit_error() {
+        use crate::extras::js::audit::{
+            AuditCapability, AuditDecision, AuditFailurePoint, AuditResultCode, EffectCompletion,
+            EffectIntent,
+        };
+
+        let audit = private_effect_audit_for_test("terminal-flush");
+        {
+            let mut guard = audit.lock().unwrap();
+            let target = guard.file_target("safe/path");
+            guard
+                .append_intent(EffectIntent {
+                    effect_id: "effect-terminal-flush".into(),
+                    invocation_id: "inv-terminal-flush".into(),
+                    grant_id: "grant-terminal-flush".into(),
+                    sequence: 1,
+                    timestamp_ms: 1_800_000_000_000,
+                    artifact_id: None,
+                    export: None,
+                    capability: AuditCapability::ReadFile,
+                    normalized_target: target,
+                    decision: AuditDecision::Authorized,
+                })
+                .unwrap();
+            guard
+                .append_completion(EffectCompletion {
+                    effect_id: "effect-terminal-flush".into(),
+                    result_code: AuditResultCode::Succeeded,
+                })
+                .unwrap();
+            guard.fail_next_durability_for_test(AuditFailurePoint::FileSync);
+        }
+        let error = flush_pending_audit(audit.clone())
+            .await
+            .expect_err("a failed terminal sync must replace the step result");
+        assert_eq!(error.to_string(), "JS effect audit unavailable");
     }
 
     #[tokio::test]
