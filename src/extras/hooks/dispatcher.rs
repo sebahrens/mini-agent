@@ -10,7 +10,8 @@ use super::normalize::{McpToolIdentity, canonical_tool_name};
 use super::pins::HookContentPins;
 use super::settings::{HookHandler, HooksConfig};
 use super::subprocess::{
-    HookOutput, HookPolicy, HookStatus, run_hook_with_policy_at_root, run_shell_condition_at_root,
+    HookOutput, HookPolicy, HookStatus, ProjectDirMemo, run_hook_with_policy_at_root,
+    run_shell_condition_at_root,
 };
 use super::{Decision, HookCtx, PreDecision, Verdict};
 
@@ -734,6 +735,9 @@ impl HookDispatcher {
         execution_root: &HookExecutionRootLease,
     ) -> Vec<HookOutput> {
         let stdin: Arc<[u8]> = serde_json::to_vec(envelope).unwrap_or_default().into();
+        // One canonicalize of the project directory per event, shared by all
+        // handlers; the next event resolves it afresh.
+        let dir_memo = Arc::new(ProjectDirMemo::default());
         let mut futures = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
@@ -749,10 +753,12 @@ impl HookDispatcher {
                 let sandbox_backend = self.sandbox_backend.clone();
                 let once_ran = Arc::clone(&self.once_ran);
                 let content_pins = self.content_pins_for(&handler);
+                let dir_memo = Arc::clone(&dir_memo);
                 std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
                     let policy =
                         HookPolicy::new(handler.trust, &sandbox_backend, handler.env.clone())
-                            .with_content_pins(content_pins);
+                            .with_content_pins(content_pins)
+                            .with_project_dir_memo(dir_memo);
                     if let Some(condition) = &handler.condition {
                         let cond_timeout = std::time::Duration::from_secs(
                             handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
@@ -830,7 +836,8 @@ impl HookDispatcher {
             // policy's launch prep and sandbox caches. Every launch still
             // verifies pins and wraps (and validates) the sandbox afresh.
             let policy = HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone())
-                .with_content_pins(self.content_pins_for(handler));
+                .with_content_pins(self.content_pins_for(handler))
+                .with_project_dir_memo(Arc::clone(&dir_memo));
             if let Some(condition) = &handler.condition {
                 let cond_timeout =
                     std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
