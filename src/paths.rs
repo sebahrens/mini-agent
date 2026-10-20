@@ -76,7 +76,9 @@ pub(crate) struct WorkspaceBinding {
     spelling: workspace_spelling::WorkspaceSpelling,
     directory: std::fs::File,
     capability: cap_std::fs::Dir,
-    identity: crate::fs::CheckedMetadata,
+    /// Physical identity only: the held `directory` descriptor is the retained
+    /// object, so no further duplicate descriptor is kept.
+    identity: crate::fs::FileIdentity,
     /// Per-binding `validate` calls (any thread), for "validated once per effect" tests.
     #[cfg(test)]
     validations: std::sync::atomic::AtomicUsize,
@@ -126,7 +128,7 @@ impl WorkspaceBinding {
         }
         // `identity` is the immutable captured value, so one validation after
         // it is folded in establishes the same fact as a bracketing pair.
-        hash.update(self.identity.identity_fingerprint());
+        hash.update(self.identity.fingerprint());
         self.validate()?;
         Ok(hash.finalize().into())
     }
@@ -150,10 +152,10 @@ impl WorkspaceBinding {
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
                 .open(&root)?
         };
-        let metadata = crate::fs::checked_file_metadata(&directory)?;
+        let (metadata, identity) = crate::fs::file_identity(&directory)?;
         let capability_file = capability.try_clone()?.into_std_file();
-        let capability_metadata = crate::fs::checked_file_metadata(&capability_file)?;
-        crate::fs::ensure_same_file(&root, &metadata, &capability_metadata)?;
+        let (_, capability_identity) = crate::fs::file_identity(&capability_file)?;
+        crate::fs::ensure_same_identity(&root, &identity, &capability_identity)?;
         if !metadata.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -168,7 +170,7 @@ impl WorkspaceBinding {
             spelling,
             directory,
             capability,
-            identity: metadata,
+            identity,
             #[cfg(test)]
             validations: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -195,7 +197,7 @@ impl WorkspaceBinding {
             spelling: self.spelling.clone(),
             directory,
             capability,
-            identity: self.identity.clone(),
+            identity: self.identity,
             #[cfg(test)]
             validations: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -935,11 +937,11 @@ impl WorkspaceBinding {
         if !metadata.is_dir() {
             return Err("workspace binding is no longer a directory".to_string());
         }
-        crate::fs::ensure_same_file(&canonical, &self.identity, &metadata)
+        crate::fs::ensure_same_identity(&canonical, &self.identity, &metadata.identity())
             .map_err(|_| "workspace binding identity changed after session creation".to_string())?;
-        let held = crate::fs::checked_file_metadata(&self.directory)
+        let (_, held) = crate::fs::file_identity(&self.directory)
             .map_err(|error| format!("workspace binding handle is unavailable: {error}"))?;
-        crate::fs::ensure_same_file(&canonical, &self.identity, &held)
+        crate::fs::ensure_same_identity(&canonical, &self.identity, &held)
             .map_err(|_| "workspace binding handle identity changed".to_string())?;
         Ok(())
     }
@@ -955,7 +957,8 @@ impl WorkspaceBinding {
     #[cfg(feature = "mcp")]
     pub(crate) fn validate_after(&self, validated: &Self) -> Result<(), String> {
         if self.root != validated.root
-            || crate::fs::ensure_same_file(&self.root, &self.identity, &validated.identity).is_err()
+            || crate::fs::ensure_same_identity(&self.root, &self.identity, &validated.identity)
+                .is_err()
         {
             return self.validate();
         }
@@ -963,9 +966,9 @@ impl WorkspaceBinding {
         self.spelling
             .validate()
             .map_err(|_| "workspace spelling changed after session creation".to_string())?;
-        let held = crate::fs::checked_file_metadata(&self.directory)
+        let (_, held) = crate::fs::file_identity(&self.directory)
             .map_err(|error| format!("workspace binding handle is unavailable: {error}"))?;
-        crate::fs::ensure_same_file(&self.root, &self.identity, &held)
+        crate::fs::ensure_same_identity(&self.root, &self.identity, &held)
             .map_err(|_| "workspace binding handle identity changed".to_string())
     }
 }
@@ -4330,6 +4333,78 @@ mod native_workspace_compatibility_tests {
             "workspace path exceeds compatibility limits"
         );
         assert!(binding.validate().is_ok());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn open_descriptor_count() -> usize {
+        #[cfg(target_os = "macos")]
+        let directory = "/dev/fd";
+        #[cfg(target_os = "linux")]
+        let directory = "/proc/self/fd";
+        std::fs::read_dir(directory).unwrap().count()
+    }
+
+    /// Other tests in this process open descriptors concurrently, so each
+    /// measurement is retried until it is undisturbed.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn settled_descriptor_delta(operation: impl Fn() -> Box<dyn std::any::Any>) -> isize {
+        let mut last = 0;
+        for _ in 0..20 {
+            let before = open_descriptor_count() as isize;
+            let held = operation();
+            let after = open_descriptor_count() as isize;
+            drop(held);
+            last = after - before;
+            if last == 0 || last == 2 || last == 3 {
+                // Plausible exact values; a concurrent test can still skew
+                // them, so require two identical consecutive readings.
+                let again_before = open_descriptor_count() as isize;
+                let held = operation();
+                let again_after = open_descriptor_count() as isize;
+                drop(held);
+                if again_after - again_before == last {
+                    return last;
+                }
+            }
+        }
+        last
+    }
+
+    /// Descriptor counts are process-global, so concurrent tests skew them.
+    /// Run with `-- --ignored --test-threads=1` to measure.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    #[ignore = "descriptor counts are process-global; run with --test-threads=1"]
+    fn native_host_binding_retains_two_descriptors_and_validation_retains_none() {
+        let root = crate::tests::OwnedTestDirectory::new("native-binding-descriptors");
+        let path = root.path().to_path_buf();
+        let captured =
+            settled_descriptor_delta(|| Box::new(WorkspaceBinding::capture(&path).unwrap()));
+        // Directory file plus capability directory; no third identity handle.
+        assert_eq!(captured, 2, "a binding must retain exactly two descriptors");
+
+        let binding = WorkspaceBinding::capture(&path).unwrap();
+        let validated = settled_descriptor_delta(|| {
+            binding.validate().unwrap();
+            Box::new(())
+        });
+        assert_eq!(validated, 0, "validate must not leave descriptors behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_binding_keeps_no_identity_handle_and_still_detects_replacement() {
+        let root = crate::tests::OwnedTestDirectory::new("native-binding-replacement-identity");
+        let victim = root.path().join("workspace");
+        std::fs::create_dir(&victim).unwrap();
+        let binding = WorkspaceBinding::capture(&victim).unwrap();
+        // The retained identity is plain data; the held directory descriptor
+        // is the only object it vouches for.
+        let _: crate::fs::FileIdentity = binding.identity;
+        assert!(binding.validate().is_ok());
+        std::fs::rename(&victim, root.path().join("moved")).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        assert!(binding.validate().is_err(), "replacement must still fail");
     }
 
     #[cfg(unix)]

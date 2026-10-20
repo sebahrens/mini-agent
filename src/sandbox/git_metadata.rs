@@ -42,7 +42,15 @@ const POINTER_FILE_LIMIT: u64 = 4096;
 thread_local! {
     /// `discover` calls made by this thread (test probe).
     pub(super) static DISCOVER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Fresh `seatbelt_resolved_spelling` lookups made while rendering Git
+    /// metadata denies on this thread (test probe).
+    pub(super) static RESOLVED_SPELLING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+/// Canonical spellings the alias validation of one launch already computed:
+/// `(configured, resolved)` for planned paths inside the canonical root.
+#[cfg(unix)]
+type ResolvedSpellings = Vec<(PathBuf, PathBuf)>;
 
 /// The Git metadata layout of one workspace, in configured spellings.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -140,9 +148,20 @@ fn read_pointer(path: &Path, prefix: Option<&str>) -> Option<PathBuf> {
 
 /// Every spelling Seatbelt must deny for `path`: the configured one and the
 /// resolved one (Seatbelt matches the kernel's resolved vnode path).
-fn spellings(path: &Path) -> Vec<PathBuf> {
+///
+/// `known` holds the resolved spellings the same launch's validation already
+/// produced; only paths absent from it are resolved again.
+fn spellings(path: &Path, known: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
     let mut spellings = vec![path.to_path_buf()];
-    if let Some(resolved) = super::seatbelt_resolved_spelling(path) {
+    let resolved = match known.iter().find(|(configured, _)| configured == path) {
+        Some((_, resolved)) => Some(resolved.clone()),
+        None => {
+            #[cfg(test)]
+            RESOLVED_SPELLING_CALLS.with(|count| count.set(count.get() + 1));
+            super::seatbelt_resolved_spelling(path)
+        }
+    };
+    if let Some(resolved) = resolved {
         push_unique(&mut spellings, resolved);
     }
     spellings
@@ -164,6 +183,12 @@ pub(super) fn seatbelt_write_denies(workspace: &Path) -> String {
 /// [`seatbelt_write_denies`] for a layout the caller already discovered, so
 /// one launch walks the workspace's `.git` metadata once.
 pub(super) fn seatbelt_write_denies_for(layout: &GitMetadataLayout) -> String {
+    seatbelt_write_denies_with(layout, &[])
+}
+
+/// [`seatbelt_write_denies_for`] reusing `known` resolved spellings. The output
+/// is byte-identical to resolving every path again.
+fn seatbelt_write_denies_with(layout: &GitMetadataLayout, known: &[(PathBuf, PathBuf)]) -> String {
     let mut filters: Vec<String> = Vec::new();
     let planned = layout
         .pinned_dir
@@ -171,7 +196,7 @@ pub(super) fn seatbelt_write_denies_for(layout: &GitMetadataLayout) -> String {
         .map(|path| (path, "literal"))
         .chain(layout.read_only.iter().map(|path| (path, "subpath")));
     for (path, filter) in planned {
-        for spelling in spellings(path) {
+        for spelling in spellings(path, known) {
             if spelling.parent().is_none() {
                 continue;
             }
@@ -227,7 +252,7 @@ impl BwrapGitMetadataBinds {
     /// entries that cannot be pinned safely refuse the launch.
     #[cfg(unix)]
     pub(super) fn open(workspace_root: &Path) -> Result<Self, String> {
-        Self::open_with_layout(workspace_root).map(|(binds, _, _)| binds)
+        Self::open_with_layout(workspace_root).map(|(binds, ..)| binds)
     }
 
     /// [`Self::open`] that also returns the canonical root and the layout it
@@ -235,7 +260,7 @@ impl BwrapGitMetadataBinds {
     #[cfg(unix)]
     pub(super) fn open_with_layout(
         workspace_root: &Path,
-    ) -> Result<(Self, PathBuf, GitMetadataLayout), String> {
+    ) -> Result<(Self, PathBuf, GitMetadataLayout, ResolvedSpellings), String> {
         let root = std::fs::canonicalize(workspace_root)
             .map_err(|_| "cannot resolve workspace Git metadata root".to_string())?;
         match std::fs::symlink_metadata(root.join(".git")) {
@@ -254,6 +279,7 @@ impl BwrapGitMetadataBinds {
         let root_fd = open_directory(&root)
             .ok_or_else(|| "cannot open workspace Git metadata root".to_string())?;
         let mut entries: Vec<BwrapGitBind> = Vec::new();
+        let mut resolved: ResolvedSpellings = Vec::new();
         let planned = layout
             .pinned_dir
             .iter()
@@ -274,7 +300,18 @@ impl BwrapGitMetadataBinds {
             }
             let metadata = match std::fs::symlink_metadata(path) {
                 Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // The nearest existing ancestor is the parent when it was
+                    // just canonicalized; otherwise the render resolves it.
+                    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+                        && let Some((_, parent_resolved)) =
+                            resolved.iter().find(|(configured, _)| configured == parent)
+                    {
+                        let missing = parent_resolved.join(name);
+                        resolved.push((path.clone(), missing));
+                    }
+                    continue;
+                }
                 Err(_) => return Err("cannot inspect workspace Git metadata".to_string()),
             };
             if metadata.file_type().is_symlink() {
@@ -285,6 +322,7 @@ impl BwrapGitMetadataBinds {
             }
             let canonical = std::fs::canonicalize(path)
                 .map_err(|_| "cannot resolve workspace Git metadata".to_string())?;
+            resolved.push((path.clone(), canonical.clone()));
             let Some(relative) = relative_beneath(&root, &canonical) else {
                 if read_only {
                     inspect_external_protected_entry(&root, path)?;
@@ -313,7 +351,7 @@ impl BwrapGitMetadataBinds {
                 fd,
             });
         }
-        Ok((Self { entries }, root, layout))
+        Ok((Self { entries }, root, layout, resolved))
     }
 
     #[cfg(not(unix))]
@@ -442,8 +480,13 @@ fn inspect_external_protected_entry(root: &Path, path: &Path) -> Result<(), Stri
 /// lookup, including cache hits; descriptors are not passed to Seatbelt.
 #[cfg(target_os = "macos")]
 pub(super) fn validate_workspace_aliases(workspace: &Path) -> Result<ValidatedGitMetadata, String> {
-    BwrapGitMetadataBinds::open_with_layout(workspace)
-        .map(|(_, root, layout)| ValidatedGitMetadata { root, layout })
+    BwrapGitMetadataBinds::open_with_layout(workspace).map(|(_, root, layout, resolved)| {
+        ValidatedGitMetadata {
+            root,
+            layout,
+            resolved,
+        }
+    })
 }
 
 /// What one alias validation discovered, for reuse within the same launch
@@ -452,6 +495,8 @@ pub(super) fn validate_workspace_aliases(workspace: &Path) -> Result<ValidatedGi
 pub(super) struct ValidatedGitMetadata {
     root: PathBuf,
     layout: GitMetadataLayout,
+    /// Canonical spellings of in-root planned paths from this validation.
+    resolved: ResolvedSpellings,
 }
 
 #[cfg(target_os = "macos")]
@@ -460,7 +505,7 @@ impl ValidatedGitMetadata {
     /// layout when it was discovered from the same spelling.
     pub(super) fn seatbelt_write_denies(&self, workspace: &Path) -> String {
         if self.root == workspace {
-            seatbelt_write_denies_for(&self.layout)
+            seatbelt_write_denies_with(&self.layout, &self.resolved)
         } else {
             seatbelt_write_denies(workspace)
         }
@@ -883,6 +928,43 @@ mod tests {
         assert!(denies.contains(&subpath(&worktree.join(".git"))));
         assert!(denies.contains(&subpath(&main.join(".git/worktrees/wt/config.worktree"))));
         assert!(!denies.contains(&subpath(&main.join(".git"))), "{denies}");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fresh_lookups() -> usize {
+        RESOLVED_SPELLING_CALLS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validated_denies_reuse_launch_spellings_and_stay_byte_identical() {
+        let scratch = Scratch::new();
+        // Plain repository (missing `modules` and `config.worktree`): every
+        // planned path is inside the root, so nothing is resolved again.
+        let plain = fixtures::plain_repository(&scratch.0, "plain");
+        let validated = validate_workspace_aliases(&plain).unwrap();
+        let before = fresh_lookups();
+        let reused = validated.seatbelt_write_denies(&plain);
+        assert_eq!(
+            fresh_lookups(),
+            before,
+            "in-root entries must not re-resolve"
+        );
+        assert_eq!(reused, seatbelt_write_denies(&plain));
+        assert!(reused.contains("modules"), "{reused}");
+
+        // Linked worktree through a symlinked alias: external Git metadata
+        // still resolves on its own, and the output is unchanged.
+        let alias = scratch.0.join("alias");
+        let real = scratch.0.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let (_, worktree) = fixtures::linked_worktree(&real, &alias);
+        let validated = validate_workspace_aliases(&worktree).unwrap();
+        let before = fresh_lookups();
+        let reused = validated.seatbelt_write_denies(&worktree);
+        assert!(fresh_lookups() > before, "external entries resolve fresh");
+        assert_eq!(reused, seatbelt_write_denies(&worktree));
     }
 
     #[test]

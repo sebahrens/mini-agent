@@ -495,7 +495,7 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FileIdentity {
+pub(crate) enum FileIdentity {
     #[cfg(all(unix, not(target_os = "macos")))]
     Unix { device: u64, inode: u64 },
     #[cfg(target_os = "macos")]
@@ -517,26 +517,13 @@ pub(crate) struct CheckedMetadata {
     handle: Arc<std::fs::File>,
 }
 
-impl std::ops::Deref for CheckedMetadata {
-    type Target = std::fs::Metadata;
-
-    fn deref(&self) -> &Self::Target {
-        &self.metadata
-    }
-}
-
-impl CheckedMetadata {
-    /// Fixed-size compatibility data from the retained physical identity.
-    /// This digest is not a file capability and cannot reopen or authorize it.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
-    pub(crate) fn identity_fingerprint(&self) -> [u8; 32] {
+impl FileIdentity {
+    /// Fixed-size digest of the physical identity; not a capability.
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"mini-agent.physical-file-identity.v1\0");
-        match self.identity {
+        match *self {
             #[cfg(all(unix, not(target_os = "macos")))]
             FileIdentity::Unix { device, inode } => {
                 hash.update(b"unix\0");
@@ -563,6 +550,31 @@ impl CheckedMetadata {
         }
         hash.finalize().into()
     }
+}
+
+impl std::ops::Deref for CheckedMetadata {
+    type Target = std::fs::Metadata;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+
+impl CheckedMetadata {
+    /// Fixed-size compatibility data from the retained physical identity.
+    /// This digest is not a file capability and cannot reopen or authorize it.
+    #[allow(
+        dead_code,
+        reason = "shared API is intentionally dormant before its frontend consumer lands"
+    )]
+    pub(crate) fn identity_fingerprint(&self) -> [u8; 32] {
+        self.identity.fingerprint()
+    }
+
+    /// The physical identity alone, without the retained descriptor.
+    pub(crate) fn identity(&self) -> FileIdentity {
+        self.identity
+    }
 
     /// The retained descriptor for the approved object. Only callers that know
     /// the handle was opened readable may read through it; `checked_path_metadata`
@@ -572,41 +584,37 @@ impl CheckedMetadata {
     }
 }
 
-fn checked_owned_file(
-    file: std::fs::File,
-    metadata: std::fs::Metadata,
-) -> std::io::Result<CheckedMetadata> {
+/// Physical identity of an open file, from the descriptor alone (fstat, plus
+/// the real-device query on macOS and the file-id query on Windows).
+fn file_identity_of(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<FileIdentity> {
     #[cfg(all(unix, not(target_os = "macos")))]
-    let identity = {
+    {
         use std::os::unix::fs::MetadataExt;
-
-        FileIdentity::Unix {
+        let _ = file;
+        Ok(FileIdentity::Unix {
             device: metadata.dev(),
             inode: metadata.ino(),
-        }
-    };
+        })
+    }
     #[cfg(target_os = "macos")]
-    let identity = {
-        let identity = macos_real_file_identity(&file)?;
-
-        FileIdentity::MacOs {
+    {
+        let _ = metadata;
+        let identity = macos_real_file_identity(file)?;
+        Ok(FileIdentity::MacOs {
             filesystem: identity.filesystem,
             inode: identity.file_id,
-        }
-    };
+        })
+    }
     #[cfg(windows)]
-    let identity = windows_file_identity(&file)?;
-    #[cfg(windows)]
-    let identity = FileIdentity::Windows {
-        volume_serial_number: identity.volume_serial_number,
-        file_id: identity.file_id,
-    };
-    #[cfg(any(unix, windows))]
     {
-        Ok(CheckedMetadata {
-            metadata,
-            identity,
-            handle: Arc::new(file),
+        let _ = metadata;
+        let identity = windows_file_identity(file)?;
+        Ok(FileIdentity::Windows {
+            volume_serial_number: identity.volume_serial_number,
+            file_id: identity.file_id,
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -617,6 +625,28 @@ fn checked_owned_file(
             "stable file identity is unavailable on this platform",
         ))
     }
+}
+
+/// Metadata and physical identity of an already-open file without duplicating
+/// or retaining its descriptor. Use when only a comparison is needed.
+pub(crate) fn file_identity(
+    file: &std::fs::File,
+) -> std::io::Result<(std::fs::Metadata, FileIdentity)> {
+    let metadata = file.metadata()?;
+    let identity = file_identity_of(file, &metadata)?;
+    Ok((metadata, identity))
+}
+
+fn checked_owned_file(
+    file: std::fs::File,
+    metadata: std::fs::Metadata,
+) -> std::io::Result<CheckedMetadata> {
+    let identity = file_identity_of(&file, &metadata)?;
+    Ok(CheckedMetadata {
+        metadata,
+        identity,
+        handle: Arc::new(file),
+    })
 }
 
 #[allow(unsafe_code)]
@@ -1203,6 +1233,19 @@ pub(crate) async fn stable_path_metadata(path: &Path) -> std::io::Result<Checked
         return Err(path_changed_error(&path));
     }
     Ok(metadata)
+}
+
+/// Like [`ensure_same_file`] for a bare identity (no retained descriptor).
+pub(crate) fn ensure_same_identity(
+    path: &Path,
+    expected: &FileIdentity,
+    current: &FileIdentity,
+) -> std::io::Result<()> {
+    if expected == current {
+        Ok(())
+    } else {
+        Err(path_changed_error(path))
+    }
 }
 
 pub(crate) fn ensure_same_file(

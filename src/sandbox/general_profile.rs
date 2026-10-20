@@ -246,9 +246,9 @@ impl HomeFile {
             return Err(changed());
         }
         crate::fs::ensure_same_file(&self.path, &self.checked, &current).map_err(|_| changed())?;
-        let held =
-            crate::fs::checked_file_metadata(self.checked.handle()).map_err(|_| changed())?;
-        crate::fs::ensure_same_file(&self.path, &self.checked, &held).map_err(|_| changed())
+        let (_, held) = crate::fs::file_identity(self.checked.handle()).map_err(|_| changed())?;
+        crate::fs::ensure_same_identity(&self.path, &self.checked.identity(), &held)
+            .map_err(|_| changed())
     }
 
     #[cfg(unix)]
@@ -326,7 +326,13 @@ pub(super) fn roots(
 }
 
 pub(super) fn protected_host_paths() -> Result<Vec<PathBuf>, String> {
-    let mut protected = crate::git::runtime::protected_runtime_paths()?;
+    protected_host_paths_from(crate::git::runtime::protected_runtime_paths()?)
+}
+
+/// [`protected_host_paths`] over a runtime-path set the caller already read.
+pub(super) fn protected_host_paths_from(
+    mut protected: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
     let paths = crate::paths::process_paths()
         .map_err(|_| "sandbox profile: private application paths are unavailable")?;
     protected.push(
