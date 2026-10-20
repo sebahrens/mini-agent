@@ -818,7 +818,7 @@ pub struct Session {
     pub(crate) retired_native_history: Vec<native_replay::NativeHistory>,
     #[serde(
         default,
-        skip_serializing_if = "native_replay::NativeFrontier::is_initial"
+        skip_serializing_if = "native_replay::NativeFrontier::skip_serializing"
     )]
     pub(crate) native_frontier: native_replay::NativeFrontier,
     /// Value-carried writer revision. Deserialization restores no permit;
