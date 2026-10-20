@@ -677,7 +677,12 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
     let absolute = McpClientHandle::connect(CompactString::new("fixture"), &absolute_config)
         .await
         .expect("absolute fixture executable must initialize");
-    assert_eq!(absolute.list_tools().await.unwrap()[0].name, "probe");
+    assert_eq!(
+        absolute.cached_tools().await.unwrap().entries[0]
+            .definition
+            .name,
+        "probe"
+    );
     let absolute_manager = McpClientManager::from_handles(vec![absolute]);
     let payload = call_fixture_tool(&absolute_manager).await;
     assert_eq!(payload["args"][0], "argument with spaces");

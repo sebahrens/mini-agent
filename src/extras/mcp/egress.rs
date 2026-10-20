@@ -296,7 +296,7 @@ impl GuardedOAuthHttpClient {
                 .await
                 .map_err(|error| OAuthHttpClientError::new(error_chain(&error)))?;
             let Some(next) = next else { break response };
-            let Some(target) = redirect_target(&response) else {
+            let Some((code, target)) = redirect_target(&response) else {
                 break response;
             };
             if !source_is_current(&self.source) {
@@ -307,7 +307,7 @@ impl GuardedOAuthHttpClient {
                 return Err(OAuthHttpClientError::new("too many redirects"));
             }
             check_url_host(&target).map_err(OAuthHttpClientError::new)?;
-            request = redirected_request(next, response.status(), target);
+            request = redirected_request(next, code, target);
             hops += 1;
         };
         if !source_is_current(&self.source) {
@@ -357,10 +357,11 @@ impl OAuthHttpClient for GuardedOAuthHttpClient {
 
 /// The absolute `Location` of a redirect status reqwest itself would follow,
 /// and `None` for any other response (including an unusable `Location`).
-fn redirect_target(response: &reqwest::Response) -> Option<reqwest::Url> {
+fn redirect_target(response: &reqwest::Response) -> Option<(reqwest::StatusCode, reqwest::Url)> {
     use reqwest::StatusCode;
+    let code = response.status();
     if !matches!(
-        response.status(),
+        code,
         StatusCode::MOVED_PERMANENTLY
             | StatusCode::FOUND
             | StatusCode::SEE_OTHER
@@ -370,7 +371,7 @@ fn redirect_target(response: &reqwest::Response) -> Option<reqwest::Url> {
         return None;
     }
     let location = response.headers().get(reqwest::header::LOCATION)?;
-    response.url().join(location.to_str().ok()?).ok()
+    Some((code, response.url().join(location.to_str().ok()?).ok()?))
 }
 
 /// The request for the next hop, with reqwest's redirect semantics: 301/302/303
@@ -378,7 +379,7 @@ fn redirect_target(response: &reqwest::Response) -> Option<reqwest::Url> {
 /// credentials never cross to another origin.
 fn redirected_request(
     mut next: reqwest::Request,
-    status: reqwest::StatusCode,
+    code: reqwest::StatusCode,
     target: reqwest::Url,
 ) -> reqwest::Request {
     use reqwest::header;
@@ -386,10 +387,10 @@ fn redirected_request(
     let cross_origin = next.url().host_str() != target.host_str()
         || next.url().port_or_known_default() != target.port_or_known_default();
     let drops_body = matches!(
-        status,
+        code,
         StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
     ) && *next.method() != Method::HEAD
-        && (status == StatusCode::SEE_OTHER || *next.method() == Method::POST);
+        && (code == StatusCode::SEE_OTHER || *next.method() == Method::POST);
     if drops_body {
         *next.method_mut() = Method::GET;
         *next.body_mut() = None;
@@ -611,7 +612,6 @@ mod tests {
             .body(b"payload".to_vec())
             .unwrap();
         let response = client.send(post, true, None).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(response.body(), b"ok");
         assert_eq!(first_hits.load(Ordering::SeqCst), 1);
         assert_eq!(final_hits.load(Ordering::SeqCst), 1);

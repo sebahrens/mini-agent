@@ -747,12 +747,6 @@ impl McpClientHandle {
         });
     }
 
-    /// Enumerate every tool the server exposes, bounded by
-    /// [`MCP_LIST_TOOLS_TIMEOUT`] and [`MCP_LIST_TOOLS_MAX_PAGES`].
-    pub async fn list_tools(&self) -> Result<Vec<Tool>, ServiceError> {
-        list_all_tools_bounded(self.running_service.peer(), MCP_LIST_TOOLS_TIMEOUT).await
-    }
-
     /// The cached listing of this connection generation, listing (and
     /// bounding) once on first use. Same cell the agent build fills.
     pub async fn cached_tools(&self) -> Result<Arc<ListedTools>, ServiceError> {
@@ -872,7 +866,7 @@ pub(crate) async fn call_tool_bounded(
 /// draining the pipe (so the server never blocks on a full stderr) but
 /// discards every chunk without locking.
 fn capture_stderr(
-    mut stderr: tokio::process::ChildStderr,
+    mut stderr: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     buffer: std::sync::Weak<Mutex<Vec<u8>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1377,17 +1371,13 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn stderr_capture_holds_no_buffer_once_the_connect_path_drops_it() {
-        let mut child = tokio::process::Command::new("sh")
-            .args(["-c", "echo first >&2; sleep 0.4; echo second >&2"])
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stderr = child.stderr.take().unwrap();
+        use tokio::io::AsyncWriteExt as _;
+        let (mut writer, reader) = tokio::io::duplex(64);
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let task = super::capture_stderr(stderr, std::sync::Arc::downgrade(&buffer));
+        let task = super::capture_stderr(reader, std::sync::Arc::downgrade(&buffer));
+        writer.write_all(b"first").await.unwrap();
         while buffer.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1397,11 +1387,13 @@ mod tests {
             "the task owns no strong ref"
         );
         let weak = std::sync::Arc::downgrade(&buffer);
-        assert!(String::from_utf8_lossy(&buffer.lock().unwrap()).contains("first"));
+        assert_eq!(&*buffer.lock().unwrap(), b"first");
         drop(buffer);
-        task.await.unwrap();
-        child.wait().await.unwrap();
         assert!(weak.upgrade().is_none(), "the buffer is freed at connect");
+        // The pipe is still drained after the buffer is gone.
+        writer.write_all(&[b'x'; 4096]).await.unwrap();
+        drop(writer);
+        task.await.unwrap();
     }
 
     #[test]
