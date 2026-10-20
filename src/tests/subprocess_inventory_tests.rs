@@ -2367,6 +2367,18 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/agent/tools/format_after_edit.rs",
+        "assert!(output.contains(\"Formatted.\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/format_after_edit.rs",
+        "output.contains(\"Formatter skipped: target changed after approval\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/session/native_publication.rs",
         "assert!(output.contains(\"NATIVE_CHILD_PID=\"), \"{output}\");",
         1,
@@ -3954,6 +3966,14 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "69224cb13021988e04ebb302f0c6f781ff9ecfb8bcf2b9e6f3aac24196f0181e",
+                1,
+            ),
+            (
+                "5cf9c9f2fb6b69af49aae4d8fc838e829258c4c610925d877aea766adf2adfc3",
+                1,
+            ),
+            (
+                "0cf3a48c5b66b4513dfff2198fb31a5a61196ff36497c315a8bcbae55d4a9ef2",
                 1,
             ),
         ],
