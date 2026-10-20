@@ -545,7 +545,8 @@ impl FetchTransport {
                 .no_brotli()
                 .no_zstd()
                 .no_deflate()
-                .pool_max_idle_per_host(0)
+                .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
                 .connect_timeout(limits.connect_timeout)
                 // The blocking client applies this bound to the initial response
                 // wait and every subsequent body read. `execute` separately owns
@@ -765,6 +766,13 @@ pub(crate) fn resolve_os_addresses(host: &str, port: u16) -> Result<Vec<SocketAd
     }
 }
 
+/// Idle keep-alive connections kept per pinned client. Each client is already
+/// keyed by host and validated destination set, so a pooled connection can only
+/// reach an address that was validated for that exact cache entry; permission,
+/// redirect re-authorization and DNS pinning still run on every call.
+const POOL_MAX_IDLE_PER_HOST: usize = 2;
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One pinned, redirect-disabled asynchronous HTTP exchange. The caller owns
 /// the absolute deadline spanning DNS, approval, every redirect and body read.
 pub(crate) async fn send_async(
@@ -797,7 +805,8 @@ pub(crate) async fn send_async(
             .no_brotli()
             .no_zstd()
             .no_deflate()
-            .pool_max_idle_per_host(0)
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .connect_timeout(limits.connect_timeout)
             .read_timeout(limits.read_timeout)
             .timeout(limits.total_timeout)
@@ -1242,6 +1251,99 @@ pub(crate) mod web_http_tests {
             .to_string();
         assert!(error.contains("not a public network address"));
         assert_eq!(peer.count(), 1);
+    }
+    #[tokio::test]
+    async fn web_http_sequential_fetches_reuse_one_keep_alive_connection() {
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (accepted_in, stop_in) = (accepted.clone(), stop.clone());
+        let server = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(15);
+            let mut handlers = Vec::new();
+            while !stop_in.load(Ordering::Acquire) && Instant::now() < end {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        accepted_in.fetch_add(1, Ordering::SeqCst);
+                        let stop = stop_in.clone();
+                        handlers.push(std::thread::spawn(move || {
+                            socket.set_nonblocking(false).unwrap();
+                            socket
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .unwrap();
+                            let mut bytes = Vec::new();
+                            let mut buffer = [0; 1024];
+                            while !stop.load(Ordering::Acquire) {
+                                match socket.read(&mut buffer) {
+                                    Ok(0) => break,
+                                    Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                                    Err(error)
+                                        if matches!(
+                                            error.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::TimedOut
+                                        ) =>
+                                    {
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
+                                while let Some(end) =
+                                    bytes.windows(4).position(|x| x == b"\r\n\r\n")
+                                {
+                                    bytes.drain(..end + 4);
+                                    // Keep-alive: no `Connection: close`.
+                                    let _ = socket.write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                                    );
+                                }
+                            }
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(_) => break,
+                }
+            }
+            for handler in handlers {
+                let _ = handler.join();
+            }
+        });
+        let mut client = NativeWebClient::new(
+            FetchPolicy::from_settings(None, true),
+            Some(allowed_permission()),
+            None,
+        );
+        client.test_resolution = Some((
+            vec![SocketAddr::new(
+                "93.184.216.34".parse().unwrap(),
+                address.port(),
+            )],
+            vec![address],
+        ));
+        for _ in 0..2 {
+            let (_, page) = client
+                .execute(
+                    &format!("http://keepalive.invalid:{}/docs", address.port()),
+                    &FetchRequest::get(),
+                    "web_fetch",
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.text, "ok");
+        }
+        let connections = accepted.load(Ordering::SeqCst);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(
+            connections, 1,
+            "second fetch must reuse the pooled connection"
+        );
     }
     #[tokio::test]
     async fn web_http_native_redirect_reauthorizes_and_rejects_credentials_and_loops() {

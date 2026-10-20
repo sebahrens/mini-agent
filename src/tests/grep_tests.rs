@@ -104,8 +104,9 @@ fn is_binary_non_utf8_no_null() {
 #[test]
 fn binary_reader_stops_after_the_sniff_window() {
     let mut reader = SniffOnlyBinaryReader { emitted: 0 };
-    let result = GrepTool::read_non_binary(&mut reader, 32 * 1024).unwrap();
-    assert!(result.is_none());
+    let mut buf = Vec::new();
+    let result = GrepTool::read_non_binary(&mut reader, &mut buf, 32 * 1024).unwrap();
+    assert!(!result);
     assert_eq!(reader.emitted, 8192);
 }
 
@@ -113,10 +114,22 @@ fn binary_reader_stops_after_the_sniff_window() {
 fn text_reader_preserves_the_sniffed_prefix_and_remaining_bytes() {
     let expected = vec![b'x'; 10 * 1024];
     let mut reader = std::io::Cursor::new(expected.clone());
-    let result = GrepTool::read_non_binary(&mut reader, expected.len())
-        .unwrap()
-        .expect("text input");
+    let mut result = Vec::new();
+    assert!(GrepTool::read_non_binary(&mut reader, &mut result, expected.len()).unwrap());
     assert_eq!(result, expected);
+}
+
+#[test]
+fn shared_read_buffer_is_not_polluted_by_a_previous_file() {
+    let mut buf = Vec::new();
+    let mut binary = std::io::Cursor::new(b"abc\0def".to_vec());
+    assert!(!GrepTool::read_non_binary(&mut binary, &mut buf, 8).unwrap());
+    let mut text = std::io::Cursor::new(b"hello\n".to_vec());
+    assert!(GrepTool::read_non_binary(&mut text, &mut buf, 6).unwrap());
+    assert_eq!(buf, b"hello\n");
+    let mut shorter = std::io::Cursor::new(b"hi".to_vec());
+    assert!(GrepTool::read_non_binary(&mut shorter, &mut buf, 2).unwrap());
+    assert_eq!(buf, b"hi");
 }
 
 fn search_args(
@@ -347,16 +360,12 @@ async fn grep_multiline_and_per_call_cap_preserve_permission_denial() {
 #[test]
 fn text_reader_limits_actual_bytes_even_when_metadata_underestimates_growth() {
     let mut reader = std::io::repeat(b'x');
-    assert!(GrepTool::read_non_binary(&mut reader, 1).unwrap().is_none());
+    let mut buf = Vec::new();
+    assert!(!GrepTool::read_non_binary(&mut reader, &mut buf, 1).unwrap());
     let mut exact = std::io::repeat(b'x').take(10 * 1024 * 1024);
     use std::io::Read;
-    assert_eq!(
-        GrepTool::read_non_binary(&mut exact, 1)
-            .unwrap()
-            .unwrap()
-            .len(),
-        10 * 1024 * 1024
-    );
+    assert!(GrepTool::read_non_binary(&mut exact, &mut buf, 1).unwrap());
+    assert_eq!(buf.len(), 10 * 1024 * 1024);
 }
 
 #[tokio::test]

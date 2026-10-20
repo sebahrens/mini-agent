@@ -181,25 +181,24 @@ impl GrepTool {
         data.iter().take(8192).any(|&b| b == 0)
     }
 
+    /// Reads a text file into the caller-owned `buf` (cleared first), reusing its
+    /// allocation across files. Returns `false` for binary or oversized input,
+    /// in which case `buf` holds no usable content.
     pub(crate) fn read_non_binary<R: Read>(
         reader: &mut R,
+        buf: &mut Vec<u8>,
         capacity: usize,
-    ) -> std::io::Result<Option<Vec<u8>>> {
-        let mut prefix = Vec::with_capacity(capacity.min(BINARY_SNIFF_BYTES as usize));
-        reader
-            .by_ref()
-            .take(BINARY_SNIFF_BYTES)
-            .read_to_end(&mut prefix)?;
-        if Self::is_binary(&prefix) {
-            return Ok(None);
+    ) -> std::io::Result<bool> {
+        buf.clear();
+        buf.reserve(capacity.min(MAX_SEARCH_FILE_BYTES as usize));
+        reader.by_ref().take(BINARY_SNIFF_BYTES).read_to_end(buf)?;
+        if Self::is_binary(buf) {
+            return Ok(false);
         }
-
-        let mut data = Vec::with_capacity(capacity.min(MAX_SEARCH_FILE_BYTES as usize));
-        data.extend_from_slice(&prefix);
         reader
-            .take(MAX_SEARCH_FILE_BYTES + 1 - data.len() as u64)
-            .read_to_end(&mut data)?;
-        Ok((data.len() as u64 <= MAX_SEARCH_FILE_BYTES).then_some(data))
+            .take(MAX_SEARCH_FILE_BYTES + 1 - buf.len() as u64)
+            .read_to_end(buf)?;
+        Ok(buf.len() as u64 <= MAX_SEARCH_FILE_BYTES)
     }
 }
 
@@ -224,15 +223,18 @@ fn matched_source_lines(
     multiline: bool,
 ) -> MatchedLines {
     if !multiline {
-        let matches: Vec<_> = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| re.is_match(line).then_some(index))
-            .collect();
+        let mut matches = Vec::new();
+        let mut ranges = BTreeMap::new();
+        for (index, line) in lines.iter().enumerate() {
+            if let Some(found) = re.find(line) {
+                matches.push(index);
+                ranges.insert(index, found.range());
+            }
+        }
         return MatchedLines {
             count: matches.len(),
             lines: matches,
-            ranges: BTreeMap::new(),
+            ranges,
             limit_hit: false,
         };
     }
@@ -315,6 +317,7 @@ fn search_bound_directory(
     let mut limit_hit = false;
     let mut work_limit_hit = false;
     let mut remaining_bytes = MAX_SEARCH_TOTAL_BYTES;
+    let mut read_buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     for entry in walker.by_ref() {
         if emitted_results >= options.max_results {
@@ -326,23 +329,23 @@ fn search_bound_directory(
             continue;
         }
 
-        let path_str = entry.path.to_string_lossy().to_string();
         let capacity = entry.metadata.len() as usize;
         let mut file = entry.file;
         // Bind the read itself, not only the earlier metadata length: the file
         // may grow while its descriptor remains open.
         let mut bounded = (&mut file).take(remaining_bytes);
-        let data = GrepTool::read_non_binary(&mut bounded, capacity).unwrap_or_default();
+        let is_text =
+            GrepTool::read_non_binary(&mut bounded, &mut read_buffer, capacity).unwrap_or(false);
         remaining_bytes = bounded.limit();
         if remaining_bytes == 0 {
             work_limit_hit = true;
             break; // The final file may be only a prefix; never search that prefix.
         }
-        let Some(data) = data else {
+        if !is_text {
             continue;
-        };
+        }
         file_count += 1;
-        let content = String::from_utf8_lossy(&data);
+        let content = String::from_utf8_lossy(&read_buffer);
         // Whole-buffer rejection of files with no match, without splitting
         // lines. Per-line search is only a subset of whole-buffer matches when
         // the pattern has no anchors (line-relative `^`/`$` differ from
@@ -365,6 +368,7 @@ fn search_bound_directory(
             continue;
         }
         files_with_matches += 1;
+        let path_str = entry.path.to_string_lossy().to_string();
 
         if options.files_only {
             results.push(path_str);
@@ -379,11 +383,7 @@ fn search_bound_directory(
 
         if options.context == 0 {
             for (match_index, &matched_line) in match_lines.iter().enumerate() {
-                let matched = if options.multiline {
-                    match_ranges.get(&matched_line).cloned()
-                } else {
-                    re.find(lines[matched_line]).map(|found| found.range())
-                };
+                let matched = match_ranges.get(&matched_line).cloned();
                 let displayed = truncate_output_line(lines[matched_line], matched);
                 results.push(format!("{}:{}:{}", path_str, matched_line + 1, displayed));
                 emitted_results += 1;
@@ -423,11 +423,7 @@ fn search_bound_directory(
                 while index < total && shown[index] && emitted_results < options.max_results {
                     let is_match = match_lines.binary_search(&index).is_ok();
                     let separator = if is_match { ':' } else { '-' };
-                    let matched = if options.multiline {
-                        match_ranges.get(&index).cloned()
-                    } else {
-                        re.find(lines[index]).map(|found| found.range())
-                    };
+                    let matched = match_ranges.get(&index).cloned();
                     let displayed = truncate_output_line(lines[index], matched);
                     results.push(format!(
                         "{}:{}{} {}",

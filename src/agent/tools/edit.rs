@@ -7,7 +7,7 @@ use crate::agent::tools::normalize::NormalizedText;
 use crate::agent::tools::{
     AskSender, EditArgs, EditBlock, EditOp, PermCheck, ReadTracker, ToolError,
     check_perm_bound_path, check_perm_path, edit_system, levenshtein_similarity_chars,
-    normalize_whitespace,
+    normalize_line_into, normalize_whitespace,
 };
 use crate::config::types::EditSystem;
 #[cfg(feature = "lsp")]
@@ -229,10 +229,65 @@ fn line_spans(content: &str) -> Vec<LineSpan<'_>> {
     spans
 }
 
+/// Per-call cache of the whitespace-normalized content: the whole-text form
+/// (built by step 2 and by `replace_all`) and, lazily, the per-line form used
+/// only by the fuzzy fallback. Shared across every block of one edit call.
+struct NormalizedContent {
+    norm: NormalizedText,
+    lines: std::sync::OnceLock<NormalizedLines>,
+}
+
+impl NormalizedContent {
+    fn new(content: &str) -> Self {
+        Self {
+            norm: NormalizedText::new(content),
+            lines: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for NormalizedContent {
+    type Target = NormalizedText;
+    fn deref(&self) -> &NormalizedText {
+        &self.norm
+    }
+}
+
+/// Every normalized line as characters in one flat buffer; line `i` is
+/// `chars[ends[i - 1]..ends[i]]` (with `ends[-1] == 0`).
+struct NormalizedLines {
+    chars: Vec<char>,
+    ends: Vec<usize>,
+}
+
+impl NormalizedLines {
+    fn new<'a>(lines: impl Iterator<Item = &'a str>) -> Self {
+        let mut chars = Vec::new();
+        let mut ends = Vec::new();
+        let mut scratch = String::new();
+        for line in lines {
+            scratch.clear();
+            normalize_line_into(line, &mut scratch);
+            chars.extend(scratch.chars());
+            ends.push(chars.len());
+        }
+        Self { chars, ends }
+    }
+
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn line(&self, index: usize) -> &[char] {
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        &self.chars[start..self.ends[index]]
+    }
+}
+
 fn find_best_match(
     content: &str,
     search: &str,
-    normalized: &std::sync::OnceLock<NormalizedText>,
+    normalized: &std::sync::OnceLock<NormalizedContent>,
 ) -> MatchResult {
     // Step 1: exact match in original content
     if let Some(pos) = content.find(search) {
@@ -243,7 +298,7 @@ fn find_best_match(
     // bytes (trailing whitespace, collapsed blank lines, tab expansion), so the
     // match span is translated back through the normalizer's byte map rather
     // than by arithmetic on the original text.
-    let content_norm = normalized.get_or_init(|| NormalizedText::new(content));
+    let content_norm = normalized.get_or_init(|| NormalizedContent::new(content));
     let search_norm = normalize_whitespace(search);
     if search_norm.is_empty() {
         return MatchResult::NotFound;
@@ -270,22 +325,27 @@ fn find_best_match(
         return MatchResult::NotFound;
     }
 
-    let search_norm_lines: Vec<String> = search_lines
-        .iter()
-        .map(|l| normalize_whitespace(l))
-        .collect();
-    let search_norm_joined = search_norm_lines.join("\n");
-    let content_norm_lines: Vec<String> = content_lines
-        .iter()
-        .map(|line| normalize_whitespace(line))
-        .collect();
+    let mut search_norm_chars: Vec<char> = Vec::new();
+    {
+        let mut scratch = String::new();
+        for (index, line) in search_lines.iter().enumerate() {
+            if index > 0 {
+                search_norm_chars.push('\n');
+            }
+            scratch.clear();
+            normalize_line_into(line, &mut scratch);
+            search_norm_chars.extend(scratch.chars());
+        }
+    }
+    let norm_lines = content_norm
+        .lines
+        .get_or_init(|| NormalizedLines::new(content_lines.iter().copied()));
 
     let window_size = search_lines.len();
     let candidate_count = content_lines.len() - window_size + 1;
-    let search_chars = search_norm_joined.chars().count() as u128;
-    let line_chars: Vec<u128> = content_norm_lines
-        .iter()
-        .map(|line| line.chars().count() as u128)
+    let search_chars = search_norm_chars.len() as u128;
+    let line_chars: Vec<u128> = (0..norm_lines.len())
+        .map(|index| norm_lines.line(index).len() as u128)
         .collect();
     let mut window_chars =
         line_chars[..window_size].iter().sum::<u128>() + window_size.saturating_sub(1) as u128;
@@ -302,14 +362,23 @@ fn find_best_match(
         }
     }
 
-    let search_norm_chars: Vec<char> = search_norm_joined.chars().collect();
     let mut best_sim = 0.0f64;
     let mut best_start = 0usize;
     let mut applicable = None;
+    // Scratch buffers reused for every window.
+    let mut window: Vec<char> = Vec::new();
+    let mut prev: Vec<usize> = Vec::new();
+    let mut curr: Vec<usize> = Vec::new();
 
-    for start in 0..=content_lines.len() - search_lines.len() {
-        let window_norm = content_norm_lines[start..start + search_lines.len()].join("\n");
-        let sim = levenshtein_similarity_chars(&search_norm_chars, &window_norm);
+    for start in 0..candidate_count {
+        window.clear();
+        for index in start..start + window_size {
+            if index > start {
+                window.push('\n');
+            }
+            window.extend_from_slice(norm_lines.line(index));
+        }
+        let sim = levenshtein_similarity_chars(&search_norm_chars, &window, &mut prev, &mut curr);
         if sim > best_sim {
             best_sim = sim;
             best_start = start;
@@ -438,7 +507,7 @@ async fn handle_similarity(
     let mut resolved: Vec<ResolvedSim> = Vec::new();
     // Normalizing a large file is the expensive part of a non-exact match;
     // build it at most once per call and share it across all blocks.
-    let normalized_content = std::sync::OnceLock::<NormalizedText>::new();
+    let normalized_content = std::sync::OnceLock::<NormalizedContent>::new();
 
     for (i, blk) in blocks.iter().enumerate() {
         let label = if blocks.len() > 1 {
@@ -458,7 +527,7 @@ async fn handle_similarity(
                 .match_indices(&search)
                 .map(|(start, _)| (start, start + search.len()))
                 .collect();
-            let normalized = normalized_content.get_or_init(|| NormalizedText::new(content));
+            let normalized = normalized_content.get_or_init(|| NormalizedContent::new(content));
             let normalized_search = normalize_whitespace(&search);
             let mut all = exact.clone();
             if !normalized_search.is_empty() {
@@ -1300,11 +1369,16 @@ impl EditTool {
         reject_overlapping_ranges(&ranges, &content, edit_label)?;
 
         let resulting_spans = final_edit_spans(&ranges);
-        let preview_before = (self.diff_options.max_lines > 0
+        let preview_wanted = self.diff_options.max_lines > 0
             && ranges.len() <= super::mutation_diff::MAX_RANGES
             && content.len() <= super::mutation_diff::MAX_INPUT_BYTES
-            && disclose_source)
-            .then(|| content.clone());
+            && disclose_source;
+        // One shared copy of the preimage serves both the diff preview and the
+        // checkpoint; `content` itself becomes the buffer that is edited.
+        let shared_preimage: Option<std::sync::Arc<str>> = (preview_wanted
+            || bound_workspace.is_some())
+        .then(|| std::sync::Arc::from(content.as_str()));
+        let preview_before = shared_preimage.clone().filter(|_| preview_wanted);
         let applied_ranges = if preview_before.is_some() {
             let mut ordered_ranges: Vec<_> = ranges.iter().collect();
             ordered_ranges.sort_by_key(|(start, _, _)| *start);
@@ -1330,10 +1404,12 @@ impl EditTool {
                 crate::session::file_checkpoints::prepare(
                     workspace,
                     relative,
-                    Some(crate::session::file_checkpoints::Preimage::new(
-                        content.clone().into_bytes(),
-                        &base,
-                    )),
+                    shared_preimage.map(|preimage| {
+                        crate::session::file_checkpoints::Preimage::new(
+                            std::sync::Arc::<[u8]>::from(preimage),
+                            &base,
+                        )
+                    }),
                     disclose_source,
                 )
                 .await
@@ -1370,38 +1446,44 @@ impl EditTool {
             replacement_excerpts(&ranges)
         };
 
-        if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
-            let workspace = std::sync::Arc::clone(workspace);
-            let owned_relative = relative.to_path_buf();
-            let owned_output = output.clone().into_bytes();
-            let expected = expected.clone();
-            crate::agent::runner::spawn_blocking_scoped(move || {
-                workspace.replace_relative_atomic_expecting(
-                    &owned_relative,
-                    &owned_output,
-                    &expected,
-                    &base,
+        let output =
+            if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
+                let workspace = std::sync::Arc::clone(workspace);
+                let owned_relative = relative.to_path_buf();
+                let expected = expected.clone();
+                // Move the output through the blocking publication and take it
+                // back instead of copying the whole file.
+                let (published, output) = crate::agent::runner::spawn_blocking_scoped(move || {
+                    let published = workspace.replace_relative_atomic_expecting(
+                        &owned_relative,
+                        output.as_bytes(),
+                        &expected,
+                        &base,
+                    );
+                    (published, output)
+                })
+                .await
+                .map_err(|_| ToolError::Msg("Edit publication job failed".to_string()))?;
+                published?;
+                output
+            } else {
+                let resolved = resolved.expect("external edit must resolve an ambient path");
+                let current = tokio::fs::canonicalize(&requested).await?;
+                if current != resolved {
+                    return Err(ToolError::Msg(format!(
+                        "Path changed after permission check: {}",
+                        expanded
+                    )));
+                }
+                crate::fs::atomic_write_resolved_expecting(
+                    &resolved,
+                    &output,
+                    approved_parent.expect("external edit must capture its parent"),
+                    base,
                 )
-            })
-            .await
-            .map_err(|_| ToolError::Msg("Edit publication job failed".to_string()))??;
-        } else {
-            let resolved = resolved.expect("external edit must resolve an ambient path");
-            let current = tokio::fs::canonicalize(&requested).await?;
-            if current != resolved {
-                return Err(ToolError::Msg(format!(
-                    "Path changed after permission check: {}",
-                    expanded
-                )));
-            }
-            crate::fs::atomic_write_resolved_expecting(
-                &resolved,
-                &output,
-                approved_parent.expect("external edit must capture its parent"),
-                base,
-            )
-            .await?;
-        }
+                .await?;
+                output
+            };
         crate::session::file_checkpoints::published();
         let after_digest = crate::fs::ContentDigest::of(output.as_bytes());
         if let Some(checkpoint) = &mut checkpoint {
@@ -1833,5 +1915,25 @@ mod tests {
         let second = find_best_match(content, "fn b() {\n    two();\n}", &cache);
         assert!(matches!(second, MatchResult::Normalized(..)));
         assert!(std::ptr::eq(built, cache.get().unwrap()));
+    }
+
+    #[test]
+    fn fuzzy_fallback_allocations_do_not_scale_with_candidate_windows() {
+        let content: String = (0..2000).map(|i| format!("v{i} = f({i});\n")).collect();
+        let search = "zzzz zzzz zzzz\nqqqq qqqq qqqq";
+        let cache = std::sync::OnceLock::new();
+        let (result, allocations, _) =
+            crate::tests::alloc_counter::measure(|| find_best_match(&content, search, &cache));
+        assert!(
+            matches!(
+                result,
+                MatchResult::NotFound | MatchResult::FuzzySuggest(..)
+            ),
+            "every window must be scored"
+        );
+        assert!(
+            allocations < 200,
+            "{allocations} allocations for 2000 fuzzy windows"
+        );
     }
 }

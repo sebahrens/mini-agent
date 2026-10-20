@@ -1096,6 +1096,10 @@ pub(crate) struct BoundWalker {
     /// Optional name filter for regular files, evaluated before the file is
     /// opened; `false` drops the entry without any syscall.
     file_filter: Option<FileFilter>,
+    /// Reused per entry so filtered entries cost no path allocation; only
+    /// yielded files and descended directories take an owned copy.
+    scratch_relative: PathBuf,
+    scratch_approved: PathBuf,
 }
 
 /// Called with the entry's path relative to the walk root and its file name.
@@ -1124,6 +1128,8 @@ impl BoundWalker {
             cancellation: None,
             cancelled: false,
             file_filter: None,
+            scratch_relative: PathBuf::new(),
+            scratch_approved: PathBuf::new(),
         })
     }
 }
@@ -1200,18 +1206,22 @@ impl Iterator for BoundWalker {
             } else {
                 kind
             };
-            let relative_path = frame.relative_path.join(&name);
-            let approved_path = self.approved_root.join(&relative_path);
+            self.scratch_relative.clone_from(&frame.relative_path);
+            self.scratch_relative.push(&name);
+            self.scratch_approved.clone_from(&self.approved_root);
+            self.scratch_approved.push(&self.scratch_relative);
+            let relative_path = &self.scratch_relative;
+            let approved_path = &self.scratch_approved;
             let hidden = self.hidden.as_ref();
             let mut file_filter = self.file_filter.as_mut();
             let mut dropped = |is_directory: bool| {
                 (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
-                    || is_ignored(&frame.matchers, &approved_path, is_directory)
-                    || hidden.is_some_and(|hidden| hidden(&approved_path, is_directory))
+                    || is_ignored(&frame.matchers, approved_path, is_directory)
+                    || hidden.is_some_and(|hidden| hidden(approved_path, is_directory))
                     || (!is_directory
                         && file_filter
                             .as_mut()
-                            .is_some_and(|filter| !filter(&relative_path, &name)))
+                            .is_some_and(|filter| !filter(relative_path, &name)))
             };
             let (child, metadata, is_directory) = match kind {
                 // A link or special file was never yielded: the no-follow open
@@ -1264,7 +1274,7 @@ impl Iterator for BoundWalker {
                 }
                 let matchers = frame.matchers.clone();
                 if let Ok(child_frame) =
-                    DirectoryFrame::new(child, relative_path, matchers, &self.approved_root)
+                    DirectoryFrame::new(child, relative_path.clone(), matchers, &self.approved_root)
                 {
                     self.stack.push(child_frame);
                 }
@@ -1274,7 +1284,7 @@ impl Iterator for BoundWalker {
                 continue;
             }
             return Some(BoundFile {
-                path: approved_path,
+                path: approved_path.clone(),
                 file_name: name,
                 file: child,
                 metadata,
@@ -2822,6 +2832,32 @@ mod tests {
         );
         assert!(walker.work_limit_hit());
         assert!(walker.stack.is_empty());
+    }
+
+    #[test]
+    fn walker_allocations_scale_with_matches_not_entries() {
+        let directory = TempDir::new("walker_alloc_budget");
+        let entries = 1000;
+        for index in 0..entries {
+            std::fs::write(directory.path().join(format!("skip_{index}.dat")), "").unwrap();
+        }
+        for index in 0..3 {
+            std::fs::write(directory.path().join(format!("keep_{index}.txt")), "").unwrap();
+        }
+        let metadata = crate::fs::checked_path_metadata(directory.path()).unwrap();
+        let bound = BoundDirectory::open(directory.path(), &metadata).unwrap();
+        let walker = bound
+            .walker()
+            .unwrap()
+            .with_file_filter(Box::new(|_, name| name.to_string_lossy().ends_with(".txt")));
+        let (kept, allocations, _) = crate::tests::alloc_counter::measure(|| walker.count());
+        assert_eq!(kept, 3);
+        // One name per directory entry is unavoidable; the two per-entry path
+        // buffers must not be allocated for filtered entries.
+        assert!(
+            allocations < entries * 3 / 2,
+            "{allocations} allocations for {entries} filtered entries"
+        );
     }
 
     #[test]

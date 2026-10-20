@@ -126,7 +126,7 @@ impl FormatAfterEdit {
         };
         let expected = ContentDigest::of(committed.as_bytes());
         let initial = match snapshot(Arc::clone(&target), limit).await {
-            Some(snapshot) if ContentDigest::of(snapshot.text.as_bytes()) == expected => snapshot,
+            Some(snapshot) if snapshot_matches(&snapshot, committed.len(), &expected) => snapshot,
             _ => {
                 return Some(unavailable(
                     "Formatter skipped: target changed; edit remains committed.",
@@ -142,9 +142,15 @@ impl FormatAfterEdit {
             "Formatter not authorized; edit remains committed."
         } else if crate::spend::run::admit_current_effect().await.is_err() || blocked() {
             "Formatter skipped: work stopped; edit remains committed."
-        } else if !matches!(snapshot(Arc::clone(&target), limit).await, Some(current)
-            if crate::fs::ensure_same_file(path, &initial.identity, &current.identity).is_ok()
-                && ContentDigest::of(current.text.as_bytes()) == expected)
+        } else if !unchanged_since_capture(
+            &target,
+            path,
+            &initial,
+            committed.len(),
+            &expected,
+            limit,
+        )
+        .await
         {
             "Formatter skipped: target changed after approval; edit remains committed."
         } else if blocked() {
@@ -254,7 +260,30 @@ impl Target {
         })
     }
 
+    /// Metadata of the target as it is now, without reading its bytes.
+    fn probe(&self) -> std::io::Result<CheckedMetadata> {
+        self.workspace.validate().map_err(std::io::Error::other)?;
+        let parent = self
+            .workspace
+            .open_relative_directory_file(self.relative.parent().unwrap_or(Path::new("")))?;
+        crate::fs::ensure_same_file(
+            &self.path,
+            &self.parent,
+            &crate::fs::checked_file_metadata(&parent)?,
+        )?;
+        let file = self.workspace.open_regular_relative(&self.relative)?;
+        crate::fs::checked_file_metadata(&file)
+    }
+
     fn read(&self, limit: u64) -> std::io::Result<Snapshot> {
+        #[cfg(test)]
+        {
+            *test_reads()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .entry(self.path.clone())
+                .or_insert(0) += 1;
+        }
         let limit = limit.min(MAX_OBSERVATION_BYTES);
         self.workspace.validate().map_err(std::io::Error::other)?;
         let parent = self
@@ -303,9 +332,57 @@ impl Target {
     }
 }
 
+/// Per-path count of full target observations, for tests.
+#[cfg(test)]
+fn test_reads() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, usize>> {
+    static READS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>> =
+        std::sync::OnceLock::new();
+    READS.get_or_init(Default::default)
+}
+
 struct Snapshot {
     identity: CheckedMetadata,
     text: String,
+}
+
+/// Cheap length check first, so a changed file skips the SHA-256 pass.
+fn snapshot_matches(snapshot: &Snapshot, expected_len: usize, expected: &ContentDigest) -> bool {
+    snapshot.text.len() == expected_len && ContentDigest::of(snapshot.text.as_bytes()) == *expected
+}
+
+/// Whether the file still is the one captured in `initial`. When the same
+/// file (physical identity, length and modification time) is still there, the
+/// bytes are taken as unchanged without another read and digest; any
+/// difference falls back to a full observation.
+async fn unchanged_since_capture(
+    target: &Arc<Target>,
+    path: &Path,
+    initial: &Snapshot,
+    expected_len: usize,
+    expected: &ContentDigest,
+    limit: u64,
+) -> bool {
+    if blocked() {
+        return false;
+    }
+    let probe = {
+        let target = Arc::clone(target);
+        crate::agent::runner::spawn_blocking_scoped(move || target.probe())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
+    if let Some(current) = &probe
+        && crate::fs::ensure_same_file(path, &initial.identity, current).is_ok()
+        && current.len() == initial.identity.len()
+        && let (Ok(before), Ok(after)) = (initial.identity.modified(), current.modified())
+        && before == after
+    {
+        return true;
+    }
+    matches!(snapshot(Arc::clone(target), limit).await, Some(current)
+        if crate::fs::ensure_same_file(path, &initial.identity, &current.identity).is_ok()
+            && snapshot_matches(&current, expected_len, expected))
 }
 
 async fn snapshot(target: Arc<Target>, limit: u64) -> Option<Snapshot> {
@@ -623,6 +700,34 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn format45_formatted_write_observes_the_target_twice_not_three_times() {
+        use super::super::{WriteArgs, WriteTool};
+        use rig::tool::Tool;
+        let (root, workspace, formatter) = fixture(0);
+        let tool = WriteTool::new(None, None, None)
+            .with_workspace_binding(workspace)
+            .with_formatter(Some(formatter));
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let output = scope
+            .run(tool.call(WriteArgs {
+                path: "counted.rs".into(),
+                content: "authored\n".into(),
+                overwrite: false,
+            }))
+            .await
+            .unwrap();
+        scope.wait_idle().await;
+        assert!(output.contains("Formatted."), "{output}");
+        let reads = test_reads()
+            .lock()
+            .unwrap()
+            .get(&root.path().join("counted.rs"))
+            .copied();
+        assert_eq!(reads, Some(2), "capture and final observation only");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn format45_actual_edit_uses_final_excerpt_and_does_not_authorize_overwrite() {
         use super::super::{
             EditArgs, EditTool, ReadArgs, ReadTool, ReadTracker, WriteArgs, WriteTool,
@@ -860,6 +965,12 @@ mod tests {
                 case == "allow",
                 "{case}: {output}"
             );
+            if matches!(case, "replace" | "inplace") {
+                assert!(
+                    output.contains("Formatter skipped: target changed after approval"),
+                    "{case}: {output}"
+                );
+            }
             if case == "allow" {
                 assert_eq!(
                     std::fs::read_to_string(root.path().join("source.rs")).unwrap(),

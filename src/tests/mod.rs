@@ -271,6 +271,8 @@ fn shared_process_env_reader_never_observes_a_mutator_scope() {
 mod acp_tests;
 #[cfg(all(test, feature = "advisor"))]
 mod advisor_tests;
+#[cfg(test)]
+pub(crate) mod alloc_counter;
 #[cfg(all(test, feature = "archmd"))]
 mod archmd_tests;
 #[cfg(test)]

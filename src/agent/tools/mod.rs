@@ -26,7 +26,9 @@ pub(crate) mod web_http;
 pub(crate) mod web_search;
 pub(crate) mod write;
 
-pub(crate) use normalize::{levenshtein_similarity_chars, normalize_whitespace};
+pub(crate) use normalize::{
+    levenshtein_similarity_chars, normalize_line_into, normalize_whitespace,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -227,7 +229,7 @@ pub(crate) struct ReadTracker {
     deny_repeated_reads: bool,
     /// Windows read so far, grouped by path so every lookup, record and
     /// untrack touches only that path's few windows.
-    tracked: std::sync::Arc<Mutex<std::collections::HashMap<String, Vec<TrackedRead>>>>,
+    tracked: std::sync::Arc<Mutex<TrackedReads>>,
     pub(crate) instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
 }
 
@@ -254,6 +256,74 @@ enum ReadKind {
     NotebookView,
 }
 
+/// Most distinct paths whose read windows are remembered; the oldest path is
+/// forgotten first. A forgotten path merely permits a repeated read again.
+const MAX_TRACKED_PATHS: usize = 4096;
+/// Most windows remembered per path.
+const MAX_WINDOWS_PER_PATH: usize = 64;
+
+/// Read windows grouped by path with insertion-order eviction.
+#[derive(Debug, Default)]
+struct TrackedReads {
+    entries: std::collections::HashMap<String, (u64, Vec<TrackedRead>)>,
+    /// Paths in insertion order with the generation they were inserted at;
+    /// an entry whose generation no longer matches is stale and skipped.
+    order: std::collections::VecDeque<(String, u64)>,
+    next_generation: u64,
+}
+
+impl TrackedReads {
+    fn get(&self, path: &str) -> Option<&Vec<TrackedRead>> {
+        self.entries.get(path).map(|(_, windows)| windows)
+    }
+
+    fn remove(&mut self, path: &str) {
+        self.entries.remove(path);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    fn windows_mut(&mut self, path: &str) -> &mut Vec<TrackedRead> {
+        if !self.entries.contains_key(path) {
+            self.next_generation += 1;
+            let generation = self.next_generation;
+            self.entries
+                .insert(path.to_string(), (generation, Vec::new()));
+            self.order.push_back((path.to_string(), generation));
+            while self.entries.len() > MAX_TRACKED_PATHS {
+                let Some((oldest, generation)) = self.order.pop_front() else {
+                    break;
+                };
+                if self
+                    .entries
+                    .get(&oldest)
+                    .is_some_and(|(current, _)| *current == generation)
+                {
+                    self.entries.remove(&oldest);
+                }
+            }
+            // Untracked paths leave stale order entries behind; compact them
+            // so the queue stays proportional to the live map.
+            if self.order.len() > MAX_TRACKED_PATHS * 2 {
+                let entries = &self.entries;
+                self.order.retain(|(path, generation)| {
+                    entries
+                        .get(path)
+                        .is_some_and(|(current, _)| current == generation)
+                });
+            }
+        }
+        &mut self
+            .entries
+            .get_mut(path)
+            .expect("path was just inserted or already tracked")
+            .1
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TrackedRead {
     kind: ReadKind,
@@ -272,7 +342,7 @@ impl ReadTracker {
     pub(crate) fn new(deny_repeated_reads: bool) -> Self {
         Self {
             deny_repeated_reads,
-            tracked: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            tracked: std::sync::Arc::new(Mutex::new(TrackedReads::default())),
             instructions: None,
             #[cfg(feature = "multimodal")]
             image_support: read_image::ImageReadSupport::default(),
@@ -379,10 +449,7 @@ impl ReadTracker {
         served_content_crc32: u32,
     ) {
         let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
-        let entries = match tracked.get_mut(path) {
-            Some(entries) => entries,
-            None => tracked.entry(path.to_string()).or_default(),
-        };
+        let entries = tracked.windows_mut(path);
         entries
             .retain(|entry| entry.kind != kind || entry.offset != offset || entry.limit != limit);
         entries.push(TrackedRead {
@@ -391,6 +458,15 @@ impl ReadTracker {
             limit,
             version: ReadVersion::new(metadata, served_content_crc32),
         });
+        if entries.len() > MAX_WINDOWS_PER_PATH {
+            // Drop the oldest window, sparing whole-file raw reads that
+            // authorize an overwrite.
+            let victim = entries
+                .iter()
+                .position(|entry| entry.kind != ReadKind::Raw || entry.offset != 0)
+                .unwrap_or(0);
+            entries.remove(victim);
+        }
     }
 
     pub(crate) fn permits_full_overwrite(
@@ -646,6 +722,44 @@ pub struct ListDirArgs {
     pub path: Option<String>,
 }
 
+/// Turns a diagnosed permission verdict into the tool-facing result: coaching
+/// is returned, a denial becomes an error, and `Ask` prompts through
+/// `handle_ask_inner` (failing closed with the non-interactive diagnostic when
+/// no prompt channel exists).
+async fn settle_check(
+    (result, diagnostic): (CheckResult, crate::permission::ask::AskDiagnostic),
+    ask_tx: &Option<AskSender>,
+    perm: &PermCheck,
+    tool: &str,
+    input: &str,
+    suggested_pattern: Option<String>,
+    additional_allow_patterns: Vec<String>,
+) -> Result<Option<String>, ToolError> {
+    match result {
+        CheckResult::Allowed => Ok(None),
+        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
+        CheckResult::Denied(reason) => {
+            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
+        }
+        CheckResult::Ask => {
+            let Some(tx) = ask_tx else {
+                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
+            };
+            handle_ask_inner(
+                tx,
+                perm,
+                tool,
+                input,
+                suggested_pattern,
+                additional_allow_patterns,
+                diagnostic,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
 async fn handle_ask_inner(
     ask_tx: &AskSender,
     permission: &PermCheck,
@@ -755,16 +869,17 @@ pub(crate) async fn request_hook_approval(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.hook_ask_decision(tool, input))
     };
-    match result {
-        CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => Ok(()),
-        CheckResult::Denied(reason) => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(tx, perm, tool, input, None, Vec::new(), diagnostic).await
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        input,
+        None,
+        Vec::new(),
+    )
+    .await
+    .map(drop)
 }
 
 pub async fn check_perm(
@@ -790,29 +905,16 @@ pub(crate) async fn check_perm_with_suggestion(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.check(tool, input_key))
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(
-                tx,
-                perm,
-                tool,
-                input_key,
-                suggested_pattern,
-                Vec::new(),
-                diagnostic,
-            )
-            .await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        input_key,
+        suggested_pattern,
+        Vec::new(),
+    )
+    .await
 }
 
 #[cfg(feature = "mcp")]
@@ -830,29 +932,16 @@ pub(crate) async fn check_mcp_perm(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.check_mcp(input_key, trusted_identity, mcp_tool_name))
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(
-                tx,
-                perm,
-                "mcp_tool",
-                input_key,
-                None,
-                Vec::new(),
-                diagnostic,
-            )
-            .await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        "mcp_tool",
+        input_key,
+        None,
+        Vec::new(),
+    )
+    .await
 }
 
 #[cfg(feature = "mcp")]
@@ -873,25 +962,17 @@ pub(crate) async fn check_mcp_auxiliary_perm(
         .check_diagnosed(|guard| {
             guard.check_mcp_auxiliary(policy_input, identity, trusted_identity, operation)
         });
-    match result {
-        CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => Ok(()),
-        CheckResult::Denied(reason) => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
-        CheckResult::Ask => {
-            let Some(sender) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(
-                sender,
-                permission,
-                "mcp_tool",
-                identity,
-                None,
-                Vec::new(),
-                diagnostic,
-            )
-            .await
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        permission,
+        "mcp_tool",
+        identity,
+        None,
+        Vec::new(),
+    )
+    .await
+    .map(drop)
 }
 
 pub async fn check_perm_path(
@@ -981,29 +1062,16 @@ async fn check_perm_path_inner(
             }
         })
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(
-                tx,
-                perm,
-                tool,
-                path,
-                suggested_pattern,
-                additional_allow_patterns,
-                diagnostic,
-            )
-            .await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        path,
+        suggested_pattern,
+        additional_allow_patterns,
+    )
+    .await
 }
 
 /// Check a canonical path whose exact filesystem object is held open by the
@@ -1025,20 +1093,16 @@ pub(crate) async fn check_perm_canonical_path(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.check_canonical_path(tool, path, external))
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(tx, perm, tool, path, None, Vec::new(), diagnostic).await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        path,
+        None,
+        Vec::new(),
+    )
+    .await
 }
 
 /// Per-entry deny filter for a walking tool (`grep`, `find_files`,
@@ -1098,20 +1162,16 @@ pub(crate) async fn check_perm_bound_path(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.check_bound_path(tool, logical))
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(tx, perm, tool, logical, None, Vec::new(), diagnostic).await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        logical,
+        None,
+        Vec::new(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1134,5 +1194,48 @@ mod read_tracker_index_tests {
         );
         tracker.clear();
         assert!(tracker.track_read("b.rs", 0, 10).is_none());
+    }
+
+    #[test]
+    fn tracked_paths_are_bounded_and_the_oldest_is_forgotten_first() {
+        let tracker = ReadTracker::new(true);
+        for index in 0..=super::MAX_TRACKED_PATHS {
+            assert!(tracker.track_read(&format!("f{index}.rs"), 0, 10).is_none());
+        }
+        let last = format!("f{}.rs", super::MAX_TRACKED_PATHS);
+        assert!(tracker.track_read(&last, 0, 10).is_some(), "newest denied");
+        assert!(
+            tracker.track_read("f0.rs", 0, 10).is_none(),
+            "oldest forgotten, repeat allowed again"
+        );
+    }
+
+    #[test]
+    fn untracked_and_retracked_paths_do_not_evict_each_other_early() {
+        let tracker = ReadTracker::new(true);
+        assert!(tracker.track_read("a.rs", 0, 10).is_none());
+        tracker.untrack_read_path("a.rs");
+        assert!(tracker.track_read("a.rs", 0, 10).is_none());
+        for index in 0..super::MAX_TRACKED_PATHS - 1 {
+            assert!(tracker.track_read(&format!("f{index}.rs"), 0, 10).is_none());
+        }
+        // Exactly at capacity: the re-tracked path is still remembered.
+        assert!(tracker.track_read("a.rs", 0, 10).is_some());
+    }
+
+    #[test]
+    fn windows_per_path_are_bounded_and_spare_the_whole_file_window() {
+        let tracker = ReadTracker::new(true);
+        for window in 0..=super::MAX_WINDOWS_PER_PATH {
+            assert!(tracker.track_read("w.rs", window * 10, 10).is_none());
+        }
+        assert!(
+            tracker.track_read("w.rs", 10, 10).is_none(),
+            "oldest non-initial window forgotten"
+        );
+        assert!(
+            tracker.track_read("w.rs", 0, 10).is_some(),
+            "offset-0 window that can authorize an overwrite is kept"
+        );
     }
 }

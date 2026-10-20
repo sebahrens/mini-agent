@@ -108,26 +108,70 @@ pub fn normalize_whitespace(s: &str) -> String {
     NormalizedText::new(s).text
 }
 
+/// Appends `normalize_whitespace(line)` to `out` without building the byte
+/// offset map. `line` is one source line without its terminator; input that
+/// contains a newline falls back to the general normalizer so the result is
+/// always identical to `normalize_whitespace`.
+pub fn normalize_line_into(line: &str, out: &mut String) {
+    if line.contains('\n') {
+        out.push_str(&normalize_whitespace(line));
+        return;
+    }
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() {
+        // `""` normalizes to `""`; whitespace-only text to a single blank line.
+        if !line.is_empty() {
+            out.push('\n');
+        }
+        return;
+    }
+    out.reserve(trimmed.len() + 1);
+    for ch in trimmed.chars() {
+        if ch == '\t' {
+            out.push_str("    ");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\n');
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn normalize_line(line: &str) -> String {
+    let mut out = String::new();
+    normalize_line_into(line, &mut out);
+    out
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn levenshtein_similarity(a: &str, b: &str) -> f64 {
     let a_chars: Vec<char> = a.chars().collect();
-    levenshtein_similarity_chars(&a_chars, b)
+    let b_chars: Vec<char> = b.chars().collect();
+    levenshtein_similarity_chars(&a_chars, &b_chars, &mut Vec::new(), &mut Vec::new())
 }
 
-/// Same as `levenshtein_similarity`, with the first operand's characters
-/// collected once by the caller (the fuzzy matcher compares one search string
-/// against many windows).
-pub fn levenshtein_similarity_chars(a_chars: &[char], b: &str) -> f64 {
-    let b_chars: Vec<char> = b.chars().collect();
+/// Similarity of two character slices. The caller owns the two DP rows so a
+/// matcher comparing one search string against many windows allocates them once.
+pub fn levenshtein_similarity_chars(
+    a_chars: &[char],
+    b_chars: &[char],
+    prev: &mut Vec<usize>,
+    curr: &mut Vec<usize>,
+) -> f64 {
     let max_len = a_chars.len().max(b_chars.len());
     if max_len == 0 {
         return 1.0;
     }
-    let dist = levenshtein_distance(a_chars, &b_chars);
+    let dist = levenshtein_distance(a_chars, b_chars, prev, curr);
     1.0 - (dist as f64 / max_len as f64)
 }
 
-fn levenshtein_distance(a_chars: &[char], b_chars: &[char]) -> usize {
+fn levenshtein_distance(
+    a_chars: &[char],
+    b_chars: &[char],
+    prev: &mut Vec<usize>,
+    curr: &mut Vec<usize>,
+) -> usize {
     let a_len = a_chars.len();
     let b_len = b_chars.len();
 
@@ -138,8 +182,10 @@ fn levenshtein_distance(a_chars: &[char], b_chars: &[char]) -> usize {
         return a_len;
     }
 
-    let mut prev: Vec<usize> = (0..=b_len).collect();
-    let mut curr = vec![0usize; b_len + 1];
+    prev.clear();
+    prev.extend(0..=b_len);
+    curr.clear();
+    curr.resize(b_len + 1, 0);
 
     for i in 1..=a_len {
         curr[0] = i;
@@ -151,7 +197,7 @@ fn levenshtein_distance(a_chars: &[char], b_chars: &[char]) -> usize {
             };
             curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
-        std::mem::swap(&mut prev, &mut curr);
+        std::mem::swap(prev, curr);
     }
 
     prev[b_len]
