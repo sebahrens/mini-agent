@@ -222,7 +222,7 @@ windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_ToolHelp
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-rig = { package = "rig-core", version = "=0.40.0", path = "patched-deps/rig-core", features = ["test-utils"] }
+rig = { package = "rig-core", version = "=0.40.0", path = "patched-deps/rig-core", default-features = false, features = ["test-utils"] }
 syn = { version = "2", features = ["full", "visit"] }
 
 [build-dependencies]
