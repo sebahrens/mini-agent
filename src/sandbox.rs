@@ -356,9 +356,11 @@ impl ExecutionCommand {
     }
 }
 
+/// Immutable-after-configuration part of a [`Sandbox`], shared by clones so a
+/// per-command clone is a pointer bump. Builder methods and setters mutate it
+/// through `Arc::make_mut` (copy-on-write via `DerefMut`).
 #[derive(Debug, Clone)]
-pub struct Sandbox {
-    enabled: bool,
+pub struct SandboxConfig {
     backend: String,
     profile: SandboxProfile,
     read_roots: Vec<PathBuf>,
@@ -380,11 +382,17 @@ pub struct Sandbox {
     validation_only_shell: bool,
     disabled_reason: DisabledSandboxReason,
     working_dir: Option<PathBuf>,
+    windows_appcontainer_read_roots: Vec<PathBuf>,
+    windows_appcontainer_write_roots: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Sandbox {
+    enabled: bool,
+    config: Arc<SandboxConfig>,
     workspace_binding: Option<Arc<crate::paths::WorkspaceBinding>>,
     /// Retained by cloned Sandbox owners through existing process retirement.
     git_write_roots: Arc<Mutex<Vec<Arc<crate::paths::WorkspaceBinding>>>>,
-    windows_appcontainer_read_roots: Vec<PathBuf>,
-    windows_appcontainer_write_roots: Vec<PathBuf>,
     active_groups: Arc<Mutex<HashSet<u32>>>,
     #[cfg(windows)]
     general_owners: GeneralOwnerMap,
@@ -1885,6 +1893,20 @@ impl Drop for OutputCommandLifecycleGuard {
     }
 }
 
+impl std::ops::Deref for Sandbox {
+    type Target = SandboxConfig;
+
+    fn deref(&self) -> &SandboxConfig {
+        &self.config
+    }
+}
+
+impl std::ops::DerefMut for Sandbox {
+    fn deref_mut(&mut self) -> &mut SandboxConfig {
+        Arc::make_mut(&mut self.config)
+    }
+}
+
 impl Sandbox {
     #[cfg(unix)]
     #[allow(unsafe_code)]
@@ -2318,24 +2340,26 @@ impl Sandbox {
         };
         Sandbox {
             enabled,
-            backend: backend.to_string(),
-            profile: SandboxProfile::Workspace,
-            read_roots: Vec::new(),
-            write_roots: Vec::new(),
-            home_mounts: Vec::new(),
-            home_masks: Vec::new(),
-            shell: "bash".to_string(),
-            shell_command_arg: "-c".to_string(),
-            shell_candidate: None,
-            shell_capability: None,
-            shell_resolution_complete: false,
-            validation_only_shell: false,
-            disabled_reason: DisabledSandboxReason::UserTrustedBypass,
-            working_dir: None,
+            config: Arc::new(SandboxConfig {
+                backend: backend.to_string(),
+                profile: SandboxProfile::Workspace,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                home_mounts: Vec::new(),
+                home_masks: Vec::new(),
+                shell: "bash".to_string(),
+                shell_command_arg: "-c".to_string(),
+                shell_candidate: None,
+                shell_capability: None,
+                shell_resolution_complete: false,
+                validation_only_shell: false,
+                disabled_reason: DisabledSandboxReason::UserTrustedBypass,
+                working_dir: None,
+                windows_appcontainer_read_roots: Vec::new(),
+                windows_appcontainer_write_roots: Vec::new(),
+            }),
             workspace_binding: None,
             git_write_roots: Arc::new(Mutex::new(Vec::new())),
-            windows_appcontainer_read_roots: Vec::new(),
-            windows_appcontainer_write_roots: Vec::new(),
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(windows)]
             general_owners: Arc::new(Mutex::new(HashMap::new())),
@@ -10303,6 +10327,17 @@ echo PRIVATE_TEMP_PASS"#,
             .unwrap();
         assert_ne!(profile_a_a, profile_with_network);
         assert!(profile_with_network.contains("(allow network*)"));
+    }
+
+    #[test]
+    fn cloning_a_sandbox_shares_configuration_until_a_clone_is_reconfigured() {
+        let original = Sandbox::new(true, "seatbelt");
+        let mut clone = original.clone();
+        assert!(Arc::ptr_eq(&original.config, &clone.config));
+        clone.validation_only_shell = true;
+        assert!(!Arc::ptr_eq(&original.config, &clone.config));
+        assert!(clone.validation_only_shell);
+        assert!(!original.validation_only_shell);
     }
 
     #[test]
