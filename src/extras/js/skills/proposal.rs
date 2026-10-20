@@ -1084,6 +1084,7 @@ impl ProposalQueue {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn start_store_worker(
         store: SkillStore,
         capacity: usize,

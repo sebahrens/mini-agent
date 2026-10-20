@@ -710,6 +710,7 @@ pub(crate) struct AdmissionWorker {
 }
 
 impl AdmissionWorker {
+    #[cfg(test)]
     pub(crate) fn start_session_scoped(
         evaluator: AdmissionEvaluator,
     ) -> Result<Self, AdmissionError> {
