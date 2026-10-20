@@ -4194,13 +4194,9 @@ async fn execute_prompt(
     // Refreshed after compaction, so the recap this turn replays is the one
     // whose daily-memory copy is left out of the block.
     #[cfg(feature = "memory")]
-    let context = {
-        let mut refreshed = (*context).clone();
-        refreshed
-            .refresh_memory_if_changed(history.active_compaction_ref())
-            .await;
-        Arc::new(refreshed)
-    };
+    let context = context
+        .with_refreshed_memory(history.active_compaction_ref())
+        .await;
     #[cfg(not(feature = "hooks"))]
     let prior_history =
         history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
