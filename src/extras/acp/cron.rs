@@ -51,8 +51,10 @@ const RESUME_REFUSED: &str =
 const PAYLOAD_REFUSED: &str = "cron: ACP cron payloads are plain prompts; slash commands and shell (!) lines cannot be scheduled over ACP";
 const BUDGET_UNBOUNDED: &str = "cron: no max_budget_usd or session token ceiling is set, so scheduled turns are unbounded in spend";
 
-/// How long a due fire waits before re-checking a busy session.
-const BUSY_POLL: Duration = Duration::from_secs(1);
+/// Safety fallback for a due fire that found the session busy. The driver is
+/// normally woken by `SessionCron::busy_wake` the moment a turn settles; this
+/// only bounds the wait for a busy cause that does not settle a turn.
+const BUSY_POLL: Duration = Duration::from_secs(30);
 
 /// The question origin of the turn whose spend profile is in scope: a `/cron`
 /// fire runs with [`RequestKind::Scheduled`].
@@ -108,6 +110,9 @@ pub(super) fn parse(arguments: &str) -> Result<Request, String> {
 pub(super) struct SessionCron {
     inner: StdMutex<Inner>,
     changed: Notify,
+    /// Notified whenever one of the session's turns settles (shared with the
+    /// session's `SessionTurns`).
+    busy_wake: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -327,10 +332,17 @@ fn one_line(payload: &str, max: usize) -> String {
 
 /// The catalogue's owner of a session's schedules: dropping the session
 /// (close or replacement by a load) clears them.
-#[derive(Default)]
 pub(super) struct CronOwner(Arc<SessionCron>);
 
 impl CronOwner {
+    /// A session's schedules, woken from a busy wait by `busy_wake`.
+    pub(super) fn new(busy_wake: Arc<Notify>) -> Self {
+        Self(Arc::new(SessionCron {
+            busy_wake,
+            ..SessionCron::default()
+        }))
+    }
+
     pub(super) fn shared(&self) -> Arc<SessionCron> {
         self.0.clone()
     }
@@ -458,6 +470,13 @@ async fn drive(
         let changed = cron.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
+        // Registered before the idle predicate is read, so a turn settling
+        // after a busy verdict still wakes the wait below.
+        let busy_wake = cron.busy_wake.clone();
+        let settled = busy_wake.notified();
+        tokio::pin!(settled);
+        settled.as_mut().enable();
+        let mut busy = false;
         let wait = match cron.step(Instant::now()) {
             Step::Exit => {
                 guard.defused = true;
@@ -465,7 +484,10 @@ async fn drive(
             }
             Step::Due => match fire(&state, &cx, &session_id, &cron).await {
                 Fire::Started | Fire::Suspended => continue,
-                Fire::Busy => Some(Instant::now() + BUSY_POLL),
+                Fire::Busy => {
+                    busy = true;
+                    Some(Instant::now() + BUSY_POLL)
+                }
                 Fire::Gone => {
                     cron.clear();
                     guard.defused = true;
@@ -478,6 +500,7 @@ async fn drive(
             Some(deadline) => {
                 tokio::select! {
                     () = &mut changed => {}
+                    () = &mut settled, if busy => {}
                     () = tokio::time::sleep_until(deadline) => {}
                 }
             }

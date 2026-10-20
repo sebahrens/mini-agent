@@ -569,6 +569,9 @@ struct RegisteredTurn {
 struct SessionTurns {
     next_generation: u64,
     queue: VecDeque<RegisteredTurn>,
+    /// Notified whenever a turn leaves `queue`, so the session's `/cron`
+    /// driver re-checks a busy session on completion instead of polling.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 struct TurnRegistration {
@@ -588,6 +591,7 @@ impl TurnRegistration {
         {
             turns.queue.remove(index);
         }
+        turns.wake.notify_waiters();
         completed
     }
 
@@ -600,6 +604,7 @@ impl TurnRegistration {
         {
             turns.queue.remove(index);
         }
+        turns.wake.notify_waiters();
     }
 }
 
@@ -1737,6 +1742,7 @@ async fn install_session(
     }
     let modes = policy.modes();
     let turns = Arc::new(StdMutex::new(SessionTurns::default()));
+    let turns_wake = lock_unpoisoned(&turns).wake.clone();
     let pending_question = canonical.pending_question.clone();
     let read_tracker = canonical.read_tracker.clone();
     let todo_store = canonical.todos.clone();
@@ -1775,7 +1781,7 @@ async fn install_session(
                 &client_mcp_servers,
             )),
             client_mcp_servers: Arc::new(client_mcp_servers),
-            cron: cron::CronOwner::default(),
+            cron: cron::CronOwner::new(turns_wake),
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id, turns);
@@ -9791,6 +9797,33 @@ mod protocol_tests {
     }
 
     #[tokio::test]
+    async fn settling_a_turn_wakes_the_cron_busy_wait() {
+        use futures::FutureExt as _;
+        let turns = Arc::new(StdMutex::new(SessionTurns::default()));
+        let wake = lock_unpoisoned(&turns).wake.clone();
+        let control = Arc::new(TurnControl::new());
+        lock_unpoisoned(&turns).queue.push_back(RegisteredTurn {
+            generation: 0,
+            control: control.clone(),
+        });
+        let registration = TurnRegistration {
+            generation: 0,
+            turns: turns.clone(),
+            control,
+        };
+        let settled = wake.notified();
+        tokio::pin!(settled);
+        settled.as_mut().enable();
+        assert!(settled.as_mut().now_or_never().is_none());
+        assert!(registration.complete_and_settle());
+        assert!(
+            settled.now_or_never().is_some(),
+            "a retiring turn must wake the driver"
+        );
+        assert!(lock_unpoisoned(&turns).queue.is_empty());
+    }
+
+    #[tokio::test]
     async fn dropping_registered_generation_aborts_work_without_removing_the_next_turn() {
         let first = Arc::new(TurnControl::new());
         let second = Arc::new(TurnControl::new());
@@ -9806,6 +9839,7 @@ mod protocol_tests {
                     control: second.clone(),
                 },
             ]),
+            ..SessionTurns::default()
         }));
         let work_scope = crate::agent::runner::AgentWorkScope::new();
         let cancellation = work_scope.cancellation_handle();
