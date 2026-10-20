@@ -24,16 +24,34 @@ pub(crate) struct RewindBinding {
     source: crate::session::file_checkpoints::FileCheckpoints,
     workspace: [u8; 32],
 }
+/// SHA-256 of `value`'s JSON serialisation, streamed into the hasher so a
+/// long history is never materialised as one buffer. Byte-identical to
+/// hashing `serde_json::to_vec(value)`.
+fn json_digest<T: serde::Serialize + ?Sized>(value: &T) -> anyhow::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    struct HashWriter(Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.0.finalize().into())
+}
 impl RewindBinding {
     pub(crate) fn capture(
         session: &crate::session::Session,
         workspace: &crate::paths::WorkspaceBinding,
     ) -> anyhow::Result<Self> {
-        use sha2::{Digest, Sha256};
         Ok(Self {
             session: session.id.to_string(),
-            history: Sha256::digest(serde_json::to_vec(&session.messages)?).into(),
-            checkpoints: Sha256::digest(serde_json::to_vec(&session.file_checkpoints)?).into(),
+            history: json_digest(&session.messages)?,
+            checkpoints: json_digest(&session.file_checkpoints)?,
             source: session.file_checkpoints.clone(),
             workspace: workspace
                 .compatibility_fingerprint()
@@ -220,6 +238,26 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn streamed_digest_equals_hashing_the_serialised_vec() {
+        use crate::session::{MessageRole, Session};
+        use sha2::{Digest, Sha256};
+        let mut session = Session::new("openrouter", "test-model", 128_000, "");
+        session.add_message(MessageRole::User, "earlier prompt é雪");
+        session.add_message(MessageRole::Assistant, &"answer \"quoted\"\n".repeat(5000));
+        session.add_shell_interaction("!printf héllo", "OUT\nline");
+        let root = crate::tests::OwnedTestDirectory::new("rewind-digest");
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let binding = RewindBinding::capture(&session, &workspace).unwrap();
+        let expected_history: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&session.messages).unwrap()).into();
+        let expected_checkpoints: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&session.file_checkpoints).unwrap()).into();
+        assert_eq!(binding.history, expected_history);
+        assert_eq!(binding.checkpoints, expected_checkpoints);
+        assert!(binding.valid(&session, &workspace));
     }
 
     fn picker() -> RewindPicker {
