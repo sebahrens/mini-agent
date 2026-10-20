@@ -2850,8 +2850,7 @@ mod tests {
             .walker()
             .unwrap()
             .with_file_filter(Box::new(|_, name| name.to_string_lossy().ends_with(".txt")));
-        let (kept, allocations, _) =
-            crate::tests::alloc_counter::measure(|| walker.map(|f| f.file_name).count());
+        let (kept, allocations, _) = crate::tests::alloc_counter::measure(|| walker.count());
         assert_eq!(kept, 3);
         // One name per directory entry is unavoidable; the two per-entry path
         // buffers must not be allocated for filtered entries.
