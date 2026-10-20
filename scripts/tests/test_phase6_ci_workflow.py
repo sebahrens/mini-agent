@@ -721,7 +721,8 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "name: Test (${{ matrix.features }}) on Linux", 1
         )[1].split("- name:", 1)[0]
         self.assertIn("matrix.os != 'macos-latest'", linux_step)
-        self.assertIn("-- --test-threads=1", linux_step)
+        # mini-agent-vb5vw.16: Linux rows use the parallel runner.
+        self.assertNotIn("--test-threads", linux_step)
         self.assertIn(
             "--skip tests::harness_eval_tests::"
             "task_json_library_axis_uses_real_store_and_records_oracles",

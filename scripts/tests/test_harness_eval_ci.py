@@ -48,7 +48,7 @@ class HarnessEvalCiTests(unittest.TestCase):
 
     def test_nightly_workflow_runs_and_archives_the_bounded_eval(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("cron: '41 2 * * *'", workflow)
+        self.assertIn("cron: '41 2 * * 1'", workflow)
         self.assertIn("env:\n  RUSTFLAGS: ''", workflow)
         self.assertIn("cargo test --locked harness_regression_eval", workflow)
         self.assertIn("cargo test --locked persona_regression_eval", workflow)
