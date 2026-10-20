@@ -5100,23 +5100,26 @@ impl<'a> App<'a> {
             placed = true;
             let limit = self.ui.cfg.mutation_diff_options().max_lines;
             let mut count = 0usize;
-            for line in observation.text.lines().take(limit) {
-                let style = if line.starts_with("@@") {
-                    crate::ui::feed::BlockStyle::DiffHunk
-                } else if line.starts_with('+') && !line.starts_with("+++") {
-                    crate::ui::feed::BlockStyle::DiffAdd
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    crate::ui::feed::BlockStyle::DiffDel
-                } else {
-                    crate::ui::feed::BlockStyle::ToolResult
-                };
-                self.renderer.feed_mut().place_after_anchor(
-                    &observation.id,
-                    style,
-                    sanitize_output(line),
-                );
-                count += 1;
-            }
+            let rows = observation
+                .text
+                .lines()
+                .take(limit)
+                .inspect(|_| count += 1)
+                .map(|line| {
+                    let style = if line.starts_with("@@") {
+                        crate::ui::feed::BlockStyle::DiffHunk
+                    } else if line.starts_with('+') && !line.starts_with("+++") {
+                        crate::ui::feed::BlockStyle::DiffAdd
+                    } else if line.starts_with('-') && !line.starts_with("---") {
+                        crate::ui::feed::BlockStyle::DiffDel
+                    } else {
+                        crate::ui::feed::BlockStyle::ToolResult
+                    };
+                    (style, sanitize_output(line))
+                });
+            self.renderer
+                .feed_mut()
+                .place_rows_after_anchor(&observation.id, rows);
             if observation.truncated || observation.text.lines().count() > count {
                 self.renderer.feed_mut().place_after_anchor(
                     &observation.id,

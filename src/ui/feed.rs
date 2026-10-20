@@ -725,6 +725,51 @@ impl Feed {
         true
     }
 
+    /// Place a run of single-line rows under `anchor` like repeated
+    /// [`Feed::place_after_anchor`] calls, but fold consecutive rows of one
+    /// style into a single multi-line block (a diff hunk header always starts
+    /// its own block). The feed wraps and colours every line of a block on its
+    /// own, so the rendered rows are those of one block per row, without a
+    /// block, caches and retention slot per diff line.
+    pub fn place_rows_after_anchor<S: AsRef<str>>(
+        &mut self,
+        anchor: &str,
+        rows: impl IntoIterator<Item = (BlockStyle, S)>,
+    ) {
+        let mut run: Option<(BlockStyle, String)> = None;
+        let mut runs: Vec<(BlockStyle, String)> = Vec::new();
+        for (style, text) in rows {
+            match run.as_mut() {
+                Some((run_style, run_text))
+                    if *run_style == style && style != BlockStyle::DiffHunk =>
+                {
+                    run_text.push('\n');
+                    run_text.push_str(text.as_ref());
+                }
+                _ => {
+                    runs.extend(run.take());
+                    run = Some((style, text.as_ref().to_owned()));
+                }
+            }
+        }
+        runs.extend(run);
+        let Some(mut position) = self.anchor_insert_position(anchor) else {
+            for (style, text) in runs {
+                self.push_block(style, text);
+            }
+            return;
+        };
+        self.touch(position);
+        for (style, text) in runs {
+            let mut block = Block::new(style, text);
+            block.attached_to = Some(CompactString::from(anchor));
+            self.total_bytes = self.total_bytes.saturating_add(block.text.len());
+            self.blocks.insert(position, block);
+            position += 1;
+        }
+        self.prune_completed_prefix();
+    }
+
     /// Show `text` as the live progress block under `anchor` (a running tool
     /// call's output preview), replacing the previous preview in place. The
     /// first preview is placed like [`Feed::place_after_anchor`]; nothing is
@@ -2293,6 +2338,44 @@ mod progress_tests {
         assert!(!feed.clear_anchor_progress("call-1"));
         assert!(!feed.set_anchor_progress("missing", BlockStyle::ToolResult, "x"));
         assert!(!feed.set_anchor_progress("", BlockStyle::ToolResult, "x"));
+    }
+
+    #[test]
+    fn grouped_rows_render_like_one_block_per_row() {
+        let rows: Vec<(BlockStyle, String)> = (0..200)
+            .map(|index| match index % 5 {
+                0 => (BlockStyle::DiffHunk, format!("@@ -{index} @@")),
+                1 | 2 => (
+                    BlockStyle::DiffAdd,
+                    format!("+added row {index} {}", "w ".repeat(50)),
+                ),
+                3 => (BlockStyle::DiffDel, format!("-removed {index}")),
+                _ => (BlockStyle::ToolResult, String::new()),
+            })
+            .collect();
+        let build = |grouped: bool| {
+            let mut feed = Feed::new();
+            feed.push_anchored_block("call-1", BlockStyle::Tool, "call");
+            feed.push_anchored_block("call-2", BlockStyle::Tool, "other");
+            if grouped {
+                feed.place_rows_after_anchor("call-1", rows.clone());
+            } else {
+                for (style, text) in rows.clone() {
+                    feed.place_after_anchor("call-1", style, text);
+                }
+            }
+            feed
+        };
+        let (grouped, single) = (build(true), build(false));
+        assert!(grouped.block_count() < single.block_count());
+        assert_eq!(grouped.block_count(), 2 + 160);
+        let (a, b) = (grouped.lines(40), single.lines(40));
+        assert_eq!(a.len(), b.len());
+        for index in 0..a.len() {
+            assert_eq!(a[index].text, b[index].text);
+            assert_eq!(a[index].color, b[index].color);
+        }
+        assert_eq!(grouped.block_text(grouped.block_count() - 1), Some("other"));
     }
 
     #[test]

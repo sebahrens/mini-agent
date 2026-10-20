@@ -141,20 +141,19 @@ pub(crate) fn push_mutation_diff(
             "Imported recorded mutation preview (not current file state)",
         );
     }
-    for row in diff.rows.iter().take(limit) {
-        let (style, prefix) = match row.kind {
-            DiffKind::Add => (BlockStyle::DiffAdd, "+"),
-            DiffKind::Delete => (BlockStyle::DiffDel, "-"),
-            DiffKind::Context => (BlockStyle::ToolResult, " "),
-            DiffKind::Hunk => (BlockStyle::DiffHunk, ""),
-            DiffKind::Notice => (BlockStyle::ToolResult, ""),
-        };
-        feed.place_after_anchor(
-            anchor,
-            style,
-            format!("{prefix}{}", sanitize_for_review(&row.text)),
-        );
-    }
+    feed.place_rows_after_anchor(
+        anchor,
+        diff.rows.iter().take(limit).map(|row| {
+            let (style, prefix) = match row.kind {
+                DiffKind::Add => (BlockStyle::DiffAdd, "+"),
+                DiffKind::Delete => (BlockStyle::DiffDel, "-"),
+                DiffKind::Context => (BlockStyle::ToolResult, " "),
+                DiffKind::Hunk => (BlockStyle::DiffHunk, ""),
+                DiffKind::Notice => (BlockStyle::ToolResult, ""),
+            };
+            (style, format!("{prefix}{}", sanitize_for_review(&row.text)))
+        }),
+    );
     let omitted = diff
         .omitted_rows
         .saturating_add(diff.rows.len().saturating_sub(limit));
