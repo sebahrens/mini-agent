@@ -65,6 +65,7 @@ impl ProviderHttpClient {
             test_wire: None,
         }))
     }
+    #[cfg(feature = "bedrock")]
     pub(crate) fn with_bedrock(
         client: reqwest::Client,
         auth: std::sync::Arc<crate::provider::bedrock::BedrockAuth>,
@@ -80,6 +81,7 @@ impl ProviderHttpClient {
             test_wire: None,
         }))
     }
+    #[cfg(feature = "vertex")]
     pub(crate) fn with_vertex(
         client: reqwest::Client,
         auth: std::sync::Arc<crate::provider::vertex::VertexAuth>,
@@ -150,9 +152,11 @@ impl ProviderHttpClient {
         &self,
         mut request: Request<Bytes>,
     ) -> http_client::Result<reqwest::RequestBuilder> {
+        #[cfg(feature = "bedrock")]
         if let Some(auth) = &self.0.bedrock {
             auth.prepare(&mut request).await?;
         }
+        #[cfg(feature = "vertex")]
         if let Some(auth) = &self.0.vertex {
             auth.prepare(&mut request).await?;
         }

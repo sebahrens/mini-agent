@@ -193,6 +193,12 @@ streaming tools and usage. It supports Claude models exposed by that API; it
 does not translate other Bedrock model families into Claude requests. No common
 model/deployment default is assumed.
 
+The native Bedrock and Vertex back-ends are the default `bedrock` and `vertex`
+Cargo features; they own the AWS SDK crates and `google-cloud-auth`/`rustls`
+respectively. A `--no-default-features` build omits them, and selecting either
+provider then fails before any credential or network work with
+"The '<provider>' provider is not compiled into this build".
+
 Without an API key, the official AWS SDK resolves credentials lazily and signs
 each request with SigV4 for service `bedrock`. Its environment, shared-key profile,
 SSO, assume-role, web-identity, ECS, and EC2 credential providers remain available.

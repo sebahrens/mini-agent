@@ -63,6 +63,23 @@ class FeatureGraphTests(unittest.TestCase):
         commands = re.findall(r"^\s*run: ((?:cargo|cross) build --locked --release --no-default-features --target \$\{\{ matrix.target \}\})$", release, re.MULTILINE)
         self.assertEqual(3, len(commands), "all native/static/Windows lite recipes remain no-default only")
 
+    def test_bedrock_and_vertex_are_default_features_owning_their_provider_crates(self) -> None:
+        self.assertTrue({"bedrock", "vertex"}.issubset(self.manifest["features"]["default"]))
+        for package in ("aws-config", "aws-sigv4", "aws-runtime"):
+            self.assertIn(package, feature_graph.resolve_feature(self.manifest["features"], "bedrock").packages)
+            self.assertIn(package, feature_graph.ACTIVATION_PACKAGES)
+        self.assertIn("google-cloud-auth", feature_graph.resolve_feature(self.manifest["features"], "vertex").packages)
+        self.assertIn("google-cloud-auth", feature_graph.ACTIVATION_PACKAGES)
+
+    def test_dropping_bedrock_from_default_features_is_rejected(self) -> None:
+        manifest = copy.deepcopy(self.manifest)
+        manifest["features"]["default"].remove("bedrock")
+
+        self.assertIn(
+            "default features must include 'bedrock'",
+            feature_graph.validate_manifest(manifest),
+        )
+
     def test_skills_must_imply_js(self) -> None:
         manifest = copy.deepcopy(self.manifest)
         manifest["features"]["skills"].remove("js")
