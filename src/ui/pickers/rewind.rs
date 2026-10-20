@@ -75,9 +75,11 @@ pub struct RewindPicker {
     binding: RewindBinding,
     stage: Stage,
     list: ListPicker,
-    /// `(message_index, preview)` for each rewind-able user turn, in order. The
-    /// list shows the previews, so `list.selected` indexes straight into this.
-    targets: Vec<(usize, String)>,
+    /// Message index of each rewind-able user turn, in order. The list shows
+    /// the previews, so `list.selected` indexes straight into this.
+    targets: Vec<usize>,
+    /// The previews, parked here while the confirm step replaces the list.
+    previews: Vec<String>,
     chosen: Option<usize>,
     outcome: Option<RewindOutcome>,
 }
@@ -85,13 +87,15 @@ pub struct RewindPicker {
 impl RewindPicker {
     pub(crate) fn new(targets: Vec<(usize, String)>, binding: RewindBinding) -> Self {
         let mut list = ListPicker::new();
-        list.set_items(targets.iter().map(|(_, p)| p.clone()).collect());
+        let (targets, previews): (Vec<usize>, Vec<String>) = targets.into_iter().unzip();
+        list.set_items(previews);
         RewindPicker {
             active: false,
             binding,
             stage: Stage::PickMessage,
             list,
             targets,
+            previews: Vec::new(),
             chosen: None,
             outcome: None,
         }
@@ -148,9 +152,10 @@ impl RewindPicker {
     fn confirm(&mut self) {
         match self.stage {
             Stage::PickMessage => {
-                if let Some(&(idx, _)) = self.targets.get(self.list.selected) {
+                if let Some(&idx) = self.targets.get(self.list.selected) {
                     self.chosen = Some(idx);
                     self.stage = Stage::Confirm;
+                    self.previews = self.list.take_items();
                     self.list.set_items(vec![
                         CONFIRM_REWIND.to_string(),
                         format!(
@@ -191,12 +196,11 @@ impl RewindPicker {
             // bailing out entirely, so a mis-step is cheap to correct.
             Stage::Confirm => {
                 self.stage = Stage::PickMessage;
-                self.list
-                    .set_items(self.targets.iter().map(|(_, p)| p.clone()).collect());
+                self.list.set_items(std::mem::take(&mut self.previews));
                 self.list.activate();
                 if let Some(pos) = self
                     .chosen
-                    .and_then(|idx| self.targets.iter().position(|(i, _)| *i == idx))
+                    .and_then(|idx| self.targets.iter().position(|i| *i == idx))
                 {
                     self.list.selected = pos;
                 }

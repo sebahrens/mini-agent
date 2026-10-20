@@ -126,7 +126,7 @@ impl Picker {
             Picker::Sessions(p) => p.draw(out, cols, floor_row, bg),
             // A new command has no history match; stay out of the way
             // instead of announcing "no matches" for every keystroke.
-            Picker::Bang(p) if p.matches.is_empty() => Ok(()),
+            Picker::Bang(p) if p.is_empty() => Ok(()),
             Picker::Bang(p) => p.draw(out, cols, None, floor_row),
         }
     }

@@ -140,7 +140,7 @@ impl ConfigPicker {
                 .collect(),
         );
         self.list.activate();
-        if self.list.matches.is_empty() {
+        if self.list.is_empty() {
             self.list.deactivate();
         }
     }

@@ -217,8 +217,7 @@ pub struct ListPicker {
     pub active: bool,
     pub query: String,
     pub cursor: usize,
-    pub matches: Vec<String>,
-    /// Index into `items` of each entry of `matches`.
+    /// Index into `items` of each matching entry, best first (at most 50).
     match_indices: Vec<usize>,
     pub selected: usize,
     items: Vec<Cow<'static, str>>,
@@ -241,7 +240,6 @@ impl ListPicker {
             active: false,
             query: String::new(),
             cursor: 0,
-            matches: Vec::new(),
             match_indices: Vec::new(),
             selected: 0,
             items: Vec::new(),
@@ -295,6 +293,17 @@ impl ListPicker {
         self.monochrome
     }
 
+    /// Move the item names out, leaving the list empty.
+    pub(crate) fn take_items(&mut self) -> Vec<String> {
+        self.items_lower.clear();
+        self.name_width = 0;
+        self.match_indices.clear();
+        std::mem::take(&mut self.items)
+            .into_iter()
+            .map(Cow::into_owned)
+            .collect()
+    }
+
     pub fn set_items(&mut self, items: Vec<String>) {
         self.set_names(items);
         self.descriptions.clear();
@@ -319,21 +328,21 @@ impl ListPicker {
     /// marker on the current entry.
     #[cfg(test)]
     pub(crate) fn display_rows(&self) -> Vec<String> {
-        (0..self.matches.len())
+        (0..self.len())
             .map(|index| self.display_row(index).into_owned())
             .collect()
     }
 
     /// The drawn row for `matches[index]`; only visible rows are formatted.
     pub(crate) fn display_row(&self, index: usize) -> Cow<'_, str> {
-        let name = self.matches[index].as_str();
+        let item = self.match_indices[index];
+        let name: &str = &self.items[item];
         if self.descriptions.is_empty() {
             return Cow::Borrowed(name);
         }
         let description = self
-            .match_indices
-            .get(index)
-            .and_then(|item| self.descriptions.get(*item))
+            .descriptions
+            .get(item)
             .map(String::as_str)
             .unwrap_or("");
         let marker = if self.current.as_deref() == Some(name) {
@@ -349,7 +358,6 @@ impl ListPicker {
         self.active = true;
         self.query.clear();
         self.cursor = 0;
-        self.matches.clear();
         self.match_indices.clear();
         self.selected = 0;
         self.filter();
@@ -387,46 +395,79 @@ impl ListPicker {
 
     fn filter(&mut self) {
         let query_lower = self.query.to_lowercase();
-        let mut ranked: Vec<(u8, usize)> = self
-            .items_lower
-            .iter()
-            .enumerate()
-            .filter_map(|(index, name)| {
-                match_rank_lower(name, &query_lower).map(|rank| (rank, index))
-            })
-            .collect();
-        // Stable on the caller's order: for commands that order is alphabetical.
-        ranked.sort_unstable();
-        self.match_indices = ranked
-            .into_iter()
-            .take(50)
-            .map(|(_, index)| index)
-            .collect();
-        self.matches = self
-            .match_indices
-            .iter()
-            .map(|index| self.items[*index].to_string())
-            .collect();
+        if query_lower
+            .strip_prefix('/')
+            .unwrap_or(&query_lower)
+            .is_empty()
+        {
+            // Every name ranks 0: the caller's order is the answer.
+            self.match_indices = (0..self.items_lower.len()).take(50).collect();
+        } else {
+            let mut ranked: Vec<(u8, usize)> = self
+                .items_lower
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| {
+                    match_rank_lower(name, &query_lower).map(|rank| (rank, index))
+                })
+                .collect();
+            // Stable on the caller's order: for commands that order is alphabetical.
+            ranked.sort_unstable();
+            self.match_indices = ranked
+                .into_iter()
+                .take(50)
+                .map(|(_, index)| index)
+                .collect();
+        }
         self.selected = if self.query.is_empty() {
             self.current
                 .as_ref()
-                .and_then(|current| self.matches.iter().position(|m| m == current))
+                .and_then(|current| {
+                    self.match_indices
+                        .iter()
+                        .position(|index| self.items[*index] == current.as_str())
+                })
                 .unwrap_or(0)
         } else {
             0
         };
     }
 
+    /// Number of matching entries (at most 50).
+    pub fn len(&self) -> usize {
+        self.match_indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.match_indices.is_empty()
+    }
+
+    /// The matching names, best first.
+    pub fn matches(&self) -> impl Iterator<Item = &str> + '_ {
+        self.match_indices.iter().map(|index| &*self.items[*index])
+    }
+
+    /// Position of `name` among the matches.
+    pub(crate) fn position_of(&self, name: &str) -> Option<usize> {
+        self.matches().position(|m| m == name)
+    }
+
+    /// The matching names collected, for tests.
+    #[cfg(test)]
+    pub(crate) fn match_names(&self) -> Vec<&str> {
+        self.matches().collect()
+    }
+
     pub fn select_next(&mut self) {
-        if !self.matches.is_empty() {
-            self.selected = (self.selected + 1) % self.matches.len();
+        if !self.is_empty() {
+            self.selected = (self.selected + 1) % self.len();
         }
     }
 
     pub fn select_prev(&mut self) {
-        if !self.matches.is_empty() {
+        if !self.is_empty() {
             self.selected = if self.selected == 0 {
-                self.matches.len() - 1
+                self.len() - 1
             } else {
                 self.selected - 1
             };
@@ -434,7 +475,9 @@ impl ListPicker {
     }
 
     pub fn selected_name(&self) -> Option<&str> {
-        self.matches.get(self.selected).map(|s| s.as_str())
+        self.match_indices
+            .get(self.selected)
+            .map(|index| &*self.items[*index])
     }
 
     pub fn draw(
@@ -450,7 +493,7 @@ impl ListPicker {
         draw_picker_rows(
             out,
             cols,
-            self.matches.len(),
+            self.len(),
             |index| self.display_row(index),
             self.selected,
             self.monochrome,

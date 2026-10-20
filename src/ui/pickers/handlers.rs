@@ -376,7 +376,7 @@ fn typed_command(buffer: &str, cursor: usize, picker: &ListPicker) -> Option<Str
     if cursor != buffer.len() || buffer.strip_prefix('/') != Some(picker.query.as_str()) {
         return None;
     }
-    (picker.matches.iter().any(|m| m == buffer) || super::list::is_command_alias(buffer))
+    (picker.matches().any(|m| m == buffer) || super::list::is_command_alias(buffer))
         .then(|| buffer.to_string())
 }
 
@@ -413,7 +413,7 @@ pub fn handle_command_key(
         KeyCode::Char(' ') if typed_command(buffer, *cursor, picker).is_some() => {
             let command = typed_command(buffer, *cursor, picker).unwrap_or_default();
             if opens_sub_picker(&command, ctx)
-                && let Some(index) = picker.matches.iter().position(|m| *m == command)
+                && let Some(index) = picker.position_of(&command)
             {
                 picker.selected = index;
                 return accept_command(buffer, cursor, ctx, picker);
@@ -451,7 +451,7 @@ pub fn handle_command_key(
             (true, None)
         }
         KeyCode::Tab => {
-            if picker.matches.is_empty() {
+            if picker.is_empty() {
                 return (true, None);
             }
             accept_command(buffer, cursor, ctx, picker)
@@ -615,7 +615,7 @@ pub fn handle_prefixed_key(
             picker.select_next();
             true
         }
-        KeyCode::Tab if picker.matches.is_empty() => true,
+        KeyCode::Tab if picker.is_empty() => true,
         KeyCode::Enter | KeyCode::Tab => {
             if let Some(name) = picker.selected_name() {
                 let after_offset = prefix_len + picker.query.chars().count();
