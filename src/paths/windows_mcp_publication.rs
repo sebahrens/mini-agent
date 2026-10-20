@@ -302,12 +302,16 @@ fn check_shape(file: &File, directory: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn check_directory(file: &File, expected: &CheckedMetadata, security: &[u8; 32]) -> io::Result<()> {
+fn check_directory(
+    file: &File,
+    expected: &crate::fs::FileIdentity,
+    security: &[u8; 32],
+) -> io::Result<()> {
     check_shape(file, true)?;
-    crate::fs::ensure_same_file(
+    crate::fs::ensure_same_identity(
         Path::new("MCP directory"),
         expected,
-        &crate::fs::checked_file_metadata(file)?,
+        &crate::fs::file_identity(file)?.1,
     )?;
     if security_fingerprint(file)? != *security {
         return Err(io::Error::new(
@@ -370,7 +374,11 @@ fn check_parent_namespace(
     // Bind the original relative namespace independently of an object's ID.
     // Current directory handles also pin names by excluding delete sharing;
     // retain this rewalk against earlier replacement or changed capture rules.
-    check_directory(&current.into_std_file(), parent_identity, parent_security)
+    check_directory(
+        &current.into_std_file(),
+        &parent_identity.identity(),
+        parent_security,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,7 +420,7 @@ fn replace_with_hooks(
             "parent directory writer",
             transaction.open(&parent_path, false, true),
         )?;
-        check_directory(&parent, &parent_identity, &parent_security)?;
+        check_directory(&parent, &parent_identity.identity(), &parent_security)?;
         at_stage(
             "original parent namespace",
             check_parent_namespace(workspace, &relative, &parent_identity, &parent_security),
@@ -450,7 +458,7 @@ fn replace_with_hooks(
             crate::fs::validate_private_file(&candidate),
         )?;
         check_directory(&root, &workspace.identity, &root_security)?;
-        check_directory(&parent, &parent_identity, &parent_security)?;
+        check_directory(&parent, &parent_identity.identity(), &parent_security)?;
         at_stage(
             "original parent namespace",
             check_parent_namespace(workspace, &relative, &parent_identity, &parent_security),

@@ -1780,6 +1780,7 @@ async fn install_session(
                 &state.cfg,
                 &client_mcp_servers,
             )),
+            #[cfg(feature = "mcp")]
             client_mcp_servers: Arc::new(client_mcp_servers),
             cron: cron::CronOwner::new(turns_wake),
         },
