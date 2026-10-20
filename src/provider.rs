@@ -21,14 +21,110 @@ use crate::config::{ApiStyle, Config, CustomProviderConfig, ReasoningConfig};
 
 #[path = "provider_azure.rs"]
 pub(crate) mod azure;
+#[cfg(feature = "bedrock")]
 #[path = "provider_bedrock.rs"]
 pub(crate) mod bedrock;
+/// Stand-in used when the `bedrock` feature is off: every entry point fails
+/// before any credential or network work with the same "not compiled" error.
+#[cfg(not(feature = "bedrock"))]
+pub(crate) mod bedrock {
+    use super::AnyClient;
+
+    /// Never constructed; types the `ProviderHttpClient` backend slot.
+    pub(crate) type BedrockAuth = std::convert::Infallible;
+
+    fn unavailable<T>() -> anyhow::Result<T> {
+        Err(anyhow::anyhow!(
+            "The 'bedrock' provider is not compiled into this build (rebuild with `--features bedrock`)"
+        ))
+    }
+
+    pub(crate) fn region<F>(_env: &F) -> anyhow::Result<String>
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
+        unavailable()
+    }
+
+    pub(crate) fn endpoint(_endpoint: Option<&str>, _region: &str) -> anyhow::Result<String> {
+        unavailable()
+    }
+
+    pub(crate) fn build_client(
+        _credential: crate::auth::ResolvedCredential,
+        _endpoint: &str,
+        _region: &str,
+        _http: reqwest::Client,
+    ) -> anyhow::Result<AnyClient> {
+        unavailable()
+    }
+}
 #[path = "provider_copilot.rs"]
 pub(crate) mod copilot;
 #[path = "provider_effort.rs"]
 pub(crate) mod effort;
+#[cfg(feature = "vertex")]
 #[path = "provider_vertex.rs"]
 pub(crate) mod vertex;
+/// Stand-in used when the `vertex` feature is off; see `bedrock` above.
+#[cfg(not(feature = "vertex"))]
+pub(crate) mod vertex {
+    use super::AnyClient;
+
+    /// Never constructed; types the `ProviderHttpClient` backend slot.
+    pub(crate) type VertexAuth = std::convert::Infallible;
+    /// Never constructed: `route` always fails in this build.
+    pub(crate) struct VertexRoute;
+
+    fn unavailable<T>() -> anyhow::Result<T> {
+        Err(anyhow::anyhow!(
+            "The 'vertex' provider is not compiled into this build (rebuild with `--features vertex`)"
+        ))
+    }
+
+    pub(crate) fn route<F>(_env: &F) -> anyhow::Result<VertexRoute>
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
+        unavailable()
+    }
+
+    pub(crate) fn endpoint(
+        _endpoint: Option<&str>,
+        _route: &VertexRoute,
+    ) -> anyhow::Result<String> {
+        unavailable()
+    }
+
+    pub(crate) fn build_client(
+        _credential: crate::auth::ResolvedCredential,
+        _endpoint: &str,
+        _route: VertexRoute,
+        _http: reqwest::Client,
+    ) -> anyhow::Result<AnyClient> {
+        unavailable()
+    }
+}
+
+#[cfg(all(test, not(any(feature = "bedrock", feature = "vertex"))))]
+mod unavailable_provider_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_native_providers_fail_with_not_compiled_error() {
+        let env = |_: &str| -> Result<String, std::env::VarError> { Ok("x".into()) };
+        for name in ["bedrock", "vertex"] {
+            let error = create_client_with_env(name, Some("k"), &HashMap::new(), None, env)
+                .err()
+                .expect("disabled provider must not build")
+                .to_string();
+            assert!(
+                error.contains(&format!("'{name}' provider is not compiled")),
+                "{error}"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "provider_effort_tests.rs"]
@@ -4727,6 +4823,7 @@ pub(crate) fn resolve_stream_idle_timeout(custom: Option<&CustomProviderConfig>)
     )
 }
 
+#[cfg(any(feature = "bedrock", test))]
 pub(crate) fn build_http_client(
     provider_name: &str,
     danger_accept_invalid_certs: bool,

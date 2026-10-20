@@ -17,6 +17,15 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 OPTIONAL_PACKAGE_OWNERS = {
+    "aws-config": "bedrock",
+    "aws-credential-types": "bedrock",
+    "aws-runtime": "bedrock",
+    "aws-sigv4": "bedrock",
+    "aws-smithy-runtime-api": "bedrock",
+    "aws-smithy-types": "bedrock",
+    "aws-types": "bedrock",
+    "google-cloud-auth": "vertex",
+    "rustls": "vertex",
     "agent-client-protocol": "acp",
     "blocking": "acp",
     "fastembed": "skills-embed",
@@ -38,7 +47,9 @@ OPTIONAL_PACKAGES = frozenset(OPTIONAL_PACKAGE_OWNERS)
 # These direct optional dependencies are also present transitively in the base
 # graph, so `cargo tree` cannot prove whether their direct edge is active.
 # `validate_manifest` still verifies their owning feature's semantic closure.
-TRANSITIVELY_PRESENT_OPTIONAL_PACKAGES = frozenset({"native-tls", "tokio-native-tls", "url", "which"})
+TRANSITIVELY_PRESENT_OPTIONAL_PACKAGES = frozenset(
+    {"native-tls", "tokio-native-tls", "rustls", "url", "which"}
+)
 ACTIVATION_PACKAGES = OPTIONAL_PACKAGES - TRANSITIVELY_PRESENT_OPTIONAL_PACKAGES
 JS_PACKAGES = frozenset({"rquickjs"})
 SKILLS_PACKAGES = JS_PACKAGES | {
@@ -553,7 +564,7 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
     dependencies = manifest.get("dependencies", {})
 
     default_features = set(features.get("default", []))
-    for feature in ("js", "sandbox", "memory"):
+    for feature in ("js", "sandbox", "memory", "bedrock", "vertex"):
         if feature not in default_features:
             errors.append(f"default features must include {feature!r}")
 
