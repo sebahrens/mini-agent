@@ -400,24 +400,32 @@ async fn rev_parse_paths(
     operation: &'static str,
     queries: &[&str],
 ) -> Result<Vec<PathBuf>, String> {
-    let mut args = vec!["rev-parse"];
-    args.extend_from_slice(queries);
-    let output = run_query(repo_path, operation, args).await?;
-    let text = trim_line(&output.stdout);
-    let paths = text
-        .split(|byte| *byte == b'\n')
-        .map(output_path)
-        .collect::<Vec<_>>();
+    let lines = rev_parse_lines(repo_path, operation, queries).await?;
     let expected = queries
         .iter()
         .filter(|query| !query.starts_with("--path-format"))
         .count();
-    if paths.len() != expected {
+    if lines.len() != expected {
         return Err(format!(
             "git {operation} returned an unexpected number of paths"
         ));
     }
-    Ok(paths)
+    Ok(lines.iter().map(|line| output_path(line)).collect())
+}
+
+/// One `git rev-parse` process; its output split into lines.
+async fn rev_parse_lines(
+    repo_path: &Path,
+    operation: &'static str,
+    queries: &[&str],
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut args = vec!["rev-parse"];
+    args.extend_from_slice(queries);
+    let output = run_query(repo_path, operation, args).await?;
+    Ok(trim_line(&output.stdout)
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 async fn validate_branch_name(repo_path: &Path, branch: &str) -> Result<(), String> {
@@ -436,19 +444,41 @@ async fn validate_branch_name(repo_path: &Path, branch: &str) -> Result<(), Stri
 
 pub async fn detect(repo_path: &Path) -> Option<WorktreeInfo> {
     let repo_path = canonical_path(repo_path, "repository").ok()?;
-    let paths = rev_parse_paths(
-        &repo_path,
-        "worktree-identity",
-        &[
-            "--path-format=absolute",
-            "--git-common-dir",
-            "--git-dir",
-            "--show-toplevel",
-        ],
-    )
-    .await
-    .ok()?;
-    let [common_dir, git_dir, root] = <[PathBuf; 3]>::try_from(paths).ok()?;
+    // One `rev-parse` answers the three identity paths and, via
+    // `--symbolic-full-name HEAD`, the checked-out branch (`HEAD` when
+    // detached).
+    let queries = [
+        "--path-format=absolute",
+        "--git-common-dir",
+        "--git-dir",
+        "--show-toplevel",
+        "--symbolic-full-name",
+        "HEAD",
+    ];
+    let (common_dir, git_dir, root, branch) =
+        match rev_parse_lines(&repo_path, "worktree-identity", &queries).await {
+            Ok(lines) => {
+                let [common_dir, git_dir, root, head] = <[Vec<u8>; 4]>::try_from(lines).ok()?;
+                let branch = head_branch(&head)?;
+                (
+                    output_path(&common_dir),
+                    output_path(&git_dir),
+                    output_path(&root),
+                    Some(branch),
+                )
+            }
+            // An unborn branch has no commit for `HEAD` to resolve to, which
+            // fails the whole query. Ask for the paths alone, then read the
+            // branch name with `symbolic-ref`.
+            Err(error) if error.contains("'HEAD'") => {
+                let paths = rev_parse_paths(&repo_path, "worktree-identity", &queries[..4])
+                    .await
+                    .ok()?;
+                let [common_dir, git_dir, root] = <[PathBuf; 3]>::try_from(paths).ok()?;
+                (common_dir, git_dir, root, None)
+            }
+            Err(_) => return None,
+        };
     let common_dir = canonical_path(&common_dir, "common Git directory").ok()?;
     let git_dir = canonical_path(&git_dir, "Git directory").ok()?;
     if common_dir == git_dir {
@@ -457,13 +487,25 @@ pub async fn detect(repo_path: &Path) -> Option<WorktreeInfo> {
 
     let worktree_path = canonical_path(&root, "worktree root").ok()?;
     let main_repo_path = canonical_path(common_dir.parent()?, "main repository").ok()?;
-    let branch = current_branch(&repo_path).await?;
+    let branch = match branch {
+        Some(branch) => branch,
+        None => current_branch(&repo_path).await?,
+    };
 
     Some(WorktreeInfo {
         branch,
         worktree_path,
         main_repo_path,
     })
+}
+
+/// The branch a `rev-parse --symbolic-full-name HEAD` line names: its
+/// `refs/heads/` short name, or `None` for a detached HEAD (`HEAD`) or any ref
+/// outside `refs/heads/`.
+fn head_branch(line: &[u8]) -> Option<String> {
+    let name = std::str::from_utf8(trim_line(line)).ok()?;
+    let branch = name.strip_prefix("refs/heads/")?;
+    (!branch.is_empty()).then(|| branch.to_string())
 }
 
 pub async fn current_branch(repo_path: &Path) -> Option<String> {
@@ -473,15 +515,24 @@ pub async fn current_branch(repo_path: &Path) -> Option<String> {
 
 pub async fn default_branch(repo_path: &Path) -> Option<String> {
     let repo_path = canonical_path(repo_path, "repository").ok()?;
-    for name in ["main", "master"] {
-        if run_query(&repo_path, "verify-branch", ["rev-parse", "--verify", name])
-            .await
-            .is_ok()
-        {
-            return Some(name.to_string());
-        }
-    }
-    None
+    // One `for-each-ref` lists whichever of the two local branches exist.
+    let output = run_query(
+        &repo_path,
+        "verify-branch",
+        [
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/main",
+            "refs/heads/master",
+        ],
+    )
+    .await
+    .ok()?;
+    let names = String::from_utf8_lossy(&output.stdout);
+    ["main", "master"]
+        .into_iter()
+        .find(|name| names.lines().any(|line| line == *name))
+        .map(str::to_string)
 }
 
 pub async fn create(

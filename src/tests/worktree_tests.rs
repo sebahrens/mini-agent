@@ -1633,6 +1633,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_branch_prefers_main_then_master_and_ignores_other_refs() {
+        let repo = TempRepo::new("default branch pick");
+        assert_eq!(default_branch(repo.path()).await.as_deref(), Some("main"));
+
+        git(repo.path(), ["branch", "master"]);
+        assert_eq!(default_branch(repo.path()).await.as_deref(), Some("main"));
+
+        git(repo.path(), ["branch", "-m", "main", "trunk"]);
+        assert_eq!(default_branch(repo.path()).await.as_deref(), Some("master"));
+
+        git(repo.path(), ["branch", "-D", "master"]);
+        assert_eq!(default_branch(repo.path()).await, None);
+    }
+
+    #[tokio::test]
+    async fn detect_reports_linked_worktree_branch_and_refuses_main_and_detached() {
+        let repo = TempRepo::new("detect identity");
+        assert!(detect(repo.path()).await.is_none(), "main checkout");
+
+        let (worktree, info) = create(repo.path(), "feat/detect", None)
+            .await
+            .expect("create linked worktree");
+        let detected = detect(&worktree).await.expect("linked worktree");
+        assert_eq!(detected.branch, "feat/detect");
+        assert_eq!(detected.branch, info.branch);
+        assert_eq!(detected.worktree_path, worktree.canonicalize().unwrap());
+        assert_eq!(detected.main_repo_path, repo.path().canonicalize().unwrap());
+
+        git(&worktree, ["checkout", "--detach"]);
+        assert!(detect(&worktree).await.is_none(), "detached HEAD");
+        cleanup_worktree(&worktree, "feat/detect", repo.path(), true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn git_runner_uses_explicit_repo_with_spaces_and_preserves_relative_reads() {
         let repo = TempRepo::new("repo with spaces");
         let original_cwd = std::env::current_dir().expect("current directory");
