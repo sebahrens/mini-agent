@@ -1,6 +1,7 @@
 use super::*;
 use crate::auth::{AuthResolver, CredentialSource, ProviderKind};
 use crate::provider::{OpenAiModel, create_client_with_env};
+use crate::tests::support::loopback_http::asynchronous::{accept_request, bind, respond_sse};
 use futures::StreamExt;
 use rig::completion::{CompletionModel, Message};
 use rig::streaming::StreamingChat;
@@ -12,7 +13,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
 fn azure81_kind_endpoint_and_deployment_protocol_are_explicit() {
@@ -187,26 +187,6 @@ impl rig::tool::Tool for Probe {
     }
 }
 
-async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Value) {
-    let mut data = Vec::new();
-    while !data.ends_with(b"\r\n\r\n") {
-        assert!(data.len() < 32 * 1024);
-        data.push(socket.read_u8().await.unwrap());
-    }
-    let headers = String::from_utf8(data).unwrap().to_ascii_lowercase();
-    let length: usize = headers
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("content-length:")
-                .map(|v| v.trim().parse().unwrap())
-        })
-        .unwrap();
-    assert!(length < 256 * 1024);
-    let mut body = vec![0; length];
-    socket.read_exact(&mut body).await.unwrap();
-    (headers, serde_json::from_slice(&body).unwrap())
-}
-
 fn reply(style: ApiStyle, step: usize) -> String {
     if style == ApiStyle::Responses {
         let response_item = if step == 0 {
@@ -276,8 +256,7 @@ where
 async fn azure81_wire_streaming_tools_usage_and_exclusive_auth_for_both_v1_apis() {
     for style in [ApiStyle::Responses, ApiStyle::Completions] {
         for auth in ["api-key", "bearer", "cli"] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let (listener, endpoint) = bind().await;
             let custom = if style == ApiStyle::Completions {
                 HashMap::from([("azure".into(), serde_json::from_value::<CustomProviderConfig>(json!({"provider_type":"azure","base_url":endpoint,"api_style":"completions","inherit_builtin_key":true,"headers":{"Authorization":"MUST_NOT_MERGE","Api-Key":"MUST_NOT_MERGE","X-Api-Key":"MUST_NOT_MERGE"}})).unwrap())])
             } else {
@@ -310,8 +289,8 @@ async fn azure81_wire_streaming_tools_usage_and_exclusive_auth_for_both_v1_apis(
             let counter = Arc::new(AtomicUsize::new(0));
             let server = async {
                 for step in 0..2 {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let (headers, body) = read_request(&mut socket).await;
+                    let (mut socket, request) = accept_request(&listener).await;
+                    let (headers, body) = (request.headers.clone(), request.json());
                     assert!(headers.starts_with(if style == ApiStyle::Responses {
                         "post /openai/v1/responses http/1.1"
                     } else {
@@ -342,7 +321,7 @@ async fn azure81_wire_streaming_tools_usage_and_exclusive_auth_for_both_v1_apis(
                         assert!(body.to_string().contains("call-azure"));
                     }
                     let body = reply(style, step);
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                    respond_sse(&mut socket, &body).await;
                 }
             };
             let request = async {

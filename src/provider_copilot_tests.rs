@@ -80,6 +80,9 @@ fn copilot81_credential_sources_are_declared_and_custom_routes_cannot_borrow_the
 }
 
 use crate::config::ApiStyle;
+use crate::tests::support::loopback_http::asynchronous::{
+    accept_request, bind, read_head, respond_json, respond_sse,
+};
 use futures::StreamExt;
 use rig::completion::{CompletionModel, Message};
 use rig::streaming::StreamingChat;
@@ -107,26 +110,6 @@ impl rig::tool::Tool for Probe {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok("OWNED_COPILOT_TOOL_OK".into())
     }
-}
-
-async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Value) {
-    let mut data = Vec::new();
-    while !data.ends_with(b"\r\n\r\n") {
-        assert!(data.len() < 32 * 1024);
-        data.push(socket.read_u8().await.unwrap());
-    }
-    let headers = String::from_utf8(data).unwrap().to_ascii_lowercase();
-    let length: usize = headers
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("content-length:")
-                .map(|v| v.trim().parse().unwrap())
-        })
-        .unwrap();
-    assert!(length < 256 * 1024);
-    let mut body = vec![0; length];
-    socket.read_exact(&mut body).await.unwrap();
-    (headers, serde_json::from_slice(&body).unwrap())
 }
 
 fn reply(style: ApiStyle, step: usize) -> String {
@@ -197,8 +180,7 @@ where
 #[tokio::test]
 async fn copilot81_actual_sdk_chat_and_responses_stream_tools_usage_and_app_identity() {
     for style in [ApiStyle::Completions, ApiStyle::Responses] {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (listener, base) = bind().await;
         let customs=HashMap::from([("owned-copilot".into(),serde_json::from_value::<crate::config::CustomProviderConfig>(json!({"provider_type":"copilot","base_url":base,"api_key_env":"OWN_TOKEN","headers":{"authorization":"MUST_NOT_MERGE","x-api-key":"MUST_NOT_MERGE","x-goog-user-project":"MUST_NOT_MERGE","user-agent":"MUST_NOT_MERGE","editor-version":"MUST_NOT_MERGE"}})).unwrap())]);
         let client = crate::provider::create_client_with_env(
             "owned-copilot",
@@ -244,8 +226,8 @@ async fn copilot81_actual_sdk_chat_and_responses_stream_tools_usage_and_app_iden
         let counter = Arc::new(AtomicUsize::new(0));
         let server = async {
             for step in 0..2 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let (headers, body) = read_request(&mut socket).await;
+                let (mut socket, request) = accept_request(&listener).await;
+                let (headers, body) = (request.headers.clone(), request.json());
                 let path = if style == ApiStyle::Responses {
                     "/responses"
                 } else {
@@ -274,7 +256,7 @@ async fn copilot81_actual_sdk_chat_and_responses_stream_tools_usage_and_app_iden
                     assert_eq!(body["tools"][0]["strict"], true);
                 }
                 let body = reply(style, step);
-                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                respond_sse(&mut socket, &body).await;
             }
         };
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -306,8 +288,7 @@ async fn copilot81_guard_rejects_changed_routes_before_auth_and_uses_bounded_lis
         let error = auth.prepare(&mut request).await.err().unwrap();
         assert!(!error.to_string().contains("PRIVATE_GITHUB"));
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (listener, base) = bind().await;
     let client = build_client(
         ResolvedCredential::ApiKey("OWNED_TOKEN".into()),
         Some(&base),
@@ -317,16 +298,11 @@ async fn copilot81_guard_rejects_changed_routes_before_auth_and_uses_bounded_lis
     .unwrap();
     let server = async {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        while !bytes.ends_with(b"\r\n\r\n") {
-            bytes.push(socket.read_u8().await.unwrap());
-            assert!(bytes.len() < 32768);
-        }
-        let headers = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
+        let headers = read_head(&mut socket).await.headers;
         assert!(headers.starts_with("get /models http/1.1"));
         assert!(headers.contains("authorization: bearer owned_token"));
         let body = json!({"data":[{"id":"owned-chat","object":"model"}]}).to_string();
-        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        respond_json(&mut socket, &body).await;
     };
     let task = async {
         let models = client.bounded_model_listing().await.unwrap();
@@ -342,8 +318,7 @@ async fn copilot81_guard_rejects_changed_routes_before_auth_and_uses_bounded_lis
 
 #[tokio::test]
 async fn copilot81_invalid_usage_rejects_before_a_tool_can_run_or_unsigned_totals_underflow() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (listener, base) = bind().await;
     let client = build_client(
         ResolvedCredential::ApiKey("OWNED_TOKEN".into()),
         Some(&base),
@@ -357,12 +332,11 @@ async fn copilot81_invalid_usage_rejects_before_a_tool_can_run_or_unsigned_total
     let count = Arc::new(AtomicUsize::new(0));
     let task_count = count.clone();
     let server = async {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let _ = read_request(&mut socket).await;
+        let (mut socket, _) = accept_request(&listener).await;
         let body =
             reply(ApiStyle::Completions, 0).replace("\"total_tokens\":12", "\"total_tokens\":1");
         assert!(body.contains("\"total_tokens\":1"));
-        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        respond_sse(&mut socket, &body).await;
     };
     let task = crate::startup::heap_future(|| async move {
         let agent = rig::agent::AgentBuilder::new(model)
@@ -397,8 +371,7 @@ async fn copilot81_invalid_usage_rejects_before_a_tool_can_run_or_unsigned_total
 async fn copilot81_blocking_usage_underflow_and_actual_factory_redirect_fail_closed() {
     for mode in 0..3 {
         let redirect = mode == 1;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (listener, base) = bind().await;
         let custom = serde_json::from_value::<crate::config::CustomProviderConfig>(
             json!({"provider_type":"copilot","base_url":base,"api_key_env":"OWN_TOKEN"}),
         )
@@ -422,8 +395,8 @@ async fn copilot81_blocking_usage_underflow_and_actual_factory_redirect_fail_clo
             panic!("converter")
         };
         let server = async {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let (headers, _) = read_request(&mut socket).await;
+            let (mut socket, request) = accept_request(&listener).await;
+            let headers = request.headers;
             assert!(headers.starts_with("post /chat/completions "));
             if redirect {
                 socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {base}/chat/completions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
@@ -449,7 +422,7 @@ async fn copilot81_blocking_usage_underflow_and_actual_factory_redirect_fail_clo
                 );
             } else {
                 let body = json!({"id":"owned","object":"chat.completion","created":0,"model":"owned-chat","choices":[{"index":0,"message":{"role":"assistant","content":"owned"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":1}}).to_string();
-                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                respond_json(&mut socket, &body).await;
             }
         };
         let task = crate::startup::heap_future(|| async move {
@@ -489,8 +462,7 @@ pub(crate) async fn text_fixture(
     &'static str,
     impl std::future::Future<Output = Value>,
 ) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (listener, base) = bind().await;
     let client = crate::provider::create_client_with_env(
         "copilot-cfg",
         Some("OWNED_TOKEN"),
@@ -508,8 +480,8 @@ pub(crate) async fn text_fixture(
         "owned-chat"
     };
     let server = async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let (headers, request) = read_request(&mut socket).await;
+        let (mut socket, raw) = accept_request(&listener).await;
+        let (headers, request) = (raw.headers.clone(), raw.json());
         assert!(headers.starts_with(if style == ApiStyle::Responses {
             "post /responses "
         } else {
@@ -522,7 +494,7 @@ pub(crate) async fn text_fixture(
             &serde_json::to_string("COPILOT_DONE").unwrap(),
             &serde_json::to_string(&text).unwrap(),
         );
-        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        respond_sse(&mut socket, &body).await;
         request
     };
     (client, name, server)

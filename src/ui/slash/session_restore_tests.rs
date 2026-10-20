@@ -1,12 +1,12 @@
 //! Exercise session activation through the actual frontend, builder and tool loop.
 
 use super::*;
+use crate::tests::support::loopback_http::asynchronous::{accept_request, respond_sse};
 use clap::Parser;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct FixtureRoot(PathBuf);
 
@@ -30,36 +30,8 @@ async fn run_probe(
     let server = async {
         let mut requests = Vec::new();
         for turn in 0..2 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let (header_len, body_len) = loop {
-                let mut chunk = [0; 4096];
-                let count = socket.read(&mut chunk).await.unwrap();
-                assert!(count > 0, "provider request closed before its headers");
-                bytes.extend_from_slice(&chunk[..count]);
-                assert!(bytes.len() < 1024 * 1024);
-                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
-                    let len = headers
-                        .lines()
-                        .find_map(|line| line.strip_prefix("content-length:"))
-                        .unwrap()
-                        .trim()
-                        .parse::<usize>()
-                        .unwrap();
-                    assert!(len < 1024 * 1024);
-                    break (end + 4, len);
-                }
-            };
-            while bytes.len() < header_len + body_len {
-                let mut chunk = [0; 4096];
-                let count = socket.read(&mut chunk).await.unwrap();
-                assert!(count > 0, "provider request closed before its body");
-                bytes.extend_from_slice(&chunk[..count]);
-            }
-            requests.push(
-                serde_json::from_slice::<Value>(&bytes[header_len..header_len + body_len]).unwrap(),
-            );
+            let (mut socket, request) = accept_request(listener).await;
+            requests.push(request.json());
             let mut calls = vec![
                 (
                     "read",
@@ -100,7 +72,7 @@ async fn run_probe(
                 "model":"fixture", "choices":[{"index":0,"delta":{},"finish_reason":if turn == 0 {"tool_calls"} else {"stop"}}],
                 "usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}});
             let body = format!("data: {chunk}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
-            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            respond_sse(&mut socket, &body).await;
         }
         requests
     };

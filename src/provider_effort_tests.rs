@@ -14,10 +14,11 @@ mod cache_tests;
 mod startup_tests;
 
 use super::*;
+use crate::tests::support::loopback_http::blocking;
 use futures::StreamExt;
 use rig::completion::CompletionModel;
 use serde_json::{Value, json};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -71,34 +72,19 @@ impl Wire {
                 socket
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
-                let mut headers = Vec::new();
-                while !headers.ends_with(b"\r\n\r\n") {
-                    assert!(headers.len() < 64 * 1024);
-                    let mut byte = [0];
-                    socket.read_exact(&mut byte).unwrap();
-                    headers.push(byte[0]);
-                }
-                let headers = String::from_utf8(headers).unwrap();
-                assert!(headers.starts_with(&expected_request), "{headers}");
-                let length: usize = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse().unwrap())
-                    })
-                    .unwrap();
-                assert!(length <= 512 * 1024);
-                let mut bytes = vec![0; length];
-                socket.read_exact(&mut bytes).unwrap();
-                requests.push(serde_json::from_slice(&bytes).unwrap());
+                let request = blocking::read_request(&mut socket, 512 * 1024);
+                assert!(
+                    request.head.starts_with(&expected_request),
+                    "{}",
+                    request.head
+                );
+                requests.push(request.json());
                 let content_type = if stream {
                     "text/event-stream"
                 } else {
                     "application/json"
                 };
-                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                socket.flush().unwrap();
+                blocking::respond(&mut socket, "200 OK", content_type, &body);
             }
         });
         Self {
