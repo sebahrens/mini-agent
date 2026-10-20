@@ -23,8 +23,9 @@
 //! binding (see "Workspace hook files are content-bound" in
 //! `docs/agent/CONFIG.md`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -50,6 +51,136 @@ pub(crate) struct HookContentPins {
     /// Set when the workspace files changed since a persisted approval and
     /// the change was not re-approved: every launch is denied (fail-closed).
     rejected: Option<String>,
+    /// Stat fingerprints recorded right after a successful hash, used to skip
+    /// re-hashing an unchanged file on later launches. Never part of the
+    /// pinned content, equality or any digest; see [`FileStamp`].
+    stamps: StampCache,
+}
+
+/// Identity and change times of a file, taken from the same open handle that
+/// was just hashed.
+///
+/// Trust argument: a launch may skip the SHA-256 only when `dev`, `ino`,
+/// `len`, `mtime` and `ctime` (nanosecond precision) all equal the stamp
+/// taken right after a successful hash of that file, AND that stamp was
+/// recorded when the file's last change was already older than
+/// [`quiet_window`]. A content change must alter `ctime` (the kernel sets it
+/// on every write and it cannot be set from userspace, unlike `mtime`); an
+/// atomic replacement alters `ino`. The quiet window closes the one remaining
+/// gap, a write landing in the same coarse timestamp tick as the stamp (same
+/// length, same tick): a stamp is simply not recorded for a file that changed
+/// that recently, so such a file is hashed on every launch until it settles.
+/// Platforms without `dev`/`ino`/`ctime` never record a stamp. Any mismatch or
+/// missing field re-hashes, so the fingerprint can only ever skip work, never
+/// approve content the full hash would deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+/// Timestamps younger than this may still share a tick with a later write.
+const DEFAULT_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[cfg(test)]
+thread_local! {
+    static QUIET_WINDOW_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+    static DIGEST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hooks: a per-thread quiet window and a per-thread hash counter.
+#[cfg(test)]
+pub(crate) fn test_set_quiet_window(window: Option<std::time::Duration>) {
+    QUIET_WINDOW_OVERRIDE.with(|cell| cell.set(window));
+}
+
+#[cfg(test)]
+pub(crate) fn test_digest_calls() -> usize {
+    DIGEST_CALLS.with(std::cell::Cell::get)
+}
+
+fn quiet_window() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(window) = QUIET_WINDOW_OVERRIDE.with(std::cell::Cell::get) {
+        return window;
+    }
+    DEFAULT_QUIET_WINDOW
+}
+
+/// The stamp of an open file's metadata, or `None` when this platform cannot
+/// back one (no `dev`/`ino`/`ctime`).
+fn stamp_of(metadata: &std::fs::Metadata) -> Option<FileStamp> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileStamp {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+/// Whether the last change in `stamp` is older than the quiet window.
+fn stamp_is_quiet(stamp: &FileStamp) -> bool {
+    let last = stamp.mtime.max(stamp.ctime);
+    let (Ok(secs), Ok(nanos)) = (u64::try_from(last.0), u32::try_from(last.1)) else {
+        return false;
+    };
+    let changed = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+    std::time::SystemTime::now()
+        .duration_since(changed)
+        .is_ok_and(|age| age > quiet_window())
+}
+
+/// Shared, interior-mutable stamp table. Cloning shares it (a dispatcher's
+/// pins and the policy copies of them see the same fingerprints); it is
+/// ignored by equality because it is a cache, not content.
+#[derive(Debug, Clone, Default)]
+struct StampCache(Arc<Mutex<HashMap<PinnedLocation, FileStamp>>>);
+
+impl PartialEq for StampCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for StampCache {}
+
+impl StampCache {
+    fn get(&self, location: &PinnedLocation) -> Option<FileStamp> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(location)
+            .copied()
+    }
+
+    fn set(&self, location: &PinnedLocation, stamp: Option<FileStamp>) {
+        let mut stamps = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match stamp {
+            Some(stamp) => {
+                stamps.insert(location.clone(), stamp);
+            }
+            None => {
+                stamps.remove(location);
+            }
+        }
+    }
 }
 
 /// The shell used for `if` conditions, as an absolute path on Unix so a
@@ -98,6 +229,7 @@ impl HookContentPins {
         Self {
             files: BTreeMap::new(),
             rejected: Some(reason.into()),
+            stamps: StampCache::default(),
         }
     }
 
@@ -111,8 +243,9 @@ impl HookContentPins {
 
     fn insert_operand(&mut self, root: &Path, operand: &std::ffi::OsStr) {
         if let Some((location, canonical)) = workspace_file(root, Path::new(operand))
-            && let Ok(digest) = file_digest(&canonical)
+            && let Ok((digest, stamp)) = file_digest(&canonical)
         {
+            self.stamps.set(&location, stamp);
             self.files.insert(location, digest);
         }
     }
@@ -174,9 +307,22 @@ impl HookContentPins {
                     Path::new(&operand).display()
                 ));
             };
+            // A matching fingerprint proves the bytes are the ones hashed
+            // earlier (see `FileStamp`); anything else takes the full hash.
+            if let Some(stamp) = self.stamps.get(&location)
+                && std::fs::symlink_metadata(&canonical)
+                    .ok()
+                    .and_then(|metadata| stamp_of(&metadata))
+                    == Some(stamp)
+            {
+                continue;
+            }
             match file_digest(&canonical) {
-                Ok(actual) if &actual == expected => {}
+                Ok((actual, stamp)) if &actual == expected => {
+                    self.stamps.set(&location, stamp);
+                }
                 Ok(_) => {
+                    self.stamps.set(&location, None);
                     return Err(format!(
                         "workspace hook file {} changed after hooks were loaded; restart to review it",
                         Path::new(&operand).display()
@@ -319,12 +465,21 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-fn file_digest(path: &Path) -> Result<String, String> {
+/// SHA-256 of `path` plus, when it is provably stable and quiet, the stamp of
+/// the very handle that was read (taken before and after the read; a file that
+/// changed while being read yields no stamp).
+fn file_digest(path: &Path) -> Result<(String, Option<FileStamp>), String> {
     use std::io::Read;
 
+    #[cfg(test)]
+    DIGEST_CALLS.with(|calls| calls.set(calls.get() + 1));
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let before = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| stamp_of(&metadata));
     let mut hasher = Sha256::new();
-    let mut limited = file.take(MAX_PINNED_FILE_BYTES + 1);
+    let mut limited = (&file).take(MAX_PINNED_FILE_BYTES + 1);
     let mut buffer = vec![0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
@@ -340,5 +495,10 @@ fn file_digest(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(crate::hex::encode_lower(hasher.finalize()))
+    let after = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| stamp_of(&metadata));
+    let stamp = before.filter(|before| Some(*before) == after && stamp_is_quiet(before));
+    Ok((crate::hex::encode_lower(hasher.finalize()), stamp))
 }

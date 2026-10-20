@@ -416,6 +416,13 @@ pub struct LspClient {
     server_root: PathBuf,
     /// Parent-canonical uri → last synced document version.
     open: Arc<Mutex<HashMap<String, SyncedDocument>>>,
+    /// Reference point for `last_used_ms`.
+    epoch: tokio::time::Instant,
+    /// Milliseconds since `epoch` of the last spawn, request or document sync,
+    /// read by the manager's idle watcher.
+    last_used_ms: std::sync::atomic::AtomicU64,
+    /// The manager's idle watcher, aborted when the client is shut down.
+    idle_task: Mutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
     sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
     #[cfg(test)]
@@ -566,7 +573,7 @@ impl LspClient {
                             break;
                         }
                     };
-                    let Ok(msg) = serde_json::from_slice::<Value>(&frame) else {
+                    let Ok(mut msg) = serde_json::from_slice::<Value>(&frame) else {
                         tracing::debug!("lsp[{server_name}]: malformed JSON-RPC frame");
                         break;
                     };
@@ -591,75 +598,76 @@ impl LspClient {
                         // Requests were answered above.
                         (Some(_), Some(_)) => {}
                         // Server→client notification.
-                        (Some(m), None) => {
+                        (Some(m), None)
                             if m == "textDocument/publishDiagnostics"
-                                && let Some(params) = msg.get("params")
-                            {
-                                let envelope =
-                                    match validate_diagnostic_envelope(&workspace_uri, params) {
-                                        DiagnosticStoreOutcome::Ignored => {
-                                            validate_diagnostic_envelope(
-                                                &parent_workspace_uri,
-                                                params,
-                                            )
-                                        }
-                                        outcome => outcome,
-                                    };
-                                match envelope {
-                                    DiagnosticStoreOutcome::Stored => {
-                                        let Some(uri) = params
-                                            .get("uri")
-                                            .and_then(Value::as_str)
-                                            .and_then(|uri| {
-                                                parent_diagnostic_uri(&workspace, &server_root, uri)
-                                            })
-                                        else {
-                                            continue;
-                                        };
-                                        let mut params = params.clone();
-                                        params["uri"] = Value::String(uri);
-                                        let diags = diags.clone();
-                                        let open = open.clone();
-                                        let server = server_name.clone();
-                                        let work = diagnostic_work.clone().lock_owned().await;
-                                        #[cfg(test)]
-                                        let probe = {
-                                            let mut probe = diagnostic_probe.lock().unwrap();
-                                            if probe.as_ref().is_some_and(|probe| {
-                                                params.get("version").and_then(Value::as_i64)
-                                                    == Some(probe.version)
-                                            }) {
-                                                probe.take()
-                                            } else {
-                                                None
-                                            }
-                                        };
-                                        let publish = move || {
-                                            #[cfg(test)]
-                                            if let Some(probe) = probe {
-                                                let _ = probe.entered.send(());
-                                                let _ = probe.release.recv();
-                                            }
-                                            store_diagnostics(&diags, &server, &params, Some(&open))
-                                        };
-                                        if tokio::task::spawn_blocking(move || {
-                                            let _work = work;
-                                            publish()
+                                && msg.get("params").is_some() =>
+                        {
+                            let envelope = {
+                                let params = &msg["params"];
+                                match validate_diagnostic_envelope(&workspace_uri, params) {
+                                    DiagnosticStoreOutcome::Ignored => {
+                                        validate_diagnostic_envelope(&parent_workspace_uri, params)
+                                    }
+                                    outcome => outcome,
+                                }
+                            };
+                            match envelope {
+                                DiagnosticStoreOutcome::Stored => {
+                                    let Some(uri) = msg["params"]
+                                        .get("uri")
+                                        .and_then(Value::as_str)
+                                        .and_then(|uri| {
+                                            parent_diagnostic_uri(&workspace, &server_root, uri)
                                         })
-                                        .await
-                                        .unwrap_or(false)
-                                        {
-                                            diag_notify.notify_waiters();
+                                    else {
+                                        continue;
+                                    };
+                                    // The frame is owned and not read again:
+                                    // move the params out instead of cloning
+                                    // a possibly large diagnostics array.
+                                    let mut params = msg["params"].take();
+                                    params["uri"] = Value::String(uri);
+                                    let diags = diags.clone();
+                                    let open = open.clone();
+                                    let server = server_name.clone();
+                                    let work = diagnostic_work.clone().lock_owned().await;
+                                    #[cfg(test)]
+                                    let probe = {
+                                        let mut probe = diagnostic_probe.lock().unwrap();
+                                        if probe.as_ref().is_some_and(|probe| {
+                                            params.get("version").and_then(Value::as_i64)
+                                                == Some(probe.version)
+                                        }) {
+                                            probe.take()
+                                        } else {
+                                            None
                                         }
+                                    };
+                                    let publish = move || {
+                                        #[cfg(test)]
+                                        if let Some(probe) = probe {
+                                            let _ = probe.entered.send(());
+                                            let _ = probe.release.recv();
+                                        }
+                                        store_diagnostics(&diags, &server, &params, Some(&open))
+                                    };
+                                    if tokio::task::spawn_blocking(move || {
+                                        let _work = work;
+                                        publish()
+                                    })
+                                    .await
+                                    .unwrap_or(false)
+                                    {
+                                        diag_notify.notify_waiters();
                                     }
-                                    DiagnosticStoreOutcome::Ignored => {}
-                                    DiagnosticStoreOutcome::LimitExceeded => {
-                                        tracing::debug!(
-                                            "lsp[{server_name}]: diagnostic storage limit exceeded"
-                                        );
-                                        transport.close();
-                                        break;
-                                    }
+                                }
+                                DiagnosticStoreOutcome::Ignored => {}
+                                DiagnosticStoreOutcome::LimitExceeded => {
+                                    tracing::debug!(
+                                        "lsp[{server_name}]: diagnostic storage limit exceeded"
+                                    );
+                                    transport.close();
+                                    break;
                                 }
                             }
                         }
@@ -733,6 +741,9 @@ impl LspClient {
             workspace,
             server_root,
             open,
+            epoch: tokio::time::Instant::now(),
+            last_used_ms: std::sync::atomic::AtomicU64::new(0),
+            idle_task: Mutex::new(None),
             #[cfg(test)]
             sync_probes: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
@@ -781,7 +792,33 @@ impl LspClient {
         Some(client)
     }
 
+    /// Records use of the server so the idle watcher defers retirement.
+    pub(crate) fn touch(&self) {
+        let elapsed = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_used_ms
+            .fetch_max(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// When the client becomes idle for `idle`, counted from its last use.
+    pub(crate) fn idle_deadline(&self, idle: Duration) -> tokio::time::Instant {
+        self.epoch
+            + Duration::from_millis(self.last_used_ms.load(std::sync::atomic::Ordering::Relaxed))
+            + idle
+    }
+
+    /// Installs the idle watcher; it is aborted by [`Self::shutdown`].
+    pub(crate) fn set_idle_task(&self, task: JoinHandle<()>) {
+        *self.idle_task.lock().unwrap() = Some(task);
+    }
+
+    /// Releases the idle watcher without aborting it, for the watcher itself
+    /// before it shuts the client down.
+    pub(crate) fn detach_idle_task(&self) {
+        drop(self.idle_task.lock().unwrap().take());
+    }
+
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Option<Value> {
+        self.touch();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -808,7 +845,9 @@ impl LspClient {
             return None;
         }
         let remaining = timeout.saturating_sub(started.elapsed());
-        match tokio::time::timeout(remaining, rx).await {
+        let response = tokio::time::timeout(remaining, rx).await;
+        self.touch();
+        match response {
             Ok(Ok(resp)) => Some(resp),
             _ => {
                 tracing::debug!("lsp[{}]: '{}' timed out", self.name, method);
@@ -850,6 +889,9 @@ impl LspClient {
     }
 
     pub(crate) async fn shutdown(&self) {
+        if let Some(task) = self.idle_task.lock().unwrap().take() {
+            task.abort();
+        }
         self.transport.close();
         if self.is_stopped() {
             return;
@@ -920,6 +962,7 @@ impl LspClient {
     /// Return the diagnostic publish counter captured for this sync, before
     /// the server can answer it. Callers must carry it into their wait.
     pub async fn sync_document(&self, path: &Path, document: Document) -> Option<u64> {
+        self.touch();
         #[cfg(test)]
         let probe = self.sync_probes.lock().unwrap().pop_front();
         #[cfg(test)]

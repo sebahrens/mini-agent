@@ -498,3 +498,64 @@ fn global_hooks_without_workspace_files_record_nothing() {
     assert!(!dispatcher.is_empty());
     assert!(!store.exists(), "an unchanged store is not rewritten");
 }
+
+#[cfg(unix)]
+#[test]
+fn unchanged_quiet_pinned_file_is_not_rehashed_but_any_rewrite_is_caught() {
+    use crate::extras::hooks::pins::{test_digest_calls, test_set_quiet_window};
+    use std::time::Duration;
+
+    let project = Project::new("stamp");
+    project.write_script("guard.sh", "#!/bin/sh\necho aaaa\n");
+    let configured = handler("./guard.sh", &[]);
+    // Let the file settle past a zero quiet window so capture records a stamp.
+    std::thread::sleep(Duration::from_millis(30));
+    test_set_quiet_window(Some(Duration::ZERO));
+    let pins = HookContentPins::capture(&project.root, &configured);
+    let program = project.root.join("guard.sh").canonicalize().unwrap();
+    let root = project.root.canonicalize().unwrap();
+
+    let before = test_digest_calls();
+    for _ in 0..3 {
+        pins.verify_launch(&root, &program, &[]).unwrap();
+    }
+    assert_eq!(
+        test_digest_calls(),
+        before,
+        "an unchanged, quiet file must not be re-hashed"
+    );
+
+    // Same length, same inode: only the change times differ.
+    std::thread::sleep(Duration::from_millis(30));
+    std::fs::write(&program, "#!/bin/sh\necho bbbb\n").unwrap();
+    let error = pins.verify_launch(&root, &program, &[]).unwrap_err();
+    assert!(error.contains("changed after hooks were loaded"), "{error}");
+    assert!(
+        test_digest_calls() > before,
+        "a mismatch takes the hash path"
+    );
+
+    test_set_quiet_window(None);
+}
+
+#[cfg(unix)]
+#[test]
+fn recently_changed_pinned_file_is_hashed_on_every_launch() {
+    use crate::extras::hooks::pins::{test_digest_calls, test_set_quiet_window};
+
+    test_set_quiet_window(None);
+    let project = Project::new("stamp-racy");
+    project.write_script("guard.sh", "#!/bin/sh\necho aaaa\n");
+    let pins = HookContentPins::capture(&project.root, &handler("./guard.sh", &[]));
+    let program = project.root.join("guard.sh").canonicalize().unwrap();
+    let root = project.root.canonicalize().unwrap();
+
+    let before = test_digest_calls();
+    pins.verify_launch(&root, &program, &[]).unwrap();
+    pins.verify_launch(&root, &program, &[]).unwrap();
+    assert_eq!(
+        test_digest_calls() - before,
+        2,
+        "a file changed inside the quiet window is never fingerprint-trusted"
+    );
+}

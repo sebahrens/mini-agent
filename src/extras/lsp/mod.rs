@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use lsp_types::DiagnosticSeverity;
 use tokio::sync::Notify;
@@ -110,6 +111,8 @@ struct Inner {
     diag_notify: Arc<Notify>,
     /// server name → whether its last edit wait missed the publish.
     publish_waits: Mutex<HashMap<String, PublishWaitState>>,
+    /// Seconds a client may sit unused before it is retired; 0 never retires.
+    idle_timeout_secs: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     active_bindings: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -365,7 +368,25 @@ impl LspManager {
             ),
         };
         let servers = registry::resolve_servers(&cfg.servers);
-        Self::with_servers(servers, workspace)
+        let manager = Self::with_servers(servers, workspace);
+        manager.apply_idle_timeout(cfg);
+        manager
+    }
+
+    /// Applies the configured idle timeout; affects servers started afterwards.
+    fn apply_idle_timeout(&self, cfg: &LspConfig) {
+        self.inner.idle_timeout_secs.store(
+            cfg.idle_timeout().map_or(0, |idle| idle.as_secs()),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The idle timeout in force, `None` when servers are never retired.
+    fn idle_timeout(&self) -> Option<Duration> {
+        match self.inner.idle_timeout_secs.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        }
     }
 
     /// Own the filesystem metadata lookup before registering actual tool schema.
@@ -379,13 +400,17 @@ impl LspManager {
             LspActivation::Off => None,
             LspActivation::On => Some(Self::new(cfg, workspace)),
             LspActivation::Auto => {
-                Self::prepare_automatic(
+                let manager = Self::prepare_automatic(
                     cfg.servers.clone(),
                     std::env::var_os("PATH"),
                     workspace,
                     crate::agent::runner::AgentWorkScope::new(),
                 )
-                .await
+                .await;
+                if let Some(manager) = &manager {
+                    manager.apply_idle_timeout(cfg);
+                }
+                manager
             }
         }
     }
@@ -447,6 +472,9 @@ impl LspManager {
             diags: DiagStore::default(),
             diag_notify: Arc::new(Notify::new()),
             publish_waits: Mutex::new(HashMap::new()),
+            idle_timeout_secs: std::sync::atomic::AtomicU64::new(
+                LspConfig::DEFAULT_IDLE_TIMEOUT_SECS,
+            ),
             #[cfg(test)]
             active_bindings: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -502,6 +530,10 @@ impl LspManager {
         if let Some(cached) = clients.get(name)
             && cached.is_usable()
         {
+            // Touch under the clients lock: the idle watcher rechecks under
+            // the same lock, so a client handed out here is never retired
+            // out from under its caller.
+            cached.touch();
             return Some(cached.clone());
         }
         if let Some(old) = clients.remove(name) {
@@ -536,7 +568,58 @@ impl LspManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(name);
         clients.insert(name.clone(), spawned.clone());
+        self.watch_idle(name, &spawned);
         Some(spawned)
+    }
+
+    /// Retires `client` once it has been unused for the idle timeout: removes
+    /// it from the map, drops its cached diagnostics and stops the process. A
+    /// later edit respawns it through [`Self::client_for`] without touching
+    /// the failure cooldown, since retirement is not a failure. The watcher
+    /// sleeps until the deadline and re-arms only if the client was used in
+    /// the meantime; it never polls.
+    fn watch_idle(&self, name: &str, client: &Arc<LspClient>) {
+        let Some(idle) = self.idle_timeout() else {
+            return;
+        };
+        let inner = Arc::downgrade(&self.inner);
+        let weak = Arc::downgrade(client);
+        let name = name.to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let Some(deadline) = weak.upgrade().map(|client| client.idle_deadline(idle)) else {
+                    return;
+                };
+                tokio::time::sleep_until(deadline).await;
+                let (Some(inner), Some(client)) = (inner.upgrade(), weak.upgrade()) else {
+                    return;
+                };
+                if !client.is_usable() {
+                    return;
+                }
+                let mut clients = inner.clients.lock().await;
+                if !clients
+                    .get(&name)
+                    .is_some_and(|current| Arc::ptr_eq(current, &client))
+                {
+                    return;
+                }
+                if client.idle_deadline(idle) > tokio::time::Instant::now() {
+                    continue;
+                }
+                clients.remove(&name);
+                inner
+                    .diags
+                    .lock()
+                    .unwrap()
+                    .retain(|_, diagnostics| diagnostics.server != name.as_str());
+                tracing::debug!("lsp[{name}]: retiring after {idle:?} idle");
+                client.detach_idle_task();
+                client.shutdown().await;
+                return;
+            }
+        });
+        client.set_idle_task(task);
     }
 
     fn server_is_cooling_down(&self, name: &str) -> bool {

@@ -831,3 +831,33 @@ fn hook_containment_reports_unsupported_backends_as_unavailable() {
         "requested-but-unavailable; launch-denied"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn handlers_of_one_event_share_one_project_dir_canonicalization() {
+    use crate::extras::hooks::subprocess::ProjectDirMemo;
+
+    let project = unique_temp_path("dir-memo-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_text = project.to_string_lossy().into_owned();
+    let (ctx, lease) = bound_context(std::path::Path::new(&project_text));
+    let args = shell_args("exit 0".to_string());
+    let memo = std::sync::Arc::new(ProjectDirMemo::default());
+    for _ in 0..3 {
+        let policy = HookPolicy::new(HookTrust::Trusted, "unused", BTreeMap::new())
+            .with_project_dir_memo(memo.clone());
+        let output = run_hook_with_policy_at_root(
+            "sh",
+            Some(&args),
+            b"",
+            Duration::from_secs(10),
+            &ctx.cwd,
+            &policy,
+            &lease,
+        )
+        .await;
+        assert_eq!(output.exit_code, Some(0));
+    }
+    assert_eq!(memo.resolutions(), 1, "three handlers, one canonicalize");
+    let _ = std::fs::remove_dir_all(&project);
+}

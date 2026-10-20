@@ -2262,3 +2262,13 @@ async fn edit_wait_shortens_after_a_missed_publish_and_recovers_after_a_late_one
     let _ = manager.diagnostics_block_for_edit(&file, Some(1)).await;
     assert!(started.elapsed() >= Duration::from_millis(900));
 }
+
+#[test]
+fn idle_timeout_defaults_to_fifteen_minutes_and_zero_disables_retirement() {
+    let mut cfg = LspConfig::default();
+    assert_eq!(cfg.idle_timeout(), Some(Duration::from_secs(900)));
+    cfg.idle_timeout_secs = Some(0);
+    assert_eq!(cfg.idle_timeout(), None);
+    cfg.idle_timeout_secs = Some(30);
+    assert_eq!(cfg.idle_timeout(), Some(Duration::from_secs(30)));
+}

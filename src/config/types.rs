@@ -706,6 +706,26 @@ pub struct LspConfig {
     /// Per-server overrides or custom servers, keyed by name. An entry with
     /// the same name as a built-in default replaces it.
     pub servers: HashMap<String, LspServerConfig>,
+    /// Seconds a started language server may sit unused before it is stopped
+    /// to reclaim its memory; the next edit restarts it. Absent selects
+    /// [`LspConfig::DEFAULT_IDLE_TIMEOUT_SECS`]; `0` never retires servers.
+    pub idle_timeout_secs: Option<u64>,
+}
+
+#[cfg(feature = "lsp")]
+impl LspConfig {
+    pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
+
+    /// The effective idle timeout, `None` when servers are never retired.
+    pub fn idle_timeout(&self) -> Option<std::time::Duration> {
+        match self
+            .idle_timeout_secs
+            .unwrap_or(Self::DEFAULT_IDLE_TIMEOUT_SECS)
+        {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
 }
 
 #[cfg(feature = "lsp")]

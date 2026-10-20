@@ -49,6 +49,50 @@ pub(crate) struct HookPolicy {
     /// Launch inputs resolved once and shared by every launch under this
     /// policy (a handler's `if` condition and the handler itself).
     prep: Arc<Mutex<Option<Arc<HookLaunchPrep>>>>,
+    /// Canonical project directory shared by every policy of one event, so K
+    /// handlers cost one `canonicalize` instead of K. Scoped to one event by
+    /// its creator; never retained across events, so a swapped directory is
+    /// resolved afresh.
+    dir_memo: Option<Arc<ProjectDirMemo>>,
+}
+
+/// The canonicalized project directory of one hook event, resolved at most
+/// once however many handlers (and conditions) launch under it.
+#[derive(Debug, Default)]
+pub(crate) struct ProjectDirMemo {
+    slot: Mutex<Option<(String, Result<std::path::PathBuf, String>)>>,
+    #[cfg(test)]
+    resolutions: std::sync::atomic::AtomicUsize,
+}
+
+impl ProjectDirMemo {
+    fn resolve(&self, project_dir: &str) -> Result<std::path::PathBuf, String> {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((requested, resolved)) = slot.as_ref()
+            && requested == project_dir
+        {
+            return resolved.clone();
+        }
+        #[cfg(test)]
+        self.resolutions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let resolved = match std::fs::canonicalize(project_dir) {
+            Ok(path) if path.parent().is_some() => Ok(path),
+            Ok(_) => Err("hook project directory cannot be the filesystem root".to_string()),
+            Err(error) => Err(format!("failed to resolve hook project directory: {error}")),
+        };
+        *slot = Some((project_dir.to_owned(), resolved.clone()));
+        resolved
+    }
+
+    /// How many times the directory was actually canonicalized.
+    #[cfg(test)]
+    pub(crate) fn resolutions(&self) -> usize {
+        self.resolutions.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Per-handler launch inputs that do not depend on the launched program.
@@ -75,7 +119,15 @@ impl HookPolicy {
             env,
             content_pins: None,
             prep: Arc::new(Mutex::new(None)),
+            dir_memo: None,
         }
+    }
+
+    /// Shares one canonical project directory across the policies of a
+    /// single event.
+    pub(crate) fn with_project_dir_memo(mut self, memo: Arc<ProjectDirMemo>) -> Self {
+        self.dir_memo = Some(memo);
+        self
     }
 
     /// Resolve the project directory and explicit environment once for this
@@ -101,18 +153,13 @@ impl HookPolicy {
             status: HookStatus::PolicyDenied,
             diagnostics: self.launch_denied_diagnostics(),
         };
-        let canonical = match std::fs::canonicalize(project_dir) {
-            Ok(path) if path.parent().is_some() => path,
-            Ok(_) => {
-                return Err(denied(
-                    b"hook project directory cannot be the filesystem root".to_vec(),
-                ));
-            }
-            Err(error) => {
-                return Err(denied(
-                    format!("failed to resolve hook project directory: {error}").into_bytes(),
-                ));
-            }
+        let resolved = match &self.dir_memo {
+            Some(memo) => memo.resolve(project_dir),
+            None => ProjectDirMemo::default().resolve(project_dir),
+        };
+        let canonical = match resolved {
+            Ok(path) => path,
+            Err(message) => return Err(denied(message.into_bytes())),
         };
         let explicit_env = self.explicit_env(&canonical.to_string_lossy());
         let prep = Arc::new(HookLaunchPrep {

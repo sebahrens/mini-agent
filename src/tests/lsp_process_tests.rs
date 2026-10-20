@@ -658,6 +658,7 @@ async fn lsp_process_publications_reach_parent_cache_before_diagnostic_wait() {
             &LspConfig {
                 enabled: true.into(),
                 servers: HashMap::from([("fixture".into(), server)]),
+                ..Default::default()
             },
             workspace.clone(),
         );
@@ -785,6 +786,7 @@ async fn lsp_process_delayed_publication_rejects_changed_source() {
                     &LspConfig {
                         enabled: true.into(),
                         servers: HashMap::from([("fixture".into(), server)]),
+                        ..Default::default()
                     },
                     workspace.clone(),
                 );
@@ -884,6 +886,7 @@ async fn lsp_process_sync_capacity_preserves_updates_to_tracked_documents() {
         &LspConfig {
             enabled: true.into(),
             servers: HashMap::from([("fixture".into(), server)]),
+            ..Default::default()
         },
         workspace.clone(),
     );
@@ -1159,6 +1162,7 @@ async fn lsp_process_permission_wait_rejects_leaf_and_parent_symlink_retargets()
                     &LspConfig {
                         enabled: true.into(),
                         servers: HashMap::from([("fixture".into(), cfg)]),
+                        ..Default::default()
                     },
                     workspace.clone(),
                 );
@@ -1360,6 +1364,7 @@ async fn lsp_process_cancelled_document_sync_rejects_queued_calls_before_reaping
         &LspConfig {
             enabled: true.into(),
             servers: HashMap::from([("fixture".into(), cfg)]),
+            ..Default::default()
         },
         workspace.clone(),
     );
@@ -1449,6 +1454,7 @@ async fn lsp_process_shutdown_drains_publication_before_manager_replacement() {
         &LspConfig {
             enabled: true.into(),
             servers: HashMap::from([("fixture".into(), fixture.config("diagnostics", &lease))]),
+            ..Default::default()
         },
         workspace,
     );
@@ -1585,6 +1591,7 @@ async fn lsp_process_rejected_documents_do_not_poison_sync_state() {
         &LspConfig {
             enabled: true.into(),
             servers: HashMap::from([("fixture".into(), cfg)]),
+            ..Default::default()
         },
         workspace.clone(),
     );
@@ -1808,6 +1815,7 @@ async fn lsp_process_manager_restarts_stopped_server() {
         &LspConfig {
             enabled: true.into(),
             servers: HashMap::from([("fixture".to_string(), server)]),
+            ..Default::default()
         },
         workspace.clone(),
     );
@@ -1904,5 +1912,62 @@ async fn lsp_process_stalled_and_queued_writers_are_bounded_and_reaped() {
     assert!(client.is_stopped());
     assert_process_reaped(parent_pid).await;
     drop(client);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn lsp_process_idle_server_is_retired_and_respawned_without_cooldown() {
+    let fixture = FixtureBuild::compile("idle-retire");
+    let workspace = fixture.workspace("workspace");
+    let source = workspace.join("idle.probe");
+    fs::write(&source, "idle fixture").unwrap();
+    let lease = fixture.path("idle.lease");
+    let launch_log = fixture.path("idle.launches");
+    let mut server = fixture.config("diagnostics", &lease);
+    server.env.insert(
+        "LSP_FIXTURE_LAUNCH_LOG".to_string(),
+        launch_log.display().to_string(),
+    );
+    let manager = LspManager::new(
+        &LspConfig {
+            enabled: true.into(),
+            servers: HashMap::from([("fixture".to_string(), server)]),
+            idle_timeout_secs: Some(1),
+        },
+        workspace.clone(),
+    );
+
+    let _ = manager.notify_changed(&source).await;
+    assert_eq!(manager.cached_client_count().await, 1);
+    let first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let launches = fs::read_to_string(&launch_log).unwrap_or_default();
+            if let Some(pid) = launch_pids(&launches).first().copied() {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("first launch recorded");
+
+    // No further use: the watcher retires the client after the idle timeout.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while manager.cached_client_count().await != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("idle client was not retired");
+    assert_process_reaped(first).await;
+
+    // Retirement is not a failure: the next edit respawns immediately.
+    let _ = manager.notify_changed(&source).await;
+    assert_eq!(manager.cached_client_count().await, 1);
+    let launches = fs::read_to_string(&launch_log).unwrap_or_default();
+    assert_eq!(launch_pids(&launches).len(), 2, "{launches}");
+
+    manager.shutdown().await;
+    drop(manager);
     fixture.cleanup().await;
 }

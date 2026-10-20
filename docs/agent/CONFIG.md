@@ -1235,7 +1235,12 @@ through a symlink) is bound, as is the resolved executable. Before every
 launch the same operands are re-resolved against the selected workspace; a
 changed file, a file that did not exist at load time, or a symlink retargeted
 elsewhere denies the launch (which blocks a `PreToolUse` call, fail-closed)
-until the session restarts. The `write`, `edit`, and JS `write_file` tools also
+until the session restarts. To avoid re-reading every bound file on every
+launch, a file whose device, inode, size and nanosecond mtime/ctime all equal a
+stamp taken from the handle that was just hashed, and whose last change was
+more than a few seconds old when stamped, is not hashed again; any mismatch,
+missing field (non-Unix platforms) or recently changed file takes the full
+hash. The `write`, `edit`, and JS `write_file` tools also
 refuse to modify a bound file in every security mode. For project hooks the
 digests are part of the confirmation hash and are shown in the prompt, so a
 rewritten script requires fresh confirmation on the next start; bindings that
@@ -3475,6 +3480,7 @@ archive recipe.
 ```toml
 [lsp]
 enabled = "auto"          # omitted also means auto; false disables, true is explicit lazy mode
+# idle_timeout_secs = 900  # stop a server unused this long (default 900); 0 never retires
 
 [lsp.servers.rust]          # override a built-in default
 command = "rust-analyzer"
@@ -3497,6 +3503,7 @@ extensions = [".my"]
 ```yaml
 lsp:
   enabled: auto
+  idle_timeout_secs: 900
   servers:
     rust:
       command: rust-analyzer
@@ -3518,6 +3525,12 @@ Behavior notes:
   binary is skipped with a debug log.
 - Servers start lazily on the first edit touching one of their extensions
   using the canonical session cwd for both process cwd and `rootUri`.
+- A started server that sees no edit or request for `idle_timeout_secs`
+  (default 900; `0` keeps servers for the whole session) is stopped and its
+  cached diagnostics dropped, reclaiming memory (a language server can hold
+  hundreds of MB to several GB). The next edit restarts it, re-indexing the
+  project; an idle retirement is not a failure and never triggers the failure
+  cooldown. The watcher sleeps until the deadline and does not poll.
 - The child environment is cleared. `inherit_env` delegates named parent
   values and `env` supplies explicit values; explicit values win. Built-ins
   delegate only `PATH` so they can find project toolchains.
