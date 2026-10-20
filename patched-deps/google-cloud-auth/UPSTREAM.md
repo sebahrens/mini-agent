@@ -19,3 +19,8 @@ Root Cargo.lock pins the path package and its registry dependencies. The product
 includes this source tree/build script and license attribution; builds need it alongside rig-core.
 Owning local controls in src/provider_vertex_adc_tests.rs verify held-fetch last-client drop, controlled
 30-second timeout, ADC refresh and wire behavior. See docs/agent/PROVIDERS.md for product scope.
+
+TLS amendment (mini-agent-vb5vw.56): the reqwest dependency drops the `rustls-no-provider` feature.
+With native-tls enabled in the root crate, reqwest always selects native-tls for default clients and
+this crate never calls `use_rustls_tls()`, so the rustls client layer (hyper-rustls, tokio-rustls,
+rustls-platform-verifier) was linked unused. The `rustls` crate dependency stays for RSA JWT signing.

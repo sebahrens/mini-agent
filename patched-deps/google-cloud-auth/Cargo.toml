@@ -131,7 +131,6 @@ features = [
     "form",
     "json",
     "query",
-    "rustls-no-provider",
 ]
 default-features = false
 
