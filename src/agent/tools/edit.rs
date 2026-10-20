@@ -1369,11 +1369,16 @@ impl EditTool {
         reject_overlapping_ranges(&ranges, &content, edit_label)?;
 
         let resulting_spans = final_edit_spans(&ranges);
-        let preview_before = (self.diff_options.max_lines > 0
+        let preview_wanted = self.diff_options.max_lines > 0
             && ranges.len() <= super::mutation_diff::MAX_RANGES
             && content.len() <= super::mutation_diff::MAX_INPUT_BYTES
-            && disclose_source)
-            .then(|| content.clone());
+            && disclose_source;
+        // One shared copy of the preimage serves both the diff preview and the
+        // checkpoint; `content` itself becomes the buffer that is edited.
+        let shared_preimage: Option<std::sync::Arc<str>> = (preview_wanted
+            || bound_workspace.is_some())
+        .then(|| std::sync::Arc::from(content.as_str()));
+        let preview_before = shared_preimage.clone().filter(|_| preview_wanted);
         let applied_ranges = if preview_before.is_some() {
             let mut ordered_ranges: Vec<_> = ranges.iter().collect();
             ordered_ranges.sort_by_key(|(start, _, _)| *start);
@@ -1399,10 +1404,12 @@ impl EditTool {
                 crate::session::file_checkpoints::prepare(
                     workspace,
                     relative,
-                    Some(crate::session::file_checkpoints::Preimage::new(
-                        content.clone().into_bytes(),
-                        &base,
-                    )),
+                    shared_preimage.map(|preimage| {
+                        crate::session::file_checkpoints::Preimage::new(
+                            std::sync::Arc::<[u8]>::from(preimage),
+                            &base,
+                        )
+                    }),
                     disclose_source,
                 )
                 .await
@@ -1439,38 +1446,44 @@ impl EditTool {
             replacement_excerpts(&ranges)
         };
 
-        if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
-            let workspace = std::sync::Arc::clone(workspace);
-            let owned_relative = relative.to_path_buf();
-            let owned_output = output.clone().into_bytes();
-            let expected = expected.clone();
-            crate::agent::runner::spawn_blocking_scoped(move || {
-                workspace.replace_relative_atomic_expecting(
-                    &owned_relative,
-                    &owned_output,
-                    &expected,
-                    &base,
+        let output =
+            if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
+                let workspace = std::sync::Arc::clone(workspace);
+                let owned_relative = relative.to_path_buf();
+                let expected = expected.clone();
+                // Move the output through the blocking publication and take it
+                // back instead of copying the whole file.
+                let (published, output) = crate::agent::runner::spawn_blocking_scoped(move || {
+                    let published = workspace.replace_relative_atomic_expecting(
+                        &owned_relative,
+                        output.as_bytes(),
+                        &expected,
+                        &base,
+                    );
+                    (published, output)
+                })
+                .await
+                .map_err(|_| ToolError::Msg("Edit publication job failed".to_string()))?;
+                published?;
+                output
+            } else {
+                let resolved = resolved.expect("external edit must resolve an ambient path");
+                let current = tokio::fs::canonicalize(&requested).await?;
+                if current != resolved {
+                    return Err(ToolError::Msg(format!(
+                        "Path changed after permission check: {}",
+                        expanded
+                    )));
+                }
+                crate::fs::atomic_write_resolved_expecting(
+                    &resolved,
+                    &output,
+                    approved_parent.expect("external edit must capture its parent"),
+                    base,
                 )
-            })
-            .await
-            .map_err(|_| ToolError::Msg("Edit publication job failed".to_string()))??;
-        } else {
-            let resolved = resolved.expect("external edit must resolve an ambient path");
-            let current = tokio::fs::canonicalize(&requested).await?;
-            if current != resolved {
-                return Err(ToolError::Msg(format!(
-                    "Path changed after permission check: {}",
-                    expanded
-                )));
-            }
-            crate::fs::atomic_write_resolved_expecting(
-                &resolved,
-                &output,
-                approved_parent.expect("external edit must capture its parent"),
-                base,
-            )
-            .await?;
-        }
+                .await?;
+                output
+            };
         crate::session::file_checkpoints::published();
         let after_digest = crate::fs::ContentDigest::of(output.as_bytes());
         if let Some(checkpoint) = &mut checkpoint {

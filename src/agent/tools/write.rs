@@ -218,7 +218,7 @@ impl Tool for WriteTool {
 impl WriteTool {
     async fn apply(
         &self,
-        args: WriteArgs,
+        mut args: WriteArgs,
         extensions: &ToolCallExtensions,
     ) -> Result<MutationOutcome, ToolError> {
         crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
@@ -311,21 +311,24 @@ impl WriteTool {
                         return Err(overwrite_not_authorized(&expanded));
                     }
                     let base = crate::fs::ContentDigest::of(&current);
+                    // One shared copy of the preimage serves both the checkpoint
+                    // and the diff preview; `current` is dropped after the copy.
+                    let shared: std::sync::Arc<str> = std::sync::Arc::from(
+                        std::str::from_utf8(&current)
+                            .expect("full text fingerprint validates UTF-8"),
+                    );
+                    drop(current);
                     if self.diff_options.max_lines > 0
-                        && current.len() <= super::mutation_diff::MAX_INPUT_BYTES
+                        && shared.len() <= super::mutation_diff::MAX_INPUT_BYTES
                         && super::mutation_diff::preimage_allowed(&self.permission, &expanded, true)
                     {
-                        preview_before = Some(
-                            std::str::from_utf8(&current)
-                                .expect("full text fingerprint validates UTF-8")
-                                .to_owned(),
-                        );
+                        preview_before = Some(std::sync::Arc::clone(&shared));
                     }
                     checkpoint = crate::session::file_checkpoints::prepare(
                         workspace,
                         relative,
                         Some(crate::session::file_checkpoints::Preimage::new(
-                            current.clone(),
+                            std::sync::Arc::<[u8]>::from(shared),
                             &base,
                         )),
                         super::mutation_diff::preimage_allowed(&self.permission, &expanded, true),
@@ -334,17 +337,23 @@ impl WriteTool {
                     digests = Some(base);
                     let workspace = std::sync::Arc::clone(workspace);
                     let owned_relative = relative.to_path_buf();
-                    let content = args.content.clone().into_bytes();
-                    crate::agent::runner::spawn_blocking_scoped(move || {
-                        workspace.replace_relative_atomic_expecting(
-                            &owned_relative,
-                            &content,
-                            &expected,
-                            &base,
-                        )
-                    })
-                    .await
-                    .map_err(|_| ToolError::Msg("Write publication job failed".to_string()))??;
+                    // Move the content through the blocking publication and take
+                    // it back instead of copying it.
+                    let content = std::mem::take(&mut args.content);
+                    let (published, content) =
+                        crate::agent::runner::spawn_blocking_scoped(move || {
+                            let published = workspace.replace_relative_atomic_expecting(
+                                &owned_relative,
+                                content.as_bytes(),
+                                &expected,
+                                &base,
+                            );
+                            (published, content)
+                        })
+                        .await
+                        .map_err(|_| ToolError::Msg("Write publication job failed".to_string()))?;
+                    args.content = content;
+                    published?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     checkpoint =
@@ -352,13 +361,17 @@ impl WriteTool {
                             .await;
                     let owned = std::sync::Arc::clone(workspace);
                     let owned_relative = relative.to_path_buf();
-                    let content = args.content.clone().into_bytes();
-                    crate::agent::runner::spawn_blocking_scoped(move || {
-                        owned.create_relative_atomic(&owned_relative, &content)
-                    })
-                    .await
-                    .map_err(|_| ToolError::Msg("Write creation job failed".to_string()))?
-                    .map_err(|error| match error.kind() {
+                    let content = std::mem::take(&mut args.content);
+                    let (created_file, content) =
+                        crate::agent::runner::spawn_blocking_scoped(move || {
+                            let created =
+                                owned.create_relative_atomic(&owned_relative, content.as_bytes());
+                            (created, content)
+                        })
+                        .await
+                        .map_err(|_| ToolError::Msg("Write creation job failed".to_string()))?;
+                    args.content = content;
+                    created_file.map_err(|error| match error.kind() {
                         std::io::ErrorKind::AlreadyExists => create_error(&expanded, error),
                         _ => crate::agent::tools::bound_open_error(workspace, relative, error),
                     })?;

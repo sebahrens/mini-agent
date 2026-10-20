@@ -666,13 +666,15 @@ pub(crate) struct Pending {
 }
 /// Preimage bytes with their precomputed lowercase SHA-256 hex.
 pub(crate) struct Preimage {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     hash: String,
 }
 impl Preimage {
-    pub(crate) fn new(bytes: Vec<u8>, digest: &crate::fs::ContentDigest) -> Self {
+    /// Takes shared bytes so a caller that also keeps the preimage for a diff
+    /// preview does not hold a second copy.
+    pub(crate) fn new(bytes: impl Into<Arc<[u8]>>, digest: &crate::fs::ContentDigest) -> Self {
         Self {
-            bytes,
+            bytes: bytes.into(),
             hash: digest.hex(),
         }
     }
@@ -695,9 +697,7 @@ pub(crate) async fn prepare(
                 recorder,
                 &workspace,
                 &path,
-                before
-                    .as_ref()
-                    .map(|p| (p.bytes.as_slice(), p.hash.as_str())),
+                before.as_ref().map(|p| (&*p.bytes, p.hash.as_str())),
                 read_allowed,
             )
         }
