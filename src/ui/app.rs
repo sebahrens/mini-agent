@@ -744,6 +744,9 @@ struct EventLoopState {
     /// The model last handed to the model picker, so unchanged frames do not
     /// allocate it again.
     synced_model: Option<compact_str::CompactString>,
+    /// The listing route (custom flag and key) whose ids the model picker
+    /// holds, so a slash command that changed neither re-clones no ids.
+    synced_route: Option<(bool, Option<crate::provider_listing::ListingKey>)>,
     /// Last MCP prompt-source revalidation; the expensive check runs at most
     /// once per second while the cheap reply/owner checks run every pass.
     last_source_revalidation: Option<std::time::Instant>,
@@ -1748,14 +1751,11 @@ impl<'a> App<'a> {
         // persona source as the task tool's enum.
         #[cfg(feature = "subagents")]
         {
-            let entries = crate::context::agents::available_described_names_for_workspace(Some(
-                &ui.workspace,
-            ));
+            let (entries, write_names) =
+                crate::context::agents::persona_picker_lists(Some(&ui.workspace));
             input.set_agent_names(entries.iter().map(|(name, _)| name.clone()).collect());
             input.set_agent_mentions(entries);
-            input.set_agent_write_names(crate::context::agents::write_persona_names_for_workspace(
-                Some(&ui.workspace),
-            ));
+            input.set_agent_write_names(write_names);
         }
         #[cfg(not(feature = "subagents"))]
         input.set_agent_names(ui.context.agent_definitions.keys().cloned().collect());
@@ -6455,7 +6455,14 @@ impl<'a> App<'a> {
             let provider = self.ui.session.provider.to_string();
             let is_custom = self.ui.cfg.custom_providers_map().contains_key(&provider);
             crate::ui::slash::warm_model_cache(&provider, is_custom, &self.ui.client);
-            self.sync_live_model_names(true);
+            // Re-clone the picker's ids only when the listing route changed;
+            // a finished background listing bumps the generation instead.
+            let route = (is_custom, self.ui.client.listing_key(&provider).ok());
+            let route_changed = self.loop_state.synced_route.as_ref() != Some(&route);
+            if route_changed {
+                self.loop_state.synced_route = Some(route);
+            }
+            self.sync_live_model_names(route_changed);
         }
 
         // Keep the measured settlement future out of the command poll frame,
@@ -6635,15 +6642,12 @@ impl<'a> App<'a> {
         };
         #[cfg(feature = "subagents")]
         {
-            let entries = crate::context::agents::available_described_names_for_workspace(Some(
-                &self.ui.workspace,
-            ));
+            let (entries, write_names) =
+                crate::context::agents::persona_picker_lists(Some(&self.ui.workspace));
             self.input
                 .set_agent_names(entries.iter().map(|(name, _)| name.clone()).collect());
             self.input.set_agent_mentions(entries);
-            self.input.set_agent_write_names(
-                crate::context::agents::write_persona_names_for_workspace(Some(&self.ui.workspace)),
-            );
+            self.input.set_agent_write_names(write_names);
         }
         self.input.set_custom_commands(commands);
     }
