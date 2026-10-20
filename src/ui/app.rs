@@ -8434,12 +8434,15 @@ fn pause_input_reader(
     };
     // The wait (at most one reader poll) must not stall other tasks queued
     // on this worker of a multi-threaded runtime.
-    match tokio::runtime::Handle::try_current() {
-        Ok(runtime) if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(wait)
-        }
-        _ => wait(),
+    #[cfg(feature = "multithread")]
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|runtime| runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(wait);
+        reader.join();
+        return;
     }
+    wait();
     reader.join();
 }
 
