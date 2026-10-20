@@ -372,8 +372,8 @@ pub struct InputEditor {
 /// fooled the way a hash could.
 struct WrapMemo {
     width: usize,
-    text: CompactString,
-    rows: Vec<wrap::VisualRow>,
+    text: std::sync::Arc<str>,
+    rows: std::sync::Arc<Vec<wrap::VisualRow>>,
 }
 
 impl InputEditor {
@@ -426,33 +426,44 @@ impl InputEditor {
         self.wrap_layouts
     }
 
+    /// Adopt the renderer's wrap layout of the current frame as the Up/Down
+    /// memo, so row movement after a frame wraps and copies nothing. Ignored
+    /// unless it describes exactly the current buffer.
+    pub(crate) fn adopt_wrap_rows(
+        &mut self,
+        width: usize,
+        text: std::sync::Arc<str>,
+        rows: std::sync::Arc<Vec<wrap::VisualRow>>,
+    ) {
+        if self
+            .wrap_memo
+            .as_ref()
+            .is_some_and(|memo| memo.width == width && std::sync::Arc::ptr_eq(&memo.text, &text))
+        {
+            return;
+        }
+        if *text == *self.buffer {
+            self.wrap_memo = Some(WrapMemo { width, text, rows });
+        }
+    }
+
     /// Make `wrap_memo` hold the buffer's soft-wrap rows at `width`,
     /// wrapping once per distinct (buffer, width).
     fn ensure_wrap_memo(&mut self, width: usize) {
         let fresh = self
             .wrap_memo
             .as_ref()
-            .is_some_and(|memo| memo.width == width && memo.text == self.buffer);
+            .is_some_and(|memo| memo.width == width && *memo.text == *self.buffer);
         if !fresh {
             #[cfg(test)]
             {
                 self.wrap_layouts += 1;
             }
-            let rows = wrap::wrap_rows(&self.buffer, width);
-            match self.wrap_memo.as_mut() {
-                Some(memo) => {
-                    memo.width = width;
-                    memo.text.clone_from(&self.buffer);
-                    memo.rows = rows;
-                }
-                None => {
-                    self.wrap_memo = Some(WrapMemo {
-                        width,
-                        text: self.buffer.clone(),
-                        rows,
-                    });
-                }
-            }
+            self.wrap_memo = Some(WrapMemo {
+                width,
+                text: std::sync::Arc::from(self.buffer.as_str()),
+                rows: std::sync::Arc::new(wrap::wrap_rows(&self.buffer, width)),
+            });
         }
     }
 
@@ -1636,7 +1647,8 @@ impl InputEditor {
         let width = self.wrap_width?;
         let cursor = self.cursor;
         self.ensure_wrap_memo(width);
-        let rows = &self.wrap_memo.as_ref().expect("wrapped above").rows;
+        let rows = std::sync::Arc::clone(&self.wrap_memo.as_ref().expect("wrapped above").rows);
+        let rows = &*rows;
         let (row, column) = wrap::cursor_position(&self.buffer, rows, cursor);
         let target = if down {
             row + 1

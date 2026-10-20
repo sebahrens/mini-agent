@@ -797,7 +797,7 @@ mod dirty {
         let prev = bottom_snapshot();
         let mut next = bottom_snapshot();
         next.prompt = PromptSnapshot::Chain {
-            question: "continue?".into(),
+            generation: 1,
             but_mode: false,
         };
         assert_eq!(

@@ -2441,12 +2441,14 @@ impl<'a> App<'a> {
             #[cfg(feature = "mcp")]
             if let Some(manager) = self.ui.mcp_manager.as_mut() {
                 let notices = manager.take_notices();
-                self.renderer.frame(|renderer| {
-                    for notice in &notices {
-                        renderer.write_line(&sanitize_output(notice), C_ERROR)?;
-                    }
-                    Ok(())
-                })?;
+                if !notices.is_empty() {
+                    self.renderer.frame(|renderer| {
+                        for notice in &notices {
+                            renderer.write_line(&sanitize_output(notice), C_ERROR)?;
+                        }
+                        Ok(())
+                    })?;
+                }
             }
             if (self.permission_prompt.is_none() && self.question_prompt.is_none())
                 && let Some(event) = self.deferred_user_events.pop_front()
@@ -2555,13 +2557,17 @@ impl<'a> App<'a> {
                     self.refresh()?;
                 }
                 Some(event) = async { self.run.agent_rx.as_mut()?.recv().await } => {
-                    if matches!(
-                        event,
-                        AgentEvent::ToolResult { .. }
-                            | AgentEvent::FileMutation { .. }
-                            | AgentEvent::Done { .. }
-                            | AgentEvent::Error { .. }
-                    ) {
+                    // Only results of tools that may change the workspace
+                    // force a refresh; unknown names (MCP, js) count as mutating.
+                    if match &event {
+                        AgentEvent::ToolResult { name, .. } => {
+                            crate::agent::runner::tool_may_mutate_workspace(name)
+                        }
+                        AgentEvent::FileMutation { .. }
+                        | AgentEvent::Done { .. }
+                        | AgentEvent::Error { .. } => true,
+                        _ => false,
+                    } {
                         self.loop_state.git_poll.mark_changed(std::time::Instant::now());
                     }
                     // This measured large child is unrelated to input, but
@@ -2682,6 +2688,12 @@ impl<'a> App<'a> {
     }
 
     fn drain_tui_diagnostics(&mut self) -> io::Result<()> {
+        // The common idle case opens no frame at all.
+        if self.tui_log_rx.as_ref().is_none_or(|rx| rx.is_empty())
+            && !crate::logging::has_dropped_tui_diagnostics()
+        {
+            return Ok(());
+        }
         let receiver = self.tui_log_rx.as_mut();
         // Every drained line is painted in one frame.
         self.renderer.frame(|renderer| {
@@ -3411,7 +3423,11 @@ impl<'a> App<'a> {
         {
             return Ok(ControlFlow::Continue(()));
         }
-        if crate::startup::heap_future(|| self.handle_plan_event(&ev)).await? {
+        // handle_plan_event returns false at once unless a plan is pending
+        // (its Quit reset also needs one); skip boxing it per keystroke.
+        if self.chain.plan.pending.is_some()
+            && crate::startup::heap_future(|| self.handle_plan_event(&ev)).await?
+        {
             return Ok(ControlFlow::Continue(()));
         }
         #[cfg(feature = "git-worktree")]
@@ -5100,23 +5116,26 @@ impl<'a> App<'a> {
             placed = true;
             let limit = self.ui.cfg.mutation_diff_options().max_lines;
             let mut count = 0usize;
-            for line in observation.text.lines().take(limit) {
-                let style = if line.starts_with("@@") {
-                    crate::ui::feed::BlockStyle::DiffHunk
-                } else if line.starts_with('+') && !line.starts_with("+++") {
-                    crate::ui::feed::BlockStyle::DiffAdd
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    crate::ui::feed::BlockStyle::DiffDel
-                } else {
-                    crate::ui::feed::BlockStyle::ToolResult
-                };
-                self.renderer.feed_mut().place_after_anchor(
-                    &observation.id,
-                    style,
-                    sanitize_output(line),
-                );
-                count += 1;
-            }
+            let rows = observation
+                .text
+                .lines()
+                .take(limit)
+                .inspect(|_| count += 1)
+                .map(|line| {
+                    let style = if line.starts_with("@@") {
+                        crate::ui::feed::BlockStyle::DiffHunk
+                    } else if line.starts_with('+') && !line.starts_with("+++") {
+                        crate::ui::feed::BlockStyle::DiffAdd
+                    } else if line.starts_with('-') && !line.starts_with("---") {
+                        crate::ui::feed::BlockStyle::DiffDel
+                    } else {
+                        crate::ui::feed::BlockStyle::ToolResult
+                    };
+                    (style, sanitize_output(line))
+                });
+            self.renderer
+                .feed_mut()
+                .place_rows_after_anchor(&observation.id, rows);
             if observation.truncated || observation.text.lines().count() > count {
                 self.renderer.feed_mut().place_after_anchor(
                     &observation.id,
@@ -11508,6 +11527,22 @@ mod permission_loop_tests {
         sent(
             &agent_events,
             AgentEvent::ToolResult {
+                id: "call-0".into(),
+                name: "read".into(),
+                output: "ok".into(),
+                images: Vec::new(),
+                is_error: false,
+            },
+        )
+        .await;
+        drain(&mut app).await;
+        assert_eq!(
+            app.loop_state.git_poll.dispatches, 1,
+            "a read-only tool result cannot change the worktree"
+        );
+        sent(
+            &agent_events,
+            AgentEvent::ToolResult {
                 id: "call-1".into(),
                 name: "bash".into(),
                 output: "ok".into(),
@@ -11522,6 +11557,49 @@ mod permission_loop_tests {
         if let Some(abort) = app.run.main_abort.take() {
             abort.abort();
         }
+    }
+
+    /// Prints the budget of the per-keystroke boxed futures (run with
+    /// `--nocapture`); the boxes are required by the 1 MiB-stack tests.
+    #[tokio::test]
+    async fn per_event_future_sizes_are_visible() {
+        let root = crate::tests::OwnedTestDirectory::new("future-sizes");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = fixture_config();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let event = UserEvent::Key(key);
+        let batch = app.handle_user_event_batch(UserEvent::Resize);
+        let batch_size = std::mem::size_of_val(&batch);
+        drop(batch);
+        let plan = app.handle_plan_event(&event);
+        let plan_size = std::mem::size_of_val(&plan);
+        drop(plan);
+        let standard = app.handle_standard_user_event(UserEvent::Resize);
+        let standard_size = std::mem::size_of_val(&standard);
+        drop(standard);
+        let key_future = app.handle_key_event_with(key, None);
+        let key_size = std::mem::size_of_val(&key_future);
+        drop(key_future);
+        eprintln!(
+            "future sizes: batch={batch_size} plan={plan_size} standard={standard_size} key={key_size}"
+        );
+        assert!(batch_size > 0 && plan_size > 0 && standard_size > 0 && key_size > 0);
     }
 }
 
