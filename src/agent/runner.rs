@@ -2289,6 +2289,128 @@ fn observed_tokens(usage: Usage) -> u64 {
         .max(usage.total_tokens)
 }
 
+/// Consecutive empty terminal responses tolerated before a turn aborts.
+const MAX_EMPTY_RESPONSES: u32 = 3;
+/// Consecutive `Stop`-hook continuations honored before a forced release.
+#[cfg(feature = "hooks")]
+const MAX_STOP_BLOCKS: u32 = 8;
+
+// Per-item state transitions shared by the interactive (`spawn_agent_*`) and
+// headless (`run_print_*`) turn loops. The loops keep their own I/O and
+// ordering; only logic that was identical in both lives here, so a fix lands
+// in one place.
+
+/// Bookkeeping for one observed `CompletionCall`: resets the mid-stream retry
+/// budget, charges the turn and folds the usage into the ledger and the spend
+/// run. Returns the usage delta.
+fn record_completion_call(
+    retry_state: &mut CompletionRetryState,
+    retry_config: &RetryConfig,
+    turns_used: &mut usize,
+    usage_ledger: &mut UsageLedger,
+    usage: Usage,
+) -> UsageDelta {
+    retry_state.reset(retry_config);
+    *turns_used = turns_used.saturating_add(1);
+    let delta = usage_ledger.record(usage);
+    crate::spend::run::observe_current(delta);
+    delta
+}
+
+/// Applies the cumulative token budget after a completion. `Err` carries
+/// `(used, budget)` when tool calls were issued and the turn must fail now;
+/// otherwise an exhausted budget is remembered so a later tool item fails.
+fn note_budget_after_completion(
+    total: Usage,
+    turn_token_budget: Option<u64>,
+    completion_had_tool_call: &mut bool,
+    exhausted_after_completion: &mut Option<(u64, u64)>,
+) -> Result<(), (u64, u64)> {
+    if let Some(exhausted) = exhausted_token_budget(total, turn_token_budget) {
+        if *completion_had_tool_call {
+            return Err(exhausted);
+        }
+        *exhausted_after_completion = Some(exhausted);
+    }
+    *completion_had_tool_call = false;
+    Ok(())
+}
+
+/// Folds the terminal response's aggregate usage into the ledger and the spend
+/// run, returning the correction delta.
+fn reconcile_terminal_usage(usage_ledger: &mut UsageLedger, usage: Usage) -> UsageDelta {
+    let delta = usage_ledger.reconcile_terminal(usage);
+    if delta.has_values() {
+        crate::spend::run::observe_current(delta);
+    }
+    delta
+}
+
+/// Reconciles the terminal response text with what was streamed and records an
+/// unstreamed terminal answer in the transcript. Returns whether the terminal
+/// text had already been streamed.
+fn reconcile_final_output(
+    response: &mut String,
+    response_len_at_stream_start: usize,
+    terminal: &str,
+    interactions: &mut Vec<Message>,
+) -> bool {
+    let terminal_was_streamed = response.len() > response_len_at_stream_start;
+    reconcile_terminal_response(response, response_len_at_stream_start, terminal);
+    if !terminal_was_streamed && !terminal.is_empty() {
+        append_streamed_text(interactions, terminal);
+    }
+    terminal_was_streamed
+}
+
+/// Counts one empty terminal response; `true` once the abort limit is reached.
+fn empty_response_limit_reached(empty_response_count: &mut u32) -> bool {
+    *empty_response_count += 1;
+    *empty_response_count >= MAX_EMPTY_RESPONSES
+}
+
+fn verification_retry_instruction(diagnostic: &str) -> String {
+    format!(
+        "The configured verification command failed. Fix the cause and rerun verification before finishing.\n\n{diagnostic}"
+    )
+}
+
+/// Decides whether a mid-stream provider error is retried; logs the retry.
+fn midstream_retry(
+    completion_retry: &mut CompletionRetryState,
+    retry_config: &RetryConfig,
+    error: &rig::agent::StreamingError,
+) -> Option<(usize, std::time::Duration)> {
+    let (attempt, delay) = completion_retry.retry_delay(retry_config, error)?;
+    tracing::warn!(
+        "agent retry {attempt}/{max} after mid-stream error: {error}",
+        max = retry_config.max_attempts,
+    );
+    Some((attempt, delay))
+}
+
+/// Registers a `Stop`-hook continuation. Returns the instruction to inject, or
+/// `None` once the consecutive-block cap forces a release.
+#[cfg(feature = "hooks")]
+fn stop_block_continuation(
+    consecutive_stop_blocks: &mut u32,
+    stop_hook_active: &mut bool,
+    reason: String,
+) -> Option<String> {
+    *consecutive_stop_blocks += 1;
+    if *consecutive_stop_blocks <= MAX_STOP_BLOCKS {
+        *stop_hook_active = true;
+        tracing::info!(
+            "hooks: Stop hook forced continuation ({consecutive_stop_blocks}/{MAX_STOP_BLOCKS}): {reason}"
+        );
+        return Some(reason);
+    }
+    tracing::warn!(
+        "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
+    );
+    None
+}
+
 fn exhausted_token_budget(usage: Usage, budget: Option<u64>) -> Option<(u64, u64)> {
     let budget = budget?;
     let used = observed_tokens(usage);
@@ -3713,7 +3835,6 @@ where
         // small replacement instruction instead of cloning the initial prompt.
         let mut stream_prompt: Option<String> = None;
         let mut empty_response_count: u32 = 0;
-        const MAX_EMPTY_RESPONSES: u32 = 3;
         let mut goal_report_accepted = false;
         let mut workspace_may_have_changed = false;
         let mut verification_attempt = 0u32;
@@ -3753,8 +3874,6 @@ where
         let mut stop_hook_active = false;
         #[cfg(feature = "hooks")]
         let mut consecutive_stop_blocks: u32 = 0;
-        #[cfg(feature = "hooks")]
-        const MAX_STOP_BLOCKS: u32 = 8;
 
         if max_turns == 0 {
             let _ = event_tx
@@ -4101,10 +4220,7 @@ where
                         completed_interactions.extend(completed_delta);
                         let usage = res.usage();
                         let context_complete = !usage_ledger.stream_has_observed_usage();
-                        let terminal_delta = usage_ledger.reconcile_terminal(usage);
-                        if terminal_delta.has_values() {
-                            crate::spend::run::observe_current(terminal_delta);
-                        }
+                        let terminal_delta = reconcile_terminal_usage(&mut usage_ledger, usage);
                         if terminal_delta.has_values() {
                             let _ = event_tx
                                 .send(AgentEvent::UsageDelta {
@@ -4115,15 +4231,12 @@ where
                                 .await;
                         }
                         let response_text = res.output;
-                        let terminal_was_streamed = response.len() > response_len_at_stream_start;
-                        reconcile_terminal_response(
+                        let terminal_was_streamed = reconcile_final_output(
                             &mut response,
                             response_len_at_stream_start,
                             &response_text,
+                            &mut interactions,
                         );
-                        if !terminal_was_streamed && !response_text.is_empty() {
-                            append_streamed_text(&mut interactions, &response_text);
-                        }
                         tracing::info!(
                             "agent done: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}",
                             usage.input_tokens,
@@ -4191,9 +4304,8 @@ where
                                     .await;
                                 if !passed {
                                     if verification_attempt < verification.max_attempts {
-                                        next_instruction = Some(format!(
-                                            "The configured verification command failed. Fix the cause and rerun verification before finishing.\n\n{diagnostic}"
-                                        ));
+                                        next_instruction =
+                                            Some(verification_retry_instruction(&diagnostic));
                                         break;
                                     }
                                     let _ = event_tx
@@ -4216,19 +4328,14 @@ where
                                     goal_hook_info(),
                                 )
                                 .await
+                                && let Some(instruction) = stop_block_continuation(
+                                    &mut consecutive_stop_blocks,
+                                    &mut stop_hook_active,
+                                    reason,
+                                )
                             {
-                                consecutive_stop_blocks += 1;
-                                if consecutive_stop_blocks <= MAX_STOP_BLOCKS {
-                                    stop_hook_active = true;
-                                    tracing::info!(
-                                        "hooks: Stop hook forced continuation ({consecutive_stop_blocks}/{MAX_STOP_BLOCKS}): {reason}"
-                                    );
-                                    next_instruction = Some(reason);
-                                    break;
-                                }
-                                tracing::warn!(
-                                    "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
-                                );
+                                next_instruction = Some(instruction);
+                                break;
                             }
                             #[cfg(feature = "skills")]
                             if !verification_ran
@@ -4245,8 +4352,7 @@ where
                                 .await;
                             return;
                         }
-                        empty_response_count += 1;
-                        if empty_response_count >= MAX_EMPTY_RESPONSES {
+                        if empty_response_limit_reached(&mut empty_response_count) {
                             tracing::warn!(
                                 "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
                             );
@@ -4263,11 +4369,14 @@ where
                         break;
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                        completion_retry.reset(&retry_config);
-                        turns_used = turns_used.saturating_add(1);
                         let usage = call.usage;
-                        let delta = usage_ledger.record(usage);
-                        crate::spend::run::observe_current(delta);
+                        let delta = record_completion_call(
+                            &mut completion_retry,
+                            &retry_config,
+                            &mut turns_used,
+                            &mut usage_ledger,
+                            usage,
+                        );
                         tracing::debug!(
                             "agent completion: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}, cumulative_tokens={}",
                             usage.input_tokens,
@@ -4339,34 +4448,33 @@ where
                             // tool batch. The UI is aborting this run.
                             return;
                         }
-                        if let Some((used, budget)) =
-                            exhausted_token_budget(usage_ledger.total, turn_token_budget)
-                        {
-                            if completion_had_tool_call {
-                                tracing::warn!(
-                                    used,
-                                    budget,
-                                    "agent cumulative token budget exhausted before the next provider call"
-                                );
-                                finalize_interactive_tool_calls(
-                                    &mut tool_calls,
-                                    &mut interactions,
-                                    &event_tx,
-                                )
+                        if let Err((used, budget)) = note_budget_after_completion(
+                            usage_ledger.total,
+                            turn_token_budget,
+                            &mut completion_had_tool_call,
+                            &mut exhausted_budget_after_completion,
+                        ) {
+                            tracing::warn!(
+                                used,
+                                budget,
+                                "agent cumulative token budget exhausted before the next provider call"
+                            );
+                            finalize_interactive_tool_calls(
+                                &mut tool_calls,
+                                &mut interactions,
+                                &event_tx,
+                            )
+                            .await;
+                            let _ = event_tx
+                                .send(AgentEvent::error_with(
+                                    CompactString::from(token_budget_exhaustion_message(
+                                        used, budget,
+                                    )),
+                                    completed_so_far!(),
+                                ))
                                 .await;
-                                let _ = event_tx
-                                    .send(AgentEvent::error_with(
-                                        CompactString::from(token_budget_exhaustion_message(
-                                            used, budget,
-                                        )),
-                                        completed_so_far!(),
-                                    ))
-                                    .await;
-                                return;
-                            }
-                            exhausted_budget_after_completion = Some((used, budget));
+                            return;
                         }
-                        completion_had_tool_call = false;
                     }
                     Err(e) => {
                         finalize_interactive_tool_calls(
@@ -4377,12 +4485,8 @@ where
                         .await;
                         park_question!();
                         if let Some((attempt, delay)) =
-                            completion_retry.retry_delay(&retry_config, &e)
+                            midstream_retry(&mut completion_retry, &retry_config, &e)
                         {
-                            tracing::warn!(
-                                "agent retry {attempt}/{max} after mid-stream error: {e}",
-                                max = retry_config.max_attempts,
-                            );
                             let _ = event_tx
                                 .send(AgentEvent::Retrying {
                                     attempt,
@@ -4874,7 +4978,6 @@ where
     // Bounded retry of empty terminal responses, mirroring `spawn_agent`: an
     // empty response must never be returned (and persisted) as the turn.
     let mut empty_response_count: u32 = 0;
-    const MAX_EMPTY_RESPONSES: u32 = 3;
     let mut goal_report_accepted = false;
     let mut workspace_may_have_changed = false;
     let mut verification_attempt = 0u32;
@@ -4921,8 +5024,6 @@ where
     let mut stop_hook_active = false;
     #[cfg(feature = "hooks")]
     let mut consecutive_stop_blocks: u32 = 0;
-    #[cfg(feature = "hooks")]
-    const MAX_STOP_BLOCKS: u32 = 8;
 
     while continue_turn {
         continue_turn = false;
@@ -5059,10 +5160,13 @@ where
                         }
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                        completion_retry.reset(retry_config);
-                        turns_used = turns_used.saturating_add(1);
-                        let delta = usage_ledger.record(call.usage);
-                        crate::spend::run::observe_current(delta);
+                        let delta = record_completion_call(
+                            &mut completion_retry,
+                            retry_config,
+                            &mut turns_used,
+                            &mut usage_ledger,
+                            call.usage,
+                        );
                         if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
                             fail_turn!(error);
                         }
@@ -5074,40 +5178,36 @@ where
                             call.usage.cache_creation_input_tokens,
                             observed_tokens(usage_ledger.total),
                         );
-                        if let Some((used, budget)) =
-                            exhausted_token_budget(usage_ledger.total, turn_token_budget)
-                        {
-                            if completion_had_tool_call {
-                                tool_calls.finalize_unresolved(&mut interactions);
-                                fail_turn!(token_budget_exhaustion_message(used, budget));
-                            }
-                            exhausted_budget_after_completion = Some((used, budget));
+                        if let Err((used, budget)) = note_budget_after_completion(
+                            usage_ledger.total,
+                            turn_token_budget,
+                            &mut completion_had_tool_call,
+                            &mut exhausted_budget_after_completion,
+                        ) {
+                            tool_calls.finalize_unresolved(&mut interactions);
+                            fail_turn!(token_budget_exhaustion_message(used, budget));
                         }
-                        completion_had_tool_call = false;
                     }
                     Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                         terminal_response_seen = true;
-                        let delta = usage_ledger.reconcile_terminal(res.usage());
-                        if delta.has_values() {
-                            crate::spend::run::observe_current(delta);
-                        }
+                        let delta = reconcile_terminal_usage(&mut usage_ledger, res.usage());
                         if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
                             fail_turn!(error);
                         }
-                        let terminal_was_streamed = full_response.len() > response_len_at_stream_start;
-                        reconcile_terminal_response(
-                            &mut full_response,
-                            response_len_at_stream_start,
-                            &res.output,
-                        );
                         // A terminal answer that was never streamed must still
                         // reach the continuation transcript and the terminal, as
                         // it does interactively (mini-agent-4v2iq).
-                        if !terminal_was_streamed && !res.output.is_empty() {
-                            append_streamed_text(&mut interactions, &res.output);
-                            if let Err(error) = output_policy.assistant_text(&res.output).await {
-                                fail_turn!(error);
-                            }
+                        let terminal_was_streamed = reconcile_final_output(
+                            &mut full_response,
+                            response_len_at_stream_start,
+                            &res.output,
+                            &mut interactions,
+                        );
+                        if !terminal_was_streamed
+                            && !res.output.is_empty()
+                            && let Err(error) = output_policy.assistant_text(&res.output).await
+                        {
+                            fail_turn!(error);
                         }
                         park_question!();
                         if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
@@ -5120,8 +5220,7 @@ where
                             && !goal_report_accepted
                             && !native_capture.completes_without_visible_text()
                         {
-                            empty_response_count += 1;
-                            if empty_response_count >= MAX_EMPTY_RESPONSES {
+                            if empty_response_limit_reached(&mut empty_response_count) {
                                 tracing::warn!(
                                     "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
                                 );
@@ -5164,9 +5263,8 @@ where
                                     fail_turn!(error);
                                 }
                                 if verification_attempt < verification.max_attempts {
-                                    next_instruction = Some(format!(
-                                        "The configured verification command failed. Fix the cause and rerun verification before finishing.\n\n{diagnostic}"
-                                    ));
+                                    next_instruction =
+                                        Some(verification_retry_instruction(&diagnostic));
                                     continue_turn = true;
                                     return Ok(false);
                                 } else {
@@ -5184,20 +5282,14 @@ where
                                 loop_info.map(|info| info.active),
                                 goal_hook_info(),
                             ))
+                            && let Some(instruction) = stop_block_continuation(
+                                &mut consecutive_stop_blocks,
+                                &mut stop_hook_active,
+                                reason,
+                            )
                         {
-                            consecutive_stop_blocks += 1;
-                            if consecutive_stop_blocks <= MAX_STOP_BLOCKS {
-                                stop_hook_active = true;
-                                tracing::info!(
-                                    "hooks: Stop hook forced continuation ({consecutive_stop_blocks}/{MAX_STOP_BLOCKS}): {reason}"
-                                );
-                                next_instruction = Some(reason);
-                                continue_turn = true;
-                            } else {
-                                tracing::warn!(
-                                    "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
-                                );
-                            }
+                            next_instruction = Some(instruction);
+                            continue_turn = true;
                         }
                         #[cfg(feature = "skills")]
                         if !continue_turn
@@ -5212,11 +5304,9 @@ where
                     Err(e) => {
                         tool_calls.finalize_unresolved(&mut interactions);
                         park_question!();
-                        if let Some((attempt, delay)) = completion_retry.retry_delay(retry_config, &e) {
-                            tracing::warn!(
-                                "agent retry {attempt}/{max} after mid-stream error: {e}",
-                                max = retry_config.max_attempts,
-                            );
+                        if let Some((_, delay)) =
+                            midstream_retry(&mut completion_retry, retry_config, &e)
+                        {
                             await_turn!(tokio::time::sleep(delay));
                             next_instruction = Some(TRANSIENT_PROVIDER_CONTINUATION.to_string());
                             retrying_interrupted_completion = true;
