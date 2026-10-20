@@ -103,10 +103,15 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
             return Flow::cont();
         };
 
-        let output_chars = result.chars().count();
+        // Cheap checks first: self-bounded tools and byte lengths under the
+        // threshold (bytes >= chars) never need the UTF-8 char walk.
         if crate::session::tool_result_is_self_bounded(tool_name)
-            || output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD
+            || result.len() <= crate::session::TOOL_RESULT_SAVE_THRESHOLD
         {
+            return Flow::cont();
+        }
+        let output_chars = result.chars().count();
+        if output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
             return Flow::cont();
         }
 
@@ -1897,13 +1902,78 @@ pub(crate) fn prepared_request_input_estimate(
 }
 
 /// Per-run cache of the character counts of every history message already
-/// measured. A child's history is append-only, so each model call re-measures
-/// only the new suffix; a cached message is reused only while it is equal to
-/// the message at the same index, so an edited or reordered history is
-/// re-measured rather than trusted.
+/// measured, plus those of the request shell (preamble, documents, tool
+/// schemas, sampling parameters). A child's history is append-only, so each
+/// model call re-measures only the new suffix; a cached message is reused only
+/// while its fingerprint equals that of the message at the same index, so an
+/// edited or reordered history is re-measured rather than trusted.
+///
+/// The cache keeps a 64-bit fingerprint per message instead of a `Message`
+/// clone, so a run does not hold a second copy of its own history. The trade
+/// is one hashing pass over the prefix per call (no allocation) instead of a
+/// memcmp, and equality holds up to 64-bit hash collision.
 #[cfg(feature = "subagents")]
 #[derive(Clone, Default)]
-struct HistoryCountCache(std::sync::Arc<std::sync::Mutex<Vec<(Message, u64, u64)>>>);
+struct HistoryCountCache(std::sync::Arc<std::sync::Mutex<CountCacheState>>);
+
+#[cfg(feature = "subagents")]
+#[derive(Default)]
+struct CountCacheState {
+    messages: Vec<CacheEntry>,
+    shell: Option<ShellEntry>,
+}
+
+/// Fingerprint and character counts of one measured history message.
+#[cfg(feature = "subagents")]
+#[derive(Clone, Copy)]
+struct CacheEntry {
+    hash: u64,
+    wide: u64,
+    narrow: u64,
+}
+
+/// Memoized character counts of the request shell. The tool `Arc`s are held so
+/// that a pointer match can never be a freed-and-reused allocation.
+#[cfg(feature = "subagents")]
+struct ShellEntry {
+    model: Option<String>,
+    preamble_len: usize,
+    preamble_hash: u64,
+    tools: Vec<std::sync::Arc<rig::completion::ToolDefinition>>,
+    max_tokens: Option<u64>,
+    temperature_bits: Option<u64>,
+    /// Hash of the serde form of the remaining (normally small or absent)
+    /// fields: documents, tool choice, additional params and output schema.
+    rest_hash: u64,
+    wide: u64,
+    narrow: u64,
+}
+
+/// `io::Write` adapter that feeds bytes to a hasher.
+#[cfg(feature = "subagents")]
+struct HashWriter<'a>(&'a mut std::collections::hash_map::DefaultHasher);
+
+#[cfg(feature = "subagents")]
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::hash::Hasher;
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 64-bit fingerprint of the exact JSON form of `value`, computed without
+/// allocating the serialization.
+#[cfg(feature = "subagents")]
+fn serde_fingerprint<T: serde::Serialize + ?Sized>(value: &T) -> Option<u64> {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_writer(HashWriter(&mut hasher), value).ok()?;
+    Some(hasher.finish())
+}
 
 /// Every `CompletionRequest` field except `chat_history`, serialized under the
 /// same names so that, together with the history framing, the character counts
@@ -1922,6 +1992,67 @@ struct RequestShell<'a, S> {
     output_schema: &'a Option<S>,
 }
 
+/// Character counts of the request shell, reused while the shell is unchanged.
+#[cfg(feature = "subagents")]
+fn shell_char_counts(
+    state: &mut CountCacheState,
+    request: &rig::completion::CompletionRequest,
+) -> Option<(u64, u64)> {
+    use std::hash::{Hash, Hasher};
+    let preamble = request.preamble.as_deref().unwrap_or("");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    preamble.hash(&mut hasher);
+    let preamble_hash = hasher.finish();
+    let rest_hash = serde_fingerprint(&(
+        &request.documents,
+        &request.tool_choice,
+        &request.additional_params,
+        &request.output_schema,
+    ))?;
+    let temperature_bits = request.temperature.map(f64::to_bits);
+    if let Some(entry) = &state.shell
+        && entry.model == request.model
+        && entry.preamble_len == preamble.len()
+        && entry.preamble_hash == preamble_hash
+        && entry.max_tokens == request.max_tokens
+        && entry.temperature_bits == temperature_bits
+        && entry.rest_hash == rest_hash
+        && entry.tools.len() == request.tools.len()
+        && entry
+            .tools
+            .iter()
+            .zip(&request.tools)
+            .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+    {
+        return Some((entry.wide, entry.narrow));
+    }
+    let shell = serde_json::to_string(&RequestShell {
+        model: &request.model,
+        preamble: &request.preamble,
+        documents: &request.documents,
+        tools: &request.tools,
+        temperature: &request.temperature,
+        max_tokens: &request.max_tokens,
+        tool_choice: &request.tool_choice,
+        additional_params: &request.additional_params,
+        output_schema: &request.output_schema,
+    })
+    .ok()?;
+    let (wide, narrow) = crate::session::Session::char_counts(&shell);
+    state.shell = Some(ShellEntry {
+        model: request.model.clone(),
+        preamble_len: preamble.len(),
+        preamble_hash,
+        tools: request.tools.clone(),
+        max_tokens: request.max_tokens,
+        temperature_bits,
+        rest_hash,
+        wide,
+        narrow,
+    });
+    Some((wide, narrow))
+}
+
 /// Exactly `Session::estimate_tokens(&serde_json::to_string(request))`,
 /// serializing only the history messages not seen on an earlier call.
 #[cfg(feature = "subagents")]
@@ -1937,39 +2068,32 @@ pub(crate) fn incremental_request_estimate(
             cache
         }
     };
-    let shell = serde_json::to_string(&RequestShell {
-        model: &request.model,
-        preamble: &request.preamble,
-        documents: &request.documents,
-        tools: &request.tools,
-        temperature: &request.temperature,
-        max_tokens: &request.max_tokens,
-        tool_choice: &request.tool_choice,
-        additional_params: &request.additional_params,
-        output_schema: &request.output_schema,
-    })
-    .ok()?;
-    let (mut wide, mut narrow) = crate::session::Session::char_counts(&shell);
+    let mut state = cache.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut wide, mut narrow) = shell_char_counts(&mut state, request)?;
     // `,"chat_history":[` + `]` and one comma between consecutive messages.
     let history_len = request.chat_history.len();
     narrow += ",\"chat_history\":".len() as u64 + 2 + history_len.saturating_sub(1) as u64;
-    let mut measured = cache.0.lock().unwrap_or_else(|e| e.into_inner());
+    let measured = &mut state.messages;
     let mut keep = 0;
     for (index, message) in request.chat_history.iter().enumerate() {
         match measured.get(index) {
-            Some((cached, ..)) if cached == message => keep = index + 1,
+            Some(cached) if Some(cached.hash) == serde_fingerprint(message) => keep = index + 1,
             _ => break,
         }
     }
     measured.truncate(keep);
     for message in request.chat_history.iter().skip(keep) {
-        let (message_wide, message_narrow) =
-            crate::session::Session::char_counts(&serde_json::to_string(message).ok()?);
-        measured.push((message.clone(), message_wide, message_narrow));
+        let json = serde_json::to_string(message).ok()?;
+        let (message_wide, message_narrow) = crate::session::Session::char_counts(&json);
+        measured.push(CacheEntry {
+            hash: serde_fingerprint(message)?,
+            wide: message_wide,
+            narrow: message_narrow,
+        });
     }
-    for (_, message_wide, message_narrow) in measured.iter() {
-        wide += message_wide;
-        narrow += message_narrow;
+    for entry in measured.iter() {
+        wide += entry.wide;
+        narrow += entry.narrow;
     }
     Some(crate::session::Session::estimate_tokens_from_counts(
         wide, narrow,
@@ -6587,6 +6711,28 @@ mod tests {
         }
     }
 
+    /// 6_000 two-byte chars: 12_000 bytes but only 6_000 chars.
+    struct WideBelowThresholdTool;
+
+    impl Tool for WideBelowThresholdTool {
+        const NAME: &'static str = "wide_below_threshold";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return multi-byte text under the char threshold".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok("é".repeat(6_000))
+        }
+    }
+
     #[derive(Clone)]
     struct AlwaysFailTool(Arc<AtomicUsize>);
 
@@ -6716,6 +6862,56 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("counted".to_string())
         }
+    }
+
+    #[tokio::test]
+    async fn multibyte_result_over_threshold_in_bytes_but_not_chars_is_not_spilled() {
+        let session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "wide-id",
+                    WideBelowThresholdTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(WideBelowThresholdTool)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        while stream.next().await.is_some() {}
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let live_output = requests[1]
+            .chat_history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|content| match content {
+                    UserContent::ToolResult(result) => {
+                        result.content.iter().find_map(|content| match content {
+                            ToolResultContent::Text(text) => Some(text.text.clone()),
+                            ToolResultContent::Image(_) => None,
+                        })
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the next request must contain the tool result");
+        assert_eq!(live_output, "é".repeat(6_000));
     }
 
     #[tokio::test]
@@ -11971,6 +12167,12 @@ mod replay_and_gate_attribution_tests {
             skipped_verification_source(false),
             Some(TaskOutcomeSource::NoVerifyCommand)
         );
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn history_count_cache_entries_hold_no_message() {
+        assert!(std::mem::size_of::<super::CacheEntry>() <= 24);
     }
 
     /// v98t: the skipped-gate turn must be recorded, not dropped. Reusing
