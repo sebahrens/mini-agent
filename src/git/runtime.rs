@@ -625,12 +625,12 @@ impl GuardedRuntime {
                 .map_err(|_| "guarded Git runtime file authority changed")?;
             crate::fs::validate_private_file(&file)
                 .map_err(|_| "guarded Git runtime file authority changed")?;
-            let current = crate::fs::checked_file_metadata(&file)
+            let (metadata, current) = crate::fs::file_identity(&file)
                 .map_err(|_| "guarded Git runtime file authority changed")?;
-            require_single_link(&current)?;
-            crate::fs::ensure_same_file(
+            require_single_link_of(&file, &metadata)?;
+            crate::fs::ensure_same_identity(
                 &self.directory.root().join(&pinned.relative_path),
-                &pinned.identity,
+                &pinned.identity.identity(),
                 &current,
             )
             .map_err(|_| "guarded Git runtime file authority changed")?;
@@ -770,16 +770,28 @@ pub(crate) fn read_bounded(file: &std::fs::File, limit: usize) -> Result<Vec<u8>
 }
 
 pub(crate) fn require_single_link(metadata: &crate::fs::CheckedMetadata) -> Result<(), String> {
+    require_single_link_of(metadata.handle(), metadata)
+}
+
+/// Single-link check for an open `file` and its own `metadata`, without
+/// requiring a retained duplicate descriptor.
+fn require_single_link_of(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> Result<(), String> {
     #[cfg(unix)]
     let single = {
         use std::os::unix::fs::MetadataExt;
+        let _ = file;
         metadata.nlink() == 1
     };
     #[cfg(windows)]
-    let single =
-        crate::fs::windows_file_link_count(metadata.handle()).is_ok_and(|count| count == 1);
+    let single = crate::fs::windows_file_link_count(file).is_ok_and(|count| count == 1);
     #[cfg(not(any(unix, windows)))]
-    let single = false;
+    let single = {
+        let _ = file;
+        false
+    };
     if !metadata.is_file() || !single {
         return Err("guarded Git authority is not a singly-linked regular file".into());
     }

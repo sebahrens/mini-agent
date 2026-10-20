@@ -246,9 +246,9 @@ impl HomeFile {
             return Err(changed());
         }
         crate::fs::ensure_same_file(&self.path, &self.checked, &current).map_err(|_| changed())?;
-        let held =
-            crate::fs::checked_file_metadata(self.checked.handle()).map_err(|_| changed())?;
-        crate::fs::ensure_same_file(&self.path, &self.checked, &held).map_err(|_| changed())
+        let (_, held) = crate::fs::file_identity(self.checked.handle()).map_err(|_| changed())?;
+        crate::fs::ensure_same_identity(&self.path, &self.checked.identity(), &held)
+            .map_err(|_| changed())
     }
 
     #[cfg(unix)]
