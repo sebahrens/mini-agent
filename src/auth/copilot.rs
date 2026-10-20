@@ -364,12 +364,20 @@ pub(crate) fn selected_for_profile(profile: &Profile) -> anyhow::Result<Option<R
 }
 
 fn http() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    // Every setting is a constant, so one client (one connection pool, TLS
+    // context and proxy resolution) serves every authorization call; clones are
+    // cheap `Arc` handles.
+    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = HTTP.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
         .connect_timeout(REQUEST_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("mini-agent/", env!("CARGO_PKG_VERSION")))
-        .build()?)
+        .build()?;
+    Ok(HTTP.get_or_init(|| client).clone())
 }
 async fn json_response(request: reqwest::RequestBuilder) -> anyhow::Result<serde_json::Value> {
     tokio::time::timeout(REQUEST_TIMEOUT, async {
