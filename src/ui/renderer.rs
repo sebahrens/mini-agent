@@ -217,6 +217,20 @@ struct ChatSnapshot {
 #[derive(Clone, PartialEq)]
 pub(crate) enum PromptSnapshot {
     Input,
+    /// `generation` identifies the prompt text (see `Renderer::overlay_prompt_rows`).
+    Permission {
+        generation: u64,
+        expanded: bool,
+    },
+    Chain {
+        generation: u64,
+        but_mode: bool,
+    },
+}
+
+/// Which prompt text a memoized overlay layout was made for.
+#[derive(Clone, PartialEq)]
+enum PromptKey {
     Permission {
         tool: CompactString,
         options: CompactString,
@@ -226,6 +240,18 @@ pub(crate) enum PromptSnapshot {
         question: CompactString,
         but_mode: bool,
     },
+}
+
+/// Memoized overlay prompt rows: valid while the prompt text and the
+/// geometry are unchanged, so a spinner tick over an open prompt wraps
+/// nothing and clones no prompt text.
+struct PromptMemo {
+    key: PromptKey,
+    /// New for every distinct prompt text; carried by `PromptSnapshot`.
+    generation: u64,
+    cols: u16,
+    available: usize,
+    rows: Arc<Vec<String>>,
 }
 
 /// Everything `draw_bottom` paints, compared between frames to decide how much
@@ -835,6 +861,9 @@ pub struct Renderer {
     pub permission_prompt: Option<PermissionPrompt>,
     pub chain_prompt: Option<ChainPrompt>,
     pub chain_but_mode: bool,
+    /// Last overlay prompt layout (see `overlay_prompt_rows`).
+    prompt_memo: std::cell::RefCell<Option<PromptMemo>>,
+    prompt_generation: std::cell::Cell<u64>,
     /// Dirty-region tracking: explicit invalidation flags plus snapshots of
     /// the state recorded after the last successful draw of each region.
     chat_dirty: bool,
@@ -1002,6 +1031,8 @@ impl Renderer {
             permission_prompt: None,
             chain_prompt: None,
             chain_but_mode: false,
+            prompt_memo: std::cell::RefCell::new(None),
+            prompt_generation: std::cell::Cell::new(0),
             chat_dirty: true,
             last_chat_snapshot: None,
             painted_rows: Vec::new(),
@@ -1626,7 +1657,7 @@ impl Renderer {
     /// Number of rows the input area will occupy for the given content. Kept in
     /// sync with the height logic used while drawing the input in `draw_bottom`.
     fn input_visible_height(&self, input_line: &str, rows: u16) -> usize {
-        if let Some(prompt_rows) = self.overlay_prompt_rows(self.terminal_size().0, rows) {
+        if let Some((_, prompt_rows)) = self.overlay_prompt_rows(self.terminal_size().0, rows) {
             return prompt_rows.len();
         }
         let available_rows = rows.saturating_sub(self.statusline_reserve()) as usize;
@@ -1720,30 +1751,83 @@ impl Renderer {
     }
 
     /// Rows of the active permission or chain prompt laid out for a
-    /// `cols` x `rows` terminal, or `None` when the input editor is shown.
-    fn overlay_prompt_rows(&self, cols: u16, rows: u16) -> Option<Vec<String>> {
+    /// `cols` x `rows` terminal, or `None` when the input editor is shown,
+    /// with a generation that changes with the prompt text. The layout is
+    /// memoized: validating it compares the prompt text with the copy made
+    /// when it was laid out, with no wrapping and no allocation.
+    fn overlay_prompt_rows(&self, cols: u16, rows: u16) -> Option<(u64, Arc<Vec<String>>)> {
         let available = rows.saturating_sub(self.statusline_reserve()) as usize;
+        let mut memo = self.prompt_memo.borrow_mut();
+        let current = match (&self.permission_prompt, &self.chain_prompt) {
+            (Some(pp), _) => Some(Ok(pp)),
+            (None, Some(cp)) => Some(Err(cp)),
+            (None, None) => None,
+        };
+        let Some(current) = current else {
+            *memo = None;
+            return None;
+        };
+        let matches_key = |key: &PromptKey| match (key, current) {
+            (
+                PromptKey::Permission {
+                    tool,
+                    options,
+                    expanded,
+                },
+                Ok(pp),
+            ) => *tool == pp.tool && *options == pp.options && *expanded == pp.expanded,
+            (PromptKey::Chain { question, but_mode }, Err(cp)) => {
+                *question == cp.question && *but_mode == self.chain_but_mode
+            }
+            _ => false,
+        };
+        let same_text = memo.as_ref().is_some_and(|memo| matches_key(&memo.key));
+        if same_text
+            && let Some(memo) = memo.as_ref()
+            && memo.cols == cols
+            && memo.available == available
+        {
+            return Some((memo.generation, memo.rows.clone()));
+        }
         // One column short of the edge: a full-width row leaves the terminal
         // in its pending-wrap state, where clearing to end of line misbehaves.
         let width = (cols as usize).saturating_sub(1).max(1);
-        if let Some(pp) = &self.permission_prompt {
-            Some(permission_prompt_rows(
-                &pp.tool,
-                &pp.options,
+        let laid_out = Arc::new(match current {
+            Ok(pp) => permission_prompt_rows(&pp.tool, &pp.options, width, available, pp.expanded),
+            Err(cp) => prompt_block_rows(
+                &cp.question,
+                self.chain_options(),
                 width,
-                available,
-                pp.expanded,
-            ))
-        } else {
-            self.chain_prompt.as_ref().map(|cp| {
-                prompt_block_rows(
-                    &cp.question,
-                    self.chain_options(),
-                    width,
-                    prompt_max_rows(available),
-                )
-            })
-        }
+                prompt_max_rows(available),
+            ),
+        });
+        let (key, generation) = match memo.take() {
+            Some(old) if same_text => (old.key, old.generation),
+            _ => {
+                let generation = self.prompt_generation.get().wrapping_add(1);
+                self.prompt_generation.set(generation);
+                let key = match current {
+                    Ok(pp) => PromptKey::Permission {
+                        tool: pp.tool.clone(),
+                        options: pp.options.clone(),
+                        expanded: pp.expanded,
+                    },
+                    Err(cp) => PromptKey::Chain {
+                        question: cp.question.clone(),
+                        but_mode: self.chain_but_mode,
+                    },
+                };
+                (key, generation)
+            }
+        };
+        *memo = Some(PromptMemo {
+            key,
+            generation,
+            cols,
+            available,
+            rows: laid_out.clone(),
+        });
+        Some((generation, laid_out))
     }
 
     /// Recompute the input height and reconcile `prev_input_height` before the
@@ -2621,19 +2705,21 @@ impl Renderer {
         cols: u16,
         rows: u16,
     ) -> BottomSnapshot {
-        let prompt = if let Some(ref pp) = self.permission_prompt {
-            PromptSnapshot::Permission {
-                tool: pp.tool.clone(),
-                options: pp.options.clone(),
-                expanded: pp.expanded,
+        let prompt = match self.overlay_prompt_rows(cols, rows) {
+            Some((generation, _)) if self.permission_prompt.is_some() => {
+                PromptSnapshot::Permission {
+                    generation,
+                    expanded: self
+                        .permission_prompt
+                        .as_ref()
+                        .is_some_and(|pp| pp.expanded),
+                }
             }
-        } else if let Some(ref cp) = self.chain_prompt {
-            PromptSnapshot::Chain {
-                question: cp.question.clone(),
+            Some((generation, _)) => PromptSnapshot::Chain {
+                generation,
                 but_mode: self.chain_but_mode,
-            }
-        } else {
-            PromptSnapshot::Input
+            },
+            None => PromptSnapshot::Input,
         };
         BottomSnapshot {
             cols,
@@ -2783,7 +2869,7 @@ impl Renderer {
         let reserve = self.statusline_reserve();
         let mut stdout = frame_out!(self);
 
-        if let Some(prompt_rows) = self.overlay_prompt_rows(cols, rows) {
+        if let Some((_, prompt_rows)) = self.overlay_prompt_rows(cols, rows) {
             let line_count = prompt_rows.len();
             let input_top = input_top_row(rows, reserve, line_count);
             let sep_above = input_top.saturating_sub(1);
@@ -4742,6 +4828,35 @@ mod frame_buffer_tests {
         assert_eq!(input.buffer, before);
         assert_eq!(input.wrap_layouts(), 0);
         assert_eq!(renderer.frame_stats().input_layouts, 1);
+    }
+
+    #[test]
+    fn an_open_prompt_is_laid_out_once_across_spinner_ticks() {
+        let mut renderer = filled_renderer();
+        renderer.permission_prompt = Some(PermissionPrompt {
+            tool: "[permission] run a long command ".repeat(40).into(),
+            options: "(y) allow  (n) deny".into(),
+            expanded: false,
+        });
+        let (cols, rows) = renderer.terminal_size();
+        let (generation, first) = renderer.overlay_prompt_rows(cols, rows).unwrap();
+        renderer.sync_input_height("").unwrap();
+        renderer.render_viewport().unwrap();
+        renderer.draw_bottom("", 0, &[], 1, true).unwrap();
+        let before = renderer.frame_stats();
+        for frame in 0..10 {
+            renderer.tick_spinner().unwrap();
+            renderer.sync_input_height("").unwrap();
+            renderer.draw_bottom("", 0, &[], 1, true).unwrap();
+            let (again, rows_again) = renderer.overlay_prompt_rows(cols, rows).unwrap();
+            assert_eq!(again, generation, "frame {frame}");
+            assert!(Arc::ptr_eq(&first, &rows_again), "frame {frame}");
+        }
+        assert_eq!(renderer.frame_stats().since(before).bottom_full_paints, 0);
+        // Changing the prompt text lays it out again under a new generation.
+        renderer.permission_prompt.as_mut().unwrap().expanded = true;
+        let (changed, _) = renderer.overlay_prompt_rows(cols, rows).unwrap();
+        assert_ne!(changed, generation);
     }
 
     #[test]
