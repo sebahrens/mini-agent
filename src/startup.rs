@@ -704,6 +704,14 @@ impl std::fmt::Display for HeadlessCompactionUsage {
     }
 }
 
+/// Resolve a spawned workspace-change baseline; a failed or cancelled capture
+/// is the same non-fatal `None` as a capture that found no Git.
+async fn join_change_baseline(
+    task: Option<tokio::task::JoinHandle<Option<crate::print::WorkspaceChangeBaseline>>>,
+) -> Option<crate::print::WorkspaceChangeBaseline> {
+    task?.await.ok().flatten()
+}
+
 /// Preparation may have completed paid compaction requests before refusing
 /// another request. Settle that observed accounting without creating a model
 /// prompt turn or connecting its tools/MCP servers.
@@ -1351,7 +1359,7 @@ impl Startup {
         #[cfg(feature = "memory")]
         {
             context.memory = crate::extras::memory::Mem::open()
-                .context_block_excluding(session.active_compaction_ref());
+                .context_block_excluding_cached(session.active_compaction_ref());
         }
 
         // The invocation's captured workspace is authoritative until an
@@ -2099,16 +2107,16 @@ impl Startup {
     }
 
     async fn dispatch_print(&mut self) -> anyhow::Result<()> {
-        let cli = self.cli.clone();
+        let output_format = self.cli.output_format();
         let root = self.workspace.root().to_path_buf();
         let identity = (self.session.id.to_string(), self.session.name.to_string());
         let result = heap_future(|| self.dispatch_print_inner()).await;
         if let Err(error) = &result
-            && cli.output_format() == OutputFormat::StreamJson
+            && output_format == OutputFormat::StreamJson
             && !crate::print::headless_result_emitted()
         {
             crate::print::emit_headless_failure(
-                &cli,
+                &self.cli,
                 &root,
                 &error.to_string(),
                 Some((&identity.0, &identity.1)),
@@ -2129,16 +2137,22 @@ impl Startup {
         let json_output = output.format != OutputFormat::Text;
         let identity = (self.session.id.to_string(), self.session.name.to_string());
         output.emit_event(serde_json::json!({"type":"system", "session_id":identity.0, "session_name":identity.1, "ephemeral":self.cli.no_session, "provider":self.session.provider, "model":self.session.model})).await?;
-        let change_baseline = if json_output {
-            crate::print::capture_workspace_change_baseline(self.workspace.root()).await
-        } else {
-            None
-        };
+        // The `git status` baseline runs concurrently with the work that
+        // cannot change the workspace (compaction, MCP connect, agent build)
+        // and is joined before anything that can: the `!` command below, or
+        // the model run (mini-agent-vb5vw.59).
+        let baseline_task = json_output.then(|| {
+            let root = self.workspace.root().to_path_buf();
+            tokio::spawn(
+                async move { crate::print::capture_workspace_change_baseline(&root).await },
+            )
+        });
         if msg.starts_with('!') {
             if msg
                 .strip_prefix('!')
                 .is_some_and(|command| !command.trim().is_empty())
             {
+                let change_baseline = join_change_baseline(baseline_task).await;
                 let run = crate::print::run_headless_command(
                     self.sandbox
                         .clone()
@@ -2336,6 +2350,9 @@ impl Startup {
                 )
             })
             .await;
+            // No tool can have run yet, so the baseline observes exactly the
+            // state it did when it was taken before MCP connect.
+            let change_baseline = join_change_baseline(baseline_task).await;
             #[cfg(feature = "subagents")]
             let agent = agent.with_headless_turn_directive(self.headless_agent_directive.take());
             #[cfg(feature = "mcp")]
@@ -5587,6 +5604,74 @@ mod tests {
             crate::session::lock::release_session(&startup.session.id);
             crate::session::lock::release_session(&saved.id);
         }
+    }
+
+    #[cfg(feature = "memory")]
+    #[tokio::test]
+    async fn startup_memory_block_is_cached_for_the_first_refresh() {
+        use crate::extras::memory::CONTEXT_BLOCK_READS;
+        let root = crate::tests::OwnedTestDirectory::new("startup-memory-cache");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "ZS_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "ZS_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "ZS_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "ZS_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let paths = crate::paths::process_paths().unwrap();
+        // Age the memory file so its stamp is stable enough to cache.
+        let memory_md = crate::extras::memory::Mem::open().memory_md();
+        std::fs::create_dir_all(memory_md.parent().unwrap()).unwrap();
+        std::fs::write(&memory_md, "- remember alpha\n").unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::open(&memory_md)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let cli = Cli {
+            api_key: Some("unused-test-key".into()),
+            no_context_files: true,
+            no_tools: true,
+            no_sandbox: true,
+            no_session: true,
+            ..Default::default()
+        };
+        let startup = super::Startup::init(
+            cli,
+            Config::default(),
+            paths,
+            workspace,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(startup.context.memory.is_some());
+        let reads = || CONTEXT_BLOCK_READS.with(std::cell::Cell::get);
+        let before = reads();
+        let first_refresh = crate::extras::memory::Mem::open()
+            .context_block_excluding_cached(startup.session.active_compaction_ref());
+        assert_eq!(first_refresh, startup.context.memory);
+        assert_eq!(
+            reads(),
+            before,
+            "the first refresh reuses the block rendered at startup"
+        );
+        crate::session::lock::release_session(&startup.session.id);
     }
 
     #[tokio::test]

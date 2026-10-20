@@ -310,20 +310,15 @@ pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
 }
 
 pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Config> {
-    if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
-        super::layers::validate_toml_bounds_diagnostic(content, MAX_PRIVATE_CONFIG_BYTES)
-            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
-    }
-    // The table only supplies the top-level spelling list. Config itself is
-    // deserialised from the text: going through a `toml::Table` routes unknown
-    // keys through serde's flatten buffer, which stringifies TOML datetimes and
-    // breaks the preserved-key round trip (config_cross_feature_round_trip).
+    // The bounds scanner already tokenises every key, so it supplies the
+    // top-level spelling list. Config itself is deserialised from the text:
+    // going through a `toml::Table` routes unknown keys through serde's
+    // flatten buffer, which stringifies TOML datetimes and breaks the
+    // preserved-key round trip (config_cross_feature_round_trip).
     let toml_keys: Vec<String> =
         if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
-            content
-                .parse::<toml::Table>()
-                .map(|table| table.keys().cloned().collect())
-                .unwrap_or_default()
+            super::layers::validate_toml_bounds_diagnostic(content, MAX_PRIVATE_CONFIG_BYTES)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?
         } else {
             Vec::new()
         };
