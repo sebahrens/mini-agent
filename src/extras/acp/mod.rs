@@ -107,17 +107,29 @@ struct PromptMcp {
 #[derive(PartialEq, Eq)]
 struct McpKey {
     workspace: usize,
-    servers: String,
+    servers: Arc<str>,
 }
 
 #[cfg(feature = "mcp")]
 impl McpKey {
+    #[cfg(test)]
     fn new(cfg: &Config, workspace: &Arc<crate::paths::WorkspaceBinding>) -> Self {
-        let servers: std::collections::BTreeMap<_, _> = cfg.mcp_servers.iter().flatten().collect();
+        Self::from_servers(Self::servers_fingerprint(cfg), workspace)
+    }
+
+    fn from_servers(servers: Arc<str>, workspace: &Arc<crate::paths::WorkspaceBinding>) -> Self {
         Self {
             workspace: Arc::as_ptr(workspace) as usize,
-            servers: serde_json::to_string(&servers).unwrap_or_default(),
+            servers,
         }
+    }
+
+    /// The server-map half of the key. `cfg` is fixed for the server's
+    /// lifetime and a session's client servers for the session's, so this is
+    /// computed once at `session/new` rather than serialized per prompt.
+    fn servers_fingerprint(cfg: &Config) -> Arc<str> {
+        let servers: std::collections::BTreeMap<_, _> = cfg.mcp_servers.iter().flatten().collect();
+        Arc::from(serde_json::to_string(&servers).unwrap_or_default())
     }
 }
 
@@ -423,6 +435,9 @@ struct SessionState {
     /// tool-enabled prompt alongside the configured servers.
     #[cfg(feature = "mcp")]
     client_mcp_servers: Arc<ClientMcpServers>,
+    /// [`McpKey::servers_fingerprint`] of the configured plus client servers.
+    #[cfg(feature = "mcp")]
+    mcp_servers_fingerprint: Arc<str>,
     /// This session's `/cron` schedules. Never persisted; dropping the
     /// session (close or replacement) clears them and releases their idle
     /// lease.
@@ -554,6 +569,9 @@ struct RegisteredTurn {
 struct SessionTurns {
     next_generation: u64,
     queue: VecDeque<RegisteredTurn>,
+    /// Notified whenever a turn leaves `queue`, so the session's `/cron`
+    /// driver re-checks a busy session on completion instead of polling.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 struct TurnRegistration {
@@ -573,6 +591,7 @@ impl TurnRegistration {
         {
             turns.queue.remove(index);
         }
+        turns.wake.notify_waiters();
         completed
     }
 
@@ -585,6 +604,7 @@ impl TurnRegistration {
         {
             turns.queue.remove(index);
         }
+        turns.wake.notify_waiters();
     }
 }
 
@@ -1722,6 +1742,7 @@ async fn install_session(
     }
     let modes = policy.modes();
     let turns = Arc::new(StdMutex::new(SessionTurns::default()));
+    let turns_wake = lock_unpoisoned(&turns).wake.clone();
     let pending_question = canonical.pending_question.clone();
     let read_tracker = canonical.read_tracker.clone();
     let todo_store = canonical.todos.clone();
@@ -1755,8 +1776,12 @@ async fn install_session(
             #[cfg(feature = "skills")]
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
             #[cfg(feature = "mcp")]
+            mcp_servers_fingerprint: McpKey::servers_fingerprint(&with_client_mcp_servers(
+                &state.cfg,
+                &client_mcp_servers,
+            )),
             client_mcp_servers: Arc::new(client_mcp_servers),
-            cron: cron::CronOwner::default(),
+            cron: cron::CronOwner::new(turns_wake),
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id, turns);
@@ -4194,13 +4219,9 @@ async fn execute_prompt(
     // Refreshed after compaction, so the recap this turn replays is the one
     // whose daily-memory copy is left out of the block.
     #[cfg(feature = "memory")]
-    let context = {
-        let mut refreshed = (*context).clone();
-        refreshed
-            .refresh_memory_if_changed(history.active_compaction_ref())
-            .await;
-        Arc::new(refreshed)
-    };
+    let context = context
+        .with_refreshed_memory(history.active_compaction_ref())
+        .await;
     #[cfg(not(feature = "hooks"))]
     let prior_history =
         history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
@@ -4256,15 +4277,19 @@ async fn execute_prompt(
     };
     #[cfg(feature = "mcp")]
     if state.cli.mcp_is_eligible(&state.cfg) {
-        let client_servers = state
+        let (client_servers, fingerprint) = state
             .sessions
             .lock()
             .await
             .get(&session_id)
-            .map(|session| session.client_mcp_servers.clone())
-            .unwrap_or_default();
-        let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
-        let key = McpKey::new(&mcp_cfg, &workspace);
+            .map(|session| {
+                (
+                    session.client_mcp_servers.clone(),
+                    session.mcp_servers_fingerprint.clone(),
+                )
+            })
+            .unwrap_or_else(|| (Default::default(), McpKey::servers_fingerprint(&state.cfg)));
+        let key = McpKey::from_servers(fingerprint, &workspace);
         // A manager this prompt did not connect stays at the session's
         // disposal until the prompt finishes (`run_prompt` hands it back).
         match history.reuse.mcp.take() {
@@ -4276,6 +4301,7 @@ async fn execute_prompt(
                 // The servers belong to the session, not to this prompt: they
                 // connect under their own scope so a later prompt's cancellation
                 // cannot reach connections it did not start.
+                let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
                 let scope = crate::agent::runner::AgentWorkScope::new();
                 #[cfg(feature = "hooks")]
                 scope.set_hook_execution_root(workspace.root());
@@ -9771,6 +9797,33 @@ mod protocol_tests {
     }
 
     #[tokio::test]
+    async fn settling_a_turn_wakes_the_cron_busy_wait() {
+        use futures::FutureExt as _;
+        let turns = Arc::new(StdMutex::new(SessionTurns::default()));
+        let wake = lock_unpoisoned(&turns).wake.clone();
+        let control = Arc::new(TurnControl::new());
+        lock_unpoisoned(&turns).queue.push_back(RegisteredTurn {
+            generation: 0,
+            control: control.clone(),
+        });
+        let registration = TurnRegistration {
+            generation: 0,
+            turns: turns.clone(),
+            control,
+        };
+        let settled = wake.notified();
+        tokio::pin!(settled);
+        settled.as_mut().enable();
+        assert!(settled.as_mut().now_or_never().is_none());
+        assert!(registration.complete_and_settle());
+        assert!(
+            settled.now_or_never().is_some(),
+            "a retiring turn must wake the driver"
+        );
+        assert!(lock_unpoisoned(&turns).queue.is_empty());
+    }
+
+    #[tokio::test]
     async fn dropping_registered_generation_aborts_work_without_removing_the_next_turn() {
         let first = Arc::new(TurnControl::new());
         let second = Arc::new(TurnControl::new());
@@ -9786,6 +9839,7 @@ mod protocol_tests {
                     control: second.clone(),
                 },
             ]),
+            ..SessionTurns::default()
         }));
         let work_scope = crate::agent::runner::AgentWorkScope::new();
         let cancellation = work_scope.cancellation_handle();

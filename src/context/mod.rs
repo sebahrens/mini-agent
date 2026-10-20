@@ -400,16 +400,43 @@ impl ContextFiles {
         &mut self,
         exclude_compaction: Option<String>,
     ) -> bool {
+        match Self::render_memory(exclude_compaction).await {
+            Some(memory) => self.replace_memory_if_changed(memory),
+            None => false,
+        }
+    }
+
+    /// [`Self::refresh_memory_if_changed`] on a shared context: the same `Arc`
+    /// comes back when the rendered memory is unchanged, so an unchanged
+    /// refresh costs no deep copy of the instruction/prompt/agent text.
+    #[cfg(all(feature = "memory", feature = "acp"))]
+    pub(crate) async fn with_refreshed_memory(
+        self: &Arc<Self>,
+        exclude_compaction: Option<String>,
+    ) -> Arc<Self> {
+        match Self::render_memory(exclude_compaction).await {
+            Some(memory) if self.memory != memory => {
+                let mut refreshed = (**self).clone();
+                refreshed.replace_memory_if_changed(memory);
+                Arc::new(refreshed)
+            }
+            _ => Arc::clone(self),
+        }
+    }
+
+    /// The freshly rendered memory block; `None` when rendering failed.
+    #[cfg(feature = "memory")]
+    async fn render_memory(exclude_compaction: Option<String>) -> Option<Option<String>> {
         match tokio::task::spawn_blocking(move || {
             crate::extras::memory::Mem::open()
                 .context_block_excluding_cached(exclude_compaction.as_deref())
         })
         .await
         {
-            Ok(memory) => self.replace_memory_if_changed(memory),
+            Ok(memory) => Some(memory),
             Err(error) => {
                 tracing::warn!(%error, "failed to refresh persistent memory context");
-                false
+                None
             }
         }
     }

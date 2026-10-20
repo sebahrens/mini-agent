@@ -44,6 +44,63 @@ pub(crate) const MCP_LIST_TOOLS_MAX_TOOLS: usize = 128;
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
 const MCP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// One listed tool plus its model-facing metadata, bounded once when the
+/// listing is cached. `bounded` is `None` when the input schema was rejected.
+pub struct ListedTool {
+    pub definition: Tool,
+    pub(crate) bounded: Option<BoundedModelMetadata>,
+}
+
+#[derive(Clone)]
+pub(crate) struct BoundedModelMetadata {
+    pub(crate) description: Arc<str>,
+    pub(crate) parameters: Arc<serde_json::Value>,
+    pub(crate) description_truncated: bool,
+}
+
+/// A successful `tools/list` of one connection generation with every tool's
+/// bounded model metadata. It depends only on the listed definitions, so it
+/// is valid exactly as long as the cell holding it (a reconnect is a new
+/// handle and a new cell).
+pub struct ListedTools {
+    pub entries: Vec<ListedTool>,
+    pub(crate) reached_tool_cap: bool,
+}
+
+pub(crate) async fn list_bounded_tools(
+    peer: &Peer<RoleClient>,
+    timeout: Duration,
+) -> Result<Arc<ListedTools>, ServiceError> {
+    let tools = list_all_tools_bounded(peer, timeout).await?;
+    Ok(Arc::new(bound_listed_tools(tools)))
+}
+
+pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
+    let reached_tool_cap = tools.len() == MCP_LIST_TOOLS_MAX_TOOLS;
+    let entries = tools
+        .into_iter()
+        .map(|definition| {
+            let bounded = super::tool::McpTool::bounded_model_metadata(&definition)
+                .ok()
+                .map(
+                    |(description, parameters, description_truncated)| BoundedModelMetadata {
+                        description: Arc::from(description),
+                        parameters: Arc::new(parameters),
+                        description_truncated,
+                    },
+                );
+            ListedTool {
+                definition,
+                bounded,
+            }
+        })
+        .collect();
+    ListedTools {
+        entries,
+        reached_tool_cap,
+    }
+}
+
 pub struct McpClientHandle {
     pub server_name: CompactString,
     pub trusted_identity: Option<TrustedMcpServer>,
@@ -56,7 +113,7 @@ pub struct McpClientHandle {
     /// new handle (and cell); failures are not cached. Without a
     /// `notifications/tools/list_changed` subscription, re-listing on every
     /// agent rebuild could not observe anything this cache hides.
-    pub(crate) tools: Arc<tokio::sync::OnceCell<Vec<Tool>>>,
+    pub(crate) tools: Arc<tokio::sync::OnceCell<Arc<ListedTools>>>,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -451,7 +508,7 @@ impl McpClientHandle {
                         })?;
                 let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
                 let stderr_task =
-                    stderr.map(|stderr| capture_stderr(stderr, Arc::clone(&stderr_buffer)));
+                    stderr.map(|stderr| capture_stderr(stderr, Arc::downgrade(&stderr_buffer)));
                 let initialized = tokio::select! {
                     biased;
                     _ = crate::agent::runner::current_work_scope_cancelled() => None,
@@ -493,6 +550,9 @@ impl McpClientHandle {
                         .await);
                     }
                 };
+                // Connected: nothing can read the diagnostic any more, so the
+                // capture task (which holds only a `Weak`) now just drains.
+                drop(stderr_buffer);
                 Ok(Self {
                     server_name,
                     trusted_identity: config.trusted_identity(),
@@ -687,10 +747,14 @@ impl McpClientHandle {
         });
     }
 
-    /// Enumerate every tool the server exposes, bounded by
-    /// [`MCP_LIST_TOOLS_TIMEOUT`] and [`MCP_LIST_TOOLS_MAX_PAGES`].
-    pub async fn list_tools(&self) -> Result<Vec<Tool>, ServiceError> {
-        list_all_tools_bounded(self.running_service.peer(), MCP_LIST_TOOLS_TIMEOUT).await
+    /// The cached listing of this connection generation, listing (and
+    /// bounding) once on first use. Same cell the agent build fills.
+    pub async fn cached_tools(&self) -> Result<Arc<ListedTools>, ServiceError> {
+        let peer = self.running_service.peer();
+        self.tools
+            .get_or_try_init(|| list_bounded_tools(peer, MCP_LIST_TOOLS_TIMEOUT))
+            .await
+            .cloned()
     }
 }
 
@@ -797,9 +861,13 @@ pub(crate) async fn call_tool_bounded(
     }
 }
 
+/// Collects up to [`MCP_STDERR_LIMIT`] bytes for connect diagnostics. It holds
+/// only a `Weak`: once the connect path drops the buffer the task keeps
+/// draining the pipe (so the server never blocks on a full stderr) but
+/// discards every chunk without locking.
 fn capture_stderr(
-    mut stderr: tokio::process::ChildStderr,
-    buffer: Arc<Mutex<Vec<u8>>>,
+    mut stderr: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    buffer: std::sync::Weak<Mutex<Vec<u8>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut chunk = [0_u8; 1024];
@@ -807,6 +875,9 @@ fn capture_stderr(
             let read = match stderr.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
                 Ok(read) => read,
+            };
+            let Some(buffer) = buffer.upgrade() else {
+                continue;
             };
             let mut captured = buffer.lock().unwrap_or_else(|error| error.into_inner());
             let remaining = MCP_STDERR_LIMIT.saturating_sub(captured.len());
@@ -1300,6 +1371,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stderr_capture_holds_no_buffer_once_the_connect_path_drops_it() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let task = super::capture_stderr(reader, std::sync::Arc::downgrade(&buffer));
+        writer.write_all(b"first").await.unwrap();
+        while buffer.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::sync::Arc::strong_count(&buffer),
+            1,
+            "the task owns no strong ref"
+        );
+        let weak = std::sync::Arc::downgrade(&buffer);
+        assert_eq!(&*buffer.lock().unwrap(), b"first");
+        drop(buffer);
+        assert!(weak.upgrade().is_none(), "the buffer is freed at connect");
+        // The pipe is still drained after the buffer is gone.
+        writer.write_all(&[b'x'; 4096]).await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+    }
+
     #[test]
     fn lossy_stderr_rendering_remains_within_the_byte_cap() {
         let rendered = bounded_lossy_diagnostic(&vec![0xff; super::MCP_STDERR_LIMIT]);
@@ -1399,7 +1495,7 @@ mod tests {
 mod local_policy_tests {
     use super::*;
     fn lookup(addresses: Vec<IpAddr>) -> super::super::egress::Lookup {
-        Arc::new(move |_| {
+        std::sync::Arc::new(move |_| {
             let addresses = addresses.clone();
             Box::pin(async move { Ok(addresses) })
         })

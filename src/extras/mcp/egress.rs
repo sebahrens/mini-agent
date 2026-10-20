@@ -214,8 +214,9 @@ fn check_url_host(url: &reqwest::Url) -> Result<(), String> {
 /// rmcp OAuth HTTP client whose every request, redirect hop and name lookup
 /// is held to the same public-address policy as the MCP transport.
 pub(crate) struct GuardedOAuthHttpClient {
-    follow_redirects: reqwest::Client,
-    stop_redirects: reqwest::Client,
+    /// Never follows redirects itself; [`Self::send`] walks them by hand so one
+    /// connection pool and TLS context serve both redirect policies.
+    client: reqwest::Client,
     endpoint: ValidatedEndpoint,
     source: Option<SourceValidator>,
 }
@@ -241,36 +242,16 @@ impl GuardedOAuthHttpClient {
         lookup: Lookup,
         source: Option<SourceValidator>,
     ) -> anyhow::Result<Self> {
-        let build = |policy: reqwest::redirect::Policy| {
-            endpoint
-                .pin_with_source(reqwest::Client::builder(), lookup.clone(), source.clone())
-                .timeout(OAUTH_HTTP_TIMEOUT)
-                .redirect(policy)
-                .build()
-                .map_err(|error| {
-                    anyhow::anyhow!("MCP OAuth HTTP client construction failed: {error}")
-                })
-        };
-        let redirect_source = source.clone();
-        let follow = reqwest::redirect::Policy::custom(move |attempt| {
-            if !source_is_current(&redirect_source) {
-                return attempt.error("MCP OAuth source changed");
-            }
-            if attempt.previous().len() >= OAUTH_HTTP_MAX_REDIRECTS {
-                return attempt.error("too many redirects");
-            }
-            match check_url_host(attempt.url()) {
-                Ok(()) => attempt.follow(),
-                Err(error) => attempt.error(error),
-            }
-        });
+        let client = endpoint
+            .pin_with_source(reqwest::Client::builder(), lookup, source.clone())
+            .timeout(OAUTH_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                anyhow::anyhow!("MCP OAuth HTTP client construction failed: {error}")
+            })?;
         Ok(Self {
-            follow_redirects: build(if endpoint.local_origin.is_some() {
-                reqwest::redirect::Policy::none()
-            } else {
-                follow
-            })?,
-            stop_redirects: build(reqwest::redirect::Policy::none())?,
+            client,
             endpoint: endpoint.clone(),
             source,
         })
@@ -287,11 +268,6 @@ impl GuardedOAuthHttpClient {
         if !source_is_current(&self.source) {
             return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
         }
-        let client = if follow_redirects {
-            &self.follow_redirects
-        } else {
-            &self.stop_redirects
-        };
         let mut request = reqwest::Request::try_from(request)
             .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
         if !self.endpoint.accepts_local_origin(request.url()) {
@@ -301,13 +277,39 @@ impl GuardedOAuthHttpClient {
                 "MCP URL must not contain credentials",
             ));
         }
-        if let Some(timeout) = timeout {
-            *request.timeout_mut() = Some(timeout);
-        }
-        let response = client
-            .execute(request)
-            .await
-            .map_err(|error| OAuthHttpClientError::new(error_chain(&error)))?;
+        // A local-origin endpoint never follows redirects.
+        let follow_redirects = follow_redirects && self.endpoint.local_origin.is_none();
+        // One whole-operation budget across every hop, as reqwest applies it.
+        let deadline = tokio::time::Instant::now() + timeout.unwrap_or(OAUTH_HTTP_TIMEOUT);
+        let mut hops = 0usize;
+        let response = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            *request.timeout_mut() = Some(remaining);
+            let next = if follow_redirects {
+                request.try_clone()
+            } else {
+                None
+            };
+            let response = self
+                .client
+                .execute(request)
+                .await
+                .map_err(|error| OAuthHttpClientError::new(error_chain(&error)))?;
+            let Some(next) = next else { break response };
+            let Some((code, target)) = redirect_target(&response) else {
+                break response;
+            };
+            if !source_is_current(&self.source) {
+                return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
+            }
+            // `previous().len()` of the equivalent redirect policy is hops + 1.
+            if hops + 1 >= OAUTH_HTTP_MAX_REDIRECTS {
+                return Err(OAuthHttpClientError::new("too many redirects"));
+            }
+            check_url_host(&target).map_err(OAuthHttpClientError::new)?;
+            request = redirected_request(next, code, target);
+            hops += 1;
+        };
         if !source_is_current(&self.source) {
             return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
         }
@@ -351,6 +353,68 @@ impl OAuthHttpClient for GuardedOAuthHttpClient {
             self.send(request, follow, timeout).await
         })
     }
+}
+
+/// The absolute `Location` of a redirect status reqwest itself would follow,
+/// and `None` for any other response (including an unusable `Location`).
+fn redirect_target(response: &reqwest::Response) -> Option<(reqwest::StatusCode, reqwest::Url)> {
+    use reqwest::StatusCode;
+    let code = response.status();
+    if !matches!(
+        code,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) {
+        return None;
+    }
+    let location = response.headers().get(reqwest::header::LOCATION)?;
+    Some((code, response.url().join(location.to_str().ok()?).ok()?))
+}
+
+/// The request for the next hop, with reqwest's redirect semantics: 301/302/303
+/// become a body-less GET (HEAD stays HEAD), 307/308 keep method and body, and
+/// credentials never cross to another origin.
+fn redirected_request(
+    mut next: reqwest::Request,
+    code: reqwest::StatusCode,
+    target: reqwest::Url,
+) -> reqwest::Request {
+    use reqwest::header;
+    use reqwest::{Method, StatusCode};
+    let cross_origin = next.url().host_str() != target.host_str()
+        || next.url().port_or_known_default() != target.port_or_known_default();
+    let drops_body = matches!(
+        code,
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
+    ) && *next.method() != Method::HEAD
+        && (code == StatusCode::SEE_OTHER || *next.method() == Method::POST);
+    if drops_body {
+        *next.method_mut() = Method::GET;
+        *next.body_mut() = None;
+        for name in [
+            header::TRANSFER_ENCODING,
+            header::CONTENT_ENCODING,
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+        ] {
+            next.headers_mut().remove(name);
+        }
+    }
+    if cross_origin {
+        for name in [
+            header::AUTHORIZATION,
+            header::COOKIE,
+            header::PROXY_AUTHORIZATION,
+            header::WWW_AUTHENTICATE,
+        ] {
+            next.headers_mut().remove(name);
+        }
+    }
+    *next.url_mut() = target;
+    next
 }
 
 /// An error and its sources on one line, so a refusal from the resolver or
@@ -522,6 +586,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), http::StatusCode::FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_client_follows_redirects_by_hand_with_one_client_and_a_hop_limit() {
+        let Some((final_port, final_hits)) =
+            loopback_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        else {
+            return;
+        };
+        let (lookup, _) = scripted_lookup(vec![PUBLIC]);
+        let endpoint = ValidatedEndpoint::new("auth.example".into(), &[LOOPBACK], false);
+        let client = GuardedOAuthHttpClient::with_lookup(&endpoint, lookup).unwrap();
+
+        // A 302 to another port of the pinned (non-literal) host is followed,
+        // and a POST becomes a body-less GET.
+        let redirect: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://auth.example:{final_port}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_boxed_str(),
+        );
+        let (port, first_hits) = loopback_server(redirect).unwrap();
+        let post = http::Request::post(format!("http://auth.example:{port}/start"))
+            .body(b"payload".to_vec())
+            .unwrap();
+        let response = client.send(post, true, None).await.unwrap();
+        assert_eq!(response.body(), b"ok");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(final_hits.load(Ordering::SeqCst), 1);
+
+        // A redirect loop stops at the same limit the reqwest policy enforced.
+        let (loop_port, loop_hits) = loopback_server(Box::leak(
+            "HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string()
+                .into_boxed_str(),
+        ))
+        .unwrap();
+        let error = client
+            .send(
+                http::Request::get(format!("http://auth.example:{loop_port}/"))
+                    .body(Vec::new())
+                    .unwrap(),
+                true,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("too many redirects"), "{error}");
+        assert_eq!(loop_hits.load(Ordering::SeqCst), OAUTH_HTTP_MAX_REDIRECTS);
     }
 }
 

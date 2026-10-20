@@ -1956,6 +1956,27 @@ fn memory62_actual_context_snapshot_and_preamble_refresh_on_note_change_only() {
     assert_ne!(first, next);
     assert!(next.contains("\"topic\" — new first line"));
     assert!(!next.contains("decision first line"));
+
+    // The shared-context refresh keeps the very same Arc while memory is
+    // unchanged and replaces it (without mutating the old one) on a change.
+    #[cfg(feature = "acp")]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        // `Mem::open` reads the process memory root, not the fixture `m`, so
+        // seed a memory block that differs from whatever it renders.
+        let mut stale = context.clone();
+        stale.memory = Some("stale memory block".to_string());
+        let shared = std::sync::Arc::new(stale);
+        let refreshed = runtime.block_on(shared.with_refreshed_memory(None));
+        assert!(!std::sync::Arc::ptr_eq(&shared, &refreshed));
+        assert_ne!(refreshed.memory.as_deref(), Some("stale memory block"));
+        assert_eq!(shared.memory.as_deref(), Some("stale memory block"));
+        // Rendered memory unchanged: the very same Arc comes back.
+        let again = runtime.block_on(refreshed.with_refreshed_memory(None));
+        assert!(std::sync::Arc::ptr_eq(&refreshed, &again));
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

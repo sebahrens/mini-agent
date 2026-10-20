@@ -1625,6 +1625,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/mcp/egress.rs",
+        "let code = response.status();",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/egress.rs",
         "assert!(response.status().is_success());",
         1,
         "NON-PROCESS",
@@ -1634,12 +1640,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "assert_eq!(response.status(), http::StatusCode::FOUND);",
         1,
         "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/client.rs",
-        "mut stderr: tokio::process::ChildStderr,",
-        1,
-        "TC-MCP-STDIO",
     ),
     (
         "src/extras/mcp/client.rs",
@@ -5729,6 +5729,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/mcp/egress.rs",
         ".status(response.status())",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/egress.rs",
+        "let code = response.status();",
         1,
         "NON-PROCESS",
     ),

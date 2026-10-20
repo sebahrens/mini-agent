@@ -678,13 +678,14 @@ async fn handle_mcp(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                 );
             }
 
-            match handle.list_tools().await {
-                Ok(tools) => {
-                    if tools.is_empty() {
+            match handle.cached_tools().await {
+                Ok(listed) => {
+                    if listed.entries.is_empty() {
                         write_ok(ctx.renderer, format!("server '{}' has no tools", name));
                     } else {
                         write_ok(ctx.renderer, format!("tools on '{}':", name));
-                        for tool in &tools {
+                        for entry in &listed.entries {
+                            let tool = &entry.definition;
                             let desc = tool.description.as_deref().unwrap_or("");
                             write_result(ctx.renderer, format!("  {}  {}", tool.name, desc));
                         }
@@ -707,44 +708,9 @@ async fn handle_mcp(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         } else {
             write_error(ctx.renderer, format!("unknown MCP server: '{name}'"));
         }
-        return Ok(());
     }
-
-    // `/mcp` — list all configured servers, green = connected, red = not.
-    let Some(servers) = ctx.cfg.mcp_servers.as_ref().filter(|s| !s.is_empty()) else {
-        write_ok(ctx.renderer, "no MCP servers configured");
-        return Ok(());
-    };
-    write_ok(ctx.renderer, "MCP servers:");
-    let mut names: Vec<&String> = servers.keys().collect();
-    names.sort();
-    for name in names {
-        if let Some(handle) = mgr
-            .handles
-            .iter()
-            .find(|h| h.server_name.as_str() == name.as_str())
-        {
-            let label = match handle.list_tools().await {
-                Ok(tools) => format!("  + {name} ({} tools)", tools.len()),
-                Err(_) => format!("  + {name} (connected)"),
-            };
-            ctx.renderer
-                .write_line(&label, crossterm::style::Color::Green)?;
-        } else {
-            let oauth = matches!(
-                servers.get(name),
-                Some(crate::extras::mcp::config::McpServerConfig::Url { oauth: Some(o), .. })
-                    if o.settings().is_some()
-            );
-            let label = if oauth {
-                format!("  - {name} (unauthenticated, run /mcp login {name})")
-            } else {
-                format!("  - {name} (not connected)")
-            };
-            ctx.renderer
-                .write_line(&label, crossterm::style::Color::Red)?;
-        }
-    }
+    // Bare `/mcp` never reaches here: `handle_mcp_command` answers it from
+    // `mcp_status()` without any RPC.
     Ok(())
 }
 
