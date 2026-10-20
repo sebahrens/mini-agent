@@ -253,6 +253,12 @@ incremental = true
 [profile.dev.package."sha2@0.11"]
 opt-level = 3
 
+# rquickjs-sys compiles the QuickJS C sources with cc, which inherits Cargo's
+# OPT_LEVEL. The interpreter, parser and GC run on every JS context and bootstrap,
+# so build them at -O3 instead of the blanket dependency opt-level 1.
+[profile.dev.package.rquickjs-sys]
+opt-level = 3
+
 # Exact 100k skill retrieval delegates its contiguous matrix-vector product to
 # this small kernel crate. Keep the kernel representative in debug builds while
 # the rest of mini-agent remains unoptimized and easy to inspect.
