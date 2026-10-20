@@ -648,6 +648,44 @@ pub struct ListDirArgs {
     pub path: Option<String>,
 }
 
+/// Turns a diagnosed permission verdict into the tool-facing result: coaching
+/// is returned, a denial becomes an error, and `Ask` prompts through
+/// `handle_ask_inner` (failing closed with the non-interactive diagnostic when
+/// no prompt channel exists).
+async fn settle_check(
+    (result, diagnostic): (CheckResult, crate::permission::ask::AskDiagnostic),
+    ask_tx: &Option<AskSender>,
+    perm: &PermCheck,
+    tool: &str,
+    input: &str,
+    suggested_pattern: Option<String>,
+    additional_allow_patterns: Vec<String>,
+) -> Result<Option<String>, ToolError> {
+    match result {
+        CheckResult::Allowed => Ok(None),
+        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
+        CheckResult::Denied(reason) => {
+            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
+        }
+        CheckResult::Ask => {
+            let Some(tx) = ask_tx else {
+                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
+            };
+            handle_ask_inner(
+                tx,
+                perm,
+                tool,
+                input,
+                suggested_pattern,
+                additional_allow_patterns,
+                diagnostic,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
 async fn handle_ask_inner(
     ask_tx: &AskSender,
     permission: &PermCheck,
@@ -757,16 +795,17 @@ pub(crate) async fn request_hook_approval(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.hook_ask_decision(tool, input))
     };
-    match result {
-        CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => Ok(()),
-        CheckResult::Denied(reason) => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(tx, perm, tool, input, None, Vec::new(), diagnostic).await
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        input,
+        None,
+        Vec::new(),
+    )
+    .await
+    .map(drop)
 }
 
 pub async fn check_perm(
@@ -792,29 +831,16 @@ pub(crate) async fn check_perm_with_suggestion(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.check(tool, input_key))
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(
-                tx,
-                perm,
-                tool,
-                input_key,
-                suggested_pattern,
-                Vec::new(),
-                diagnostic,
-            )
-            .await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        input_key,
+        suggested_pattern,
+        Vec::new(),
+    )
+    .await
 }
 
 #[cfg(feature = "mcp")]
@@ -832,29 +858,16 @@ pub(crate) async fn check_mcp_perm(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.check_mcp(input_key, trusted_identity, mcp_tool_name))
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(
-                tx,
-                perm,
-                "mcp_tool",
-                input_key,
-                None,
-                Vec::new(),
-                diagnostic,
-            )
-            .await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        "mcp_tool",
+        input_key,
+        None,
+        Vec::new(),
+    )
+    .await
 }
 
 #[cfg(feature = "mcp")]
@@ -875,25 +888,17 @@ pub(crate) async fn check_mcp_auxiliary_perm(
         .check_diagnosed(|guard| {
             guard.check_mcp_auxiliary(policy_input, identity, trusted_identity, operation)
         });
-    match result {
-        CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => Ok(()),
-        CheckResult::Denied(reason) => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
-        CheckResult::Ask => {
-            let Some(sender) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(
-                sender,
-                permission,
-                "mcp_tool",
-                identity,
-                None,
-                Vec::new(),
-                diagnostic,
-            )
-            .await
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        permission,
+        "mcp_tool",
+        identity,
+        None,
+        Vec::new(),
+    )
+    .await
+    .map(drop)
 }
 
 pub async fn check_perm_path(
@@ -983,29 +988,16 @@ async fn check_perm_path_inner(
             }
         })
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(
-                tx,
-                perm,
-                tool,
-                path,
-                suggested_pattern,
-                additional_allow_patterns,
-                diagnostic,
-            )
-            .await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        path,
+        suggested_pattern,
+        additional_allow_patterns,
+    )
+    .await
 }
 
 /// Check a canonical path whose exact filesystem object is held open by the
@@ -1027,20 +1019,16 @@ pub(crate) async fn check_perm_canonical_path(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.check_canonical_path(tool, path, external))
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(tx, perm, tool, path, None, Vec::new(), diagnostic).await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        path,
+        None,
+        Vec::new(),
+    )
+    .await
 }
 
 /// Per-entry deny filter for a walking tool (`grep`, `find_files`,
@@ -1100,20 +1088,16 @@ pub(crate) async fn check_perm_bound_path(
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_diagnosed(|guard| guard.check_bound_path(tool, logical))
     };
-    match result {
-        CheckResult::Allowed => Ok(None),
-        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(diagnostic.noninteractive_error()));
-            };
-            handle_ask_inner(tx, perm, tool, logical, None, Vec::new(), diagnostic).await?;
-            Ok(None)
-        }
-    }
+    settle_check(
+        (result, diagnostic),
+        ask_tx,
+        perm,
+        tool,
+        logical,
+        None,
+        Vec::new(),
+    )
+    .await
 }
 
 #[cfg(test)]
