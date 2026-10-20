@@ -508,7 +508,7 @@ impl McpClientHandle {
                         })?;
                 let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
                 let stderr_task =
-                    stderr.map(|stderr| capture_stderr(stderr, Arc::clone(&stderr_buffer)));
+                    stderr.map(|stderr| capture_stderr(stderr, Arc::downgrade(&stderr_buffer)));
                 let initialized = tokio::select! {
                     biased;
                     _ = crate::agent::runner::current_work_scope_cancelled() => None,
@@ -550,6 +550,9 @@ impl McpClientHandle {
                         .await);
                     }
                 };
+                // Connected: nothing can read the diagnostic any more, so the
+                // capture task (which holds only a `Weak`) now just drains.
+                drop(stderr_buffer);
                 Ok(Self {
                     server_name,
                     trusted_identity: config.trusted_identity(),
@@ -864,9 +867,13 @@ pub(crate) async fn call_tool_bounded(
     }
 }
 
+/// Collects up to [`MCP_STDERR_LIMIT`] bytes for connect diagnostics. It holds
+/// only a `Weak`: once the connect path drops the buffer the task keeps
+/// draining the pipe (so the server never blocks on a full stderr) but
+/// discards every chunk without locking.
 fn capture_stderr(
     mut stderr: tokio::process::ChildStderr,
-    buffer: Arc<Mutex<Vec<u8>>>,
+    buffer: std::sync::Weak<Mutex<Vec<u8>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut chunk = [0_u8; 1024];
@@ -874,6 +881,9 @@ fn capture_stderr(
             let read = match stderr.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
                 Ok(read) => read,
+            };
+            let Some(buffer) = buffer.upgrade() else {
+                continue;
             };
             let mut captured = buffer.lock().unwrap_or_else(|error| error.into_inner());
             let remaining = MCP_STDERR_LIMIT.saturating_sub(captured.len());
@@ -1367,6 +1377,33 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_capture_holds_no_buffer_once_the_connect_path_drops_it() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "echo first >&2; sleep 0.4; echo second >&2"])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let task = super::capture_stderr(stderr, std::sync::Arc::downgrade(&buffer));
+        while buffer.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::sync::Arc::strong_count(&buffer),
+            1,
+            "the task owns no strong ref"
+        );
+        let weak = std::sync::Arc::downgrade(&buffer);
+        assert!(String::from_utf8_lossy(&buffer.lock().unwrap()).contains("first"));
+        drop(buffer);
+        task.await.unwrap();
+        child.wait().await.unwrap();
+        assert!(weak.upgrade().is_none(), "the buffer is freed at connect");
+    }
+
     #[test]
     fn lossy_stderr_rendering_remains_within_the_byte_cap() {
         let rendered = bounded_lossy_diagnostic(&vec![0xff; super::MCP_STDERR_LIMIT]);
@@ -1466,7 +1503,7 @@ mod tests {
 mod local_policy_tests {
     use super::*;
     fn lookup(addresses: Vec<IpAddr>) -> super::super::egress::Lookup {
-        Arc::new(move |_| {
+        std::sync::Arc::new(move |_| {
             let addresses = addresses.clone();
             Box::pin(async move { Ok(addresses) })
         })
