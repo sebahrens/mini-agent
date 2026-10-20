@@ -282,14 +282,18 @@ def validate_policy(root: Path, *, today: dt.date | None = None) -> None:
     )
 
     workflow = (root / ".github" / "workflows" / "ci.yml").read_text()
+    pins = []
     for tool in ("cargo-audit", "cargo-deny"):
         version = metadata.get(f"{tool}-version")
         require(
             isinstance(version, str) and bool(version),
             f"{tool}-version must be pinned in Cargo.toml",
         )
-        install = f"cargo install --locked {tool} --version {version}"
-        require(install in workflow, f"CI tool pin is missing or stale: {install}")
+        pins.append(f"{tool}@{version}")
+    # Prebuilt binaries via taiki-e/install-action; Cargo.toml stays the
+    # single source of truth for the versions.
+    install = f"tool: {','.join(pins)}"
+    require(install in workflow, f"CI tool pin is missing or stale: {install}")
 
     required_commands = [
         "python3 scripts/tests/test_check_dependency_policy.py",

@@ -1,9 +1,11 @@
 name: Nightly harness evaluation
 
+# Weekly drift run (Mondays): ci.yml's harness-regression job already runs the
+# same fixtures on every push and PR, so nightly runs re-proved identical commits.
 on:
   workflow_dispatch:
   schedule:
-    - cron: '41 2 * * *'
+    - cron: '41 2 * * 1'
 
 permissions:
   contents: read

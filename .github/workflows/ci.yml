@@ -368,6 +368,8 @@ jobs:
       # internal, so it stays valid while scripts/gym/* is rewritten.
       - name: Smoke the Gym entrypoints
         shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           set -euo pipefail
           cargo install --locked --path . --debug --features skills \
@@ -444,6 +446,8 @@ jobs:
 
       - name: Install native ACP candidate
         working-directory: .
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           cargo install --path . --debug --locked --root "$RUNNER_TEMP/vscode-native"
           mkdir -p editors/vscode/bin/linux-x64
@@ -665,7 +669,7 @@ jobs:
       - name: Test (${{ matrix.features }}) on Linux
         if: matrix.os != 'macos-latest' && steps.fp.outputs.skip != 'true'
         run: >-
-          cargo test --locked ${{ matrix.features }} -- --test-threads=1
+          cargo test --locked ${{ matrix.features }} --
           --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
           --skip extras::js::tests::skill_runtime_binding
 
@@ -808,9 +812,11 @@ jobs:
           classes: production+tests
           key: ${{ steps.fp.outputs.key }}
 
-  # Every `test` row serialises with --test-threads=1, so only this job sees
-  # the load of the standard parallel runner that local `cargo test` applies.
-  # macOS runs it too: a readiness race there is invisible to the Linux row.
+  # The Linux `test` rows run the standard parallel runner (rows that need
+  # process-global isolation have their own serial steps), while the macOS
+  # `test` rows stay serial with --test-threads=1. This job keeps the default
+  # suite under the parallel runner on macOS too: a readiness race there is
+  # invisible to the serial macOS row.
   parallel-test-smoke:
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs: changes
@@ -1351,6 +1357,8 @@ jobs:
 
       - name: Measure Linux JS worker resources without gating noisy timing percentiles
         shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           benchmark_root="${RUNNER_TEMP}/js-worker-benchmark-install"
           cargo install --locked --path . --debug --no-default-features --features js \
@@ -1524,6 +1532,8 @@ jobs:
 
       - name: Validate the non-libtest macOS production-binary containment matrix
         shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           install_root="${RUNNER_TEMP}/macos-hosted-matrix-install"
           cargo install --locked --path . --debug --no-default-features --features js \
@@ -1613,6 +1623,8 @@ jobs:
       - name: Measure macOS JS worker resources without gating noisy timing percentiles
         if: matrix.os == 'macos-26'
         shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           benchmark_root="${RUNNER_TEMP}/js-worker-benchmark-install"
           cargo install --locked --path . --debug --no-default-features --features js \
@@ -1824,6 +1836,8 @@ jobs:
 
       - name: Install the debug binary used by the native sandbox probe
         shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           $root = Join-Path $env:RUNNER_TEMP 'windows-general-sandbox'
           cargo install --locked --path . --debug --root $root
@@ -1959,6 +1973,8 @@ jobs:
 
       - name: Install the exact JS binary for Unicode-path containment cases
         shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           # Keep dependency sources beneath an ASCII Cargo home because aws-lc's
           # NASM build cannot consume non-ASCII source paths. The native gate
@@ -3001,6 +3017,8 @@ jobs:
 
       - name: Install debug binary into a clean root
         shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           $installRoot = Join-Path $env:RUNNER_TEMP 'zerostack-platform-install'
           cargo install --locked --path . --debug --root $installRoot
@@ -3239,6 +3257,8 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Install locally (debug)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo install --locked --path . --debug
 
   windows-msi:
@@ -3364,9 +3384,9 @@ jobs:
         run: cargo metadata --locked --all-features --format-version 1 > /dev/null
 
       - name: Install dependency policy tools
-        run: |
-          cargo install --locked cargo-audit --version 0.22.1
-          cargo install --locked cargo-deny --version 0.19.4
+        uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
+        with:
+          tool: cargo-audit@0.22.1,cargo-deny@0.19.4
 
       - name: Audit the committed lockfile
         run: cargo audit --file Cargo.lock
