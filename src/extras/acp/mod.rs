@@ -107,17 +107,29 @@ struct PromptMcp {
 #[derive(PartialEq, Eq)]
 struct McpKey {
     workspace: usize,
-    servers: String,
+    servers: Arc<str>,
 }
 
 #[cfg(feature = "mcp")]
 impl McpKey {
+    #[cfg(test)]
     fn new(cfg: &Config, workspace: &Arc<crate::paths::WorkspaceBinding>) -> Self {
-        let servers: std::collections::BTreeMap<_, _> = cfg.mcp_servers.iter().flatten().collect();
+        Self::from_servers(Self::servers_fingerprint(cfg), workspace)
+    }
+
+    fn from_servers(servers: Arc<str>, workspace: &Arc<crate::paths::WorkspaceBinding>) -> Self {
         Self {
             workspace: Arc::as_ptr(workspace) as usize,
-            servers: serde_json::to_string(&servers).unwrap_or_default(),
+            servers,
         }
+    }
+
+    /// The server-map half of the key. `cfg` is fixed for the server's
+    /// lifetime and a session's client servers for the session's, so this is
+    /// computed once at `session/new` rather than serialized per prompt.
+    fn servers_fingerprint(cfg: &Config) -> Arc<str> {
+        let servers: std::collections::BTreeMap<_, _> = cfg.mcp_servers.iter().flatten().collect();
+        Arc::from(serde_json::to_string(&servers).unwrap_or_default())
     }
 }
 
@@ -423,6 +435,9 @@ struct SessionState {
     /// tool-enabled prompt alongside the configured servers.
     #[cfg(feature = "mcp")]
     client_mcp_servers: Arc<ClientMcpServers>,
+    /// [`McpKey::servers_fingerprint`] of the configured plus client servers.
+    #[cfg(feature = "mcp")]
+    mcp_servers_fingerprint: Arc<str>,
     /// This session's `/cron` schedules. Never persisted; dropping the
     /// session (close or replacement) clears them and releases their idle
     /// lease.
@@ -1755,6 +1770,10 @@ async fn install_session(
             #[cfg(feature = "skills")]
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
             #[cfg(feature = "mcp")]
+            mcp_servers_fingerprint: McpKey::servers_fingerprint(&with_client_mcp_servers(
+                &state.cfg,
+                &client_mcp_servers,
+            )),
             client_mcp_servers: Arc::new(client_mcp_servers),
             cron: cron::CronOwner::default(),
         },
@@ -4252,15 +4271,19 @@ async fn execute_prompt(
     };
     #[cfg(feature = "mcp")]
     if state.cli.mcp_is_eligible(&state.cfg) {
-        let client_servers = state
+        let (client_servers, fingerprint) = state
             .sessions
             .lock()
             .await
             .get(&session_id)
-            .map(|session| session.client_mcp_servers.clone())
-            .unwrap_or_default();
-        let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
-        let key = McpKey::new(&mcp_cfg, &workspace);
+            .map(|session| {
+                (
+                    session.client_mcp_servers.clone(),
+                    session.mcp_servers_fingerprint.clone(),
+                )
+            })
+            .unwrap_or_else(|| (Default::default(), McpKey::servers_fingerprint(&state.cfg)));
+        let key = McpKey::from_servers(fingerprint, &workspace);
         // A manager this prompt did not connect stays at the session's
         // disposal until the prompt finishes (`run_prompt` hands it back).
         match history.reuse.mcp.take() {
@@ -4272,6 +4295,7 @@ async fn execute_prompt(
                 // The servers belong to the session, not to this prompt: they
                 // connect under their own scope so a later prompt's cancellation
                 // cannot reach connections it did not start.
+                let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
                 let scope = crate::agent::runner::AgentWorkScope::new();
                 #[cfg(feature = "hooks")]
                 scope.set_hook_execution_root(workspace.root());

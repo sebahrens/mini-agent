@@ -699,7 +699,7 @@ impl<'de> Deserialize<'de> for LspActivation {
 /// enabled, language servers are spawned lazily for edited files and
 /// diagnostics are fed back to the agent after edits.
 #[cfg(feature = "lsp")]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LspConfig {
     pub enabled: LspActivation,
@@ -709,7 +709,7 @@ pub struct LspConfig {
 }
 
 #[cfg(feature = "lsp")]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LspServerConfig {
     /// Server binary, resolved via PATH. Empty when the entry only disables

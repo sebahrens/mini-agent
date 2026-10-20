@@ -203,7 +203,7 @@ pub(crate) struct SessionLsp {
 #[cfg(any(feature = "acp", test))]
 struct SessionLspEntry {
     workspace: usize,
-    config: serde_json::Value,
+    config: LspConfig,
     manager: Option<LspManager>,
 }
 
@@ -218,14 +218,12 @@ impl SessionLsp {
         cfg: &LspConfig,
         workspace: Arc<crate::paths::WorkspaceBinding>,
     ) -> Option<LspManager> {
-        let key = (
-            Arc::as_ptr(&workspace) as usize,
-            serde_json::to_value(cfg).ok(),
-        );
+        let workspace_id = Arc::as_ptr(&workspace) as usize;
         let mut slot = self.slot.lock().await;
-        if let (Some(entry), (ptr, Some(config))) = (slot.as_ref(), &key)
-            && entry.workspace == *ptr
-            && entry.config == *config
+        // Structural equality: no per-prompt serialization or allocation.
+        if let Some(entry) = slot.as_ref()
+            && entry.workspace == workspace_id
+            && entry.config == *cfg
         {
             return entry.manager.clone();
         }
@@ -234,14 +232,11 @@ impl SessionLsp {
         let manager = LspManager::prepare(cfg, workspace).await;
         // A changed workspace or configuration replaces the entry; its old
         // servers are stopped rather than left running unowned.
-        let previous = match key {
-            (workspace, Some(config)) => slot.replace(SessionLspEntry {
-                workspace,
-                config,
-                manager: manager.clone(),
-            }),
-            _ => slot.take(),
-        };
+        let previous = slot.replace(SessionLspEntry {
+            workspace: workspace_id,
+            config: cfg.clone(),
+            manager: manager.clone(),
+        });
         if let Some(previous) = previous.and_then(|entry| entry.manager) {
             previous.shutdown().await;
         }
