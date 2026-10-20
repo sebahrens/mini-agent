@@ -789,6 +789,10 @@ pub(crate) enum MemoryPlacement {
 pub struct Session {
     pub id: CompactString,
     pub name: CompactString,
+    /// Declared right after `name` so it serializes in the file head: `--continue`
+    /// peeks it without reading or parsing foreign sessions (mini-agent-vb5vw.58).
+    /// Deserialization is order-independent, so older files still load.
+    pub working_dir: CompactString,
     /// A title the configured `session_title_model` generated after the first
     /// exchange. Shown in session lists when the session has no name; absent
     /// unless that opt-in setting is on (mini-agent-3wsib).
@@ -814,7 +818,7 @@ pub struct Session {
     pub(crate) retired_native_history: Vec<native_replay::NativeHistory>,
     #[serde(
         default,
-        skip_serializing_if = "native_replay::NativeFrontier::is_initial"
+        skip_serializing_if = "native_replay::NativeFrontier::skip_serializing"
     )]
     pub(crate) native_frontier: native_replay::NativeFrontier,
     /// Value-carried writer revision. Deserialization restores no permit;
@@ -912,7 +916,6 @@ pub struct Session {
     pub provider: CompactString,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_override_audit: Vec<ProviderOverrideAudit>,
-    pub working_dir: CompactString,
     #[serde(default)]
     pub permission_allowlist: Vec<PermissionAllowEntry>,
     /// Structured task state shared by the active agent tools and persisted

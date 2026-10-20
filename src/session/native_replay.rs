@@ -143,6 +143,12 @@ impl NativeFrontier {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// `skip_serializing_if` for `Session::native_frontier`: the in-flight
+    /// projection always carries a refusal, so it is never initial.
+    pub(super) fn skip_serializing(&self) -> bool {
+        !ENCODE_IN_FLIGHT.with(std::cell::Cell::get) && self.is_initial()
+    }
+
     pub(crate) fn is_initial(&self) -> bool {
         let saved = self.checkpoint();
         saved.epoch == 0 && saved.refusal.is_none() && !saved.activated
@@ -233,10 +239,37 @@ struct ActivatedFrontier {
     activated: bool,
 }
 
+thread_local! {
+    /// While set, every frontier on this thread encodes as its
+    /// [`NativeFrontier::in_flight_projection`] without building one.
+    static ENCODE_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores the previous encoding mode when the projected encoding ends.
+pub(super) struct InFlightEncoding(bool);
+impl InFlightEncoding {
+    /// Encode borrowed frontiers as their in-flight projection until dropped,
+    /// so a borrowed `Session` serializes exactly as a clone carrying
+    /// `in_flight_projection()` would, without deep-cloning the Session.
+    pub(super) fn install() -> Self {
+        Self(ENCODE_IN_FLIGHT.with(|flag| flag.replace(true)))
+    }
+}
+impl Drop for InFlightEncoding {
+    fn drop(&mut self) {
+        ENCODE_IN_FLIGHT.with(|flag| flag.set(self.0));
+    }
+}
+
 impl serde::Serialize for NativeFrontier {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let saved = self.checkpoint();
-        match saved.refusal {
+        let refusal = if ENCODE_IN_FLIGHT.with(std::cell::Cell::get) {
+            Some(RestartReason::InFlight)
+        } else {
+            saved.refusal
+        };
+        match refusal {
             Some(refusal) => RefusedFrontier {
                 epoch: saved.epoch,
                 refusal,

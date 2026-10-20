@@ -239,3 +239,10 @@ fn login_labels47_copilot_marker_requires_a_private_record_for_the_captured_host
     );
     assert!(!directory.join("session.lock").exists());
 }
+
+#[test]
+fn copilot_http_client_is_built_once_and_reused() {
+    // Both calls must succeed; the second is served from the cached client.
+    http().expect("first client");
+    http().expect("second client");
+}

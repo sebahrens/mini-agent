@@ -124,6 +124,10 @@ struct Scan {
     bytes: usize,
     records: usize,
     identities: BTreeMap<Uuid, [u8; 32]>,
+    /// Receipt IDs of rows covered by a verified checkpoint, whose fingerprints
+    /// were not recomputed. Empty after a full scan. A pending receipt found
+    /// here forces a full rescan so conflicting duplicates are still detected.
+    prefix_ids: std::collections::HashSet<Uuid>,
     summary: LedgerSummary,
 }
 
@@ -587,7 +591,11 @@ impl Ledger {
     }
     /// The ledger's current flush scan, under the writer lock. The cache is
     /// taken, so any failure before `flush_rows` stores it again leaves none.
-    fn flush_scan(&self, file: &mut File) -> anyhow::Result<Scan> {
+    fn flush_scan(
+        &self,
+        binding: &crate::paths::WorkspaceBinding,
+        file: &mut File,
+    ) -> anyhow::Result<Scan> {
         let cached = self
             .flush_cache
             .lock()
@@ -613,6 +621,31 @@ impl Ledger {
                 return Ok(cache.scan);
             }
         }
+        // First flush of the process: seed from the verified checkpoint (one
+        // streamed hash of the covered prefix, no parsing) and parse only the
+        // rows past its offset. Any checkpoint problem scans the whole file.
+        let length = file.metadata()?.len();
+        anyhow::ensure!(
+            length <= MAX_LEDGER_BYTES as u64,
+            "usage ledger exceeds byte limit"
+        );
+        if let Some(state) = load_checkpoint(binding, file, length) {
+            let offset = state.offset;
+            let mut scanned = Scan {
+                bytes: offset as usize,
+                records: state.records,
+                identities: BTreeMap::new(),
+                prefix_ids: state.ids,
+                summary: LedgerSummary {
+                    all_time: state.all_time,
+                    ..Default::default()
+                },
+            };
+            if length > offset {
+                scan_appended(file, &mut scanned, offset, length)?;
+            }
+            return Ok(scanned);
+        }
         scan(file, None)
     }
     fn flush_rows(&self, account: &Account, pending: &[Arc<Row>]) -> anyhow::Result<()> {
@@ -624,7 +657,15 @@ impl Ledger {
         #[cfg(all(test, unix))]
         self.pause_lock_for_test(&file);
         Self::revalidate(&binding, &file)?;
-        let mut scanned = self.flush_scan(&mut file)?;
+        let mut scanned = self.flush_scan(&binding, &mut file)?;
+        // A receipt already in the checkpointed prefix has no fingerprint yet:
+        // rescan fully so a conflicting duplicate fails exactly as before.
+        if pending
+            .iter()
+            .any(|row| scanned.prefix_ids.contains(&row.id))
+        {
+            scanned = scan(&mut file, None)?;
+        }
         // Validate the entire pending batch before appending any of it.
         let mut additions = Vec::new();
         for row in pending {
@@ -741,7 +782,8 @@ fn scan_appended(
         FLUSH_ROWS_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
         let fingerprint = Sha256::digest(serde_json::to_vec(&row)?).into();
         anyhow::ensure!(
-            scanned.identities.insert(row.id, fingerprint).is_none(),
+            !scanned.prefix_ids.contains(&row.id)
+                && scanned.identities.insert(row.id, fingerprint).is_none(),
             "usage ledger contains duplicate receipts"
         );
         scanned.summary.all_time.add(&row)?;
@@ -771,6 +813,7 @@ fn scan_with(file: &mut File, session_id: Option<&str>, mode: ScanMode) -> anyho
         bytes: bytes.len(),
         records: 0,
         identities: BTreeMap::new(),
+        prefix_ids: Default::default(),
         summary: LedgerSummary::default(),
     };
     let mut seen = std::collections::BTreeSet::new();
@@ -1586,6 +1629,49 @@ mod tests {
         flush_receipt(&ledger, &one_receipt("a", 14)).unwrap();
         assert_eq!(flush_rows_parsed() - before, 10, "truncation rescans");
         assert_eq!(line_count(&ledger), 11);
+    }
+
+    // mini-agent-vb5vw.60: the first flush of a process seeds from the verified
+    // checkpoint and parses only the rows past its offset, while a receipt that
+    // re-uses a prefix id still gets the full conflict check.
+    #[test]
+    fn first_flush_seeds_from_the_checkpoint_and_still_detects_prefix_conflicts() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-flush-seed");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let writer = Ledger::new(&state);
+        let mut rng = Rng(0x0bad_cafe_f00d_1234);
+        append_random_rows(&writer, &mut rng, 30);
+        let first = one_receipt("a", 5);
+        flush_receipt(&writer, &first).unwrap();
+        // Startup reconciliation writes the checkpoint at the current end.
+        Ledger::new(&state).session_summary("a").unwrap();
+        assert!(state.join(CHECKPOINT_FILE).exists());
+        // Rows past the checkpoint, from another process.
+        append_random_rows(&writer, &mut rng, 3);
+
+        let fresh = Ledger::new(&state);
+        let before = flush_rows_parsed();
+        let new = one_receipt("a", 21);
+        flush_receipt(&fresh, &new).unwrap();
+        assert_eq!(
+            flush_rows_parsed() - before,
+            3,
+            "only the rows past the checkpoint are parsed"
+        );
+        assert_eq!(line_count(&fresh), 35);
+        assert_eq!(fresh.summary().unwrap().all_time.records, 35);
+
+        // A prefix receipt re-used with different content is still rejected;
+        // the identical row is still an idempotent no-op.
+        let mut conflicting = one_receipt("a", 22);
+        Arc::get_mut(&mut conflicting.row).unwrap().id = first.row.id;
+        assert!(flush_receipt(&Ledger::new(&state), &conflicting).is_err());
+        assert_eq!(line_count(&fresh), 35);
+        let mut same = one_receipt("a", 5);
+        same.row = first.row.clone();
+        flush_receipt(&Ledger::new(&state), &same).unwrap();
+        assert_eq!(line_count(&fresh), 35);
     }
 
     #[test]

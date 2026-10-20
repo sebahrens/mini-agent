@@ -606,21 +606,18 @@ fn write_projection_with(
     in_flight: bool,
     encoded: Option<String>,
 ) -> anyhow::Result<()> {
-    let projected;
-    let snapshot = if in_flight {
-        let mut copy = session.clone();
-        copy.native_frontier = session.native_frontier.in_flight_projection();
-        projected = copy;
-        &projected
-    } else {
-        session
-    };
-    snapshot.validate_native_persistence()?;
+    // The in-flight projection differs from `session` only in its encoded
+    // frontier, which the thread-local encoding mode supplies; no Session
+    // clone is built. Validation reads only the (unchanged) epoch.
+    session.validate_native_persistence()?;
     let json = match encoded.filter(|_| !in_flight) {
         Some(encoded) => encoded,
-        None => super::storage::serialize_bounded_session(snapshot)?,
+        None => {
+            let _projection = in_flight.then(super::native_replay::InFlightEncoding::install);
+            super::storage::serialize_bounded_session(session)?
+        }
     };
-    let publication = snapshot
+    let publication = session
         .native_publication
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("native checkpoint requires its retained writer"))?;
@@ -1835,6 +1832,35 @@ mod tests {
             assert_eq!(imported(&session).messages.len(), 2);
             assert!(session.permission_allowlist.is_empty());
         });
+    }
+
+    // mini-agent-vb5vw.57: the in-flight projection is encoded from the borrowed
+    // Session by a thread-local mode instead of a deep clone, and the bytes are
+    // exactly those of a clone carrying `in_flight_projection()`.
+    #[test]
+    fn in_flight_projection_encoding_equals_the_cloned_projection_without_a_clone() {
+        for activated in [false, true] {
+            let mut session = Session::new("anthropic", "fixture", 32_000, "");
+            session.add_message(super::super::MessageRole::User, "literal prompt");
+            if activated {
+                session.native_frontier.activate_publication();
+            }
+            let mut clone = session.clone();
+            clone.native_frontier = session.native_frontier.in_flight_projection();
+            let expected = super::super::storage::serialize_bounded_session(&clone).unwrap();
+            let live = super::super::storage::serialize_bounded_session(&session).unwrap();
+            let projected = {
+                let _mode = super::super::native_replay::InFlightEncoding::install();
+                super::super::storage::serialize_bounded_session(&session).unwrap()
+            };
+            assert_eq!(projected, expected, "activated={activated}");
+            assert_ne!(projected, live);
+            assert_eq!(
+                super::super::storage::serialize_bounded_session(&session).unwrap(),
+                live,
+                "the mode ends with its guard"
+            );
+        }
     }
 
     #[test]
