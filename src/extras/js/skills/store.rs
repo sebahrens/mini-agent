@@ -370,6 +370,8 @@ impl SkillStore {
         // deferred read-to-write upgrade, while WAL keeps unrelated readers
         // from blocking the writer.
         db.busy_timeout(STORE_BUSY_TIMEOUT)?;
+        // Per-turn readers and the admission poll reuse fixed-text statements.
+        db.set_prepared_statement_cache_capacity(32);
         let current_journal_mode: String =
             db.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
         let journal_mode = if current_journal_mode.eq_ignore_ascii_case("wal") {
@@ -484,7 +486,7 @@ impl SkillStore {
     /// Recomputes the canonical identity and refuses to return source for a
     /// tampered row. Returns None if the skill does not exist.
     pub fn get(&self, id: &str) -> Result<Option<SkillArtifact>, StoreError> {
-        let mut stmt = self.db.prepare(
+        let mut stmt = self.db.prepare_cached(
             "SELECT id, identity_version, source, description, tags_json,
                     exports_json, tests_json, capability_json, status
              FROM skill_revisions WHERE id = ?",
@@ -509,7 +511,7 @@ impl SkillStore {
         &self,
         predecessor_id: &str,
     ) -> Result<Vec<SkillArtifact>, StoreError> {
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             "WITH RECURSIVE ancestors(
                  id, identity_version, source, description, tags_json,
                  exports_json, tests_json, capability_json, status, supersedes_id
@@ -547,7 +549,7 @@ impl SkillStore {
     /// Test snapshots use this view; production retrieval loads an index generation.
     #[cfg(test)]
     pub fn list_retrievable(&self) -> Result<Vec<SkillArtifact>, StoreError> {
-        let mut stmt = self.db.prepare(
+        let mut stmt = self.db.prepare_cached(
             "SELECT id, identity_version, source, description, tags_json,
                     exports_json, tests_json, capability_json, status
              FROM skill_revisions WHERE status = 'active'
@@ -600,7 +602,7 @@ impl SkillStore {
             })
             .transpose()?
             .flatten();
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             // A replacement only gains `lineage_root_id` when it is promoted, so
             // a sibling that is still `verified` or in canary carries its
             // lineage on its proposal instead. Resolving through the proposal
@@ -669,7 +671,7 @@ impl SkillStore {
         model_revision: &str,
     ) -> Result<Vec<(SkillArtifact, Option<StoredEmbedding>, SkillRecordMetadata)>, StoreError>
     {
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             "SELECT r.id, r.identity_version, r.source, r.description, r.tags_json,
                     r.exports_json, r.tests_json, r.capability_json, r.status,
                     r.supersedes_id, r.superseded_by_id, r.row_version,
@@ -746,7 +748,7 @@ impl SkillStore {
         model_id: &str,
         model_revision: &str,
     ) -> Result<Vec<(String, Option<StoredEmbedding>, SkillRecordMetadata)>, StoreError> {
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             "SELECT r.id, r.status, r.supersedes_id, r.superseded_by_id, r.row_version,
                     e.dimensions, e.normalized, e.embedding
              FROM skill_revisions r
@@ -819,7 +821,7 @@ impl SkillStore {
     {
         #[cfg(test)]
         ARTIFACT_SCANS.with(|scans| scans.set(scans.get() + 1));
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             "SELECT r.id, r.identity_version, r.source, r.description, r.tags_json,
                     r.exports_json, r.tests_json, r.capability_json, r.status,
                     r.supersedes_id, r.superseded_by_id, r.row_version,
@@ -893,7 +895,7 @@ impl SkillStore {
     pub(super) fn snapshot_lifecycle_only(
         &self,
     ) -> Result<Vec<(String, SkillRecordMetadata)>, StoreError> {
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             "SELECT id, status, supersedes_id, superseded_by_id, row_version
              FROM skill_revisions
              WHERE status = 'active' AND identity_version = 2
@@ -1145,26 +1147,25 @@ impl SkillStore {
     /// Read persisted desired/applied generation and active model metadata.
     pub fn generation_state(&self) -> Result<GenerationState, StoreError> {
         self.db
-            .query_row(
+            .prepare_cached(
                 "SELECT desired_generation, applied_generation, model_id, model_revision,
                     dimensions, normalized, publication_mode
              FROM skill_generations WHERE singleton = 1",
-                [],
-                |row| {
-                    let desired: i64 = row.get(0)?;
-                    let applied: i64 = row.get(1)?;
-                    let dimensions: i64 = row.get(4)?;
-                    Ok(GenerationState {
-                        desired_generation: u64::try_from(desired).unwrap_or(0),
-                        applied_generation: u64::try_from(applied).unwrap_or(0),
-                        model_id: row.get(2)?,
-                        model_revision: row.get(3)?,
-                        dimensions: usize::try_from(dimensions).unwrap_or(0),
-                        normalized: row.get::<_, i64>(5)? == 1,
-                        publication_mode: row.get(6)?,
-                    })
-                },
-            )
+            )?
+            .query_row([], |row| {
+                let desired: i64 = row.get(0)?;
+                let applied: i64 = row.get(1)?;
+                let dimensions: i64 = row.get(4)?;
+                Ok(GenerationState {
+                    desired_generation: u64::try_from(desired).unwrap_or(0),
+                    applied_generation: u64::try_from(applied).unwrap_or(0),
+                    model_id: row.get(2)?,
+                    model_revision: row.get(3)?,
+                    dimensions: usize::try_from(dimensions).unwrap_or(0),
+                    normalized: row.get::<_, i64>(5)? == 1,
+                    publication_mode: row.get(6)?,
+                })
+            })
             .map_err(StoreError::from)
     }
 
@@ -1412,7 +1413,7 @@ impl SkillStore {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidate: Option<(String, String, Option<String>, u32, u32, i64)> = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT proposal_id, skill_id, predecessor_id, attempt_count,
                         infrastructure_attempt_count, row_version
                  FROM skill_proposals
@@ -1424,18 +1425,17 @@ impl SkillStore {
                    )
                  ORDER BY proposed_at, proposal_id
                  LIMIT 1",
-                params![MAX_EVALUATION_ATTEMPTS, now],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
+            )?
+            .query_row(params![MAX_EVALUATION_ATTEMPTS, now], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
             .optional()?;
         let Some((
             proposal_id,
@@ -1548,6 +1548,24 @@ impl SkillStore {
     /// with an explicit reason code keeps the immutable identity unrejected and
     /// recoverable, either by an authenticated reevaluation request or by a
     /// byte-identical resubmission.
+    /// Earliest instant at which a still-claimable proposal becomes due:
+    /// a pending row's `next_attempt_at` (or `now` when unset) or an
+    /// evaluating row's lease expiry. `None` when nothing is claimable.
+    /// Read-only; lets the admission worker sleep until real work exists.
+    pub(crate) fn earliest_proposal_due_at(&self, now: i64) -> Result<Option<i64>, StoreError> {
+        let due: Option<i64> = self
+            .db
+            .prepare_cached(
+                "SELECT MIN(CASE WHEN status = 'pending'
+                                 THEN COALESCE(next_attempt_at, ?2)
+                                 ELSE lease_expires_at END)
+                 FROM skill_proposals
+                 WHERE attempt_count < ?1 AND status IN ('pending', 'evaluating')",
+            )?
+            .query_row(params![MAX_EVALUATION_ATTEMPTS, now], |row| row.get(0))?;
+        Ok(due)
+    }
+
     pub(crate) fn sweep_exhausted_proposals(
         &mut self,
         now: i64,
@@ -1556,7 +1574,7 @@ impl SkillStore {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stranded = {
-            let mut statement = tx.prepare(
+            let mut statement = tx.prepare_cached(
                 "SELECT proposal_id FROM skill_proposals
                  WHERE attempt_count >= ?1
                    AND ((status = 'evaluating' AND lease_expires_at <= ?2)
@@ -1872,7 +1890,7 @@ impl SkillStore {
 
     /// Trusted evaluator-only suite access. Proposal/model APIs do not expose this.
     pub(crate) fn enabled_held_out_suites(&self) -> Result<Vec<HeldOutSuiteRecord>, StoreError> {
-        let mut stmt = self.db.prepare(
+        let mut stmt = self.db.prepare_cached(
             "SELECT suite_id, selector_json, cases_json, content_hash, canonical_payload,
                     approved_by, approved_at, enabled
              FROM held_out_suites
