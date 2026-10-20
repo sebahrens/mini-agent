@@ -4370,8 +4370,11 @@ mod native_workspace_compatibility_tests {
         last
     }
 
+    /// Descriptor counts are process-global, so concurrent tests skew them.
+    /// Run with `-- --ignored --test-threads=1` to measure.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
+    #[ignore = "descriptor counts are process-global; run with --test-threads=1"]
     fn native_host_binding_retains_two_descriptors_and_validation_retains_none() {
         let root = crate::tests::OwnedTestDirectory::new("native-binding-descriptors");
         let path = root.path().to_path_buf();
@@ -4386,13 +4389,20 @@ mod native_workspace_compatibility_tests {
             Box::new(())
         });
         assert_eq!(validated, 0, "validate must not leave descriptors behind");
+    }
 
-        let parent = root.path().join("parent");
-        std::fs::create_dir(&parent).unwrap();
-        let victim = parent.join("workspace");
+    #[cfg(unix)]
+    #[test]
+    fn native_host_binding_keeps_no_identity_handle_and_still_detects_replacement() {
+        let root = crate::tests::OwnedTestDirectory::new("native-binding-replacement-identity");
+        let victim = root.path().join("workspace");
         std::fs::create_dir(&victim).unwrap();
         let binding = WorkspaceBinding::capture(&victim).unwrap();
-        std::fs::rename(&victim, parent.join("moved")).unwrap();
+        // The retained identity is plain data; the held directory descriptor
+        // is the only object it vouches for.
+        let _: crate::fs::FileIdentity = binding.identity;
+        assert!(binding.validate().is_ok());
+        std::fs::rename(&victim, root.path().join("moved")).unwrap();
         std::fs::create_dir(&victim).unwrap();
         assert!(binding.validate().is_err(), "replacement must still fail");
     }

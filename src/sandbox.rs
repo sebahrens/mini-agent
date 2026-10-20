@@ -124,6 +124,15 @@ impl GeneralRoots {
     }
 }
 
+/// Bindings validated by `retain_canonical_git_write_roots` earlier in one
+/// launch, handed to the profile build of that same launch so it does not
+/// validate them again. It lives for one `wrap_command_inner` call and is never
+/// stored or cached across commands.
+struct LaunchValidation {
+    roots: Arc<GeneralRoots>,
+    protected: Option<crate::git::runtime::ProtectedRuntimes>,
+}
+
 /// Seatbelt profile inputs computed from the explicit roots, workspace and
 /// cache of one launch shape.
 #[derive(Debug)]
@@ -1969,21 +1978,34 @@ impl Sandbox {
     /// Sandbox owner and its existing worker clone retain these capabilities;
     /// runtime accounting itself holds only weak references.
     fn retain_git_write_roots(&self, cwd: &Path) -> Result<Option<PathBuf>, String> {
+        self.retain_git_write_roots_for_launch(cwd)
+            .map(|(workspace, _)| workspace)
+    }
+
+    /// [`Self::retain_git_write_roots`] that also returns what this launch
+    /// validated, for its own profile build.
+    fn retain_git_write_roots_for_launch(
+        &self,
+        cwd: &Path,
+    ) -> Result<(Option<PathBuf>, Option<LaunchValidation>), String> {
         crate::git::global_snapshot::mark_effects_started();
         if !self.enabled {
-            return Ok(None);
+            return Ok((None, None));
         }
         let workspace = canonical_non_root(cwd, "sandbox write root")?;
-        self.retain_canonical_git_write_roots(&workspace)?;
-        Ok(Some(workspace))
+        let launch = self.retain_canonical_git_write_roots(&workspace)?;
+        Ok((Some(workspace), launch))
     }
 
     /// [`Self::retain_git_write_roots`] for a workspace that is already the
     /// canonical, non-root output of `canonical_non_root` in this launch.
-    fn retain_canonical_git_write_roots(&self, workspace: &Path) -> Result<(), String> {
+    fn retain_canonical_git_write_roots(
+        &self,
+        workspace: &Path,
+    ) -> Result<Option<LaunchValidation>, String> {
         crate::git::global_snapshot::mark_effects_started();
         if !self.enabled {
-            return Ok(());
+            return Ok(None);
         }
         let cache = self.get_cached_cache_dir()?;
         let roots = self.general_roots(workspace)?;
@@ -2058,7 +2080,7 @@ impl Sandbox {
             .iter()
             .map(|(binding, validated)| (binding, *validated))
             .collect::<Vec<_>>();
-        crate::git::runtime::record_model_roots(&batch)?;
+        let protected = crate::git::runtime::record_model_roots(&batch)?;
         retained.extend(added);
         if self.profile == SandboxProfile::HostFull {
             let owner = retained
@@ -2067,10 +2089,12 @@ impl Sandbox {
             crate::git::runtime::record_host_writes(
                 &self.git_write_roots,
                 owner,
-                &general_profile::protected_host_paths()?,
+                &general_profile::protected_host_paths_from(
+                    crate::git::runtime::protected_runtime_paths_reusing(protected.as_ref())?,
+                )?,
             )?;
         }
-        Ok(())
+        Ok(Some(LaunchValidation { roots, protected }))
     }
 
     /// Explicit general-profile roots for `base`, captured once and validated
@@ -2958,6 +2982,19 @@ impl Sandbox {
         cache: &Path,
         deny_network: bool,
     ) -> Result<Arc<str>, String> {
+        self.get_seatbelt_profile_for_launch(workspace, cache, deny_network, None)
+    }
+
+    /// [`Self::get_seatbelt_profile`] for a launch that already validated the
+    /// explicit roots and protected runtimes of this same workspace; those are
+    /// reused instead of validated a second time. `None` validates everything.
+    fn get_seatbelt_profile_for_launch(
+        &self,
+        workspace: &Path,
+        cache: &Path,
+        deny_network: bool,
+        launch: Option<&LaunchValidation>,
+    ) -> Result<Arc<str>, String> {
         // Dynamic per launch: Git metadata aliases, `.git` write denials,
         // guarded runtime paths and explicit-root identity are re-checked on
         // every call, including cache hits. Only the private-path denials
@@ -2979,11 +3016,16 @@ impl Sandbox {
         let git_write_denies = validated_metadata.seatbelt_write_denies(workspace);
         #[cfg(not(target_os = "macos"))]
         let git_write_denies = git_metadata::seatbelt_write_denies(workspace);
-        let mut protected = crate::git::runtime::protected_runtime_paths()?;
+        let mut protected = crate::git::runtime::protected_runtime_paths_reusing(
+            launch.and_then(|launch| launch.protected.as_ref()),
+        )?;
         protected.push(app_paths.cache_dir);
         let protected_denies = private.protected_denies(&protected)?;
         let protected_storage = &protected_denies.storage;
-        let roots = self.general_roots(workspace)?;
+        let roots = match launch {
+            Some(launch) if launch.roots.base == workspace => launch.roots.clone(),
+            _ => self.general_roots(workspace)?,
+        };
         let root_inputs =
             seatbelt_root_inputs(&roots, workspace, cache, &workspace_str, &cache_str)?;
         let SeatbeltRootInputs {
@@ -3108,7 +3150,7 @@ impl Sandbox {
             .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
         // One resolution of the requested directory serves the write-root
         // accounting, the child cwd and the profile's workspace grant.
-        let resolved_cwd = self.retain_git_write_roots(&requested_cwd)?;
+        let (resolved_cwd, launch) = self.retain_git_write_roots_for_launch(&requested_cwd)?;
         match self.policy() {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
@@ -3181,8 +3223,13 @@ impl Sandbox {
             // through the descriptor below.
             let profile_workspace =
                 self.canonical_workspace_root_from(&requested_cwd, resolved_cwd.as_deref())?;
-            let mut command =
-                self.build_seatbelt_command(seatbelt, command, &profile_workspace, &cache_dir)?;
+            let mut command = self.build_seatbelt_command(
+                seatbelt,
+                command,
+                &profile_workspace,
+                &cache_dir,
+                launch.as_ref(),
+            )?;
             if self.workspace_binding.is_some() && cfg!(unix) {
                 command.current_dir("/");
             }
@@ -3297,7 +3344,7 @@ impl Sandbox {
             return Ok(cmd);
         }
 
-        self.retain_canonical_git_write_roots(&cwd)?;
+        let launch = self.retain_canonical_git_write_roots(&cwd)?;
         let cache_dir = self.get_cached_cache_dir()?;
 
         if self.backend == "seatbelt" {
@@ -3306,7 +3353,8 @@ impl Sandbox {
                 "sandbox backend 'seatbelt' is not a trusted system executable — refusing to run hook unsandboxed"
                     .to_string()
             })?;
-            let profile = self.get_seatbelt_profile(&cwd, &cache_dir, true)?;
+            let profile =
+                self.get_seatbelt_profile_for_launch(&cwd, &cache_dir, true, launch.as_ref())?;
             let mut cmd = Command::new(seatbelt);
             cmd.arg("-p")
                 .arg(profile.as_ref())
@@ -3489,7 +3537,7 @@ impl Sandbox {
 
         let cwd = canonical_non_root(cwd, "workspace-service working directory")?;
         let cache_dir = self.get_cached_cache_dir()?;
-        self.retain_canonical_git_write_roots(&cwd)?;
+        let launch = self.retain_canonical_git_write_roots(&cwd)?;
 
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
@@ -3514,7 +3562,12 @@ impl Sandbox {
                 "sandbox backend 'seatbelt' is not a trusted system executable — refusing workspace-service launch"
                     .to_string()
             })?;
-            let profile = self.get_seatbelt_profile(&cwd, &cache_dir, deny_network)?;
+            let profile = self.get_seatbelt_profile_for_launch(
+                &cwd,
+                &cache_dir,
+                deny_network,
+                launch.as_ref(),
+            )?;
             let mut cmd = Command::new(seatbelt);
             cmd.env_clear();
             cmd.arg("-p")
@@ -3748,8 +3801,9 @@ impl Sandbox {
         command: &str,
         cwd: &Path,
         cache_dir: &Path,
+        launch: Option<&LaunchValidation>,
     ) -> Result<Command, String> {
-        let profile = self.get_seatbelt_profile(cwd, cache_dir, true)?;
+        let profile = self.get_seatbelt_profile_for_launch(cwd, cache_dir, true, launch)?;
 
         let mut cmd = Command::new(seatbelt);
         cmd.arg("-p").arg(profile.as_ref());
@@ -8396,6 +8450,7 @@ mod sandbox_tests {
                 "printf sandboxed",
                 &workspace,
                 &cache,
+                None,
             )
             .unwrap();
         let args = command_argv(&command);
@@ -9070,6 +9125,7 @@ echo COMMITTED"#;
                 "printf sandboxed",
                 &workspace,
                 Path::new("/cache/mini-agent"),
+                None,
             )
             .unwrap();
         let args: Vec<String> = command
@@ -10196,6 +10252,62 @@ echo PRIVATE_TEMP_PASS"#,
             .get_seatbelt_profile(&workspace, &cache_dir, true)
             .unwrap();
         assert!(!without_root.contains(&format!("(subpath \"{probe_literal}\")")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_launch_validates_runtime_and_explicit_root_bindings_once() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
+        let scratch = ScratchDir::new();
+        let workspace = scratch.path().join("workspace");
+        let probe = scratch.path().join("probe-root");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&probe).unwrap();
+        let cache_dir = std::env::temp_dir().join(format!("test-cache-{}", uuid::Uuid::new_v4()));
+        let runtime_home = crate::tests::OwnedTestDirectory::new("launch-validation-runtime");
+        let runtime = crate::git::runtime::GuardedRuntime::materialize(
+            crate::git::runtime::bundled_approval().expect("test requires approved bundle"),
+            &runtime_home.path().join("runtime"),
+            &[],
+        )
+        .unwrap();
+        let sandbox = Sandbox::new(true, "seatbelt")
+            .with_test_cache_dir(&cache_dir)
+            .with_general_profile(SandboxProfile::Workspace, vec![probe.clone()], Vec::new());
+        let validations = || crate::paths::VALIDATE_CALLS.with(std::cell::Cell::get);
+
+        // Warm the per-Sandbox root capture so only validations are counted.
+        sandbox
+            .retain_canonical_git_write_roots(&workspace)
+            .unwrap();
+        let start = validations();
+        let launch = sandbox
+            .retain_canonical_git_write_roots(&workspace)
+            .unwrap()
+            .unwrap();
+        let reused = sandbox
+            .get_seatbelt_profile_for_launch(&workspace, &cache_dir, true, Some(&launch))
+            .unwrap();
+        let with_launch = validations() - start;
+
+        let start = validations();
+        sandbox
+            .retain_canonical_git_write_roots(&workspace)
+            .unwrap();
+        let independent = sandbox
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
+            .unwrap();
+        let without_launch = validations() - start;
+
+        assert_eq!(reused.as_ref(), independent.as_ref());
+        // The standalone build validates the explicit root and the retained
+        // runtime directory again; the launch-scoped build does neither.
+        assert_eq!(
+            without_launch - with_launch,
+            2,
+            "with={with_launch} without={without_launch}"
+        );
+        drop(runtime);
     }
 
     #[cfg(unix)]

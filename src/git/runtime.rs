@@ -37,6 +37,17 @@ struct ModelRoots {
     programs: Vec<Weak<TrustedProgram>>,
     host_writes: Vec<HostWrites>,
     refused: bool,
+    /// Bumped whenever a runtime or program is registered, so a snapshot of
+    /// the protected set taken earlier in a launch can prove it is current.
+    generation: u64,
+}
+
+/// The protected runtime/program paths one `record_model_roots` call just
+/// validated, tagged with the registration generation they were read under.
+/// Valid only within the launch that produced it.
+pub(crate) struct ProtectedRuntimes {
+    generation: u64,
+    paths: Vec<PathBuf>,
 }
 
 impl ModelRoots {
@@ -63,15 +74,13 @@ pub(crate) fn record_host_writes(
     binding: &Arc<crate::paths::WorkspaceBinding>,
     paths: &[PathBuf],
 ) -> Result<(), String> {
-    let readonly = paths
+    // Canonical spellings first: the common repeated launch matches an
+    // existing grant by these alone and never needs to open identities.
+    let canonical = paths
         .iter()
         .map(|path| {
-            let canonical = path
-                .canonicalize()
-                .map_err(|_| "host-full readonly authority changed")?;
-            let identity = crate::fs::checked_path_metadata(&canonical)
-                .map_err(|_| "host-full readonly authority changed")?;
-            Ok((canonical, identity))
+            path.canonicalize()
+                .map_err(|_| "host-full readonly authority changed".to_string())
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut state = MODEL_ROOTS
@@ -87,14 +96,18 @@ pub(crate) fn record_host_writes(
     }
     if state.host_writes.iter().any(|grant| {
         grant.owner.ptr_eq(&Arc::downgrade(owner))
-            && grant
-                .readonly
-                .iter()
-                .map(|(p, _)| p)
-                .eq(readonly.iter().map(|(p, _)| p))
+            && grant.readonly.iter().map(|(p, _)| p).eq(canonical.iter())
     }) {
         return Ok(());
     }
+    let readonly = canonical
+        .into_iter()
+        .map(|canonical| {
+            let identity = crate::fs::checked_path_metadata(&canonical)
+                .map_err(|_| "host-full readonly authority changed")?;
+            Ok((canonical, identity))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     if state.host_writes.len() >= MAX_ROOTS {
         return Err("guarded Git host-write count exceeds its bound".into());
     }
@@ -138,7 +151,7 @@ static MODEL_ROOTS: OnceLock<Mutex<ModelRoots>> = OnceLock::new();
 /// retirement. Weak accounting never keeps a retired Windows directory locked.
 #[cfg_attr(not(any(test, windows)), allow(dead_code))]
 pub(crate) fn record_model_root(root: &Arc<crate::paths::WorkspaceBinding>) -> Result<(), String> {
-    record_model_roots(&[(root, false)])
+    record_model_roots(&[(root, false)]).map(|_| ())
 }
 
 /// [`record_model_root`] for every root of one launch under a single lock
@@ -147,9 +160,13 @@ pub(crate) fn record_model_root(root: &Arc<crate::paths::WorkspaceBinding>) -> R
 /// `validated` was identity-checked by the caller immediately before this
 /// call, so its own binding is not validated a second time; the runtime and
 /// program checks, disjointness and the refusal latch apply to every root.
+///
+/// Returns the protected runtime/program paths it validated (sorted, deduped),
+/// or `None` when `roots` was empty and nothing was validated, so the same
+/// launch can build its profile without validating them again.
 pub(crate) fn record_model_roots(
     roots: &[(&Arc<crate::paths::WorkspaceBinding>, bool)],
-) -> Result<(), String> {
+) -> Result<Option<ProtectedRuntimes>, String> {
     let mut state = MODEL_ROOTS
         .get_or_init(Mutex::default)
         .lock()
@@ -164,21 +181,27 @@ pub(crate) fn record_model_roots(
         }
     }
     if roots.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let root_paths = roots
         .iter()
         .map(|(root, _)| root.root().to_path_buf())
         .collect::<Vec<_>>();
+    let mut protected = Vec::new();
     for runtime in state.runtimes.iter().filter_map(Weak::upgrade) {
         runtime.validate()?;
         require_disjoint(runtime.root(), &root_paths)?;
+        protected.push(runtime.root().to_path_buf());
     }
     for program in state.programs.iter().filter_map(Weak::upgrade) {
         program.validate()?;
         require_disjoint(&program.path, &root_paths)?;
         require_disjoint(&program.target, &root_paths)?;
+        protected.push(program.path.clone());
+        protected.push(program.target.clone());
     }
+    protected.sort();
+    protected.dedup();
     for (root, _) in roots {
         if state
             .roots
@@ -194,7 +217,10 @@ pub(crate) fn record_model_roots(
         }
         state.roots.push(Arc::downgrade(root));
     }
-    Ok(())
+    Ok(Some(ProtectedRuntimes {
+        generation: state.generation,
+        paths: protected,
+    }))
 }
 
 pub(crate) fn model_write_roots() -> Result<Vec<PathBuf>, String> {
@@ -220,12 +246,28 @@ pub(crate) fn model_write_roots() -> Result<Vec<PathBuf>, String> {
 /// Current retained executable authority is a read-only exception to explicit
 /// host-wide filesystem writes, never a grant inferred from bundle metadata.
 pub(crate) fn protected_runtime_paths() -> Result<Vec<PathBuf>, String> {
+    protected_runtime_paths_reusing(None)
+}
+
+/// [`protected_runtime_paths`] that skips re-validating the runtimes and
+/// programs when `validated` was produced in this launch and no runtime or
+/// program has been registered since: under the same lock acquisition the set
+/// is then the very objects `record_model_roots` just validated. Any change,
+/// or no snapshot, takes the full validating path.
+pub(crate) fn protected_runtime_paths_reusing(
+    validated: Option<&ProtectedRuntimes>,
+) -> Result<Vec<PathBuf>, String> {
     let state = MODEL_ROOTS
         .get_or_init(Mutex::default)
         .lock()
         .map_err(|_| "guarded Git runtime protection is unavailable")?;
     if state.refused {
         return Err("guarded Git runtime protection is unavailable".into());
+    }
+    if let Some(validated) = validated
+        && validated.generation == state.generation
+    {
+        return Ok(validated.paths.clone());
     }
     let mut paths = Vec::new();
     for root in state.runtimes.iter().filter_map(Weak::upgrade) {
@@ -260,6 +302,7 @@ fn protect_runtime(root: &Arc<crate::paths::WorkspaceBinding>) -> Result<(), Str
         return Err("guarded Git runtime root count exceeds its bound".into());
     }
     state.runtimes.push(Arc::downgrade(root));
+    state.generation += 1;
     Ok(())
 }
 
@@ -321,6 +364,7 @@ impl TrustedProgram {
             require_disjoint(&program.target, &[root.root().to_path_buf()])?;
         }
         state.programs.push(Arc::downgrade(&program));
+        state.generation += 1;
         Ok(program)
     }
     pub(super) fn validate(&self) -> Result<(), String> {

@@ -326,7 +326,13 @@ pub(super) fn roots(
 }
 
 pub(super) fn protected_host_paths() -> Result<Vec<PathBuf>, String> {
-    let mut protected = crate::git::runtime::protected_runtime_paths()?;
+    protected_host_paths_from(crate::git::runtime::protected_runtime_paths()?)
+}
+
+/// [`protected_host_paths`] over a runtime-path set the caller already read.
+pub(super) fn protected_host_paths_from(
+    mut protected: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
     let paths = crate::paths::process_paths()
         .map_err(|_| "sandbox profile: private application paths are unavailable")?;
     protected.push(
