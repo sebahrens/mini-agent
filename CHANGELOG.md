@@ -6,6 +6,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-10-23
+
 ### Added
 
 - Full/default builds include LSP, lifecycle hooks, and multimodal messages. LSP
@@ -373,6 +375,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Changed
 
+- Refresh the embedded model catalog with current provider models and context limits;
+  remove retired chat aliases and unavailable OpenRouter models.
 - CI assembles the GPL Corresponding Source archive in its own code-gated job, so documentation-only
   pushes no longer spend minutes vendoring ~500 npm tarballs, and caches those tarballs by the
   `package-lock.json` hash. `package-corresponding-source.sh --npm-vendor-cache <dir>` reuses a cached
@@ -700,6 +704,7 @@ as 1.9.3; all of its changes ship in 1.9.4.
 
 Thanks to sebahrens and platon2001 for the release work.
 
-[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.9.4...HEAD
+[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/sebahrens/mini-agent/compare/v1.9.4...v1.10.0
 [1.9.4]: https://github.com/sebahrens/mini-agent/compare/v1.8.0...v1.9.4
 [1.8.0]: https://github.com/sebahrens/mini-agent/compare/v1.7.2...v1.8.0
