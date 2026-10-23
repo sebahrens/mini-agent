@@ -681,43 +681,51 @@ mod tests {
                 Ok(read)
             }
         }
-        let prefix = br#"{"id":"fixture","messages":[{"content":"Preview \u96ea \ud83d\ude00 "#;
-        let middle =
-            br#"","role":"user"},{"content":"answer","role":"assistant"}],"padding":{"model":""#;
-        let suffix = br#""},"working_dir":"/late/workspace","model":"late-model","provider":"late-provider"}"#;
-        let size = 12 * 1024 * 1024;
-        let source = prefix
-            .as_slice()
-            .chain(std::io::repeat(b'x').take(size))
-            .chain(middle.as_slice())
-            .chain(std::io::repeat(b'y').take(size))
-            .chain(suffix.as_slice());
-        let mut source = CountReader {
-            source,
-            bytes: 0,
-            max_request: 0,
-        };
-        let (header, _, allocated) =
-            crate::tests::alloc_counter::measure(|| read_header(&mut source).unwrap());
-        assert_eq!(header.id, "fixture");
-        assert_eq!(header.working_dir, "/late/workspace");
-        assert_eq!(header.model, "late-model");
-        assert_eq!(header.provider, "late-provider");
-        assert_eq!(header.messages.count, 2);
-        assert!(header.messages.first_user.starts_with("Preview 雪 😀 "));
-        assert_eq!(
-            source.bytes,
-            prefix.len() + middle.len() + suffix.len() + 2 * size as usize
-        );
-        assert!(
-            source.max_request <= 8 * 1024,
-            "read request: {}",
-            source.max_request
-        );
-        assert!(
-            allocated < 512 * 1024,
-            "allocated {allocated} bytes for streamed metadata"
-        );
+        // Independent virtual documents exercise repeated discovery without
+        // allocating or writing ninety MiB of fixture payloads to disk.
+        for index in 0..3 {
+            let id = format!("fixture-{index}");
+            let prefix =
+                format!(r#"{{"id":"{id}","messages":[{{"content":"Preview \u96ea \ud83d\ude00 "#);
+            let middle =
+                br#"","role":"user"},{"content":"answer","role":"assistant"}],"padding":{"model":""#;
+            let suffix = br#""},"working_dir":"/late/workspace","model":"late-model","provider":"late-provider"}"#;
+            let size = 15 * 1024 * 1024;
+            let source = prefix
+                .as_bytes()
+                .chain(std::io::repeat(b'x').take(size))
+                .chain(middle.as_slice())
+                .chain(std::io::repeat(b'y').take(size))
+                .chain(suffix.as_slice());
+            let mut source = CountReader {
+                source,
+                bytes: 0,
+                max_request: 0,
+            };
+            let (header, _, allocated) =
+                crate::tests::alloc_counter::measure(|| read_header(&mut source).unwrap());
+            assert_eq!(header.id, id);
+            assert_eq!(header.working_dir, "/late/workspace");
+            assert_eq!(header.model, "late-model");
+            assert_eq!(header.provider, "late-provider");
+            assert_eq!(header.messages.count, 2);
+            assert!(header.messages.first_user.starts_with("Preview 雪 😀 "));
+            assert_eq!(
+                source.bytes,
+                prefix.len() + middle.len() + suffix.len() + 2 * size as usize
+            );
+            assert!(source.bytes > 30 * 1024 * 1024);
+            assert!((source.bytes as u64) < MAX_FILE_BYTES);
+            assert!(
+                source.max_request <= 8 * 1024,
+                "document {index} read request: {}",
+                source.max_request
+            );
+            assert!(
+                allocated < 512 * 1024,
+                "document {index} allocated {allocated} bytes for streamed metadata"
+            );
+        }
     }
 
     #[test]
