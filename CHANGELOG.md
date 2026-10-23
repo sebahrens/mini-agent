@@ -212,6 +212,23 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Raise the shared persisted-session ceiling to 32 MiB for long-context and tool-heavy
+  conversations, keeping save, catalogue and reload limits aligned. The catalogue scans
+  session JSON with bounded memory, including files written with older field orders.
+  Older binaries still refuse files larger than their previous 8 MiB ceiling without
+  changing those files; use a current binary to reopen them (mini-agent-nqxsh,
+  mini-agent-z3brj).
+- The VS Code extension accepts up to 48 MiB of ACP session replay, including notification
+  envelopes, alongside the server's 32 MiB session limit. The independent 100,000-update
+  limit remains unchanged. Update the extension as well as the server to reopen larger
+  conversations; an older extension continues to refuse oversized replay safely
+  (mini-agent-y09gf).
+- Oversized saves discard an optional rewind undo snapshot once before retrying, without
+  truncating conversation history or starting model-driven compaction. Saves still over the
+  limit retain the last good file and show a deduplicated `/compact` remedy; successful saves
+  crossing 75% of the limit warn once. Native sessions apply undo recovery only through their
+  authorized publication owner before sealing its digest (mini-agent-ldiyp).
+
 - Four Unix-only Seatbelt/cache tests are correctly gated, restoring Windows test compilation.
 - The scheduled harness-evaluation and JS worker stdout jobs provision the guarded Git runtime
   before Cargo again; since 2026-10-16 every nightly run had failed in the build script.

@@ -2773,6 +2773,13 @@ refuse image input and saved image history before dispatch, retaining stored
 data. The SDK's transport and provider error handling remain authoritative for
 unknown model capabilities; no model-name capability inference is used.
 
+The fixed session-storage ceiling is not a configuration setting. A size-only
+save failure may discard optional rewind undo and retry once; conversation
+history is never truncated. Saves still over the limit retain the last good
+file and suggest `/compact`, without repeating the warning every turn. A
+successful save crossing 75% of the limit also suggests compaction. See the
+[session storage recovery policy](../specs/session-storage-recovery.md).
+
 ACP clients receive per-session permission modes when ordinary tools and
 permission checks are enabled. `session/set_mode` changes that session only
 while it is idle; an active generation, an unknown mode, or disabled checks

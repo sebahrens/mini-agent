@@ -55,6 +55,7 @@ planning context only; it cannot override the cited section.
 | 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Delivered | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
 | Feature | [goals.md](goals.md) | Delivered; reconciled 2026-09-12 after a post-delivery review (see its shipped-binary status) | Persistent objectives, the round loop, the completion gate, verification tiers, bounds, and the goal surfaces |
 | Feature | [acp-session-runtime-policy.md](acp-session-runtime-policy.md) | Canonical session persistence and public editor resume | Bounded private list/load, ordered image turns, per-session modes/choices, actual Plan updates, literal commands and retained native publication |
+| Feature | [session-storage-recovery.md](session-storage-recovery.md) | Canonical storage-size recovery | Bounded undo-only retry, native owner sealing, actionable deduplicated size notices, and compaction recovery |
 
 **Phase 5 reachability note.** "Delivered" in the row above means the phase owns those concerns and
 their contracts are implemented and regression-tested. It does not mean every one of them is

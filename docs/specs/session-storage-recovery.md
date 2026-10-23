@@ -3,7 +3,7 @@
 Session files remain bounded by `session::storage::MAX_SESSION_BYTES`. The
 encoder counts JSON bytes, including escaping, and retains at most the bounded
 payload. Storage errors remain static and do not quote session content. A typed
-size error supplies the encoded byte count and configured limit to frontends.
+size error supplies the encoded byte count and fixed byte limit to frontends.
 
 All ordinary persistence consumers use the shared recovery preparation path:
 interactive settled turns and metadata saves, permissions, goal round boundaries,
@@ -28,8 +28,9 @@ accepted for publication; later I/O errors retain their existing reporting.
 
 Native publication has an additional authority boundary. The exact startup,
 progress, refusal or retirement owner may run the same shrink ladder before
-sealing its new canonical digest. Its acknowledged encoding decision removes
-undo from the live session and queues notices for the frontend. Immutable raw
+sealing its new canonical digest. Removing undo from the live session immediately
+queues its notice, even if publication or acknowledgment subsequently fails;
+successful acknowledgment updates the size-threshold state. Immutable raw
 native snapshots, replay hashes and ordinary saves of an already sealed native
 snapshot remain strict: storage cannot remove undo and then bless a different
 digest. Stale revisions, independently deserialized data and unowned snapshots
