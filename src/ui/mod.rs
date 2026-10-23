@@ -1607,10 +1607,11 @@ pub(crate) fn record_goal_round_boundary(
     run: &mut AgentRunState,
     persistence_enabled: bool,
     next_prompt: &str,
+    notice: impl FnMut(&str),
 ) -> Result<Vec<anyhow::Error>, anyhow::Error> {
     let settled = match run.pending_turn.take() {
         Some(pending) if persistence_enabled => {
-            crate::session::storage::save_session(session)?;
+            crate::session::storage::save_session_recovering(session, notice)?;
             pending.commit_side_effects(true)
         }
         _ => Vec::new(),
@@ -1719,16 +1720,18 @@ pub(crate) fn preserve_pending_main_turn_progress(
 /// but the disk snapshot remains at the pre-turn state until the turn reaches
 /// one terminal success/failure/cancellation transition.
 pub(crate) fn persist_session_if_settled(
-    session: &Session,
+    session: &mut Session,
     persistence_enabled: bool,
     run: &AgentRunState,
+    mut notice: impl FnMut(&str),
 ) -> anyhow::Result<bool> {
+    crate::session::storage::report_pending_save_notices(session, &mut notice);
     if !persistence_enabled || run.pending_turn.is_some() {
         return Ok(false);
     }
     // Turn-end snapshots are serialized here and written off the UI task;
     // exit and session switch join them (see `flush_deferred_sessions`).
-    crate::session::storage::save_session_deferred(session)?;
+    crate::session::storage::save_session_deferred_recovering(session, notice)?;
     Ok(true)
 }
 
@@ -2140,6 +2143,7 @@ mod goal_round_boundary_tests {
             &mut run,
             false,
             "Verification failed, so the goal is not met yet:\ncargo test",
+            |_| {},
         )
         .expect("the boundary is recorded");
         assert!(errors.is_empty());

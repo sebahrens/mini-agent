@@ -991,7 +991,9 @@ pub fn persist_round(
             cfg.normalize_usage(&session.provider, usage.into()),
             cfg.is_anthropic_native(&session.provider),
         );
-        crate::session::storage::save_session(session)
+        crate::session::storage::save_session_recovering(session, |notice| {
+            eprintln!("warning: {notice}")
+        })
     };
     if let Some(failure) = failure {
         // The round's own failure wins; a persistence failure is reported with

@@ -1012,6 +1012,8 @@ pub struct Session {
     #[serde(skip)]
     history_conversion_cache: HistoryConversionCache,
     #[serde(skip)]
+    pub(crate) save_notice_state: storage::SaveNoticeState,
+    #[serde(skip)]
     history_revision: u64,
 }
 
@@ -1401,6 +1403,7 @@ impl Session {
             overhead_parts: Vec::new(),
             rewind_undo: None,
             history_conversion_cache: HistoryConversionCache::default(),
+            save_notice_state: storage::SaveNoticeState::default(),
             history_revision: 0,
         }
     }

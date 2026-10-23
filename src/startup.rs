@@ -716,7 +716,7 @@ async fn join_change_baseline(
 /// another request. Settle that observed accounting without creating a model
 /// prompt turn or connecting its tools/MCP servers.
 async fn settle_headless_preparation_failure(
-    session: &Session,
+    session: &mut Session,
     cfg: &Config,
     cli: &Cli,
     workspace: &crate::paths::WorkspaceBinding,
@@ -725,7 +725,7 @@ async fn settle_headless_preparation_failure(
     let persistence = if cli.no_session {
         Ok(())
     } else {
-        session::storage::save_session(session)
+        session::storage::save_session_recovering(session, |notice| eprintln!("warning: {notice}"))
     };
     if cli.output_format() != OutputFormat::Text {
         let usage = failure
@@ -1425,7 +1425,9 @@ impl Startup {
                 && native_startup.is_none()
                 && (cli.name.is_some() || cli.fork_session)
             {
-                session::storage::save_session(&session)?;
+                session::storage::save_session_recovering(&mut session, |notice| {
+                    eprintln!("warning: {notice}")
+                })?;
             }
         }
         // Goal/name changes belong to this exact startup actor value. They
@@ -2037,6 +2039,9 @@ impl Startup {
     }
 
     async fn dispatch_inner(mut self: Box<Self>) -> anyhow::Result<()> {
+        session::storage::report_pending_save_notices(&mut self.session, |notice| {
+            eprintln!("warning: {notice}")
+        });
         if self.resume_override_pending {
             // All fallible startup validation has completed. Persist the
             // identity/audit update atomically before any agent can receive
@@ -2044,7 +2049,9 @@ impl Startup {
             if let Some(owner) = &mut self.native_startup {
                 owner.save_progress(&mut self.session).await?;
             } else {
-                session::storage::save_session(&self.session)?;
+                session::storage::save_session_recovering(&mut self.session, |notice| {
+                    eprintln!("warning: {notice}")
+                })?;
             }
             self.resume_override_pending = false;
         }
@@ -2184,7 +2191,11 @@ impl Startup {
                 if !self.cli.no_session {
                     let session = &mut self.session;
                     session.add_shell_interaction(&msg, &result);
-                    if let Err(error) = session::storage::save_session(session) {
+                    if let Err(error) =
+                        session::storage::save_session_recovering(session, |notice| {
+                            eprintln!("warning: {notice}")
+                        })
+                    {
                         persistence_failure = Some(error);
                     } else if let Err(e) = session::chat_history::append_entry(
                         &session::chat_history::ChatHistoryEntry {
@@ -2288,7 +2299,7 @@ impl Startup {
                 Err(error) => {
                     return Err(heap_future(|| {
                         settle_headless_preparation_failure(
-                            &self.session,
+                            &mut self.session,
                             &self.cfg,
                             &self.cli,
                             &self.workspace,
@@ -2568,9 +2579,15 @@ impl Startup {
                 session.charge_usage_delta(usage.into(), anthropic_native);
             }
             let saved = if let Some(owner) = &mut self.native_headless {
-                owner.progress(session).await
+                let result = owner.progress(session).await;
+                session::storage::report_pending_save_notices(session, |notice| {
+                    eprintln!("warning: {notice}")
+                });
+                result
             } else {
-                session::storage::save_session(session)
+                session::storage::save_session_recovering(session, |notice| {
+                    eprintln!("warning: {notice}")
+                })
             };
             if let Err(error) = saved {
                 persistence_failure = Some(error);
@@ -2595,9 +2612,15 @@ impl Startup {
                         failure = Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED));
                     }
                     let saved = if let Some(owner) = &mut self.native_headless {
-                        owner.progress(session).await
+                        let result = owner.progress(session).await;
+                        session::storage::report_pending_save_notices(session, |notice| {
+                            eprintln!("warning: {notice}")
+                        });
+                        result
                     } else {
-                        session::storage::save_session(session)
+                        session::storage::save_session_recovering(session, |notice| {
+                            eprintln!("warning: {notice}")
+                        })
                     };
                     if let Err(error) = saved {
                         persistence_failure = Some(error);
@@ -2629,10 +2652,16 @@ impl Startup {
         if self.native_headless.is_none()
             && !self.cli.no_session
             && !self.session.background_history.is_empty()
-            && let Err(error) = session::storage::save_session(&self.session)
+            && let Err(error) =
+                session::storage::save_session_recovering(&mut self.session, |notice| {
+                    eprintln!("warning: {notice}")
+                })
         {
             persistence_failure = Some(error);
         }
+        session::storage::report_pending_save_notices(&mut self.session, |notice| {
+            eprintln!("warning: {notice}")
+        });
         if let Some((files_changed, pricing)) = json_context {
             let stop_reason = if pending_question.is_some() {
                 crate::print::HeadlessStopReason::AwaitingUser
@@ -3164,7 +3193,13 @@ async fn run_bound_headless_round(
         return failed(error);
     }
     session.pending_question = None;
-    if let Err(error) = owner.progress(session).await {
+    if let Err(error) = {
+        let result = owner.progress(session).await;
+        session::storage::report_pending_save_notices(session, |notice| {
+            eprintln!("warning: {notice}")
+        });
+        result
+    } {
         return failed(error);
     }
     #[cfg(feature = "goal")]
@@ -3213,7 +3248,13 @@ async fn run_bound_headless_round(
             return failed(error.into());
         }
         file_checkpoints.rebase_turn(session.messages.len());
-        if let Err(error) = owner.progress(session).await {
+        if let Err(error) = {
+            let result = owner.progress(session).await;
+            session::storage::report_pending_save_notices(session, |notice| {
+                eprintln!("warning: {notice}")
+            });
+            result
+        } {
             return failed(error);
         }
     }
@@ -3277,7 +3318,13 @@ async fn run_bound_headless_round(
         {
             turn.failure = Some(error);
         }
-    } else if let Err(error) = owner.progress(session).await {
+    } else if let Err(error) = {
+        let result = owner.progress(session).await;
+        session::storage::report_pending_save_notices(session, |notice| {
+            eprintln!("warning: {notice}")
+        });
+        result
+    } {
         turn.failure = Some(error);
     }
     (turn, true)

@@ -2382,12 +2382,16 @@ impl<'a> App<'a> {
     }
 
     #[cfg(feature = "subagents")]
-    pub(super) fn persist_background_state(&self) -> anyhow::Result<()> {
+    pub(super) fn persist_background_state(&mut self) -> anyhow::Result<()> {
         if !self.ui.cli.no_session
             && !self.ui.session.background_history.is_empty()
             && !crate::session::native_publication::is_native_bearing(self.ui.session)
         {
-            crate::session::storage::save_session(self.ui.session)
+            crate::session::storage::save_session_recovering(self.ui.session, |notice| {
+                let _ = self
+                    .renderer
+                    .write_line(&format!("warning: {notice}"), C_ERROR);
+            })
         } else {
             Ok(())
         }
@@ -2403,6 +2407,11 @@ impl<'a> App<'a> {
                 self.fail_pending_main_turn().await;
             }
         }
+        crate::session::storage::report_pending_save_notices(self.ui.session, |notice| {
+            let _ = self
+                .renderer
+                .write_line(&format!("warning: {notice}"), C_ERROR);
+        });
         #[cfg(feature = "mcp")]
         {
             result.and(mcp_retirement)
@@ -7737,13 +7746,19 @@ impl<'a> App<'a> {
         if self.ui.cli.no_session {
             return true;
         }
-        match crate::session::storage::save_session(self.ui.session) {
+        match crate::session::storage::save_session_recovering(self.ui.session, |notice| {
+            let _ = self
+                .renderer
+                .write_line(&format!("warning: {notice}"), C_ERROR);
+        }) {
             Ok(()) => true,
             Err(error) => {
-                let _ = self.renderer.write_line(
-                    &format!("warning: failed to save session: {error}"),
-                    C_ERROR,
-                );
+                if !crate::session::storage::is_session_size_error(&error) {
+                    let _ = self.renderer.write_line(
+                        &format!("warning: failed to save session: {error}"),
+                        C_ERROR,
+                    );
+                }
                 false
             }
         }

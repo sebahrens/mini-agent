@@ -358,16 +358,84 @@ fn tool_events_during_a_pending_turn_perform_no_serialization() {
     for index in 0..20 {
         let id = format!("call-{index}");
         session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": "a.txt"}));
-        assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+        assert!(!persist_session_if_settled(&mut session, true, &run, |_| {}).unwrap());
         session.add_tool_result_with_id(&id, "read", "contents");
-        assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+        assert!(!persist_session_if_settled(&mut session, true, &run, |_| {}).unwrap());
     }
     assert_eq!(calls.with(std::cell::Cell::get), 0);
 
     run.pending_turn = None;
-    assert!(persist_session_if_settled(&session, true, &run).unwrap());
+    assert!(persist_session_if_settled(&mut session, true, &run, |_| {}).unwrap());
     assert_eq!(calls.with(std::cell::Cell::get), 1);
     crate::session::storage::flush_deferred_session(&session.id).unwrap();
+}
+
+#[test]
+fn session_save_recovery_settled_ui_path_reports_notices_once_and_preserves_history() {
+    let _env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    session.add_message(MessageRole::User, "retained history");
+    session.add_message(
+        MessageRole::Assistant,
+        &"x".repeat(crate::session::storage::MAX_SESSION_BYTES),
+    );
+    session.rewind_to(1);
+    let mut run = AgentRunState::default();
+    run.pending_turn = Some(PendingMainTurn::capture(&session, "pending"));
+    let mut notices = Vec::new();
+    assert!(
+        !persist_session_if_settled(&mut session, true, &run, |notice| notices
+            .push(notice.to_owned()))
+        .unwrap()
+    );
+    assert!(
+        session.rewind_undo.is_some(),
+        "pending tool events must not trigger recovery"
+    );
+    assert!(notices.is_empty());
+    run.pending_turn = None;
+    assert!(
+        persist_session_if_settled(&mut session, true, &run, |notice| notices
+            .push(notice.to_owned()))
+        .unwrap()
+    );
+    assert_eq!(
+        notices,
+        ["undo snapshot dropped to stay within the session size limit"]
+    );
+    assert!(session.rewind_undo.is_none());
+    assert_eq!(
+        load_session_exact(&session.id).unwrap().unwrap().messages[0].content,
+        "retained history"
+    );
+    notices.clear();
+    assert!(
+        persist_session_if_settled(&mut session, true, &run, |notice| notices
+            .push(notice.to_owned()))
+        .unwrap()
+    );
+    assert!(notices.is_empty());
+    session.add_message(
+        MessageRole::Assistant,
+        &"x".repeat(crate::session::storage::MAX_SESSION_BYTES),
+    );
+    for _ in 0..2 {
+        assert!(
+            persist_session_if_settled(&mut session, true, &run, |notice| notices
+                .push(notice.to_owned()))
+            .is_err()
+        );
+    }
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("/compact"));
+    assert_eq!(
+        load_session_exact(&session.id)
+            .unwrap()
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -395,7 +463,7 @@ fn failed_turn_persistence_rollback_keeps_partial_events_off_disk() {
         pattern: "partial.txt".into(),
     });
 
-    assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+    assert!(!persist_session_if_settled(&mut session, true, &run, |_| {}).unwrap());
     let on_disk_during_turn = find_sessions_by_prefix(&session.id[..8]).unwrap();
     assert_eq!(on_disk_during_turn.len(), 1);
     assert_eq!(
@@ -407,7 +475,7 @@ fn failed_turn_persistence_rollback_keeps_partial_events_off_disk() {
         rollback_pending_main_turn(&mut run, &mut session).as_deref(),
         Some("failed prompt")
     );
-    assert!(persist_session_if_settled(&session, true, &run).unwrap());
+    assert!(persist_session_if_settled(&mut session, true, &run, |_| {}).unwrap());
     let expected_after = serde_json::to_value(&session).unwrap();
     let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
     assert_eq!(reloaded.len(), 1);
@@ -601,14 +669,14 @@ fn failed_turn_persistence_rollback_save_failure_keeps_prior_snapshot() {
     let pending = PendingMainTurn::capture(&session, "failed prompt");
     mark_main_turn_started(&mut session, &mut run, pending);
     session.add_message(MessageRole::Assistant, "partial response");
-    assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+    assert!(!persist_session_if_settled(&mut session, true, &run, |_| {}).unwrap());
     rollback_pending_main_turn(&mut run, &mut session).unwrap();
 
     let sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions");
     let saved_sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions.saved");
     std::fs::rename(&sessions_dir, &saved_sessions_dir).unwrap();
     symlink(&saved_sessions_dir, &sessions_dir).unwrap();
-    let failed_save = persist_session_if_settled(&session, true, &run);
+    let failed_save = persist_session_if_settled(&mut session, true, &run, |_| {});
     std::fs::remove_file(&sessions_dir).unwrap();
     std::fs::rename(&saved_sessions_dir, &sessions_dir).unwrap();
     assert!(failed_save.is_err());
@@ -635,7 +703,7 @@ fn successful_turn_persistence_failure_keeps_live_success_and_prior_disk_snapsho
     let pending = PendingMainTurn::capture(&session, "successful prompt");
     mark_main_turn_started(&mut session, &mut run, pending);
     session.add_message(MessageRole::Assistant, "successful response");
-    assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+    assert!(!persist_session_if_settled(&mut session, true, &run, |_| {}).unwrap());
 
     let sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions");
     let saved_sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions.saved");

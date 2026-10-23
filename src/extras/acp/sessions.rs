@@ -117,7 +117,10 @@ mod tests {
 
 /// Publication follows the exact model/effect/accounting retirement boundary.
 /// The retained session lease owns the writer until the last history owner drops.
-pub(super) async fn checkpoint(history: &super::SessionHistory) -> anyhow::Result<()> {
+pub(super) async fn checkpoint(
+    history: &mut super::SessionHistory,
+    mut notice: impl FnMut(&str),
+) -> anyhow::Result<()> {
     let lease = history
         ._lease
         .clone()
@@ -130,7 +133,8 @@ pub(super) async fn checkpoint(history: &super::SessionHistory) -> anyhow::Resul
     // message); only native-bearing ones keep an owned snapshot for the writer.
     // A validation/size failure is carried into the blocking job so it is
     // reported (and scoped) exactly like a failed write.
-    let snapshot = crate::session::storage::prepare_save(&history.session);
+    let snapshot =
+        crate::session::storage::prepare_save_recovering(&mut history.session, &mut notice);
     let scope = crate::agent::runner::AgentWorkScope::new();
     #[cfg(test)]
     let scope = super::lock_unpoisoned(&lease.owner.storage_scope_for_test)
@@ -151,11 +155,17 @@ pub(super) async fn checkpoint(history: &super::SessionHistory) -> anyhow::Resul
         })
         .await;
     cleanup.settle().await;
-    result
-        .map_err(|_| anyhow::anyhow!("ACP session checkpoint task failed"))?
-        .map_err(|_| {
-            anyhow::anyhow!("ACP session checkpoint failed; observed progress remains in memory")
-        })
+    let result = result.map_err(|_| anyhow::anyhow!("ACP session checkpoint task failed"))?;
+    match result {
+        Ok(()) => {
+            crate::session::storage::report_save_success(&mut history.session, notice);
+            Ok(())
+        }
+        Err(error) if crate::session::storage::is_session_size_error(&error) => Err(error),
+        Err(_) => Err(anyhow::anyhow!(
+            "ACP session checkpoint failed; observed progress remains in memory"
+        )),
+    }
 }
 
 pub(super) async fn handle_load(

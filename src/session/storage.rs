@@ -8,6 +8,43 @@ use crate::session::Session;
 pub(crate) const MAX_SESSION_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SESSION_MESSAGES: usize = 100_000;
 
+/// The persisted-storage error remains static and never includes session data.
+/// Frontends can use the attached counts for an actionable, deduplicated notice.
+#[derive(Debug)]
+pub(crate) struct SessionSizeError {
+    pub(crate) encoded_bytes: usize,
+    pub(crate) limit_bytes: usize,
+}
+
+impl std::fmt::Display for SessionSizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("persisted session exceeds the byte limit")
+    }
+}
+
+impl std::error::Error for SessionSizeError {}
+
+pub(crate) fn is_session_size_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SessionSizeError>().is_some()
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SaveSizeState {
+    #[default]
+    Normal,
+    NearLimit,
+    Oversized,
+}
+
+/// Ephemeral presentation state: excluded from storage, canonical digests and
+/// imports. Warn on size-state transitions, rather than on every later turn.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SaveNoticeState {
+    size: SaveSizeState,
+    encoded_bytes: Option<usize>,
+    pending: Vec<String>,
+}
+
 /// Decode only bounded data. Provider/workspace compatibility and fresh runtime
 /// grants belong to the host's import controller, never saved labels.
 pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
@@ -66,15 +103,19 @@ pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<Str
         session.messages.len() <= MAX_SESSION_MESSAGES,
         "persisted session exceeds the message limit"
     );
-    struct BoundedJson(Vec<u8>);
+    struct BoundedJson {
+        bytes: Vec<u8>,
+        encoded_bytes: usize,
+    }
     impl std::io::Write for BoundedJson {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .len()
-                .checked_add(bytes.len())
-                .filter(|size| *size <= MAX_SESSION_BYTES)
-                .ok_or_else(|| std::io::Error::other("persisted session exceeds the byte limit"))?;
-            self.0.extend_from_slice(bytes);
+            self.encoded_bytes = self.encoded_bytes.saturating_add(bytes.len());
+            // Continue counting after overflow without retaining more bytes.
+            // This reports the encoded size (including JSON escaping), while
+            // keeping the buffer bounded and never writing a partial session.
+            if self.encoded_bytes <= MAX_SESSION_BYTES {
+                self.bytes.extend_from_slice(bytes);
+            }
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -83,9 +124,19 @@ pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<Str
     }
     // Encode shared task/account owners once. A separate count pass would not
     // constrain a second snapshot if one of those owners changed meanwhile.
-    let mut json = BoundedJson(Vec::new());
+    let mut json = BoundedJson {
+        bytes: Vec::new(),
+        encoded_bytes: 0,
+    };
     serde_json::to_writer(&mut json, session)?;
-    String::from_utf8(json.0).map_err(|_| anyhow::anyhow!("invalid persisted session UTF-8"))
+    if json.encoded_bytes > MAX_SESSION_BYTES {
+        return Err(SessionSizeError {
+            encoded_bytes: json.encoded_bytes,
+            limit_bytes: MAX_SESSION_BYTES,
+        }
+        .into());
+    }
+    String::from_utf8(json.bytes).map_err(|_| anyhow::anyhow!("invalid persisted session UTF-8"))
 }
 
 /// Exact, noncreating and nonrepairing import. Both retained directories are
@@ -234,6 +285,201 @@ pub(crate) fn atomic_write_with_failure(
 
 pub fn save_session(session: &Session) -> anyhow::Result<()> {
     prepare_save(session)?.commit()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SaveEncoding {
+    pub(crate) encoded_bytes: usize,
+    pub(crate) undo_dropped: bool,
+}
+
+/// The single bounded shrink ladder. Callers must already own any mutation
+/// authority required by their persistence domain; strict digests never call it.
+fn encode_with_recovery<T>(
+    session: &mut Session,
+    mut encode: impl FnMut(&Session) -> anyhow::Result<T>,
+    allow_undo_drop: bool,
+) -> (anyhow::Result<T>, bool) {
+    let mut result = encode(session);
+    let undo_dropped = result.as_ref().is_err_and(is_session_size_error)
+        && allow_undo_drop
+        && session.rewind_undo.take().is_some();
+    if undo_dropped {
+        result = encode(session);
+    }
+    (result, undo_dropped)
+}
+
+/// Only an exact native actor may call this before sealing a new digest.
+/// Immutable raw snapshots and replay hashes keep the strict serializer.
+pub(crate) fn encode_owned_session(
+    session: &mut Session,
+    in_flight: bool,
+) -> anyhow::Result<(String, Option<String>, SaveEncoding)> {
+    let encode = |session: &Session| {
+        let canonical = serialize_bounded_session(session)?;
+        let denied = if in_flight {
+            let _projection = super::native_replay::InFlightEncoding::install();
+            Some(serialize_bounded_session(session)?)
+        } else {
+            None
+        };
+        Ok((canonical, denied))
+    };
+    let (result, undo_dropped) = encode_with_recovery(session, encode, true);
+    let (canonical, denied) = result?;
+    let encoding = SaveEncoding {
+        encoded_bytes: denied.as_ref().unwrap_or(&canonical).len(),
+        undo_dropped,
+    };
+    Ok((canonical, denied, encoding))
+}
+
+pub(crate) fn record_native_undo_drop(session: &mut Session, encoding: SaveEncoding) {
+    if encoding.undo_dropped && session.rewind_undo.take().is_some() {
+        session
+            .save_notice_state
+            .pending
+            .push("undo snapshot dropped to stay within the session size limit".into());
+    }
+}
+
+/// Adopt only an acknowledged native owner's encoding decision. Notices are
+/// queued for its frontend, rather than printed by a blocking storage worker.
+pub(crate) fn adopt_native_encoding(session: &mut Session, encoding: SaveEncoding) {
+    record_native_undo_drop(session, encoding);
+    let mut pending = Vec::new();
+    session.save_notice_state.encoded_bytes = Some(encoding.encoded_bytes);
+    report_save_success(session, |notice| pending.push(notice.to_owned()));
+    session.save_notice_state.pending.extend(pending);
+}
+
+pub(crate) fn queue_native_save_failure(session: &mut Session, error: &anyhow::Error) {
+    let mut pending = Vec::new();
+    report_save_failure(session, error, |notice| pending.push(notice.to_owned()));
+    session.save_notice_state.pending.extend(pending);
+}
+
+pub(crate) fn report_pending_save_notices(session: &mut Session, mut notice: impl FnMut(&str)) {
+    for pending in std::mem::take(&mut session.save_notice_state.pending) {
+        notice(&pending);
+    }
+}
+
+/// Save with the bounded recovery policy shared by ordinary frontends.
+/// Only optional rewind undo may be discarded; history is never truncated.
+pub(crate) fn save_session_recovering(
+    session: &mut Session,
+    mut notice: impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let prepared = prepare_save_recovering(session, &mut notice)?;
+    prepared.commit()?;
+    report_save_success(session, notice);
+    Ok(())
+}
+
+/// Capture bytes before any disk publication. Native snapshots stay strict:
+/// removing undo would invalidate their canonical replay/publication digest.
+pub(crate) fn prepare_save_recovering(
+    session: &mut Session,
+    mut notice: impl FnMut(&str),
+) -> anyhow::Result<PreparedSave> {
+    report_pending_save_notices(session, &mut notice);
+    let native = super::native_publication::is_native_bearing(session);
+    let prepare = |session: &Session| -> anyhow::Result<(PreparedSave, Option<usize>)> {
+        // Native publication uses canonical bytes; ordinary files use their
+        // compact storage representation. Never change either digest domain.
+        let native_size = if native {
+            Some(serialize_bounded_session(session)?.len())
+        } else {
+            None
+        };
+        let prepared = prepare_save(session)?;
+        let size = match &prepared {
+            PreparedSave::Legacy { json, .. } => Some(json.len()),
+            PreparedSave::Native(_) => native_size,
+            PreparedSave::Disabled { .. } => None,
+        };
+        Ok((prepared, size))
+    };
+    let (result, undo_dropped) = encode_with_recovery(session, prepare, !native);
+    if undo_dropped {
+        notice("undo snapshot dropped to stay within the session size limit");
+    }
+    match result {
+        Ok((prepared, size)) => {
+            session.save_notice_state.encoded_bytes = size;
+            Ok(prepared)
+        }
+        Err(error) => {
+            report_save_failure(session, &error, notice);
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn report_save_failure(
+    session: &mut Session,
+    error: &anyhow::Error,
+    mut notice: impl FnMut(&str),
+) {
+    if let Some(size) = error.downcast_ref::<SessionSizeError>() {
+        if session.save_notice_state.size != SaveSizeState::Oversized {
+            notice(&format!(
+                "session was not saved: encoded size {} bytes exceeds the {} byte limit; use /compact to reduce history before saving again",
+                size.encoded_bytes, size.limit_bytes
+            ));
+        }
+        session.save_notice_state.size = SaveSizeState::Oversized;
+    }
+}
+
+pub(crate) fn report_save_success(session: &mut Session, mut notice: impl FnMut(&str)) {
+    let Some(bytes) = session.save_notice_state.encoded_bytes else {
+        return;
+    };
+    let size = if bytes >= MAX_SESSION_BYTES * 3 / 4 {
+        SaveSizeState::NearLimit
+    } else {
+        SaveSizeState::Normal
+    };
+    if size == SaveSizeState::NearLimit && session.save_notice_state.size != size {
+        notice(&format!(
+            "session encoded size is {} bytes of the {} byte limit (75% or more); use /compact to make room",
+            bytes, MAX_SESSION_BYTES
+        ));
+    }
+    session.save_notice_state.size = size;
+}
+
+/// Turn-end form of the same recovery policy. The captured snapshot is handed
+/// to the existing single-flight writer; no unbounded clone or model work is
+/// introduced for legacy sessions.
+pub(crate) fn save_session_deferred_recovering(
+    session: &mut Session,
+    mut notice: impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let Some(runtime) = deferred::runtime() else {
+        return save_session_recovering(session, notice);
+    };
+    let prepared = prepare_save_recovering(session, &mut notice)?;
+    let result = match prepared {
+        PreparedSave::Legacy { id, json } => {
+            deferred::queue(&runtime, &id, deferred::Snapshot::Legacy(json.into_bytes()))
+        }
+        PreparedSave::Native(snapshot) => {
+            super::native_publication::ensure_snapshot_owner(&snapshot)?;
+            deferred::queue(
+                &runtime,
+                &snapshot.id.clone(),
+                deferred::Snapshot::Native(snapshot),
+            )
+        }
+        disabled @ PreparedSave::Disabled { .. } => disabled.commit(),
+    };
+    result?;
+    report_save_success(session, notice);
+    Ok(())
 }
 
 /// A session snapshot captured for a later blocking write. A legacy session is
@@ -1360,6 +1606,214 @@ mod readonly_import_tests {
         invalid_projection.messages[0].role = crate::session::MessageRole::Assistant;
         assert!(save_session(&invalid_projection).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+    }
+
+    #[test]
+    fn session_save_recovery_drops_only_undo_and_notifies_once() {
+        let root = crate::tests::OwnedTestDirectory::new("session-save-recovery-undo");
+        let _environment = scoped_state(&root);
+        let mut session = Session::new("provider", "model", 32_000, "undo");
+        session.add_message(super::super::MessageRole::User, "keep this history");
+        session.add_message(
+            super::super::MessageRole::Assistant,
+            &"x".repeat(MAX_SESSION_BYTES),
+        );
+        session.rewind_to(1);
+        assert!(session.rewind_undo.is_some());
+        let history = serde_json::to_value(&session.messages).unwrap();
+        let mut notices = Vec::new();
+        SERIALIZE_BOUNDED_CALLS.with(|calls| calls.set(0));
+        save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
+        assert_eq!(SERIALIZE_BOUNDED_CALLS.with(|calls| calls.get()), 2);
+        assert_eq!(
+            notices,
+            ["undo snapshot dropped to stay within the session size limit"]
+        );
+        assert!(session.rewind_undo.is_none());
+        assert_eq!(serde_json::to_value(&session.messages).unwrap(), history);
+        let loaded = load_session_exact(&session.id).unwrap().unwrap();
+        assert!(loaded.rewind_undo.is_none());
+        assert_eq!(serde_json::to_value(&loaded.messages).unwrap(), history);
+        notices.clear();
+        save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn session_save_recovery_refuses_oversize_without_creating_or_replacing_and_compact_recovers() {
+        let root = crate::tests::OwnedTestDirectory::new("session-save-recovery-refuse");
+        let _environment = scoped_state(&root);
+        let mut session = Session::new("provider", "model", 32_000, "oversize");
+        session.add_message(
+            super::super::MessageRole::User,
+            &"\"".repeat(MAX_SESSION_BYTES / 2),
+        );
+        let encoded_size = serde_json::to_string(&session).unwrap().len();
+        let mut notices = Vec::new();
+        let error = save_session_recovering(&mut session, |notice| notices.push(notice.to_owned()))
+            .unwrap_err();
+        let size = error.downcast_ref::<SessionSizeError>().unwrap();
+        assert_eq!(size.encoded_bytes, encoded_size);
+        assert_eq!(size.limit_bytes, MAX_SESSION_BYTES);
+        assert_eq!(
+            error.to_string(),
+            "persisted session exceeds the byte limit"
+        );
+        assert!(!root.path().join("state").exists());
+        assert_eq!(session.messages.len(), 1, "history must never be truncated");
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains(&encoded_size.to_string()));
+        assert!(notices[0].contains(&MAX_SESSION_BYTES.to_string()));
+        assert!(notices[0].contains("/compact"));
+        let path = session_path(&session.id).unwrap();
+        let previous =
+            serde_json::to_string(&Session::new("provider", "model", 32_000, "previous")).unwrap();
+        atomic_write(&path, &previous).unwrap();
+        notices.clear();
+        // Even a later turn remains the same oversized state: no warning storm.
+        session.add_message(super::super::MessageRole::Assistant, "another turn");
+        assert!(
+            save_session_recovering(&mut session, |notice| notices.push(notice.to_owned()))
+                .is_err()
+        );
+        assert!(notices.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+        session.apply_compaction("explicit compact summary".into(), 2, 0, 16 * 1024);
+        save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
+        assert!(notices.is_empty());
+        let loaded = load_session_exact(&session.id).unwrap().unwrap();
+        assert!(
+            loaded.messages[0]
+                .content
+                .contains("explicit compact summary")
+        );
+        assert_eq!(loaded.compactions.len(), 1);
+    }
+
+    #[test]
+    fn session_save_recovery_undo_retry_still_oversized_is_bounded_and_keeps_history() {
+        let root = crate::tests::OwnedTestDirectory::new("session-save-recovery-still-oversize");
+        let _environment = scoped_state(&root);
+        let mut session = Session::new("provider", "model", 32_000, "still oversized");
+        session.add_message(
+            super::super::MessageRole::User,
+            &"x".repeat(MAX_SESSION_BYTES),
+        );
+        session.add_message(
+            super::super::MessageRole::Assistant,
+            "optional removed tail",
+        );
+        session.rewind_to(1);
+        let mut notices = Vec::new();
+        SERIALIZE_BOUNDED_CALLS.with(|calls| calls.set(0));
+        assert!(
+            save_session_recovering(&mut session, |notice| notices.push(notice.to_owned()))
+                .is_err()
+        );
+        assert_eq!(SERIALIZE_BOUNDED_CALLS.with(|calls| calls.get()), 2);
+        assert!(session.rewind_undo.is_none());
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content.len(), MAX_SESSION_BYTES);
+        assert_eq!(notices.len(), 2);
+        assert_eq!(
+            notices[0],
+            "undo snapshot dropped to stay within the session size limit"
+        );
+        assert!(notices[1].contains("/compact"));
+        assert!(!root.path().join("state").exists());
+        notices.clear();
+        assert!(
+            save_session_recovering(&mut session, |notice| notices.push(notice.to_owned()))
+                .is_err()
+        );
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn session_save_recovery_warns_once_per_near_limit_crossing_and_never_serializes_notice_state()
+    {
+        let root = crate::tests::OwnedTestDirectory::new("session-save-recovery-threshold");
+        let _environment = scoped_state(&root);
+        let mut session = Session::new("provider", "model", 32_000, "threshold");
+        session.add_message(
+            super::super::MessageRole::User,
+            &"x".repeat(MAX_SESSION_BYTES * 3 / 4),
+        );
+        let mut notices = Vec::new();
+        save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("75%"));
+        assert!(notices[0].contains("/compact"));
+        let canonical = serde_json::to_string(&session).unwrap();
+        assert!(!canonical.contains("save_notice_state"));
+        notices.clear();
+        session.add_message(super::super::MessageRole::Assistant, "small next turn");
+        save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
+        assert!(notices.is_empty());
+        session.apply_compaction("summary".into(), 2, 0, 16 * 1024);
+        save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
+        assert!(notices.is_empty());
+        session.add_message(
+            super::super::MessageRole::User,
+            &"x".repeat(MAX_SESSION_BYTES * 3 / 4),
+        );
+        save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
+        assert_eq!(notices.len(), 1);
+    }
+
+    #[test]
+    fn session_save_recovery_does_not_drop_undo_for_non_size_validation_failure() {
+        let root = crate::tests::OwnedTestDirectory::new("session-save-recovery-validation");
+        let _environment = scoped_state(&root);
+        let mut session = Session::new("provider", "model", 32_000, "invalid");
+        session.add_user_message(
+            super::super::user::PersistedUserMessage::new(vec![
+                super::super::user::UserBlock::Text {
+                    text: "canonical user text".into(),
+                },
+            ])
+            .unwrap(),
+        );
+        session.add_message(super::super::MessageRole::Assistant, "tail");
+        session.rewind_to(1);
+        session.messages[0].content = "mismatched user projection".into();
+        let mut notices = Vec::new();
+        assert!(
+            save_session_recovering(&mut session, |notice| notices.push(notice.to_owned()))
+                .is_err()
+        );
+        assert!(session.rewind_undo.is_some());
+        assert!(notices.is_empty());
+        assert!(!root.path().join("state").exists());
+    }
+
+    #[tokio::test]
+    async fn session_save_recovery_deferred_uses_the_same_undo_ladder() {
+        let root = crate::tests::OwnedTestDirectory::new("session-save-recovery-deferred");
+        let _environment = scoped_state(&root);
+        let _defer = defer_saves_for_test();
+        let mut session = Session::new("provider", "model", 32_000, "deferred");
+        session.add_message(super::super::MessageRole::User, "kept");
+        session.add_message(
+            super::super::MessageRole::Assistant,
+            &"x".repeat(MAX_SESSION_BYTES),
+        );
+        session.rewind_to(1);
+        let mut notices = Vec::new();
+        save_session_deferred_recovering(&mut session, |notice| notices.push(notice.to_owned()))
+            .unwrap();
+        flush_deferred_session(&session.id).unwrap();
+        assert_eq!(
+            notices,
+            ["undo snapshot dropped to stay within the session size limit"]
+        );
+        assert!(
+            load_session_exact(&session.id)
+                .unwrap()
+                .unwrap()
+                .rewind_undo
+                .is_none()
+        );
     }
 
     fn scoped_state(root: &crate::tests::OwnedTestDirectory) -> crate::tests::ScopedProcessEnv {

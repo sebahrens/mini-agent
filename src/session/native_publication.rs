@@ -55,6 +55,7 @@ pub(crate) struct NativePublication {
     owner: Arc<WriterOwner>,
     revision: u64,
     digest: [u8; 32],
+    encoding: super::storage::SaveEncoding,
     #[cfg(feature = "subagents")]
     observations: Option<Arc<super::background_observation::SharedObservations>>,
 }
@@ -617,6 +618,11 @@ fn write_projection_with(
             super::storage::serialize_bounded_session(session)?
         }
     };
+    write_encoded_projection(session, &json)
+}
+
+fn write_encoded_projection(session: &Session, json: &str) -> anyhow::Result<()> {
+    session.validate_native_persistence()?;
     let publication = session
         .native_publication
         .as_ref()
@@ -654,7 +660,9 @@ fn begin_blocking(
         checked_publication(&snapshot)?;
     }
     snapshot.native_frontier.activate_publication();
-    let current_digest = digest(&snapshot)?;
+    let (canonical, denied, encoding) = super::storage::encode_owned_session(&mut snapshot, true)?;
+    let current_digest: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
+    drop(canonical);
     let publication = {
         let mut state = owner
             .cell
@@ -681,6 +689,7 @@ fn begin_blocking(
             owner: Arc::clone(&owner),
             revision: state.revision,
             digest: current_digest,
+            encoding,
             #[cfg(feature = "subagents")]
             observations,
         }
@@ -693,7 +702,9 @@ fn begin_blocking(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     writer.check()?;
-    let result = write_projection(&snapshot, true).and_then(|()| writer.check());
+    let result =
+        write_encoded_projection(&snapshot, denied.as_deref().expect("in-flight encoding"))
+            .and_then(|()| writer.check());
     let mut state = owner
         .cell
         .state
@@ -730,7 +741,11 @@ pub(crate) async fn begin_owned(
         .run(async move {
             crate::agent::runner::spawn_blocking_scoped(move || begin_blocking(snapshot)).await
         })
-        .await??;
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result)
+        .inspect_err(|error| super::storage::queue_native_save_failure(session, error))?;
+    super::storage::adopt_native_encoding(session, publication.encoding);
     session.native_publication = Some(publication);
     Ok(ticket)
 }
@@ -783,7 +798,7 @@ fn seal_progress(
     let mut snapshot = session.clone();
     #[cfg(feature = "subagents")]
     let observations = freeze_shared_observations(&mut snapshot);
-    let canonical = super::storage::serialize_bounded_session(&snapshot)?;
+    let (canonical, denied, encoding) = super::storage::encode_owned_session(&mut snapshot, true)?;
     let digest: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
     // This detached data projection is never a runtime Session. Decode the
     // exact captured bytes so mutable account/todo/goal owners cannot change
@@ -791,7 +806,7 @@ fn seal_progress(
     let mut projection: Session = serde_json::from_str(&canonical)?;
     projection.native_frontier = projection.native_frontier.in_flight_projection();
     projection.validate_native_persistence()?;
-    let denied = super::storage::serialize_bounded_session(&projection)?;
+    let denied = denied.expect("in-flight encoding");
     ensure_actor_value(session, ticket)?;
     let owner = Arc::clone(&ticket.publication.owner);
     let publication = {
@@ -809,10 +824,12 @@ fn seal_progress(
             owner: Arc::clone(&owner),
             revision: state.revision,
             digest,
+            encoding,
             #[cfg(feature = "subagents")]
             observations,
         }
     };
+    super::storage::record_native_undo_drop(session, encoding);
     session.native_publication = Some(publication.clone());
     ticket.publication = publication.clone();
     snapshot.native_publication = Some(publication.clone());
@@ -954,7 +971,9 @@ pub(crate) async fn progress_owned(
         session.native_frontier.clone(),
         expected_epoch,
     );
-    let (identity, denied, publication) = seal_progress(session, ticket)?;
+    let (identity, denied, publication) = seal_progress(session, ticket).inspect_err(|error| {
+        super::storage::queue_native_save_failure(session, error);
+    })?;
     awaiting.publication = publication.clone();
     // The awaiter guard covers cancellation before the child is constructed,
     // and lost acknowledgment after it finishes. The child guard covers its
@@ -980,6 +999,7 @@ pub(crate) async fn progress_owned(
         "native progress acknowledgment was interrupted"
     );
     awaiting.acknowledge(true);
+    super::storage::adopt_native_encoding(session, awaiting.publication.encoding);
     Ok(())
 }
 
@@ -1026,12 +1046,13 @@ pub(crate) async fn publish_refused_owned(
         state.consumed = true;
         refusal
     };
-    let snapshot = session.clone();
-    #[cfg(feature = "subagents")]
-    let mut snapshot = snapshot;
+    let mut snapshot = session.clone();
     #[cfg(feature = "subagents")]
     let observations = freeze_shared_observations(&mut snapshot);
-    let json = super::storage::serialize_bounded_session(&snapshot)?;
+    let (json, _, encoding) = super::storage::encode_owned_session(&mut snapshot, false)
+        .inspect_err(|error| {
+            super::storage::queue_native_save_failure(session, error);
+        })?;
     let projection: Session = serde_json::from_str(&json)?;
     projection.validate_native_persistence()?;
     let digest: [u8; 32] = Sha256::digest(json.as_bytes()).into();
@@ -1054,10 +1075,12 @@ pub(crate) async fn publish_refused_owned(
             owner: Arc::clone(&owner),
             revision: state.revision,
             digest,
+            encoding,
             #[cfg(feature = "subagents")]
             observations,
         }
     };
+    super::storage::record_native_undo_drop(session, encoding);
     session.native_publication = Some(publication.clone());
     let identity = session.clone();
     let mut awaiting = RefusedFence {
@@ -1131,6 +1154,7 @@ pub(crate) async fn publish_refused_owned(
         "native refusal acknowledgment was interrupted"
     );
     awaiting.acknowledge();
+    super::storage::adopt_native_encoding(session, awaiting.publication.encoding);
     Ok(())
 }
 
@@ -1223,7 +1247,9 @@ fn retire_blocking_using(
     }
     #[cfg(feature = "subagents")]
     let observations = freeze_shared_observations(&mut snapshot);
-    let next_digest = digest(&snapshot)?;
+    let (canonical, _, encoding) = super::storage::encode_owned_session(&mut snapshot, false)?;
+    let next_digest: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
+    drop(canonical);
     let publication = {
         let mut state = owner
             .cell
@@ -1242,6 +1268,7 @@ fn retire_blocking_using(
             owner: Arc::clone(owner),
             revision: state.revision,
             digest: next_digest,
+            encoding,
             #[cfg(feature = "subagents")]
             observations,
         }
@@ -1331,7 +1358,11 @@ pub(crate) async fn retire_owned(
             })
             .await
         })
-        .await??;
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result)
+        .inspect_err(|error| super::storage::queue_native_save_failure(session, error))?;
+    super::storage::adopt_native_encoding(session, publication.encoding);
     session.native_publication = Some(publication);
     Ok(())
 }
@@ -1831,6 +1862,219 @@ mod tests {
             super::super::storage::save_session(&session).unwrap();
             assert_eq!(imported(&session).messages.len(), 2);
             assert!(session.permission_allowlist.is_empty());
+        });
+    }
+
+    #[test]
+    fn session_save_recovery_native_owner_seals_after_dropping_undo_and_raw_snapshots_stay_strict()
+    {
+        let roots = crate::tests::OwnedTestDirectory::new("native-save-recovery-undo");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        session.add_message(super::super::MessageRole::User, "retained history");
+        let oversized_undo = || {
+            let mut seed = Session::new("anthropic", "fixture", 32_000, "");
+            seed.add_message(super::super::MessageRole::User, "kept");
+            seed.add_message(
+                super::super::MessageRole::Assistant,
+                &"x".repeat(super::super::storage::MAX_SESSION_BYTES),
+            );
+            seed.rewind_to(1);
+            seed.rewind_undo.take().unwrap()
+        };
+        runtime().block_on(async {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            session.rewind_undo = Some(oversized_undo());
+            let mut ticket = begin_owned(&mut session, &scope).await.unwrap();
+            assert!(
+                session.rewind_undo.is_none(),
+                "startup owner may shrink before its first digest"
+            );
+            let mut notices = Vec::new();
+            super::super::storage::report_pending_save_notices(&mut session, |notice| {
+                notices.push(notice.to_owned())
+            });
+            assert_eq!(
+                notices,
+                ["undo snapshot dropped to stay within the session size limit"]
+            );
+            let stale = session.clone();
+            let path = super::super::storage::session_path(&session.id).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            session.rewind_undo = Some(oversized_undo());
+            assert!(super::super::storage::serialize_bounded_session(&session).is_err());
+            assert!(super::super::storage::save_session_recovering(&mut session, |_| {}).is_err());
+            assert!(
+                session.rewind_undo.is_some(),
+                "raw storage cannot reseal a native digest"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let history = serde_json::to_value(&session.messages).unwrap();
+            progress_owned(&mut session, &mut ticket, &scope)
+                .await
+                .unwrap();
+            assert!(session.rewind_undo.is_none());
+            assert_eq!(serde_json::to_value(&session.messages).unwrap(), history);
+            checked_publication(&session).expect("the authorized digest binds the shrunk snapshot");
+            notices.clear();
+            super::super::storage::report_pending_save_notices(&mut session, |notice| {
+                notices.push(notice.to_owned())
+            });
+            assert_eq!(
+                notices,
+                ["undo snapshot dropped to stay within the session size limit"]
+            );
+            let current = std::fs::read(&path).unwrap();
+            assert!(super::super::storage::save_session(&stale).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), current);
+            let mut unowned = imported(&session);
+            unowned.rewind_undo = Some(oversized_undo());
+            assert!(super::super::storage::save_session_recovering(&mut unowned, |_| {}).is_err());
+            assert!(unowned.rewind_undo.is_some());
+            assert_eq!(std::fs::read(&path).unwrap(), current);
+            session.rewind_undo = Some(oversized_undo());
+            retire_owned(
+                &mut session,
+                ticket,
+                RetiredNativeOutcome::Completed,
+                &scope,
+            )
+            .await
+            .unwrap();
+            assert!(
+                session.rewind_undo.is_none(),
+                "retirement seals its own shrunk digest"
+            );
+            checked_publication(&session).unwrap();
+            super::super::storage::save_session(&session).unwrap();
+            notices.clear();
+            super::super::storage::report_pending_save_notices(&mut session, |notice| {
+                notices.push(notice.to_owned())
+            });
+            assert_eq!(
+                notices,
+                ["undo snapshot dropped to stay within the session size limit"]
+            );
+            super::super::storage::report_pending_save_notices(&mut session, |notice| {
+                notices.push(notice.to_owned())
+            });
+            assert_eq!(notices.len(), 1);
+            scope.wait_idle().await;
+        });
+    }
+
+    #[test]
+    fn session_save_recovery_native_failed_ack_still_reports_the_live_undo_drop_once() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-save-recovery-failed-ack");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        session.add_message(super::super::MessageRole::User, "kept");
+        runtime().block_on(async {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let mut ticket = begin_owned(&mut session, &scope).await.unwrap();
+            let path = super::super::storage::session_path(&session.id).unwrap();
+            let previous = std::fs::read(&path).unwrap();
+            let mut seed = Session::new("anthropic", "fixture", 32_000, "");
+            seed.add_message(
+                super::super::MessageRole::Assistant,
+                &"x".repeat(super::super::storage::MAX_SESSION_BYTES),
+            );
+            seed.rewind_to(0);
+            session.rewind_undo = seed.rewind_undo.take();
+            scope.cancellation_handle().cancel();
+            assert!(
+                progress_owned(&mut session, &mut ticket, &scope)
+                    .await
+                    .is_err()
+            );
+            assert!(session.rewind_undo.is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), previous);
+            let mut notices = Vec::new();
+            super::super::storage::report_pending_save_notices(&mut session, |notice| {
+                notices.push(notice.to_owned())
+            });
+            super::super::storage::report_pending_save_notices(&mut session, |notice| {
+                notices.push(notice.to_owned())
+            });
+            assert_eq!(
+                notices,
+                ["undo snapshot dropped to stay within the session size limit"]
+            );
+            assert!(super::super::storage::save_session(&session).is_err());
+            scope.wait_idle().await;
+        });
+    }
+
+    #[test]
+    fn session_save_recovery_native_checks_larger_denied_projection_before_sealing() {
+        let roots =
+            crate::tests::OwnedTestDirectory::new("native-save-recovery-projected-boundary");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        session.add_message(super::super::MessageRole::User, "x");
+        let mut seed = Session::new("anthropic", "fixture", 32_000, "");
+        seed.add_message(super::super::MessageRole::Assistant, "optional undo");
+        seed.rewind_to(0);
+        session.rewind_undo = seed.rewind_undo.take();
+        session.native_frontier.activate_publication();
+        let overhead = super::super::storage::serialize_bounded_session(&session)
+            .unwrap()
+            .len()
+            - 1;
+        session.messages[0].content = "x"
+            .repeat(super::super::storage::MAX_SESSION_BYTES - overhead)
+            .into();
+        assert_eq!(
+            super::super::storage::serialize_bounded_session(&session)
+                .unwrap()
+                .len(),
+            super::super::storage::MAX_SESSION_BYTES
+        );
+        {
+            let _projection = super::super::native_replay::InFlightEncoding::install();
+            assert!(
+                super::super::storage::serialize_bounded_session(&session).is_err(),
+                "the denied projection is larger than the valid canonical encoding"
+            );
+        }
+        runtime().block_on(async {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let ticket = begin_owned(&mut session, &scope).await.unwrap();
+            assert!(session.rewind_undo.is_none());
+            let saved =
+                std::fs::read(super::super::storage::session_path(&session.id).unwrap()).unwrap();
+            assert!(saved.len() <= super::super::storage::MAX_SESSION_BYTES);
+            checked_publication(&session).unwrap();
+            let mut notices = Vec::new();
+            super::super::storage::report_pending_save_notices(&mut session, |notice| {
+                notices.push(notice.to_owned())
+            });
+            assert_eq!(notices.len(), 2);
+            assert_eq!(
+                notices[0],
+                "undo snapshot dropped to stay within the session size limit"
+            );
+            assert!(notices[1].contains("75%"));
+            retire_owned(
+                &mut session,
+                ticket,
+                RetiredNativeOutcome::Completed,
+                &scope,
+            )
+            .await
+            .unwrap();
+            super::super::storage::report_pending_save_notices(&mut session, |notice| {
+                notices.push(notice.to_owned())
+            });
+            assert_eq!(
+                notices.len(),
+                2,
+                "retirement above the threshold must not warn again"
+            );
+            scope.wait_idle().await;
         });
     }
 

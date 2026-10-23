@@ -168,7 +168,11 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         session,
         new_client,
         new_agent,
-        crate::session::storage::save_session,
+        |session| {
+            crate::session::storage::save_session_recovering(session, |notice| {
+                write_error(ctx.renderer, format!("warning: {notice}"));
+            })
+        },
     ) {
         write_error(ctx.renderer, format!("failed to save session: {}", e));
         return Ok(());
@@ -190,12 +194,12 @@ fn commit_staged_import<S, C, A>(
     current_session: &mut S,
     current_client: &mut C,
     current_agent: &mut Option<A>,
-    new_session: S,
+    mut new_session: S,
     new_client: C,
     new_agent: A,
-    persist: impl FnOnce(&S) -> anyhow::Result<()>,
+    persist: impl FnOnce(&mut S) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    persist(&new_session)?;
+    persist(&mut new_session)?;
     *current_client = new_client;
     *current_agent = Some(new_agent);
     *current_session = new_session;
@@ -404,7 +408,9 @@ async fn handle_rename(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             if turn_in_flight {
                 Ok(())
             } else {
-                persist_session_unless_ephemeral(no_session, session)
+                persist_session_unless_ephemeral(no_session, session, |notice| {
+                    write_error(ctx.renderer, format!("warning: {notice}"))
+                })
             }
         },
         crate::session::storage::load_session_exact,
@@ -634,7 +640,7 @@ async fn handle_fork(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             return Ok(());
         }
     };
-    let fork = match crate::session::lock::fork_at_turn(ctx.session, turn) {
+    let mut fork = match crate::session::lock::fork_at_turn(ctx.session, turn) {
         Ok(fork) => fork,
         Err(error) => {
             write_error(ctx.renderer, format!("could not fork: {error}"));
@@ -642,7 +648,9 @@ async fn handle_fork(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         }
     };
     let id = fork.id.clone();
-    if let Err(error) = persist_session_unless_ephemeral(ctx.cli.no_session, &fork) {
+    if let Err(error) = persist_session_unless_ephemeral(ctx.cli.no_session, &mut fork, |notice| {
+        write_error(ctx.renderer, format!("warning: {notice}"))
+    }) {
         crate::session::lock::release_session(&id);
         write_error(ctx.renderer, format!("could not save fork: {error}"));
         return Ok(());
@@ -661,7 +669,11 @@ async fn handle_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match mutate_and_persist_session(
         ctx.session,
         clear_session_mutation,
-        |session| persist_session_unless_ephemeral(ctx.cli.no_session, session),
+        |session| {
+            persist_session_unless_ephemeral(ctx.cli.no_session, session, |notice| {
+                write_error(ctx.renderer, format!("warning: {notice}"))
+            })
+        },
         crate::session::storage::load_session_exact,
     ) {
         Ok(PersistedMutation::Persisted(())) => {}
@@ -713,7 +725,11 @@ async fn handle_undo(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
     let removed = match mutate_and_persist_session(
         ctx.session,
         undo_session_mutation,
-        |session| persist_session_unless_ephemeral(ctx.cli.no_session, session),
+        |session| {
+            persist_session_unless_ephemeral(ctx.cli.no_session, session, |notice| {
+                write_error(ctx.renderer, format!("warning: {notice}"))
+            })
+        },
         crate::session::storage::load_session_exact,
     ) {
         Ok(PersistedMutation::Persisted(removed)) => removed,
@@ -760,7 +776,11 @@ async fn handle_redo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match mutate_and_persist_session(
         ctx.session,
         redo_session_mutation,
-        |session| persist_session_unless_ephemeral(ctx.cli.no_session, session),
+        |session| {
+            persist_session_unless_ephemeral(ctx.cli.no_session, session, |notice| {
+                write_error(ctx.renderer, format!("warning: {notice}"))
+            })
+        },
         crate::session::storage::load_session_exact,
     ) {
         Ok(PersistedMutation::Persisted(())) => {}
@@ -829,7 +849,7 @@ enum PersistedMutation<T> {
 fn mutate_and_persist_session<T>(
     session: &mut crate::session::Session,
     mutate: impl FnOnce(&mut crate::session::Session) -> Option<T>,
-    persist: impl FnOnce(&crate::session::Session) -> anyhow::Result<()>,
+    persist: impl FnOnce(&mut crate::session::Session) -> anyhow::Result<()>,
     load_persisted: impl FnOnce(&str) -> anyhow::Result<Option<crate::session::Session>>,
 ) -> anyhow::Result<PersistedMutation<T>> {
     let previous = session.clone();
@@ -914,12 +934,13 @@ pub(crate) fn is_persistence_restart_required(error: &anyhow::Error) -> bool {
 
 fn persist_session_unless_ephemeral(
     no_session: bool,
-    session: &crate::session::Session,
+    session: &mut crate::session::Session,
+    notice: impl FnMut(&str),
 ) -> anyhow::Result<()> {
     if no_session {
         Ok(())
     } else {
-        crate::session::storage::save_session(session)
+        crate::session::storage::save_session_recovering(session, notice)
     }
 }
 
@@ -1502,7 +1523,7 @@ mod session_persistence_tests {
         let mut session = session_with_turn();
         session.name = "old".into();
         assert_eq!(
-            persist_session_unless_ephemeral(true, &session).ok(),
+            persist_session_unless_ephemeral(true, &mut session, |_| {}).ok(),
             Some(()),
             "--no-session must not touch storage"
         );

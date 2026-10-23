@@ -355,7 +355,11 @@ pub(crate) async fn repair_rounds(
             crate::print::persist_headless_turn(session, &prompt, &response, &interactions);
             let usage = cfg.normalize_usage(&session.provider, attempt_usage.into());
             session.charge_usage_delta(usage, cfg.is_anthropic_native(&session.provider));
-            if let Err(error) = crate::session::storage::save_session(session) {
+            if let Err(error) =
+                crate::session::storage::save_session_recovering(session, |notice| {
+                    eprintln!("warning: {notice}")
+                })
+            {
                 rounds.turn.failure = Some(error);
                 return SchemaOutcome::default();
             }

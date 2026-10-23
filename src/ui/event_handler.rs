@@ -188,6 +188,9 @@ pub async fn handle_agent_event(
         UserEvent,
     >,
 ) -> anyhow::Result<()> {
+    crate::session::storage::report_pending_save_notices(ui.session, |notice| {
+        let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
+    });
     // Every event contributes to the round the gate will judge, so the goal
     // sees the run exactly as it happened rather than as the final response
     // describes it.
@@ -568,13 +571,17 @@ fn apply_usage_delta(
 }
 
 fn save_session_if_settled(
-    session: &Session,
+    session: &mut Session,
     cli: &Cli,
     run: &AgentRunState,
     renderer: &mut Renderer,
 ) -> anyhow::Result<()> {
-    if let Err(e) = crate::ui::persist_session_if_settled(session, !cli.no_session, run) {
-        renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
+    if let Err(e) = crate::ui::persist_session_if_settled(session, !cli.no_session, run, |notice| {
+        let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
+    }) {
+        if !crate::session::storage::is_session_size_error(&e) {
+            renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
+        }
     }
     Ok(())
 }
@@ -697,8 +704,14 @@ async fn handle_agent_done(
     // `Done` can still be an intermediate state for a loop validation or a
     // following loop iteration. Keep the pre-turn disk snapshot authoritative
     // until App::finalize_turn observes that the whole user turn has settled.
-    if let Err(e) = crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run) {
-        renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
+    if let Err(e) =
+        crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run, |notice| {
+            let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
+        })
+    {
+        if !crate::session::storage::is_session_size_error(&e) {
+            renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
+        }
     }
     run.is_running = false;
     if let Some(ss) = ui.status_signals.as_ref() {
@@ -1112,10 +1125,18 @@ async fn finish_goal_round(
         RoundOutcome::Inactive => Ok(false),
         RoundOutcome::Stopped { line, .. } => {
             renderer.write_line(&line, C_AGENT)?;
-            if let Err(e) =
-                crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run)
-            {
-                renderer.write_line(&format!("warning: failed to save session: {e}"), C_ERROR)?;
+            if let Err(e) = crate::ui::persist_session_if_settled(
+                ui.session,
+                !ui.cli.no_session,
+                run,
+                |notice| {
+                    let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
+                },
+            ) {
+                if !crate::session::storage::is_session_size_error(&e) {
+                    renderer
+                        .write_line(&format!("warning: failed to save session: {e}"), C_ERROR)?;
+                }
             }
             Ok(false)
         }
@@ -1129,6 +1150,9 @@ async fn finish_goal_round(
                 run,
                 !ui.cli.no_session,
                 &relaunch.prompt,
+                |notice| {
+                    let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
+                },
             ) {
                 Ok(errors) => {
                     for error in errors {
@@ -1138,8 +1162,9 @@ async fn finish_goal_round(
                         )?;
                     }
                 }
-                Err(e) => renderer
+                Err(e) if !crate::session::storage::is_session_size_error(&e) => renderer
                     .write_line(&format!("warning: failed to save session: {e}"), C_ERROR)?,
+                Err(_) => {}
             }
             let keep_recent = ui.cfg.resolve_keep_recent_tool_results();
             run.request_tool_results_cleared =

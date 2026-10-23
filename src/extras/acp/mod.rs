@@ -3453,7 +3453,18 @@ async fn run_prompt(
             if !registration.control.complete() {
                 return respond_terminal(registration, responder, StopReason::Cancelled);
             }
-            if !state.cli.no_session && sessions::checkpoint(&history).await.is_err() {
+            if !state.cli.no_session
+                && sessions::checkpoint(&mut history, |notice| {
+                    let _ = cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new(format!("warning: {notice}")),
+                        ))),
+                    ));
+                })
+                .await
+                .is_err()
+            {
                 return respond_terminal_error(
                     registration,
                     responder,
@@ -3698,10 +3709,27 @@ async fn run_prompt(
             outcome.error = Some(error.to_string());
         }
     } else if !state.cli.no_session
-        && let Err(error) = sessions::checkpoint(&history).await
+        && let Err(error) = sessions::checkpoint(&mut history, |notice| {
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(format!("warning: {notice}")),
+                ))),
+            ));
+        })
+        .await
     {
         outcome.error = Some(error.to_string());
     }
+
+    crate::session::storage::report_pending_save_notices(&mut history.session, |notice| {
+        let _ = cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(format!("warning: {notice}")),
+            ))),
+        ));
+    });
 
     // Report the decision twice: as a thought chunk a person can read, and as
     // `_meta` a client can act on without parsing prose. Clients routinely hide
@@ -5732,7 +5760,7 @@ mod protocol_tests {
             .unwrap(),
         );
         history.session.messages.last_mut().unwrap().content = "mismatched".into();
-        let mut work = Box::pin(sessions::checkpoint(&history));
+        let mut work = Box::pin(sessions::checkpoint(&mut history, |_| {}));
         acp53_poll_storage_until_held(&mut work, &mut started).await;
         assert_eq!(scope.active_children(), 1);
         drop(work);
@@ -5781,7 +5809,7 @@ mod protocol_tests {
             .unwrap(),
         );
         history.session.messages.last_mut().unwrap().content = "mismatched".into();
-        let mut work = Box::pin(sessions::checkpoint(&history));
+        let mut work = Box::pin(sessions::checkpoint(&mut history, |_| {}));
         acp53_poll_storage_until_held(&mut work, &mut started).await;
         assert_eq!(scope.active_children(), 1);
         assert!(
