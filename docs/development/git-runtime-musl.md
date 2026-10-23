@@ -20,6 +20,16 @@ UID/GID, no capabilities and no privilege escalation. Each checkout keeps its
 own cache. A failed or cancelled client retires only its uniquely named build
 container. Existing output directories are preserved and cause an error.
 
+The Git compile budget defaults to 3600 seconds for ARM64 (including QEMU) and
+900 seconds for x86-64. Override it with `MINI_AGENT_GIT_COMPILE_TIMEOUT_SECONDS`
+or `--compile-timeout-seconds` (CLI first, integer seconds 1–86400). The launcher
+validates the setting before starting Docker and passes only the resolved
+number to the offline producer's CLI. The container wait is bounded by
+`max(1800, compile_budget + 300)` seconds, leaving cleanup time after the inner
+deadline; toolchain image construction and public source collection retain
+their separate 1800-second deadlines. Timeout or cancellation still retires
+only the uniquely named owned container. No payload validation is relaxed.
+
 The TLS backend is Mbed TLS under its upstream GPL-2.0-or-later licensing option;
 curl is built from its pinned source. Distribution packaging requires
 verbatim dependency notices and corresponding source records. The native

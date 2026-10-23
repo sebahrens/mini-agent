@@ -227,7 +227,7 @@ class GitBootstrapTests(unittest.TestCase):
         self.enterContext(patch.object(MODULE.subprocess, "check_output", return_value="binary:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1)\n"))
         return dict(target=TARGET, source_archive=source, policy_patch=policy, cache_root=self.root / "cache", jobs=1)
 
-    def fixture_build(self, command, cwd, env):
+    def fixture_build(self, command, cwd, env, *, timeout=900):
         self.assertEqual(env.get("HOME"), os.environ.get("HOME"))
         self.assertFalse(any(key.startswith("GIT_") for key in env))
         self.assertNotIn("MINI_AGENT_GIT_GLOBAL_SNAPSHOT", env)
@@ -307,6 +307,44 @@ class GitBootstrapTests(unittest.TestCase):
             self.assertGreater(run.call_count, first_calls)
         self.assertEqual(len(list(args["cache_root"].glob("*/*/bundle/git"))), 2)
 
+    def test_compile_budget_only_changes_make_deadline_and_native_default_is_900(self):
+        args = self.configure_build()
+        for budget in (None, 1700):
+            with self.subTest(budget=budget):
+                parameters = dict(args, cache_root=self.root / f"cache-{budget}")
+                if budget is not None:
+                    parameters["compile_timeout_seconds"] = budget
+                with patch.object(MODULE, "run", side_effect=self.fixture_build) as execute:
+                    result = MODULE.bootstrap(output=self.root / f"bundle-{budget}", **parameters)
+                self.assertTrue((result / "bundle.manifest").is_file())
+                deadlines = {call.args[0][0]: call.kwargs.get("timeout", 900) for call in execute.call_args_list}
+                self.assertEqual(deadlines["make"], 900 if budget is None else budget)
+                self.assertEqual(deadlines["patch"], 900)
+                self.assertEqual(deadlines[next(program for program in deadlines if program.endswith("/git"))], 900)
+
+    def test_compile_budget_cli_overrides_environment_and_invalid_settings_never_build(self):
+        base = [str(SCRIPT), "--target", TARGET, "--output", str(self.root / "cli-output")]
+        for environment, command_line, expected in ((None, [], 900), ("", [], 900), ("1200", [], 1200), ("1200", ["--compile-timeout-seconds", "1700"], 1700), ("invalid", ["--compile-timeout-seconds", "1700"], 1700)):
+            with self.subTest(environment=environment, command_line=command_line):
+                settings = dict(os.environ)
+                settings.pop(MODULE.COMPILE_TIMEOUT_ENV, None)
+                if environment is not None:
+                    settings[MODULE.COMPILE_TIMEOUT_ENV] = environment
+                with patch.dict(os.environ, settings, clear=True), patch.object(sys, "argv", base + command_line), patch.object(MODULE.signal, "signal"), patch.object(MODULE, "bootstrap", return_value=self.root) as build, patch.object(sys, "stdout", io.StringIO()):
+                    MODULE.main()
+                self.assertEqual(build.call_args.kwargs["compile_timeout_seconds"], expected)
+        for value in ("0", "-1", "86401", "1.5", "nan"):
+            for command_line in (False, True):
+                with self.subTest(value=value, command_line=command_line), patch.dict(os.environ, {MODULE.COMPILE_TIMEOUT_ENV: value}), patch.object(sys, "argv", base + (["--compile-timeout-seconds", value] if command_line else [])), patch.object(MODULE, "bootstrap") as build, patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit) as refused:
+                    MODULE.main()
+                self.assertEqual(refused.exception.code, 2)
+                build.assert_not_called()
+        args = self.configure_build()
+        for value in (0, -1, 86401, True, 1.5):
+            with patch.object(MODULE, "run") as execute, self.assertRaises(ValueError):
+                MODULE.bootstrap(output=self.root / "invalid-budget", compile_timeout_seconds=value, **args)
+            execute.assert_not_called()
+
     def test_wrong_archive_or_patch_never_starts_build(self):
         args = self.configure_build()
         for field in ("source_archive", "policy_patch"):
@@ -367,6 +405,19 @@ class GitBootstrapTests(unittest.TestCase):
         self.assertIsNotNone(child_holder[0].returncode)
         with self.assertRaises(ProcessLookupError):
             os.kill(child_holder[0].pid, 0)
+
+    def test_make_timeout_kills_and_reaps_the_owned_process_group(self):
+        original_popen = subprocess.Popen
+        children = []
+        def launch(*args, **kwargs):
+            child = original_popen(*args, **kwargs)
+            children.append(child)
+            return child
+        with patch.object(MODULE.subprocess, "Popen", side_effect=launch), self.assertRaises(subprocess.TimeoutExpired):
+            MODULE.run([sys.executable, "-c", "import time; time.sleep(300)"], self.root, os.environ.copy(), timeout=0.05)
+        self.assertIsNotNone(children[0].returncode)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(children[0].pid, 0)
 
 
 if __name__ == "__main__":

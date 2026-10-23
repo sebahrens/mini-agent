@@ -12,15 +12,31 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 PLATFORMS = {"x86_64-unknown-linux-musl": "linux/amd64", "aarch64-unknown-linux-musl": "linux/arm64"}
 CURL_SHA256 = "8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5"
+COMPILE_TIMEOUT_ENV = "MINI_AGENT_GIT_COMPILE_TIMEOUT_SECONDS"
+
+
+def validate_compile_timeout(value: str | int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("Git compile timeout must be integer seconds between 1 and 86400")
+    try:
+        seconds = int(value)
+    except ValueError as error:
+        raise ValueError("Git compile timeout must be integer seconds between 1 and 86400") from error
+    if not 1 <= seconds <= 86400:
+        raise ValueError("Git compile timeout must be integer seconds between 1 and 86400")
+    return seconds
 
 
 def run(command: list[str], timeout: int) -> None:
     subprocess.run(command, check=True, timeout=timeout, stdout=sys.stderr, stderr=sys.stderr)
 
 
-def build(*, target: str, output: Path, root: Path = ROOT, jobs: int = 8) -> Path:
+def build(*, target: str, output: Path, root: Path = ROOT, jobs: int = 8, compile_timeout_seconds: int | None = None) -> Path:
     if target not in PLATFORMS or not 1 <= jobs <= 64:
         raise ValueError("Expected a supported musl target and jobs between 1 and 64")
+    if compile_timeout_seconds is None:
+        compile_timeout_seconds = 3600 if target == "aarch64-unknown-linux-musl" else 900
+    compile_timeout_seconds = validate_compile_timeout(compile_timeout_seconds)
     root = root.resolve(strict=True)
     output = output.absolute()
     if output.exists() or output.is_symlink():
@@ -42,9 +58,11 @@ def build(*, target: str, output: Path, root: Path = ROOT, jobs: int = 8) -> Pat
     cache.mkdir(mode=0o700, parents=True, exist_ok=True)
     run(["docker", "build", "--platform", platform, "--file", str(recipe), "--tag", image, str(context)], 1800)
     name = "mini-agent-git-musl-" + uuid.uuid4().hex
-    command = ["docker", "run", "--rm", "--name", name, "--platform", platform, "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", f"{os.getuid()}:{os.getgid()}", "--tmpfs", "/tmp:rw,nosuid,nodev", "--mount", f"type=bind,src={root},dst=/source,readonly", "--mount", f"type=bind,src={cache},dst=/cache", "--mount", f"type=bind,src={output.parent},dst=/output", "--workdir", "/source", image, "python3", "scripts/build-git-runtime.py", "--target", target, "--output", "/output/" + output.name, "--cache-root", "/cache", "--jobs", str(jobs)]
+    command = ["docker", "run", "--rm", "--name", name, "--platform", platform, "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", f"{os.getuid()}:{os.getgid()}", "--tmpfs", "/tmp:rw,nosuid,nodev", "--mount", f"type=bind,src={root},dst=/source,readonly", "--mount", f"type=bind,src={cache},dst=/cache", "--mount", f"type=bind,src={output.parent},dst=/output", "--workdir", "/source", image, "python3", "scripts/build-git-runtime.py", "--target", target, "--output", "/output/" + output.name, "--cache-root", "/cache", "--jobs", str(jobs), "--compile-timeout-seconds", str(compile_timeout_seconds)]
     try:
-        run(command, 1800)
+        # Keep the old native wrapper deadline, while allowing an emulated
+        # compile to use its entire budget and retire before Docker is reaped.
+        run(command, max(1800, compile_timeout_seconds + 300))
     except BaseException:
         # A killed Docker client need not retire its container. Remove only the
         # exact uniquely named build actor before returning a failed build.
@@ -91,13 +109,14 @@ def main() -> None:
     parser.add_argument("--target", required=True, choices=PLATFORMS)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
+    parser.add_argument("--compile-timeout-seconds", type=validate_compile_timeout, default=os.environ.get(COMPILE_TIMEOUT_ENV) or None, help="Git make budget in seconds (1–86400); overrides MINI_AGENT_GIT_COMPILE_TIMEOUT_SECONDS, default ARM64 3600 / x86-64 900")
     parser.add_argument("--native-sources-output", type=Path, help="also capture verified target-native sources in a separate public-download phase")
     args = parser.parse_args()
     try:
         sources = args.native_sources_output
         if sources is not None and (sources.exists() or sources.is_symlink()):
             raise ValueError("Native source output must not already exist")
-        bundle = build(target=args.target, output=args.output, jobs=args.jobs)
+        bundle = build(target=args.target, output=args.output, jobs=args.jobs, compile_timeout_seconds=args.compile_timeout_seconds)
         if sources is not None:
             collect_sources(target=args.target, bundle=bundle, output=sources)
         print(bundle)

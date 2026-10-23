@@ -29,6 +29,20 @@ TARGETS = (
     "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc",
 )
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_COMPILE_TIMEOUT_SECONDS = 900
+COMPILE_TIMEOUT_ENV = "MINI_AGENT_GIT_COMPILE_TIMEOUT_SECONDS"
+
+
+def validate_compile_timeout(value: str | int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("Git compile timeout must be integer seconds between 1 and 86400")
+    try:
+        seconds = int(value)
+    except ValueError as error:
+        raise ValueError("Git compile timeout must be integer seconds between 1 and 86400") from error
+    if not 1 <= seconds <= 86400:
+        raise ValueError("Git compile timeout must be integer seconds between 1 and 86400")
+    return seconds
 
 
 def digest(data: bytes) -> str:
@@ -211,12 +225,12 @@ def make_arguments(target: str, jobs: int, env: dict[str, str]) -> list[str]:
     return arguments + ["git", "git-remote-http"]
 
 
-def run(command: list[str], cwd: Path, env: dict[str, str]) -> None:
+def run(command: list[str], cwd: Path, env: dict[str, str], *, timeout: int = DEFAULT_COMPILE_TIMEOUT_SECONDS) -> None:
     # Own the complete make process group through interruption before removing
     # its staging directory. Keep HOME and compiler diagnostics unchanged.
     child = subprocess.Popen(command, cwd=cwd, env=env, stdout=sys.stderr, stderr=sys.stderr, start_new_session=True)
     try:
-        status = child.wait(timeout=900)
+        status = child.wait(timeout=timeout)
     except BaseException:
         try:
             os.killpg(child.pid, signal.SIGTERM)
@@ -355,8 +369,9 @@ def build_environment() -> dict[str, str]:
     return env
 
 
-def bootstrap(*, target: str, output: Path, source_archive: Path, policy_patch: Path, cache_root: Path, jobs: int) -> Path:
+def bootstrap(*, target: str, output: Path, source_archive: Path, policy_patch: Path, cache_root: Path, jobs: int, compile_timeout_seconds: int = DEFAULT_COMPILE_TIMEOUT_SECONDS) -> Path:
     require_target(target)
+    compile_timeout_seconds = validate_compile_timeout(compile_timeout_seconds)
     if not 1 <= jobs <= 64:
         raise ValueError("Git bootstrap jobs must be between 1 and 64")
     output, source_archive, policy_patch, cache_root = (p.absolute() for p in (output, source_archive, policy_patch, cache_root))
@@ -391,7 +406,7 @@ def bootstrap(*, target: str, output: Path, source_archive: Path, policy_patch: 
                 run(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(patch_file)], source, env)
                 if "musl" in target:
                     namespace_static_error(source)
-                run(make_arguments(target, jobs, env), source, env)
+                run(make_arguments(target, jobs, env), source, env, timeout=compile_timeout_seconds)
                 for name in ("git", "git-remote-http"):
                     verify_binary(source / name, target)
                 run([str(source / "git"), "--version"], source, env)
@@ -425,6 +440,7 @@ def main() -> None:
     parser.add_argument("--policy-patch", type=Path, default=ROOT / "scripts/git-runtime/policy.patch")
     parser.add_argument("--cache-root", type=Path, default=ROOT / "target/git-runtime-bootstrap")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
+    parser.add_argument("--compile-timeout-seconds", type=validate_compile_timeout, default=os.environ.get(COMPILE_TIMEOUT_ENV) or str(DEFAULT_COMPILE_TIMEOUT_SECONDS), help="Git make budget in seconds (1–86400); overrides MINI_AGENT_GIT_COMPILE_TIMEOUT_SECONDS, default 900")
     args = parser.parse_args()
     # SIGTERM must retire the owned C build before staging cleanup, too.
     def interrupt(_signum, _frame):
@@ -446,7 +462,7 @@ def main() -> None:
             parameters = vars(args).copy()
             parameters.pop("print_cache_identity")
             print(bootstrap(**parameters))
-    except (OSError, ValueError, subprocess.CalledProcessError, tarfile.TarError) as error:
+    except (OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as error:
         parser.exit(1, f"Git runtime bootstrap failed: {error}\n")
 
 

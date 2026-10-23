@@ -202,6 +202,8 @@ jobs:
 
       - name: Build the guarded static Git payload
         shell: bash
+        env:
+          MINI_AGENT_GIT_COMPILE_TIMEOUT_SECONDS: ${{ matrix.target == 'aarch64-unknown-linux-musl' && vars.MINI_AGENT_GIT_ARM64_MUSL_COMPILE_TIMEOUT_SECONDS || '' }}
         run: |
           relative="target/git-runtime-payloads/${{ matrix.target }}"
           bundle="$GITHUB_WORKSPACE/$relative"

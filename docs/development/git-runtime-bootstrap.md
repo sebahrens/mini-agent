@@ -28,6 +28,15 @@ Cache hits recheck the target, manifest and every executable hash/architecture.
 Invalid cache entries fail without being repaired or adopted. Removing an owned
 cache explicitly is an operator action, not an automatic error fallback.
 
+Git compilation has a 900-second native default. Set
+`MINI_AGENT_GIT_COMPILE_TIMEOUT_SECONDS` or pass `--compile-timeout-seconds` to
+select an integer budget from 1 to 86400 seconds; the CLI takes precedence and
+an empty environment setting uses the default. This budget applies only to
+Git's `make`, not patching, executable probes, validation or source collection.
+A timeout still kills and reaps the entire owned make process group before
+removing staging. The musl launcher below selects a larger ARM64 compile default
+for QEMU builds and forwards its resolved budget explicitly.
+
 Extraction uses exclusive staging with bounded member counts and expanded size,
 rejects traversal, hardlinks, duplicate paths and symlink ancestors, and permits
 only internal symlinks. Failed builds retire their owned process group before

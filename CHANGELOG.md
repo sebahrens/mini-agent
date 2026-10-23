@@ -223,6 +223,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - GNU Linux release builds provision the native tools required to embed guarded Git.
   macOS builds explicitly select system libraries, keeping packaged Git independent
   of Homebrew, Fink, and MacPorts while preserving dependency validation.
+- ARM64 musl release builds use a configurable, bounded Git compilation budget
+  that accounts for emulation and retains process and container cleanup.
 - Raise the shared persisted-session ceiling to 32 MiB for long-context and tool-heavy
   conversations, keeping save, catalogue and reload limits aligned. The catalogue scans
   session JSON with bounded memory, including files written with older field orders.

@@ -299,6 +299,20 @@ class GitRuntimeCiTests(unittest.TestCase):
         for forbidden in ["continue-on-error", "cargo ", "git clone", "curl https", "wget ", "sudo "]:
             self.assertNotIn(forbidden, windows)
 
+    def test_release_arm_musl_compile_budget_override_is_target_scoped(self):
+        workflow = CHECK_PACKAGE_METADATA.parse_yaml_document(self.release)
+        job = workflow["jobs"]["build-static"]
+        step = next(step for step in job["steps"]
+                    if step.get("name") == "Build the guarded static Git payload")
+        variable = "MINI_AGENT_GIT_COMPILE_TIMEOUT_SECONDS"
+        self.assertEqual(step["env"][variable],
+                         "${{ matrix.target == 'aarch64-unknown-linux-musl' && "
+                         "vars.MINI_AGENT_GIT_ARM64_MUSL_COMPILE_TIMEOUT_SECONDS || '' }}")
+        self.assertNotIn(variable, workflow.get("env", {}))
+        self.assertNotIn(variable, job.get("env", {}))
+        self.assertNotIn("vars.MINI_AGENT_GIT_ARM64_MUSL_COMPILE_TIMEOUT_SECONDS", step["run"])
+        self.assertIn("python3 scripts/build-git-runtime-musl.py", step["run"])
+
     def test_release_native_records_are_required_before_notices_and_source_assembly(self):
         windows = job_body(self.release, "build-windows")
         self.assertIn('collect-sources: "true"', windows)

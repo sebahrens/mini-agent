@@ -355,6 +355,18 @@ On both Ubuntu GNU runners (x86-64 and ARM64), it explicitly installs the native
 `libcurl4-openssl-dev` (including `curl-config`), and the other pinned-Git build prerequisites.
 The action leaves macOS on its system toolchain; musl and Windows retain their separate payload
 provisioning paths. Cargo's guarded Git bootstrap never installs missing packages itself.
+
+The ARM64 musl Git C compilation runs under QEMU with a default 3,600-second budget;
+native and x86-64 musl compilation retain 900 seconds. To tune the ARM64 release lane,
+set the repository variable `MINI_AGENT_GIT_ARM64_MUSL_COMPILE_TIMEOUT_SECONDS` under
+Settings → Secrets and variables → Actions → Variables. It accepts an integer from 1 to
+86,400; blank or unset uses the target default. The static payload step forwards it through
+`MINI_AGENT_GIT_COMPILE_TIMEOUT_SECONDS` only for ARM64, and the driver validates it before
+passing an explicit `--compile-timeout-seconds` value into the offline container. Its outer
+Docker run allows at least 1,800 seconds or the compilation budget plus 300 seconds, whichever
+is greater; Docker image construction and source collection retain their separate 1,800-second
+bounds. Timeout and interruption still retire the owned make process group and named container.
+
 Manual branch dispatch is intentionally disabled, so a branch name can
 never become a public release identity. Tags containing a prerelease suffix (for example,
 `v2.0.0-rc.1`) remain GitHub prereleases.

@@ -1,6 +1,9 @@
 import importlib.util
+import io
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -41,6 +44,55 @@ class MuslBuildTests(unittest.TestCase):
         run.assert_not_called()
         self.assertEqual((self.output/'sentinel').read_text(),'keep')
 
+    def test_compile_budget_reaches_inner_producer_with_outer_retirement_headroom(self):
+        for target, override, expected, outer in (
+            ('x86_64-unknown-linux-musl', None, 900, 1800),
+            ('aarch64-unknown-linux-musl', None, 3600, 3900),
+            ('aarch64-unknown-linux-musl', 5400, 5400, 5700),
+            ('aarch64-unknown-linux-musl', 1, 1, 1800),
+            ('aarch64-unknown-linux-musl', 86400, 86400, 86700),
+        ):
+            with self.subTest(target=target, override=override):
+                output = self.root / 'target' / f'{target}-{override}'
+                commands = []
+                def execute(command, timeout):
+                    commands.append((command, timeout))
+                    if command[1] == 'run':
+                        output.mkdir()
+                        (output / 'bundle.manifest').write_text('published fixture')
+                with patch.object(MODULE, 'run', side_effect=execute):
+                    MODULE.build(root=self.root, output=output, target=target, compile_timeout_seconds=override)
+                self.assertEqual(commands[0][1], 1800, 'toolchain image keeps its own deadline')
+                command, timeout = commands[1]
+                self.assertEqual(command[command.index('--compile-timeout-seconds') + 1], str(expected))
+                self.assertEqual(timeout, outer)
+                self.assertGreaterEqual(timeout - expected, 300)
+                self.assertNotIn('--env', command)
+                self.assertTrue((output / 'bundle.manifest').is_file())
+
+    def test_cli_budget_precedence_and_validation_prevent_docker_admission(self):
+        base = ['build-git-runtime-musl.py', '--target', 'aarch64-unknown-linux-musl', '--output', str(self.output)]
+        for environment, command_line, expected in ((None, [], None), ('', [], None), ('4200', [], 4200), ('4200', ['--compile-timeout-seconds', '5100'], 5100), ('invalid', ['--compile-timeout-seconds', '5100'], 5100)):
+            with self.subTest(environment=environment, command_line=command_line):
+                settings = dict(os.environ)
+                settings.pop(MODULE.COMPILE_TIMEOUT_ENV, None)
+                if environment is not None:
+                    settings[MODULE.COMPILE_TIMEOUT_ENV] = environment
+                with patch.dict(os.environ, settings, clear=True), patch.object(sys, 'argv', base + command_line), patch.object(MODULE, 'build', return_value=self.output) as build, patch.object(sys, 'stdout', io.StringIO()):
+                    MODULE.main()
+                self.assertEqual(build.call_args.kwargs['compile_timeout_seconds'], expected)
+        for value in ('0', '-1', '86401', '1.5', 'nan'):
+            for command_line in (False, True):
+                with self.subTest(value=value, command_line=command_line), patch.dict(os.environ, {MODULE.COMPILE_TIMEOUT_ENV: value}), patch.object(sys, 'argv', base + (['--compile-timeout-seconds', value] if command_line else [])), patch.object(MODULE, 'build') as build, patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(SystemExit) as refused:
+                    MODULE.main()
+                self.assertEqual(refused.exception.code, 2)
+                build.assert_not_called()
+        for value in (0, -1, 86401, True, 1.5):
+            with self.subTest(value=value), patch.object(MODULE, 'run') as execute, self.assertRaises(ValueError):
+                MODULE.build(root=self.root, output=self.output, target='aarch64-unknown-linux-musl', compile_timeout_seconds=value)
+            execute.assert_not_called()
+        self.assertFalse(self.output.exists())
+
     def test_actual_platform_and_readonly_source_are_explicit(self):
         commands=[]
         def run(command, timeout):
@@ -70,6 +122,21 @@ class MuslBuildTests(unittest.TestCase):
         name=commands[-1][commands[-1].index('--name')+1]
         self.assertTrue(name.startswith('mini-agent-git-musl-'))
         self.assertEqual(retire.call_args.args[0],['docker','rm','--force',name])
+        self.assertFalse(self.output.exists())
+
+    def test_arm_compile_timeout_still_retires_only_its_exact_container(self):
+        commands = []
+        def execute(command, timeout):
+            commands.append((command, timeout))
+            if command[1] == 'run':
+                raise subprocess.TimeoutExpired(command, timeout)
+        with patch.object(MODULE, 'run', side_effect=execute), patch.object(MODULE.subprocess, 'run') as retire, self.assertRaises(subprocess.TimeoutExpired):
+            MODULE.build(root=self.root, output=self.output, target='aarch64-unknown-linux-musl')
+        command, deadline = commands[-1]
+        self.assertEqual(deadline, 3900)
+        name = command[command.index('--name') + 1]
+        self.assertEqual(retire.call_args.args[0], ['docker', 'rm', '--force', name])
+        self.assertEqual(retire.call_args.kwargs['timeout'], 30)
         self.assertFalse(self.output.exists())
 
 
