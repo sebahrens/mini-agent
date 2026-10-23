@@ -49,6 +49,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- Refresh the audited Rust lockfile to ctutils 0.4.4, Tokio 1.53.3,
+  rustls-webpki 0.103.16, and webpki-root-certs/webpki-roots 1.0.10. The VS Code
+  tooling uses Vite 6.4.5 and Vitest 4.1.12, including its mocker package.
+  These patch updates resolve the newly reported dependency audit findings
+  without adding exceptions or weakening audit policy.
+
 - Update rustls to 0.23.46, including upstream fixes for unauthenticated key-exchange
   hints, session debug output, and early application data on ECH rejection.
 
