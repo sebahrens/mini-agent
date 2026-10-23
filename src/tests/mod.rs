@@ -34,6 +34,16 @@ fn env_state() -> std::sync::MutexGuard<'static, EnvLockState> {
 struct EnvWriteGuard;
 
 impl EnvWriteGuard {
+    #[cfg(unix)]
+    fn try_acquire() -> Option<Self> {
+        let mut state = env_state();
+        if state.writer_active || state.readers > 0 || state.waiting_readers > 0 {
+            return None;
+        }
+        state.writer_active = true;
+        Some(Self)
+    }
+
     fn acquire() -> Self {
         let mut state = env_state();
         while state.writer_active || state.readers > 0 || state.waiting_readers > 0 {
@@ -198,7 +208,16 @@ pub(crate) struct ScopedProcessEnv {
 
 impl ScopedProcessEnv {
     pub(crate) fn set(values: &[(&str, Option<OsString>)]) -> Self {
-        let lock = EnvWriteGuard::acquire();
+        Self::set_locked(values, EnvWriteGuard::acquire())
+    }
+
+    /// Attempts a scope without waiting, for deterministic exclusion controls.
+    #[cfg(unix)]
+    pub(crate) fn try_set(values: &[(&str, Option<OsString>)]) -> Option<Self> {
+        Some(Self::set_locked(values, EnvWriteGuard::try_acquire()?))
+    }
+
+    fn set_locked(values: &[(&str, Option<OsString>)], lock: EnvWriteGuard) -> Self {
         ENV_ROLE.with(|cell| cell.set(Some(EnvRole::Writer)));
         let previous = values
             .iter()

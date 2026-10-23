@@ -485,7 +485,9 @@ impl GitRunner {
     ) -> Result<Vec<PathBuf>, String> {
         self.untrusted_config_roots(workspace, "global source capture", true)
             .await
-            .map_err(|_| {
+            .map_err(|_error| {
+                #[cfg(test)]
+                eprintln!("guarded Git startup root capture failed: {_error}");
                 "guarded Git startup repository/cache roots cannot be retained".to_string()
             })
     }
@@ -3060,7 +3062,11 @@ mod guarded_runtime_tests {
         project: &Path,
         global: Vec<PathBuf>,
         helpers: Option<&Path>,
-    ) -> GitRunner {
+    ) -> (GitRunner, crate::tests::ScopedProcessEnv) {
+        // The runner snapshots PATH/HOME and startup probes resolve AppPaths.
+        // Own the process environment until every use of this fixture ends,
+        // so another test cannot lend it temporary roots or executable paths.
+        let environment = crate::tests::ScopedProcessEnv::set(&[]);
         let runtime = super::super::runtime::GuardedRuntime::materialize(
             super::super::runtime::bundled_approval().expect("test requires approved bundle"),
             &root.join("runtime"),
@@ -3071,7 +3077,63 @@ mod guarded_runtime_tests {
         let sources = GlobalSources::capture_roots(&runner, project, global, helpers)
             .await
             .unwrap();
-        runner.with_test_globals(sources)
+        (runner.with_test_globals(sources), environment)
+    }
+
+    #[tokio::test]
+    async fn guarded_fixture_excludes_poisoned_environment_until_all_probes_finish() {
+        let owned = SnapshotDirectory::new(&std::env::temp_dir()).unwrap();
+        let root = owned.path();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (runner, environment) = fixture_runner(root, &project, Vec::new(), None).await;
+        let original_path = std::env::var_os("PATH");
+        let poisoned_path = root.join("nonexistent-search-path").into_os_string();
+        let worker_project = project.clone();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let poison = [
+                ("PATH", Some(poisoned_path.clone())),
+                (
+                    "ZS_CACHE_DIR",
+                    Some(OsString::from("relative-poisoned-cache")),
+                ),
+            ];
+            let early = crate::tests::ScopedProcessEnv::try_set(&poison);
+            let acquired_early = early.is_some();
+            drop(early);
+            attempted_tx.send(acquired_early).unwrap();
+            if acquired_early {
+                return None;
+            }
+            released_rx.recv().unwrap();
+            let _poison = crate::tests::ScopedProcessEnv::set(&poison);
+            assert_eq!(std::env::var_os("PATH"), Some(poisoned_path));
+            Some(crate::paths::AppPaths::from_process(Some(worker_project)).unwrap_err())
+        });
+        assert!(
+            !attempted_rx.recv().unwrap(),
+            "another test must not replace the fixture's environment"
+        );
+        let captured_path = runner
+            .captured_environment
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.clone());
+        assert_eq!(captured_path, original_path);
+        let roots = runner.startup_untrusted_roots(&project).await.unwrap();
+        assert!(roots.contains(&project.canonicalize().unwrap()));
+        assert_eq!(std::env::var_os("PATH"), original_path);
+        drop(environment);
+        released_tx.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Some(crate::paths::AppPathError::RelativeOverride {
+                variable: "ZS_CACHE_DIR",
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -3080,7 +3142,7 @@ mod guarded_runtime_tests {
         let root = owned.path();
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let runner = fixture_runner(root, &project, Vec::new(), None).await;
+        let (runner, _environment) = fixture_runner(root, &project, Vec::new(), None).await;
         let has_path = runner
             .captured_environment
             .iter()
@@ -3126,7 +3188,8 @@ mod guarded_runtime_tests {
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let global = operator.join("config");
         std::fs::write(&global, "[credential]\nhelper = inert-probe\n[user]\nname = Approved\nemail = approved@example.invalid\n").unwrap();
-        let runner = fixture_runner(root, &project, vec![global], Some(&execpath)).await;
+        let (runner, _environment) =
+            fixture_runner(root, &project, vec![global], Some(&execpath)).await;
         runner
             .run(&project, "init", ["init", "--quiet"], QUERY_LIMITS)
             .await
@@ -3242,7 +3305,7 @@ mod guarded_runtime_tests {
         .unwrap();
         let project = root.join("absent");
         std::fs::create_dir(&project).unwrap();
-        let runner = fixture_runner(root, &project, vec![global], None).await;
+        let (runner, _environment) = fixture_runner(root, &project, vec![global], None).await;
         let backend = if cfg!(target_os = "linux") {
             "bwrap"
         } else {
