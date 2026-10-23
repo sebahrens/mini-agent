@@ -6,7 +6,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
-## [1.10.1] - 2026-10-24
+## [1.10.2] - 2026-10-24
 
 ### Added
 
@@ -51,6 +51,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- Update the VS Code Zod schema dependency to 4.6.7 to address collection-validation
+  memory exhaustion ([GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5)).
 - Refresh the audited Rust lockfile to ctutils 0.4.4, Tokio 1.53.3,
   rustls-webpki 0.103.16, and webpki-root-certs/webpki-roots 1.0.10. The VS Code
   tooling uses Vite 6.4.5 and Vitest 4.1.12, including its mocker package.
@@ -709,7 +711,7 @@ as 1.9.3; all of its changes ship in 1.9.4.
 
 Thanks to sebahrens and platon2001 for the release work.
 
-[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.10.1...HEAD
-[1.10.1]: https://github.com/sebahrens/mini-agent/compare/v1.9.4...v1.10.1
+[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.10.2...HEAD
+[1.10.2]: https://github.com/sebahrens/mini-agent/compare/v1.9.4...v1.10.2
 [1.9.4]: https://github.com/sebahrens/mini-agent/compare/v1.8.0...v1.9.4
 [1.8.0]: https://github.com/sebahrens/mini-agent/compare/v1.7.2...v1.8.0

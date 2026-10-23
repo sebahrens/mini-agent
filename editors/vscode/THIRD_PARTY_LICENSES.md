@@ -4,7 +4,7 @@ The bundled extension JavaScript includes these direct runtime dependencies:
 
 - `@agentclientprotocol/sdk` 1.3.0, Apache-2.0, source:
   <https://github.com/agentclientprotocol/typescript-sdk/tree/v1.3.0>
-- `zod` 4.4.3, MIT, source: <https://github.com/colinhacks/zod/tree/v4.4.3>
+- `zod` 4.6.7, MIT, source: <https://github.com/colinhacks/zod/tree/v4.6.7>
 
 This file covers the extension's JavaScript and the non-Cargo components of the
 bundled native `mini-agent` executable. It is not the complete notice for that

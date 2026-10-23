@@ -2,7 +2,7 @@
   "name": "mini-agent",
   "displayName": "Mini Agent",
   "description": "Mini Agent \u2014 AI coding agent with ACP stdio integration",
-  "version": "1.10.1",
+  "version": "1.10.2",
   "publisher": "mini-agent",
   "license": "GPL-3.0-only",
   "repository": {
@@ -134,7 +134,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.3.0",
-    "zod": "4.4.3"
+    "zod": "4.6.7"
   },
   "overrides": {
     "fast-uri": "3.1.8",
