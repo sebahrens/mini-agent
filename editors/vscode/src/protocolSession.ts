@@ -2,7 +2,7 @@ import * as acp from '@agentclientprotocol/sdk';
 import { SessionUnavailableError, type ConversationSession } from './conversation';
 
 const MAX_REPLAY_UPDATES = 100_000;
-const MAX_REPLAY_BYTES = 8 * 1024 * 1024;
+const MAX_REPLAY_BYTES = 48 * 1024 * 1024;
 
 /** One connection's current conversation, with bounded load-time update routing. */
 export class SessionUpdateRouter {
