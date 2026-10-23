@@ -380,8 +380,10 @@ fn session_save_recovery_settled_ui_path_reports_notices_once_and_preserves_hist
         &"x".repeat(crate::session::storage::MAX_SESSION_BYTES),
     );
     session.rewind_to(1);
-    let mut run = AgentRunState::default();
-    run.pending_turn = Some(PendingMainTurn::capture(&session, "pending"));
+    let mut run = AgentRunState {
+        pending_turn: Some(PendingMainTurn::capture(&session, "pending")),
+        ..Default::default()
+    };
     let mut notices = Vec::new();
     assert!(
         !persist_session_if_settled(&mut session, true, &run, |notice| notices

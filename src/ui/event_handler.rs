@@ -578,10 +578,9 @@ fn save_session_if_settled(
 ) -> anyhow::Result<()> {
     if let Err(e) = crate::ui::persist_session_if_settled(session, !cli.no_session, run, |notice| {
         let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
-    }) {
-        if !crate::session::storage::is_session_size_error(&e) {
-            renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
-        }
+    }) && !crate::session::storage::is_session_size_error(&e)
+    {
+        renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
     }
     Ok(())
 }
@@ -708,10 +707,9 @@ async fn handle_agent_done(
         crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run, |notice| {
             let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
         })
+        && !crate::session::storage::is_session_size_error(&e)
     {
-        if !crate::session::storage::is_session_size_error(&e) {
-            renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
-        }
+        renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
     }
     run.is_running = false;
     if let Some(ss) = ui.status_signals.as_ref() {
@@ -1132,11 +1130,9 @@ async fn finish_goal_round(
                 |notice| {
                     let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
                 },
-            ) {
-                if !crate::session::storage::is_session_size_error(&e) {
-                    renderer
-                        .write_line(&format!("warning: failed to save session: {e}"), C_ERROR)?;
-                }
+            ) && !crate::session::storage::is_session_size_error(&e)
+            {
+                renderer.write_line(&format!("warning: failed to save session: {e}"), C_ERROR)?;
             }
             Ok(false)
         }

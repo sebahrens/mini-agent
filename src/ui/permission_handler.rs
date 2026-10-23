@@ -629,10 +629,9 @@ fn record_session_grants(
             crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run, |notice| {
                 let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
             })
+            && !crate::session::storage::is_session_size_error(&e)
         {
-            if !crate::session::storage::is_session_size_error(&e) {
-                renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
-            }
+            renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
         }
     }
     Ok(())

@@ -283,6 +283,9 @@ pub(crate) fn atomic_write_with_failure(
     Ok(())
 }
 
+// Strict writes are retained for persistence and stale-snapshot probes. Ordinary
+// production consumers must use the shared recovering preparation path.
+#[cfg(test)]
 pub fn save_session(session: &Session) -> anyhow::Result<()> {
     prepare_save(session)?.commit()
 }
@@ -492,7 +495,8 @@ pub(crate) enum PreparedSave {
     Disabled { id: String },
 }
 
-/// Validate and capture `session` exactly as [`save_session`] does, without
+/// Validate and capture `session` without the optional-state recovery in
+/// [`prepare_save_recovering`], and without
 /// touching the disk. The result is `Send` and is written by [`PreparedSave::commit`].
 pub(crate) fn prepare_save(session: &Session) -> anyhow::Result<PreparedSave> {
     if super::native_publication::is_native_bearing(session) {
@@ -549,6 +553,7 @@ impl PreparedSave {
 ///
 /// A failure of an earlier deferred write is returned by the next call (and by
 /// [`flush_deferred_sessions`]), so callers still warn about it.
+#[cfg(test)]
 pub fn save_session_deferred(session: &Session) -> anyhow::Result<()> {
     let Some(runtime) = deferred::runtime() else {
         return save_session(session);
