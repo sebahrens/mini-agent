@@ -1429,7 +1429,7 @@ mod tests {
             super::super::storage::decode_session_json(&oversized)
                 .unwrap_err()
                 .to_string()
-                .contains("8 MiB")
+                .contains("byte limit")
         );
         assert_eq!(session.messages.len(), 1);
     }

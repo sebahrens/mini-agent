@@ -1,7 +1,7 @@
 //! Bounded discovery metadata for workspace-scoped interactive session selection.
 //! Stored workspace text labels history; it is never opened or resolved.
 
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::{Component, Path};
 
 use compact_str::CompactString;
@@ -11,8 +11,19 @@ use super::{SESSION_TITLE_CHARS, Session};
 
 pub(crate) const MAX_ENTRIES: usize = 2_048;
 pub(crate) const MAX_ROWS: usize = 100;
-pub(crate) const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = super::storage::MAX_SESSION_BYTES as u64;
+const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    file_bytes: u64,
+    total_bytes: u64,
+}
+
+const SCAN_LIMITS: ScanLimits = ScanLimits {
+    file_bytes: MAX_FILE_BYTES,
+    total_bytes: MAX_TOTAL_BYTES,
+};
 const MAX_MESSAGES: usize = 100_000;
 
 #[derive(Clone, Debug)]
@@ -106,6 +117,203 @@ struct Header {
     messages: MessageSummary,
 }
 
+// serde_json's reader deserializer buffers a complete string before calling a
+// visitor. Project strings first so a multi-megabyte message cannot become its
+// scratch buffer. The projection validates the *entire* original token, even
+// its discarded suffix; serde then validates the complete JSON grammar. Exact
+// metadata is never truncated into a different identity/workspace label.
+const MAX_PREVIEW_CHARS: usize = 4_096;
+const MAX_METADATA_BYTES: usize = 64 * 1024;
+
+struct PreviewReader<R> {
+    source: BufReader<R>,
+    pending: Vec<u8>,
+    position: usize,
+    previous: Option<u8>,
+    exact_key: bool,
+    messages_key: bool,
+    depth: usize,
+    messages_depth: Option<usize>,
+}
+
+impl<R: Read> PreviewReader<R> {
+    fn new(source: R) -> Self {
+        Self {
+            source: BufReader::new(source),
+            pending: Vec::new(),
+            position: 0,
+            previous: None,
+            exact_key: false,
+            messages_key: false,
+            depth: 0,
+            messages_depth: None,
+        }
+    }
+
+    fn byte(&mut self) -> std::io::Result<Option<u8>> {
+        let mut byte = [0];
+        Ok((self.source.read(&mut byte)? != 0).then_some(byte[0]))
+    }
+
+    fn required(&mut self) -> std::io::Result<u8> {
+        self.byte()?
+            .ok_or_else(|| Self::invalid("unterminated JSON string"))
+    }
+
+    fn invalid(message: &'static str) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+    }
+
+    fn hex_quad(&mut self) -> std::io::Result<u16> {
+        let mut value = 0;
+        for _ in 0..4 {
+            let digit = (self.required()? as char)
+                .to_digit(16)
+                .ok_or_else(|| Self::invalid("invalid JSON Unicode escape"))?;
+            value = value * 16 + digit as u16;
+        }
+        Ok(value)
+    }
+
+    fn escaped(&mut self) -> std::io::Result<char> {
+        Ok(match self.required()? {
+            b'"' => '"',
+            b'\\' => '\\',
+            b'/' => '/',
+            b'b' => '\u{8}',
+            b'f' => '\u{c}',
+            b'n' => '\n',
+            b'r' => '\r',
+            b't' => '\t',
+            b'u' => {
+                let first = self.hex_quad()?;
+                let scalar = if (0xd800..=0xdbff).contains(&first) {
+                    if self.required()? != b'\\' || self.required()? != b'u' {
+                        return Err(Self::invalid("invalid JSON surrogate pair"));
+                    }
+                    let second = self.hex_quad()?;
+                    if !(0xdc00..=0xdfff).contains(&second) {
+                        return Err(Self::invalid("invalid JSON surrogate pair"));
+                    }
+                    0x10000 + ((first as u32 - 0xd800) << 10) + second as u32 - 0xdc00
+                } else {
+                    first as u32
+                };
+                char::from_u32(scalar)
+                    .ok_or_else(|| Self::invalid("invalid JSON Unicode scalar"))?
+            }
+            _ => return Err(Self::invalid("invalid JSON escape")),
+        })
+    }
+
+    fn string(&mut self) -> std::io::Result<String> {
+        let exact = self.previous == Some(b':') && self.exact_key;
+        let trim_start = self.previous == Some(b':') && !exact;
+        let mut text = String::new();
+        let mut chars = 0;
+        loop {
+            let byte = self.required()?;
+            let ch = match byte {
+                b'"' => break,
+                b'\\' => self.escaped()?,
+                0..=0x1f => return Err(Self::invalid("control byte in JSON string")),
+                0x20..=0x7f => byte as char,
+                _ => {
+                    let width = match byte {
+                        0xc2..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        0xf0..=0xf4 => 4,
+                        _ => return Err(Self::invalid("invalid JSON UTF-8")),
+                    };
+                    let mut bytes = [byte, 0, 0, 0];
+                    for byte in &mut bytes[1..width] {
+                        *byte = self.required()?;
+                    }
+                    std::str::from_utf8(&bytes[..width])
+                        .map_err(|_| Self::invalid("invalid JSON UTF-8"))?
+                        .chars()
+                        .next()
+                        .expect("a validated scalar")
+                }
+            };
+            if trim_start && chars == 0 && ch.is_whitespace() {
+                continue;
+            }
+            if exact {
+                if text.len() + ch.len_utf8() > MAX_METADATA_BYTES {
+                    return Err(Self::invalid("session catalogue metadata exceeds budget"));
+                }
+                text.push(ch);
+            } else if chars < MAX_PREVIEW_CHARS {
+                text.push(ch);
+                chars += 1;
+            }
+        }
+        Ok(text)
+    }
+}
+
+impl<R: Read> Read for PreviewReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while written < output.len() {
+            if self.position < self.pending.len() {
+                let count = (output.len() - written).min(self.pending.len() - self.position);
+                output[written..written + count]
+                    .copy_from_slice(&self.pending[self.position..self.position + count]);
+                self.position += count;
+                written += count;
+                continue;
+            }
+            self.pending.clear();
+            self.position = 0;
+            let Some(byte) = self.byte()? else { break };
+            if byte == b'"' {
+                let text = self.string()?;
+                self.exact_key = if self.depth == 1 {
+                    matches!(
+                        text.as_str(),
+                        "id" | "updated_at" | "working_dir" | "provider" | "model"
+                    )
+                } else {
+                    self.messages_depth
+                        .is_some_and(|depth| self.depth == depth + 1)
+                        && text == "role"
+                };
+                self.messages_key = self.depth == 1 && text == "messages";
+                serde_json::to_writer(&mut self.pending, &text).map_err(std::io::Error::other)?;
+                self.previous = Some(b'"');
+            } else {
+                output[written] = byte;
+                written += 1;
+                match byte {
+                    b'[' | b'{' => {
+                        self.depth = self.depth.saturating_add(1);
+                        if byte == b'[' && self.previous == Some(b':') && self.messages_key {
+                            self.messages_depth = Some(self.depth);
+                        }
+                    }
+                    b']' | b'}' => {
+                        if byte == b']' && self.messages_depth == Some(self.depth) {
+                            self.messages_depth = None;
+                        }
+                        self.depth = self.depth.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                if !byte.is_ascii_whitespace() {
+                    self.previous = Some(byte);
+                }
+            }
+        }
+        Ok(written)
+    }
+}
+
+fn read_header(reader: impl Read) -> serde_json::Result<Header> {
+    serde_json::from_reader(BufReader::new(PreviewReader::new(reader)))
+}
+
 fn short_text(value: &str) -> String {
     let sanitized = crate::ui::events::sanitize_output(value);
     let text = sanitized
@@ -168,6 +376,15 @@ fn list_mode(
     workspace: &crate::paths::WorkspaceBinding,
     all: bool,
     readonly: bool,
+) -> anyhow::Result<Catalogue> {
+    list_with_limits(workspace, all, readonly, SCAN_LIMITS)
+}
+
+fn list_with_limits(
+    workspace: &crate::paths::WorkspaceBinding,
+    all: bool,
+    readonly: bool,
+    limits: ScanLimits,
 ) -> anyhow::Result<Catalogue> {
     workspace.validate().map_err(anyhow::Error::msg)?;
     let mut catalogue = Catalogue::default();
@@ -246,22 +463,26 @@ fn list_mode(
             retained.validate().map_err(anyhow::Error::msg)?;
             let length = file.metadata()?.len();
             anyhow::ensure!(
-                length <= MAX_FILE_BYTES,
+                length <= limits.file_bytes,
                 "oversized session catalogue entry"
             );
-            if total.saturating_add(length) > MAX_TOTAL_BYTES {
+            if total.saturating_add(length) > limits.total_bytes {
                 catalogue.truncated = true;
                 anyhow::bail!("catalogue byte budget exhausted");
             }
-            let mut bytes = Vec::new();
-            file.by_ref()
-                .take((MAX_TOTAL_BYTES - total).min(MAX_FILE_BYTES) + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_TOTAL_BYTES - total {
+            let remaining = limits.total_bytes - total;
+            let cap = remaining.min(limits.file_bytes) + 1;
+            let mut input = file.by_ref().take(cap);
+            let header = read_header(&mut input);
+            // Charge malformed records too, and detect growth with one byte
+            // beyond the remaining budget. Neither path retains file bytes.
+            std::io::copy(&mut input, &mut std::io::sink())?;
+            let consumed = cap - input.limit();
+            total += consumed;
+            if consumed > remaining {
                 catalogue.truncated = true;
                 anyhow::bail!("catalogue byte budget exhausted");
             }
-            total += bytes.len() as u64;
             if let Some(identity) = identity {
                 crate::fs::validate_private_file(&file)?;
                 let current = retained.open_regular_relative(&relative)?;
@@ -274,10 +495,10 @@ fn list_mode(
                 retained.validate_private_root()?;
             }
             anyhow::ensure!(
-                bytes.len() as u64 <= MAX_FILE_BYTES,
+                consumed <= limits.file_bytes,
                 "session grew beyond catalogue budget"
             );
-            let header: Header = serde_json::from_slice(&bytes)?;
+            let header = header?;
             anyhow::ensure!(header.id == stem, "session filename/id mismatch");
             Ok(header)
         })();
@@ -352,6 +573,15 @@ pub(crate) fn selected(
     workspace: &crate::paths::WorkspaceBinding,
     all: bool,
 ) -> anyhow::Result<Session> {
+    selected_with_limit(row, workspace, all, MAX_FILE_BYTES)
+}
+
+fn selected_with_limit(
+    row: &SessionRow,
+    workspace: &crate::paths::WorkspaceBinding,
+    all: bool,
+    max_file_bytes: u64,
+) -> anyhow::Result<Session> {
     workspace.validate().map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         uuid::Uuid::try_parse(&row.id).is_ok(),
@@ -364,10 +594,10 @@ pub(crate) fn selected(
     retained.validate().map_err(anyhow::Error::msg)?;
     let mut bytes = Vec::new();
     file.by_ref()
-        .take(MAX_FILE_BYTES + 1)
+        .take(max_file_bytes + 1)
         .read_to_end(&mut bytes)?;
     anyhow::ensure!(
-        bytes.len() as u64 <= MAX_FILE_BYTES,
+        bytes.len() as u64 <= max_file_bytes,
         "selected session exceeds reload budget"
     );
     let session: Session = serde_json::from_slice(&bytes)?;
@@ -424,6 +654,143 @@ mod tests {
         super::super::storage::atomic_write(&file, &serde_json::to_string(&session).unwrap())
             .unwrap();
         session
+    }
+
+    #[test]
+    fn catalogue_and_storage_share_fixed_session_byte_limit() {
+        assert_eq!(
+            MAX_FILE_BYTES,
+            super::super::storage::MAX_SESSION_BYTES as u64
+        );
+        assert_eq!(MAX_FILE_BYTES, 32 * 1024 * 1024);
+        assert_eq!(MAX_TOTAL_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn catalogue_streams_large_messages_and_unknown_fields_with_bounded_allocations() {
+        struct CountReader<R> {
+            source: R,
+            bytes: usize,
+            max_request: usize,
+        }
+        impl<R: Read> Read for CountReader<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.max_request = self.max_request.max(buffer.len());
+                let read = self.source.read(buffer)?;
+                self.bytes += read;
+                Ok(read)
+            }
+        }
+        let prefix = br#"{"id":"fixture","messages":[{"content":"Preview \u96ea \ud83d\ude00 "#;
+        let middle =
+            br#"","role":"user"},{"content":"answer","role":"assistant"}],"padding":{"model":""#;
+        let suffix = br#""},"working_dir":"/late/workspace","model":"late-model","provider":"late-provider"}"#;
+        let size = 12 * 1024 * 1024;
+        let source = prefix
+            .as_slice()
+            .chain(std::io::repeat(b'x').take(size))
+            .chain(middle.as_slice())
+            .chain(std::io::repeat(b'y').take(size))
+            .chain(suffix.as_slice());
+        let mut source = CountReader {
+            source,
+            bytes: 0,
+            max_request: 0,
+        };
+        let (header, _, allocated) =
+            crate::tests::alloc_counter::measure(|| read_header(&mut source).unwrap());
+        assert_eq!(header.id, "fixture");
+        assert_eq!(header.working_dir, "/late/workspace");
+        assert_eq!(header.model, "late-model");
+        assert_eq!(header.provider, "late-provider");
+        assert_eq!(header.messages.count, 2);
+        assert!(header.messages.first_user.starts_with("Preview 雪 😀 "));
+        assert_eq!(
+            source.bytes,
+            prefix.len() + middle.len() + suffix.len() + 2 * size as usize
+        );
+        assert!(
+            source.max_request <= 8 * 1024,
+            "read request: {}",
+            source.max_request
+        );
+        assert!(
+            allocated < 512 * 1024,
+            "allocated {allocated} bytes for streamed metadata"
+        );
+    }
+
+    #[test]
+    fn catalogue_validates_discarded_string_suffixes_and_exact_metadata() {
+        let mut valid = br#"{"id":"fixture","messages":[{"content":""#.to_vec();
+        valid.extend(std::iter::repeat_n(b'x', MAX_PREVIEW_CHARS + 10));
+        valid.extend_from_slice(br#"\u96ea\ud83d\ude00","role":"user"}],"working_dir":"/late"}"#);
+        let header = read_header(valid.as_slice()).unwrap();
+        assert_eq!(header.messages.count, 1);
+        assert_eq!(header.working_dir, "/late");
+        for tail in [br#"\q"#.as_slice(), br#"\ud800"#, &[0xff], b"\n"] {
+            let mut invalid = br#"{"id":"fixture","messages":[{"content":""#.to_vec();
+            invalid.extend(std::iter::repeat_n(b'x', MAX_PREVIEW_CHARS + 10));
+            invalid.extend_from_slice(tail);
+            invalid.extend_from_slice(br#"","role":"user"}]}"#);
+            assert!(read_header(invalid.as_slice()).is_err());
+        }
+        assert!(read_header(br#"{"id":"fixture","messages":[]}"#.as_slice()).is_ok());
+        assert!(read_header(br#"{"id":"fixture","messages":[]} trailing"#.as_slice()).is_err());
+        let oversized_metadata = format!(
+            r#"{{"id":"fixture","working_dir":"{}"}}"#,
+            "x".repeat(MAX_METADATA_BYTES + 1)
+        );
+        assert!(read_header(oversized_metadata.as_bytes()).is_err());
+        // Truncation must never turn an unknown key into a recognized field,
+        // nor trim leading spaces from exact metadata or key names.
+        let header = read_header(
+            br#"{"id":"fixture"," working_dir":"ignored","working_dir":" /exact "}"#.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(header.working_dir, " /exact ");
+    }
+
+    #[test]
+    fn catalogue_roundtrips_exact_saved_session_above_previous_eight_mib_limit() {
+        let root = crate::tests::OwnedTestDirectory::new("session-catalogue-large-roundtrip");
+        let _env = environment(&root);
+        let binding = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let mut session = Session::new("provider", "model", 32_000, "Large roundtrip");
+        session.working_dir = root.path().to_string_lossy().into();
+        let content = format!("Large retained message 雪 {}", "x".repeat(9 * 1024 * 1024));
+        session.add_message(MessageRole::User, &content);
+        super::super::storage::save_session(&session).unwrap();
+        let path = super::super::storage::session_path(&session.id).unwrap();
+        let length = std::fs::metadata(&path).unwrap().len();
+        assert!(length > 8 * 1024 * 1024 && length < MAX_FILE_BYTES);
+        let catalogue = list_readonly(&binding, false).unwrap();
+        assert_eq!(catalogue.rows.len(), 1);
+        assert_eq!(catalogue.skipped, 0);
+        assert!(!catalogue.truncated);
+        let row = &catalogue.rows[0];
+        assert_eq!(row.id, session.id);
+        assert_eq!(row.title, "[Large roundtrip]");
+        assert_eq!(row.message_count, 1);
+        let loaded = selected(row, &binding, false).unwrap();
+        assert_eq!(loaded.messages[0].content, content);
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&session).unwrap()
+        );
+        let loaded = super::super::storage::load_session_exact(&session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&session).unwrap()
+        );
+        let sessions = crate::paths::WorkspaceBinding::capture(path.parent().unwrap()).unwrap();
+        let imported =
+            super::super::storage::load_session_exact_read_only(&sessions, &session.id, &binding)
+                .unwrap()
+                .unwrap();
+        assert_eq!(imported.messages[0].content, content);
     }
 
     #[cfg(unix)]
@@ -516,15 +883,23 @@ mod tests {
                 .to_string()
                 .contains("workspace changed")
         );
-        super::super::storage::atomic_write(&path, &"x".repeat(MAX_FILE_BYTES as usize + 1))
-            .unwrap();
+        super::super::storage::atomic_write(&path, &"x".repeat(1_025)).unwrap();
         assert!(
-            selected(&row, &binding, true)
+            selected_with_limit(&row, &binding, true, 1_024)
                 .unwrap_err()
                 .to_string()
                 .contains("reload budget")
         );
-        let catalogue = list(&binding, true).unwrap();
+        let catalogue = list_with_limits(
+            &binding,
+            true,
+            false,
+            ScanLimits {
+                file_bytes: 1_024,
+                total_bytes: 8_192,
+            },
+        )
+        .unwrap();
         assert!(catalogue.rows.is_empty());
         assert_eq!(catalogue.skipped, 1);
     }
@@ -602,14 +977,23 @@ mod tests {
             let header=serde_json::json!({"id":id,"working_dir":root.path().to_string_lossy(),"messages":[]}).to_string();
             let mut payload = header.trim_end_matches('}').to_owned();
             payload.push_str(",\"padding\":\"");
-            let room = MAX_FILE_BYTES as usize - payload.len() - 2;
+            let room = 1_024 - payload.len() - 2;
             payload.extend(std::iter::repeat_n('x', room));
             payload.push_str("\"}");
-            assert_eq!(payload.len(), MAX_FILE_BYTES as usize);
+            assert_eq!(payload.len(), 1_024);
             super::super::storage::atomic_write(&directory.join(format!("{id}.json")), &payload)
                 .unwrap();
         }
-        let result = list(&binding, true).unwrap();
+        let result = list_with_limits(
+            &binding,
+            true,
+            false,
+            ScanLimits {
+                file_bytes: 1_024,
+                total_bytes: 8_192,
+            },
+        )
+        .unwrap();
         assert_eq!(result.rows.len(), 8);
         assert!(result.truncated);
         for entry in std::fs::read_dir(&directory).unwrap() {

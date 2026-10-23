@@ -2768,7 +2768,7 @@ With `multimodal`, ordered inline PNG/JPEG/GIF/WebP images reach the provider an
 persist in the canonical User row. URI metadata is never fetched. Limits are
 128 blocks, 8 images, 2 MiB per decoded image, 4 MiB of decoded images, 1 MiB of
 text, and 6 MiB of actual encoded payload; each cap applies independently. Shared
-session storage is limited to 8 MiB and 100,000 messages. Feature-off builds
+session storage is limited to 32 MiB and 100,000 messages. Feature-off builds
 refuse image input and saved image history before dispatch, retaining stored
 data. The SDK's transport and provider error handling remain authoritative for
 unknown model capabilities; no model-name capability inference is used.

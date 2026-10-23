@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::session::Session;
 
-pub(crate) const MAX_SESSION_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_SESSION_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SESSION_MESSAGES: usize = 100_000;
 
 /// Decode only bounded data. Provider/workspace compatibility and fresh runtime
@@ -13,7 +13,7 @@ const MAX_SESSION_MESSAGES: usize = 100_000;
 pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
     anyhow::ensure!(
         json.len() <= MAX_SESSION_BYTES,
-        "persisted session exceeds the 8 MiB limit"
+        "persisted session exceeds the byte limit"
     );
     let session: Session = serde_json::from_str(json)
         .map_err(|_| anyhow::anyhow!("invalid persisted session JSON"))?;
@@ -46,7 +46,7 @@ thread_local! {
 /// Session file bytes. Identical to [`serialize_bounded_session`] except that a
 /// tool-result row whose display `content` is `prefix + tool.output` writes the
 /// output once (`content_prefix`), roughly halving tool-heavy files and the
-/// 8 MiB budget they consume (mini-agent-buv2v). Loading restores `content`
+/// session byte budget they consume (mini-agent-buv2v). Loading restores `content`
 /// exactly, and every digest is taken over the canonical form, never this one.
 pub(super) fn serialize_session_for_storage(session: &Session) -> anyhow::Result<String> {
     let _storage = super::StorageEncodingGuard::enable();
@@ -73,9 +73,7 @@ pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<Str
                 .len()
                 .checked_add(bytes.len())
                 .filter(|size| *size <= MAX_SESSION_BYTES)
-                .ok_or_else(|| {
-                    std::io::Error::other("persisted session exceeds the 8 MiB limit")
-                })?;
+                .ok_or_else(|| std::io::Error::other("persisted session exceeds the byte limit"))?;
             self.0.extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -119,7 +117,7 @@ pub(crate) fn load_session_exact_read_only(
         .read_to_end(&mut bytes)?;
     anyhow::ensure!(
         bytes.len() <= MAX_SESSION_BYTES,
-        "persisted session exceeds the 8 MiB limit"
+        "persisted session exceeds the byte limit"
     );
     crate::fs::validate_private_file(&file)?;
     let current = sessions_root.open_regular_relative(&relative)?;
@@ -198,7 +196,7 @@ fn read_private_string(path: &Path) -> anyhow::Result<String> {
         .read_to_string(&mut content)?;
     anyhow::ensure!(
         content.len() <= MAX_SESSION_BYTES,
-        "persisted session exceeds the 8 MiB limit"
+        "persisted session exceeds the byte limit"
     );
     Ok(content)
 }
@@ -1234,7 +1232,7 @@ mod readonly_import_tests {
             load_session_exact_read_only(&sessions, &loaded.id, &workspace)
                 .unwrap_err()
                 .to_string()
-                .contains("8 MiB")
+                .contains("byte limit")
         );
     }
 
@@ -1307,13 +1305,13 @@ mod readonly_import_tests {
             serialize_bounded_session(&session)
                 .unwrap_err()
                 .to_string()
-                .contains("8 MiB")
+                .contains("byte limit")
         );
         assert!(
             save_session(&session)
                 .unwrap_err()
                 .to_string()
-                .contains("8 MiB")
+                .contains("byte limit")
         );
         assert!(!root.path().join("state").exists());
         let path = session_path(&session.id).unwrap();
@@ -1324,7 +1322,7 @@ mod readonly_import_tests {
             save_session(&session)
                 .unwrap_err()
                 .to_string()
-                .contains("8 MiB")
+                .contains("byte limit")
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
         // UTF-8 source size is not the encoded size: escaped content must be
@@ -1339,7 +1337,7 @@ mod readonly_import_tests {
             save_session(&session)
                 .unwrap_err()
                 .to_string()
-                .contains("8 MiB")
+                .contains("byte limit")
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
         let oversized = serde_json::to_string(&session).unwrap();
@@ -1347,7 +1345,7 @@ mod readonly_import_tests {
             decode_session_json(&oversized)
                 .unwrap_err()
                 .to_string()
-                .contains("8 MiB")
+                .contains("byte limit")
         );
         assert_eq!(
             decode_session_json("{\"messages\": [\"opaque-secret\"]}")

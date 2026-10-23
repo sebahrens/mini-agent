@@ -496,7 +496,12 @@ Executing a custom command always uses the uncached loader.
 
 [`src/session/catalogue.rs`](../../src/session/catalogue.rs) reads private,
 no-follow, single-link UUID session files through bounded metadata discovery:
-2,048 directory entries, 8 MiB per file, 64 MiB total, and 100 displayed rows.
+2,048 directory entries, 32 MiB per file, 256 MiB total, and 100 displayed rows.
+Discovery streams the complete JSON, accepting legacy field order even when
+workspace metadata follows messages. It retains at most 4,096 preview characters
+per string and refuses exact identity/workspace/provider metadata above 64 KiB;
+message bodies and unknown payload strings never become whole-file buffers.
+Discarded string suffixes still undergo UTF-8 and escape validation.
 Oversized or unsafe files are skipped with a visible catalogue notice. Stored
 workspace strings are labels; they are never canonicalized or opened. Selection
 reloads the exact bounded private record and verifies identity, unchanged scope,
@@ -1255,10 +1260,11 @@ permissions are unchanged. Diagnostic origin labels never confer launch authorit
 `session::storage::load_session_exact_read_only` imports data through two
 host-retained roots. It validates the application-private directory and file
 without creating or repairing them, rejects links and changed identity, reads
-at most 8 MiB plus one detection byte, and requires the requested portable ID
+at most 32 MiB plus one detection byte, and requires the requested portable ID
 and current workspace. Saved labels and approvals do not create runtime grants;
 the frontend constructs fresh permissions/instruction services separately.
-All Session reads/serialization use the same 8 MiB ceiling. Saves encode once
+All Session reads/serialization use the same fixed 32 MiB hardening ceiling,
+independent of model context and configuration. Saves encode once
 through a bounded byte writer, so shared-owner changes cannot evade a separate
 size-count pass. Malformed snapshots
 produce a bounded static parse error; oversize saves refuse before creating or
@@ -1414,7 +1420,7 @@ scan. Stored workspace labels are returned as data and are never resolved.
 `session/user.rs` validates ordered inline text/image data. It caps blocks (128),
 images (8), each decoded image (2 MiB), aggregate decoded images (4 MiB), text
 (1 MiB), and the actual encoded JSON payload (6 MiB) independently. Whole session
-storage remains capped at 8 MiB; combining individually valid maxima does not
+storage remains capped at 32 MiB; combining individually valid maxima does not
 promise that a session fits. Image MIME types are PNG, JPEG, GIF and WebP. URI
 and annotation fields do not open files or fetch resources. Images remain data
 on import, with the canonical role and literal text projection checked before
