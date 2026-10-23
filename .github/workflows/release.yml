@@ -112,6 +112,9 @@ jobs:
           toolchain: "1.96.0"
           target: ${{ matrix.target }}
 
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
+
       - name: Generate third-party license inventories
         run: |
           cargo fetch --locked

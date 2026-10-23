@@ -43,6 +43,17 @@ system dylibs. GNU/Linux uses the native host glibc/curl/zlib toolchain and its
 system library prerequisites; this does not assert compatibility with every
 older glibc distribution or provide a static-musl payload.
 
+The macOS producer explicitly disables Git's Homebrew, Fink and MacPorts library
+discovery, selects `ICONVDIR=/usr` and `/usr/bin/curl-config`, and uses the native
+compiler's system SDK. This prevents the pinned Git Makefile from selecting an
+operator's Homebrew libiconv on Darwin 24 and later. The toolchain cache identity
+probes the same system curl configuration program used by make; the producer
+script's bytes also participate in the cache key, so changed library-selection
+flags cannot reuse a bundle built under an earlier recipe. The independent
+`otool -L` check still refuses every dependency outside `/usr/lib/` and
+`/System/Library/`; installing an extra package-manager dylib never authorizes it
+for the published payload.
+
 Packages: Debian/Ubuntu `apt install build-essential libcurl4-openssl-dev zlib1g-dev python3`
 (`curl-config` comes from `libcurl4-openssl-dev`); Fedora/RHEL
 `dnf install gcc make patch libcurl-devel zlib-devel python3`; macOS

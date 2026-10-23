@@ -65,6 +65,8 @@ class GitBootstrapTests(unittest.TestCase):
             program.write_bytes(("fixture program " + name).encode())
             program.chmod(0o700)
             programs[name] = str(program)
+        programs["/usr/bin/curl-config"] = programs["curl-config"]
+        self.programs = programs
         self.enterContext(patch.object(
             MODULE.shutil, "which", side_effect=lambda name, **_kwargs: programs.get(name)
         ))
@@ -162,6 +164,50 @@ class GitBootstrapTests(unittest.TestCase):
                 with self.subTest(target=target), self.assertRaises(ValueError):
                     MODULE.require_target(target)
 
+    def test_macos_pinned_make_uses_system_libraries_despite_operator_homebrew(self):
+        archive = (SCRIPT.parent / "git-runtime/git-2.56.0.tar.xz").read_bytes()
+        prefix = self.root / "operator-homebrew"
+        for package in ("gettext", "libiconv"):
+            (prefix / "opt" / package / "include").mkdir(parents=True)
+            (prefix / "opt" / package / "lib").mkdir()
+        for target, machine in (("x86_64-apple-darwin", "x86_64"), (TARGET, "arm64")):
+            with self.subTest(target=target):
+                directory = self.root / target
+                directory.mkdir()
+                source = MODULE.extract_source(archive, directory)
+                probe = source / "bootstrap-query.mk"
+                probe.write_text(
+                    "bootstrap-print-libraries:\n"
+                    "\t@printf 'ICONVDIR=%s\\nCURL_CONFIG=%s\\nCFLAGS=%s\\nLDFLAGS=%s\\nLIBS=%s\\n' "
+                    "'$(ICONVDIR)' '$(CURL_CONFIG)' '$(BASIC_CFLAGS)' '$(BASIC_LDFLAGS)' '$(EXTLIBS)'\n"
+                )
+                arguments = MODULE.make_arguments(target, 1, {})[:-2]
+                options = ["-s", "-f", "Makefile", "-f", str(probe), "uname_S=Darwin", "uname_R=24.0.0", f"uname_M={machine}", f"HOMEBREW_PREFIX={prefix}", "NO_CURL=YesPlease", "bootstrap-print-libraries"]
+                # Show the exact upstream route that the publisher must block,
+                # without compiling or relying on a host package-manager path.
+                unforced = [arg for arg in arguments if not arg.startswith(("NO_HOMEBREW=", "NO_FINK=", "NO_DARWIN_PORTS=", "ICONVDIR=", "CURL_CONFIG="))]
+                old = subprocess.run(unforced + options, cwd=source, capture_output=True, text=True, timeout=30, check=True).stdout
+                self.assertIn(f"ICONVDIR={prefix}/opt/libiconv", old)
+                self.assertIn(f"-L{prefix}/opt/gettext/lib", old)
+                selected = subprocess.run(arguments + options, cwd=source, capture_output=True, text=True, timeout=30, check=True).stdout
+                self.assertIn("ICONVDIR=/usr\n", selected)
+                self.assertIn("CURL_CONFIG=/usr/bin/curl-config\n", selected)
+                self.assertIn("-liconv", selected)
+                self.assertNotIn(str(prefix), selected)
+                self.assertNotIn("-I/sw/", selected)
+                self.assertNotIn("-L/opt/local/", selected)
+
+    def test_macos_toolchain_identity_binds_the_selected_system_curl(self):
+        for target in ("x86_64-apple-darwin", TARGET):
+            with self.subTest(target=target), patch.object(MODULE.subprocess, "check_output", return_value=b"fixed toolchain") as probe:
+                before = MODULE.toolchain_identity({"PATH": "/operator/homebrew"}, target)
+                curl_commands = [call.args[0] for call in probe.call_args_list if "curl-config" in call.args[0][0]]
+                self.assertTrue(curl_commands)
+                self.assertTrue(all(command[0] == "/usr/bin/curl-config" for command in curl_commands))
+                program = Path(self.programs["/usr/bin/curl-config"])
+                program.write_bytes(program.read_bytes() + b"updated system curl")
+                self.assertNotEqual(before, MODULE.toolchain_identity({"PATH": "/operator/homebrew"}, target))
+
     def configure_build(self):
         scripts = self.root / "scripts/git-runtime"
         scripts.mkdir(parents=True)
@@ -226,6 +272,19 @@ class GitBootstrapTests(unittest.TestCase):
             self.assertEqual(first, MODULE.toolchain_identity({}, "aarch64-unknown-linux-musl"))
             (self.root / "libcurl.a").write_bytes(b"security patch under unchanged version")
             self.assertNotEqual(first, MODULE.toolchain_identity({}, "aarch64-unknown-linux-musl"))
+
+    def test_macos_non_system_dylib_still_refuses_publication_and_cache(self):
+        args = self.configure_build()
+        def probe(command, **_kwargs):
+            if command[0] == "otool":
+                return "binary:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1)\n\t/operator/homebrew/lib/libiconv.2.dylib (compatibility version 1)\n"
+            return b"fixed toolchain"
+        with patch.object(MODULE.subprocess, "check_output", side_effect=probe), patch.object(MODULE, "run", side_effect=self.fixture_build):
+            with self.assertRaisesRegex(ValueError, "non-system dynamic library dependency"):
+                MODULE.bootstrap(output=self.root / "not-published", **args)
+        self.assertFalse((self.root / "not-published").exists())
+        self.assertFalse(list(args["cache_root"].rglob("bundle.manifest")))
+        self.assertFalse(list(args["cache_root"].rglob(".building-*")))
 
     def test_missing_native_toolchain_program_is_named_before_build(self):
         for missing in ("cc", "curl-config"):

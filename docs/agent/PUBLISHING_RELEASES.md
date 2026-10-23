@@ -65,8 +65,8 @@ the Conda source recipe generates it for its host target, the MSI installs it as
 `THIRD_PARTY_LICENSES.txt`, and each VSIX carries it next to its native binary as
 `bin/<target>/THIRD_PARTY_LICENSES`.
 
-The first release that ships the inventory is 1.10.0. The compatibility cutoff remains 1.9.5
-(`FIRST_INVENTORY_RELEASE` in `install.sh`). Until 1.10.0 is published, the latest release still
+The first release that ships the inventory is 1.10.1. The compatibility cutoff remains 1.9.5
+(`FIRST_INVENTORY_RELEASE` in `install.sh`). Until 1.10.1 is published, the latest release still
 points at archives without it, so the rollout is guarded: `install.sh` requires the inventory only
 for archives of 1.9.5 or later (the requested `--release`, or for `latest` the version the verified
 executable reports; an unreadable version keeps it required) and otherwise installs with the
@@ -75,7 +75,7 @@ warning "this release predates the bundled third-party licence inventory";
 when the archive contains it (the Conda source recipe generates it only when the source archive
 contains `scripts/third_party_licenses.py`), so neither Conda recipe lists it as a `license_file` or
 tests for it yet. `scripts/smoke-package-compliance.py` stages every recipe with and without the
-inventory. Once 1.10.0 has shipped and every recipe has verified digests for it or later, drop
+inventory. Once 1.10.1 has shipped and every recipe has verified digests for it or later, drop
 these guards: make the recipe installs unconditional, restore the Conda `license_file` and
 `test -f` entries, and remove
 the version tolerance from the installer and the canonical installer smoke.
@@ -349,7 +349,13 @@ a malformed tag, or a tag whose version differs from the root Cargo package vers
 release binary is built. The same job reads the version once from `Cargo.toml` (and requires
 `editors/vscode/package.json` to agree) and exports it as a job output; every VSIX and SBOM file
 name downstream is derived from that output, never from a literal in the workflow. All release
-builds run with `--locked` so the committed `Cargo.lock` is authoritative. Manual branch dispatch is intentionally disabled, so a branch name can
+builds run with `--locked` so the committed `Cargo.lock` is authoritative. Before either full or
+lite Cargo compilation, the native build job runs the reviewed `prepare-git-runtime` composite.
+On both Ubuntu GNU runners (x86-64 and ARM64), it explicitly installs the native C toolchain,
+`libcurl4-openssl-dev` (including `curl-config`), and the other pinned-Git build prerequisites.
+The action leaves macOS on its system toolchain; musl and Windows retain their separate payload
+provisioning paths. Cargo's guarded Git bootstrap never installs missing packages itself.
+Manual branch dispatch is intentionally disabled, so a branch name can
 never become a public release identity. Tags containing a prerelease suffix (for example,
 `v2.0.0-rc.1`) remain GitHub prereleases.
 

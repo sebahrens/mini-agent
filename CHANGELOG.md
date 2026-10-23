@@ -6,7 +6,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
-## [1.10.0] - 2026-10-23
+## [1.10.1] - 2026-10-24
 
 ### Added
 
@@ -220,6 +220,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- GNU Linux release builds provision the native tools required to embed guarded Git.
+  macOS builds explicitly select system libraries, keeping packaged Git independent
+  of Homebrew, Fink, and MacPorts while preserving dependency validation.
 - Raise the shared persisted-session ceiling to 32 MiB for long-context and tool-heavy
   conversations, keeping save, catalogue and reload limits aligned. The catalogue scans
   session JSON with bounded memory, including files written with older field orders.
@@ -704,7 +707,7 @@ as 1.9.3; all of its changes ship in 1.9.4.
 
 Thanks to sebahrens and platon2001 for the release work.
 
-[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.10.0...HEAD
-[1.10.0]: https://github.com/sebahrens/mini-agent/compare/v1.9.4...v1.10.0
+[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.10.1...HEAD
+[1.10.1]: https://github.com/sebahrens/mini-agent/compare/v1.9.4...v1.10.1
 [1.9.4]: https://github.com/sebahrens/mini-agent/compare/v1.8.0...v1.9.4
 [1.8.0]: https://github.com/sebahrens/mini-agent/compare/v1.7.2...v1.8.0

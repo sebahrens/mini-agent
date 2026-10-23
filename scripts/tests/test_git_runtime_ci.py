@@ -194,6 +194,32 @@ class GitRuntimeCiTests(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaises(AssertionError):
                 validate_linux_preparation(job)
 
+    def test_release_gnu_builds_provision_native_tools_before_full_and_lite(self):
+        jobs = linux_compiling_jobs(self.release)
+        self.assertEqual(set(jobs), {"build"})
+        job = jobs["build"]
+        gnu_rows = [row for row in job["strategy"]["matrix"]["include"]
+                    if row["target"].endswith("-unknown-linux-gnu")]
+        self.assertEqual(gnu_rows, [
+            {"os": "ubuntu-latest", "target": "x86_64-unknown-linux-gnu"},
+            {"os": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},
+        ])
+        validate_linux_preparation(job)
+        compiled = [step for step in job["steps"] if compiles_our_crate(step)]
+        self.assertEqual(len(compiled), 2, "full and lite both bootstrap guarded Git")
+
+    def test_release_gnu_missing_or_late_native_tools_are_rejected(self):
+        original = linux_compiling_jobs(self.release)["build"]
+        index = next(i for i, step in enumerate(original["steps"])
+                     if step.get("uses") == "./.github/actions/prepare-git-runtime")
+        for mode in ("missing", "late"):
+            job = copy.deepcopy(original)
+            preparation = job["steps"].pop(index)
+            if mode == "late":
+                job["steps"].append(preparation)
+            with self.subTest(mode=mode), self.assertRaises(AssertionError):
+                validate_linux_preparation(job)
+
     def test_linux_action_installs_only_explicit_build_prerequisites(self):
         document = CHECK_PACKAGE_METADATA.parse_yaml_document(self.action)
         linux = [step for step in document["runs"]["steps"] if step.get("if") == "runner.os == 'Linux'"]
@@ -236,7 +262,6 @@ class GitRuntimeCiTests(unittest.TestCase):
         # Static-musl preparation is owned by the separate static publisher;
         # this action cannot label a Windows/host bundle as musl.
         self.assertNotIn(PREP, job_body(self.release, "build-static"))
-        self.assertNotIn(PREP, job_body(self.release, "build"))
 
     def test_action_pins_official_toolchain_and_does_not_change_home(self):
         self.assertIn("scripts.tests.test_collect_git_native_sources", job_body(self.ci, "fmt"))

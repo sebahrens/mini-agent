@@ -186,8 +186,18 @@ def namespace_static_error(source: Path) -> None:
         path.write_text(text)
 
 
+def curl_config_program(target: str) -> str:
+    # Match the system dylib policy, independently of an operator's brew PATH.
+    return "/usr/bin/curl-config" if "apple" in target else "curl-config"
+
+
 def make_arguments(target: str, jobs: int, env: dict[str, str]) -> list[str]:
     arguments = ["make", f"-j{jobs}", "NO_RUST=YesPlease", "NO_GETTEXT=YesPlease", "NO_TCLTK=YesPlease", "NO_PERL=YesPlease", "NO_PYTHON=YesPlease", "NO_INSTALL_HARDLINKS=YesPlease", "NO_GITWEB=YesPlease", "NO_SUBMODULE_LINT=YesPlease", "CC=cc", "CFLAGS=-O2", "prefix=/usr"]
+    if "apple" in target:
+        # Pinned Git otherwise discovers package-manager include/link paths,
+        # including Homebrew libiconv on Darwin 24+. Use the SDK/system libs;
+        # the independent otool gate below still rejects non-system dylibs.
+        arguments += ["NO_HOMEBREW=YesPlease", "NO_FINK=YesPlease", "NO_DARWIN_PORTS=YesPlease", "ICONVDIR=/usr", f"CURL_CONFIG={curl_config_program(target)}"]
     if "musl" in target:
         # pkg-config's complete static closure includes the provisioned curl TLS,
         # compression and resolver libraries; the resulting ELF is checked below.
@@ -272,7 +282,8 @@ def toolchain_identity(env: dict[str, str], target: str, inputs: list[Path] | No
         value = env.get(variable, "").encode(errors="surrogateescape")
         identity.update(len(value).to_bytes(8, "little"))
         identity.update(value)
-    for program in ["cc", "curl-config"] + (["pkg-config"] if "musl" in target else []):
+    curl_config = curl_config_program(target)
+    for program in ["cc", curl_config] + (["pkg-config"] if "musl" in target else []):
         executable = shutil.which(program, path=env.get("PATH"))
         if executable is None:
             raise ValueError(f"Git build toolchain program is unavailable: {program}. {PACKAGE_HINT.get(program, '')}{PACKAGE_HINT_TAIL}")
@@ -281,7 +292,7 @@ def toolchain_identity(env: dict[str, str], target: str, inputs: list[Path] | No
         identity.update(hashlib.sha256(read_regular(resolved, 256 * 1024 * 1024)).digest())
         if inputs is not None:
             inputs.extend([path, resolved])
-    for command in (["cc", "--version"], ["cc", "-dumpmachine"], ["curl-config", "--version"], ["curl-config", "--ssl-backends"], ["curl-config", "--static-libs"]):
+    for command in (["cc", "--version"], ["cc", "-dumpmachine"], [curl_config, "--version"], [curl_config, "--ssl-backends"], [curl_config, "--static-libs"]):
         output = subprocess.check_output(command, env=env, timeout=30)
         if isinstance(output, str):
             output = output.encode()
