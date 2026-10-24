@@ -10,8 +10,8 @@ $ErrorActionPreference = 'Stop'
 function Trace-Stage($stage) { [Console]::Error.WriteLine('fixture-private-init:' + $stage) }
 Trace-Stage 'transport'
 try {
-[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
-Trace-Stage 'encoding-ready'
+# Stage names and normalized ACL fields are ASCII; changing console encoding
+# is unnecessary and blocked before identity/ACL work on the hosted runner.
 Trace-Stage 'current-user'
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().User
 Trace-Stage 'current-user-ready'

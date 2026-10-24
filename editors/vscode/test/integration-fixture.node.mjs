@@ -37,6 +37,8 @@ test('Windows initializer uses canonical PowerShell, bounded transport and no in
       assert.deepEqual(args.slice(0, 4), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand']);
       const script = Buffer.from(args[4], 'base64').toString('utf16le');
       assert.ok(script.includes('Set-Acl -LiteralPath'));
+      assert.ok(!/\[Console\]::(?:OutputEncoding|InputEncoding)|Text\.(?:UTF8|Unicode|ASCII)Encoding/i.test(script), 'ASCII fixture diagnostics must not mutate console encoding');
+      assert.ok(script.indexOf("Trace-Stage 'transport'") < script.indexOf("Trace-Stage 'current-user'"));
       assert.ok(!script.includes(fixture.root), 'paths must be transported through env, not script interpolation');
       assert.deepEqual(options.env, { SystemRoot: 'C:\\Windows', TEMP: 'C:\\Temp', USERPROFILE: 'C:\\Users\\fixture', PATH: 'C:\\Windows\\System32', MINI_AGENT_VSIX_PRIVATE_ROOT: fixture.configRoot });
       assert.equal(options.timeout, 30_000);
