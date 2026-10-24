@@ -6,7 +6,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
-## [1.10.3] - 2026-10-24
+## [1.10.4] - 2026-10-24
 
 ### Added
 
@@ -225,6 +225,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Skip canonical storage paths that also appear as legacy migration candidates,
+  avoiding unnecessary reads of active session lock files during Windows restart.
+- Keep VS Code integration data separate from current session state, bind test
+  prompts and commands to the same activated extension, and compare Windows editor
+  paths through the VS Code URI representation.
 - The Windows VS Code release fixture initializes explicit private ownership and ACLs
   before startup. A native Windows regression checks that its configuration remains
   readable after private-directory hardening, before release artifacts are built.
@@ -717,7 +722,7 @@ as 1.9.3; all of its changes ship in 1.9.4.
 
 Thanks to sebahrens and platon2001 for the release work.
 
-[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.10.3...HEAD
-[1.10.3]: https://github.com/sebahrens/mini-agent/compare/v1.9.4...v1.10.3
+[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.10.4...HEAD
+[1.10.4]: https://github.com/sebahrens/mini-agent/compare/v1.9.4...v1.10.4
 [1.9.4]: https://github.com/sebahrens/mini-agent/compare/v1.8.0...v1.9.4
 [1.8.0]: https://github.com/sebahrens/mini-agent/compare/v1.7.2...v1.8.0

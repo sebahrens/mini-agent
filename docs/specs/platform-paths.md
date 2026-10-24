@@ -334,9 +334,16 @@ secure-write contract. Errors and logs never include tokens.
 
 ## Legacy discovery and migration
 
-After resolving canonical paths, startup checks legacy locations only when the canonical artifact
-is absent. Known legacy candidates include prior config-under-data, config-under-XDG-config,
+After resolving canonical paths, startup discovers documented legacy locations and migrates
+content only when the canonical artifact is absent. Known legacy candidates include prior
+config-under-data, config-under-XDG-config,
 session/data, hook trust, OAuth, log, and Phase 3 draft skill-database locations.
+
+When the canonical artifact already exists, a missing marker may be repaired by comparing a
+distinct legacy candidate. After no-follow type validation, a candidate whose path equals the
+canonical path is excluded. If no distinct candidate remains, startup accepts the canonical
+artifact without reading or hashing its tree and without creating a migration marker. This
+allows shared data/state roots to contain active session locks.
 
 Migration rules:
 

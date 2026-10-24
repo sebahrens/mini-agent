@@ -2479,7 +2479,13 @@ pub fn migrate_legacy_path(
             // Enumerate candidates first (stat only); the canonical tree is
             // hashed only when a legacy candidate could be compared to it.
             let candidates =
-                existing_candidates(&request.candidates, request.artifact, request.kind)?;
+                existing_candidates(&request.candidates, request.artifact, request.kind)?
+                    .into_iter()
+                    // Shared data/state roots can nominate the canonical path
+                    // itself. It is not a legacy source, and hashing it would
+                    // unnecessarily read live state, including locked files.
+                    .filter(|candidate| candidate != &request.canonical)
+                    .collect::<Vec<_>>();
             if !candidates.is_empty() {
                 let canonical_identity =
                     content_identity(&request.canonical).map_err(|source| {
@@ -4011,6 +4017,113 @@ mod tests {
         assert_eq!(result.unwrap(), LegacyMigrationStatus::CanonicalPresent);
         assert!(!request.marker.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn legacy_path_migration_self_candidate_never_reads_canonical_tree() {
+        let (root, paths) = isolated_paths();
+        let canonical = paths.sessions_dir();
+        std::fs::create_dir_all(&canonical).unwrap();
+        let poison = canonical.join("poison");
+        #[cfg(unix)]
+        {
+            let outside = root.join("outside");
+            std::fs::write(&outside, b"untouched").unwrap();
+            std::os::unix::fs::symlink(outside, &poison).unwrap();
+        }
+        #[cfg(windows)]
+        let held = {
+            let mut file = std::fs::File::create(&poison).unwrap();
+            file.write_all(b"held").unwrap();
+            file.lock().unwrap();
+            file
+        };
+        // Prove the fixture would reject a tree read: a link on Unix, or an
+        // actual mandatory Windows byte-range lock held throughout migration.
+        let rejected = content_identity(&canonical).unwrap_err();
+        #[cfg(windows)]
+        assert_eq!(rejected.raw_os_error(), Some(33));
+        #[cfg(unix)]
+        assert_eq!(rejected.kind(), io::ErrorKind::PermissionDenied);
+        let request = LegacyMigrationRequest {
+            artifact: "sessions",
+            canonical: canonical.clone(),
+            candidates: vec![canonical],
+            marker: paths.migration_markers_dir().join("sessions.json"),
+            requirement: LegacyArtifactRequirement::Optional,
+            kind: LegacyArtifactKind::Directory,
+            selected: None,
+        };
+        assert_eq!(
+            migrate_legacy_path(&request).unwrap(),
+            LegacyMigrationStatus::CanonicalPresent
+        );
+        assert!(!request.marker.exists());
+        #[cfg(windows)]
+        {
+            held.unlock().unwrap();
+            drop(held);
+            assert_eq!(std::fs::read(&poison).unwrap(), b"held");
+        }
+        #[cfg(unix)]
+        {
+            assert!(
+                std::fs::symlink_metadata(&poison)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(root.join("outside")).unwrap(), b"untouched");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_path_migration_self_candidate_does_not_mask_real_legacy_comparison() {
+        for identical in [false, true] {
+            let (root, paths) = isolated_paths();
+            let canonical = paths.sessions_dir();
+            let legacy = paths.data_dir.join("sessions");
+            std::fs::create_dir_all(&canonical).unwrap();
+            std::fs::create_dir_all(&legacy).unwrap();
+            std::fs::write(canonical.join("one.json"), b"canonical").unwrap();
+            let legacy_bytes: &[u8] = if identical {
+                b"canonical"
+            } else {
+                b"different"
+            };
+            std::fs::write(legacy.join("one.json"), legacy_bytes).unwrap();
+            let request = LegacyMigrationRequest {
+                artifact: "sessions",
+                canonical: canonical.clone(),
+                candidates: vec![canonical.clone(), legacy.clone()],
+                marker: paths.migration_markers_dir().join("sessions.json"),
+                requirement: LegacyArtifactRequirement::Optional,
+                kind: LegacyArtifactKind::Directory,
+                selected: None,
+            };
+            assert_eq!(
+                migrate_legacy_path(&request).unwrap(),
+                LegacyMigrationStatus::CanonicalPresent
+            );
+            assert_eq!(request.marker.exists(), identical);
+            if identical {
+                let marker: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&request.marker).unwrap()).unwrap();
+                assert_eq!(marker["source"], legacy.to_string_lossy().as_ref());
+                assert_eq!(marker["canonical"], canonical.to_string_lossy().as_ref());
+            }
+            assert_eq!(
+                std::fs::read(canonical.join("one.json")).unwrap(),
+                b"canonical"
+            );
+            assert_eq!(
+                std::fs::read(legacy.join("one.json")).unwrap(),
+                legacy_bytes
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
