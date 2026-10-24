@@ -15,9 +15,9 @@ async function within(promise, milliseconds, label) {
   } finally { clearTimeout(timer); }
 }
 
-// Only closed classes and this static harness's numeric source location leave
-// this diagnostic boundary. Never format error.message, arbitrary stacks,
-// provider responses, session history, configuration, or filesystem paths.
+// This offline harness uses fixed synthetic inputs. Retain only a bounded
+// error name/message, scrubbing fixture paths and credential values; never
+// serialize the error object, stack, environment or provider/session data.
 function reportFailure(stage, error) {
   const categories = {
     ERR_ASSERTION: 'assertion', IDE_ACP53_TIMEOUT: 'timeout', ETIMEDOUT: 'timeout',
@@ -28,7 +28,15 @@ function reportFailure(stage, error) {
   const location = typeof error?.stack === 'string'
     ? error.stack.split('\n').slice(1).map(line => line.match(/\bresume\.integration\.cjs:(\d{1,7}):(\d{1,5})\b/)).find(Boolean)
     : undefined;
-  console.error(`IDE_ACP53_RESUME_FAILED stage=${stage} category=${category} location=${location ? `resume.integration.cjs:${location[1]}:${location[2]}` : 'unknown'}`);
+  let detail = `${typeof error?.name === 'string' ? error.name : 'Error'}: ${typeof error?.message === 'string' ? error.message : ''}`;
+  for (const key of ['MINI_AGENT_VSIX_PROFILE_ROOT', 'ZS_CONFIG_DIR', 'MINI_AGENT_HOME', 'MINI_AGENT_IDE_PROVIDER_EVENTS']) {
+    const value = process.env[key];
+    if (value) { detail = detail.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '<fixture>'); }
+  }
+  for (const key of ['OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'AZURE_OPENAI_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN']) {
+    if (process.env[key]) { detail = detail.replaceAll(process.env[key], '<redacted>'); }
+  }
+  console.error(`IDE_ACP53_RESUME_FAILED stage=${stage} category=${category} location=${location ? `resume.integration.cjs:${location[1]}:${location[2]}` : 'unknown'} detail=${JSON.stringify(detail.slice(0, 2000))}`);
 }
 
 exports.run = async () => {
