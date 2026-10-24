@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const host = vi.hoisted(() => ({ download: vi.fn(), command: vi.fn(), tests: vi.fn() }));
 vi.mock('@vscode/test-electron', () => ({
@@ -52,4 +54,20 @@ it('retains the install phase and numeric launcher exit before cleanup runs', as
   expect(errors).toHaveBeenCalledWith('IDE_HOST_RUNNER_STAGE=cleanup');
   expect(host.tests).not.toHaveBeenCalled();
   expect(JSON.stringify(errors.mock.calls)).not.toContain('PRIVATE_COMMAND_OUTPUT');
+});
+
+it('passes distinct data/state roots to the actual host runner and leaves private data creation to Rust', async () => {
+  const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  host.command.mockResolvedValueOnce({ stdout: '' }).mockResolvedValueOnce({ stdout: `mini-agent.mini-agent@${version}` });
+  const stopped = new Error('offline host boundary reached');
+  host.tests.mockImplementation(async (options: { extensionTestsEnv: Record<string, string> }) => {
+    const environment = options.extensionTestsEnv;
+    expect(environment.ZS_STATE_DIR).toBe(environment.ZS_CONFIG_DIR);
+    expect(environment.ZS_DATA_DIR).toBe(join(dirname(environment.ZS_CONFIG_DIR), 'data'));
+    expect(environment.ZS_DATA_DIR).not.toBe(environment.ZS_STATE_DIR);
+    expect(existsSync(environment.ZS_DATA_DIR)).toBe(false);
+    throw stopped;
+  });
+  await expect(import(runner)).rejects.toBe(stopped);
+  expect(host.tests).toHaveBeenCalledOnce();
 });

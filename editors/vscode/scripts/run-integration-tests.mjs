@@ -63,6 +63,9 @@ try {
   const testExtension = join(testRoot, 'test-extension');
   const profileRoot = join(testRoot, 'profile');
   const configRoot = fixture.configRoot;
+  // Let the binary create this absent root with its native private owner/ACL.
+  // Current state must not also appear as the fixture's legacy data source.
+  const dataRoot = join(testRoot, 'data');
   const providerEvents = join(testRoot, 'provider-events.jsonl');
   const fixtureFile = join(workspace, 'fixture.txt');
   const profileArgs = [
@@ -169,7 +172,7 @@ try {
       extensionTestsEnv: {
         MINI_AGENT_HOME: configRoot,
         ZS_CONFIG_DIR: configRoot,
-        ZS_DATA_DIR: configRoot,
+        ZS_DATA_DIR: dataRoot,
         ZS_LOCAL_DATA_DIR: configRoot,
         ZS_STATE_DIR: configRoot,
         ZS_CACHE_DIR: configRoot,
