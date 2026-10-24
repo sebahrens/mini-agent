@@ -93,6 +93,19 @@ npm test
 npm audit --audit-level=high
 ```
 
+The required `windows-default-compile` CI job also runs
+`node --test editors/vscode/test/integration-fixture.node.mjs` on native Windows,
+using the same pinned Node version before Git bootstrap or Cargo work. These
+standalone controls need no npm install and exercise Windows fixture ownership,
+protected ACLs and config readback after parent-directory tightening. The
+fixture uses the canonical system PowerShell to initialize only its newly
+created config directory and `config.toml`, with the current user as owner and
+a protected DACL granting full access to that user and SYSTEM through explicit,
+non-inheritable ACEs. Its native control records what happens to an inherited
+child's ACL without presuming the historical failure's cause; the initialized
+protected-file control must remain readable after parent repair. Tag CI requires
+this job to pass before the release build gate accepts its evidence.
+
 ## Generic ACP clients over TCP
 
 Other ACP clients can connect over TCP, which is useful when the agent runs on a

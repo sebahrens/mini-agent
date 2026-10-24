@@ -1,9 +1,10 @@
-import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { downloadAndUnzipVSCode, runTests, runVSCodeCommand } from '@vscode/test-electron';
 import { TARGETS } from './platform.mjs';
+import { createIntegrationFixture } from './integration-fixture.mjs';
 
 const [, , vsixArgument, target, testScenario = 'smoke'] = process.argv;
 if (!vsixArgument || !TARGETS[target] || !['smoke', 'resume'].includes(testScenario)) {
@@ -24,11 +25,12 @@ const vscodeExecutablePath = await downloadAndUnzipVSCode({ version, platform, c
 const options = { version, platform, cachePath, reuseMachineInstall: false };
 // macOS VS Code embeds this path in a Unix socket with a 103-byte limit.
 const profileBase = process.platform === 'darwin' ? '/private/tmp' : realpathSync(tmpdir());
-const testRoot = mkdtempSync(join(profileBase, 'ma-vs-'));
+const fixture = createIntegrationFixture(profileBase);
+const testRoot = fixture.root;
 const workspace = join(testRoot, 'workspace');
 const testExtension = join(testRoot, 'test-extension');
 const profileRoot = join(testRoot, 'profile');
-const configRoot = join(testRoot, 'config');
+const configRoot = fixture.configRoot;
 const providerEvents = join(testRoot, 'provider-events.jsonl');
 const fixtureFile = join(workspace, 'fixture.txt');
 const profileArgs = [
@@ -38,7 +40,6 @@ const profileArgs = [
 mkdirSync(workspace);
 writeFileSync(fixtureFile, 'OFFLINE_IDE_FIXTURE\n');
 mkdirSync(testExtension);
-mkdirSync(configRoot, { mode: 0o700 });
 const provider = createServer(async (request, response) => {
   if (request.method === 'GET') {
     response.writeHead(200, { 'content-type': 'application/json' });
@@ -81,31 +82,34 @@ const provider = createServer(async (request, response) => {
       + `data: ${chunk({}, 'stop')}\n\ndata: [DONE]\n\n`);
   }
 });
-await new Promise((resolveListen, rejectListen) => {
-  provider.once('error', rejectListen);
-  provider.listen(0, '127.0.0.1', resolveListen);
-});
-const port = provider.address().port;
-writeFileSync(join(configRoot, 'config.toml'), [
-  'provider = "offline-ide"',
-  'model = "offline-ide"',
-  'max_tokens = 256',
-  'session_title_model = "off"',
-  'default_permission_mode = "restrictive"',
-  '[custom_providers.offline-ide]',
-  'provider_type = "openai"',
-  `base_url = "http://127.0.0.1:${port}/v1"`,
-  'api_key_env = "MINI_AGENT_IDE_FIXTURE_KEY"',
-  'api_style = "completions"',
-  '',
-].join('\n'), { mode: 0o600 });
-writeFileSync(join(testExtension, 'package.json'), JSON.stringify({
-  name: 'mini-agent-integration-runner',
-  publisher: 'mini-agent-tests',
-  version: '0.0.1',
-  engines: { vscode: '^1.91.0' },
-}));
 try {
+  await new Promise((resolveListen, rejectListen) => {
+    provider.once('error', rejectListen);
+    provider.listen(0, '127.0.0.1', resolveListen);
+  });
+  const port = provider.address().port;
+  const privateInitialization = fixture.writeConfig([
+    'provider = "offline-ide"',
+    'model = "offline-ide"',
+    'max_tokens = 256',
+    'session_title_model = "off"',
+    'default_permission_mode = "restrictive"',
+    '[custom_providers.offline-ide]',
+    'provider_type = "openai"',
+    `base_url = "http://127.0.0.1:${port}/v1"`,
+    'api_key_env = "MINI_AGENT_IDE_FIXTURE_KEY"',
+    'api_style = "completions"',
+    '',
+  ].join('\n'));
+  if (privateInitialization) {
+    console.log(`Windows owned integration fixture ACL/readback: ${JSON.stringify(privateInitialization)}`);
+  }
+  writeFileSync(join(testExtension, 'package.json'), JSON.stringify({
+    name: 'mini-agent-integration-runner',
+    publisher: 'mini-agent-tests',
+    version: '0.0.1',
+    engines: { vscode: '^1.91.0' },
+  }));
   // The VS Code CLI puts its clean profile under the current directory.
   process.chdir(testRoot);
   await runVSCodeCommand([...profileArgs, '--install-extension', vsix, '--force'], options);

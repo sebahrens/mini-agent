@@ -8,9 +8,41 @@ import re
 import unittest
 from pathlib import Path
 
+from scripts.ci_success import evaluate
+from scripts.tests.test_phase6_ci_workflow import job_body
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+WINDOWS_FIXTURE_STEP = "Test native Windows VS Code private fixture contracts"
+WINDOWS_FIXTURE_COMMAND = "node --test editors/vscode/test/integration-fixture.node.mjs"
+
+
+def validate_windows_fixture_gate(workflow: str) -> None:
+    job = job_body(workflow, "windows-default-compile")
+    if "runs-on: windows-latest" not in job:
+        raise AssertionError("fixture ACL controls require native Windows")
+    marker = "- name: " + WINDOWS_FIXTURE_STEP
+    if job.count(marker) != 1:
+        raise AssertionError("one native fixture acceptance step is required")
+    step = job.split(marker, 1)[1].split("\n      - ", 1)[0]
+    if any(flag in step for flag in ("if:", "continue-on-error:", "npm ")):
+        raise AssertionError("fixture acceptance must run without skips or npm dependencies")
+    for required in ("shell: pwsh", WINDOWS_FIXTURE_COMMAND,
+                     "if ($LASTEXITCODE -ne 0) { throw"):
+        if required not in step:
+            raise AssertionError("missing native fixture execution guard: " + required)
+    setup = "- name: Select Node for native Windows fixture contracts"
+    if setup not in job:
+        raise AssertionError("pinned fixture Node setup is required")
+    node = job.split(setup, 1)[1].split("\n      - ", 1)[0]
+    if "if:" in node or "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" not in node or "node-version-file: editors/vscode/.nvmrc" not in node:
+        raise AssertionError("fixture controls must use the manifest Node toolchain")
+    if not job.index(setup) < job.index(marker) < job.index("- name: Prepare guarded Git runtime") < job.index("cargo test"):
+        raise AssertionError("fixture acceptance must run before native producer and Cargo work")
+    aggregate = job_body(workflow, "ci-success").split("    runs-on:", 1)[0]
+    if "      - windows-default-compile\n" not in aggregate:
+        raise AssertionError("native fixture job must gate ci-success")
 
 
 class VsCodeCiWorkflowTests(unittest.TestCase):
@@ -90,6 +122,34 @@ class VsCodeCiWorkflowTests(unittest.TestCase):
         condition = self.body.splitlines()[0].strip()
         self.assertIn("github.event_name != 'schedule'", condition)
         self.assertIn("inputs.scope != 'windows-general-sandbox'", condition)
+
+    def test_native_windows_fixture_acceptance_precedes_producer_and_cargo(self) -> None:
+        validate_windows_fixture_gate(WORKFLOW.read_text(encoding="utf-8"))
+        for result in ("failure", "cancelled", "skipped"):
+            with self.subTest(result=result):
+                needs = {
+                    "changes": {"result": "success", "outputs": {"code": "true"}},
+                    "fmt": {"result": "success"},
+                    "windows-default-compile": {"result": result},
+                }
+                errors = evaluate(needs, "push", "refs/tags/vfixture")
+                self.assertTrue(any("windows-default-compile" in error for error in errors))
+
+    def test_native_windows_fixture_gate_rejects_missing_skipped_or_non_native_proof(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        marker = "- name: " + WINDOWS_FIXTURE_STEP
+        mutations = (
+            workflow.replace(WINDOWS_FIXTURE_COMMAND, "echo fixture proof omitted"),
+            workflow.replace(marker, marker + "\n        if: false"),
+            workflow.replace(marker, marker + "\n        continue-on-error: true"),
+            workflow.replace("- name: Select Node for native Windows fixture contracts", "- name: Omitted fixture Node setup"),
+            workflow.replace("actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020", "actions/setup-node@v4"),
+            workflow.replace("runs-on: windows-latest", "runs-on: ubuntu-latest"),
+            workflow.replace("      - windows-default-compile\n", ""),
+        )
+        for index, mutated in enumerate(mutations):
+            with self.subTest(mutation=index), self.assertRaises(AssertionError):
+                validate_windows_fixture_gate(mutated)
 
 
 if __name__ == "__main__":

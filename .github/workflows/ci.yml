@@ -888,6 +888,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Select Node for native Windows fixture contracts
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: editors/vscode/.nvmrc
+
+      - name: Test native Windows VS Code private fixture contracts
+        shell: pwsh
+        run: |
+          node --test editors/vscode/test/integration-fixture.node.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows VS Code private fixture contracts failed' }
+
       - name: Prepare guarded Git runtime
         uses: ./.github/actions/prepare-git-runtime
         with:
