@@ -72,7 +72,7 @@ exports.run = async () => {
 
     const configPath = path.join(process.env.MINI_AGENT_HOME, 'config.toml');
     assert.ok(fs.existsSync(configPath), 'Open Config selects or creates the private config');
-    assert.equal(vscode.window.activeTextEditor?.document.uri.fsPath, configPath);
+    assert.equal(vscode.window.activeTextEditor?.document.uri.fsPath, vscode.Uri.file(configPath).fsPath);
 
     // The clean offline host cannot fetch VS Code's signed-in Chat registry.
     // Invoke the installed extension's production session path directly while
