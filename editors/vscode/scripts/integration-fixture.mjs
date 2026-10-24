@@ -2,6 +2,23 @@ import { spawnSync } from 'node:child_process';
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, win32 } from 'node:path';
 
+// Removing an inherited PS7 path still lets Windows PowerShell reconstruct
+// CurrentUser/AllUsers discovery paths. This fixture only needs in-box modules:
+// load their absolute manifests and disable ambient autoloading before the
+// first Utility/Management/Security cmdlet. Import-Module itself is Core.
+export const WINDOWS_FIXTURE_MODULE_SETUP = String.raw`
+Trace-Stage 'module-path'
+$fixtureModules = [IO.Path]::Combine($PSHOME, 'Modules')
+$env:PSModulePath = $fixtureModules
+$PSModuleAutoLoadingPreference = 'None'
+foreach ($module in @('Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Security')) {
+    Trace-Stage ('import:' + $module)
+    $manifest = [IO.Path]::Combine([IO.Path]::Combine($fixtureModules, $module), $module + '.psd1')
+    Import-Module -Name $manifest -ErrorAction Stop
+    Trace-Stage ('import-ready:' + $module)
+}
+`;
+
 // This script only receives paths created by createIntegrationFixture below.
 // Protect the leaf first: tightening a parent can remove an unprotected child's
 // inherited grants before the child's own ACL can be initialized.
@@ -15,7 +32,10 @@ try {
 Trace-Stage 'current-user'
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().User
 Trace-Stage 'current-user-ready'
+${WINDOWS_FIXTURE_MODULE_SETUP}
+Trace-Stage 'system-sid'
 $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+Trace-Stage 'system-sid-ready'
 function Inspect-Acl($path, $relative) {
     $acl = Get-Acl -LiteralPath $path
     $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
@@ -33,10 +53,12 @@ function Inspect-Acl($path, $relative) {
         } })
     }
 }
+Trace-Stage 'fixture-paths'
 $paths = @(
     @{ path = (Join-Path $env:MINI_AGENT_VSIX_PRIVATE_ROOT 'config.toml'); relative = 'config.toml'; directory = $false },
     @{ path = $env:MINI_AGENT_VSIX_PRIVATE_ROOT; relative = '.'; directory = $true }
 )
+Trace-Stage 'fixture-paths-ready'
 $before = @()
 foreach ($entry in $paths) {
     Trace-Stage ('inspect:' + $entry.relative)

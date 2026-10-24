@@ -4,7 +4,7 @@ import { linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, 
 import { tmpdir } from 'node:os';
 import { join, win32 } from 'node:path';
 import test from 'node:test';
-import { createIntegrationFixture, fixturePowerShellEnvironment } from '../scripts/integration-fixture.mjs';
+import { createIntegrationFixture, fixturePowerShellEnvironment, WINDOWS_FIXTURE_MODULE_SETUP } from '../scripts/integration-fixture.mjs';
 
 function base(t) {
   const path = mkdtempSync(join(tmpdir(), 'ma-fixture-test-'));
@@ -39,6 +39,9 @@ test('Windows initializer uses canonical PowerShell, bounded transport and no in
       assert.ok(script.includes('Set-Acl -LiteralPath'));
       assert.ok(!/\[Console\]::(?:OutputEncoding|InputEncoding)|Text\.(?:UTF8|Unicode|ASCII)Encoding/i.test(script), 'ASCII fixture diagnostics must not mutate console encoding');
       assert.ok(script.indexOf("Trace-Stage 'transport'") < script.indexOf("Trace-Stage 'current-user'"));
+      assert.ok(script.includes(WINDOWS_FIXTURE_MODULE_SETUP));
+      assert.ok(script.indexOf(WINDOWS_FIXTURE_MODULE_SETUP) < script.indexOf('New-Object'));
+      assert.ok(script.indexOf(WINDOWS_FIXTURE_MODULE_SETUP) < script.indexOf('Join-Path'));
       assert.ok(!script.includes(fixture.root), 'paths must be transported through env, not script interpolation');
       assert.deepEqual(options.env, { SystemRoot: 'C:\\Windows', TEMP: 'C:\\Temp', USERPROFILE: 'C:\\Users\\fixture', PATH: 'C:\\Windows\\System32', MINI_AGENT_VSIX_PRIVATE_ROOT: fixture.configRoot });
       assert.equal(options.timeout, 30_000);
@@ -49,6 +52,16 @@ test('Windows initializer uses canonical PowerShell, bounded transport and no in
   });
   assert.equal(fixture.writeConfig('offline fixture').readback, true);
   assert.equal(invoked, true);
+});
+
+test('module setup pins system manifests before cmdlet use and does not discover ambient modules', () => {
+  assert.ok(WINDOWS_FIXTURE_MODULE_SETUP.includes("$fixtureModules = [IO.Path]::Combine($PSHOME, 'Modules')"));
+  assert.ok(WINDOWS_FIXTURE_MODULE_SETUP.includes('$env:PSModulePath = $fixtureModules'));
+  assert.ok(WINDOWS_FIXTURE_MODULE_SETUP.includes("$PSModuleAutoLoadingPreference = 'None'"));
+  assert.ok(WINDOWS_FIXTURE_MODULE_SETUP.includes("@('Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Security')"));
+  assert.ok(WINDOWS_FIXTURE_MODULE_SETUP.includes("[IO.Path]::Combine([IO.Path]::Combine($fixtureModules, $module), $module + '.psd1')"));
+  assert.ok(WINDOWS_FIXTURE_MODULE_SETUP.indexOf('$env:PSModulePath =') < WINDOWS_FIXTURE_MODULE_SETUP.indexOf('Import-Module -Name $manifest -ErrorAction Stop'));
+  assert.ok(!/New-Object|Join-Path|Get-Module|Get-Command|USERPROFILE|ProgramFiles/.test(WINDOWS_FIXTURE_MODULE_SETUP));
 });
 
 test('PowerShell environment retains OS/profile/temp inputs with Windows case-insensitive names', () => {
@@ -179,8 +192,10 @@ test('native Windows protected config survives parent repair; inherited control 
   t.diagnostic(`initialized ACLs/readback: ${JSON.stringify(initialized)}`);
   const script = String.raw`
 $ErrorActionPreference = 'Stop'
-[Console]::Error.WriteLine('fixture-private-control:transport')
+function Trace-Stage($stage) { [Console]::Error.WriteLine('fixture-private-control:' + $stage) }
+Trace-Stage 'transport'
 try {
+${WINDOWS_FIXTURE_MODULE_SETUP}
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
 function Set-OwnedAcl($path, $directory, $inherit, $setOwner = $true) {
