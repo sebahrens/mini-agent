@@ -63,7 +63,15 @@ exports.run = async () => {
     original = config.inspect('executablePath')?.globalValue;
     const bundled = path.join(extension.extensionPath, 'bin', `${process.platform}-${process.arch}`,
       process.platform === 'win32' ? 'mini-agent.exe' : 'mini-agent');
-    const installed = require(path.join(extension.extensionPath, 'dist', 'extension.js'));
+    const entry = path.join(extension.extensionPath, 'dist', 'extension.js');
+    const canonicalEntry = fs.realpathSync.native(entry);
+    const cacheMatches = [...new Set(Object.values(require.cache))].filter(module => {
+      try { return typeof module?.filename === 'string' && path.relative(canonicalEntry, fs.realpathSync.native(module.filename)) === ''; }
+      catch { return false; }
+    });
+    console.log(`IDE_EXTENSION_CACHE_BIND matches=${cacheMatches.length} resolved_hit=${Number(cacheMatches.length === 1 && require.cache[require.resolve(entry)] === cacheMatches[0])}`);
+    assert.equal(cacheMatches.length, 1, 'exactly one activated extension module is already loaded');
+    const installed = cacheMatches[0].exports;
     const context = { extensionUri: extension.extensionUri, extension: { packageJSON: extension.packageJSON }, subscriptions: [] };
     const events = () => fs.readFileSync(process.env.MINI_AGENT_IDE_PROVIDER_EVENTS, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
     const sessions = path.join(process.env.ZS_STATE_DIR, 'sessions');
