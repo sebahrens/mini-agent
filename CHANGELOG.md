@@ -51,6 +51,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- Pin the VS Code packaging tool's Azure Identity dependency to patched MSAL Node
+  7.1.0 for [GHSA-xcx6-jx8p-x3h5](https://github.com/advisories/GHSA-xcx6-jx8p-x3h5),
+  with offline compatibility and authorization-code security controls.
 - Update the VS Code Zod schema dependency to 4.6.7 to address collection-validation
   memory exhaustion ([GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5)).
 - Refresh the audited Rust lockfile to ctutils 0.4.4, Tokio 1.53.3,

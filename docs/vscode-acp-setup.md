@@ -106,6 +106,22 @@ child's ACL without presuming the historical failure's cause; the initialized
 protected-file control must remain readable after parent repair. Tag CI requires
 this job to pass before the release build gate accepts its evidence.
 
+The packaging dependency `@azure/identity@4.13.3` temporarily overrides its MSAL
+Node child to exactly `7.1.0` for
+[GHSA-xcx6-jx8p-x3h5](https://github.com/advisories/GHSA-xcx6-jx8p-x3h5).
+Identity's published range still selects affected MSAL versions. The override
+is restricted to that reviewed parent, preserves Node 22 and the audit gate,
+and retains the authentication checks added by MSAL 7.1. The
+[MSAL v7 migration guide](https://github.com/AzureAD/microsoft-authentication-library-for-js/blob/msal-node-v7.1.0/lib/msal-node/docs/v7-migration.md)
+limits the breaking change to interactive browser response-mode selection;
+Identity's requests do not set that option. `test/msal-compatibility.test.ts`
+exercises the actual Identity client-secret/cache, managed-identity and authorization-code paths
+with synthetic credentials and an injected offline transport, plus rejection
+and endpoint-substitution controls. Remove the override when an upstream
+Identity release permits patched MSAL directly, then rerun these controls,
+extension checks, packaging and a fresh audit. MSAL is a packaging dependency,
+not part of the bundled extension runtime.
+
 ## Generic ACP clients over TCP
 
 Other ACP clients can connect over TCP, which is useful when the agent runs on a
