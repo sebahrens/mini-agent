@@ -2339,6 +2339,21 @@ impl Session {
         self.calibrated_tokens == 0
     }
 
+    #[cfg(any(feature = "acp", test))]
+    pub(crate) fn compacted_image_bytes(&self) -> usize {
+        self.compactions
+            .last()
+            .filter(|_| self.compacted_context().0.is_some())
+            .map_or(0, |record| record.images.serialized_bytes())
+    }
+
+    fn compacted_image_token_estimate(&self) -> u64 {
+        self.compactions
+            .last()
+            .filter(|_| self.compacted_context().0.is_some())
+            .map_or(0, |record| record.images.estimated_tokens())
+    }
+
     pub fn effective_context_tokens(&self) -> u64 {
         if self.calibrated_tokens == 0 {
             // No real usage yet: per-message estimates cover only `messages`, so
@@ -2347,7 +2362,8 @@ impl Session {
             // already inside the anchor, so it is not added in that branch.
             return self
                 .overhead_tokens
-                .saturating_add(self.total_estimated_tokens);
+                .saturating_add(self.total_estimated_tokens)
+                .saturating_add(self.compacted_image_token_estimate());
         }
         let start = self.calibrated_msg_count.min(self.messages.len());
         let delta: u64 = self.messages[start..]
@@ -2415,6 +2431,7 @@ impl Session {
         let anchor = self.calibrated_msg_count.min(self.messages.len());
         let mut effective = if self.calibrated_tokens == 0 {
             self.overhead_tokens
+                .saturating_add(self.compacted_image_token_estimate())
         } else {
             self.calibrated_tokens
         };

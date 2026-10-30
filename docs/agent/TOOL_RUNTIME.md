@@ -1759,7 +1759,9 @@ attachment counts rather than base64 and must not infer unseen pixels.
 The active compaction retains the newest eight distinct images within 7 MiB of
 encoded image data. Identical pixels with the same MIME/detail are deduplicated.
 Images beyond count/byte limits, or invalid imported images, produce an explicit
-omission count and up to sixteen recent omitted content identities. A text recap
+cumulative omission-event count and up to sixteen recent omitted content identities.
+The notice describes past omissions; rereading matching pixels can make them
+available again in the retained inventory. A text recap
 does not recover omitted pixels; obtain the original evidence when it matters.
 Only the active compaction serializes image payloads; older records retain
 identities so repeated compaction does not write duplicate images. In-memory
@@ -1768,3 +1770,16 @@ restore them. A historical record reloaded without pixels reports that absence
 explicitly if it becomes active again. Session
 save/reload and rewind/redo retain this inventory. Imported inventories remain
 labeled as imported, untrusted history, and cannot name a URL or filesystem path.
+
+Retained image evidence participates in context pressure. Before actual provider
+usage is available, each validated image reserves 256 tokens plus 256 per 512px
+tile, and the image inventory reserves 1,024 tokens for bounded labels and loss
+metadata. This is a conservative scheduling estimate, not provider billing;
+reported usage replaces it without double-counting pixels. The estimate is
+cached while validating image dimensions and survives reload by recomputation.
+ACP reports/counts the serialized active image inventory separately from its
+existing 2 MiB live text/tail allowance: at most 7 MiB of encoded retained pixels
+plus their bounded metadata may accompany that tail. Image bytes cannot hide an
+over-budget tail, and compaction stops rather than repeatedly summarizing an
+unshrinkable image-only recap. Active retained pixels remain recoverable in the
+saved session under the retention limits above.

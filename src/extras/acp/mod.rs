@@ -264,14 +264,17 @@ impl SessionHistory {
             })
             .collect()
     }
-    fn live_bytes(&self) -> usize {
+    fn live_bytes(&self) -> (usize, usize) {
         #[cfg(test)]
         LIVE_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
-        struct Count(usize);
+        struct Count {
+            bytes: usize,
+            limit: usize,
+        }
         impl std::io::Write for Count {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 = self.0.saturating_add(bytes.len());
-                if self.0 > MAX_ACP_HISTORY_BYTES {
+                self.bytes = self.bytes.saturating_add(bytes.len());
+                if self.bytes > self.limit {
                     return Err(std::io::Error::other("ACP live history byte bound"));
                 }
                 Ok(bytes.len())
@@ -280,9 +283,18 @@ impl SessionHistory {
                 Ok(())
             }
         }
-        let mut count = Count(0);
+        // Keep the existing 2 MiB tail budget. The separately validated active
+        // image inventory (at most 7 MiB encoded pixels plus bounded metadata)
+        // is counted once and gets its own finite allowance, not a text-sized
+        // ceiling that would reject an otherwise valid 2 MiB input image.
+        let image_bytes = self.session.compacted_image_bytes();
+        let limit = MAX_ACP_HISTORY_BYTES.saturating_add(image_bytes);
+        let mut count = Count {
+            bytes: image_bytes,
+            limit,
+        };
         let _ = serde_json::to_writer(&mut count, &self.session.messages[self.live_start()..]);
-        count.0
+        (count.bytes, limit)
     }
     #[cfg(feature = "hooks")]
     fn record_hook_context(&mut self, notices: Vec<String>) {
@@ -295,7 +307,10 @@ impl SessionHistory {
     fn needs_compaction(&self) -> bool {
         (self.manual_compact && self.live_start() < self.session.messages.len())
             || self.user_starts().len() > MAX_ACP_HISTORY_TURNS
-            || self.live_bytes() > MAX_ACP_HISTORY_BYTES
+            || {
+                let (bytes, limit) = self.live_bytes();
+                bytes > limit
+            }
     }
     fn next_cut(&self) -> usize {
         if self.manual_compact {
@@ -365,6 +380,11 @@ impl SessionHistory {
                 return None;
             }
             let cut = self.next_cut();
+            // Retained pixels cannot be shrunk by repeatedly summarizing a recap.
+            // Let the caller report the remaining fixed evidence pressure.
+            if cut <= self.live_start() {
+                return Some(usage);
+            }
             let previous = self.session.compacted_context().0.map(str::to_owned);
             // Shared provider serialization describes attachments without putting
             // base64 into text; apply_compaction retains the original pixels.
@@ -426,7 +446,7 @@ impl SessionHistory {
         self.manual_compact = false;
         while self.needs_compaction() {
             let cut = self.next_cut();
-            if cut == 0 {
+            if cut <= self.live_start() {
                 break;
             }
             self.session
@@ -4444,6 +4464,11 @@ async fn execute_prompt(
         let Some(usage) = compacted else {
             return Ok(PromptOutcome::cancelled(None));
         };
+        if history.needs_compaction() {
+            return Ok(PromptOutcome::failed(
+                "retained historical image evidence exceeds the ACP history limit; start a fresh session or provide fewer/smaller images".into(),
+            ));
+        }
         #[cfg(feature = "hooks")]
         {
             let notices = crate::startup::heap_future(|| {
@@ -5519,6 +5544,77 @@ mod history_tests {
                     "[Recap of my prior work in this conversation]\noversized origin retained"
                 ),
             "a single oversized turn must be replaced by its bounded recap"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_images_count_toward_payload_without_consuming_the_text_budget_or_looping() {
+        use base64::Engine;
+        let mut bytes = include_bytes!("../../agent/tools/fixtures/read-image64/3x2.png").to_vec();
+        bytes.resize(2 * 1024 * 1024, 0);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let image =
+            crate::session::tool_image::PersistedToolImage::from_rig(&rig::message::Image {
+                data: rig::message::DocumentSourceKind::Base64(encoded.clone()),
+                media_type: Some(rig::message::ImageMediaType::PNG),
+                detail: None,
+                additional_params: None,
+            })
+            .unwrap();
+        let mut history = SessionHistory::default();
+        history.session.add_tool_call_with_id(
+            "image",
+            "read",
+            &serde_json::json!({"path":"chart.png"}),
+        );
+        history
+            .session
+            .add_tool_result_with_images("image", "read", "pixels", vec![image]);
+        history
+            .session
+            .compress("recap".into(), history.session.messages.len(), 0);
+        let (payload, limit) = history.live_bytes();
+        assert!(
+            payload > MAX_ACP_HISTORY_BYTES,
+            "pixel bytes are not hidden from accounting"
+        );
+        assert!(payload < limit);
+        assert!(
+            !history.needs_compaction(),
+            "a supported image does not consume the text allowance"
+        );
+        history.session.add_message(
+            crate::session::MessageRole::User,
+            &"x".repeat(MAX_ACP_HISTORY_BYTES),
+        );
+        assert!(
+            history.needs_compaction(),
+            "image allowance cannot conceal an over-budget text tail"
+        );
+        let mut calls = 0;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            history.compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| {
+                    calls += 1;
+                    let count = messages.len();
+                    async move { Ok(compaction_output("bounded text recap", count)) }
+                },
+            ),
+        )
+        .await
+        .expect("compaction must not loop over a retained-image floor")
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(!history.needs_compaction());
+        let serialized = serde_json::to_string(&history.session).unwrap();
+        assert_eq!(
+            serialized.matches(&encoded).count(),
+            1,
+            "pixels remain available exactly once"
         );
     }
 

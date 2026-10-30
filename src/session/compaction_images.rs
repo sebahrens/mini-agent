@@ -136,6 +136,43 @@ impl Images {
         self.imported = true;
     }
 
+    /// Serialized inventory bytes participate in ACP's existing history bound.
+    /// Count into a sink: never clone the base64 or allocate a second body.
+    #[cfg(any(feature = "acp", test))]
+    pub(crate) fn serialized_bytes(&self) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        if serde_json::to_writer(&mut count, self).is_err() {
+            return usize::MAX;
+        }
+        count.0
+    }
+
+    pub(super) fn estimated_tokens(&self) -> u64 {
+        if self.is_empty() {
+            return 0;
+        }
+        // Covers the bounded labels, identities and omission metadata, separately
+        // from model-dependent pixel processing. Base64 is not ordinary prose.
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.image.as_ref())
+            .map(PersistedToolImage::context_token_estimate)
+            .fold(1024, u64::saturating_add)
+    }
+
     pub(crate) fn to_message(&self) -> Option<rig::message::Message> {
         if self.is_empty() {
             return None;
@@ -162,7 +199,7 @@ impl Images {
         }
         if self.omitted > 0 {
             parts.push(UserContent::text(format!(
-                "[Historical images not retained due to image count, byte, or validation limits: {}; recent omitted sha256 identities: {}. The recap does not represent their pixels; obtain the original evidence if needed.]",
+                "[Historical image omission events due to count, byte, or validation limits: {}; recent omitted sha256 identities: {}. A matching image may have been retained again above. The recap does not represent missing pixels; obtain the original evidence if needed.]",
                 self.omitted, self.omitted_identities.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(", "),
             )));
         }
@@ -475,6 +512,57 @@ mod tests {
     }
 
     #[test]
+    fn compaction_images_participate_in_cold_pressure_without_double_counting_calibration() {
+        let mut session = Session::new("test", "test", 1024, "");
+        let expected = image(None);
+        assert_eq!(expected.context_token_estimate(), 512);
+        session.add_tool_call_with_id("image", "read", &serde_json::json!({"path":"plot.png"}));
+        session.add_tool_result_with_images("image", "read", "pixels", vec![expected]);
+        session.compress("tiny recap".into(), session.messages.len(), 0);
+        let estimate = session.effective_context_tokens();
+        assert_eq!(estimate, session.total_estimated_tokens + 1024 + 512);
+        assert_eq!(
+            session.effective_context_tokens_after_tool_result_pruning(0),
+            estimate
+        );
+        assert!(session.needs_compaction_after_tool_result_pruning(0, 0));
+        let serialized = serde_json::to_vec(&session.compactions.last().unwrap().images).unwrap();
+        assert_eq!(session.compacted_image_bytes(), serialized.len());
+        let restored: Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(restored.effective_context_tokens(), estimate);
+        session.set_calibration(200, 10);
+        assert_eq!(session.effective_context_tokens(), 210);
+        assert_eq!(
+            session.effective_context_tokens_after_tool_result_pruning(0),
+            210
+        );
+        assert!(!session.needs_compaction_after_tool_result_pruning(0, 0));
+    }
+
+    #[test]
+    fn compaction_images_omission_notice_describes_history_when_pixels_are_reread() {
+        let mut images = Images::default();
+        let original = image(None);
+        images.add(Origin::Tool, original.clone());
+        for n in 0..MAX_IMAGES {
+            let mut bytes = PNG.to_vec();
+            bytes.push(n as u8);
+            images.add(Origin::Tool, image_bytes(&bytes, None));
+        }
+        assert_eq!(images.omitted_identities[0], original.evidence_identity());
+        images.add(Origin::Tool, original.clone());
+        let message = images.to_message().unwrap();
+        assert!(pixels(std::slice::from_ref(&message)).contains(&original.to_rig()));
+        let rendered = serde_json::to_string(&message).unwrap();
+        assert!(
+            rendered.contains("omission events")
+                && rendered.contains("may have been retained again above")
+        );
+        assert!(!rendered.contains("Historical images not retained due"));
+    }
+
+    #[test]
     fn compaction_images_keep_only_the_drained_prefix_and_do_not_load_paths() {
         let expected = image(None);
         let mut session = Session::new("test", "test", 128_000, "");
@@ -517,7 +605,7 @@ mod tests {
         assert_eq!(images.omitted_identities[0], first.evidence_identity());
         let rendered = serde_json::to_string(&images.to_message().unwrap()).unwrap();
         assert!(
-            rendered.contains("not retained")
+            rendered.contains("omission events")
                 && rendered.contains("recent omitted sha256 identities")
         );
         images.mark_imported();

@@ -15,6 +15,9 @@ pub struct PersistedToolImage {
     mime_type: super::user::ImageMime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     detail: Option<rig::message::ImageDetail>,
+    /// Derived once while validating literal bytes; never part of persisted identity.
+    #[serde(skip)]
+    context_tokens: std::sync::OnceLock<u64>,
 }
 fn serialize_shared<S: serde::Serializer>(
     data: &std::sync::Arc<str>,
@@ -45,6 +48,7 @@ impl TryFrom<UncheckedImage> for PersistedToolImage {
             data: value.data.into(),
             mime_type: value.mime_type,
             detail: value.detail,
+            context_tokens: std::sync::OnceLock::new(),
         };
         image.validate()?;
         Ok(image)
@@ -53,6 +57,11 @@ impl TryFrom<UncheckedImage> for PersistedToolImage {
 impl PersistedToolImage {
     pub(crate) fn encoded_len(&self) -> usize {
         self.data.len()
+    }
+    /// Conservative sizing policy, not provider billing: one 256-token reserve
+    /// plus 256 per 512px tile. Actual reported usage replaces this estimate.
+    pub(crate) fn context_token_estimate(&self) -> u64 {
+        self.context_tokens.get().copied().unwrap_or(65_792)
     }
     pub(crate) fn evidence_identity(&self) -> compact_str::CompactString {
         use sha2::Digest;
@@ -87,6 +96,7 @@ impl PersistedToolImage {
             data: data.as_str().into(),
             mime_type,
             detail: image.detail.clone(),
+            context_tokens: std::sync::OnceLock::new(),
         };
         value.validate()?;
         Ok(value)
@@ -107,6 +117,8 @@ impl PersistedToolImage {
         if info.format.mime() != self.mime_type.as_str() {
             return Err("Tool image MIME type does not match its bytes");
         }
+        let tiles = u64::from(info.width.div_ceil(512)) * u64::from(info.height.div_ceil(512));
+        let _ = self.context_tokens.set(256 + tiles * 256);
         Ok(())
     }
     pub(crate) fn to_rig(&self) -> rig::message::Image {
