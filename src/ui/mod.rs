@@ -1396,10 +1396,7 @@ pub(crate) async fn start_main_run_with_directive(
                 media.iter().filter(|item| {
                     !matches!(
                         item,
-                        crate::extras::multimodal::MediaAttachment::Image {
-                            clipboard: Some(_),
-                            ..
-                        }
+                        crate::extras::multimodal::MediaAttachment::Image { .. }
                     )
                 }),
             ));

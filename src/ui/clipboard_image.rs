@@ -278,6 +278,12 @@ pub(super) fn labels(pending: &[MediaAttachment]) -> String {
                 info.width,
                 info.height
             )),
+            MediaAttachment::Image { mime, .. } => Some(format!(
+                "[image {}: {}]",
+                i + 1,
+                crate::session::user::ImageMime::parse(mime)
+                    .map_or("unsupported", |mime| mime.as_str())
+            )),
             _ => None,
         })
         .take(MAX_USER_IMAGES)
@@ -290,15 +296,10 @@ pub(super) fn user_message(
     text: &str,
 ) -> anyhow::Result<Option<crate::session::user::PersistedUserMessage>> {
     use crate::session::user::{ImageMime, PersistedUserMessage, UserBlock};
-    if !pending.iter().any(|item| {
-        matches!(
-            item,
-            MediaAttachment::Image {
-                clipboard: Some(_),
-                ..
-            }
-        )
-    }) {
+    if !pending
+        .iter()
+        .any(|item| matches!(item, MediaAttachment::Image { .. }))
+    {
         return Ok(None);
     }
     let mut blocks = Vec::new();
@@ -310,23 +311,19 @@ pub(super) fn user_message(
     let mut count = 0usize;
     let mut bytes = 0usize;
     for item in pending {
-        if let MediaAttachment::Image {
-            data,
-            clipboard: Some(_),
-            ..
-        } = item
-        {
+        if let MediaAttachment::Image { data, mime, .. } = item {
             count += 1;
             bytes = bytes.saturating_add(data.len());
             anyhow::ensure!(
                 count <= MAX_USER_IMAGES
                     && data.len() <= MAX_USER_IMAGE_BYTES
                     && bytes <= MAX_USER_IMAGE_TOTAL,
-                "clipboard image limits exceeded"
+                "image attachment limits exceeded"
             );
             blocks.push(UserBlock::Image {
                 data: base64::engine::general_purpose::STANDARD.encode(data),
-                mime_type: ImageMime::Png,
+                mime_type: ImageMime::parse(mime)
+                    .ok_or_else(|| anyhow::anyhow!("unsupported image attachment MIME type"))?,
             });
         }
     }
@@ -407,6 +404,165 @@ pub(super) mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn attachment_images_keep_file_mime_bytes_and_canonical_replay() {
+        use crate::extras::multimodal::load_attachment;
+        let root = crate::tests::OwnedTestDirectory::new("attached-image");
+        let path = root.path().join("scan.jpg");
+        let bytes = include_bytes!("../agent/tools/fixtures/read-image64/3x2.jpg");
+        std::fs::write(&path, bytes).unwrap();
+        let mut pending = vec![load_attachment(&path).unwrap()];
+        stage_image(&mut pending, decode_png(png()).unwrap()).unwrap();
+        assert!(labels(&pending).contains("[image 1: image/jpeg]"));
+        let user = user_message(&pending, "read the scan").unwrap().unwrap();
+        let image_only = user_message(&pending, "").unwrap().unwrap();
+        assert!(image_only.has_images());
+        assert!(image_only.literal_text().is_empty());
+        let mut session = crate::session::Session::new("offline", "fixture", 32_000, "");
+        session.add_user_message(user.clone());
+        let encoded = serde_json::to_string(&session).unwrap();
+        let restored = crate::session::storage::decode_session_json(&encoded).unwrap();
+        assert_eq!(restored.messages[0].user.as_ref(), Some(&user));
+        let expected = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let blocks = &user.blocks();
+        assert!(
+            matches!(&blocks[1], crate::session::user::UserBlock::Image { data, mime_type }
+            if data == &expected && *mime_type == crate::session::user::ImageMime::Jpeg)
+        );
+        assert_eq!(
+            crate::agent::runner::convert_history(&restored),
+            vec![user.to_message()]
+        );
+        assert!(!encoded.contains(&path.to_string_lossy().to_string()));
+        assert_eq!(pending.len(), 2, "construction never consumes the draft");
+        if let MediaAttachment::Image { data, .. } = &mut pending[0] {
+            data.resize(MAX_USER_IMAGE_BYTES + 1, 0);
+        }
+        assert!(user_message(&pending, "still retained").is_err());
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn attachment_images_reach_actual_openai_requests_after_save_reload() {
+        use crate::provider::{AnyModel, OpenAiModel};
+        use rig::completion::{CompletionModel, CompletionRequest};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = crate::tests::OwnedTestDirectory::new("attached-image-wire");
+        let path = root.path().join("scan.png");
+        let bytes = png();
+        std::fs::write(&path, &bytes).unwrap();
+        let pending = vec![crate::extras::multimodal::load_attachment(&path).unwrap()];
+        let user = user_message(&pending, "read this scan").unwrap().unwrap();
+        let mut session = crate::session::Session::new("openai", "fixture", 32_000, "");
+        session.add_user_message(user);
+        let restored =
+            crate::session::storage::decode_session_json(&serde_json::to_string(&session).unwrap())
+                .unwrap();
+        let expected = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        for style in ["completions", "responses"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+                "custom_providers": {"attachment-wire": {"provider_type":"openai", "base_url":format!("http://{address}"), "api_style":style}}
+            })).unwrap();
+            let client = crate::provider::create_client(
+                "attachment-wire",
+                Some("unused-fixture"),
+                cfg.custom_providers_map(),
+                None,
+            )
+            .unwrap();
+            let model = client.completion_model("owned-vision-fixture");
+            let request = CompletionRequest {
+                model: None,
+                preamble: None,
+                chat_history: rig::OneOrMany::many(crate::agent::runner::convert_history(
+                    &restored,
+                ))
+                .unwrap(),
+                documents: Vec::new(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: Some(64),
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+            };
+            let send = async {
+                match &model {
+                    AnyModel::OpenAI(OpenAiModel::Completions(model)) => {
+                        model.completion(request).await.map(|_| ())
+                    }
+                    AnyModel::OpenAI(OpenAiModel::Responses(model)) => {
+                        model.completion(request).await.map(|_| ())
+                    }
+                    _ => panic!("expected OpenAI transport"),
+                }
+            };
+            let receive = tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    assert!(bytes.len() < 64 * 1024);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let length: usize = std::str::from_utf8(&bytes[..end])
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(length < 64 * 1024);
+                while bytes.len() < end + length {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+                body
+            });
+            let (result, body) = tokio::join!(send, receive);
+            assert!(result.is_err());
+            let body = body.unwrap_or_else(|_| panic!("{style} refused before HTTP: {result:?}"));
+            let rows = body
+                .get("messages")
+                .or_else(|| body.get("input"))
+                .unwrap()
+                .as_array()
+                .unwrap();
+            let parts: Vec<_> = rows
+                .iter()
+                .flat_map(|row| row["content"].as_array().into_iter().flatten())
+                .collect();
+            assert!(
+                parts.iter().any(|part| {
+                    (part["type"] == "image_url" && part["image_url"]["url"] == expected)
+                        || (part["type"] == "input_image" && part["image_url"] == expected)
+                }),
+                "{style}: {body}"
+            );
+            assert!(
+                parts.iter().any(|part| part["text"] == "read this scan"),
+                "{style}: {body}"
+            );
+        }
     }
 
     #[test]

@@ -8,6 +8,32 @@ at most 5 MiB, dimensions from 1 to 8000 pixels, and no text `offset`/`limit`.
 An image read never establishes the raw full-read proof required for a text
 overwrite. Text, notebook and CRC reading retain their existing behavior.
 
+## Showing a scan to the agent
+
+The default build accepts native image content; it is not a text-only runtime.
+Use a vision-capable model and one of these entrypoints:
+
+- In the TUI, `/add scan.png` (also JPEG, GIF or WebP), then enter a question or
+  press Enter to send the image alone. File images and clipboard images use the
+  same ordered, inline user-image format and survive canonical save/reload.
+  They share the existing limits: 2 MiB per image, 4 MiB total and eight images.
+  An oversized or invalid submission retains the staged image and text draft.
+- Paste a clipboard image into an idle TUI prompt. Clipboard capture remains an
+  explicit operator action; it does not run a model request until submission.
+- From headless mode, ask the agent to `read` the workspace image, for example
+  `mini-agent -p "Read scan.png and transcribe the page"`. This is a normal agent
+  file read with the read permission and image limits described above, not an
+  automatic attachment or permission grant.
+- ACP clients can submit inline image content blocks. The inline bytes are
+  authoritative; a supplied URI is display metadata and is never fetched.
+
+A scanned PDF is a different input format. The default build does not enable
+`pdf`, and `read` does not rasterize PDF pages or perform OCR. The optional `pdf`
+feature enables a separate native document attachment surface, subject to the
+selected provider's document support; it does not convert a scan into images.
+Export the needed pages as PNG/JPEG to use the image paths above. No local
+image renderer or OCR service is started implicitly.
+
 The actual captured model/transport decides admission. An exact model declared
 text-only in the embedded catalogue returns `model has no vision`. Unknown
 custom model capabilities retain normal provider error handling; they are not

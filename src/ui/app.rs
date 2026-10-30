@@ -4375,21 +4375,18 @@ impl<'a> App<'a> {
         }
 
         #[cfg(feature = "multimodal")]
-        let clipboard_only = self.clipboard_image_allowed()
+        let image_only = self.clipboard_image_allowed()
             && self.input.buffer.trim().is_empty()
             && self.input.keybindings.action(key, true) == Some(KeyAction::Submit)
             && self.ui.session.pending_media.iter().any(|item| {
                 matches!(
                     item,
-                    crate::extras::multimodal::MediaAttachment::Image {
-                        clipboard: Some(_),
-                        ..
-                    }
+                    crate::extras::multimodal::MediaAttachment::Image { .. }
                 )
             });
         #[cfg(not(feature = "multimodal"))]
-        let clipboard_only = false;
-        let submitted = if clipboard_only {
+        let image_only = false;
+        let submitted = if image_only {
             self.input.clear_buffer();
             Some(compact_str::CompactString::new(""))
         } else if self.renderer.chain_but_mode || picker_owned_key {
@@ -4427,7 +4424,7 @@ impl<'a> App<'a> {
                 return Ok(());
             }
 
-            let submission = if clipboard_only {
+            let submission = if image_only {
                 super::SubmitAction::Run
             } else {
                 classify_submission(self.run.is_running, &text, &self.ui.context.prompts)
@@ -5905,10 +5902,7 @@ impl<'a> App<'a> {
             if self.ui.session.pending_media.iter().any(|item| {
                 matches!(
                     item,
-                    crate::extras::multimodal::MediaAttachment::Image {
-                        clipboard: Some(_),
-                        ..
-                    }
+                    crate::extras::multimodal::MediaAttachment::Image { .. }
                 )
             }) {
                 self.input.load_text(text);
@@ -10956,8 +10950,14 @@ mod permission_loop_tests {
                 .unwrap()
         );
 
+        std::fs::write(root.path().join("scan.png"), clipboard_image::tests::png()).unwrap();
+        crate::startup::heap_future(|| app.run_slash_command("/add scan.png"))
+            .await
+            .unwrap();
+        assert_eq!(app.ui.session.pending_media.len(), 2);
         let user = clipboard_image::user_message(&app.ui.session.pending_media, &app.input.buffer)
             .unwrap();
+        assert_eq!(user.as_ref().unwrap().blocks().len(), 3);
         let mut pending = PendingMainTurn::capture(app.ui.session, &app.input.buffer);
         pending.set_user(user.clone());
         pending.take_pending_media(app.ui.session);
@@ -10976,7 +10976,16 @@ mod permission_loop_tests {
             crate::ui::rollback_pending_main_turn(&mut app.run, app.ui.session).unwrap(),
             "literal 雪"
         );
-        assert_eq!(app.ui.session.pending_media.len(), 1);
+        assert_eq!(app.ui.session.pending_media.len(), 2);
+        // The subsequent image-only admission exercises a /add file image alone.
+        app.ui.session.pending_media.remove(0);
+        assert!(matches!(
+            app.ui.session.pending_media[0],
+            crate::extras::multimodal::MediaAttachment::Image {
+                clipboard: None,
+                ..
+            }
+        ));
         assert!(app.ui.session.messages.is_empty());
         assert_eq!(app.input.buffer, "literal 雪");
         let reads = reader.0.load(Ordering::SeqCst);
