@@ -10414,14 +10414,21 @@ printf MACOS_SEATBELT_POLICY_PASS
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_seatbelt_sysctl_reads_allow_native_rust_startup() {
-        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        let owned = crate::tests::OwnedTestDirectory::new("seatbelt-sysctl");
+        // Host profiles pin the publisher cache as protected storage. A fresh
+        // runner need not have an ambient cache, so own this fixture explicitly.
+        let publisher = owned.path().join("publisher");
+        std::fs::create_dir(&publisher).unwrap();
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[(
+            "MINI_AGENT_CACHE_DIR",
+            Some(publisher.into_os_string()),
+        )]);
         if !seatbelt_exists() {
             skip_unusable_real_sandbox_test(
                 "sysctl startup regression requires the real macOS Seatbelt backend",
             );
             return;
         }
-        let owned = crate::tests::OwnedTestDirectory::new("seatbelt-sysctl");
         let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
         // The test image is a real native Rust binary in the repository's target
