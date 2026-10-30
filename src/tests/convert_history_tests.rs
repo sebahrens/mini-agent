@@ -229,6 +229,37 @@ fn legacy_and_orphaned_tool_records_fall_back_to_labeled_prose() {
 }
 
 #[test]
+fn default_history_replay_preserves_early_evidence_past_the_eighth_tool_result() {
+    let mut session = sample_session();
+    for index in 0..12 {
+        let id = format!("call-{index}");
+        session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": id}));
+        session.add_tool_result_with_id(&id, "read", &format!("evidence-{index}"));
+    }
+    let history = convert_history(&session);
+    let mut outputs = Vec::new();
+    for message in history {
+        if let Message::User { content } = message {
+            for item in content {
+                if let UserContent::ToolResult(result) = item {
+                    for part in result.content {
+                        if let ToolResultContent::Text(text) = part {
+                            outputs.push(text.text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        outputs,
+        (0..12)
+            .map(|index| format!("evidence-{index}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn old_tool_results_are_cleared_without_dropping_calls_or_mutating_the_session() {
     let mut session = sample_session();
     for index in 0..4 {

@@ -1045,6 +1045,8 @@ mod tests {
             .call(ReadArgs {
                 path: "book.ipynb".into(),
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 offset: None,
                 limit: None,
             })
@@ -1061,6 +1063,8 @@ mod tests {
             .call(ReadArgs {
                 path: "book.ipynb".into(),
                 raw_notebook: true,
+                character_offset: None,
+                character_limit: None,
                 offset: None,
                 limit: None,
             })

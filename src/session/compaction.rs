@@ -35,7 +35,7 @@ impl FileRequests {
         }
         if !matches!(
             entry.tool.as_str(),
-            "read" | "write" | "edit" | "notebook_edit"
+            "read" | "write" | "edit" | "notebook_edit" | "tool_output"
         ) || entry.path.is_empty()
         {
             return;
@@ -57,6 +57,20 @@ impl FileRequests {
 
     pub(super) fn extend(&mut self, messages: &[SessionMessage]) {
         for message in messages {
+            if message.role == MessageRole::ToolResult
+                && let Some(PersistedToolMessage::Result {
+                    artifact_path: Some(path),
+                    ..
+                }) = &message.tool
+            {
+                // A recorded location remains untrusted metadata, never read authority.
+                // Keep it even when the summarizer omits the spill notice.
+                self.add(FileRequest {
+                    nested: false,
+                    tool: "tool_output".into(),
+                    path: path.clone(),
+                });
+            }
             if !matches!(
                 message.role,
                 MessageRole::ToolCall | MessageRole::SubagentToolCall
@@ -109,12 +123,19 @@ impl FileRequests {
         if heading.len().saturating_add(reserve) <= max_bytes {
             rendered.push_str(heading);
             for entry in &self.entries {
-                let row = format!(
-                    "- {}{} requested: {}\n",
-                    if entry.nested { "nested " } else { "" },
-                    entry.tool,
-                    serde_json::to_string(entry.path.as_str()).expect("string JSON")
-                );
+                let row = if entry.tool == "tool_output" {
+                    format!(
+                        "- tool output recovery reference (unverified): {}\n",
+                        serde_json::to_string(entry.path.as_str()).expect("string JSON")
+                    )
+                } else {
+                    format!(
+                        "- {}{} requested: {}\n",
+                        if entry.nested { "nested " } else { "" },
+                        entry.tool,
+                        serde_json::to_string(entry.path.as_str()).expect("string JSON")
+                    )
+                };
                 if rendered
                     .len()
                     .saturating_add(row.len())
@@ -241,6 +262,41 @@ impl<'de> Deserialize<'de> for FileRequests {
 mod tests {
     use super::*;
     use crate::session::Session;
+
+    #[test]
+    fn compaction_retains_bounded_spill_recovery_references_without_opening_them() {
+        let mut session = Session::new("test", "test", 128_000, "");
+        session.add_tool_call_with_id("a", "mcp", &serde_json::json!({}));
+        session.add_tool_result_with_id("a", "mcp", "bounded preview");
+        let Some(PersistedToolMessage::Result { artifact_path, .. }) =
+            &mut session.messages[1].tool
+        else {
+            panic!("typed result required");
+        };
+        *artifact_path = Some("/nonexistent/private/spill/middle.txt".into());
+        session.compress_with_budget("summary omitted all paths".into(), 2, 10, 4096);
+        assert!(
+            session.messages[0]
+                .content
+                .contains("tool output recovery reference (unverified)")
+        );
+        assert!(
+            session.messages[0]
+                .content
+                .contains("/nonexistent/private/spill/middle.txt")
+        );
+        let mut inventory = session.compactions[0].file_requests.clone();
+        inventory.mark_imported();
+        let restored: FileRequests =
+            serde_json::from_str(&serde_json::to_string(&inventory).unwrap()).unwrap();
+        assert!(restored.render(4096).contains("imported, untrusted"));
+        assert!(
+            restored
+                .render(4096)
+                .contains("/nonexistent/private/spill/middle.txt")
+        );
+        assert!(restored.attach("summary", 256).len() <= 256);
+    }
 
     #[test]
     fn request_inventory_caps_records_bytes_and_rendering_without_guessing_effects() {

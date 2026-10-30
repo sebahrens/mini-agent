@@ -33,7 +33,9 @@ pub(crate) fn tool_result_is_self_bounded(name: &str) -> bool {
         "read" | "shell" | "grep" | "find_files" | "list_dir" | "js" | "web_fetch" | "web_search"
     )
 }
-pub const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = 8;
+/// Count-only pruning is opt-in. The normal context-budget compactor decides
+/// when verbatim history must be summarized; the ninth result is not a boundary.
+pub const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = usize::MAX;
 pub const CLEARED_TOOL_RESULT_NOTICE: &str =
     "[result cleared: old tool output omitted from the live context; re-run the tool if needed]";
 
@@ -2811,7 +2813,7 @@ pub(crate) fn format_truncated_tool_output(
         output,
         output_chars,
         &format!(
-            "[full output saved to: {}; use the read tool on this path to inspect the complete output]",
+            "[full output saved to: {}; use the read tool on this path to inspect the complete output; use offset/limit for lines or character_offset/character_limit inside long lines]",
             path.display()
         ),
     )
@@ -3236,6 +3238,33 @@ mod preflight_tests {
             );
         }
         assert!(session.is_irreducible_with_pending(u64::MAX, 0));
+    }
+
+    #[test]
+    fn default_retention_preserves_more_than_eight_results_and_full_context_pressure() {
+        let mut session = Session::new("openai", "model", 10_000, "");
+        for index in 0..12 {
+            let id = format!("call-{index}");
+            session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": id}));
+            session.add_tool_result_with_id(
+                &id,
+                "read",
+                &format!("evidence-{index}-{}", "x".repeat(800)),
+            );
+        }
+        let keep = crate::config::Config::default().resolve_keep_recent_tool_results();
+        let projected = session.context_messages_with_pruned_tool_results(keep);
+        for (shown, original) in projected.iter().zip(&session.messages) {
+            assert_eq!(shown.content, original.content);
+            assert_eq!(shown.tool, original.tool);
+        }
+        let complete = session.effective_context_tokens_after_tool_result_pruning(keep);
+        let cleared = session.effective_context_tokens_after_tool_result_pruning(8);
+        assert_eq!(complete, session.effective_context_tokens());
+        assert!(complete > cleared);
+        session.context_window = cleared + (complete - cleared) / 2;
+        assert!(session.needs_compaction_after_tool_result_pruning(0, keep));
+        assert!(!session.needs_compaction_after_tool_result_pruning(0, 8));
     }
 
     #[test]

@@ -155,7 +155,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .shaped(ConfigShape::Integer),
     key("reserve_tokens").shaped(ConfigShape::Integer),
     key("keep_recent_tokens").shaped(ConfigShape::Integer),
-    key("keep_recent_tool_results").described("Number of newest historical tool results kept verbatim in the live model context.").shaped(ConfigShape::Integer),
+    key("keep_recent_tool_results").described("Optional count-only pruning limit; omit to retain tool evidence until context-budget compaction.").shaped(ConfigShape::Integer),
     key("max_agent_turns").shaped(ConfigShape::Integer),
     key("cron_max_fires")
         .described("Fires each /cron entry may start before it is removed (default 24)")

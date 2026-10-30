@@ -535,7 +535,8 @@ temperature: 0.7
 context_window: 128000
 reserve_tokens: 8192
 keep_recent_tokens: 10000
-keep_recent_tool_results: 8
+# Optional count-only pruning; omit to preserve evidence until compaction.
+# keep_recent_tool_results: 8
 compact_enabled: true
 mid_turn_compact_threshold: 0.80
 deny_repeated_reads: false
@@ -590,7 +591,8 @@ temperature = 0.7
 context_window = 128000
 reserve_tokens = 8192
 keep_recent_tokens = 10000
-keep_recent_tool_results = 8
+# Optional count-only pruning; omit to preserve evidence until compaction.
+# keep_recent_tool_results = 8
 compact_enabled = true
 mid_turn_compact_threshold = 0.80
 edit_system = "similarity"
@@ -725,7 +727,7 @@ Accepted top-level keys:
 | `context_window`          | integer | Session context-window size used for status and auto-compaction. When unset, auto-detected from the selected model's catalog entry; falls back to `128000` if the model is not in the catalog. A value of `0` disables auto-compaction. |
 | `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. When unset globally, falls back to the active quick model's `reserve_tokens` field, then to a default that scales with the context window: `window/10`, never below `16384` (so one maximal response cannot overshoot the window) and never above half the window. Examples: 128k window → 16384, 1M window → 100000. |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. When unset, scales with the context window: `window/20` clamped to `[10000, 50000]` and at most a quarter of the window. Examples: 128k window → 10000, 1M window → 50000.                          |
-| `keep_recent_tool_results` | integer | Number of newest historical tool results kept verbatim when a turn or restarted turn assembles its model history. Older results are replaced with a short recovery notice while their calls, durable session records, and spill files remain intact. Default: `8`; set a larger value to retain more output. |
+| `keep_recent_tool_results` | integer | Optional count-only pruning policy. Omit it (the default) to retain every historical tool result until context-budget compaction. An explicit finite value keeps only that many newest results verbatim and replaces older results with recovery notices; `0` clears all historical results. Calls, durable session records, and spill files remain intact. |
 | `max_text_file_size`      | integer | Maximum write size and maximum raw text returned by one `read` call. A larger file can be read only with an explicit `offset` or `limit`, and the selected line window must fit this byte cap. The resolved config default is `1048576` (1 MiB); subagent construction has a defensive `10485760` (10 MiB) fallback only when handed an unresolved config with this field absent. |
 | `max_read_lines`          | integer | Default maximum lines returned by one `read` call. Default: `2000`. |
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
@@ -1311,16 +1313,17 @@ See [COMMANDS.md](COMMANDS.md#hooks) for the `/hooks` slash command.
 
 ## Mid-turn compaction
 
-Before deciding whether automatic compaction is necessary, mini-agent clears
-historical tool results older than `keep_recent_tool_results` from the live
-model context. The tool calls remain structured and the newest results stay
-verbatim. A cleared result tells the model to re-run the tool; when the original
-result was spilled to disk, the notice retains its recorded spill-file path.
-This is a request-time projection only: session exports, undo/redo state, and
-the spill file keep the original result. If the projected context is still over
-budget, compaction summarizes the retained, unpruned session prefix under its
-separate bounded rolling input budget. It does not open recorded spill files;
-only the output already retained in the session is sent.
+Historical tool results remain verbatim in the live model context by default, including
+results older than the newest eight. The actual context-window budget determines when
+compaction is needed; adding another tool result is not itself permission to erase earlier
+evidence. `keep_recent_tool_results` is an optional finite count-only pruning policy for
+operators who explicitly want that tradeoff. Existing files that explicitly set `8`
+retain that policy; remove the key to use the evidence-preserving default. With it set, older results become recovery
+notices while calls, session exports, undo/redo state and spill files stay intact.
+
+Context pressure accounts for the selected policy. If the complete default context is over
+budget, compaction summarizes the retained session prefix under its separate bounded rolling
+input budget. It does not open recorded spill files; only output retained in the session is sent.
 
 Automatic compaction is off by default. With `compact_enabled = true`, mini-agent
 only compacts the conversation *between* turns unless mid-turn compaction is also
@@ -1334,8 +1337,14 @@ results, including MCP results, are independently bounded before Rig commits
 them to the live conversation: results over 12,000 characters are written to
 the private tool-output directory and replaced with a 2,000-character head,
 an omission/path notice, and an 8,000-character tail. The `read` tool can open
-immediate spill files for the active session without an approval prompt,
-including in headless mode. This grant never includes other sessions, nested
+immediate spill files for the active session without an approval prompt. Use line
+`offset`/`limit`, or `character_offset`/`character_limit` for a range inside a huge
+single line. Character offsets count Unicode scalar values from 1, not UTF-8 bytes;
+the returned range names its units and next offset and stays under the same byte
+cap. A partial character slice does not authorize a full-file overwrite. This also
+works in headless mode. Compaction keeps bounded spill recovery references alongside
+historical file requests, independently of summary prose; references remain untrusted
+locations and never authorize access by themselves. This grant never includes other sessions, nested
 directories, writes, JavaScript file reads, or symlink escapes; explicit tool
 and external-directory deny rules still apply. The artifact directory is bound
 to its identity and reads use its retained directory capability. If the spill

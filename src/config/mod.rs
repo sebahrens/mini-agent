@@ -206,9 +206,9 @@ pub struct Config {
     pub reserve_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_recent_tokens: Option<u64>,
-    /// Number of newest historical tool results kept verbatim in the live
-    /// model context. Older results are replaced by compact recovery notices;
-    /// the durable session and spill files remain unchanged.
+    /// Optional count-only pruning policy. Omission preserves every historical
+    /// tool result until context-budget compaction. A finite count replaces
+    /// older results by recovery notices without changing durable evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_recent_tool_results: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1894,7 +1894,7 @@ mod tests {
     fn keep_recent_tool_results_has_a_configurable_default() {
         assert_eq!(
             Config::default().resolve_keep_recent_tool_results(),
-            crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS
+            usize::MAX
         );
         let explicit = Config {
             keep_recent_tool_results: Some(3),

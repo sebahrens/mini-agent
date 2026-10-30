@@ -8880,6 +8880,8 @@ mod tests {
         let native_output = native_read
             .call(crate::agent::tools::ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "gold-eiffel.js".to_string(),
                 offset: None,
                 limit: None,

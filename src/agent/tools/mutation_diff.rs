@@ -951,6 +951,8 @@ mod tests {
         );
         read.call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "new.txt".into(),
             offset: None,
             limit: None,
@@ -996,6 +998,8 @@ mod tests {
         // An already-read snapshot does not override a later read denial.
         read.call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "new.txt".into(),
             offset: None,
             limit: None,
@@ -1027,6 +1031,8 @@ mod tests {
         );
         read.call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "new.txt".into(),
             offset: None,
             limit: None,
@@ -1265,6 +1271,8 @@ mod tests {
                 .with_workspace(root.path())
                 .call(ReadArgs {
                     raw_notebook: false,
+                    character_offset: None,
+                    character_limit: None,
                     path: "target.txt".into(),
                     offset: None,
                     limit: None,
@@ -1690,6 +1698,8 @@ mod tests {
         ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: alias.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -1799,6 +1809,8 @@ mod tests {
                 .with_workspace(root.path())
                 .call(ReadArgs {
                     raw_notebook: false,
+                    character_offset: None,
+                    character_limit: None,
                     path: "target.txt".into(),
                     offset: None,
                     limit: None,

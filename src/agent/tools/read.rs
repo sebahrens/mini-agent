@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use rig::tool::Tool;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
 use crate::agent::tools::crc::{Crc32, crc32_hex};
 use crate::agent::tools::{
@@ -43,7 +43,7 @@ fn not_utf8(path: &str) -> ToolError {
 
 fn excerpt_cap_exceeded(cap: u64) -> ToolError {
     ToolError::Msg(format!(
-        "Requested text window exceeds the {cap} byte read output cap. Re-call with a smaller limit or narrower offset/limit range; for very long or non-text lines, use the shell tool with `head`, `cut`, or `strings`."
+        "Requested text window exceeds the {cap} byte read output cap. Re-call with a smaller limit or narrower offset/limit range; for very long lines, use character_offset/character_limit to select bounded Unicode characters. For non-text data use a binary-aware tool."
     ))
 }
 
@@ -177,7 +177,7 @@ impl Tool for ReadTool {
             ),
         };
         format!(
-            "{text} PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization."
+            "{text} For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization."
         )
     }
 
@@ -188,6 +188,8 @@ impl Tool for ReadTool {
                 "path": { "type": "string", "description": "Path to the file (relative or absolute)" },
                 "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
                 "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to read" },
+                "character_offset": { "type": "integer", "minimum": 1, "description": "1-indexed Unicode character offset for a bounded text slice, including inside very long lines. Cannot combine with line offset/limit." },
+                "character_limit": { "type": "integer", "minimum": 1, "description": "Maximum Unicode characters for a text slice (default 16000); output byte cap still applies. Partial slices never authorize a text overwrite." },
                 "raw_notebook": { "type": "boolean", "description": "For .ipynb: read raw JSON instead of virtual cell/source/output lines; required for raw hashedit or full-file overwrite authorization", "default": false }
             },
             "required": ["path"]
@@ -257,6 +259,16 @@ impl ReadTool {
     ) -> Result<String, ToolError> {
         let notebook_view =
             !args.raw_notebook && super::notebook::is_notebook(Path::new(&args.path));
+        let character_window = args.character_offset.is_some() || args.character_limit.is_some();
+        if character_window
+            && (args.offset.is_some()
+                || args.limit.is_some()
+                || notebook_view
+                || args.character_offset == Some(0)
+                || args.character_limit == Some(0))
+        {
+            return Err(ToolError::Msg("Character reads require positive character_offset/character_limit, cannot combine with line offset/limit, and require raw_notebook:true for notebook JSON".into()));
+        }
         let limit = args.limit.unwrap_or(self.max_lines as usize);
         let limit = if notebook_view {
             limit.min(self.max_lines as usize)
@@ -405,9 +417,9 @@ impl ReadTool {
                 .image_support
                 .check(format)
                 .map_err(|message| ToolError::Msg(message.into()))?;
-            if args.offset.is_some() || args.limit.is_some() {
+            if args.offset.is_some() || args.limit.is_some() || character_window {
                 return Err(ToolError::Msg(
-                    "Image reads do not accept text line offset/limit; read the whole image".into(),
+                    "Image reads do not accept text offset/limit or character_offset/character_limit; read the whole image".into(),
                 ));
             }
             let cap = super::read_image::MAX_IMAGE_BYTES;
@@ -444,6 +456,67 @@ impl ReadTool {
             return Ok(match coaching {
                 Some(coaching) => format!("{coaching}\n\n{summary}"),
                 None => summary,
+            });
+        }
+        if character_window {
+            if !metadata.is_file() {
+                return Err(ToolError::Msg(
+                    "Character windows require a regular UTF-8 text file".into(),
+                ));
+            }
+            let start = args.character_offset.unwrap_or(1).saturating_sub(1);
+            let count = args.character_limit.unwrap_or(16_000);
+            let window = read_character_window(
+                reader.take(metadata.len()),
+                start,
+                count,
+                self.max_text_file_size,
+                &path,
+            )
+            .await?;
+            let crc = super::crc::crc32(window.text.as_bytes());
+            if let Some(blocked) = self.read_tracker.check_character_window(
+                &permission_path,
+                start,
+                count,
+                &metadata,
+                crc,
+            ) {
+                return Err(ToolError::Msg(blocked));
+            }
+            self.read_tracker.record_character_window(
+                &permission_path,
+                start,
+                count,
+                &metadata,
+                crc,
+            );
+            let returned = window.text.chars().count();
+            let mut text = format!(
+                "Characters {}-{} (1-indexed Unicode characters; partial text, no line/CRC edit authorization):\n{}",
+                if returned == 0 {
+                    0
+                } else {
+                    start.saturating_add(1)
+                },
+                if returned == 0 {
+                    0
+                } else {
+                    start.saturating_add(returned)
+                },
+                window.text,
+            );
+            if window.more {
+                text.push_str(&format!(
+                    "\n[more text; continue with character_offset={}, character_limit={count}]",
+                    start.saturating_add(returned).saturating_add(1)
+                ));
+            } else {
+                text.push_str("\n[EOF]");
+            }
+            return Ok(match coaching {
+                Some(coaching) => format!("{coaching}\n\n{text}"),
+                None => text,
             });
         }
         let file_size = metadata.len();
@@ -722,6 +795,58 @@ impl ReadTool {
     }
 }
 
+/// A bounded character slice. Decoder memory is constant even for a single huge line;
+/// only selected text is retained, under the same output-byte ceiling as line reads.
+struct CharacterWindow {
+    text: String,
+    more: bool,
+}
+
+async fn read_character_window<R: AsyncRead + Unpin>(
+    mut reader: R,
+    offset: usize,
+    limit: usize,
+    byte_cap: u64,
+    path: &str,
+) -> Result<CharacterWindow, ToolError> {
+    let mut buffer = vec![0_u8; 8 * 1024];
+    let mut pending = Vec::with_capacity(buffer.len() + 4);
+    let mut text = String::new();
+    let mut position = 0_usize;
+    let mut retained = 0_usize;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        pending.extend_from_slice(&buffer[..read]);
+        let (valid, invalid) = match std::str::from_utf8(&pending) {
+            Ok(_) => (pending.len(), false),
+            Err(error) => (error.valid_up_to(), error.error_len().is_some()),
+        };
+        let decoded = std::str::from_utf8(&pending[..valid]).expect("validated UTF-8 prefix");
+        for ch in decoded.chars() {
+            if position >= offset {
+                if retained >= limit
+                    || (text.len() as u64).saturating_add(ch.len_utf8() as u64) > byte_cap
+                {
+                    if retained == 0 {
+                        return Err(excerpt_cap_exceeded(byte_cap));
+                    }
+                    return Ok(CharacterWindow { text, more: true });
+                }
+                text.push(ch);
+                retained += 1;
+            }
+            position = position.saturating_add(1);
+        }
+        if invalid || (read == 0 && valid != pending.len()) {
+            return Err(not_utf8(path));
+        }
+        if read == 0 {
+            return Ok(CharacterWindow { text, more: false });
+        }
+        pending.drain(..valid);
+    }
+}
+
 fn display_start(start: usize, total_lines: usize) -> usize {
     if total_lines == 0 { 0 } else { start + 1 }
 }
@@ -742,12 +867,195 @@ fn numbered_excerpt(lines: &[String], start: usize, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn character_window_recovers_middle_of_a_single_line_private_spill_and_keeps_access_scoped()
+     {
+        use crate::agent::tools::ReadTracker;
+        use crate::permission::checker::PermissionChecker;
+        use crate::permission::{PermissionConfigs, SecurityMode};
+        use std::sync::{Arc, Mutex};
+        let root = crate::tests::OwnedTestDirectory::new("character-spill");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("MINI_AGENT_DATA_DIR", Some(root.path().into())),
+            ("MINI_AGENT_CONFIG_DIR", Some(root.path().into())),
+            ("MINI_AGENT_STATE_DIR", Some(root.path().into())),
+        ]);
+        let complete = format!(
+            "{}{}MIDDLE_EVIDENCE{}",
+            "H".repeat(2_000),
+            "M".repeat(15_000),
+            "T".repeat(20_000)
+        );
+        let path = crate::session::storage::save_tool_output("active-character", "mcp", &complete)
+            .unwrap();
+        let other =
+            crate::session::storage::save_tool_output("other-character", "mcp", &complete).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), complete);
+        let preview = crate::session::format_truncated_tool_output(
+            &complete,
+            complete.chars().count(),
+            &path,
+        );
+        assert!(!preview.contains("MIDDLE_EVIDENCE"));
+        assert!(preview.contains("full output saved to:"));
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(workspace),
+            None,
+        )
+        .unwrap();
+        checker
+            .bind_tool_output_session("active-character")
+            .unwrap();
+        let permission = Arc::new(Mutex::new(checker));
+        let tracker = ReadTracker::new(true);
+        let tool =
+            ReadTool::new_with_tracker(Some(permission), None, Some(128), 100, tracker.clone());
+        let args = |path: &std::path::Path| ReadArgs {
+            path: path.to_string_lossy().into_owned(),
+            character_offset: Some(17_001),
+            character_limit: Some(15),
+            ..Default::default()
+        };
+        let line = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: Some(1),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(line.to_string().contains("byte read output cap"));
+        let output = tool.call(args(&path)).await.unwrap();
+        assert!(
+            output.contains("Characters 17001-17015 (1-indexed Unicode characters"),
+            "{output}"
+        );
+        assert!(output.contains("MIDDLE_EVIDENCE"), "{output}");
+        assert!(output.contains("character_offset=17016"), "{output}");
+        assert!(!tracker.permits_full_overwrite(
+            &path.to_string_lossy(),
+            &std::fs::metadata(&path).unwrap(),
+            crate::agent::tools::crc::crc32(complete.as_bytes()),
+            1
+        ));
+        let repeated = tool.call(args(&path)).await.unwrap_err().to_string();
+        assert!(repeated.contains("characters 17001-17015"), "{repeated}");
+        assert!(
+            tool.call(args(&other)).await.is_err(),
+            "another session is not authorized"
+        );
+        let small = crate::session::storage::save_tool_output("active-character", "small", "SHORT")
+            .unwrap();
+        let output = tool
+            .call(ReadArgs {
+                path: small.to_string_lossy().into_owned(),
+                character_offset: Some(1),
+                character_limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(output.contains("SHORT") && output.contains("[EOF]"));
+        let small_metadata = std::fs::metadata(&small).unwrap();
+        let small_crc = crate::agent::tools::crc::crc32(b"SHORT");
+        assert!(
+            !tracker.permits_full_overwrite(
+                &small.to_string_lossy(),
+                &small_metadata,
+                small_crc,
+                1
+            ),
+            "even an EOF-reaching character slice is not a raw line read"
+        );
+        assert!(
+            tracker
+                .check_read(&small.to_string_lossy(), 0, 100, &small_metadata, small_crc)
+                .is_none(),
+            "character and line windows must not collide"
+        );
+        let changed = complete.replace("MIDDLE_EVIDENCE", "CHANGED_WINDOW!");
+        std::fs::write(&path, &changed).unwrap();
+        assert!(
+            tool.call(args(&path))
+                .await
+                .unwrap()
+                .contains("CHANGED_WINDOW!")
+        );
+    }
+
+    #[tokio::test]
+    async fn character_window_is_unicode_correct_byte_bounded_and_explicit_about_eof() {
+        use super::read_character_window;
+        let content = format!("{}🦀é中\nlast", "x".repeat(8_191));
+        let window = read_character_window(
+            std::io::Cursor::new(content.as_bytes()),
+            8_191,
+            4,
+            100,
+            "fixture",
+        )
+        .await
+        .unwrap();
+        assert_eq!(window.text, "🦀é中\n");
+        assert!(window.more);
+        let window = read_character_window(
+            std::io::Cursor::new("🦀é中".as_bytes()),
+            0,
+            100,
+            5,
+            "fixture",
+        )
+        .await
+        .unwrap();
+        assert_eq!(window.text, "🦀");
+        assert!(window.more);
+        let window = read_character_window(std::io::Cursor::new("abc"), 100, 10, 10, "fixture")
+            .await
+            .unwrap();
+        assert!(window.text.is_empty());
+        assert!(!window.more);
+        assert!(
+            read_character_window(std::io::Cursor::new([0xff]), 0, 1, 100, "fixture")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn character_windows_reject_ambiguous_or_zero_ranges_before_access() {
+        let tool = ReadTool::new(None, None, None, 100);
+        for value in [
+            serde_json::json!({"path":"missing", "character_offset":0}),
+            serde_json::json!({"path":"missing", "character_limit":0}),
+            serde_json::json!({"path":"missing", "character_offset":1, "offset":1}),
+            serde_json::json!({"path":"missing", "character_offset":1, "limit":1}),
+            serde_json::json!({"path":"missing.ipynb", "character_offset":1}),
+        ] {
+            let error = tool
+                .call(serde_json::from_value(value).unwrap())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("Character reads require positive"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn zero_read_limit_is_rejected_before_path_or_permission_effects() {
         use super::*;
         let tool = ReadTool::new(None, None, None, 100);
         let error = tool
             .call(crate::agent::tools::ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "missing-file".into(),
                 offset: Some(1),
                 limit: Some(0),
@@ -762,6 +1070,8 @@ mod tests {
         assert!(
             tool.call(crate::agent::tools::ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "missing-file".into(),
                 offset: None,
                 limit: None
@@ -811,6 +1121,8 @@ mod tests {
         let output = ReadTool::new(None, None, None, 100)
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: path.to_string_lossy().into_owned(),
                 offset: Some(6),
                 limit: Some(2),
@@ -838,6 +1150,8 @@ mod tests {
         let output = tool
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: path.to_string_lossy().into_owned(),
                 offset: Some(3),
                 limit: Some(2),
@@ -865,6 +1179,8 @@ mod tests {
         let error = tool
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -889,6 +1205,8 @@ mod tests {
         let error = tool
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -941,6 +1259,8 @@ mod tests {
 
         let call = tool.call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: link.to_string_lossy().into_owned(),
             offset: None,
             limit: None,
@@ -1017,6 +1337,8 @@ mod tests {
                 offset: None,
                 limit: None,
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
             })
             .await
             .unwrap_err();
@@ -1047,6 +1369,8 @@ mod tests {
         let output = ReadTool::new(None, None, None, 100)
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: path.to_string_lossy().into_owned(),
                 offset: Some(19_998),
                 limit: Some(2),

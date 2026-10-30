@@ -1,0 +1,35 @@
+{
+  "beads": [
+    "mini-agent-tmryb",
+    "mini-agent-h2bz4"
+  ],
+  "changes": [
+    "Preserve all historical results by default until context-budget compaction; retain finite authored count limits, including zero, as opt-in policy.",
+    "Keep oversized live previews and full private spills bounded; add 1-indexed Unicode character windows to read so a middle slice of a huge single line remains accessible without shell access.",
+    "Track character windows separately from raw line and notebook reads; character windows never establish full-overwrite authority.",
+    "Keep bounded spill recovery references in compaction inventory independently of summary prose; treat them as untrusted locations and never as permission grants."
+  ],
+  "adversarial": {
+    "findings": [],
+    "resolved_scenarios": [
+      "Ninth historical result erased early evidence despite ample context budget.",
+      "Private single-line spill exceeded line-read byte cap, so middle evidence could not be inspected through the authorized read tool.",
+      "Summary prose omitted recovery path while compaction drained the result record."
+    ],
+    "residual_risks": [
+      "Explicit configured count limits intentionally retain their prior pruning semantics.",
+      "Compaction inventory remains bounded and reports omitted records; it does not promise unlimited recovery-reference retention.",
+      "Failed spill persistence explicitly reports full output unavailable; the context cap remains in force."
+    ]
+  },
+  "testing": {
+    "new_behavior_cases": [
+      "Twelve default historical tool results survive Session projection and provider-history replay.",
+      "Default context accounting retains complete pressure and triggers compaction rather than silently discounting evidence.",
+      "Actual private spill middle recovery, unchanged repeat refusal, changed-content re-read, cross-session denial and no-overwrite authority.",
+      "Unicode decoder chunk split, byte cap, EOF, invalid UTF-8 and ambiguous/zero range refusals.",
+      "Compaction preserves an untrusted nonexistent spill location without opening it, including serialization and imported classification."
+    ],
+    "execution": "Deferred to parent combined validation to avoid duplicate Cargo builds; cargo fmt and git diff --check passed."
+  }
+}

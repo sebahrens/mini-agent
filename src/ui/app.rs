@@ -9020,6 +9020,8 @@ mod interrupt_rewind_tests {
             crate::session::file_checkpoints::scope(Some(recorder), async {
                 read.call(crate::agent::tools::ReadArgs {
                     raw_notebook: false,
+                    character_offset: None,
+                    character_limit: None,
                     path: "rewound.txt".into(),
                     offset: None,
                     limit: None,
@@ -11970,6 +11972,8 @@ mod mutation_consumer_tests {
             .with_workspace(root.path())
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "target.txt".into(),
                 offset: None,
                 limit: None,

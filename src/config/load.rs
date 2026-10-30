@@ -582,7 +582,9 @@ pub(super) fn rich_default_config() -> Config {
         // config files; only authored max_tokens limits constrain children.
         max_tokens: None,
         compact_enabled: Some(false),
-        keep_recent_tool_results: Some(crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS),
+        // Omission preserves every historical result until context compaction.
+        // A finite authored value explicitly opts into count-only pruning.
+        keep_recent_tool_results: None,
         max_text_file_size: Some(1_048_576),
         edit_system: Some(EditSystem::Similarity),
         default_permission_mode: Some("standard".to_string()),

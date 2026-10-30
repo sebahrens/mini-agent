@@ -179,6 +179,8 @@ async fn image_read64_actual_read_keeps_bytes_permissions_and_overwrite_proof_se
         offset: None,
         limit: None,
         raw_notebook: false,
+        character_offset: None,
+        character_limit: None,
     };
     for (name, bytes) in fixtures {
         std::fs::write(root.path().join(name), bytes).unwrap();
@@ -438,6 +440,8 @@ async fn image_read64_existing_read_deny_and_byte_limit_precede_payload() {
         offset: None,
         limit: None,
         raw_notebook: false,
+        character_offset: None,
+        character_limit: None,
     };
     let denied = ReadTool::new_with_tracker(Some(checker), None, None, 100, tracker.clone())
         .with_workspace(root.path())
@@ -510,6 +514,8 @@ async fn image_read64_feature_off_retains_data_but_refuses_read_and_dispatch() {
             offset: None,
             limit: None,
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
         })
         .await
         .unwrap_err()

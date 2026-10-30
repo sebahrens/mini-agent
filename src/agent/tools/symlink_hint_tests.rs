@@ -71,6 +71,8 @@ async fn read_through_in_workspace_symlink_names_the_link() {
     let error = tool
         .call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "docs/CLAUDE.md".into(),
             offset: None,
             limit: None,
@@ -87,6 +89,8 @@ async fn read_through_in_workspace_symlink_names_the_link() {
     let error = tool
         .call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "packages/x/lib.ts".into(),
             offset: None,
             limit: None,
@@ -104,6 +108,8 @@ async fn read_through_in_workspace_symlink_names_the_link() {
     let ok = tool
         .call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: fixture
                 .workspace
                 .join("AGENTS.md")
@@ -198,6 +204,8 @@ async fn non_symlink_errors_pass_through_unchanged() {
         .with_workspace(fixture.workspace.clone())
         .call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "AGENTS.md/child".into(),
             offset: None,
             limit: None,
@@ -219,6 +227,8 @@ async fn escaping_symlink_target_is_not_disclosed() {
         .with_workspace(fixture.workspace.clone())
         .call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "docs/escape.md".into(),
             offset: None,
             limit: None,

@@ -166,6 +166,8 @@ async fn read_and_edit_home_paths_resolve_through_the_ambient_path() {
         .with_workspace(fixture.workspace.clone())
         .call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "$HOME/notes.txt".into(),
             offset: None,
             limit: None,

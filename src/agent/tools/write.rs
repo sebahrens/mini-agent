@@ -818,6 +818,8 @@ mod tests {
 
         read.call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "existing.txt".into(),
             offset: None,
             limit: None,
@@ -849,6 +851,8 @@ mod tests {
 
         read.call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "existing.txt".into(),
             offset: None,
             limit: None,

@@ -924,6 +924,8 @@ mod tests {
         .with_workspace(workspace.root())
         .call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: path.into(),
             offset: None,
             limit: None,
@@ -1153,6 +1155,8 @@ mod tests {
         .with_workspace(root.path())
         .call(ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "file".into(),
             offset: None,
             limit: None,

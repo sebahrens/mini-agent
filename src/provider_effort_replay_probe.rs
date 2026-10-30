@@ -4759,6 +4759,8 @@ async fn cache71_memory_actual_paused_write_checkpoint_tracks_the_literal_user_a
         .with_workspace_binding(workspace.clone())
         .call(crate::agent::tools::ReadArgs {
             raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
             path: "file.txt".into(),
             offset: None,
             limit: None,

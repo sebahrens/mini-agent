@@ -742,6 +742,8 @@ mod tests {
             .with_workspace_binding(Arc::clone(&workspace))
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "source.rs".into(),
                 offset: None,
                 limit: None,
@@ -1116,6 +1118,8 @@ mod tests {
             .with_workspace_binding(Arc::clone(&workspace))
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "same.rs".into(),
                 offset: None,
                 limit: None,

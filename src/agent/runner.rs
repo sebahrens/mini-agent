@@ -7239,6 +7239,8 @@ mod tests {
             crate::agent::tools::ReadTool::new_with_tracker(None, None, None, 2_000, tracker)
                 .call(crate::agent::tools::ReadArgs {
                     raw_notebook: false,
+                    character_offset: None,
+                    character_limit: None,
                     path: path.to_string_lossy().into_owned(),
                     offset: Some(1),
                     limit: Some(400),

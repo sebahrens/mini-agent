@@ -11621,12 +11621,16 @@ mod workspace_tests {
         let (first_value, second_value) = tokio::join!(
             first_read.call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "sentinel.txt".into(),
                 offset: None,
                 limit: None,
             }),
             second_read.call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "sentinel.txt".into(),
                 offset: None,
                 limit: None,
@@ -11792,6 +11796,8 @@ mod workspace_tests {
         let error = tool
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: relative_escape.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -11877,6 +11883,8 @@ mod workspace_tests {
         assert!(
             read.call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "sentinel.txt".into(),
                 offset: None,
                 limit: None,
@@ -11939,6 +11947,8 @@ mod workspace_tests {
             .with_workspace_binding(workspace.clone())
             .call(ReadArgs {
                 raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
                 path: "safe/link.txt".into(),
                 offset: None,
                 limit: None,

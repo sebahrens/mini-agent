@@ -282,6 +282,7 @@ impl ReadVersion {
 enum ReadKind {
     Raw,
     NotebookView,
+    CharacterWindow,
 }
 
 /// Most distinct paths whose read windows are remembered; the oldest path is
@@ -395,6 +396,24 @@ impl ReadTracker {
         )
     }
 
+    pub(crate) fn check_character_window(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        metadata: &std::fs::Metadata,
+        crc: u32,
+    ) -> Option<String> {
+        self.check_read_kind(
+            ReadKind::CharacterWindow,
+            path,
+            offset,
+            limit,
+            metadata,
+            crc,
+        )
+    }
+
     pub(crate) fn check_notebook_view(
         &self,
         path: &str,
@@ -432,8 +451,12 @@ impl ReadTracker {
         }
         let start = offset.saturating_add(1);
         let end = offset.saturating_add(limit);
+        let (units, parameters) = match kind {
+            ReadKind::CharacterWindow => ("characters", "character_offset or character_limit"),
+            _ => ("lines", "offset or limit"),
+        };
         Some(format!(
-            "read blocked: {path} (lines {}-{}) was already read and has not been modified since. Reuse the earlier result if it is still available, or read a different section by changing offset or limit.",
+            "read blocked: {path} ({units} {}-{}) was already read and has not been modified since. Reuse the earlier result if it is still available, or read a different section by changing {parameters}.",
             start,
             if end > 0 { end } else { start }
         ))
@@ -454,6 +477,24 @@ impl ReadTracker {
             limit,
             metadata,
             served_content_crc32,
+        )
+    }
+
+    pub(crate) fn record_character_window(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        metadata: &std::fs::Metadata,
+        crc: u32,
+    ) {
+        self.record_read_kind(
+            ReadKind::CharacterWindow,
+            path,
+            offset,
+            limit,
+            metadata,
+            crc,
         )
     }
 
@@ -628,13 +669,16 @@ pub fn is_vcs_metadata(name: &str) -> bool {
     matches!(name, ".git" | ".hg" | ".svn" | ".bzr")
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct ReadArgs {
     pub path: String,
     #[serde(default)]
     pub raw_notebook: bool,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
+    /// 1-indexed Unicode scalar value offset, independent of text lines.
+    pub character_offset: Option<usize>,
+    pub character_limit: Option<usize>,
 }
 
 #[derive(Deserialize)]

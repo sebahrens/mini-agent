@@ -6787,6 +6787,8 @@ mod compaction_quality_tests {
             let output = read
                 .call(ReadArgs {
                     raw_notebook: false,
+                    character_offset: None,
+                    character_limit: None,
                     path,
                     offset: None,
                     limit: None,
