@@ -681,7 +681,7 @@ Pre-built release archives include JavaScript execution but not learned-skill st
 build that can propose, verify, retrieve, and curate skills, build from source with:
 
 ```bash
-cargo install --locked --git https://github.com/sebahrens/mini-agent --tag v1.10.4 --features skills
+cargo install --locked --git https://github.com/sebahrens/mini-agent --tag v1.11.0 --features skills
 ```
 
 | Feature | Adds |
