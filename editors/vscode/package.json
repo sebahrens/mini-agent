@@ -2,7 +2,7 @@
   "name": "mini-agent",
   "displayName": "Mini Agent",
   "description": "Mini Agent \u2014 AI coding agent with ACP stdio integration",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "publisher": "mini-agent",
   "license": "GPL-3.0-only",
   "repository": {

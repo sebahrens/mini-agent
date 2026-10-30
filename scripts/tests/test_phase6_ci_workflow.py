@@ -392,6 +392,9 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         "sandbox::sandbox_tests::macos_seatbelt_policy_enforces_real_backend": (
             "src/sandbox.rs"
         ),
+        "sandbox::sandbox_tests::macos_seatbelt_sysctl_reads_allow_native_rust_startup": (
+            "src/sandbox.rs"
+        ),
         "tests::sandbox_platform_tests::macos_seatbelt_denies_symlinked_credential_reads": (
             "src/tests/sandbox_platform_tests.rs"
         ),

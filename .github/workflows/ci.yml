@@ -1601,6 +1601,7 @@ jobs:
         run: |
           guarded_tests=(
             'sandbox::sandbox_tests::macos_seatbelt_policy_enforces_real_backend'
+            'sandbox::sandbox_tests::macos_seatbelt_sysctl_reads_allow_native_rust_startup'
             'sandbox::sandbox_tests::seatbelt_workspace_git_metadata_rejects_cached_aliases'
             'sandbox::sandbox_tests::seatbelt_workspace_gitfile_target_directory_cannot_be_renamed'
             'tests::sandbox_platform_tests::macos_seatbelt_denies_symlinked_credential_reads'

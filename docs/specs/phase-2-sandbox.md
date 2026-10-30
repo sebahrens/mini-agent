@@ -385,6 +385,14 @@ ambient or explicitly supplied temporary-directory variables. These directories 
 owned private application state. The profile grants no write authority to shared `/private/tmp`.
 Hooks and workspace services use the same temporary-directory policy.
 
+All three general-command profiles (`workspace`, `host-read`, and `host-full`) allow
+`sysctl-read` so native runtimes can query kernel and hardware information when setting up
+threads and guard pages. `sysctl-write` remains denied by the default policy. The native macOS
+regression runs a Rust test image and reads `hw.pagesize` through each production profile, then
+removes only the read grant to confirm that the same sysctl query fails. The CI Seatbelt gate
+requires this regression to run without skipping. This general-command grant does not change
+the separate Phase 6 worker profile or Linux and Windows sandbox policies.
+
 The configured application cache is used only when it is disjoint from both the configuration
 and credential directories. If a shared application home places that cache inside a private root,
 macOS selects its per-user system cache at `zerostack/sandbox-runtime` instead. Both configured and

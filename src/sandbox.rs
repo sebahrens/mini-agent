@@ -6421,7 +6421,7 @@ fn seatbelt_profile_ladder(
         format!("(deny file-write*{protected_git})\n")
     };
     format!(
-        "(version 1)\n(deny default)\n(allow process*)\n{reads}\n{writes}\n(deny file-read*{private})\n(deny file-write*{protected_storage})\n(allow file-write* (subpath \"{cache}\"))\n{git_rule}(deny file-write*{private})\n(deny file-write-unlink{namespace_denies})\n{network}"
+        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n{reads}\n{writes}\n(deny file-read*{private})\n(deny file-write*{protected_storage})\n(allow file-write* (subpath \"{cache}\"))\n{git_rule}(deny file-write*{private})\n(deny file-write-unlink{namespace_denies})\n{network}"
     )
 }
 
@@ -6523,6 +6523,7 @@ pub(crate) fn seatbelt_shell_profile(
         r#"(version 1)
 (deny default)
 (allow process*)
+(allow sysctl-read)
 (deny file-read*{private_read_denies})
 (allow file-read*)
 (allow file-write*
@@ -9967,6 +9968,8 @@ echo COMMITTED"#;
                 "",
                 true,
             );
+            assert!(rendered.contains("(allow sysctl-read)"));
+            assert!(!rendered.contains("(allow sysctl-write"));
             assert_eq!(
                 rendered.contains("(allow file-read*)"),
                 profile != SandboxProfile::Workspace
@@ -10406,6 +10409,89 @@ printf MACOS_SEATBELT_POLICY_PASS
             matrix.filesystem_reads,
             "workspace, command cache, explicit roots and system runtime files; private application/secret paths denied"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_seatbelt_sysctl_reads_allow_native_rust_startup() {
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        if !seatbelt_exists() {
+            skip_unusable_real_sandbox_test(
+                "sysctl startup regression requires the real macOS Seatbelt backend",
+            );
+            return;
+        }
+        let owned = crate::tests::OwnedTestDirectory::new("seatbelt-sysctl");
+        let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        // The test image is a real native Rust binary in the repository's target
+        // directory. Running a small existing test also exercises thread startup,
+        // without depending on an independently installed tool such as dsntk.
+        let executable = executable.to_str().unwrap().replace('\'', "'\\''");
+        let child_test = "cli::tests::long_version_reports_exact_build_identity_without_startup";
+        let script = format!(
+            "set -e; /usr/sbin/sysctl -n hw.pagesize; '{executable}' --exact {child_test} --test-threads=1"
+        );
+        for profile in [
+            SandboxProfile::Workspace,
+            SandboxProfile::HostRead,
+            SandboxProfile::HostFull,
+        ] {
+            let sandbox = Sandbox::new(true, "seatbelt")
+                .with_working_dir(&workspace)
+                .with_test_cache_dir(&owned.path().join(format!("cache-{profile}")))
+                .with_general_profile(profile, Vec::new(), Vec::new());
+            let command = sandbox.wrap_command(&script).unwrap();
+            let rendered = command
+                .as_std()
+                .get_args()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find_map(|args| (args[0] == "-p").then(|| args[1].to_str().unwrap().to_owned()))
+                .expect("production Seatbelt profile");
+            let output = sandbox
+                .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+                .await
+                .unwrap();
+            assert_eq!(output.status, CommandStatus::Completed, "{profile}");
+            assert!(
+                output.exit_status.is_some_and(|status| status.success()),
+                "{profile}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.lines().next().unwrap().parse::<usize>().unwrap() > 0);
+            assert!(
+                stdout.contains(&format!("test {child_test} ... ok")),
+                "{profile}: {stdout}"
+            );
+            assert!(
+                stdout.contains("1 passed; 0 failed; 0 ignored"),
+                "{profile}: {stdout}"
+            );
+
+            // A negative control proves this host really enforces the missing
+            // read permission. This is the emitted production profile with only
+            // the new grant removed, and the command performs no writes.
+            assert_eq!(rendered.matches("(allow sysctl-read)").count(), 1);
+            let mut denied = Command::new(seatbelt_path().unwrap());
+            denied.args([
+                "-p",
+                &rendered.replace("(allow sysctl-read)", ""),
+                "/usr/sbin/sysctl",
+                "-n",
+                "hw.pagesize",
+            ]);
+            let denied = sandbox
+                .output_built_command_with_limits(denied, DEFAULT_COMMAND_LIMITS)
+                .await
+                .unwrap();
+            assert_eq!(denied.status, CommandStatus::Completed, "{profile}");
+            assert!(
+                denied.exit_status.is_some_and(|status| !status.success()),
+                "{profile}: sysctl read must fail without its grant"
+            );
+        }
     }
 
     /// Shell probe shared by the workspace-binding Seatbelt tests: the child
