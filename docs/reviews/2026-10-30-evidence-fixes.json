@@ -1,0 +1,48 @@
+{
+  "requested_issues": [
+    {
+      "bead": "mini-agent-tmryb",
+      "change": "Historical tool results remain verbatim by default until real context-budget compaction; explicit finite retention remains an opt-in policy."
+    },
+    {
+      "bead": "mini-agent-h2bz4",
+      "change": "Bounded Unicode character windows recover middle ranges from single-line spill artifacts through existing permission and retained-directory guards; compaction retains bounded recovery references."
+    },
+    {
+      "bead": "mini-agent-8tpau",
+      "change": "Active compaction retains typed image evidence with MIME/detail/digest, bounded to eight images and7MiB encoded payload, with explicit historical omission metadata. Archived in-memory snapshots support rollback without serializing duplicate pixels. Cold token pressure and ACP byte accounting include retained evidence."
+    },
+    {
+      "bead": "mini-agent-r0uzf",
+      "change": "File images staged by /add use canonical typed user input, persist and replay to native provider images, preserve image-only submission and failed-preflight drafts. Existing read_image, ACP and clipboard delivery remains supported."
+    },
+    {
+      "bead": "mini-agent-bygyx",
+      "change": "Five unchanged successful local evidence reads stop before the next model request, retaining typed results and terminal receipts; changed evidence resets detection; polling is excluded; possibly mutating attempts reset evidence. No user-steering injection or successful result rewriting."
+    }
+  ],
+  "review": {
+    "delegation": "Three isolated worktrees; root alone coordinated Cargo validation in main to avoid duplicate builds.",
+    "corrected_findings": [
+      "Successful result rewriting drops native image parts/tool references; preserve result unchanged.",
+      "Canonical input injection is operator steering in ACP/TUI; keep successful-read guard free of injected messages.",
+      "Generic mutation classification let job-status polling erase read-loop history; explicitly exclude polling.",
+      "Retained images were absent from cold token and ACP byte pressure; add bounded accounting.",
+      "Cumulative omission notices could contradict re-retained pixels; label historical omission events."
+    ],
+    "compatibility": "Explicit finite retention settings remain honored. Image/PDF backend and feature capability checks remain authoritative. Imported evidence is labeled untrusted and never grants filesystem authority."
+  },
+  "validation": {
+    "combined_affected_rust": "93 passed",
+    "minimal_affected_rust": "22 passed; strict minimal all-targets Clippy passed before final pressure refinement",
+    "terminal_receipts": "1 passed after adding canonical receipt assertion",
+    "pressure_refinement": "12 focused tests passed, including all new pressure/omission controls",
+    "ci_policy": "72 passed",
+    "headless_acp": "6 ACP parity +53 headless tests passed",
+    "strict_rich_clippy": "skills-enabled all-targets strict Clippy passed",
+    "debug_install_native": "final skills-enabled debug install passed; installed binary native macOS JS runtime check PASS (2) with canonical per-user temporary home",
+    "hosted_ci": "consolidated commit pending push/run",
+    "strict_minimal_clippy": "final minimal all-targets strict Clippy passed after pressure refinement"
+  },
+  "predecessor_ci": "41023420121 was superseded and cancelled. Linux/macOS parallel and all-features failures shared six raw-message expectations now corrected and locally passing. Linux native gate failed exact probe discovery (module name corrected); dependency, VSCode and Windows default compilation passed."
+}
