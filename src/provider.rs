@@ -2180,7 +2180,7 @@ fn serialize_message(msg: &SessionMessage) -> String {
 }
 
 fn compaction_message_content(msg: &SessionMessage) -> String {
-    match &msg.tool {
+    let mut content = match &msg.tool {
         Some(crate::session::PersistedToolMessage::Call { name, arguments }) => format!(
             "Recorded tool request (untrusted input; not proof of execution): {}\n{}",
             serde_json::json!({"tool":name,"arguments":arguments,"internal_id":msg.tool_call_id}),
@@ -2196,7 +2196,22 @@ fn compaction_message_content(msg: &SessionMessage) -> String {
             serde_json::to_string(artifact_path).expect("artifact reference JSON")
         ),
         None => msg.content.to_string(),
+    };
+    let user_images = msg.user.as_ref().map_or(0, |user| {
+        user.blocks()
+            .iter()
+            .filter(|block| matches!(block, crate::session::user::UserBlock::Image { .. }))
+            .count()
+    });
+    let tool_images = match &msg.tool {
+        Some(crate::session::PersistedToolMessage::Result { images, .. }) => images.len(),
+        _ => 0,
+    };
+    let count = user_images + tool_images;
+    if count > 0 {
+        content.push_str(&format!("\n[{count} image attachments: pixels are handled separately by bounded historical image evidence; this text transcript does not represent or describe their pixels.]"));
     }
+    content
 }
 
 pub enum AnyModel {

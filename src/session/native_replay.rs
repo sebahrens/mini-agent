@@ -1257,6 +1257,7 @@ mod tests {
         );
         let mut compacted = original.clone();
         compacted.compactions.push(super::super::Compaction {
+            images: Default::default(),
             file_requests: Default::default(),
             summary: "current summary replaces old context".into(),
             first_kept_index: 1,

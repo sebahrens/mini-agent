@@ -51,6 +51,20 @@ impl TryFrom<UncheckedImage> for PersistedToolImage {
     }
 }
 impl PersistedToolImage {
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.data.len()
+    }
+    pub(crate) fn evidence_identity(&self) -> compact_str::CompactString {
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"mini-agent-compacted-image-v1\0");
+        digest.update(self.mime_type.as_str().as_bytes());
+        digest.update([0]);
+        digest.update(serde_json::to_vec(&self.detail).expect("image detail JSON"));
+        digest.update([0]);
+        digest.update(self.data.as_bytes());
+        format!("{:x}", digest.finalize()).into()
+    }
     pub(crate) fn from_rig(image: &rig::message::Image) -> Result<Self, &'static str> {
         use rig::message::{DocumentSourceKind, MimeType};
         let DocumentSourceKind::Base64(data) = &image.data else {

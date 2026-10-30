@@ -3011,6 +3011,13 @@ fn convert_history_uncached(
             "[Recap of my prior work in this conversation]\n{}",
             summary
         )));
+        if let Some(evidence) = session
+            .compactions
+            .last()
+            .and_then(|record| record.images.to_message())
+        {
+            messages.push(evidence);
+        }
     }
 
     #[derive(Clone, Copy)]

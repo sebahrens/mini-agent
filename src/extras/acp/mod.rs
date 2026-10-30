@@ -366,24 +366,9 @@ impl SessionHistory {
             }
             let cut = self.next_cut();
             let previous = self.session.compacted_context().0.map(str::to_owned);
-            let mut messages = self.session.messages[self.live_start()..cut].to_vec();
-            // Text summaries can retain the fact an image was supplied, never
-            // infer pixels or turn the opaque base64 into instruction text.
-            for message in &mut messages {
-                if let Some(user) = &message.user {
-                    let image_count = user
-                        .blocks()
-                        .iter()
-                        .filter(|block| {
-                            matches!(block, crate::session::user::UserBlock::Image { .. })
-                        })
-                        .count();
-                    if image_count > 0 {
-                        message.content = format!("{}\n[{} image attachments supplied; pixels not represented in this text summary]", message.content, image_count).into();
-                        message.user = None;
-                    }
-                }
-            }
+            // Shared provider serialization describes attachments without putting
+            // base64 into text; apply_compaction retains the original pixels.
+            let messages = self.session.messages[self.live_start()..cut].to_vec();
             let result = tokio::select! {
                 biased;
                 _ = control.cancelled() => return None,

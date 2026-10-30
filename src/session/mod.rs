@@ -3,6 +3,7 @@ pub(crate) mod background_observation;
 pub(crate) mod catalogue;
 pub mod chat_history;
 pub(crate) mod compaction;
+pub(crate) mod compaction_images;
 pub(crate) mod environment;
 pub(crate) mod file_checkpoints;
 pub mod lock;
@@ -680,6 +681,8 @@ impl Clone for HistoryConversionCache {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Compaction {
+    #[serde(default, skip_serializing_if = "compaction_images::Images::is_empty")]
+    pub(crate) images: compaction_images::Images,
     #[serde(default)]
     pub(crate) file_requests: compaction::FileRequests,
     pub summary: CompactString,
@@ -2609,6 +2612,9 @@ impl Session {
                 break;
             }
         }
+        if let Some(active) = self.compactions.last_mut() {
+            active.images.activate();
+        }
     }
 
     /// Fold records beyond [`MAX_RETAINED_COMPACTIONS`] into the first
@@ -2674,6 +2680,16 @@ impl Session {
             .map(|previous| previous.file_requests.clone())
             .unwrap_or_default();
         file_requests.extend(&self.messages[..first_kept_index]);
+        let has_previous = self.compacted_context().0.is_some();
+        let mut images = if has_previous {
+            self.compactions
+                .last_mut()
+                .map(|previous| previous.images.rollover())
+                .unwrap_or_default()
+        } else {
+            compaction_images::Images::default()
+        };
+        images.extend(&self.messages[..first_kept_index]);
         let mut summary = file_requests.attach(&summary, summary_byte_budget);
         if let Some(todo_context) = self.todos.critical_context() {
             summary.push_str("\n\n");
@@ -2712,6 +2728,7 @@ impl Session {
         self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
 
         self.compactions.push(Compaction {
+            images,
             file_requests,
             summary: CompactString::from(summary),
             first_kept_index: 1, // The summary is at index 0
@@ -3791,6 +3808,7 @@ mod compaction_history_tests {
     #[test]
     fn the_pruned_chain_is_a_deterministic_function_of_the_full_history() {
         let record = |summary: &str| Compaction {
+            images: Default::default(),
             file_requests: Default::default(),
             summary: summary.into(),
             first_kept_index: 1,

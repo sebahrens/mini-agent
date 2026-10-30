@@ -1745,3 +1745,26 @@ authoritative. These labels grant no permission and do not expose rule text or
 hook output. Unmatched benign multiline shell/Python input sends no Ask in Yolo;
 Standard still asks. This does not establish the cause of an older photographed
 prompt without its matching runtime/version and policy evidence.
+
+### Images across conversation compaction
+
+`src/session/compaction_images.rs` keeps literal image evidence independently of
+the text recap. On compaction, typed user and tool images in the drained prefix
+are retained with their MIME type, detail setting, and SHA-256 identity. The next
+request carries those pixels as explicitly labeled, untrusted historical data
+after the recap; it does not synthesize a tool call, a fresh user instruction,
+or proof that a file still has the same contents. The text summarizer receives
+attachment counts rather than base64 and must not infer unseen pixels.
+
+The active compaction retains the newest eight distinct images within 7 MiB of
+encoded image data. Identical pixels with the same MIME/detail are deduplicated.
+Images beyond count/byte limits, or invalid imported images, produce an explicit
+omission count and up to sixteen recent omitted content identities. A text recap
+does not recover omitted pixels; obtain the original evidence when it matters.
+Only the active compaction serializes image payloads; older records retain
+identities so repeated compaction does not write duplicate images. In-memory
+predecessors share immutable pixels until pruning so failed-turn rollback can
+restore them. A historical record reloaded without pixels reports that absence
+explicitly if it becomes active again. Session
+save/reload and rewind/redo retain this inventory. Imported inventories remain
+labeled as imported, untrusted history, and cannot name a URL or filesystem path.

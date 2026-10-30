@@ -2572,3 +2572,55 @@ fn native_replay_protocol_classifier_uses_actual_custom_adapter_and_api_style() 
         assert_eq!(restored, expected);
     }
 }
+
+#[tokio::test]
+async fn compaction_text_serializer_marks_user_and_tool_images_without_sending_base64() {
+    use base64::Engine;
+    let bytes = include_bytes!("../agent/tools/fixtures/read-image64/3x2.png");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let mut session = crate::session::Session::new("test", "test", 128_000, "");
+    session.add_user_message(
+        crate::session::user::PersistedUserMessage::new(vec![
+            crate::session::user::UserBlock::Text {
+                text: "compare this chart".into(),
+            },
+            crate::session::user::UserBlock::Image {
+                data: encoded.clone(),
+                mime_type: crate::session::user::ImageMime::Png,
+            },
+        ])
+        .unwrap(),
+    );
+    let image = crate::session::tool_image::PersistedToolImage::from_rig(&rig::message::Image {
+        data: rig::message::DocumentSourceKind::Base64(encoded.clone()),
+        media_type: Some(rig::message::ImageMediaType::PNG),
+        detail: None,
+        additional_params: None,
+    })
+    .unwrap();
+    session.add_tool_call_with_id(
+        "image",
+        "read",
+        &serde_json::json!({"path":"not-opened.png"}),
+    );
+    session.add_tool_result_with_images("image", "read", "image metadata", vec![image]);
+    let output = compress_messages_with(&session.messages, None, None, 8192, |prompt| {
+        assert_eq!(
+            prompt.matches("1 image attachments:").count(),
+            2,
+            "{prompt}"
+        );
+        assert!(prompt.contains("does not represent or describe their pixels"));
+        assert!(prompt.contains("compare this chart") && prompt.contains("image metadata"));
+        assert!(!prompt.contains(&encoded));
+        async {
+            Ok((
+                "The image evidence is separate from this recap.".into(),
+                UsageDelta::default(),
+            ))
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.messages_included, session.messages.len());
+}

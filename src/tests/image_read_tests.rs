@@ -261,13 +261,14 @@ async fn image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlat
     use crate::provider::{AnyModel, OpenAiModel};
     use rig::completion::{CompletionModel, CompletionRequest};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    for (protocol, style) in [
-        ("anthropic", "completions"),
-        ("openai", "completions"),
-        ("openai", "responses"),
-        ("openrouter", "completions"),
-        ("gemini", "completions"),
-        ("ollama", "completions"),
+    for (protocol, style, compacted) in [
+        ("anthropic", "completions", false),
+        ("openai", "completions", false),
+        ("openai", "responses", false),
+        ("openrouter", "completions", false),
+        ("gemini", "completions", false),
+        ("ollama", "completions", false),
+        ("openai", "completions", true),
     ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -280,10 +281,30 @@ async fn image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlat
         )
         .unwrap();
         let model = client.completion_model("owned-vision-fixture");
+        let history = if compacted {
+            let mut session = crate::session::Session::new("openai", "fixture", 200_000, "");
+            crate::print::persist_headless_turn_input(
+                &mut session,
+                &crate::agent::input::PromptInput::text("read it".into()),
+                "seen",
+                &interactions(),
+            )
+            .unwrap();
+            session.compress(
+                "The image had useful evidence.".into(),
+                session.messages.len(),
+                0,
+            );
+            let restored: crate::session::Session =
+                serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+            crate::agent::runner::convert_history(&restored)
+        } else {
+            interactions()
+        };
         let request = CompletionRequest {
             model: None,
             preamble: Some("immutable image policy".into()),
-            chat_history: OneOrMany::many(interactions()).unwrap(),
+            chat_history: OneOrMany::many(history).unwrap(),
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,
@@ -353,6 +374,14 @@ async fn image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlat
             text.contains(&base64::engine::general_purpose::STANDARD.encode(PNG)),
             "{protocol}/{style}: {body}"
         );
+        if compacted {
+            assert!(text.contains("Historical image evidence"), "{body}");
+            assert!(
+                !text.contains("image-call") && !text.contains("text-call"),
+                "compaction must not synthesize native calls: {body}"
+            );
+            continue;
+        }
         assert!(
             text.contains("image-call")
                 && text.contains("text-call")

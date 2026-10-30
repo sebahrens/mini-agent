@@ -1000,6 +1000,7 @@ async fn native_bound_interactive_turn() {
     changed_compaction
         .compactions
         .push(crate::session::Compaction {
+            images: Default::default(),
             file_requests: Default::default(),
             summary: "changed bound context".into(),
             first_kept_index: 1,
