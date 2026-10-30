@@ -229,3 +229,7 @@ reproducing code; focus on structure, relationships, and rationale.
 
 Both files complement each other: `AGENTS.md` tells the agent how to operate;
 `ARCHITECTURE.md` tells it what it's operating on.
+
+`src/agent/read_loop.rs` owns the bounded, turn-local inventory of successful read output hashes.
+`ToolLoopGuard` observes completed results and stops only at the next model-request boundary,
+so it never substitutes stale evidence before a read or discards the final observed result.

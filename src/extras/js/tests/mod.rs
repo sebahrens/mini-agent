@@ -668,7 +668,7 @@ async fn test_timeout() {
 }
 
 #[tokio::test]
-async fn test_exception_surfaces_only_its_bounded_message() {
+async fn test_exception_keeps_arbitrary_message_out_of_diagnostics() {
     let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
     let tool = make_test_tool(&audit_dirs);
@@ -682,7 +682,7 @@ async fn test_exception_surfaces_only_its_bounded_message() {
 
     assert_eq!(
         result,
-        "JS exception at 1:10: test exception (stage: evaluation; script: model)"
+        "JS exception at 1:10 (stage: evaluation; script: model)"
     );
 }
 

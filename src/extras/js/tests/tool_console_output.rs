@@ -111,12 +111,13 @@ fn first_line(text: &str) -> &str {
 }
 
 #[tokio::test]
-async fn js_tool_uncaught_effect_error_names_effect_and_code() {
+async fn js_tool_uncaught_effect_error_keeps_closed_diagnostics() {
     let result =
         run("const SECRET_LOCAL = 'S3CR3T_SOURCE_TOKEN'; read_file('nope/missing.txt')").await;
     assert!(result.starts_with("JS exception at 1:"), "{result}");
     assert!(
-        result.contains(": read_file: not_found (stage: evaluation; script: model)"),
+        result.contains("(stage: evaluation; script: model)")
+            && !result.contains("nope/missing.txt"),
         "{result}"
     );
     assert!(
@@ -126,11 +127,11 @@ async fn js_tool_uncaught_effect_error_names_effect_and_code() {
 }
 
 #[tokio::test]
-async fn js_tool_type_and_reference_errors_carry_the_engine_message() {
+async fn js_tool_type_and_reference_errors_keep_only_closed_metadata() {
     let type_error = run("const r = undefined;\nr.paths").await;
     assert!(type_error.starts_with("JS TypeError at 2:"), "{type_error}");
     assert!(
-        type_error.contains("'paths'") && type_error.contains("undefined"),
+        !type_error.contains("'paths'") && !type_error.contains("undefined"),
         "{type_error}"
     );
 
@@ -139,21 +140,18 @@ async fn js_tool_type_and_reference_errors_carry_the_engine_message() {
         reference.starts_with("JS ReferenceError at 1:"),
         "{reference}"
     );
-    assert!(
-        reference.contains("missing_identifier_xyz is not defined"),
-        "{reference}"
-    );
+    assert!(!reference.contains("missing_identifier_xyz"), "{reference}");
 }
 
 #[tokio::test]
-async fn js_tool_syntax_error_carries_the_engine_message() {
+async fn js_tool_syntax_error_keeps_class_and_source_position() {
     let result = run("let x = 1;\nlet y = (;").await;
     assert!(result.starts_with("JS SyntaxError at 2:"), "{result}");
-    assert!(result.contains("unexpected token"), "{result}");
+    assert!(!result.contains("unexpected token"), "{result}");
 }
 
 #[tokio::test]
-async fn js_tool_error_message_is_sanitized_and_bounded() {
+async fn js_tool_error_message_is_not_disclosed() {
     let result =
         run("throw new Error('first\\nsecond\\u0007\\u001b[31m ' + 'x'.repeat(5000))").await;
     let line = first_line(&result);
@@ -168,7 +166,10 @@ async fn js_tool_error_message_is_sanitized_and_bounded() {
         !result.chars().any(char::is_control),
         "control char survived: {result:?}"
     );
-    assert!(line.contains("first second"), "{line}");
+    assert!(
+        !line.contains("first") && !line.contains("second"),
+        "{line}"
+    );
 }
 
 #[tokio::test]
@@ -192,18 +193,20 @@ async fn js_tool_limit_errors_state_the_limit_and_remedy() {
         "{effects}"
     );
 
-    let many = run("read_files(new Array(300).fill('a'))").await;
+    let many =
+        run("try { read_files(new Array(300).fill('a')) } catch (error) { error.message }").await;
     assert!(
         many.contains("limit 256 paths per call; split into batches of 256"),
         "{many}"
     );
 
-    let grep_missing = run("grep('x', {path: 'no-such-file.txt'})").await;
+    let grep_missing =
+        run("try { grep('x', {path: 'no-such-file.txt'}) } catch (error) { error.message }").await;
     assert!(
         grep_missing.contains("path must be an existing directory or regular file"),
         "{grep_missing}"
     );
-    let list_file = run("list_dir('Cargo.toml')").await;
+    let list_file = run("try { list_dir('Cargo.toml') } catch (error) { error.message }").await;
     assert!(
         list_file.contains("path must be a directory; use include for files, or read_file"),
         "{list_file}"

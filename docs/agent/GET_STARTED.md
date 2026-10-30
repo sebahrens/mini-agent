@@ -529,7 +529,12 @@ During every user turn, mini-agent also detects repetitive tool loops. The third
 call is replaced with corrective feedback, later calls with the same tool and arguments are skipped
 before execution, and a sixth alternating A/B edit is stopped before it can undo the prior edit
 again. Interactive sessions show a yellow `loop guard` event; headless and subagent runs receive the
-same corrective tool result. These attempts still consume the configured model-turn budget.
+same corrective tool result. Successful local read/search calls are compared by canonical
+arguments and output hash: the third unchanged result adds coaching, and the fifth stops the
+turn before another model request, after preserving its result. Each read executes first so changed
+content resets the count; potentially mutating calls reset the read inventory even on failure. Shell, JS, MCP, network
+and job-status polling are excluded. New user turns get a fresh guard. These attempts still consume
+the configured model-turn budget.
 
 Offline policy probes—`--config-preservation-check`,
 `--project-config-trust-check`, `--js-runtime-check`,

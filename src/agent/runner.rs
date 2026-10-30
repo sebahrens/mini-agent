@@ -240,6 +240,8 @@ fn hash_canonical_json(digest: &mut Sha256, value: &serde_json::Value) {
 
 #[derive(Clone, Default)]
 struct ToolLoopState {
+    successful_reads: super::read_loop::ReadLoopState,
+    pending_read_notice: Option<String>,
     failures: HashMap<ToolCallFingerprint, u32>,
     recent_successful_edits: VecDeque<ToolCallFingerprint>,
     blocked_edit_pair: Option<[ToolCallFingerprint; 2]>,
@@ -301,9 +303,23 @@ impl ToolLoopState {
         tool_name: &str,
         fingerprint: ToolCallFingerprint,
         outcome: &rig::tool::ToolOutcome,
+        result: &str,
     ) -> Option<String> {
+        if super::read_loop::invalidates_evidence(tool_name) {
+            self.successful_reads.clear_after_mutation();
+            self.pending_read_notice = None;
+        }
         if outcome.is_success() {
             self.failures.remove(&fingerprint);
+            if super::read_loop::is_evidence_read(tool_name) {
+                self.pending_read_notice = self
+                    .successful_reads
+                    .observe(fingerprint.0, result)
+                    .map(|notice| format!("{TOOL_LOOP_NOTICE_PREFIX} {notice}"));
+                // Rewriting a successful result would erase native image parts and tool
+                // references. Append coaching as ordinary canonical input at the next boundary.
+                return None;
+            }
             if tool_name == "edit" {
                 self.recent_successful_edits.push_back(fingerprint);
                 while self.recent_successful_edits.len() > ALTERNATING_EDIT_HISTORY {
@@ -326,7 +342,7 @@ impl ToolLoopState {
     }
 }
 
-/// Run-scoped guard against repeated failing calls and edit/undo oscillation.
+/// Run-scoped guard against repeated failures, unchanged reads and edit/undo oscillation.
 /// Rig creates a fresh [`HookContext`] for every user turn, so no state leaks
 /// between turns or agents.
 pub(crate) struct ToolLoopGuard;
@@ -334,6 +350,23 @@ pub(crate) struct ToolLoopGuard;
 impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
     async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
+            StepEvent::CompletionCall { .. } => {
+                let (stop, notice) = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                    (
+                        state.successful_reads.stop_requested(),
+                        state.pending_read_notice.take(),
+                    )
+                });
+                if stop {
+                    Flow::terminate(super::read_loop::STOP_REASON)
+                } else if let Some(notice) = notice {
+                    Flow::patch_request(
+                        rig::agent::RequestPatch::new().append_input([Message::user(notice)]),
+                    )
+                } else {
+                    Flow::cont()
+                }
+            }
             StepEvent::ToolCall {
                 tool_name,
                 args,
@@ -375,7 +408,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 });
                 let fingerprint = cached.unwrap_or_else(|| tool_call_fingerprint(tool_name, args));
                 let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
-                    state.record_result(tool_name, fingerprint, outcome)
+                    state.record_result(tool_name, fingerprint, outcome, result)
                 });
                 notice.map_or_else(Flow::cont, |notice| {
                     Flow::rewrite_result(format!("{result}\n\n{notice}"))
@@ -386,7 +419,10 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
     }
 
     fn observes(&self, kind: StepEventKind) -> bool {
-        matches!(kind, StepEventKind::ToolCall | StepEventKind::ToolResult)
+        matches!(
+            kind,
+            StepEventKind::CompletionCall | StepEventKind::ToolCall | StepEventKind::ToolResult
+        )
     }
 }
 
@@ -7452,6 +7488,172 @@ mod tests {
         assert!(!full.contains("raw-secret-canary"));
         drop(stream);
         drop(environment);
+    }
+
+    #[derive(Clone)]
+    struct ReadEvidenceProbe {
+        executions: Arc<AtomicUsize>,
+        outputs: Vec<&'static str>,
+    }
+
+    impl Tool for ReadEvidenceProbe {
+        const NAME: &'static str = "grep";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Read local evidence".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn call(&self, _args: Self::Args) -> Result<String, MockToolError> {
+            let index = self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(self.outputs[index.min(self.outputs.len() - 1)].into())
+        }
+    }
+
+    #[derive(Clone)]
+    struct PollingProbe(Arc<AtomicUsize>);
+    impl Tool for PollingProbe {
+        const NAME: &'static str = "job_status";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+        fn description(&self) -> String {
+            "Poll an existing job".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn call(&self, _args: Self::Args) -> Result<String, MockToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("running".into())
+        }
+    }
+
+    fn evidence_turns(calls: usize) -> Vec<Vec<MockStreamEvent>> {
+        let mut turns = (0..calls)
+            .map(|index| {
+                vec![
+                    MockStreamEvent::tool_call(
+                        format!("evidence-{index}"),
+                        ReadEvidenceProbe::NAME,
+                        serde_json::json!({"path":"evidence.txt", "pattern":"fact"}),
+                    ),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        turns.push(vec![
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]);
+        turns
+    }
+
+    #[tokio::test]
+    async fn unchanged_successful_reads_preserve_last_result_then_stop_before_sixth_request() {
+        let mut turns = evidence_turns(6);
+        for (index, turn) in turns.iter_mut().take(6).enumerate() {
+            turn.insert(
+                1,
+                MockStreamEvent::tool_call(
+                    format!("poll-{index}"),
+                    PollingProbe::NAME,
+                    serde_json::json!({"id":"job-1", "action":"poll"}),
+                ),
+            );
+        }
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new(model.clone())
+            .tool(PollingProbe(polls.clone()))
+            .tool(ReadEvidenceProbe {
+                executions: executions.clone(),
+                outputs: vec!["retained fact"],
+            })
+            .add_hook(super::ToolLoopGuard)
+            .default_max_turns(8)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "inspect evidence".into(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut outputs = Vec::new();
+        let mut stopped = false;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::ToolResult {
+                    name,
+                    output,
+                    is_error,
+                    ..
+                } if name == ReadEvidenceProbe::NAME => {
+                    assert!(!is_error);
+                    outputs.push(output.to_string());
+                }
+                crate::event::AgentEvent::Error { message, .. } => {
+                    assert!(
+                        message.contains(super::super::read_loop::STOP_REASON),
+                        "{message}"
+                    );
+                    stopped = true;
+                    break;
+                }
+                crate::event::AgentEvent::Retrying { .. } => {
+                    panic!("read-loop stops must never retry the provider")
+                }
+                crate::event::AgentEvent::Done { .. } => panic!("unchanged read loop must stop"),
+                _ => {}
+            }
+        }
+        assert!(stopped);
+        assert_eq!(executions.load(Ordering::SeqCst), 5);
+        assert_eq!(model.requests().len(), 5);
+        assert_eq!(outputs.len(), 5);
+        assert_eq!(polls.load(Ordering::SeqCst), 5);
+        assert!(
+            outputs
+                .iter()
+                .all(|output| output.contains("retained fact"))
+        );
+        assert!(outputs.iter().all(|output| output == "retained fact"));
+        let requests = model.requests();
+        let fourth_request = &requests[3];
+        let encoded = serde_json::to_string(&fourth_request.chat_history).unwrap();
+        assert!(encoded.contains("unchanged evidence"));
+    }
+
+    #[tokio::test]
+    async fn changed_successful_read_evidence_resets_the_live_guard() {
+        let model = MockCompletionModel::from_stream_turns(evidence_turns(6));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new(model.clone())
+            .tool(ReadEvidenceProbe {
+                executions: executions.clone(),
+                outputs: vec!["old", "old", "old", "old", "new", "new"],
+            })
+            .add_hook(super::ToolLoopGuard)
+            .build();
+        let mut stream = agent
+            .stream_chat("inspect changing evidence", Vec::<Message>::new())
+            .max_turns(8)
+            .await;
+        while let Some(item) = stream.next().await {
+            item.expect("changed evidence must continue");
+        }
+        assert_eq!(executions.load(Ordering::SeqCst), 6);
+        assert_eq!(model.requests().len(), 7);
     }
 
     #[tokio::test]
