@@ -69,7 +69,8 @@ use `JSON.stringify(value)` for Date, Map, Set, class instances, or objects cont
 
 pub const READ_TOOL_PROMPT: &str = "\n\n## File reads\n\
 - **read** reads file contents. Repeated reads of the same path/offset/limit are blocked until the \
-file changes. Read enough context at once and do not re-read unchanged sections.\n\
+file changes. Read enough context at once and do not re-read unchanged sections. Five identical \
+read/search results stop a turn; reuse retained evidence or change the range or approach.\n\
 - Read a file before changing it and verify changed areas after editing.";
 
 pub const WRITE_TOOL_PROMPT: &str =

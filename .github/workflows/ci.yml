@@ -1336,7 +1336,7 @@ jobs:
           containment_count=$(printf '%s\n' "$js_tests" | grep -c '^extras::js::tests::worker_containment::linux_js_worker_containment: test$')
           test "$containment_count" -eq 1
           for probe in \
-            sandbox::worker::platform::tests::loaded_runtime_closure_keeps_loader_visible_soname_aliases \
+            sandbox::worker::platform::runtime_closure_tests::loaded_runtime_closure_keeps_loader_visible_soname_aliases \
             extras::js::tests::worker_containment::linux_js_worker_survives_transient_launch_thread_exit; do
             test "$(printf '%s\n' "$js_tests" | grep -Fxc "$probe: test")" -eq 1
           done

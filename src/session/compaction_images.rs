@@ -112,7 +112,11 @@ impl Images {
                                 // identity remains an explicit loss marker, not a path to open.
                                 use sha2::Digest;
                                 self.omit(
-                                    format!("{:x}", sha2::Sha256::digest(data.as_bytes())).into(),
+                                    sha2::Sha256::digest(data.as_bytes())
+                                        .iter()
+                                        .map(|byte| format!("{byte:02x}"))
+                                        .collect::<String>()
+                                        .into(),
                                 );
                             }
                         }

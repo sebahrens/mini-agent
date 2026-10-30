@@ -241,7 +241,6 @@ fn hash_canonical_json(digest: &mut Sha256, value: &serde_json::Value) {
 #[derive(Clone, Default)]
 struct ToolLoopState {
     successful_reads: super::read_loop::ReadLoopState,
-    pending_read_notice: Option<String>,
     failures: HashMap<ToolCallFingerprint, u32>,
     recent_successful_edits: VecDeque<ToolCallFingerprint>,
     blocked_edit_pair: Option<[ToolCallFingerprint; 2]>,
@@ -307,17 +306,13 @@ impl ToolLoopState {
     ) -> Option<String> {
         if super::read_loop::invalidates_evidence(tool_name) {
             self.successful_reads.clear_after_mutation();
-            self.pending_read_notice = None;
         }
         if outcome.is_success() {
             self.failures.remove(&fingerprint);
             if super::read_loop::is_evidence_read(tool_name) {
-                self.pending_read_notice = self
-                    .successful_reads
-                    .observe(fingerprint.0, result)
-                    .map(|notice| format!("{TOOL_LOOP_NOTICE_PREFIX} {notice}"));
-                // Rewriting a successful result would erase native image parts and tool
-                // references. Append coaching as ordinary canonical input at the next boundary.
+                self.successful_reads.observe(fingerprint.0, result);
+                // Keep successful typed payloads and canonical operator input untouched.
+                // The next model boundary owns the stop after the completed result.
                 return None;
             }
             if tool_name == "edit" {
@@ -351,18 +346,11 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
     async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
             StepEvent::CompletionCall { .. } => {
-                let (stop, notice) = ctx.scratchpad().update(|state: &mut ToolLoopState| {
-                    (
-                        state.successful_reads.stop_requested(),
-                        state.pending_read_notice.take(),
-                    )
-                });
+                let stop = ctx
+                    .scratchpad()
+                    .update(|state: &mut ToolLoopState| state.successful_reads.stop_requested());
                 if stop {
                     Flow::terminate(super::read_loop::STOP_REASON)
-                } else if let Some(notice) = notice {
-                    Flow::patch_request(
-                        rig::agent::RequestPatch::new().append_input([Message::user(notice)]),
-                    )
                 } else {
                     Flow::cont()
                 }
@@ -7611,7 +7599,17 @@ mod tests {
                     assert!(!is_error);
                     outputs.push(output.to_string());
                 }
-                crate::event::AgentEvent::Error { message, .. } => {
+                crate::event::AgentEvent::Error {
+                    message,
+                    interactions,
+                } => {
+                    assert_eq!(
+                        tool_result_texts(&interactions)
+                            .into_iter()
+                            .filter(|text| *text == "retained fact")
+                            .count(),
+                        5
+                    );
                     assert!(
                         message.contains(super::super::read_loop::STOP_REASON),
                         "{message}"
@@ -7637,10 +7635,6 @@ mod tests {
                 .all(|output| output.contains("retained fact"))
         );
         assert!(outputs.iter().all(|output| output == "retained fact"));
-        let requests = model.requests();
-        let fourth_request = &requests[3];
-        let encoded = serde_json::to_string(&fourth_request.chat_history).unwrap();
-        assert!(encoded.contains("unchanged evidence"));
     }
 
     #[tokio::test]

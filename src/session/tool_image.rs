@@ -63,7 +63,12 @@ impl PersistedToolImage {
         digest.update(serde_json::to_vec(&self.detail).expect("image detail JSON"));
         digest.update([0]);
         digest.update(self.data.as_bytes());
-        format!("{:x}", digest.finalize()).into()
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            .into()
     }
     pub(crate) fn from_rig(image: &rig::message::Image) -> Result<Self, &'static str> {
         use rig::message::{DocumentSourceKind, MimeType};

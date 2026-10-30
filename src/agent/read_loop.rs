@@ -7,7 +7,6 @@ use std::collections::{HashMap, VecDeque};
 use sha2::{Digest, Sha256};
 
 const MAX_OBSERVATIONS: usize = 128;
-const WARN_AFTER: u32 = 3;
 const STOP_AFTER: u32 = 5;
 pub(super) const STOP_REASON: &str = "tool-loop detected: repeated successful reads returned unchanged evidence; use the retained results or change the approach";
 
@@ -63,7 +62,7 @@ impl ReadLoopState {
         *self = Self::default();
     }
 
-    pub(super) fn observe(&mut self, fingerprint: [u8; 32], output: &str) -> Option<&'static str> {
+    pub(super) fn observe(&mut self, fingerprint: [u8; 32], output: &str) {
         let output: [u8; 32] = Sha256::digest(output.as_bytes()).into();
         let repetitions = if let Some(previous) = self.observations.get_mut(&fingerprint) {
             if previous.output == output {
@@ -93,15 +92,6 @@ impl ReadLoopState {
         };
         if repetitions >= STOP_AFTER {
             self.stop = true;
-            Some(
-                "This successful read returned the same evidence five times. Its latest result is retained; this turn will stop before another model request. Reuse the evidence or change the approach in a new turn.",
-            )
-        } else if repetitions >= WARN_AFTER {
-            Some(
-                "This successful read keeps returning unchanged evidence. Reuse the earlier result instead of rereading it; inspect a different range or change the approach. Five unchanged results stop this turn.",
-            )
-        } else {
-            None
         }
     }
 }
@@ -111,18 +101,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn successful_reads_warn_then_stop_but_changed_evidence_recovers() {
+    fn successful_reads_stop_but_changed_evidence_recovers() {
         let mut state = ReadLoopState::default();
-        assert!(state.observe([1; 32], "first").is_none());
-        assert!(state.observe([1; 32], "first").is_none());
-        assert!(state.observe([1; 32], "first").is_some());
+        state.observe([1; 32], "first");
+        state.observe([1; 32], "first");
+        state.observe([1; 32], "first");
+        assert!(!state.stop_requested());
         state.observe([1; 32], "first");
         state.observe([1; 32], "first");
         assert!(state.stop_requested());
-        assert!(state.observe([1; 32], "changed").is_none());
+        state.observe([1; 32], "changed");
         assert!(!state.stop_requested());
         state.clear_after_mutation();
-        assert!(state.observe([1; 32], "changed").is_none());
+        state.observe([1; 32], "changed");
     }
 
     #[test]

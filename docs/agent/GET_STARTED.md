@@ -530,8 +530,8 @@ call is replaced with corrective feedback, later calls with the same tool and ar
 before execution, and a sixth alternating A/B edit is stopped before it can undo the prior edit
 again. Interactive sessions show a yellow `loop guard` event; headless and subagent runs receive the
 same corrective tool result. Successful local read/search calls are compared by canonical
-arguments and output hash: the third unchanged result adds coaching, and the fifth stops the
-turn before another model request, after preserving its result. Each read executes first so changed
+arguments and output hash: the fifth unchanged result stops the turn before another model
+request, after preserving its result. Each read executes first so changed
 content resets the count; potentially mutating calls reset the read inventory even on failure. Shell, JS, MCP, network
 and job-status polling are excluded. New user turns get a fresh guard. These attempts still consume
 the configured model-turn budget.
@@ -559,8 +559,8 @@ enabled by default: Linux uses `bwrap` when installed and trusted, supported mac
 system-provided Seatbelt backend at `/usr/bin/sandbox-exec`, and Windows selects the attested
 AppContainer backend (`restricted-token` remains a compatibility alias). Windows availability
 requires its cached native production preflight. That probe has a thirty-second run deadline followed
-by up to five seconds for whole-tree reaping and a fresh five-second profile/ACL recovery window.
-Before a new probe, a separate five-second bounded sweep recovers exact private roots preserved by
+by up to five seconds for whole-tree reaping and a fresh fifteen-second profile/ACL recovery window.
+Before a new probe, a separate fifteen-second bounded sweep recovers exact private roots preserved by
 an interrupted earlier process; malformed or active roots fail closed without deletion. Failure is cached and
 remains closed unless `--no-sandbox` explicitly opts out. On Linux and macOS an implicitly selected
 default backend that is unavailable (for example `bwrap` missing, or blocked by Ubuntu 24.04's

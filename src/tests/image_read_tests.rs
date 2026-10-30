@@ -257,7 +257,7 @@ async fn image_read64_actual_read_keeps_bytes_permissions_and_overwrite_proof_se
 
 #[cfg(feature = "multimodal")]
 #[tokio::test]
-async fn image_read64_repeated_successes_preserve_native_images_and_separate_loop_guidance() {
+async fn image_read64_repeated_successes_preserve_native_images_without_steering() {
     use crate::agent::tools::{ReadTool, ReadTracker, read_image::ImageReadSupport};
     use futures::StreamExt;
     use rig::agent::{AgentBuilder, MultiTurnStreamItem};
@@ -347,9 +347,14 @@ async fn image_read64_repeated_successes_preserve_native_images_and_separate_loo
         })
         .collect();
     assert_eq!(images, vec![&image(), &image(), &image()]);
-    assert!(last.iter().any(|message| matches!(message, Message::User { content }
-        if content.iter().any(|part| matches!(part, UserContent::Text(text) if text.text.contains("unchanged evidence"))))),
-        "the next request must receive loop guidance separately from native image results");
+    assert!(
+        !last
+            .iter()
+            .any(|message| matches!(message, Message::User { content }
+        if content.iter().any(|part| matches!(part, UserContent::Text(text)
+            if text.text.contains("[tool-loop detected]"))))),
+        "successful reads must not impersonate operator steering"
+    );
 }
 
 #[cfg(feature = "multimodal")]
