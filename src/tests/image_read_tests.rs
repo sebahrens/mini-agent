@@ -257,6 +257,103 @@ async fn image_read64_actual_read_keeps_bytes_permissions_and_overwrite_proof_se
 
 #[cfg(feature = "multimodal")]
 #[tokio::test]
+async fn image_read64_repeated_successes_preserve_native_images_and_separate_loop_guidance() {
+    use crate::agent::tools::{ReadTool, ReadTracker, read_image::ImageReadSupport};
+    use futures::StreamExt;
+    use rig::agent::{AgentBuilder, MultiTurnStreamItem};
+    use rig::streaming::StreamingChat;
+    use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+
+    let root = super::OwnedTestDirectory::new("image64-repeat");
+    std::fs::write(root.path().join("scan.png"), PNG).unwrap();
+    let mut tracker = ReadTracker::new(false);
+    tracker.image_support = ImageReadSupport::captured("anthropic", "claude-fable-5-1", false);
+    let read =
+        ReadTool::new_with_tracker(None, None, Some(16), 100, tracker).with_workspace(root.path());
+    let mut turns: Vec<_> = (0..3)
+        .map(|index| {
+            vec![
+                MockStreamEvent::tool_call(
+                    format!("repeat-image-{index}"),
+                    "read",
+                    serde_json::json!({"path":"scan.png"}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]
+        })
+        .collect();
+    turns.push(vec![
+        MockStreamEvent::text("the scan is visible"),
+        MockStreamEvent::final_response_with_default_usage(),
+    ]);
+    let model = MockCompletionModel::from_stream_turns(turns);
+    let agent = AgentBuilder::new(model.clone())
+        .tool(read)
+        .add_hook(crate::agent::runner::ToolLoopGuard)
+        .build();
+    let mut stream = agent
+        .stream_chat("inspect the scan", Vec::<Message>::new())
+        .max_turns(5)
+        .await;
+    let mut results = 0;
+    while let Some(item) = stream.next().await {
+        if let MultiTurnStreamItem::StreamUserItem(
+            rig::streaming::StreamedUserContent::ToolResult { tool_result, .. },
+        ) = item.unwrap()
+        {
+            results += 1;
+            let images: Vec<_> = tool_result
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    ToolResultContent::Image(image) => Some(image),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                images,
+                vec![&image()],
+                "result {results} lost its native image"
+            );
+            assert!(
+                tool_result.content.iter().all(|part| match part {
+                    ToolResultContent::Text(text) => !text.text.contains("[tool-loop detected]"),
+                    _ => true,
+                }),
+                "guidance must not replace the successful image envelope"
+            );
+        }
+    }
+    assert_eq!(results, 3);
+    let requests = model.requests();
+    assert_eq!(requests.len(), 4);
+    let last = &requests[3].chat_history;
+    let images: Vec<_> = last
+        .iter()
+        .flat_map(|message| match message {
+            Message::User { content } => content
+                .iter()
+                .filter_map(|part| match part {
+                    UserContent::ToolResult(result) => Some(result.content.iter()),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|part| match part {
+                    ToolResultContent::Image(image) => Some(image),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect();
+    assert_eq!(images, vec![&image(), &image(), &image()]);
+    assert!(last.iter().any(|message| matches!(message, Message::User { content }
+        if content.iter().any(|part| matches!(part, UserContent::Text(text) if text.text.contains("unchanged evidence"))))),
+        "the next request must receive loop guidance separately from native image results");
+}
+
+#[cfg(feature = "multimodal")]
+#[tokio::test]
 async fn image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlation() {
     use crate::provider::{AnyModel, OpenAiModel};
     use rig::completion::{CompletionModel, CompletionRequest};
