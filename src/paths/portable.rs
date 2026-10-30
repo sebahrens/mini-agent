@@ -18,7 +18,7 @@ pub const MAX_PORTABLE_PATH_BYTES: usize = 4096;
 #[cfg(any(feature = "agent-skills", test))]
 pub const MAX_PORTABLE_PATH_UTF16_UNITS: usize = 32_767;
 
-const OPAQUE_IDENTITY_VERSION: &[u8] = b"zerostack-opaque-name-v1";
+const OPAQUE_IDENTITY_VERSION: &[u8] = b"mini-agent-opaque-name-v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PortablePathError {

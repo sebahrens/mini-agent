@@ -13,7 +13,7 @@ use rig::tool::ToolDyn;
 use crate::config::{Config, merge_config_override};
 use crate::extras::mcp::client::McpClientHandle;
 use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
-use crate::extras::mcp::{McpClientManager, McpToolTimeouts};
+use crate::extras::mcp::{McpClientManager, McpNoticeLevel, McpToolTimeouts};
 use crate::permission::checker::PermissionChecker;
 use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
@@ -1290,7 +1290,7 @@ async fn tui_prebuild_retirement_reaps_pending_queued_and_rejected_mcp_results()
 }
 
 fn isolated_prebuild_test(test_name: &str) -> bool {
-    if std::env::var("ZS_TEST_PREBUILD_CASE").as_deref() == Ok(test_name) {
+    if std::env::var("MINI_AGENT_TEST_PREBUILD_CASE").as_deref() == Ok(test_name) {
         return false;
     }
     let fixture = FixtureBuild::compile();
@@ -1299,7 +1299,7 @@ fn isolated_prebuild_test(test_name: &str) -> bool {
     child
         .args(["--exact", test_name, "--nocapture"])
         .current_dir(&root)
-        .env("ZS_TEST_PREBUILD_CASE", test_name);
+        .env("MINI_AGENT_TEST_PREBUILD_CASE", test_name);
     for name in [
         "CONFIG",
         "DATA",
@@ -1308,7 +1308,7 @@ fn isolated_prebuild_test(test_name: &str) -> bool {
         "CACHE",
         "CREDENTIALS",
     ] {
-        child.env(format!("ZS_{name}_DIR"), root.join(name));
+        child.env(format!("MINI_AGENT_{name}_DIR"), root.join(name));
     }
     let output = child.output().unwrap();
     fixture.cleanup();
@@ -1500,8 +1500,9 @@ async fn mcp_tools_list_hang_does_not_block_other_servers() {
     assert_eq!(tools[0].name(), "probe");
     let notices = manager.take_notices();
     assert_eq!(notices.len(), 1, "notices: {notices:?}");
+    assert_eq!(notices[0].level(), McpNoticeLevel::Error);
     assert_eq!(
-        notices[0],
+        notices[0].message(),
         "MCP server 'slow' tools unavailable: tools/list timed out after 300 ms"
     );
     assert!(manager.take_notices().is_empty(), "notices drain once");
@@ -1540,9 +1541,10 @@ async fn mcp_tools_list_error_produces_notice() {
     assert!(tools.is_empty());
     let notices = manager.take_notices();
     assert_eq!(notices.len(), 1, "notices: {notices:?}");
-    assert!(notices[0].contains("broken"), "{}", notices[0]);
+    assert_eq!(notices[0].level(), McpNoticeLevel::Error);
+    assert!(notices[0].message().contains("broken"), "{}", notices[0]);
     assert!(
-        notices[0].contains("fixture tools/list failure"),
+        notices[0].message().contains("fixture tools/list failure"),
         "{}",
         notices[0]
     );
@@ -1654,9 +1656,18 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
 
     let notices = manager.take_notices();
     assert_eq!(notices.len(), 1, "notices: {notices:?}");
-    assert!(notices[0].contains("probe"), "{}", notices[0]);
-    assert!(notices[0].contains("alpha__probe"), "{}", notices[0]);
-    assert!(notices[0].contains("beta__probe"), "{}", notices[0]);
+    assert_eq!(notices[0].level(), McpNoticeLevel::Info);
+    assert!(notices[0].message().contains("probe"), "{}", notices[0]);
+    assert!(
+        notices[0].message().contains("alpha__probe"),
+        "{}",
+        notices[0]
+    );
+    assert!(
+        notices[0].message().contains("beta__probe"),
+        "{}",
+        notices[0]
+    );
     // A rebuild of the same connection generation reuses its listed tools and
     // still produces the identical namespaced catalogue.
     assert!(
@@ -1679,7 +1690,14 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
         "built tools must share the cached schema Arc"
     );
     let mut rebuilt: Vec<String> = manager
-        .collect_tools_with_timeouts(None, None, McpToolTimeouts::default())
+        .collect_tools_with_timeouts(
+            Some(permission_for_servers(&[
+                ("alpha", Action::Allow),
+                ("beta", Action::Deny),
+            ])),
+            None,
+            McpToolTimeouts::default(),
+        )
         .await
         .iter()
         .map(|tool| tool.name())
@@ -1687,6 +1705,10 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
     rebuilt.sort();
     assert_eq!(rebuilt, names);
     assert_eq!(Arc::as_ptr(&manager.handles[0].tools), cached);
+    assert!(
+        manager.take_notices().is_empty(),
+        "an unchanged rename mapping must not be announced after a rebuild"
+    );
     assert!(Arc::ptr_eq(
         &listed_before,
         manager.handles[0].tools.get().unwrap()
@@ -1763,7 +1785,7 @@ async fn mcp_registered_aliases_preserve_wire_names_and_permission_keys() {
             assert!(notices.is_empty());
         } else {
             assert_eq!(notices.len(), 1);
-            assert!(notices[0].contains(&expected_alias));
+            assert!(notices[0].message().contains(&expected_alias));
         }
         let pid = wait_for_pid(&lease).await;
         shutdown(manager).await;
@@ -1802,7 +1824,9 @@ async fn builder_omissions_reach_the_headless_notice_sink_after_collection() {
         leases.push(lease);
     }
     let mut manager = McpClientManager::from_handles(handles);
-    manager.notices.push("connection notice".into());
+    manager
+        .notices
+        .push(crate::extras::mcp::McpNotice::error("connection notice"));
     let mut shown = Vec::new();
     crate::startup::report_headless_mcp_notices(Some(&mut manager), |notice| {
         shown.push(notice.to_string())

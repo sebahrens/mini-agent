@@ -1356,8 +1356,8 @@ fn format_diag_line(location_prefix: &str, d: &lsp_types::Diagnostic) -> String 
         Some(DiagnosticSeverity::INFORMATION) => "info",
         _ => "hint",
     };
-    let line = d.range.start.line + 1;
-    let col = d.range.start.character + 1;
+    let line = d.range.start.line.saturating_add(1);
+    let col = d.range.start.character.saturating_add(1);
     let message = d.message.lines().next().unwrap_or_default();
     let message = message.chars().take(200).collect::<String>();
     let where_ = if location_prefix.is_empty() {
@@ -1395,6 +1395,20 @@ mod retry_tests {
         assert_eq!(capped.retry_after.duration_since(now), SERVER_RETRY_MAX);
         assert!(capped.cooling_down(now));
         assert!(!capped.cooling_down(capped.retry_after));
+    }
+
+    #[test]
+    fn diagnostic_formatting_saturates_peer_positions() {
+        let position = lsp_types::Position::new(u32::MAX, u32::MAX);
+        let diagnostic = lsp_types::Diagnostic::new_simple(
+            lsp_types::Range::new(position, position),
+            "bounded".into(),
+        );
+
+        assert_eq!(
+            format_diag_line("file.rs", &diagnostic),
+            format!("\n  file.rs:{}:{} hint: bounded", u32::MAX, u32::MAX)
+        );
     }
 }
 

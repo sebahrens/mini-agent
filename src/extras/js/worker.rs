@@ -25,7 +25,7 @@ use super::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, DenialReason, Diagnostic,
     DiagnosticClass, DiagnosticStage, DirectoryEntry, DirectoryEntryKind, EffectErrorCode,
     EffectOperation, EffectRequest, EffectResponse, EffectResult, GrepMatch, GrepOptions,
-    JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES, MAX_CONSOLE_RECORD_BYTES,
+    JsDiagnosticHint, JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES, MAX_CONSOLE_RECORD_BYTES,
     MAX_CONSOLE_RECORDS, MAX_RESULT_BYTES, ModelEffectProfile, ParentFrame, ParentWireFrame,
     ProtocolError, ProtocolFault, ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole,
     StepOutcome, StepResult, VERIFICATION_LOADER_VERSION, VerificationCaseResult,
@@ -41,9 +41,13 @@ use super::protocol::{
     SkillCallResponse, SkillInvocationGrant,
 };
 use super::session::{SCRATCH_KEY_MAX_BYTES, SCRATCH_VALUE_MAX_BYTES, STRUCTURED_RESULT_MAX_BYTES};
+#[cfg(feature = "sandbox")]
+use super::types::FETCH_URL_MAX_BYTES;
 use super::types::{
-    DISCOVERY_PATTERN_MAX_BYTES, READ_FILE_MAX_BYTES, READ_FILES_MAX_PATH_BYTES,
-    READ_FILES_MAX_PATHS, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
+    DISCOVERY_PATTERN_MAX_BYTES, EFFECT_PATH_MAX_BYTES, READ_FILES_MAX_PATH_BYTES,
+    READ_FILES_MAX_PATHS, READ_LINES_MAX_COUNT, READ_LINES_MAX_SCAN_BYTES,
+    SPAWN_ARGUMENT_MAX_COUNT, SPAWN_ARGUMENTS_MAX_BYTES, STACK_LIMIT, STEP_TIMEOUT,
+    WRITE_FILE_MAX_BYTES,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::capability::{InvocationAuthorization, InvocationCapabilityRuntime};
@@ -58,11 +62,6 @@ const EXIT_FAILURE: i32 = 1;
 const MAX_PENDING_JOBS: usize = 10_000;
 const MAX_VERIFICATION_CASES: usize = 4_096;
 const MAX_VERIFICATION_CASE_ID_BYTES: usize = 128;
-const EFFECT_PATH_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
-const SPAWN_ARGUMENT_MAX_COUNT: usize = 4_096;
-const SPAWN_ARGUMENTS_MAX_BYTES: usize = 1024 * 1024;
-#[cfg(feature = "sandbox")]
-const FETCH_URL_MAX_BYTES: usize = 64 * 1024;
 #[cfg(feature = "sandbox")]
 const FETCH_REQUEST_HEADER_MAX_COUNT: usize = 64;
 #[cfg(feature = "sandbox")]
@@ -310,6 +309,40 @@ impl<'js> IntoJs<'js> for WorkerGrepMatch {
     }
 }
 
+struct WorkerReadLinesResult {
+    lines: Vec<String>,
+    eof: bool,
+}
+
+impl<'js> IntoJs<'js> for WorkerReadLinesResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set("lines", self.lines)?;
+        object.set("eof", self.eof)?;
+        Ok(object.into())
+    }
+}
+
+/// `from` is a 1-based line number, or negative for "the last -from lines"; `count` defaults to
+/// the maximum and is required to be a positive integer otherwise.
+fn parse_read_lines_range(from: f64, count: Option<f64>) -> Result<(i64, u32), EffectErrorCode> {
+    let whole = |value: f64| value.is_finite() && value.fract() == 0.0 && value.abs() < 9.0e15;
+    if !whole(from) || from == 0.0 {
+        return Err(EffectErrorCode::InvalidTarget);
+    }
+    let count = match count {
+        None => READ_LINES_MAX_COUNT,
+        Some(count) if whole(count) && count >= 1.0 => {
+            if count > f64::from(READ_LINES_MAX_COUNT) {
+                return Err(EffectErrorCode::TooLarge);
+            }
+            count as u32
+        }
+        Some(_) => return Err(EffectErrorCode::InvalidTarget),
+    };
+    Ok((from as i64, count))
+}
+
 struct WorkerGrepResult {
     matches: Vec<GrepMatch>,
     truncated: bool,
@@ -330,6 +363,9 @@ impl<'js> IntoJs<'js> for WorkerGrepResult {
     }
 }
 
+/// Pure (effect-free) helpers: `splitLines(text)` and `json_exact(text)`; see `pure_helpers.js`.
+const PURE_HELPERS_JS: &str = include_str!("pure_helpers.js");
+
 fn install_model_effect_globals(
     context: &Context,
     effects: ModelEffectDispatcher,
@@ -349,6 +385,14 @@ fn install_model_effect_globals(
         })?;
         let read_many_effects = effects.clone();
         let read_files = Function::new(ctx.clone(), move |ctx: Ctx<'_>, paths: Vec<String>| {
+            if paths.len() > READ_FILES_MAX_PATHS {
+                return Err(effect_error_detail(
+                    &ctx,
+                    "read_files",
+                    EffectErrorCode::TooLarge,
+                    Some("limit 256 paths per call; split into batches of 256"),
+                ));
+            }
             validate_read_files_paths(&paths)
                 .map_err(|code| effect_error(&ctx, "read_files", code))?;
             super::memory::ensure_healthy(&ctx)?;
@@ -358,6 +402,25 @@ fn install_model_effect_globals(
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
+        let read_lines_effects = effects.clone();
+        let read_lines = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, path: String, from: f64, count: Opt<f64>| {
+                validate_path(&path).map_err(|code| effect_error(&ctx, "read_lines", code))?;
+                let (from, count) = parse_read_lines_range(from, count.0)
+                    .map_err(|code| effect_error(&ctx, "read_lines", code))?;
+                super::memory::ensure_healthy(&ctx)?;
+                match read_lines_effects(EffectOperation::ReadLines { path, from, count }) {
+                    EffectResult::ReadLines { lines, eof } => {
+                        Ok(WorkerReadLinesResult { lines, eof })
+                    }
+                    EffectResult::Error(error) => {
+                        Err(effect_error_from(&ctx, "read_lines", &error))
+                    }
+                    _ => Err(rquickjs::Error::Unknown),
+                }
+            },
+        )?;
         let list_effects = effects.clone();
         let list_dir = Function::new(ctx.clone(), move |ctx: Ctx<'_>, path: Opt<String>| {
             let path = path.0.unwrap_or_else(|| ".".to_string());
@@ -456,6 +519,9 @@ fn install_model_effect_globals(
             )?
         };
         ctx.globals().set("read_file", read_file)?;
+        ctx.eval::<(), _>(PURE_HELPERS_JS)?;
+        super::pack::install(&ctx)?;
+        ctx.globals().set("read_lines", read_lines)?;
         ctx.globals().set("list_dir", list_dir)?;
         ctx.globals().set("grep", grep)?;
         if profile == ModelEffectProfile::Full {
@@ -831,21 +897,62 @@ fn fetch_options_error(message: impl Into<String>) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("fetch options", "fetch", message.into())
 }
 
-fn effect_error_from(
+pub(super) fn effect_error_from(
     ctx: &Ctx<'_>,
-    tool: &'static str,
+    tool: &str,
     error: &super::protocol::EffectError,
 ) -> rquickjs::Error {
+    let (message, code) = effect_error_text(tool, error);
+    throw_effect_exception(ctx, &message, code)
+}
+
+/// The exact message and closed `code` a direct effect global throws for `error`.
+/// Skill boundaries reuse it so a denial reads the same wherever it surfaces.
+pub(super) fn effect_error_text(
+    tool: &str,
+    error: &super::protocol::EffectError,
+) -> (String, &'static str) {
     let detail = match error.reason {
         Some(DenialReason::NoConfiguredRoots) if tool == "write_file" => {
             Some("no js-write-roots configured")
         }
         Some(DenialReason::NoConfiguredRoots) => Some("no js-read-roots configured"),
-        Some(DenialReason::OutsideRoots) => Some("outside configured roots"),
+        Some(DenialReason::OutsideRoots) if tool == "write_file" => {
+            Some("outside configured roots; path is outside the allowed write roots")
+        }
+        Some(DenialReason::OutsideRoots) => {
+            Some("outside configured roots; path is outside the allowed read roots")
+        }
         Some(DenialReason::PermissionDenied) => Some("permission denied"),
         None => None,
     };
-    effect_error_detail(ctx, tool, error.code, detail)
+    effect_error_message(tool, error.code, detail)
+}
+
+/// Model-facing remedy for a known effect failure: names the limit or the alternative to try.
+/// Static text only; never derived from the script, its paths or file contents.
+fn effect_hint(tool: &str, code: &str) -> Option<String> {
+    let fixed = |text: &str| Some(text.to_owned());
+    match (tool, code) {
+        ("read_file", "too_large") => {
+            fixed("limit 1 MiB; use read_lines(path, from, count) or grep() for large files")
+        }
+        ("read_lines", "too_large") => Some(format!(
+            "count max {READ_LINES_MAX_COUNT}, scan max {} MiB per call; read a smaller from/count range or use grep()",
+            READ_LINES_MAX_SCAN_BYTES / (1024 * 1024)
+        )),
+        ("read_files", "too_large") => fixed(
+            "limits: 256 paths, 1 MiB per file, 6 MiB total; read fewer files per call or use grep()",
+        ),
+        ("write_file", "too_large") => fixed("limit 1 MiB per write"),
+        ("grep", "invalid_target" | "not_found") => {
+            fixed("path must be an existing directory or regular file; use include to filter files")
+        }
+        ("glob" | "list_dir", "invalid_target" | "not_found") => {
+            fixed("path must be a directory; use include for files, or read_file")
+        }
+        _ => None,
+    }
 }
 
 fn effect_error(ctx: &Ctx<'_>, tool: &'static str, code: EffectErrorCode) -> rquickjs::Error {
@@ -856,8 +963,17 @@ fn effect_error_detail(
     ctx: &Ctx<'_>,
     tool: &'static str,
     code: EffectErrorCode,
-    detail: Option<&'static str>,
+    detail: Option<&str>,
 ) -> rquickjs::Error {
+    let (message, code) = effect_error_message(tool, code, detail);
+    throw_effect_exception(ctx, &message, code)
+}
+
+fn effect_error_message(
+    tool: &str,
+    code: EffectErrorCode,
+    detail: Option<&str>,
+) -> (String, &'static str) {
     let code = match code {
         EffectErrorCode::Denied => "denied",
         EffectErrorCode::CapabilityDenied => "capability_denied",
@@ -871,11 +987,17 @@ fn effect_error_detail(
         EffectErrorCode::AuditFailure => "audit_failure",
         EffectErrorCode::OutcomeUnknown => "outcome_unknown",
     };
-    let message = match detail {
-        Some(detail) => format!("js/{tool}: {code} ({detail})"),
-        None => format!("{tool}: {code}"),
+    let hint = effect_hint(tool, code);
+    let message = match (detail, hint) {
+        (Some(detail), _) => format!("js/{tool}: {code} ({detail})"),
+        (None, Some(hint)) => format!("{tool}: {code} ({hint})"),
+        (None, None) => format!("{tool}: {code}"),
     };
-    let Ok(exception) = Exception::from_message(ctx.clone(), &message) else {
+    (message, code)
+}
+
+fn throw_effect_exception(ctx: &Ctx<'_>, message: &str, code: &'static str) -> rquickjs::Error {
+    let Ok(exception) = Exception::from_message(ctx.clone(), message) else {
         return rquickjs::Error::Unknown;
     };
     if exception.as_object().prop("code", code).is_err() {
@@ -1081,7 +1203,7 @@ mod effect_error_tests {
             (
                 DenialReason::OutsideRoots,
                 "read_file",
-                "js/read_file: denied (outside configured roots)",
+                "js/read_file: denied (outside configured roots; path is outside the allowed read roots)",
             ),
         ] {
             let runtime = Runtime::new().expect("create runtime");
@@ -1143,7 +1265,12 @@ mod effect_error_tests {
             assert_eq!(observed["isError"], true);
             assert_eq!(observed["ownsCode"], true);
             assert_eq!(observed["name"], "Error");
-            assert_eq!(observed["message"], format!("read_file: {expected}"));
+            let hint = if expected == "too_large" {
+                " (limit 1 MiB; use read_lines(path, from, count) or grep() for large files)"
+            } else {
+                ""
+            };
+            assert_eq!(observed["message"], format!("read_file: {expected}{hint}"));
             assert_eq!(observed["code"], expected);
         }
     }
@@ -1305,6 +1432,8 @@ const EXCEPTION_INSPECTOR_SOURCE: &str = r#"
     const internalPrototype = InternalError.prototype;
     const modelMarker = "mini-agent-model.js:";
     const maxStackCharacters = 16384;
+    const maxMessageCharacters = 1024;
+    const slice = uncurryThis(String.prototype.slice);
 
     function ownData(object, key) {
         const descriptor = getOwnPropertyDescriptor(object, key);
@@ -1359,7 +1488,7 @@ const EXCEPTION_INSPECTOR_SOURCE: &str = r#"
 
     return value => {
         // Error.isError is an engine class check and does not run Proxy traps or user getters.
-        if (!isError(value)) return [5, false, 0, 0];
+        if (!isError(value)) return [5, false, 0, 0, ""];
         const prototype = getPrototypeOf(value);
         let kind = 5;
         if (prototype === syntaxPrototype) kind = 0;
@@ -1372,7 +1501,8 @@ const EXCEPTION_INSPECTOR_SOURCE: &str = r#"
         const stackLimit =
             kind === 3 && message === "Maximum call stack size exceeded";
         const location = modelLocation(ownData(value, "stack"));
-        return [kind, stackLimit, location[0], location[1]];
+        const text = typeof message === "string" ? slice(message, 0, maxMessageCharacters) : "";
+        return [kind, stackLimit, location[0], location[1], text];
     };
 })()
 "#;
@@ -1695,9 +1825,9 @@ mod trusted_bootstrap_bytecode_tests {
                 assert_eq!(encoded, expected);
                 let gated: String = string_gate.call((expected,)).expect("gate string");
                 assert_eq!(gated, expected);
-                let metadata: rquickjs::prelude::List<(u8, bool, u32, u32)> =
+                let metadata: rquickjs::prelude::List<(u8, bool, u32, u32, String)> =
                     exception_inspector.call((42,)).expect("inspect primitive");
-                assert_eq!(metadata.0, (5, false, 0, 0));
+                assert_eq!(metadata.0, (5, false, 0, 0, String::new()));
                 let completion: Object = ctx.eval("({value: 42})").expect("create completion");
                 let completion_value: i32 = async_completion_value
                     .call((completion,))
@@ -1865,6 +1995,11 @@ impl ClosedFailure {
                 exception_class: Some(inspected.class),
                 line: inspected.line,
                 column: inspected.column,
+                hint: if role == ScriptRole::Model {
+                    inspected.hint
+                } else {
+                    None
+                },
             },
         }
     }
@@ -1878,15 +2013,17 @@ fn diagnostic(class: DiagnosticClass, stage: DiagnosticStage, role: ScriptRole) 
         exception_class: None,
         line: None,
         column: None,
+        hint: None,
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct InspectedException {
     class: JsExceptionClass,
     stack_limit: bool,
     line: Option<u32>,
     column: Option<u32>,
+    hint: Option<JsDiagnosticHint>,
 }
 
 struct ExceptionDiagnostics<'a> {
@@ -1901,11 +2038,12 @@ impl ExceptionDiagnostics<'_> {
             stack_limit: false,
             line: None,
             column: None,
+            hint: None,
         };
         let result = self.inspector.clone().restore(ctx).and_then(|inspector| {
-            inspector.call::<_, rquickjs::prelude::List<(u8, bool, u32, u32)>>((thrown,))
+            inspector.call::<_, rquickjs::prelude::List<(u8, bool, u32, u32, String)>>((thrown,))
         });
-        let rquickjs::prelude::List((class, stack_limit, line, column)) = match result {
+        let rquickjs::prelude::List((class, stack_limit, line, column, message)) = match result {
             Ok(result) => result,
             Err(error) => {
                 if matches!(error, Error::Exception) {
@@ -1926,12 +2064,54 @@ impl ExceptionDiagnostics<'_> {
         let location = self.model_source.and_then(|source| {
             source_position_is_valid(source, line, column).then_some((line, column))
         });
+        let location = match (class, location, self.model_source) {
+            (JsExceptionClass::SyntaxError, Some((line, column)), Some(source)) => {
+                Some((line, refine_syntax_column(source, line, column, &message)))
+            }
+            _ => location,
+        };
         InspectedException {
             class,
             stack_limit,
             line: location.map(|location| location.0),
             column: location.map(|location| location.1),
+            // Only a closed hint crosses the wire; the inspected text stays in this worker.
+            hint: if stack_limit {
+                None
+            } else {
+                JsDiagnosticHint::from_exception(class, &message)
+            },
         }
+    }
+}
+
+/// QuickJS reports the right line but always column 1 for parse errors (`let x = ;` is 1:1).
+/// For `unexpected token ... 'X'` messages, recover the column when the quoted token occurs
+/// exactly once on that line; otherwise keep the engine's value rather than guess. The result
+/// is a 1-based character column within the line, never beyond what
+/// [`source_position_is_valid`] accepts.
+fn refine_syntax_column(source: &str, line: u32, column: u32, message: &str) -> u32 {
+    if column != 1 || !message.starts_with("unexpected token") {
+        return column;
+    }
+    let Some(token) = message
+        .strip_suffix('\'')
+        .and_then(|rest| rest.rsplit_once(": '"))
+        .map(|(_, token)| token)
+        .filter(|token| !token.is_empty())
+    else {
+        return column;
+    };
+    let Some(text) = source.split('\n').nth(line.saturating_sub(1) as usize) else {
+        return column;
+    };
+    let mut hits = text.match_indices(token);
+    match (hits.next(), hits.next()) {
+        (Some((offset, _)), None) => u32::try_from(text[..offset].chars().count() + 1)
+            .ok()
+            .filter(|refined| source_position_is_valid(source, line, *refined))
+            .unwrap_or(column),
+        _ => column,
     }
 }
 
@@ -2166,6 +2346,15 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
         let message = match request.message {
             ParentFrame::RunStep(step) => {
                 #[cfg(feature = "skills")]
+                if !run_step_authority_shape_is_valid(&step) {
+                    return write_invocation_protocol_fault(
+                        &transport,
+                        &build,
+                        invocation_id.ok_or(())?,
+                        sequence,
+                    );
+                }
+                #[cfg(feature = "skills")]
                 let (step, artifacts) = {
                     let mut step = step;
                     let artifacts = match skill_cache.resolve(&mut step) {
@@ -2243,6 +2432,27 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
 }
 
 #[cfg(feature = "skills")]
+fn write_invocation_protocol_fault<R: std::io::Read, W: Write>(
+    transport: &Arc<Mutex<WorkerTransport<R, W>>>,
+    build: &BuildIdentity,
+    invocation_id: InvocationId,
+    sequence: u64,
+) -> Result<(), ()> {
+    let response = WireFrame::invocation(
+        build.clone(),
+        invocation_id,
+        sequence,
+        WorkerFrame::ProtocolFault(ProtocolFault {
+            code: ProtocolFaultCode::InvalidState,
+            stage: ProtocolStage::Invocation,
+        }),
+    );
+    let mut transport = transport.lock().map_err(|_| ())?;
+    transport.protocol.on_send(&response).map_err(|_| ())?;
+    write_terminal(&mut transport.output, &response)
+}
+
+#[cfg(feature = "skills")]
 fn write_skill_cache_failure<R: std::io::Read, W: Write>(
     transport: &Arc<Mutex<WorkerTransport<R, W>>>,
     build: &BuildIdentity,
@@ -2263,6 +2473,7 @@ fn write_skill_cache_failure<R: std::io::Read, W: Write>(
                 exception_class: None,
                 line: None,
                 column: None,
+                hint: None,
             }),
             skill_events: Vec::new(),
             evidence_complete: false,
@@ -2372,17 +2583,19 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
                     EffectErrorCode::Denied,
                 ));
             }
-            if effect_limit_reached.load(Ordering::Acquire) {
-                return backend_failure();
-            }
-            let effect_ordinal = ordinal.fetch_add(1, Ordering::AcqRel);
-            if effect_ordinal >= super::protocol::MAX_EFFECTS_PER_STEP {
-                // Quota exhaustion is an ordinary closed step result. Never emit a 257th effect
-                // frame or poison the transport: the parent remains in the Running state and can
-                // accept the terminal result with the first 256 effects durably accounted for.
+            // `result()` owns one extra slot past the quota (mini-agent-nsjvk): a script that
+            // hits the effect limit can still hand back what it gathered from its catch block.
+            let is_result = matches!(&operation, EffectOperation::Result { .. });
+            let attempted = ordinal.load(Ordering::Acquire);
+            let quota = super::protocol::MAX_EFFECTS_PER_STEP;
+            if attempted > quota || (attempted == quota && !is_result) {
+                // Quota exhaustion is an ordinary closed step result. Never emit a further
+                // effect frame or poison the transport: the parent remains in the Running state
+                // and can accept the terminal result with the first 256 effects accounted for.
                 effect_limit_reached.store(true, Ordering::Release);
                 return backend_failure();
             }
+            let effect_ordinal = ordinal.fetch_add(1, Ordering::AcqRel);
             let request = EffectRequest {
                 effect_ordinal,
                 grant_id,
@@ -2490,6 +2703,19 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
         // An accepted `result()` holds a parent receipt; the step outcome must match it exactly.
         // Effect-quota exhaustion never overrides it (the parent would reject the mismatch as a
         // protocol violation and discard the accepted value).
+        if effect_limit_reached.load(Ordering::Acquire)
+            && structured_result_accepted
+            && terminal.console.len() < MAX_CONSOLE_RECORDS
+        {
+            terminal.console.push(ConsoleRecord {
+                level: ConsoleLevel::Warn,
+                text: format!(
+                    "effect limit ({} per call) was reached; the result() you set is returned, but the script did not finish its reads",
+                    super::protocol::MAX_EFFECTS_PER_STEP
+                ),
+                truncated: false,
+            });
+        }
         if effect_limit_reached.load(Ordering::Acquire) && !structured_result_accepted {
             #[cfg(feature = "skills")]
             {
@@ -2510,6 +2736,7 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
                     exception_class: None,
                     line: None,
                     column: None,
+                    hint: None,
                 });
             }
         }
@@ -2769,9 +2996,21 @@ fn validate_skill_cached_artifacts_bounds(artifacts: &[CachedSkillArtifact]) -> 
 #[cfg(all(test, feature = "skills"))]
 mod skill_authority_bound_tests {
     use super::*;
+    use crate::extras::js::protocol::GrantId;
     use crate::extras::js::skills::{
         CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
     };
+
+    #[test]
+    fn read_only_steps_reject_proposal_authority() {
+        let grant = GrantId::new(uuid::Uuid::new_v4()).unwrap();
+        let mut request = RunStep::new("1".into()).with_proposal_grant(grant);
+        request.model_effect_profile = ModelEffectProfile::ReadOnly;
+        assert!(!run_step_authority_shape_is_valid(&request));
+
+        request.model_effect_profile = ModelEffectProfile::Full;
+        assert!(run_step_authority_shape_is_valid(&request));
+    }
 
     fn artifact(export_count: usize, capability: CapabilityManifest) -> SkillArtifact {
         SkillArtifact::new(
@@ -2867,6 +3106,24 @@ fn execute_run_step(
     terminal_requested: Arc<AtomicBool>,
     #[cfg(feature = "skills")] authorize_skill_call: WorkerSkillCallAuthorizer,
 ) -> StepResult {
+    #[cfg(feature = "skills")]
+    if !run_step_authority_shape_is_valid(&request) {
+        return StepResult {
+            outcome: StepOutcome::Error(JsErrorCode::Internal),
+            console: Vec::new(),
+            diagnostic: Some(Diagnostic {
+                class: DiagnosticClass::Internal,
+                stage: DiagnosticStage::Initialization,
+                script_role: ScriptRole::Model,
+                exception_class: None,
+                line: None,
+                column: None,
+                hint: None,
+            }),
+            skill_events: Vec::new(),
+            evidence_complete: false,
+        };
+    }
     let console = Arc::new(Mutex::new(Vec::new()));
     #[cfg(feature = "skills")]
     let event_state = Arc::new(Mutex::new(WorkerEventState::default()));
@@ -2903,6 +3160,7 @@ fn execute_run_step(
                     exception_class: None,
                     line: None,
                     column: None,
+                    hint: None,
                 }),
                 skill_events: Vec::new(),
                 evidence_complete: false,
@@ -2979,6 +3237,11 @@ fn execute_run_step(
             evidence_complete: true,
         },
     }
+}
+
+#[cfg(feature = "skills")]
+fn run_step_authority_shape_is_valid(request: &RunStep) -> bool {
+    request.model_effect_profile == ModelEffectProfile::Full || request.proposal_grant_id.is_none()
 }
 
 // These arguments are the complete per-request security context and keeping them
@@ -3077,7 +3340,9 @@ fn execute_fresh_step(
                 })?;
         }
         #[cfg(feature = "skills")]
-        if let Some(proposal_effects) = proposal_effects {
+        if model_effect_profile == ModelEffectProfile::Full
+            && let Some(proposal_effects) = proposal_effects
+        {
             install_proposal_global(&context, proposal_effects).map_err(|error| {
                 classify_error(
                     &context,
@@ -3370,7 +3635,8 @@ fn settle_and_convert(
     role: ScriptRole,
     exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<StepOutcome, ClosedFailure> {
-    let allocation_failed = runtime.allocation_failed();
+    const MAX_PROMISE_UNWRAPS: usize = 64;
+
     context.with(|ctx| {
         let mut value = value.restore(&ctx).map_err(|error| {
             classify_ctx_error(
@@ -3384,8 +3650,29 @@ fn settle_and_convert(
             )
         })?;
         let mut unwrap_async_completion = role == ScriptRole::Model;
+        let mut promise_unwraps = 0_usize;
         loop {
             if let Some(promise) = value.as_promise() {
+                if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    return Err(ClosedFailure::timeout(
+                        DiagnosticStage::ResultConversion,
+                        role,
+                    ));
+                }
+                if runtime.allocation_failed() {
+                    return Err(ClosedFailure::out_of_memory(
+                        DiagnosticStage::ResultConversion,
+                        role,
+                    ));
+                }
+                if promise_unwraps >= MAX_PROMISE_UNWRAPS {
+                    return Err(ClosedFailure::error(
+                        JsErrorCode::JobLimit,
+                        DiagnosticStage::ResultConversion,
+                        role,
+                    ));
+                }
+                promise_unwraps += 1;
                 value = match promise.state() {
                     PromiseState::Resolved => promise
                         .result::<Value>()
@@ -3399,7 +3686,7 @@ fn settle_and_convert(
                         })?,
                     PromiseState::Rejected => {
                         let rejected = promise.result::<Value>();
-                        if allocation_failed {
+                        if runtime.allocation_failed() {
                             if matches!(rejected, Some(Err(Error::Exception))) {
                                 let _ = ctx.catch();
                             }
@@ -3450,7 +3737,7 @@ fn settle_and_convert(
                     }
                     if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
                         ClosedFailure::timeout(DiagnosticStage::ResultConversion, role)
-                    } else if allocation_failed {
+                    } else if runtime.allocation_failed() {
                         ClosedFailure::out_of_memory(DiagnosticStage::ResultConversion, role)
                     } else {
                         ClosedFailure::error(
@@ -4076,7 +4363,9 @@ fn execute_verification_fake(
             .collect::<Result<Vec<_>, _>>()
             .map(|contents| EffectResult::ReadFiles { contents })
             .map_err(|_| CapabilityError::DispatchDenied),
-        EffectOperation::ListDir { .. }
+        // Skills do not get the ranged read; verification fakes only model whole-file reads.
+        EffectOperation::ReadLines { .. }
+        | EffectOperation::ListDir { .. }
         | EffectOperation::Glob { .. }
         | EffectOperation::Grep { .. } => Err(CapabilityError::DispatchDenied),
         EffectOperation::WriteFile { path, content } => fakes
@@ -4122,6 +4411,7 @@ fn verification_scope_allows(
     use super::skills::{CapabilityScope, HostCapability, HttpMethod as SkillHttpMethod};
     match operation {
         EffectOperation::ReadFile { path }
+        | EffectOperation::ReadLines { path, .. }
         | EffectOperation::ListDir { path }
         | EffectOperation::Glob { path, .. }
         | EffectOperation::Grep { path, .. } => manifest
@@ -4757,4 +5047,34 @@ fn failed_verification_with(
 #[cfg(test)]
 pub(crate) fn exit_test_worker() -> ! {
     std::process::exit(run_marked_worker())
+}
+
+#[cfg(test)]
+mod syntax_column_tests {
+    use super::refine_syntax_column;
+
+    #[test]
+    fn recovers_the_column_of_a_unique_unexpected_token() {
+        // mini-agent-4yrjs: QuickJS reports column 1 for parse errors.
+        let message = "unexpected token in expression: ';'";
+        assert_eq!(refine_syntax_column("let x = ;", 1, 1, message), 9);
+        assert_eq!(
+            refine_syntax_column(
+                "let a = 1;\nlet y = );",
+                2,
+                1,
+                "unexpected token in expression: ')'"
+            ),
+            9
+        );
+    }
+
+    #[test]
+    fn keeps_the_engine_column_when_the_token_is_ambiguous_or_unrelated() {
+        let message = "unexpected token in expression: ';'";
+        assert_eq!(refine_syntax_column("a; let x = ;", 1, 1, message), 1);
+        assert_eq!(refine_syntax_column("let x = 1", 1, 1, message), 1);
+        assert_eq!(refine_syntax_column("let x = ;", 1, 1, "expecting ';'"), 1);
+        assert_eq!(refine_syntax_column("let x = ;", 1, 4, message), 4);
+    }
 }

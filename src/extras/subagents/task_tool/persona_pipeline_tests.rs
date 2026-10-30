@@ -41,13 +41,16 @@ struct Pipeline {
 impl Pipeline {
     fn new(label: &str, glm_key: Option<&str>) -> Self {
         let root = crate::tests::OwnedTestDirectory::new(label);
+        // Canonical `MINI_AGENT_*_DIR` override names (see
+        // `paths::process_override`); the stale `ZS_*` prefix matched no
+        // override, so this test silently resolved real default path roots.
         let env = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             ("ANTHROPIC_API_KEY", Some(OsString::from("anthropic-key"))),
@@ -351,6 +354,8 @@ fn alias_persona(alias: &str) -> ResolvedSpecialization {
         required_tools: Vec::new(),
         model: Some(alias.into()),
         turn_budget: None,
+        #[cfg(feature = "mcp")]
+        mcp_servers: None,
     }
 }
 

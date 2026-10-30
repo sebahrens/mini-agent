@@ -9,7 +9,7 @@ use crate::paths::{
 #[test]
 fn portable_filename_policy_accepts_only_cross_platform_components() {
     for valid in [
-        ".zerostack",
+        ".mini-agent",
         "normal-name_1.json",
         "résumé",
         "COM0",

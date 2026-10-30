@@ -22,6 +22,9 @@ pub(crate) fn format_size(bytes: u64) -> String {
     }
 }
 
+const NOT_A_DIRECTORY_HINT: &str =
+    "Use read to view the file, or pass its parent directory as path.";
+
 pub struct ListDirTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -91,12 +94,25 @@ impl Tool for ListDirTool {
         );
         let requested = target.requested;
         let path = requested.to_string_lossy().into_owned();
+        crate::agent::tools::precheck_perm_path_deny(&self.permission, "list_dir", &path)?;
         let relative = target.bound_relative.as_deref().unwrap_or(Path::new(""));
         let bound_workspace = target.bound_relative.as_ref().and(self.workspace.as_ref());
         tracing::debug!("tool list_dir start: path={}", path);
         let (bound_directory, coaching) = if let Some(workspace) = bound_workspace {
             let logical = workspace.logical_relative_path(relative)?;
-            let directory = workspace.open_relative_directory_file(relative)?;
+            let directory = workspace
+                .open_relative_directory_file(relative)
+                .map_err(|error| {
+                    if crate::agent::tools::names_regular_file(&logical) {
+                        crate::agent::tools::not_a_directory_error(
+                            "list_dir",
+                            &logical,
+                            NOT_A_DIRECTORY_HINT,
+                        )
+                    } else {
+                        crate::agent::tools::bound_open_error(workspace, relative, error)
+                    }
+                })?;
             let bound = BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(
                 crate::agent::tools::walk_deny_filter(
                     &self.permission,
@@ -116,6 +132,13 @@ impl Tool for ListDirTool {
         } else {
             let resolved = tokio::fs::canonicalize(&requested).await?;
             let checked_metadata = crate::fs::stable_path_metadata(&resolved).await?;
+            if checked_metadata.is_file() {
+                return Err(crate::agent::tools::not_a_directory_error(
+                    "list_dir",
+                    &resolved,
+                    NOT_A_DIRECTORY_HINT,
+                ));
+            }
             // Pin the exact authorized directory before an interactive
             // permission wait can race a pathname replacement.
             let bound = BoundDirectory::open(&resolved, &checked_metadata)?.with_hidden_filter(
@@ -285,7 +308,7 @@ mod tests {
     async fn descriptor_bound_listing_ignores_an_aba_swap_during_permission_wait() {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let temp = std::env::temp_dir().join(format!(
-            "zerostack_list_dir_toctou_test_{}_{}",
+            "mini-agent_list_dir_toctou_test_{}_{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -339,6 +362,42 @@ mod tests {
             "checked"
         );
 
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    // mini-agent-10dje: naming a regular file explains the directory-only
+    // contract instead of surfacing `Not a directory (os error 20)`.
+    #[tokio::test]
+    async fn file_path_reports_a_clear_not_a_directory_error() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-agent-list-dir-file-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("notes.txt"), "notes").unwrap();
+        let absolute = temp.join("notes.txt").to_string_lossy().into_owned();
+        for (tool, path) in [
+            (
+                ListDirTool::new(None, None, None).with_workspace(&temp),
+                "notes.txt",
+            ),
+            (ListDirTool::new(None, None, None), absolute.as_str()),
+        ] {
+            let error = tool
+                .call(ListDirArgs {
+                    path: Some(path.to_string()),
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("is a file, not a directory") && error.contains("notes.txt"),
+                "{path}: {error}"
+            );
+            assert!(error.contains("Use read"), "{path}: {error}");
+            assert!(!error.contains("os error"), "{path}: {error}");
+        }
         std::fs::remove_dir_all(temp).unwrap();
     }
 }

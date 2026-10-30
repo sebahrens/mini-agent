@@ -15,12 +15,19 @@ pub const READ_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const READ_FILES_MAX_PATHS: usize = 256;
 pub const READ_FILES_MAX_PATH_BYTES: usize = 1024 * 1024; // 1 MiB aggregate request text
 pub const READ_FILES_MAX_RESULT_BYTES: usize = 6 * 1024 * 1024; // encoded JSON contents
+pub const READ_LINES_MAX_COUNT: u32 = 10_000;
+pub const READ_LINES_MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024; // bytes scanned per call
+pub const READ_LINES_MAX_LINE_BYTES: usize = 64 * 1024; // longer lines are truncated
 pub const WRITE_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const DISCOVERY_MAX_RESULTS: usize = 1_000;
 pub const DISCOVERY_MAX_VISITED_FILES: usize = 100_000;
 pub const DISCOVERY_MAX_RESULT_BYTES: usize = 256 * 1024;
 pub const DISCOVERY_PATTERN_MAX_BYTES: usize = 8 * 1024;
 pub const GREP_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub const EFFECT_PATH_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
+pub const SPAWN_ARGUMENT_MAX_COUNT: usize = 4_096;
+pub const SPAWN_ARGUMENTS_MAX_BYTES: usize = 1024 * 1024;
+pub const FETCH_URL_MAX_BYTES: usize = 64 * 1024;
 
 /// Closed failures returned by parent-side effect services.
 ///

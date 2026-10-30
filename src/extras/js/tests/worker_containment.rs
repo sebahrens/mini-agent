@@ -162,6 +162,9 @@ fn linux_worker_launcher_source_is_broker_only_and_fail_closed() {
     assert!(!source.contains("cache_dir"));
     assert!(!source.contains("fn launch_unconfined"));
     assert!(source.contains("trusted_runtime_files"));
+    assert!(source.contains("add_loader_visible_aliases"));
+    assert!(source.contains("MAX_RUNTIME_DIRECTORY_ENTRIES"));
+    assert!(source.contains("MAX_RUNTIME_FILES"));
     assert!(source.contains("SYS_close_range"));
     assert!(source.contains("is_trusted_runtime_file"));
     let runtime_validation = source
@@ -426,6 +429,55 @@ fn windows_containment_probe_child() {
 fn linux_js_worker_containment() {
     crate::sandbox::worker::run_linux_containment_probe()
         .expect("Linux JS worker containment probe must pass");
+}
+
+/// Regression for the `PR_SET_PDEATHSIG`-vs-thread race (mini-agent-hdl3i): `bwrap
+/// --die-with-parent` tracks the OS *thread* that spawned it, not the parent process. Before the
+/// fix, the production launch performed `Command::spawn()` on a transient thread that delivered
+/// the launched `WorkerProcess` and then exited; if bwrap installed its parent-death signal before
+/// that thread's ordinary exit, the kernel SIGKILLed the freshly launched worker. Routing the spawn
+/// through the process-lifetime `sandbox::spawner` thread removes that race.
+///
+/// This launches through the real production path from a transient thread that exits immediately
+/// after delivering the process, waits past the race window, and asserts the worker is still
+/// alive. It repeats so a reintroduced race shows up as an intermittent failure rather than a flake
+/// a single run might miss.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a real trusted bubblewrap backend and Linux namespace/seccomp support"]
+fn linux_js_worker_survives_transient_launch_thread_exit() {
+    use crate::sandbox::worker::{ProductionWorkerLauncher, WorkerLauncher};
+
+    for attempt in 0..20 {
+        let mut process = std::thread::Builder::new()
+            .name(format!("mini-agent-test-transient-launch-{attempt}"))
+            .spawn(|| {
+                ProductionWorkerLauncher
+                    .launch()
+                    .expect("production JS worker launch must succeed")
+            })
+            .expect("failed to start the transient launch thread")
+            .join()
+            .expect("transient launch thread panicked");
+
+        // The thread that performed the launch has already exited by the time `join()` returns.
+        // Give bwrap's own `--die-with-parent` startup, and the kernel, time to deliver a spurious
+        // PDEATHSIG if the exited launch thread were still the tracked parent.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        match process.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => panic!(
+                "attempt {attempt}: JS worker exited after its transient launch thread exited \
+                 (status={status}); PR_SET_PDEATHSIG tracked the wrong thread"
+            ),
+            Err(error) => panic!("attempt {attempt}: failed to poll JS worker liveness: {error}"),
+        }
+
+        process
+            .terminate_and_reap(std::time::Duration::from_secs(5))
+            .expect("JS worker must terminate and reap cleanly");
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -1609,6 +1609,9 @@ fn is_ignored(matchers: &IgnoreChain, path: &Path, is_directory: bool) -> bool {
     false
 }
 
+const NOT_A_DIRECTORY_HINT: &str =
+    "Pass a directory as path (for example its parent) and match the file name with pattern.";
+
 pub struct FindFilesTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -1777,12 +1780,29 @@ impl Tool for FindFilesTool {
         let target =
             crate::agent::tools::resolve_tool_target(self.workspace.as_ref(), requested_path);
         let search_path = target.requested;
+        crate::agent::tools::precheck_perm_path_deny(
+            &self.permission,
+            "find_files",
+            &search_path.to_string_lossy(),
+        )?;
         let (bound_directory, path_coaching) = if let Some(relative) =
             target.bound_relative.as_deref()
             && let Some(workspace) = &self.workspace
         {
             let logical = workspace.logical_relative_path(relative)?;
-            let directory = workspace.open_relative_directory_file(relative)?;
+            let directory = workspace
+                .open_relative_directory_file(relative)
+                .map_err(|error| {
+                    if crate::agent::tools::names_regular_file(&logical) {
+                        crate::agent::tools::not_a_directory_error(
+                            "find_files",
+                            &logical,
+                            NOT_A_DIRECTORY_HINT,
+                        )
+                    } else {
+                        crate::agent::tools::bound_open_error(workspace, relative, error)
+                    }
+                })?;
             let bound = BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(
                 crate::agent::tools::walk_deny_filter(
                     &self.permission,
@@ -1802,6 +1822,13 @@ impl Tool for FindFilesTool {
         } else {
             let traversal_root = tokio::fs::canonicalize(&search_path).await?;
             let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
+            if authorized_metadata.is_file() {
+                return Err(crate::agent::tools::not_a_directory_error(
+                    "find_files",
+                    &traversal_root,
+                    NOT_A_DIRECTORY_HINT,
+                ));
+            }
             let bound =
                 BoundDirectory::open(&traversal_root, &authorized_metadata)?.with_hidden_filter(
                     crate::agent::tools::walk_deny_filter(&self.permission, "find_files", None),
@@ -2995,6 +3022,38 @@ mod tests {
             assert!(listing.starts_with("1 files found"), "{path:?}: {listing}");
             assert!(!listing.contains("key.txt"), "{path:?}: {listing}");
             assert!(!listing.contains("plan.txt"), "{path:?}: {listing}");
+        }
+    }
+
+    // mini-agent-10dje: a regular file as `path` gets an actionable error.
+    #[tokio::test]
+    async fn file_path_reports_a_clear_not_a_directory_error() {
+        let directory = TempDir::new("file-path");
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "notes").unwrap();
+        let absolute = root.join("notes.txt").to_string_lossy().into_owned();
+        for (tool, path) in [
+            (
+                FindFilesTool::new(None, None, 10).with_workspace(&root),
+                "notes.txt",
+            ),
+            (FindFilesTool::new(None, None, 10), absolute.as_str()),
+        ] {
+            let error = tool
+                .call(FindFilesArgs {
+                    pattern: "*".to_string(),
+                    path: Some(path.to_string()),
+                    mode: Default::default(),
+                    sort: Default::default(),
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("find_files: ") && error.contains("is a file, not a directory"),
+                "{path}: {error}"
+            );
+            assert!(!error.contains("os error"), "{path}: {error}");
         }
     }
 }

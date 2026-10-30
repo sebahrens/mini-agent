@@ -26,7 +26,7 @@ fn unique_temp_path(name: &str) -> std::path::PathBuf {
         .expect("system clock should be after the Unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "zerostack-hook-subprocess-{name}-{}-{nonce}",
+        "mini-agent-hook-subprocess-{name}-{}-{nonce}",
         std::process::id()
     ))
 }
@@ -526,7 +526,7 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 #[tokio::test]
-async fn run_hook_exposes_zerostack_project_dir_env_var() {
+async fn run_hook_exposes_mini_agent_project_dir_env_var() {
     let project = std::env::temp_dir().join(format!(
         "mini-agent-hook-workspace-{}",
         uuid::Uuid::new_v4()
@@ -534,7 +534,7 @@ async fn run_hook_exposes_zerostack_project_dir_env_var() {
     std::fs::create_dir_all(&project).unwrap();
     let args = vec![
         "-c".to_string(),
-        "printf '%s\\n%s' \"$ZEROSTACK_PROJECT_DIR\" \"$PWD\"".to_string(),
+        "printf '%s\\n%s' \"$MINI_AGENT_PROJECT_DIR\" \"$PWD\"".to_string(),
     ];
     let output = run_hook(
         "sh",
@@ -561,7 +561,7 @@ async fn run_hook_exposes_zerostack_project_dir_env_var() {
 #[tokio::test]
 async fn run_hook_rejects_shell_metacharacters_without_args() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hook-subprocess-injection-{}",
+        "mini-agent-hook-subprocess-injection-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
@@ -611,7 +611,7 @@ async fn hook_subprocess_policy_sets_project_cwd_and_minimal_explicit_environmen
     env.insert("HOOK_EXPLICIT".to_string(), "visible".to_string());
     let policy = HookPolicy::new(HookTrust::Trusted, "unused", env);
     let args = shell_args(
-        "printf '%s|%s|%s|%s' \"$PWD\" \"$ZEROSTACK_PROJECT_DIR\" \"$HOOK_EXPLICIT\" \"${CARGO_MANIFEST_DIR-unset}\"",
+        "printf '%s|%s|%s|%s' \"$PWD\" \"$MINI_AGENT_PROJECT_DIR\" \"$HOOK_EXPLICIT\" \"${CARGO_MANIFEST_DIR-unset}\"",
     );
 
     let (ctx, lease) = bound_context(&project);
@@ -685,7 +685,7 @@ async fn hook_subprocess_policy_rejects_reserved_environment_override() {
     std::fs::create_dir_all(&project).unwrap();
     let mut env = BTreeMap::new();
     env.insert(
-        "zerostack_project_dir".to_string(),
+        "mini_agent_project_dir".to_string(),
         "/attacker-controlled".to_string(),
     );
     let policy = HookPolicy::new(HookTrust::Trusted, "unused", env);

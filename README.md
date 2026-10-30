@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="mini-agent" width="760">
+  <img src="assets/mini-agent-logo.png" alt="mini-agent" width="760">
 </p>
 
 # mini-agent
@@ -19,27 +19,37 @@ one-off shell commands.
 
 ## TL;DR — what users need to know
 
-mini-agent is a small, local-first Rust coding agent for the terminal. It combines the everyday
-agent features inherited from ZeroStack with a contained QuickJS runtime, so the model can use short
-JavaScript programs to coordinate work without turning JavaScript into ambient filesystem, network,
-or process authority.
+mini-agent is a small, local-first Rust coding agent for the terminal. Its defining capability is
+**code as tool**: instead of choosing one host tool call at a time, the model can write a short,
+bounded JavaScript program that parses, filters, branches, loops, and composes typed operations in a
+single action. QuickJS handles the computation while Rust authorizes every external effect and the
+OS contains the worker.
+
+With the optional `skills` build, a successful recorded JavaScript step can be distilled into an
+editable proposal, then verified, approved, activated, and retrieved for relevant work later.
+Attributable task outcomes and human feedback let operators improve the library over time through
+explicit promotion and retirement, while directly attributed faults can automatically quarantine a
+revision. The [Skill Gym](docs/agent/GYM.md) adds isolated no-library versus library episodes for
+deliberate training and evaluation; gym results never auto-author, approve, activate, or promote a
+skill.
 
 | Area | What it means for you |
 |---|---|
 | Interfaces | Use the interactive terminal UI for ongoing work, `mini-agent -p` for one-shot prompts, or `mini-agent -p --output json` for automation. ACP support lets compatible editors and clients drive the same agent. |
-| Models | OpenRouter is the default; OpenAI (including ChatGPT sign-in), Azure OpenAI, Anthropic, AWS Bedrock and Vertex AI Claude, GitHub Copilot, Gemini, Ollama, and custom providers are supported (see [PROVIDERS.md](docs/agent/PROVIDERS.md)). Model credentials remain parent-side and are not exposed to contained JavaScript workers. |
+| Models | The GenAI Shared Service is supported through custom-provider configuration, alongside OpenRouter, OpenAI, Anthropic, Gemini, Ollama, and other custom providers. OpenRouter remains the upstream default. Model credentials stay parent-side and are never exposed to contained JavaScript workers. |
 | Core workflow | The model reads and edits files, searches code, runs permission-controlled commands, uses structured local Git operations, fetches and searches the web through native permission-checked tools, and can delegate bounded work to subagents in the foreground or as background tasks. Sessions, compaction, prompts, memory, loops, MCP tools, and Git worktrees cover longer-running repository work; hooks and LSP integration are optional. |
 | JavaScript actions | The model can filter, parse, loop, branch, and combine tool results inside one bounded QuickJS program. There is no Node.js sidecar, package manager, `require()`, `import()`, or direct OS API. A fresh JavaScript runtime is created for every request. |
 | Permissions and effects | Rust owns every JavaScript external effect. Brokered file, fetch, process, and skill operations are typed, scope-narrowed, permission-checked, bounded, and audited by the parent process. Approval of one operation does not grant unrelated authority. |
 | Sandboxing | Linux, macOS, and Windows use different native containment backends behind the same JavaScript contract. Startup includes live platform checks; if mini-agent cannot prove the required boundary, the affected capability fails closed instead of silently running uncontained. |
-| Learned skills | The optional `skills` build can turn useful JavaScript into immutable, content-addressed local skills. Proposals do not activate themselves: verification, explicit human approval, activation, and promotion are separate lifecycle stages, and quarantine is automatic on directly attributed faults. |
+| Learning over time | The optional `skills` build can distil a recorded successful JavaScript step into an editable proposal and turn approved proposals into content-addressed local tools. It attributes verified outcomes and feedback to exact revisions; approval, activation, and promotion remain explicit human actions, while directly attributed faults can quarantine a revision automatically. |
+| Skill Gym | The operator-run gym exercises the real skill store and lifecycle in isolated paired episodes, comparing the same task with and without a library. It supports repeatable training and evaluation while keeping gym outcomes non-production and unable to change lifecycle state automatically. |
 | Default versus optional | Release binaries include JavaScript execution, sandboxing, MCP, ACP, subagents, worktrees, loops, memory, LSP diagnostics, lifecycle hooks, image attachments, and the other default features. Learned-skill storage is not included in release archives; install from source with `--features skills` to enable it. |
 | Data and operation | Configuration, sessions, memory, and learned skills are local. The contained JavaScript worker has no direct network access; providers, MCP services, hooks, and shell or fetch operations follow their separately visible configuration, permission, and containment policies. |
 
-The shortest mental model is: **the model decides, JavaScript coordinates, Rust authorizes and
-executes, and the OS contains**. Start with `mini-agent --setup`, then run `mini-agent`; use the
-[quick start](#quick-start) for installation and the
-[configuration guide](docs/agent/CONFIG.md) when you want to change providers, permissions,
+The shortest mental model is: **the model decides, JavaScript coordinates tools, Rust authorizes and
+executes effects, the OS contains the worker, and verified skills preserve what works**. Start with
+`mini-agent --setup`, then run `mini-agent`; use the [quick start](#quick-start) for installation and
+the [configuration guide](docs/agent/CONFIG.md) when you want to change providers, permissions,
 sandboxing, or optional integrations.
 
 ## Why ZeroStack is the right foundation
@@ -53,7 +63,8 @@ the agent shell.
 
 Just as importantly, ZeroStack already provides the everyday product around the agent loop:
 
-- OpenRouter, OpenAI, Anthropic, Gemini, Ollama, and custom providers
+- the GenAI Shared Service through custom-provider configuration, plus OpenRouter, OpenAI,
+  Anthropic, Gemini, Ollama, and other custom providers
 - a responsive terminal UI plus headless one-shot operation
 - configurable permissions and session-scoped approvals
 - saved sessions, compaction, prompts, memory, and context files
@@ -115,7 +126,7 @@ or direct network/filesystem API.
 
 ## JavaScript as the cross-platform feature
 
-Shell is not one language across operating systems. Bash, PowerShell, executable lookup, quoting,
+Shell is not one language across operating systems. Bash, Command Prompt, PowerShell, executable lookup, quoting,
 signals, path syntax, and sandbox primitives all differ. A Bash-first action design therefore makes
 one platform canonical and the others compatibility ports.
 
@@ -168,6 +179,17 @@ does not trade away the raced-edit protection used by Linux and macOS merely to 
 See [the architecture overview](ARCHITECTURE.md) and
 [brokered runtime specification](docs/specs/phase-6-brokered-js-runtime.md) for the exact threat
 model.
+
+### Getting the `js` tool used
+
+Two things decide whether the model reaches for `js` on everyday work. First, brokered JS reads are
+default-deny: set `js-read-roots = ["."]` (read-only, workspace) in `config.toml`, otherwise every
+`read_file` in a script fails with `no js-read-roots configured`. Second, the model needs routing
+guidance: a persona prompt needs a
+"Built-in tool routing" section that sends cross-file questions (per-file counts, "which X has no
+Y", cross-file references, JSON parsing) to a single `js` call and keeps single lookups on
+`read`/`grep`. Several mini-agent processes can use `js` at the same time; each takes its own
+effect-audit slot (see [platform paths](docs/specs/platform-paths.md)).
 
 ## An agent-curated library of JavaScript tools
 
@@ -252,9 +274,42 @@ record of executable know-how rather than a growing prompt full of prose recipes
 
 Completion verification now records whether real work passed and which learned revisions were
 actually invoked; operators can compare those task counts with matched no-skill baselines in
-`--learned-skill-stats`. The [Skill Gym](docs/agent/GYM.md) runs isolated paired library/no-library
-episodes for evaluation, always as non-production evidence. It does not auto-author skills,
-approve them, or bypass the human lifecycle gates.
+`--learned-skill-stats`.
+
+## Skill Gym
+
+Normal work and Gym training improve the same kind of learned JavaScript library, but they keep
+their evidence separate. After the agent solves a real task with a successful JavaScript tool call,
+an operator can turn that recorded step into an editable skill proposal:
+
+```bash
+mini-agent --distill-learned-skill <session-id> <tool-call-id>
+```
+
+The distiller either generalizes the recorded code with a configured model or emits an explicit
+scaffold for the operator to finish. It never silently activates the result: the package must still
+be reviewed, imported, verified, approved, and activated through the normal learned-skill
+lifecycle.
+
+The [Skill Gym](docs/agent/GYM.md) provides the deliberate training and evaluation loop. It runs the
+same task in isolated `none` and `library` arms, gives each episode its own worktree and local state,
+checks the result with a mechanical oracle, and writes comparable JSONL outcomes. A minimal run is:
+
+```bash
+scripts/gym/setup.sh
+scripts/gym/train.sh \
+  --tasks tasks.json \
+  --output outcomes.jsonl \
+  --binary "$PWD/.gym/bin/mini-agent" \
+  --agent-arg=--yolo
+```
+
+This lets operators iterate on a candidate library and measure whether it helps across repeatable
+tasks instead of judging it from anecdotes. Gym outcomes are always marked non-production and
+cannot author, approve, activate, or promote a skill automatically; an operator decides what to
+change and what enters the production lifecycle. The current Gym runs on Linux and macOS. See the
+[full Gym guide](docs/agent/GYM.md) for task mining, provider/model selection, permission modes,
+budgets, isolation, and result interpretation.
 
 ## Quick start
 
@@ -298,6 +353,9 @@ On x86-64 Windows, the same release publishes
 checksum, open the MSI for a per-user, no-admin install; it also attempts to
 side-load the bundled VSIX when VS Code is installed. Enterprise deployment
 can use `msiexec /i mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart`.
+See the [Windows installation guide](docs/agent/WINDOWS_INSTALL.md) for the release link, exact
+PowerShell checksum verification, VSIX-only installation, enterprise download alternatives, and
+current Marketplace status.
 
 Release binaries are not code-signed yet. The Windows MSI and `mini-agent.exe` carry no
 Authenticode signature, and the macOS binaries are neither Developer ID signed nor notarized.
@@ -317,14 +375,36 @@ Because there is no publisher certificate, AppLocker and WDAC publisher rules ca
 mini-agent by signer identity. Managed fleets that enforce application control must use file-hash
 rules for the verified MSI and `mini-agent.exe`, and refresh them on every release.
 
-Or build and install the checked-out source. Do not run `cargo install mini-agent`: crates.io
-currently assigns that name to an unrelated project.
+### Build an optimized binary from source
+
+From a source checkout, `make install` is the production-style local installation. It enables every
+optional feature, compiles with the optimized Cargo release profile, and replaces an existing
+`mini-agent` installation in Cargo's binary directory:
 
 ```bash
 git clone https://github.com/sebahrens/mini-agent.git
 cd mini-agent
-cargo install --path . --locked
+make install
 ```
+
+Cargo installs with the release profile by default, so a successful build reports
+`Finished release profile [optimized]`. The command run by `make install` is:
+
+```bash
+cargo install --locked --path . --features "hooks,lsp,skills,multimodal,pdf,advisor" --force
+```
+
+That is the default feature set plus every optional feature that builds on Linux, WSL, macOS, and
+Windows without extra native libraries. It deliberately avoids `--all-features`, which would also
+enable `skills-embed` and require a prebuilt ONNX Runtime (`ort-sys`). Override the list with
+`make install FEATURES=...`.
+
+`make install` also installs the bundled [ghagent-mcp](tools/ghagent-mcp/README.md) companion server
+(`~/.local/bin/ghagent-mcp`, override with `PREFIX=`). It is a small stdlib-only Python MCP server that
+runs outside the agent sandbox and gives a sandboxed agent two guarded GitHub operations,
+`push_branch` and `wait_for_checks` (plus an opt-in `create_release`): fast-forward-only pushes to
+non-protected branches of allowlisted repositories, and CI check-run status. It is not enabled
+automatically; register it under `[mcp_servers.ghagent]` as described in its README.
 
 Source builds also need Python 3 and the native C, curl and zlib development
 toolchain for the embedded Git runtime:
@@ -342,8 +422,10 @@ explicit prepared payload. See [Git runtime build prerequisites](docs/developmen
 and [static Linux builds](docs/development/git-runtime-musl.md). Prebuilt release
 archives already include this payload.
 
-`--locked` builds with the dependency versions in the checked-in `Cargo.lock`. Contributors use a
-separate debug build; see [CONTRIBUTING.md](CONTRIBUTING.md).
+`--locked` uses the dependency versions in the checked-in `Cargo.lock`. Do not run
+`cargo install mini-agent`: crates.io currently assigns that name to an unrelated project. The
+faster, unoptimized contributor build (which reports `Finished dev profile [unoptimized]`) is
+documented in [CONTRIBUTING.md](CONTRIBUTING.md) together with the complete contributor workflow.
 
 ### Linux prerequisites
 
@@ -393,6 +475,125 @@ subprocesses follows the sandbox policy in
 to start, while an implicit default warns. The `js` tool is always reported unavailable, since
 it has no uncontained fallback. The shell installer warns when `bwrap` is not on `PATH`.
 
+#### Tools outside the system directories (Homebrew, Cargo, `~/.local/bin`)
+
+The sandbox mounts only the system runtime directories (`/usr`, `/bin`, `/sbin`, `/lib*`, `/nix`)
+plus the workspace. CLIs installed elsewhere are invisible inside it, and the shell tool reports
+`command not found` even though `PATH` names them. `sandbox-toolchain-roots` adds read-only binds for
+such trees. Its default is:
+
+```toml
+sandbox-toolchain-roots = ["/home/linuxbrew", "~/.cargo/bin", "~/.local/bin", "~/.rustup"]
+```
+
+This covers Homebrew on Linux (for example `bd`), Cargo-installed binaries, user-local scripts,
+and the rustup toolchains that Cargo's proxies and Debian's `/usr/bin/cargo` need. Missing entries
+are skipped, mounted `bin` directories are appended to the sandbox `PATH`, and nothing is writable.
+`~/.cargo` itself is not listed because it holds `credentials.toml`. Setting the key replaces the
+default, so restate the defaults you want to keep, for example
+`sandbox-toolchain-roots = ["/home/linuxbrew", "~/.rustup", "/opt/tools"]`. Use `[]` to bind nothing
+extra. The `--sandbox-toolchain-root PATH` flag (repeatable) overrides both for one run. Run
+`mini-agent --print-config` to see the configured and effective roots under **Sandbox
+capabilities**. Entries must be absolute or start with `~/`; mini-agent refuses an entry that is `/`,
+your home directory or one of its parents, contains the workspace or application cache, or overlaps
+its private configuration, credential, or state directory. Commands that write to `~/.cargo`
+(for example `cargo build` fetching crates) still cannot write there from inside the sandbox.
+
+#### Dot folders, MCP servers, and network access
+
+Making a CLI's binary visible is only half of it: most tools also keep data in HOME dot folders,
+and the default `workspace` sandbox profile hides HOME. Three rules decide what a tool can reach.
+
+1. **Shell commands are sandboxed; MCP stdio servers are not, unless you ask.** Bash and JS
+   `spawn` run inside the general sandbox. An `[mcp_servers.NAME]` stdio entry without a
+   `sandbox = "BACKEND"` key is launched as trusted code outside it, with a cleared environment
+   plus its `env`/`inherit_env` values and the workspace as its working directory. Such a server
+   can read its own dot folders and use the network. The usual way to give the agent a tool that
+   needs HOME data or the network is therefore an MCP server rather than a shell command.
+2. **HOME dot folders are hidden from shell commands until you mount them.**
+   `sandbox-home-mounts` exposes HOME-relative dot files and folders, read-only by default or
+   writable with a trailing `:rw` (directories only). For example, to run `json2pptx` through Bash
+   as well as through its MCP server:
+
+   ```toml
+   sandbox-home-mounts = [
+     ".json2pptx:rw",               # templates and wiki
+     ".cache/json2pptx:rw",         # render cache
+     ".cache/json2pptx-render:rw",  # thumbnail renders
+     ".config/libreoffice:rw",      # soffice profile used for thumbnails
+     ".gitconfig",                  # Git identity
+     ".config/git",                 # Git ignore and attributes
+   ]
+   ```
+
+   **1.12.0 release only (Linux):** with the bundled Git runtime in use, any non-empty
+   `sandbox-home-mounts` list made every shell command fail with `sandbox profile unavailable:
+   private mask overlaps a retained Git executable`. Builds from `main` after 1.12.0 fix this;
+   the masked runtime stays hidden from contained commands. On the 1.12.0 release, leave the list
+   unset and reach HOME data through MCP servers.
+
+   Missing entries are skipped. Mounts are refused if they name, contain or lie inside a masked
+   path. Built-in masks that can never be exposed are `.ssh`, `.aws`, `.gnupg`, `.kube`,
+   `.azure`, `.config/gcloud`, `.config/gh`, and mini-agent's own configuration, credential, state
+   and data directories. That is why `.config` cannot be mounted whole and must be listed per
+   subfolder. Restart mini-agent after changing the list; `mini-agent --print-config` shows the
+   effective grants.
+3. **Shell commands never have network access.** The Linux bwrap sandbox always uses a separate
+   network namespace, and macOS Seatbelt and Windows AppContainer deny network the same way. No
+   mount changes this. A networked CLI such as `gh` therefore fails inside the sandbox for two
+   reasons: no network, and `.config/gh`, which holds its login, is masked. Use a GitHub MCP
+   server instead, as described below. The only other option is to start the session with
+   `--no-sandbox`, which turns containment off for every shell command in that session.
+
+##### GitHub access through the GitHub MCP server
+
+GitHub's official MCP server runs outside the sandbox and gives the agent repository, issue,
+pull-request and Actions tools without exposing your `gh` login to shell commands. Install it
+(Homebrew shown; release binaries are also published by GitHub):
+
+```bash
+brew install github-mcp-server
+```
+
+Add the server to `~/.config/mini-agent/config.toml`:
+
+```toml
+[mcp_servers.github]
+command = "/home/linuxbrew/.linuxbrew/bin/github-mcp-server"   # `command -v github-mcp-server`
+args = ["stdio", "--toolsets=repos,issues,pull_requests,actions"]
+inherit_env = ["HOME", "PATH", "GITHUB_PERSONAL_ACCESS_TOKEN"]
+```
+
+`--toolsets` keeps the tool list small (43 tools for these four groups); add `--read-only` to
+remove every write tool. Never put the token in `config.toml`. Export it from the environment
+mini-agent starts in; `inherit_env` passes only the listed names to the server. To reuse an
+existing `gh auth login` without copying the token anywhere, add this to `~/.bashrc` (or your
+shell's profile):
+
+```bash
+if command -v gh >/dev/null 2>&1; then
+  GITHUB_PERSONAL_ACCESS_TOKEN="$(gh auth token 2>/dev/null)" && export GITHUB_PERSONAL_ACCESS_TOKEN
+fi
+```
+
+Open a new shell, start mini-agent, and check that `mini-agent --doctor` counts the server under
+**MCP configured servers**. The server can do whatever the token's scopes allow (`gh auth status`
+lists them), so use `--read-only` or a fine-grained token when the agent should only read.
+
+##### Example: code-indexer, json2pptx and GitHub together
+
+| Tool | Configured as | Runs | Needs |
+|---|---|---|---|
+| code-indexer | `[mcp_servers.code-indexer]` (`code-indexer-server mcp`) | outside the sandbox | nothing extra; it writes its index to `.code-indexer/` in the workspace |
+| json2pptx | `[mcp_servers.json2pptx]` (`json2pptx mcp`) | outside the sandbox | nothing extra; it reads `~/.json2pptx/templates` and writes `./output` |
+| json2pptx through Bash | shell command | inside the sandbox | the `sandbox-home-mounts` entries shown above; on the 1.12.0 release use the MCP server instead (see the note above) |
+| GitHub | `[mcp_servers.github]` | outside the sandbox | `GITHUB_PERSONAL_ACCESS_TOKEN` exported, listed in `inherit_env` |
+| `gh` through Bash | shell command | inside the sandbox | not possible: no network, `.config/gh` masked |
+
+Project-level `.mini-agent/config.toml` layers need trusted-project approval before their
+`sandbox-home-mounts` take effect. They may add `sandbox-home-masks` without approval, because
+masks can only narrow access.
+
 Configure a provider interactively, then start a session:
 
 ```bash
@@ -400,7 +601,7 @@ mini-agent --setup
 mini-agent
 ```
 
-OpenRouter is the default provider and can also be configured directly:
+OpenRouter remains the upstream default and can also be configured directly:
 
 ```bash
 export OPENROUTER_API_KEY="sk-or-v1-..."
@@ -416,10 +617,64 @@ See [Getting started](docs/agent/GET_STARTED.md),
 also run the [deterministic harness evaluation](docs/agent/HARNESS_EVAL.md) for
 task-level regression coverage without a live provider.
 
+### Configuration checklist
+
+Everything below lives in the global config file (`mini-agent --print-config` prints its path;
+on Linux/WSL it is `~/.config/mini-agent/config.toml`) or in your shell environment. Scalar keys
+such as `provider` or `sandbox-home-mounts` must appear before the first `[table]` header.
+Secrets never go into the file: providers and MCP servers read them from named environment
+variables.
+
+| # | What | Required? | How |
+|---|---|---|---|
+| 1 | Model provider | yes | `mini-agent --setup`, or set `provider`/`model` and export the provider's key variable (for example `OPENROUTER_API_KEY`). See [provider configuration](docs/agent/PROVIDERS.md). |
+| 2 | Sandbox backend | Linux/WSL: yes | Install `bwrap` ([Linux prerequisites](#linux-prerequisites)). macOS and Windows use their built-in backends. |
+| 3 | Tools outside system directories | only if a CLI reports `command not found` | Add its prefix to `sandbox-toolchain-roots` ([details](#tools-outside-the-system-directories-homebrew-cargo-localbin)). |
+| 4 | MCP servers | for code-indexer, json2pptx, GitHub, etc. | One `[mcp_servers.NAME]` table per server (examples below). They run outside the sandbox. |
+| 5 | Personas | optional | Install persona files into `~/.local/share/mini-agent/agents/`. Persona files may include a `code-indexer` specialist. |
+| 6 | GitHub token | only with the GitHub server | Export `GITHUB_PERSONAL_ACCESS_TOKEN` before starting mini-agent ([details](#github-access-through-the-github-mcp-server)). |
+| 7 | HOME dot folders for shell commands | optional | `sandbox-home-mounts` ([details](#dot-folders-mcp-servers-and-network-access)). Requires a build newer than 1.12.0. |
+
+Minimal MCP entries for the code-navigation and slide tools used by the coding personas:
+
+```toml
+[mcp_servers.code-indexer]
+command = "code-indexer-server"            # absolute path if it is not on PATH
+args = ["mcp"]
+inherit_env = ["HOME", "PATH"]
+env = { RUST_LOG = "warn" }
+
+[mcp_servers.json2pptx]
+command = "json2pptx"
+args = ["mcp", "--templates-dir", "/absolute/path/to/json2pptx/templates", "--output", "./output"]
+inherit_env = ["HOME", "PATH"]
+```
+
+`code-indexer-server` indexes the directory mini-agent starts in and writes `.code-indexer/` there,
+so start mini-agent from the repository root. Add `.code-indexer/` to the repository's
+`.gitignore`. Agents load deferred MCP tools with `mcp_search`, so naming several tools in one
+query (`ci_search_symbols ci_get_impl ci_find_callers`) enables them all at once.
+
+To use the `code-indexer` specialist persona from another persona, delegate with
+`task {"agent_type": "code-indexer", ...}`. The specialist needs both the `code-indexer` MCP server
+above and a `code-indexer` persona file in
+the agents directory. Its frontmatter `mcp_servers` allowlist names exactly the `ci_*` tools it
+may call, at most 8 servers and 32 tools.
+
+After any change, restart mini-agent and check:
+
+```bash
+mini-agent --print-config   # effective config, sandbox capabilities, load warnings
+mini-agent --doctor         # provider, sandbox and "MCP configured servers" count
+```
+
+`load warnings: 0` means every key was recognised. An unknown key, for example one your build is
+too old for, is reported there and otherwise ignored.
+
 ## Feature flags
 
-The default build enables `loop`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,
-`status-signals`, `multithread`, `export`, `js`, `sandbox`, `memory`, `agent-skills`, `lsp`, `hooks`, and `multimodal`. Learned-skill storage is
+The default build enables `loop`, `goal`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,
+`status-signals`, `multithread`, `export`, `js`, `sandbox`, `memory`, `agent-skills`, `lsp`, `hooks`, `multimodal`, `bedrock`, and `vertex`. Learned-skill storage is
 opt-in because it adds SQLite and retrieval dependencies.
 
 Pre-built release archives include JavaScript execution but not learned-skill storage. To install a
@@ -440,14 +695,37 @@ cargo install --locked --git https://github.com/sebahrens/mini-agent --tag v1.10
 | `memory` | Persistent project and user memory |
 | `mcp` | MCP client transports and tool discovery |
 | `acp` | Stable Agent Client Protocol server over stdio or authenticated TCP; included by default |
+| `loop`, `goal` | Autonomous rounds and their persistent objective/completion contract; `loop` implies `goal` |
+| `git-worktree`, `subagents`, `archmd` | Isolated worktrees, delegated agents, and repository architecture context |
+| `status-signals`, `multithread`, `export` | Local status endpoints, multi-threaded Tokio execution, and session export |
 | `lsp` | Default-on automatic discovery of installed language servers; explicit `[lsp] enabled = false` disables it |
 | `hooks` | Included by default; no commands run without hook configuration |
-| `multimodal` | Default image/document message support, subject to provider capabilities |
-| `advisor`, `pdf` | Optional advisor and explicit document-attachment feature alias |
+| `multimodal` | Default image/audio/document message support, subject to provider capabilities |
+| `advisor` | Optional second-model advice |
+| `pdf` | Explicit PDF document-attachment feature sent as raw provider messages; implies `multimodal` |
 
 Full release archives use these defaults. Lite archives retain their explicit `--no-default-features` recipe. Automatic LSP discovery checks installed executables and starts each server only when an authorized file operation needs it; nothing is installed or downloaded. `/toggle` lists captured runtime availability.
 
 For the full feature graph, see [Cargo.toml](Cargo.toml).
+
+To compile and install the checked-out source with the default features plus `hooks`, `lsp`,
+`skills`, `multimodal`, `pdf`, and `advisor`, with release optimizations, run:
+
+```bash
+make install
+```
+
+`make install` deliberately keeps Cargo's default release profile for installs. The equivalent Cargo command is
+`cargo install --locked --path . --features "hooks,lsp,skills,multimodal,pdf,advisor" --force`.
+`skills-embed` is left out because `ort-sys` has no prebuilt ONNX Runtime for every host; add it
+with `make install FEATURES=hooks,lsp,skills-embed,multimodal,pdf,advisor` where it builds. When selecting features
+individually, pass them as one comma-delimited argument, for example
+`--features skills,js,sandbox,memory,mcp,acp,multimodal,pdf`; shell-separated feature names are
+interpreted as additional package names.
+
+The multithreaded runtime provisions an explicit 8 MiB stack for each Tokio worker. This keeps
+full-feature installations—including tool-enabled turns on WSL2—independent of an ambient
+`RUST_MIN_STACK` setting.
 
 ## Architecture and specifications
 
@@ -492,12 +770,11 @@ It is built from the excellent
 [ZeroStack](https://github.com/gi-dellav/zerostack) project and preserves its preference for a small,
 fast, understandable native agent.
 
-The public product name, command, and new export file names are `mini-agent`.
-Existing `zerostack` user-data directories, `.zerostack` project files, `ZS_*`
-environment variables, `ZEROSTACK_PROJECT_DIR` hook envelopes, log file names,
-and `zerostack::audit::*` targets remain compatibility identifiers. JSONL
-exports retain the `zerostack-session-jsonl` schema marker; `/import` accepts
-legacy version 1 and current version 2 records regardless of the file name.
+The public product name, command, project directory (`.mini-agent`), `MINI_AGENT_*` environment
+variables, hook project envelope (`MINI_AGENT_PROJECT_DIR`), log file names, audit targets, and new
+export file names use `mini-agent`. Unambiguous pre-rename `zerostack` user-global artifacts are
+imported through the versioned legacy migration, and `/import` still accepts the legacy
+`zerostack-session-jsonl` schema marker regardless of the file name.
 HTML exports are standalone viewing documents; use JSONL to import a transcript.
 See the [identity and package compatibility policy](docs/agent/PUBLISHING_RELEASES.md#product-identity-matrix).
 

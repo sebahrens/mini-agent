@@ -277,7 +277,7 @@ async fn azure81_wire_streaming_tools_usage_and_exclusive_auth_for_both_v1_apis(
             .unwrap();
             let debug = match &client {
                 AnyClient::OpenAI(OpenAiClient::Responses(c)) => format!("{c:?}"),
-                AnyClient::OpenAI(OpenAiClient::Completions(c)) => format!("{c:?}"),
+                AnyClient::OpenAI(OpenAiClient::Completions(c, _)) => format!("{c:?}"),
                 _ => unreachable!(),
             };
             assert!(

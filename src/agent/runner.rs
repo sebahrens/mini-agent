@@ -4344,12 +4344,23 @@ where
                                 verification
                                     .record_verification_skipped(workspace_may_have_changed);
                             }
-                            let _ = event_tx
+                            tracing::debug!(
+                                response_bytes = response.len(),
+                                interactions = completed_interactions.len(),
+                                "agent model completion ready for terminal event delivery"
+                            );
+                            if event_tx
                                 .send(AgentEvent::Done {
                                     response: CompactString::from(response.clone()),
                                     interactions: completed_interactions,
                                 })
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                tracing::error!(
+                                    "agent terminal event delivery failed because the UI receiver closed"
+                                );
+                            }
                             return;
                         }
                         if empty_response_limit_reached(&mut empty_response_count) {
@@ -5499,6 +5510,7 @@ pub(crate) async fn run_subagent<M>(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     retry_config: &RetryConfig,
     usage_ledger: SharedUsageLedger,
+    token_budget: Option<u64>,
 ) -> SubagentRunOutput
 where
     M: CompletionModel + 'static,
@@ -5512,6 +5524,7 @@ where
         event_tx,
         retry_config,
         usage_ledger,
+        token_budget,
     )
     .await
 }
@@ -5533,6 +5546,7 @@ fn tool_result_text_bytes(result: &rig::message::ToolResult) -> u64 {
 /// with `prompt` instead of starting an empty one. The returned `history` is
 /// the whole conversation, so a later tool-free turn can restate its findings.
 #[cfg(feature = "subagents")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_subagent_with_history<M>(
     agent: &Agent<M>,
     prompt: &str,
@@ -5541,6 +5555,7 @@ pub(crate) async fn run_subagent_with_history<M>(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     retry_config: &RetryConfig,
     usage_ledger: SharedUsageLedger,
+    token_budget: Option<u64>,
 ) -> SubagentRunOutput
 where
     M: CompletionModel + 'static,
@@ -5669,6 +5684,10 @@ where
             Ok(MultiTurnStreamItem::CompletionCall(call)) => {
                 turns = turns.saturating_add(1);
                 usage_ledger.record_completion(call.usage);
+                if exhausted_token_budget(usage_ledger.total(), token_budget).is_some() {
+                    append_subagent_turn_budget_partial(&mut full_response);
+                    break;
+                }
             }
             Ok(_) => {}
             Err(_) if crate::spend::run::Run::current().is_some_and(|run| run.was_refused()) => {
@@ -7012,9 +7031,9 @@ mod tests {
             .join(format!("mini-agent-live-spill-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let _environment = crate::tests::ScopedProcessEnv::set(&[
-            ("ZS_DATA_DIR", Some(root.clone().into_os_string())),
-            ("ZS_CONFIG_DIR", Some(root.clone().into_os_string())),
-            ("ZS_STATE_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_DATA_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_CONFIG_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_STATE_DIR", Some(root.clone().into_os_string())),
         ]);
 
         let mut session = crate::session::Session::new("test", "mock", 128_000, "");
@@ -7350,9 +7369,9 @@ mod tests {
         let fixture = crate::tests::OwnedTestDirectory::new("loop-spill");
         let root = fixture.path().to_path_buf();
         let environment = crate::tests::ScopedProcessEnv::set(&[
-            ("ZS_DATA_DIR", Some(root.clone().into_os_string())),
-            ("ZS_CONFIG_DIR", Some(root.clone().into_os_string())),
-            ("ZS_STATE_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_DATA_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_CONFIG_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_STATE_DIR", Some(root.clone().into_os_string())),
         ]);
         let mut session = crate::session::Session::new("test", "mock", 128_000, "");
         let mut turns = Vec::new();
@@ -7841,6 +7860,7 @@ mod tests {
             None,
             &crate::retry::RetryConfig::default(),
             super::SharedUsageLedger::default(),
+            None,
         )
         .await;
 
@@ -7908,6 +7928,7 @@ mod tests {
                 None,
                 &crate::retry::RetryConfig::default(),
                 super::SharedUsageLedger::default().with_admission(admission),
+                None,
             )
             .await;
             assert_eq!(model.requests().len(), 1);
@@ -8005,6 +8026,7 @@ mod tests {
             None,
             &crate::retry::RetryConfig::default(),
             super::SharedUsageLedger::default().with_admission(admission),
+            None,
         )
         .await;
         assert_eq!(
@@ -8092,6 +8114,7 @@ mod tests {
             None,
             &crate::retry::RetryConfig::default(),
             super::SharedUsageLedger::default().with_admission(admission),
+            None,
         )
         .await;
 
@@ -8207,6 +8230,7 @@ mod tests {
                             None,
                             &crate::retry::RetryConfig::default(),
                             super::SharedUsageLedger::default(),
+                            None,
                         ),
                     )
                     .await;
@@ -8265,11 +8289,58 @@ mod tests {
             None,
             &crate::retry::RetryConfig::default(),
             super::SharedUsageLedger::default(),
+            None,
         )
         .await;
 
         assert!(model.requests().is_empty());
         assert_eq!(run.response.unwrap(), "[partial: turn budget exhausted]");
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn subagent_cost_budget_stops_before_another_provider_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("bounded finding"),
+                MockStreamEvent::tool_call(
+                    "budgeted-call",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response(usage(40, 15, 0, 0)),
+            ],
+            vec![
+                MockStreamEvent::text("must not run"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(2)
+            .build();
+
+        let run = super::run_subagent(
+            &agent,
+            "investigate",
+            2,
+            None,
+            &crate::retry::RetryConfig::default(),
+            super::SharedUsageLedger::default(),
+            Some(50),
+        )
+        .await;
+
+        assert_eq!(model.requests().len(), 1);
+        // The completion's usage is observed before its proposed tool call is
+        // executed, so exhausting the reservation prevents both side effects
+        // and another provider turn.
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            run.response.unwrap(),
+            "bounded finding\n[partial: turn budget exhausted]"
+        );
     }
 
     #[tokio::test]
@@ -8627,79 +8698,95 @@ mod tests {
     }
 
     #[cfg(feature = "subagents")]
-    #[tokio::test]
-    async fn concurrent_agents_route_subagent_events_to_their_own_runner() {
-        async fn collect_subagent_markers(
-            mut runner: super::AgentRunner,
-        ) -> Vec<compact_str::CompactString> {
-            let mut markers = Vec::new();
-            while let Some(event) = runner.event_rx.recv().await {
-                match event {
-                    crate::event::AgentEvent::SubagentToolCall { name, .. } => markers.push(name),
-                    crate::event::AgentEvent::Done { .. }
-                    | crate::event::AgentEvent::Error { .. } => {
-                        break;
+    #[test]
+    fn concurrent_agents_route_subagent_events_to_their_own_runner() {
+        std::thread::Builder::new()
+            .name("concurrent-agent-routing-test".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build concurrent-agent routing runtime");
+                runtime.block_on(crate::startup::heap_future(|| async {
+                    async fn collect_subagent_markers(
+                        mut runner: super::AgentRunner,
+                    ) -> Vec<compact_str::CompactString> {
+                        let mut markers = Vec::new();
+                        while let Some(event) = runner.event_rx.recv().await {
+                            match event {
+                                crate::event::AgentEvent::SubagentToolCall { name, .. } => {
+                                    markers.push(name)
+                                }
+                                crate::event::AgentEvent::Done { .. }
+                                | crate::event::AgentEvent::Error { .. } => {
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        markers
                     }
-                    _ => {}
-                }
-            }
-            markers
-        }
 
-        fn probe_agent(
-            marker: &'static str,
-            barrier: Arc<tokio::sync::Barrier>,
-        ) -> rig::agent::Agent<MockCompletionModel> {
-            let model = MockCompletionModel::from_stream_turns(vec![vec![
-                MockStreamEvent::tool_call(
-                    format!("{marker}-call"),
-                    RoutingProbeTool::NAME,
-                    serde_json::json!({}),
-                ),
-                MockStreamEvent::final_response_with_default_usage(),
-            ]]);
-            AgentBuilder::new(model)
-                .tool(RoutingProbeTool { marker, barrier })
-                .default_max_turns(2)
-                .build()
-        }
+                    fn probe_agent(
+                        marker: &'static str,
+                        barrier: Arc<tokio::sync::Barrier>,
+                    ) -> rig::agent::Agent<MockCompletionModel> {
+                        let model = MockCompletionModel::from_stream_turns(vec![vec![
+                            MockStreamEvent::tool_call(
+                                format!("{marker}-call"),
+                                RoutingProbeTool::NAME,
+                                serde_json::json!({}),
+                            ),
+                            MockStreamEvent::final_response_with_default_usage(),
+                        ]]);
+                        AgentBuilder::new(model)
+                            .tool(RoutingProbeTool { marker, barrier })
+                            .default_max_turns(2)
+                            .build()
+                    }
 
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let runner_one = super::spawn_agent(
-            probe_agent("runner-one", barrier.clone()),
-            "start one".to_string(),
-            Vec::new(),
-            crate::retry::RetryConfig::default(),
-            None,
-            #[cfg(feature = "skills")]
-            None,
-            #[cfg(feature = "hooks")]
-            None,
-        );
-        let runner_two = super::spawn_agent(
-            probe_agent("runner-two", barrier),
-            "start two".to_string(),
-            Vec::new(),
-            crate::retry::RetryConfig::default(),
-            None,
-            #[cfg(feature = "skills")]
-            None,
-            #[cfg(feature = "hooks")]
-            None,
-        );
+                    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+                    let runner_one = super::spawn_agent(
+                        probe_agent("runner-one", barrier.clone()),
+                        "start one".to_string(),
+                        Vec::new(),
+                        crate::retry::RetryConfig::default(),
+                        None,
+                        #[cfg(feature = "skills")]
+                        None,
+                        #[cfg(feature = "hooks")]
+                        None,
+                    );
+                    let runner_two = super::spawn_agent(
+                        probe_agent("runner-two", barrier),
+                        "start two".to_string(),
+                        Vec::new(),
+                        crate::retry::RetryConfig::default(),
+                        None,
+                        #[cfg(feature = "skills")]
+                        None,
+                        #[cfg(feature = "hooks")]
+                        None,
+                    );
 
-        let (markers_one, markers_two) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                tokio::join!(
-                    collect_subagent_markers(runner_one),
-                    collect_subagent_markers(runner_two)
-                )
+                    let (markers_one, markers_two) =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                            tokio::join!(
+                                collect_subagent_markers(runner_one),
+                                collect_subagent_markers(runner_two)
+                            )
+                        })
+                        .await
+                        .expect("concurrent agent runs must complete without deadlocking");
+
+                    assert_eq!(markers_one, ["runner-one"]);
+                    assert_eq!(markers_two, ["runner-two"]);
+                }));
             })
-            .await
-            .expect("concurrent agent runs must complete without deadlocking");
-
-        assert_eq!(markers_one, ["runner-one"]);
-        assert_eq!(markers_two, ["runner-two"]);
+            .expect("spawn concurrent-agent routing test thread")
+            .join()
+            .expect("concurrent-agent routing test thread panicked");
     }
 
     #[tokio::test]

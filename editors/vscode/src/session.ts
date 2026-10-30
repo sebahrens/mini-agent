@@ -15,6 +15,7 @@ import {
   withRecentStderr,
 } from './diagnostics';
 import { log } from './log';
+import { PERSONA_CONFIG_ID, personaSelector } from './persona';
 import { SessionUpdateRouter, type PublicProtocolSession } from './protocolSession';
 
 type SessionState = 'stopped' | 'starting' | 'running' | 'stopping';
@@ -212,7 +213,7 @@ export class AgentSession {
       const response = await client.request(acp.methods.agent.session.new, { cwd: this.folder.uri.fsPath, mcpServers: [] },
         { cancellationSignal: AbortSignal.timeout(10_000) });
       requireTrustedWorkspace();
-      const session = this.updates.finish(client, response.sessionId);
+      const session = this.updates.finish(client, response.sessionId, response.configOptions ?? []);
       log.info(`ACP session created: ${session.sessionId}`);
       return session;
     } catch (error) { this.updates.reset(); throw error; }
@@ -241,10 +242,10 @@ export class AgentSession {
       this.updates.begin(selected.sessionId);
       let attached: PublicProtocolSession | undefined;
       try {
-        await client.request(acp.methods.agent.session.load, { sessionId: selected.sessionId, cwd: this.folder.uri.fsPath, mcpServers: [] },
+        const loaded = await client.request(acp.methods.agent.session.load, { sessionId: selected.sessionId, cwd: this.folder.uri.fsPath, mcpServers: [] },
           { cancellationSignal: AbortSignal.timeout(10_000) });
         requireTrustedWorkspace();
-        attached = this.updates.finish(client, selected.sessionId);
+        attached = this.updates.finish(client, selected.sessionId, loaded.configOptions ?? []);
         await this.conversation.adopt(attached);
         log.info(`ACP saved session resumed: ${selected.sessionId}`);
       } catch (error) {
@@ -253,6 +254,35 @@ export class AgentSession {
         else { await client.request(acp.methods.agent.session.close, { sessionId: selected.sessionId }, { cancellationSignal: AbortSignal.timeout(5000) }).catch(() => undefined); }
         throw error;
       }
+    });
+  }
+
+  /** Pick the persona (prompt and routed model) for the workspace conversation. */
+  async selectPersona(): Promise<void> {
+    await this.start();
+    return this.transitions.run(async () => {
+      requireTrustedWorkspace();
+      if (this.state !== 'running') { throw new Error('Mini Agent failed to start.'); }
+      if (this.conversation.isPrompting) { throw new Error('Wait for the current prompt to settle before switching persona.'); }
+      const active = await this.conversation.current();
+      const selector = personaSelector(active.configOptions?.());
+      if (!selector || !active.setConfigOption) {
+        void vscode.window.showInformationMessage('This Mini Agent session offers no persona selection.');
+        return;
+      }
+      const items = selector.choices.map(choice => ({
+        label: safeSessionLabel(choice.name),
+        description: safeSessionLabel(choice.value === selector.current ? `${choice.value} (current)` : choice.value),
+        ...(choice.description ? { detail: safeSessionLabel(choice.description) } : {}),
+        value: choice.value,
+      }));
+      const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select the Mini Agent persona for this conversation' });
+      if (!picked || picked.value === selector.current) { return; }
+      requireTrustedWorkspace();
+      if (this.conversation.isPrompting) { throw new Error('A prompt started meanwhile; the persona was not changed.'); }
+      await active.setConfigOption(PERSONA_CONFIG_ID, picked.value);
+      log.info(`ACP persona selected: ${picked.value}`);
+      void vscode.window.showInformationMessage(`Mini Agent persona: ${picked.label}. It applies from the next prompt.`);
     });
   }
 

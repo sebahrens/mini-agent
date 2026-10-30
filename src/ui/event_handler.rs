@@ -3,7 +3,6 @@ use crossterm::style::Color;
 use rig::completion::Message;
 
 use crate::cli::Cli;
-use crate::config::ResolvedShowToolDetails;
 use crate::event::AgentEvent;
 #[cfg(any(feature = "loop", feature = "goal"))]
 use crate::event::UserEvent;
@@ -153,28 +152,6 @@ fn show_tool_progress(renderer: &mut Renderer, id: &str, text: &str) -> std::io:
         renderer.render_viewport()?;
     }
     Ok(())
-}
-
-/// The `Limited(max_lines)` tool-result display. Output that sanitising would
-/// leave unchanged (the common case) is counted in place, and only the shown
-/// lines are copied, instead of copying and line-splitting a result that can
-/// run to a megabyte for a three-line preview.
-fn limited_result_summary(output: &str, max_lines: usize) -> String {
-    let sanitized;
-    let text: &str = if crate::ui::events::is_terminal_clean(output) {
-        output
-    } else {
-        sanitized = sanitize_output(output);
-        &sanitized
-    };
-    let char_count = text.chars().count();
-    let line_count = text.lines().count();
-    if line_count > max_lines {
-        let shown = text.lines().take(max_lines).collect::<Vec<_>>().join("\n");
-        format!("◈ result ({char_count} chars, {line_count} lines, showing {max_lines}):\n{shown}")
-    } else {
-        format!("◈ result ({char_count} chars):\n{text}")
-    }
 }
 
 pub async fn handle_agent_event(
@@ -361,7 +338,11 @@ pub async fn handle_agent_event(
         }
         AgentEvent::ToolProgress { id, text } => show_tool_progress(renderer, &id, &text)?,
         AgentEvent::ToolResult {
-            id, name, output, images, ..
+            id,
+            name,
+            output,
+            images,
+            is_error,
         } => {
             // The final result replaces any live output preview of this call.
             renderer.feed_mut().clear_anchor_progress(&id);
@@ -378,25 +359,12 @@ pub async fn handle_agent_event(
             } else if name == "todo_write" {
                 renderer.write_line_after(&id, &sanitize_output(&output), C_TOOL)?;
             } else {
-                let show_details = ui
-                    .cfg
-                    .show_tool_details
-                    .as_ref()
-                    .map(|s| s.resolve())
-                    .unwrap_or(ResolvedShowToolDetails::Limited(3));
-                match show_details {
-                    ResolvedShowToolDetails::Off => {}
-                    ResolvedShowToolDetails::Limited(max_lines) => {
-                        let summary = limited_result_summary(&output, max_lines);
-                        renderer.write_line_after(&id, &summary, Color::DarkGrey)?;
-                    }
-                    ResolvedShowToolDetails::Unlimited => {
-                        let sanitized = sanitize_output(&output);
-                        let char_count = sanitized.chars().count();
-                        let summary = format!("◈ result ({} chars):\n{}", char_count, sanitized);
-                        renderer.write_line_after(&id, &summary, Color::DarkGrey)?;
-                    }
-                }
+                let view = crate::ui::tool_output::tool_result_view(
+                    &output,
+                    is_error,
+                    ui.cfg.resolve_tool_output(),
+                );
+                renderer.write_tool_result(&id, &view)?;
             }
         }
         AgentEvent::ToolLoop { name, message } => {
@@ -534,6 +502,14 @@ pub async fn handle_agent_event(
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             let safe = sanitize_output(&e);
             renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
+            // A failed run is a goal round too: the gate retries it, or parks
+            // the goal after repeated failures, exactly as headless does. Left
+            // unsettled, the goal silently stopped, and the next ordinary turn
+            // adopted this collector and was judged as failed itself.
+            #[cfg(feature = "goal")]
+            if Box::pin(run_goal_round(renderer, run, ui, validation_tx)).await? {
+                return Ok(());
+            }
         }
     }
     Ok(())
@@ -630,6 +606,11 @@ async fn handle_agent_done(
     >,
 ) -> anyhow::Result<()> {
     run.was_reasoning = false;
+    tracing::debug!(
+        response_bytes = response.len(),
+        interactions = interactions.len(),
+        "TUI received terminal model completion"
+    );
 
     // Commit the provider's completed response and accounting before any
     // fallible presentation or post-processing. The App wrapper can then
@@ -644,6 +625,7 @@ async fn handle_agent_done(
     // retirement, which must run either way.
     let painted = finalize_response_segment(renderer, run);
     run.settle(std::time::Duration::from_secs(5)).await?;
+    tracing::debug!("TUI terminal event stream settled");
     crate::ui::settle_native_main_turn(
         run,
         ui.session,
@@ -709,9 +691,11 @@ async fn handle_agent_done(
         })
         && !crate::session::storage::is_session_size_error(&e)
     {
+        tracing::warn!(error = %e, "TUI terminal persistence failed");
         renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
     }
     run.is_running = false;
+    tracing::debug!("TUI terminal state returned to idle");
     if let Some(ss) = ui.status_signals.as_ref() {
         ss.send_stop();
     }
@@ -1255,8 +1239,7 @@ fn finalize_response_segment(
 mod tests {
     use super::{
         RUNNING_TICK_INTERVAL, RunningTick, STREAM_REPAINT_INTERVAL, apply_usage_delta,
-        limited_result_summary, should_auto_compact_between_turns, show_tool_progress,
-        stream_repaint_due,
+        should_auto_compact_between_turns, show_tool_progress, stream_repaint_due,
     };
     use crate::event::UsageDelta;
     use crate::session::Session;
@@ -1296,43 +1279,6 @@ mod tests {
                 "tick {tick} repainted {} of {visible} rows",
                 paint.viewport_rows
             );
-        }
-    }
-
-    #[test]
-    fn limited_result_summary_matches_the_sanitise_then_split_reference() {
-        fn reference(output: &str, max_lines: usize) -> String {
-            let sanitized = super::sanitize_output(output);
-            let char_count = sanitized.chars().count();
-            let lines: Vec<&str> = sanitized.lines().collect();
-            if lines.len() > max_lines {
-                let shown = lines[..max_lines].join("\n");
-                format!(
-                    "◈ result ({char_count} chars, {} lines, showing {max_lines}):\n{shown}",
-                    lines.len()
-                )
-            } else {
-                format!("◈ result ({char_count} chars):\n{sanitized}")
-            }
-        }
-        let big = "line of output with ünïcode\n".repeat(40_000);
-        let cases = [
-            "",
-            "one",
-            "a\nb\nc",
-            "a\nb\nc\nd\n",
-            "esc \x1b[31mred\x1b[0m\nnext\r\nthird\rfourth\tfifth\nsixth",
-            big.as_str(),
-        ];
-        for case in cases {
-            for max_lines in [0, 1, 3, 50] {
-                assert_eq!(
-                    limited_result_summary(case, max_lines),
-                    reference(case, max_lines),
-                    "case {:?} max {max_lines}",
-                    &case[..case.len().min(20)]
-                );
-            }
         }
     }
 

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -10,7 +11,7 @@ use super::settings::{HookGroup, HookHandler, HooksConfig, parse_hooks_config};
 /// Deterministic hash of a project hook binding (project root + event +
 /// matcher + handler definition). Any change to the binding, or trusting the
 /// same binding from a different project root, changes the hash, so trust
-/// never crosses project boundaries. Hook subprocesses inherit zerostack's
+/// never crosses project boundaries. Hook subprocesses inherit mini-agent's
 /// CWD, so without the root a binding trusted in one project would silently
 /// execute a same-named script in any other project.
 pub(crate) fn hash_hook_binding(
@@ -19,12 +20,71 @@ pub(crate) fn hash_hook_binding(
     matcher: Option<&str>,
     handler: &HookHandler,
 ) -> String {
-    let canonical = serde_json::to_vec(&(project_root.to_string_lossy(), event, matcher, handler))
-        .expect("serializing hook trust bindings cannot fail");
+    let file_bindings = project_file_bindings(project_root, handler);
+    let canonical = serde_json::to_vec(&(
+        project_root.to_string_lossy(),
+        event,
+        matcher,
+        handler,
+        file_bindings,
+    ))
+    .expect("serializing hook trust bindings cannot fail");
     let mut hasher = Sha256::new();
-    hasher.update(b"mini-agent-hook-binding-v2\0");
+    hasher.update(b"mini-agent-hook-binding-v3\0");
     hasher.update(canonical);
     crate::hex::encode_lower(hasher.finalize())
+}
+
+fn project_file_bindings(
+    project_root: &Path,
+    handler: &HookHandler,
+) -> Vec<(usize, String, String)> {
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let candidates = handler
+        .command
+        .iter()
+        .chain(handler.args.iter().flatten())
+        .enumerate();
+    let mut bindings = Vec::new();
+    for (index, candidate) in candidates {
+        let path = Path::new(candidate);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            canonical_root.join(path)
+        };
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if !canonical.starts_with(&canonical_root) || !canonical.is_file() {
+            continue;
+        }
+        let digest =
+            hash_project_hook_file(&canonical).unwrap_or_else(|_| "unreadable".to_string());
+        let relative = canonical
+            .strip_prefix(&canonical_root)
+            .unwrap_or(&canonical)
+            .to_string_lossy()
+            .into_owned();
+        bindings.push((index, relative, digest));
+    }
+    bindings
+}
+
+fn hash_project_hook_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(crate::hex::encode_lower(hasher.finalize()))
 }
 
 /// Trust hash that also binds the content of every workspace-resident file
@@ -97,22 +157,22 @@ fn project_settings_path(paths: &crate::paths::AppPaths) -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn managed_settings_path() -> PathBuf {
-    PathBuf::from("/etc/zerostack/managed-settings.json")
+    PathBuf::from("/etc/mini-agent/managed-settings.json")
 }
 
 #[cfg(target_os = "macos")]
 fn managed_settings_path() -> PathBuf {
-    PathBuf::from("/Library/Application Support/zerostack/managed-settings.json")
+    PathBuf::from("/Library/Application Support/mini-agent/managed-settings.json")
 }
 
 #[cfg(target_os = "windows")]
 fn managed_settings_path() -> PathBuf {
-    PathBuf::from(r"C:\ProgramData\zerostack\managed-settings.json")
+    PathBuf::from(r"C:\ProgramData\mini-agent\managed-settings.json")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn managed_settings_path() -> PathBuf {
-    PathBuf::from("/etc/zerostack/managed-settings.json")
+    PathBuf::from("/etc/mini-agent/managed-settings.json")
 }
 
 /// Prompts the user to confirm an untrusted project hook via stdin, matching

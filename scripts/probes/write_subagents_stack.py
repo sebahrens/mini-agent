@@ -108,7 +108,7 @@ thread = threading.Thread(target=serve)
 thread.start()
 env = os.environ.copy()
 env.update(HOME=str(home), MINI_AGENT_HOME=str(home), OPENAI_API_KEY='owned-local-write55', NO_PROXY='127.0.0.1', no_proxy='127.0.0.1', RUST_LOG='off')
-for key in ['ZS_CONFIG_DIR', 'ZS_DATA_DIR', 'ZS_LOCAL_DATA_DIR', 'ZS_STATE_DIR', 'ZS_CACHE_DIR', 'ZS_CREDENTIALS_DIR']:
+for key in ['MINI_AGENT_CONFIG_DIR', 'MINI_AGENT_DATA_DIR', 'MINI_AGENT_LOCAL_DATA_DIR', 'MINI_AGENT_STATE_DIR', 'MINI_AGENT_CACHE_DIR', 'MINI_AGENT_CREDENTIALS_DIR']:
     env[key] = str(home)
 for key in ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'ANTHROPIC_API_KEY', 'BASH_ENV', 'ENV']:
     env.pop(key, None)

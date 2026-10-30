@@ -234,6 +234,9 @@ pub(crate) fn pr_command(
         return Err("not a pull request proposal".into());
     };
     match dialect {
+        crate::sandbox::ShellDialect::Cmd => Err(
+            "pull request creation needs a POSIX shell or PowerShell; cmd.exe cannot quote the proposal text literally".into(),
+        ),
         crate::sandbox::ShellDialect::Posix => {
             let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
             Ok(format!(
@@ -1316,27 +1319,27 @@ pub(crate) mod test_support {
             let environment = crate::tests::ScopedProcessEnv::set(&[
                 ("PATH", Some(std::env::join_paths(path).unwrap())),
                 (
-                    "ZS_CONFIG_DIR",
+                    "MINI_AGENT_CONFIG_DIR",
                     Some(directory.path().join("config").into_os_string()),
                 ),
                 (
-                    "ZS_STATE_DIR",
+                    "MINI_AGENT_STATE_DIR",
                     Some(directory.path().join("state").into_os_string()),
                 ),
                 (
-                    "ZS_CACHE_DIR",
+                    "MINI_AGENT_CACHE_DIR",
                     Some(directory.path().join("cache").into_os_string()),
                 ),
                 (
-                    "ZS_DATA_DIR",
+                    "MINI_AGENT_DATA_DIR",
                     Some(directory.path().join("data").into_os_string()),
                 ),
                 (
-                    "ZS_LOCAL_DATA_DIR",
+                    "MINI_AGENT_LOCAL_DATA_DIR",
                     Some(directory.path().join("local-data").into_os_string()),
                 ),
                 (
-                    "ZS_CREDENTIALS_DIR",
+                    "MINI_AGENT_CREDENTIALS_DIR",
                     Some(directory.path().join("credentials").into_os_string()),
                 ),
             ]);
@@ -2321,12 +2324,12 @@ mod windows_native_pr_tests {
                 ("MINI_AGENT_TEST_GH_ROLE", Some("must-be-scrubbed".into())),
             ];
             for name in [
-                "ZS_CONFIG_DIR",
-                "ZS_DATA_DIR",
-                "ZS_LOCAL_DATA_DIR",
-                "ZS_STATE_DIR",
-                "ZS_CACHE_DIR",
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CONFIG_DIR",
+                "MINI_AGENT_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
+                "MINI_AGENT_STATE_DIR",
+                "MINI_AGENT_CACHE_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
             ] {
                 bindings.push((name, Some(directory.path().join(name).into_os_string())));
             }

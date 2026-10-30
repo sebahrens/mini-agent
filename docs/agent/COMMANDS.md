@@ -12,7 +12,15 @@ For shell flag completion outside the TUI, run `mini-agent --completions <shell>
 with `bash`, `zsh`, `fish`, or `powershell`. This exclusive local command prints the installed
 binary's completion script and exits. See [installation instructions](GET_STARTED.md#shell-completions).
 
-All slash commands are available from the TUI input prompt.
+All slash commands are available from the TUI input prompt. Commands with a
+fixed set of arguments open a second picker after the command is selected.
+Press `Tab` after an exact or partially completed command (including pasted or
+history-recalled input) to show and filter every valid choice. Commands whose
+argument is free-form print their dedicated usage when it is omitted.
+In an argument picker, `Enter` selects the highlighted value and submits the
+complete command in the same key event; `Tab` selects it without submitting so
+the command can still be edited. Typing a space after an exact free-form command
+such as `/add` closes command completion and starts ordinary argument entry.
 
 While the main agent is running, `/help` (including `/help keys`), bare `/model`,
 `/sessions`, `/sessions --all`, bare `/sandbox`, `/jobs` and `/tasks` remain available as views. Busy session
@@ -89,7 +97,7 @@ build does not know parks it.
 
 | Command | Description |
 | ------- | ----------- |
-| `/provider` | Show the current provider. |
+| `/provider` | Show the current provider and usage; press `Tab` to list providers. |
 | `/provider <name>` | Switch to a different provider. |
 | `/model` | Show the current model. From the command picker, Enter on `/model` opens the model picker: Tab switches between quick aliases and the provider's models, and the current model is marked `(current)`. |
 | `/model <alias\|id>` | Switch model: a `[quick_models]` alias first (which may also switch provider and pricing), otherwise a raw model id on the current provider. Raw ids resolve pricing from the live listing, baked catalog, then a matching quick model, as at startup. Unknown prices reset both rates to zero and show a yellow note explaining that costs are not tracked. |
@@ -141,6 +149,10 @@ built-in prompts, or create a custom `code.md` prompt).
 | `/mode planwrite` | Read-only except for the built-in, workspace-contained plan-file write exception. |
 | `/mode guarded` | Allow reads; ask for writes, edits, shell, and everything else. Config rules apply. |
 | `/mode yolo` | Allow everything; ask for destructive shell commands. Config rules apply. |
+| `/permissions` | Open the approval-mode picker. |
+| `/permissions auto` | Auto-approve workspace-safe operations; equivalent to `/mode standard`. `auto-approval` is accepted as an alias. |
+| `/permissions manual` | Ask before every operation; equivalent to `/mode restrictive`. `manual-approval` is accepted as an alias. |
+| `/permissions yolo` | Allow everything except destructive shell commands, which still ask; equivalent to `/mode yolo`. |
 | `/mode accept` | Alias for `/mode standard`, matching `default_permission_mode`. |
 | `/sandbox` | Show the current ordinary command filesystem profile and describe `workspace`, `host-read` and `host-full`. Works while the agent runs. |
 | `/sandbox <profile>` | Switch this idle session's profile and rebuild its agent, without saving config. Active turns, background tasks and commands must settle first. Profiles never widen the JS worker; see [CONFIG.md](CONFIG.md) (`sandbox-profile`). |
@@ -224,8 +236,27 @@ files are skipped with a warning containing their path and read error.
 | `/thinking` | Alias for `/reasoning`. |
 | `/steer <message>` | While a turn runs, hold one text message (up to 64 KiB) for the next settled tool batch instead of queueing it; it does not interrupt tools. A second steer stays in the draft. See [mid-turn steering](TOOL_RUNTIME.md#mid-turn-steering) and `running_input` in [CONFIG.md](CONFIG.md). |
 | `/review [msg]` | Run a one-shot code review. Activates the `review` prompt in readonly mode, submits a review message, and restores the previous prompt afterward. Without a message, auto-generates one based on session and worktree context. |
+| `/expand [n\|all]` | Unfold a folded tool result in place: the latest without an argument, the `n`th latest expandable result (`1` = latest), or every retained result with `all`. Works while the agent is running and reports only on the status line. |
+| `/collapse [n\|all]` | Fold tool results back to their one-line summary; same arguments as `/expand`. |
 | `/toggle` | Show toggleable features, runtime availability, and current-workspace learned-skill service failures or degradation with retry status. |
 | `/toggle todo [on\|off]` | Enable or disable todo-list tools. |
+
+### Tool output
+
+Tool calls stay compact in the transcript. Each call keeps its `◈ name "arg"`
+row, and its result becomes one summary row under it:
+
+| Row | Meaning |
+| --- | ------- |
+| `  ▸ 126 lines, 4963 chars` | Folded result; unfold with `Ctrl+T` (latest), `/expand [n]`, or a click on the row. |
+| `  ▾ 126 lines, 4963 chars` | Unfolded result; the full output follows. Fold it again the same way. |
+| `  ⎿ ok: 3 files` | A short one-line result shown verbatim; there is nothing to unfold. |
+| `  ✗ Error: file not found (3 lines, 80 chars)` | A failed call: its first line always stays visible, and the rest unfolds like any result. |
+
+`tool_output` in the config picks the initial form: `collapsed` (default),
+`preview` (the summary plus the first `show_tool_details` lines, default 3) or
+`full` (start unfolded). Folding never changes what the model sees or what the
+session stores.
 
 The startup banner reports JavaScript or learned-skill unavailability only after
 the containment probe has made a refusal decision. While the initial agent is
@@ -774,7 +805,7 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | -------- | ------ |
 | `Enter` | Send message. |
 | `Shift+Enter` or `Alt+Enter` | Insert newline. |
-| `Ctrl+C` | Cancel the current agent response, validation, or shell command. Typed follow-up drafts remain in the editor unless the failed prompt is restored; in that case Ctrl+Y can recover the displaced draft. Queued inputs are dropped with a count. When idle it clears a non-empty draft (Ctrl+Y brings it back) and quits on an empty input. |
+| `Ctrl+C` | Cancel the current agent response, validation, or shell command. Typed follow-up drafts remain in the editor unless the failed prompt is restored; in that case Ctrl+Y can recover the displaced draft. Queued inputs are dropped with a count. When idle it clears a non-empty draft (Ctrl+Y brings it back). The first press immediately acknowledges the interrupt and arms exit before cleanup begins; only a second consecutive `Ctrl+C` exits, with a shutdown acknowledgment. Any intervening key or paste disarms exit. |
 | `Ctrl+D` | Same interrupt behavior as `Ctrl+C` while something runs. When idle it deletes the character under the cursor in a non-empty draft and quits on an empty input. |
 | `Ctrl+Shift+C` | Copy selected text through the Unicode clipboard on Windows. |
 | `Ctrl+V` | Paste Unicode clipboard text at the cursor on Windows. |
@@ -792,6 +823,7 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `Ctrl+G` | Open the current input in the system editor (`$EDITOR`). |
 | `Ctrl+O` | Launch `lazygit` (git TUI) in the project directory. (It was `Ctrl+H`, which many terminals send for Backspace; `Ctrl+H` is now always backspace.) tmux leaves `Ctrl+O` unbound by default; zellij's default keymap claims it for its session mode, so there switch zellij to locked mode (`Ctrl+G`) first or use zellij's `unlock-first` preset, as for `Ctrl+G` and the other editing keys. |
 | `Ctrl+R` | Cycle reasoning display: collapsed → full → off → collapsed. Saves the preference globally. Click a reasoning header to expand or collapse that block. |
+| `Ctrl+T` | Fold or unfold the latest tool result in place (see Tool output above). Use `/expand n` for an older one, or click a result's summary row. |
 | `Shift+Tab` | With no picker open, cycle permission modes: standard → guarded → yolo → standard. Works while idle or running, including during an approval; the existing request remains unanswered. The status line flashes the new mode. Customize the ring with global `permission_mode_cycle`; in pickers Shift+Tab still moves the highlight. |
 | `/` | Open the command picker at the start of the input. Typing filters it, and commands that start with the typed text rank first. Tab inserts the highlighted command. Enter runs a command typed in full and otherwise inserts the highlighted one. A space after a command typed in full closes completion and types the space; for a command with an argument picker (`/model `, `/models `, `/theme `, `/mode `, ...) it opens that picker instead. Argument pickers follow the monochrome setting like every other picker. Up/Down or Shift+Tab move the highlight, Backspace on the bare slash removes it, and Escape closes the picker. Backspace on an empty argument (for example after `/theme `) deletes the space and reopens completion on the command, as does deleting back to a bare `/command` word. Compatibility aliases (`/compact`, `/exit`, `/thinking`, `/tutorial`) are not suggested, but typing one in full and pressing Enter still runs it. |
 | `@<query>` | Activate the file picker when `@` starts a word (input start, or after whitespace, a newline, `(` or a quote, including a pasted trailing `@`). When the `subagents` feature is compiled, the available specialist personas are listed first as `@agent:<name>` rows, ahead of `@mcp:` operands and files, from the same trusted persona source as the `task` tool and the `/agent` picker (refreshed when `@` or a leading `/` is typed). Each persona row is labelled `[read-only sub-agent]` (or `[write-capable sub-agent]` for a `mode: write` persona) and shows the persona's one-line description dimmed after the name; `/agent <name>` rows are labelled `main-agent persona`, since that command changes the main agent instead of starting a child. A bare `@name` that matches a persona is a file mention; on submit a dim hint says to write `@agent:name`. The description is cut to the terminal width and never wrapped; the query matches the name only, never the description; Tab or Enter inserts the highlighted path, or `@agent:<name>` followed by a space for a persona row, a space keeps the typed text and closes the picker, Ctrl+W deletes the query, and Escape closes it. On submit, `@agent:<name>` routes the request to that specialist through `task` and an unknown name is refused with the draft restored ([SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent)). |
@@ -808,6 +840,7 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | Paste | Bracketed paste and `Ctrl+V` insert at the cursor. Pasted `\r` and `\r\n` line endings become newlines, tabs become four spaces, and escape sequences and other control characters are dropped. |
 | Mouse drag | Select transcript text from the press point to the release point (partial first and last lines) and copy it on release; the result is shown briefly on the status line rather than added to the transcript. A plain click (no drag) never copies. |
 | Mouse double-click | Select and copy the word under the pointer: letters, digits and `_ - . / ~ :`, so an identifier, a path or a `file.rs:12` location is taken whole (a trailing `.` or `:` is left out). Dragging after the second press extends the selection from the word. Set `mouse_capture = false` to leave the mouse to the terminal's (or multiplexer's) native selection. |
+| Mouse click on a tool-result summary | Fold or unfold that result. A click elsewhere does nothing; a drag still selects and copies. |
 | Mouse scroll | Scroll chat history. |
 | Permission prompt | While a `[permission]` prompt waits, the mouse wheel, `Up`/`Down`, `PageUp`/`PageDown` (and the `Alt+Up/Down`, `Ctrl+Home/End`, `Alt+Shift+Up/Down`, `Alt+</>` chords, Shift/Ctrl+wheel) and `Home`/`End` scroll the transcript so the request's context can be reviewed; `y` allows once, `a` and `f` grant only the labelled session scopes, and `n` denies just this call. Native write/edit requests inside the captured workspace also offer `w`: allow writes and edits throughout that workspace for this session, including resume. This grants no read, shell, JavaScript, or MCP access, never overrides denied paths, and is unavailable for external or stale requests. Changing modes does not revoke an explicit session grant. `Esc`, `Ctrl-C`, and `Ctrl-D` deny the current request and stop its run, settling owned work and visibly discarding queued inputs. `s` also stops immediately, then accepts an optional one-line instruction: Enter puts it in the editor for review and a separate Enter sends it as the next user turn; Esc skips the note. The interrupted prompt and any displaced draft remain available through the kill ring (`Ctrl-Y`, then `Alt-Y` to cycle). Side-question answers, agent progress, session titles, diagnostics and MCP notices continue to render above the prompt before it is answered. A long path wraps (a path too long for the prompt area is shortened in the middle, keeping the file name); a multi-line command shows its first lines and a count of the rest, and its full text is in the transcript above. When the request was shortened the options end with `(e) show full request`: `e` expands the prompt to every row but one above the status line (a long path then wraps in full and a script shows as many lines as fit), and `e` again collapses it; `e` never answers the prompt. The status line stays visible while the prompt waits. Invisible Unicode characters that could make the request display differently from what runs (bidi embedding/override/isolate controls U+202A–U+202E and U+2066–U+2069, LRM/RLM/ALM, U+2028/U+2029, and the zero-width U+200B, U+2060 and U+FEFF) are shown in the prompt as a visible `<U+XXXX>` marker; elsewhere in the chat and in pickers they are removed or shown as `�`. Transcript tool-call lines show only the first line of a multi-line script, followed by `(+N lines, M chars)`. |
 
@@ -922,8 +955,8 @@ user turn, including its automatic continuations. The arguments are literal user
 expand shell variables, file includes or permission directives. A later explicit user prompt removes
 the pin. Built-in commands and custom command templates take precedence over skill names.
 
-Discovery checks explicitly imported packages first, then captured project `.zerostack/skills`,
-`.mini-agent/skills` and `.claude/skills`, then the captured user's `~/.claude/skills`. First valid name
+Discovery checks explicitly imported packages first, then captured project `.mini-agent/skills`
+and `.claude/skills`, then the captured user's `~/.claude/skills`. First valid name
 wins. Project sources use the existing project-config trust fingerprint; each original source also
 requires current read authority. An Ask or Deny source is omitted without prompting or granting.
 Links, special files, hard links and escaping resources are refused. Scripts and `allowed-tools`

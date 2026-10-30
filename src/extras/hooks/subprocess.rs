@@ -285,7 +285,7 @@ impl HookPolicy {
             if key.is_empty()
                 || key.contains('=')
                 || key.contains('\0')
-                || key.eq_ignore_ascii_case("ZEROSTACK_PROJECT_DIR")
+                || key.eq_ignore_ascii_case(crate::product::HOOK_PROJECT_DIR_ENV)
             {
                 return Err(format!("invalid or reserved environment key {key:?}"));
             }
@@ -298,7 +298,10 @@ impl HookPolicy {
         if env.values().any(|value| value.contains('\0')) {
             return Err("hook environment values cannot contain NUL".to_string());
         }
-        env.insert("ZEROSTACK_PROJECT_DIR".to_string(), project_dir.to_string());
+        env.insert(
+            crate::product::HOOK_PROJECT_DIR_ENV.to_string(),
+            project_dir.to_string(),
+        );
         Ok(env)
     }
 }
@@ -418,7 +421,7 @@ pub(crate) fn build_hook_invocation(
 /// stdout/stderr, waits up to `timeout`, and kills and reaps the whole process
 /// group on any resource or I/O failure. `async: true` handling (run in the
 /// background, ignore the decision) is the caller's responsibility.
-/// `project_dir` is exposed to the hook as `$ZEROSTACK_PROJECT_DIR`. `args`
+/// `project_dir` is exposed to the hook as `$MINI_AGENT_PROJECT_DIR`. `args`
 /// is required so the command always uses direct exec form (see
 /// [`build_hook_invocation`]).
 #[cfg(test)]
@@ -975,7 +978,7 @@ mod launch_prep_tests {
         let env = first.explicit_env.as_ref().unwrap();
         assert_eq!(env.get("HOOK_FLAG").map(String::as_str), Some("1"));
         assert_eq!(
-            env.get("ZEROSTACK_PROJECT_DIR").map(String::as_str),
+            env.get("MINI_AGENT_PROJECT_DIR").map(String::as_str),
             Some(first.project_dir.to_string_lossy().as_ref())
         );
 

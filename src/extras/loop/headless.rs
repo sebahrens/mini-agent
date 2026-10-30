@@ -202,9 +202,9 @@ mod persistence_tests {
             std::fs::create_dir(&root).unwrap();
             let root = root.canonicalize().unwrap();
             let environment = crate::tests::ScopedProcessEnv::set(&[
-                ("ZS_DATA_DIR", Some(root.clone().into_os_string())),
-                ("ZS_STATE_DIR", Some(root.clone().into_os_string())),
-                ("ZS_CONFIG_DIR", Some(root.clone().into_os_string())),
+                ("MINI_AGENT_DATA_DIR", Some(root.clone().into_os_string())),
+                ("MINI_AGENT_STATE_DIR", Some(root.clone().into_os_string())),
+                ("MINI_AGENT_CONFIG_DIR", Some(root.clone().into_os_string())),
             ]);
             Self {
                 path: root,

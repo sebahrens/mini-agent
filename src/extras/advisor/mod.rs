@@ -1192,7 +1192,7 @@ mod tests {
 
     fn client_url(client: &AnyClient) -> &str {
         match client {
-            AnyClient::OpenAI(crate::provider::OpenAiClient::Completions(client)) => {
+            AnyClient::OpenAI(crate::provider::OpenAiClient::Completions(client, _)) => {
                 client.base_url()
             }
             _ => panic!("expected an OpenAI completions gateway"),

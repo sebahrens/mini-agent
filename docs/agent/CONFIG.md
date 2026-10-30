@@ -7,26 +7,30 @@ description: "Full mini-agent configuration reference: config file locations, pr
 mini-agent reads an optional TOML, YAML, or JSON config from one canonical
 configuration root, resolved in this order:
 
-1. `ZS_CONFIG_DIR`, when set.
+1. `MINI_AGENT_CONFIG_DIR`, when set.
 2. `MINI_AGENT_HOME`, when set (one directory for every global root).
 3. `~/.mini-agent` (`%USERPROFILE%\.mini-agent` on Windows) when it exists, or
-   on a fresh install where no legacy `zerostack` root exists yet.
-4. Otherwise, for an existing legacy install, the legacy root:
-   `~/.config/zerostack` on Linux, `~/Library/Application Support/zerostack`
-   on macOS, and `%APPDATA%\zerostack` on Windows.
+   on a fresh install where no prior platform-native root exists yet.
+4. Otherwise, for an existing install, the platform-native root:
+   `~/.config/mini-agent` on Linux, `~/Library/Application Support/mini-agent`
+   on macOS, and `%APPDATA%\mini-agent` on Windows.
 
 `--print-config` shows the resolved values. Within that directory the filename
 priority is `config.toml`, `config.yaml`, `config.yml`, then `config.json`.
 If none exists, mini-agent creates `config.toml` in that same directory.
 
-`ZS_DATA_DIR` does not redirect configuration. Set both `ZS_CONFIG_DIR` and
-`ZS_DATA_DIR` when a hermetic installation needs one physical root. A config
+Canonical `MINI_AGENT_*_DIR` overrides take precedence over the prior `ZS_*_DIR`
+names, followed by `ZEROSTACK_*_DIR` compatibility aliases. Existing override-based
+installations keep their explicit roots during migration.
+
+`MINI_AGENT_DATA_DIR` does not redirect configuration. Set both `MINI_AGENT_CONFIG_DIR` and
+`MINI_AGENT_DATA_DIR` when a hermetic installation needs one physical root. A config
 left under the former data-root location is migrated before config creation.
 The source is retained for rollback.
 
 **Project layers and CLI overrides**: from the captured working directory,
 mini-agent walks upward and selects the nearest directory containing either
-`.zerostack/config.toml` or `.zerostack/config.local.toml`. It uses that one pair;
+`.mini-agent/config.toml` or `.mini-agent/config.local.toml`. It uses that one pair;
 a local-only pair is valid. The walk stops at the first `.git` marker, before
 entering an ancestor HOME or filesystem root, and after at most 64 directories.
 A malformed, linked, oversized, or unavailable nearest candidate is refused;
@@ -38,7 +42,7 @@ Precedence is global config → selected `config.toml` → selected
 `config.local.toml` → repeated `--config key=value` → existing dedicated flags.
 Tables merge by key; scalars and arrays replace. Each project file has its own
 canonical path/SHA-256 approval; approval for `config.toml` does not activate
-sensitive local values. `.zerostack/config.local.toml` is ignored by this repository.
+sensitive local values. `.mini-agent/config.local.toml` is ignored by this repository.
 Existing global-only financial/cache and permission-cycle policy stays global-only.
 
 `--config` accepts literal TOML, including dotted paths and quoted dynamic names:
@@ -72,7 +76,7 @@ embedded example is `data/config.sample.toml`.
 
 
 ```toml
-# .zerostack/config.toml
+# .mini-agent/config.toml
 model = "anthropic/claude-sonnet-4-5"
 show_reasoning = true
 
@@ -113,7 +117,7 @@ that hosted step passes; successful unrelated path or sandbox tests do not
 substitute for these readers.
 
 Trusted project specialist definitions and the append-only
-`.zerostack/agents/.notes.md` layer use this same content-and-path-bound trust
+`.mini-agent/agents/.notes.md` layer use this same content-and-path-bound trust
 decision. They remain inert in untrusted, headless, or copied checkouts even
 when their files are present.
 
@@ -123,14 +127,14 @@ overriding earlier ones for same-named files:
 **Prompts** (priority low to high):
 1. Embedded at compile time
 2. `<data-root>/prompts/` (global, user-level; `~/.mini-agent/prompts/` with the global home)
-3. `<startup-workspace>/.zerostack/prompts/` (project-level, highest priority)
+3. `<startup-workspace>/.mini-agent/prompts/` (project-level, highest priority)
 
 **Themes** (priority low to high):
 1. Embedded at compile time
 2. `<data-root>/themes/` (global, user-level; `~/.mini-agent/themes/` with the global home)
 
-`ZS_CONFIG_DIR` changes only the config root; prompts and themes continue to
-use `ZS_DATA_DIR`, the global home, or the legacy platform data root.
+`MINI_AGENT_CONFIG_DIR` changes only the config root; prompts and themes continue to
+use `MINI_AGENT_DATA_DIR`, the global home, or the platform data root.
 
 With the global home (`~/.mini-agent` or `MINI_AGENT_HOME`), every platform
 uses one directory:
@@ -147,20 +151,20 @@ the global home:
 
 | Content | Linux legacy | macOS legacy | Windows legacy |
 | --- | --- | --- | --- |
-| Config | `~/.config/zerostack` | `~/Library/Application Support/zerostack` | `%APPDATA%\zerostack` |
-| Portable data | `~/.local/share/zerostack` | `~/Library/Application Support/zerostack` | `%APPDATA%\zerostack` |
-| State, sessions, transcripts, logs | `~/.local/state/zerostack` | `~/Library/Application Support/zerostack/state` | `%LOCALAPPDATA%\zerostack\state` |
-| Cache | `~/.cache/zerostack` | `~/Library/Caches/zerostack` | `%LOCALAPPDATA%\zerostack\cache` |
-| Credentials | `<local-data>/credentials` | `<local-data>/credentials` | `%LOCALAPPDATA%\zerostack\credentials` |
+| Config | `~/.config/mini-agent` | `~/Library/Application Support/mini-agent` | `%APPDATA%\mini-agent` |
+| Portable data | `~/.local/share/mini-agent` | `~/Library/Application Support/mini-agent` | `%APPDATA%\mini-agent` |
+| State, sessions, transcripts, logs | `~/.local/state/mini-agent` | `~/Library/Application Support/mini-agent/state` | `%LOCALAPPDATA%\mini-agent\state` |
+| Cache | `~/.cache/mini-agent` | `~/Library/Caches/mini-agent` | `%LOCALAPPDATA%\mini-agent\cache` |
+| Credentials | `<local-data>/credentials` | `<local-data>/credentials` | `%LOCALAPPDATA%\mini-agent\credentials` |
 
-The corresponding overrides are `ZS_CONFIG_DIR`, `ZS_DATA_DIR`,
-`ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`, and
-`ZS_CREDENTIALS_DIR`; each one takes precedence over `MINI_AGENT_HOME` and
+The corresponding overrides are `MINI_AGENT_CONFIG_DIR`, `MINI_AGENT_DATA_DIR`,
+`MINI_AGENT_LOCAL_DATA_DIR`, `MINI_AGENT_STATE_DIR`, `MINI_AGENT_CACHE_DIR`, and
+`MINI_AGENT_CREDENTIALS_DIR`; each one takes precedence over `MINI_AGENT_HOME` and
 `~/.mini-agent` for its own root. Overrides must be absolute (a leading `~` is
 expanded). mini-agent never uses the current directory as a fallback for
 user-global state.
 
-**Adopting `~/.mini-agent` from a legacy install** is explicit; nothing is
+**Adopting `~/.mini-agent` from a platform-native install** is explicit; nothing is
 moved automatically. Create the directory (or set `MINI_AGENT_HOME`) and
 mini-agent uses it from the next start. The config, sessions, logs, chat
 history, hook trust, memory, and learned skill database are then copied (never
@@ -170,15 +174,15 @@ themes, agents, credentials, remaining state), copy the legacy trees first:
 ```sh
 # Linux
 mkdir -p ~/.mini-agent/state
-cp -a ~/.config/zerostack/. ~/.local/share/zerostack/. ~/.mini-agent/
-cp -a ~/.local/state/zerostack/. ~/.mini-agent/state/
+cp -a ~/.config/mini-agent/. ~/.local/share/mini-agent/. ~/.mini-agent/
+cp -a ~/.local/state/mini-agent/. ~/.mini-agent/state/
 # macOS
 mkdir -p ~/.mini-agent
-cp -a ~/Library/Application\ Support/zerostack/. ~/.mini-agent/
+cp -a ~/Library/Application\ Support/mini-agent/. ~/.mini-agent/
 ```
 
-On Windows, copy the contents of `%APPDATA%\zerostack` and
-`%LOCALAPPDATA%\zerostack` into `%USERPROFILE%\.mini-agent`. The cache is
+On Windows, copy the contents of `%APPDATA%\mini-agent` and
+`%LOCALAPPDATA%\mini-agent` into `%USERPROFILE%\.mini-agent`. The cache is
 rebuildable. Delete the legacy directories yourself once the new home works.
 
 The brokered JavaScript effect audit permits one active parent writer for its private state store
@@ -346,10 +350,10 @@ configured provider endpoints win endpoint environment fallbacks.
 | `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_API_KEY` | Provider API keys: `--api-key` wins for the session's own provider, then the designated provider environment variable, then `api_keys` in config. `--api-key` is never forwarded to a different provider (persona or subagent quick-models, the advisor, a `/model` or `/provider` switch, ACP turns on another provider): that provider resolves its own credential and fails closed without one. Ollama may run without a key. Isolated custom providers read only their designated `api_key_env` and their own config slot; `inherit_builtin_key = true` explicitly permits vendor credential inheritance. |
 | `ANTHROPIC_AUTH_TOKEN` | Native Anthropic bearer credential: `--api-key` and the designated API-key environment variable win; this token then wins config-file keys. It is consulted only when credential inheritance is allowed and no explicit `api_key_env` is configured. It sends `Authorization: Bearer <token>` without `x-api-key`; API-key values remain API keys regardless of their contents. Empty credentials are ignored. |
 | `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL` | Endpoint fallbacks only when no endpoint is configured in `custom_providers`. A configured endpoint wins and its credential-isolation policy remains in force. Empty/whitespace fallbacks are ignored. Anthropic accepts its root, `/v1`, or `/v1/messages` form; OpenAI compatible gateway URLs select Chat Completions unless `api_style` explicitly selects another protocol. Other providers use their normal endpoint or a configured custom endpoint. |
-| `ZS_PROVIDER`, `ZS_MODEL` | Environment-backed `--provider` and `--model`: explicit CLI wins, then these values, then config/default provider and model selection. |
-| `OPENROUTER_MODEL` | Legacy model fallback after `--model`/`ZS_MODEL`, before config; only applies when OpenRouter is the provider in effect. |
-| `MINI_AGENT_HOME` | Application home for roots without a more specific `ZS_*_DIR` override; precedes default home/platform layout discovery. |
-| `ZS_CONFIG_DIR`, `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`, `ZS_CREDENTIALS_DIR` | Override the corresponding persistence root before `MINI_AGENT_HOME` and platform defaults. `--config` selects an explicit config file; these variables still control other roots. See application paths above for artifact and no-persist policy. |
+| `MINI_AGENT_PROVIDER`, `MINI_AGENT_MODEL` | Environment-backed `--provider` and `--model`: explicit CLI wins, then these values, then config/default provider and model selection. |
+| `OPENROUTER_MODEL` | Legacy model fallback after `--model`/`MINI_AGENT_MODEL`, before config; only applies when OpenRouter is the provider in effect. |
+| `MINI_AGENT_HOME` | Application home for roots without a more specific `MINI_AGENT_*_DIR` override; precedes default home/platform layout discovery. |
+| `MINI_AGENT_CONFIG_DIR`, `MINI_AGENT_DATA_DIR`, `MINI_AGENT_LOCAL_DATA_DIR`, `MINI_AGENT_STATE_DIR`, `MINI_AGENT_CACHE_DIR`, `MINI_AGENT_CREDENTIALS_DIR` | Override the corresponding persistence root before `MINI_AGENT_HOME` and platform defaults. Legacy `ZEROSTACK_*_DIR` spellings are read only when the canonical name is unset. `--config` selects an explicit config file; these variables still control other roots. See application paths above for artifact and no-persist policy. |
 | `EXA_API_KEY`, `CONTEXT7_API_KEY`, `GREP_APP_API_KEY` | Credentials for the corresponding built-in MCP registrations when enabled; `EXA_API_KEY` also supplies native `web_search`. User-configured registrations retain their own configured headers. |
 | `GITHUB_COPILOT_API_TOKEN`, `COPILOT_GITHUB_TOKEN` | Copilot model API token or explicitly supplied GitHub bootstrap token, respectively. CLI API key wins, then these designated sources, then `api_keys.copilot`, then a saved Copilot login. No ambient GitHub CLI/Actions tokens or editor caches are read. Isolated custom providers need their own token or explicit inheritance. |
 | `COPILOT_CLIENT_ID`, `COPILOT_GITHUB_HOST`, `COPILOT_API_URL` | Your device-flow-enabled GitHub OAuth app ID (required for `/login copilot` or `--login copilot`), authorization host (`github.com` or `SUBDOMAIN.ghe.com`), and optional model API origin. A configured endpoint wins the origin fallback; GitHub-issued endpoint selection stays within the captured host's approved Copilot service origins. See [Copilot credentials](PROVIDERS.md#github-copilot-credential-ownership). |
@@ -361,6 +365,7 @@ configured provider endpoints win endpoint environment fallbacks.
 | `MINI_AGENT_ACP_TLS_CERT`, `MINI_AGENT_ACP_TLS_KEY` | ACP TCP TLS certificate/key paths, supplied together; the remote listener requires TLS unless the explicit insecure-remote override below is enabled. |
 | `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE` | Value `1` explicitly permits an insecure remote ACP TCP listener; other values retain the TLS requirement. |
 | `MINI_AGENT_ACP_TRUST_CLIENT_MCP` | Value `1` authorizes ACP client-supplied MCP registrations to launch; otherwise they are not trusted. It does not replace configured MCP policy. |
+| `MINI_AGENT_PROJECT_DIR` | Set by mini-agent for hook children to the canonical selected workspace. The key is reserved: hook `env` cannot override it in any ASCII case, and an inherited parent value is replaced. |
 
 Names designated by provider/embedding `api_key_env`, whole-string `${VAR}` custom
 provider headers, and configured MCP/LSP/hook `inherit_env` lists are also read when
@@ -382,6 +387,7 @@ win where applicable. Windows environment names are case-insensitive.
 | `USER`, `USERNAME`, `HOSTNAME`, `HOST` | User/host statusline labels; the first available name in each pair is used. |
 | `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `COLORTERM`, `NO_COLOR` | Non-credential platform/terminal inputs preserved only by the relevant subprocess allow-list; terminal libraries can also consult them. |
 | `WAYLAND_DISPLAY`, `DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | Desktop clipboard IPC inputs inherited only by the fixed image clipboard helper. Presence of `WAYLAND_DISPLAY` selects `wl-paste`; otherwise Linux uses `xclip`. These do not enable background clipboard reads. |
+| `WSL_INTEROP`, `WSL_DISTRO_NAME` | WSL detection markers (alongside a `microsoft` kernel release string) for desktop URL opening. Under WSL, browser launches use only the Windows URL dispatchers (`rundll32.exe`, then `explorer.exe`) and never fall through to Linux browser helpers. They grant no permissions and add no subprocess environment allowance. |
 | `COLORFGBG` | Optional terminal background hint for the TUI's default foreground palette. The final ANSI index selects a light or dark fallback when no explicit background or OSC 11 reply is available; invalid or oversized hints are ignored. This does not add a subprocess environment allowance. |
 | `TMPDIR`, `TMP`, `TEMP` | Platform temporary-directory inputs. Sandboxed children receive the boundary's private temporary paths. |
 | `SYSTEMROOT`, `SystemRoot`, `WINDIR`, `COMSPEC`, `SYSTEMDRIVE`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432` | Windows runtime/executable roots and explicitly permitted non-credential child environment inputs. |
@@ -403,17 +409,17 @@ so fixture names remain visible without advertising them as product configuratio
 | Private worker dispatch | `MINI_AGENT_INTERNAL_JS_WORKER`, `MINI_AGENT_INTERNAL_JS_GUARDIAN`: parent-owned broker/guardian dispatch. |
 | macOS containment fixtures | `MINI_AGENT_INTERNAL_MACOS_CONTAINMENT_PROBE`, `MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE`, `MINI_AGENT_INTERNAL_MACOS_PARENT_DEATH_CANARY`, `MINI_AGENT_CONTAINMENT_EVIDENCE`, `MINI_AGENT_MACOS_CREDENTIAL_SENTINEL`, `MINI_AGENT_MACOS_DESCRIPTOR_BOUND`, `MINI_AGENT_MACOS_GUARDIAN_PGID`, `MINI_AGENT_MACOS_ONE_TIME_IMAGE`, `MINI_AGENT_MACOS_ORIGINAL_EXECUTABLE`, `MINI_AGENT_MACOS_SKILL_SENTINEL`, `MINI_AGENT_MACOS_WORKSPACE_SENTINEL`: hosted containment evidence and canaries. |
 | Retained worker image fixture | `MINI_AGENT_SNAPSHOT86_BINARY`: installed debug executable selected by the explicitly invoked macOS retained-image regression test; test-only input, never a production worker-selection override. |
-| Windows containment fixtures | `MINI_AGENT_LPAC_CARGO_INSTALL_EXE`, `MINI_AGENT_LPAC_OMITTED_HANDLE`, `MINI_AGENT_LPAC_PROTECTED_EXE`, `MINI_AGENT_LPAC_SENTINEL`, `MINI_AGENT_WINDOWS_PROBE_NETWORK_POLICY`, `MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SOCKET_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE`, `MINI_AGENT_WINDOWS_PROBE_WORKSPACE`, `MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE`, `MINI_AGENT_TEST_PROFILE_PUBLICATION`, `ZS_TEST_PREFLIGHT_RECOVERY_ROOT`: installed-image and containment probes. |
+| Windows containment fixtures | `MINI_AGENT_LPAC_CARGO_INSTALL_EXE`, `MINI_AGENT_LPAC_OMITTED_HANDLE`, `MINI_AGENT_LPAC_PROTECTED_EXE`, `MINI_AGENT_LPAC_SENTINEL`, `MINI_AGENT_WINDOWS_PROBE_NETWORK_POLICY`, `MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SOCKET_HANDLE`, `MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE`, `MINI_AGENT_WINDOWS_PROBE_WORKSPACE`, `MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE`, `MINI_AGENT_TEST_PROFILE_PUBLICATION`, `MINI_AGENT_TEST_PARENT_WATCHDOG_EVENT`, `MINI_AGENT_TEST_PARENT_WATCHDOG_READY`, `MINI_AGENT_TEST_PREFLIGHT_RECOVERY_ROOT`: installed-image and containment probes. |
 | Worker/runner fixtures | `MINI_AGENT_LINUX_CPU_LIMIT_ARMED`, `MINI_AGENT_TEST_WORKER_PROCESS`, `MINI_AGENT_TEST_WORKER_TIMEOUT_MS`, `MINI_AGENT_TEST_WORKER_MAX_PENDING_JOBS`, `MINI_AGENT_TEST_SUPERVISOR_SCRIPT`, `MINI_AGENT_TEST_SUPERVISOR_STARTUP`, `MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES`, `MINI_AGENT_TEST_FORCED_STOP_CHILD`, `MINI_AGENT_TEST_COMPLETION_ENV`, `MINI_AGENT_TEST_REAL_SANDBOX_SKIP_CHILD`, `MINI_AGENT_REQUIRE_REAL_SANDBOX`, `MINI_AGENT_PATHLESS_KILLPG_CHILD`: test process behavior and failure injection. |
-| Skill experiments | `MINI_AGENT_GYM` disables auto-learning during Gym execution when present; `MINI_AGENT_JS_BOOTSTRAP_BENCH`, `MINI_AGENT_JS_WORKER_BENCH`, `MINI_AGENT_JS_WORKER_BENCH_COMPARE`, `MINI_AGENT_JS_WORKER_BENCH_EXE`, `MINI_AGENT_JS_WORKER_BENCH_INPUTS`, `MINI_AGENT_JS_WORKER_BENCH_OUTPUT`, `MINI_AGENT_SKILL_RELEVANCE`, `MINI_AGENT_SKILL_RELEVANCE_OUTPUT`, `ZS_SKILL_BENCH_FULL`, `ZS_SKILL_BENCH_SIZE` select test/benchmark datasets and output. |
-| Persistence/workspace fixtures | `MINI_AGENT_MODEL_SECRET_TEST`, `MINI_AGENT_ACTIVE_CWD_MAIN`, `MINI_AGENT_ACTIVE_CWD_WORKTREE`, `ZS_PLATFORM_PATH_NEGATIVE_CONTROL`, `ZS_CONFIG_PERMISSION_UMASK_CHILD`, `ZS_CONFIG_RESTRICTIVE_UMASK_CHILD`, `ZS_SESSION_PERMISSION_UMASK_CHILD`, `ZS_SCOPED_ENV_UNWIND_TEST`: test paths, permission checks and environment cleanup. |
+| Skill experiments | `MINI_AGENT_GYM` disables auto-learning during Gym execution when present; `MINI_AGENT_JS_BOOTSTRAP_BENCH`, `MINI_AGENT_JS_WORKER_BENCH`, `MINI_AGENT_JS_WORKER_BENCH_COMPARE`, `MINI_AGENT_JS_WORKER_BENCH_EXE`, `MINI_AGENT_JS_WORKER_BENCH_INPUTS`, `MINI_AGENT_JS_WORKER_BENCH_OUTPUT`, `MINI_AGENT_SKILL_RELEVANCE`, `MINI_AGENT_SKILL_RELEVANCE_OUTPUT`, `MINI_AGENT_SKILL_BENCH_FULL`, `MINI_AGENT_SKILL_BENCH_SIZE` select test/benchmark datasets and output. |
+| Persistence/workspace fixtures | `MINI_AGENT_MODEL_SECRET_TEST`, `MINI_AGENT_ACTIVE_CWD_MAIN`, `MINI_AGENT_ACTIVE_CWD_WORKTREE`, `MINI_AGENT_PLATFORM_PATH_NEGATIVE_CONTROL`, `MINI_AGENT_CONFIG_PERMISSION_UMASK_CHILD`, `MINI_AGENT_CONFIG_RESTRICTIVE_UMASK_CHILD`, `MINI_AGENT_SESSION_PERMISSION_UMASK_CHILD`, `MINI_AGENT_SCOPED_ENV_UNWIND_TEST`: test paths, permission checks and environment cleanup. |
 | Native publication reload fixtures | `NATIVE_PUBLICATION_REFUSED_RELOAD`, `NATIVE_PUBLICATION_RELOAD_SESSIONS`, `NATIVE_PUBLICATION_RELOAD_USAGE`, `NATIVE_PUBLICATION_RELOAD_WORKSPACE`: unit-test subprocess inputs for separate-process refusal, exact retained roots and canonical usage after interrupted native publication; never read by production dispatch. |
 | Update-cache fixtures | `MINI_AGENT_TEST_UPDATE_ADMISSION`, `MINI_AGENT_TEST_UPDATE_NOW`: test-only child cache path and controlled timestamp for cross-process release-check admission; never read by production update checks. |
 | Native Windows PR fixtures | `MINI_AGENT_WINDOWS_GH_FIXTURE_EXE`: exact Cargo-discovered test image; `MINI_AGENT_TEST_GH_ROLE`: scrubbed environment canary, not helper authorization. The test-only native helper requires an exact owned `gh-role` marker inside its workspace and the copied `fixture bin 雪/gh.exe` identity; arbitrary environment variables remain scrubbed by ordinary Shell execution. |
 | Cost ledger fixture | `MINI_AGENT_TEST_COST_LEDGER_IO_GATE`: unit-test child only; holds the real regular-file ledger writer before fsync for CLI SIGINT and cleanup ownership witnesses. |
 | Command-file fixtures | `MINI_AGENT_TEST_COMMAND_FIFO`: test-only bounded child probe for command-file and project-trust FIFO reads. |
 | Process-env lock fixture | `ZS_SHARED_READER_TEST`: test-only variable set under the exclusive process-env scope to prove a shared reader never observes a mutator scope; never read by production code. |
-| MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `ZS_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
+| MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `MINI_AGENT_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
 
 mini-agent sends no analytics or network telemetry. Learned-skill telemetry is stored in the
 local skill store; provider, embedding, MCP, sharing and explicitly invoked tool requests
@@ -510,8 +516,14 @@ only that feature. To recover non-interactively, compare the reported files,
 move the intended source to the reported canonical path, then restart; do not
 delete the retained legacy tree until rollback is no longer needed.
 
+For upgrades from the pre-rename layout, `zerostack` user-global roots and the six
+`ZEROSTACK_*_DIR` path overrides are legacy inputs only. A corresponding
+`MINI_AGENT_*_DIR` value wins. Repository-controlled `.zerostack` content is not
+loaded automatically; after review, rename it to `.mini-agent` and approve its
+path-bound project configuration again.
+
 All config keys are optional. CLI flags and their environment-backed values
-(such as `ZS_PROVIDER` and `ZS_MODEL`) take precedence where both exist.
+(such as `MINI_AGENT_PROVIDER` and `MINI_AGENT_MODEL`) take precedence where both exist.
 
 Example (YAML):
 
@@ -530,7 +542,7 @@ deny_repeated_reads: false
 default_prompt: code
 default_permission_mode: standard
 permission-modes: ["guarded", "standard", "yolo"]
-show_tool_details: 3
+tool_output: collapsed
 sandbox: false
 
 quick_models:
@@ -585,7 +597,7 @@ edit_system = "similarity"
 default_prompt = "code"
 default_permission_mode = "standard"
 permission-modes = ["guarded", "standard", "yolo"]
-show_tool_details = 3
+tool_output = "collapsed"
 
 [quick_models.fast]
 provider = "openai"
@@ -599,6 +611,7 @@ api_key_env = "VLLM_API_KEY"
 [permission]
 "*" = "ask"
 read = "allow"
+doom_loop = "ask"
 
 [permission.write]
 "**/*.rs" = "allow"
@@ -611,8 +624,6 @@ read = "allow"
 [permission.external_directory]
 "/tmp/**" = "allow"
 "/**" = "ask"
-
-permission.doom_loop = "ask"
 ```
 
 ### Optional formatting after file edits
@@ -679,7 +690,7 @@ status events; headless mode writes the status and diagnostics to stderr.
 
 `verify_command` is executed by a shell and therefore carries the authority of
 the user who configured it. It is a sensitive project-local setting: an
-untrusted `.zerostack/config.toml` cannot activate it in TUI, headless, or ACP
+untrusted `.mini-agent/config.toml` cannot activate it in TUI, headless, or ACP
 mode. Configured verification and `--loop-run` resolve the selected shell even
 when `--no-tools` is set or the model's tool list excludes `shell`. They retain
 the configured sandbox policy and executable identity checks; enabling a
@@ -708,7 +719,7 @@ Accepted top-level keys:
 | `verify_max_attempts`     | integer | Maximum verification attempts in one agent turn, including the first check. Default: `3`; clamped to `1..=8` and also bounded by the remaining `max_agent_turns` budget. |
 | `temperature`             | number  | Model temperature (`0.0` to `2.0`). Precedence is `--temperature`, then the active quick model's value, then this global value; values are clamped to the supported range. |
 | `extra_body`              | object  | Provider-specific JSON shallow-merged into every completion request body as a global default (e.g. OpenRouter `plugins` routing presets). A matching `quick_models` entry's `extra_body` overrides this. See Provider-specific request body parameters below. |
-| `retry`                   | object  | Retry policy with `max_attempts` (default `3`, clamped to 1–10), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`); both backoffs are clamped to at most `60000` and `initial_backoff_ms` to at most `max_backoff_ms`, with a startup warning for each clamped field. A retry sleeps the current backoff plus jitter but never longer than `max_backoff_ms`. A project `.zerostack/config.toml` may only tighten these values (see project-local trust above). The same configured policy drives ordinary completion starts and compaction summarizer calls through one shared retry primitive; interactive starts receive retry events from that primitive. The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. Transient HTTP statuses `408`, `409`, `425`, `429`, `500`, `502`, `503`, `504`, and `529` are retried. The provider HTTP adapter preserves actual `Retry-After` headers on each failed request’s typed error source. Integer seconds and HTTP dates extend the delay to the greater of the hint and backoff plus jitter, capped at `max_backoff_ms`; malformed or past hints retain ordinary backoff. Concurrent requests and subagents cannot share or consume another request’s hint. Provider status codes are classified structurally when available and by explicit HTTP/status syntax otherwise; unrelated digits or words such as `connection` do not make an application error retryable. Context-window errors bypass retry and immediately include compaction guidance. |
+| `retry`                   | object  | Retry policy with `max_attempts` (default `3`, clamped to 1–10), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`); both backoffs are clamped to at most `60000` and `initial_backoff_ms` to at most `max_backoff_ms`, with a startup warning for each clamped field. A retry sleeps the current backoff plus jitter but never longer than `max_backoff_ms`. A project `.mini-agent/config.toml` may only tighten these values (see project-local trust above). The same configured policy drives ordinary completion starts and compaction summarizer calls through one shared retry primitive; interactive starts receive retry events from that primitive. The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. Transient HTTP statuses `408`, `409`, `425`, `429`, `500`, `502`, `503`, `504`, and `529` are retried. The provider HTTP adapter preserves actual `Retry-After` headers on each failed request’s typed error source. Integer seconds and HTTP dates extend the delay to the greater of the hint and backoff plus jitter, capped at `max_backoff_ms`; malformed or past hints retain ordinary backoff. Concurrent requests and subagents cannot share or consume another request’s hint. Provider status codes are classified structurally when available and by explicit HTTP/status syntax otherwise; unrelated digits or words such as `connection` do not make an application error retryable. Context-window errors bypass retry and immediately include compaction guidance. |
 | `no_tools`                | boolean | Disable all tools. Default: `false`.                                                                                                                                        |
 | `no_context_files`        | boolean | Disable loading global/project `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md` (if `archmd` feature enabled) context files. Default: `false`.                               |
 | `context_window`          | integer | Session context-window size used for status and auto-compaction. When unset, auto-detected from the selected model's catalog entry; falls back to `128000` if the model is not in the catalog. A value of `0` disables auto-compaction. |
@@ -730,12 +741,13 @@ Accepted top-level keys:
 | `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section while its prior result remains in the current conversation. The section's served-content CRC joins file length and modification time in the version key, so same-length or mtime-preserving edits remain readable. Editing or writing the target, compaction, failed-turn rollback, clear, undo/rewind, and redo reset the relevant session tracker. Ordinary agent rebuilds retain it; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
 | `show_cost_always`        | boolean | Show the session cost in the status bar even when it is `$0.0000` (for example when the model has no per-token pricing configured). Default: `false`, which hides the cost until it is above zero. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, and opt-in mid-turn compaction). Default: `false`. When `false`, nothing is ever compacted automatically.            |
+| `claude_project_agents`   | boolean | Read project `.claude/agents/*.md` as specialist definitions (Claude Code compatibility). `false` makes mini-agent ignore that layer entirely (no loading, no validation warnings), leaving `.mini-agent/agents`, the user-global and the built-in definitions. Default: `true`. Restart required. |
 | `mid_turn_compact_threshold` | number | Opt-in mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Unset by default, meaning no mid-turn compaction. Honored only when `compact_enabled` is `true`. Recommended starting value: `0.80`. See Mid-turn compaction below.            |
 | `always_show_welcome`     | boolean | Always show the welcome banner on startup, bypassing the one-shot marker file. Default: `false`.                                                                               |
 | `auto-update-prompts`     | boolean | When `true`, always regenerate prompts on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `auto-update-themes`      | boolean | When `true`, always regenerate themes on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `edit_system`             | string  | Edit system mode: `"similarity"` (SEARCH/REPLACE with explicit fuzzy opt-in, default) or `"hashedit"` (CRC-32 tag-based CAS edits). See Edit System Modes below.                     |
-| `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "model", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` and the provider-switch default `model` are optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. `inherit_builtin_key` (default `false`) is the explicit opt-in to reuse the `provider_type` vendor key; see Custom provider credentials below. See the OpenAI API styles section below. |
+| `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "model", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs", "prompt_caching", "model_prices" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` and the provider-switch default `model` are optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. `inherit_builtin_key` (default `false`) is the explicit opt-in to reuse the `provider_type` vendor key; see Custom provider credentials below. `prompt_caching` (default `false`) opts Chat Completions Claude-family requests into `cache_control` markers; see Claude prompt caching below. `model_prices` (default empty) prices this provider's models per id so `/cost` works without a `quick_models` alias; see Per-model token prices below. See the OpenAI API styles section below. |
 | `embedding`               | object  | Skill-retrieval embedding backend and model settings. See Skill embeddings above. |
 | `enable_skill_proposals`  | boolean | Expose bounded `propose_skill` authority to model-authored JS and start the session proposal/admission workers. Default: `false`; project-local values require content-bound trust. |
 | `permission`              | object  | Permission rules using glob patterns; see the permission config notes below.                                |
@@ -756,17 +768,21 @@ Accepted top-level keys:
 | `sandbox-home-mounts` | array | HOME-relative dot files/folders exposed to contained commands, for example `[".gitconfig", ".npmrc", ".config/git", ".cargo:rw"]`. Read-only by default; a trailing `:rw` makes a **directory** writable (writable files are refused because guarded Git tracks model-writable roots as directories). Each entry must be relative, start with `.`, have no empty, `.` or `..` components, and resolve (after symlinks) to a path still under HOME; an entry that names, contains or lies inside a built-in or configured mask (for example `.ssh`, `.config` or `.config/gh`) is a config error. Missing paths are skipped and never created. Entries count toward the 32-root cap of `sandbox-read-roots`/`sandbox-write-roots`. `workspace` gains the reads and writes; `host-read` already reads HOME, so only `:rw` entries add writes; `host-full` validates entries but gains nothing. A symlinked entry is mounted at its resolved path. Adding mounts from a project layer requires trusted project approval. Unsupported by the Windows AppContainer backend: a non-empty list makes the sandbox unavailable (startup fails closed); use `windows-appcontainer-read-roots`. Restart required. |
 | `sandbox-home-masks` | array | Extra HOME-relative dot paths hidden in every profile, added to the built-in masks (which cannot be removed). Same syntax rules as `sandbox-home-mounts`, without `:rw`. Project layers may set this without approval because they can only add masks: a project list is merged with, never replaces, inherited masks. On Windows AppContainer, which exposes nothing from HOME except explicit roots, a mask is honoured when no AppContainer root equals, contains or lies inside it; otherwise the sandbox is unavailable rather than silently wider. Restart required. |
 | `sandbox-backend`         | string  | General-process backend. Defaults to `bwrap` on Linux, the system-provided `seatbelt` at `/usr/bin/sandbox-exec` on supported macOS hosts, and `appcontainer` on Windows (`restricted-token` is a compatibility alias). Setting this key or passing `--sandbox-backend` makes an enabled sandbox request explicit and fail-closed. Windows availability requires the cached native AppContainer production preflight. Before a new probe, a separate five-second bounded sweep recovers exact private roots preserved by interrupted earlier preflights. The new run phase is limited to five seconds, whole-tree reaping receives up to five seconds, and profile/ACL recovery then receives a fresh five-second ceiling. Failure remains closed unless `--no-sandbox` explicitly opts out. The backend adds package-SID workspace read/write plus read/execute grants for the application cache, exact selected executable, and explicitly configured AppContainer roots; ambient `PATH`, home, Cargo, and Rustup roots are never inferred. As a regular AppContainer it retains standard Windows system resources and any pre-existing object accessible to `ALL APPLICATION PACKAGES`; such an existing ACL can include write authority, so universal filesystem isolation is not claimed. It uses private profile storage, grants no network capability, and retains the private desktop plus bounded creation-time Job. Hosted observations describe the reference runner, not every host's ACL visibility; broader registry/device/session isolation is not claimed. `zerobox` is explicit and backend-defined. None of these profiles launches or describes the broker-only JS worker. |
+| `sandbox-required`        | boolean | Global-only (ignored in project config). When `true`, startup fails with a clear message if `--no-sandbox`, `sandbox = false`, or an unavailable backend would leave shell commands unsandboxed. Default: unset. |
+| `permission-checks-required` | boolean | Global-only (ignored in project config). When `true`, startup fails if `--dangerously-skip-permissions` is passed. Default: unset. |
+| `sandbox-toolchain-roots` | array of paths | Extra **read-only** binds for the Linux `bwrap` general-process and sandboxed-hook profiles, so CLIs installed outside `/usr`, `/bin`, `/sbin`, `/lib*`, and `/nix` stay runnable from the shell tool. Default when unset: `["/home/linuxbrew", "~/.cargo/bin", "~/.local/bin", "~/.rustup"]` (Homebrew on Linux, Cargo-installed binaries, user-local binaries, and the rustup toolchains behind Cargo's proxies; `~/.cargo` itself is excluded because it holds `credentials.toml`). Setting the key replaces the default; `[]` binds nothing extra. Entries must be absolute or start with `~/` (expanded against the real home directory) and may not contain `..`. Missing entries are skipped (`--ro-bind-try`, debug log). An entry that is `/`, the home directory or one of its ancestors, contains the workspace or application cache, or overlaps mini-agent's private configuration, credential, or state directory fails the launch closed; an entry already inside the writable workspace is skipped so it cannot shadow writable files or the read-only Git metadata binds. Symlinked entries are bound at their canonical target and at the configured spelling. Mounted `bin`/`sbin` entries are appended to the sandbox `PATH` when the host `PATH` lacks them. Writes to these trees remain impossible (for example Cargo cannot update `~/.cargo/registry`). Seatbelt already leaves host files readable and AppContainer uses `windows-appcontainer-read-roots`, so other backends ignore this key. Distinct from the profile-level `sandbox-read-roots`/`sandbox-write-roots` grants. `--print-config` shows the configured and effective lists under **Sandbox capabilities**. Security-sensitive: a project-local value applies only after content-bound project-config trust. CLI: repeat `--sandbox-toolchain-root PATH` to replace the list for one run. |
 | `windows-appcontainer-read-roots` | array of paths | Additional Windows AppContainer read/execute roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they are remote, reparse-based, multiply linked, overlap a writable root, or contain the private AppContainer control sibling. Conflict diagnostics expose only fixed root roles and containment direction, never paths. CLI: repeat `--windows-appcontainer-read-root PATH`. |
 | `windows-appcontainer-write-roots` | array of paths | Additional Windows AppContainer read/write roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they overlap the read-only cache/configured roots, another writable root, or the private AppContainer control sibling. Deterministic conflicts are rejected before profile/journal creation. CLI: repeat `--windows-appcontainer-write-root PATH`. |
-| `js-fetch-origins`        | array   | Exact origin narrowing list for the sandbox-gated JS `fetch()` global, for example `["https://docs.rs", "https://api.example.com:8443"]`. Absent leaves narrowing to permissions; empty or malformed denies all fetches. |
+| `js-fetch-origins`        | `"all"`, `"none"` or array | Origin narrowing for the sandbox-gated JS `fetch()` global. `"all"` applies no narrowing; `"none"` denies every fetch; an array lists exact origins, for example `["https://docs.rs", "https://api.example.com:8443"]` (an empty or malformed array denies all fetches). Any other string is a startup error. Absent behaves like `"all"` and logs a one-time notice; the `js/fetch` permission check applies in every form (unmatched is `Ask` in standard/guarded modes, allowed in yolo). Sensitive in a project config, and a project layer cannot widen inherited origins to `"all"`. In `yolo` mode an absent key lets `fetch()` reach any public HTTPS origin (loopback and private targets are always refused) even though shells have no network, so prefer `"none"` or a list. |
 | `js-fetch-allow-http`     | boolean | Permit public-address HTTP origins for JS `fetch()` in addition to HTTPS. Default: `false`. Private, loopback, link-local, metadata, multicast, and reserved destinations remain denied. |
 | `js-file-base-dir`        | path    | Base used to resolve relative JS file roots. Relative values resolve from the captured startup workspace; absent uses that workspace directly. |
-| `js-read-roots`           | array   | Explicit read roots for brokered JS file effects, resolved from `js-file-base-dir`. |
+| `js-read-roots`           | array   | Explicit read roots for brokered JS file effects, resolved from `js-file-base-dir`. Reads are default-deny: with no roots every JS `read_file`/`read_files`/`list_dir`/`grep` fails with `no js-read-roots configured` and the model falls back to slower multi-call tools. `["."]` grants the workspace read-only and is the recommended setting. |
 | `js-write-roots`          | array   | Explicit write roots for brokered JS file effects, resolved from `js-file-base-dir`. |
 | `js-read-unrestricted`    | boolean | Explicitly allow brokered JS reads outside configured roots; cannot be combined with `js-read-roots`. Default: `false`. |
 | `js-write-unrestricted`   | boolean | Explicitly allow brokered JS writes outside configured roots; cannot be combined with `js-write-roots`. Default: `false`. |
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo` (`accept` is an alias for `standard`). Any other value is rejected at startup with the list of accepted values. |
-| `show_tool_details`       | boolean or integer | Show tool-result previews in the TUI. `false` omits previews and hidden-result placeholders during live rendering and session replay; tool-call lines remain visible. Task-list updates remain visible independently of this setting. `true` shows all lines, an integer limits to that many lines (e.g. `3`). Default: `3`. |
+| `tool_output`             | string  | How tool results appear in the TUI transcript: `collapsed` (one summary row per call: size, or the error's first line), `preview` (the summary plus the first `show_tool_details` lines, default 3), or `full` (the whole output, unfolded). Any result can be folded or unfolded in place with `Ctrl+T`, `/expand [n\|all]`, `/collapse [n\|all]`, or a click on its summary row. Default: `collapsed`. |
+| `show_tool_details`       | boolean or integer | Legacy tool-result setting. With `tool_output = "preview"` an integer sets the preview length. Without `tool_output` it keeps its old meaning as an opt-in: an integer previews that many lines, `true` shows everything, `false` (or `0`) collapses. Unset means collapsed. Task-list updates remain visible independently of this setting. |
 | `diff_context_lines`      | integer | Unchanged context rows around a successful native edit/write preview. Default: `3`; clamped to `20`. |
 | `max_diff_lines`          | integer | Maximum retained mutation-preview rows, including headers and notices. Default: `200`; clamped to `1000`. `0` disables preview capture/display. `show_tool_details=false` hides previews during live rendering and replay; integer tool-detail limits apply to ordinary result text separately. |
 | `reasoning_display`       | `"off"`, `"collapsed"`, `"full"` | TUI presentation of reasoning. Default: `"collapsed"` with one live character-count and elapsed-time header. `Ctrl+R` cycles the modes and saves the preference to global config; clicking a header expands or collapses that block. This setting does not change model requests. Resume shows available recorded human-readable reasoning; elapsed time is live-only, and signatures/encrypted/redacted payloads stay opaque. |
@@ -778,7 +794,7 @@ Accepted top-level keys:
 | `terminal_title`          | boolean | Report agent activity in the terminal/window title (OSC 0): `mini-agent: working` while a run is active, `mini-agent: waiting for approval` while a permission prompt waits, and `mini-agent: idle` otherwise. Terminal multiplexers and tab bars that show pane or window titles (tmux `#{pane_title}`, zellij, herdr, terminal tabs) can surface it. The title is saved on start and restored on exit (XTWINOPS title stack; terminals without it fall back to their default title). The text is fixed, never model or tool output. Set `false` to leave the title alone. Default: `true`. |
 | `terminal_notify`         | string  | Desktop notification escape emitted when a turn finishes (`<name>: turn finished`) and when a permission prompt starts waiting (`<name>: waiting for approval`): `"osc9"` sends `OSC 9 ; <text> BEL` (iTerm2, WezTerm, Ghostty, kitty, foot), `"osc777"` sends `OSC 777 ; notify ; <name> ; <text> BEL` (rxvt-unicode, foot, Ghostty, WezTerm, patched VTE terminals), `"off"` sends nothing. Terminals interpret these differently (some treat unknown `OSC 9` payloads as progress or ignore them), so the default is `"off"`. The text is fixed, never model or tool output, and control characters and `;` are stripped from every payload. Inside tmux the sequences reach the outer terminal only with passthrough enabled (`set -g allow-passthrough on`). |
 | `terminal_prompt_marks`   | boolean | Emit OSC 133 semantic prompt marks: `A`/`B` (prompt, input) while the TUI waits for input or a permission answer, `C` when a run starts, and `D` when it finishes. Multiplexers and terminals that track shell prompts (herdr, WezTerm, kitty, Ghostty, iTerm2) can use them to tell a busy agent from one waiting for input. Which signal herdr reads is not confirmed, so this is opt-in alongside `terminal_title` and `terminal_notify`. Default: `false`. |
-| `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`. If the prompt file has a `%%mode=<mode>` first-line directive, the security mode is set automatically (see Prompt directives below). |
+| `default_prompt`          | string  | Prompt name to activate on startup and in every new ACP session. Default: `code`. If the prompt file has a `%%mode=<mode>` first-line directive, the security mode is set automatically (see Prompt directives below). |
 | `wt-auto-merge`           | boolean | Automatically merge a CLI-created worktree on exit; requires `git-worktree`. Default: `false`. |
 | `wt-base-dir`             | path    | Base directory for CLI-created worktrees (default: parent of the repository toplevel; targets inside a checkout are rejected); requires `git-worktree`. |
 | `shell`                   | string  | Shell executable for the model-visible `shell` compatibility tool and explicit shell commands. Unix accepts Bash/sh; Windows also accepts PowerShell/pwsh. |
@@ -797,11 +813,12 @@ Accepted top-level keys:
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 | `acp_host`                | string  | TCP bind host for ACP server mode (equivalent to `--acp-host`).                                                                                                              |
 | `acp_port`                | integer | TCP bind port for ACP server mode (equivalent to `--acp-port`, default: 7243).                                                                                               |
+| `acp_accept_timeout_secs` | integer | Maximum seconds to wait for the first authenticated ACP TCP peer (equivalent to `--acp-accept-timeout-secs`, default: 300).                                                  |
 | `task_max_turns`          | integer | Maximum model turns per subagent. Default: `20`; requires `subagents`. |
 | `task_max_prompts`        | integer | Maximum prompts in one `task` call. Default: `8`; requires `subagents`. |
 | `task_max_concurrency`    | integer | Maximum concurrently polled child futures. Default: `4`; requires `subagents`. |
 | `task_max_output_bytes`   | integer | Aggregate rendered output cap for a `task` call. Default: `131072`; requires `subagents`. |
-| `task_max_cost_units`     | integer | Aggregate normalized work-unit cap for a `task` call, independent of USD. Default: `4000000`; requires `subagents`. |
+| `task_max_cost_units`     | integer | Hard cap on aggregate normalized work units for a `task` call, independent of USD. The budget is reserved across prompts before concurrent children launch; a child stops further provider calls when its share is exhausted. Default: `4000000`; requires `subagents`. |
 | `task_cost_weighting`     | string | `"auto"` (default) derives model-aware normalized ratios; `"fixed"` uses configured weights. Applies to the next delegation; requires `subagents`. |
 | `task_cost_weights`       | object | Finite token weights: `input=1.0`, `output=5.0`, `cache_read=1.0`, `cache_write_5m=2.0`, `cache_write_1h=2.0`. Input/output must be positive; cache weights nonnegative. Partial objects use built-in defaults. Applies to the next delegation. |
 | `task_cost_overrides`     | object | Map of exact quick-model aliases to `{ weighting?, weights? }`. Only the actual selected alias matching the child provider/model can override the globals. Default: `{}`; applies to the next delegation. |
@@ -865,8 +882,8 @@ owned by the caller (ordinary shell and hooks deny it); permission modes remain
 independent, and the mandatory broker-only JS worker profile is unchanged.
 
 Skill Gym has no `gym.toml` key or production configuration namespace. Its scripts use command-line
-arguments and task JSON, set `MINI_AGENT_GYM=1`, and override `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`,
-`ZS_STATE_DIR`, and `ZS_CACHE_DIR`. See [GYM.md](GYM.md). Task-outcome production status is not a
+arguments and task JSON, set `MINI_AGENT_GYM=1`, and override `MINI_AGENT_DATA_DIR`, `MINI_AGENT_LOCAL_DATA_DIR`,
+`MINI_AGENT_STATE_DIR`, and `MINI_AGENT_CACHE_DIR`. See [GYM.md](GYM.md). Task-outcome production status is not a
 user-widenable setting.
 
 JavaScript worker containment is a runtime prerequisite, not a user-selected sandbox mode.
@@ -971,8 +988,8 @@ You can append custom text to **every** system prompt by creating a
 `SUFFIX.md` file in the config directory (same location as `config.toml`):
 
 - Global home: `~/.mini-agent/SUFFIX.md` (or `$MINI_AGENT_HOME/SUFFIX.md`)
-- Linux legacy: `~/.config/zerostack/SUFFIX.md` (or `$ZS_CONFIG_DIR/SUFFIX.md`)
-- macOS legacy: `~/Library/Application Support/zerostack/SUFFIX.md`
+- Linux platform root: `~/.config/mini-agent/SUFFIX.md` (or `$MINI_AGENT_CONFIG_DIR/SUFFIX.md`)
+- macOS platform root: `~/Library/Application Support/mini-agent/SUFFIX.md`
 
 If the file exists and contains non-whitespace content, its contents are
 appended at the very end of the system prompt preamble — **after** AGENTS.md,
@@ -1014,9 +1031,9 @@ to three locations, loaded and merged in this order:
 
 | Location | Trust |
 | -------- | ----- |
-| `<config-root>/settings.json`, e.g. `~/.mini-agent/settings.json` (global; legacy `~/.config/zerostack/settings.json`, on macOS `~/Library/Application Support/zerostack/settings.json`; on Windows `%APPDATA%\zerostack\settings.json`, experimental) | Trusted by default |
-| `.zerostack/settings.json` (project, relative to CWD) | **Not** trusted by default — see Trust model below |
-| `/etc/zerostack/managed-settings.json` (Linux) / `/Library/Application Support/zerostack/managed-settings.json` (macOS) / `C:\ProgramData\zerostack\managed-settings.json` (Windows, experimental) — admin-controlled | Always trusted; unaffected by `disableAllHooks` |
+| `<config-root>/settings.json`, e.g. `~/.mini-agent/settings.json` (global; existing Linux install `~/.config/mini-agent/settings.json`, on macOS `~/Library/Application Support/mini-agent/settings.json`; on Windows `%APPDATA%\mini-agent\settings.json`, experimental) | Trusted by default |
+| `.mini-agent/settings.json` (project, relative to CWD) | **Not** trusted by default — see Trust model below |
+| `/etc/mini-agent/managed-settings.json` (Linux) / `/Library/Application Support/mini-agent/managed-settings.json` (macOS) / `C:\ProgramData\mini-agent\managed-settings.json` (Windows, experimental) — admin-controlled | Always trusted; unaffected by `disableAllHooks` |
 
 Each file may have a top-level `hooks` object (keyed by event name) and a
 top-level `disableAllHooks: true` boolean. `disableAllHooks` (from the global
@@ -1029,7 +1046,7 @@ does not read that file directly, but its own `settings.json` uses the same
 basic `hooks` schema. For security, every command handler must add an `args`
 array (use `[]` when the executable takes no arguments); mini-agent never
 implicitly passes `command` to a shell. Scripts may also need a change because
-mini-agent sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
+mini-agent sets `$MINI_AGENT_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 
 ### Handler schema
 
@@ -1058,14 +1075,14 @@ mini-agent sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `type` | string | Only `"command"` is supported. |
-| `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical selected workspace; bare names resolve through absolute `PATH` entries only. Workspace-resident files are content-bound (see Trust model). Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
+| `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical selected workspace; bare names resolve through absolute `PATH` entries only. Workspace-resident files are content-bound (see Trust model). Receives the stdin envelope as JSON; `$MINI_AGENT_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
 | `args` | array of strings | Required, but may be empty. Passed directly as the executable's argv with no shell metacharacter expansion. |
 | `timeout` | integer (seconds) | Per-hook timeout; the whole process group is killed on expiry. Default: 60. |
 | `async` | boolean | When `true`, the hook's `if` condition and handler run in the background and its decision is ignored. Agent-turn work owns the background task, so turn cancellation still terminates and reaps it before the turn settles. Default: `false`. |
 | `if` | string | A shell command evaluated (with the same stdin envelope) before the handler runs; the handler only runs if it exits `0`. Fails closed: a broken/unparseable/timed-out condition still runs the handler, with a warning. |
 | `once` | boolean | Runs the handler at most once per event per session. A false `if` condition or a policy/preflight/spawn denial does not consume the binding; a successfully started child does. |
 | `trust` | `"sandboxed"` or `"trusted"` | Subprocess authority. Default: `"sandboxed"`, which requires the configured general workspace sandbox and denies the hook and guarded action before child creation if the backend is unavailable. `"trusted"` is an explicit, audited containment bypass for reviewed automation; it does not restore the parent environment. |
-| `env` | object of string values | Explicit environment additions. Values are literal (no shell expansion). The reserved `ZEROSTACK_PROJECT_DIR` key cannot be overridden in any ASCII case. Invalid names, NUL values, or case-insensitively colliding keys deny launch for portable Windows semantics. |
+| `env` | object of string values | Explicit environment additions. Values are literal (no shell expansion). The reserved `MINI_AGENT_PROJECT_DIR` key cannot be overridden in any ASCII case. Invalid names, NUL values, or case-insensitively colliding keys deny launch for portable Windows semantics. |
 
 Project-hook approval remains bound to the immutable canonical startup project
 root where the configuration was loaded. Worktree selection does not reload or
@@ -1081,7 +1098,7 @@ restores only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`,
 `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `TEMP`, `TMP`, `USERNAME`, and
 `USERPROFILE`, `SYSTEMDRIVE`, `ProgramFiles`, `ProgramFiles(x86)`, and
 `ProgramW6432` when present, plus the handler's `env` values and
-`ZEROSTACK_PROJECT_DIR`. API keys and other ambient credentials are therefore
+`MINI_AGENT_PROJECT_DIR`. API keys and other ambient credentials are therefore
 absent unless the hook owner explicitly provides them in `env`.
 Sandbox backends override `TMPDIR` with their confined temporary directory.
 
@@ -1207,7 +1224,7 @@ control-sanitized block reason.
 
 ### Trust model
 
-Project-level hook handlers (`.zerostack/settings.json` — global and managed
+Project-level hook handlers (`.mini-agent/settings.json` — global and managed
 hooks are trusted automatically) require interactive confirmation the first
 time they'd run, keyed by a hash of the handler's definition (event +
 matcher + command/args/timeout/etc.) and of the content of every workspace
@@ -1255,8 +1272,8 @@ rewritten in one session never silently takes effect in the next. First use
 is trusted as configured, so prefer pointing global hooks at files outside
 the workspace.
 
-A token that starts with `$ZEROSTACK_PROJECT_DIR/` or
-`${ZEROSTACK_PROJECT_DIR}/` is bound as the same path inside the workspace,
+A token that starts with `$MINI_AGENT_PROJECT_DIR/` or
+`${MINI_AGENT_PROJECT_DIR}/` is bound as the same path inside the workspace,
 because the hook child receives exactly that value. The binding is otherwise
 best-effort, and these gaps remain:
 
@@ -1305,8 +1322,9 @@ budget, compaction summarizes the retained, unpruned session prefix under its
 separate bounded rolling input budget. It does not open recorded spill files;
 only the output already retained in the session is sent.
 
-By default mini-agent only compacts the conversation *between* turns, after a
-response finishes, when the accumulated session history exceeds
+Automatic compaction is off by default. With `compact_enabled = true`, mini-agent
+only compacts the conversation *between* turns unless mid-turn compaction is also
+configured: after a response finishes, when the accumulated session history exceeds
 `context_window - reserve_tokens`. Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, and `js`) retain their documented
 line, byte, and result limits in both live and replayed history. Their
@@ -1407,7 +1425,7 @@ soon as a complete provider snapshot arrives.
   attention degradation ("context rot") that large, full context windows suffer.
 
 ```toml
-compact_enabled = true            # master switch (default true)
+compact_enabled = true            # master switch (default false)
 context_window = 24576
 mid_turn_compact_threshold = 0.80 # compact mid-turn at 80% real prompt pressure
 ```
@@ -1508,6 +1526,81 @@ Selecting the built-in `openai` provider with no custom entry uses no
 Responses requests include an opaque SHA-256 `prompt_cache_key` derived from the
 stable session ID, keeping consecutive turns on the same provider cache route.
 An explicit `prompt_cache_key` in `extra_body` overrides this generated default.
+Chat Completions requests get the identical generated key for an OpenAI-family
+model id (same session, same key, whichever `api_style` is selected), unless
+the model id is in the Claude family, which instead uses the `cache_control`
+markers described next (mini-agent-fb20s).
+
+#### Claude prompt caching on OpenAI-compatible gateways (`prompt_caching`)
+
+`custom_providers.<name>.prompt_caching` (boolean, default `false`) opts a
+Chat Completions custom provider into Anthropic-style `cache_control`
+breakpoints — on the system prompt, the last tool definition, and the
+conversation tail — for requests whose model id is in the Claude family
+(`bedrock.anthropic.*`, `vertex.anthropic.*`, `claude-*`, or any
+`/`-delimited path ending in a `claude-*` segment). This targets gateways
+that front a native Anthropic/Bedrock/Vertex backend over an OpenAI-shaped
+wire format (e.g. a LiteLLM proxy): with the markers, the gateway's prefix
+cache reports hits on repeat turns instead of re-billing the same system
+prompt, tools, and settled history every call. It has no effect on the
+Responses API style, and no effect for a non-Claude model id, so it is safe
+to enable even when one `custom_providers` entry serves several model
+families — only the Claude-family requests are marked. A gateway that
+ignores or rejects the `cache_control` field is unaffected while this stays
+off (the default); enabling it against a gateway that silently drops the
+field is also harmless, just ineffective. When `cache_ttl = "1h"` (see
+below) is set, the marker carries `"ttl": "1h"` instead of the implicit
+five-minute default. Quick models that route through a `custom_providers`
+entry inherit that entry's `prompt_caching` setting; there is no separate
+per-quick-model override.
+
+```toml
+[custom_providers.litellm-gw]
+provider_type = "openai"
+base_url = "https://litellm.example.com/v1"
+api_key_env = "LITELLM_API_KEY"
+prompt_caching = true
+```
+
+#### Per-model token prices on custom providers (`model_prices`)
+
+`custom_providers.<name>.model_prices` (table, default empty) carries
+per-model USD-per-million-token prices keyed by the exact model id, so a
+gateway configured only as a `custom_providers` entry — no `quick_models`
+alias needed — can report `/cost` instead of `cost:?`, and `max_budget_usd`
+can bound spend on it. Each entry mirrors `quick_models`' price fields:
+`input_token_cost`, `output_token_cost`, `cache_read_token_cost`,
+`cache_write_token_cost`, and `cache_write_1h_token_cost`, all non-negative
+and finite (an invalid value fails config load, and an unrecognized key in
+the table is rejected rather than silently ignored). A missing tier falls
+back to the embedded catalog by this entry's `provider_type` (e.g. a
+Claude-via-Bedrock route falls back to Anthropic's published rates); a model
+absent from the table entirely has no price from this source. Resolution
+order for a request's prices is: a cached live model listing, then this
+table, then the embedded catalog, then a `quick_models` alias that happens to
+point at the same `provider`/`model` pair — so a `quick_models` entry stays
+the way to override a specific alias's price without touching the provider's
+table. This feeds the status line, the spend account, and `max_budget_usd`
+for both the main session and subagent/advisor/judge calls.
+
+A custom provider with no `model_prices` entry (and no catalog or listing
+price) is unpriced: headless `--output-format json` reports `"cost": 0` and
+adds `"cost_unpriced": true`, so 0 means "not priced", not "free". Cached
+tokens are read from the response's `prompt_tokens_details.cached_tokens`
+(Chat Completions) and stay 0 when the gateway omits that field.
+
+```toml
+[custom_providers.litellm-gw]
+provider_type = "openai"
+base_url = "https://litellm.example.com/v1"
+api_key_env = "LITELLM_API_KEY"
+
+[custom_providers.litellm-gw.model_prices."bedrock.anthropic.claude-sonnet-5-5"]
+input_token_cost = 3.0
+output_token_cost = 15.0
+cache_read_token_cost = 0.3
+cache_write_token_cost = 3.75
+```
 
 For local HTTP(S) endpoints, connection pooling is disabled to avoid stale
 keep-alive sockets used by some local servers. Local detection covers loopback
@@ -1921,9 +2014,9 @@ to accept or read, including during turn interruption and shutdown.
 
 ## Colors
 
-The `colors` object accepts `scheme_type`, background colors, and foreground
-roles. Each color is an optional named color or hex string (e.g.
-`"#1e1e2e"`). Named colors are case-insensitive. Built-in themes include full
+The `colors` object accepts `scheme_type`, background colors, foreground
+roles, and an optional semantic `accent`. Each color is an optional named color
+or hex string (e.g. `"#1e1e2e"`). Named colors are case-insensitive. Built-in themes include full
 foreground palettes and explicit `default-light` / `default-dark` variants in
 `/theme`; choosing a theme retains its saved precedence over config colors.
 
@@ -1973,6 +2066,13 @@ Default status items inherit `status`; explicit custom segment colors remain
 explicit. Live context/sandbox alerts use `warning`/`error`, including their
 compact forms, rather than a bright yellow that disappears on white.
 
+### Accent field
+
+- `accent` — the branded highlight for user-message markers and success
+  states; it also supplies the welcome/banner and picker-selection foreground.
+  Themes can use it to provide a branded highlight
+  without changing error, warning, Markdown-link, or Markdown-heading colors.
+
 Supported named colors: `reset`, `black`, `red`, `green`, `yellow`, `blue`,
 `magenta`, `cyan`, `white`, `grey`, `dark_grey`, `dark_red`, `dark_green`,
 `dark_yellow`, `dark_blue`, `dark_magenta`, `dark_cyan`.
@@ -1984,7 +2084,8 @@ Example:
     "scheme_type": "full",
     "chat_background": "#1e1e2e",
     "input_background": "#181825",
-    "status_background": "#11111b"
+    "status_background": "#11111b",
+    "accent": "#FD5108"
   }
 }
 ```
@@ -2031,6 +2132,12 @@ command (`ls`, `cat`, `head`, `tail` without `-f`, `wc`, `grep`, `rg` without
 paths stay inside the working directory. Redirections, `$`/backtick expansion,
 subshells, `tee`, `xargs`, env assignments, `&` and any other command still ask.
 Git is withheld in the unsandboxed fallback. See `src/permission/readonly_shell.rs`.
+On Linux, procfs process secrets are denied by a built-in baseline in every
+mode that no rule or session grant can lift (only
+`--dangerously-skip-permissions` bypasses permission checks): `/proc/<pid>|self|thread-self/{environ,cmdline,mem}` (and the
+`task/<tid>/` spellings) are refused for every file tool, and `grep`/`find_files`
+cannot be rooted at `/proc` or a process directory. This keeps env-held tokens
+out of the model's reach through the in-process read tools.
 An `external_directory` deny is a security baseline: it takes precedence over
 matching tool-specific allows and prior session AllowAlways scopes, including
 inherited `read` access used by `lsp_diagnostics`. When several
@@ -2040,7 +2147,9 @@ wins, otherwise the most specific pattern, with `ask` beating `allow` on a tie.
 So `/tmp/**` allow plus `/**` ask allows `/tmp/x` and asks elsewhere, and a
 nested `~/.ssh/**` deny always beats a broader `~/**` allow. On Windows, where
 a path is also matched in its verbatim spelling, matching rules combine
-fail-closed instead (deny, then ask, then allow).
+fail-closed instead (deny, then ask, then allow). A matching `external_directory`
+`ask` prompts in every mode, including `guarded` reads and
+`yolo`; yolo only skips the prompt for external paths that match no rule.
 
 Tool argument validation happens before permissions or execution. `read.limit` must
 be positive (including an effective configured default); invalid windows return a
@@ -2125,6 +2234,11 @@ Ordinary Windows atomic replacements retain existing readers of the old file,
 including LSP's identity-tracking handles; newly opened readers see the complete
 replacement. Handles that deny delete sharing still prevent publication and
 follow the bounded sharing-lock retry policy.
+
+Windows shell capability binding crosses the selected AppContainer with a no-op
+before the shell tool is published. It uses the same thirty-second enterprise
+startup ceiling as the general preflight; failure disables the shell instead of
+retrying outside containment.
 
 Foreground shell commands have a mandatory deadline of 120 seconds by default.
 `shell_timeout_secs` sets that deadline between 1 and 600 seconds. A tool call's optional
@@ -2243,7 +2357,15 @@ macOS and Windows. With `read = { "config/secrets/**" = "deny" }`, `grep`
 over `.` never returns lines from `config/secrets/`, and `find_files` and
 `list_dir` never list its files. This per-entry filter evaluates only `deny`
 rules; it never asks, and `ask` or `allow` rules on entries beneath an
-authorised root do not affect the walk. The `js` tool's discovery globals
+authorised root do not affect the walk. When `grep`'s `path` names a single
+regular file, only that file is searched (through the same workspace binding,
+path permission check, 10 MiB size cap, binary detection and output format);
+the per-entry filter is applied to the file and its ancestor directories, so a
+file that a walk would skip is refused with `Permission denied`. An explicitly
+named file is searched even if `.gitignore` would omit it from a walk, and an
+`include` glob is matched against its file name. `find_files` and `list_dir`
+require a directory and answer a file path with a "is a file, not a directory"
+error. The `js` tool's discovery globals
 `list_dir`, `glob`, and `grep` apply the same filter, using the `deny` rules
 for `js/list_dir`, `js/glob`, or `js/grep` together with those for `read` and
 `js/read_file`.
@@ -2472,7 +2594,7 @@ initialization failure, cancellation, reconnect replacement, shutdown, and
 handle drop terminate and reap the service tree, including descendants that
 close inherited protocol pipes.
 
-Servers can also be added per project via `.zerostack/config.toml` (see
+Servers can also be added per project via `.mini-agent/config.toml` (see
 *Project-local override* above); project servers merge with — and can override
 — global ones by name.
 
@@ -2535,6 +2657,7 @@ extra scopes), or an object for explicit settings:
       "oauth": {
         "scopes": ["read", "write"],
         "client_id": "pre-registered-client-id",
+        "redirect_host": "localhost",
         "redirect_port": 8970
       }
     }
@@ -2548,21 +2671,31 @@ OAuth fields (all optional):
 | --------------- | ------------------------------ | ------------------------------------------------------------------------ |
 | `scopes`        | none                           | Scopes to request during authorization.                                  |
 | `client_id`     | dynamic registration           | Pre-registered client id. When omitted, the client registers on the fly. |
-| `redirect_port` | `8970`                         | Loopback port for the redirect URI `http://127.0.0.1:<port>/callback`.   |
+| `redirect_host` | `"127.0.0.1"`                  | Exact host spelling registered for the callback; only `"127.0.0.1"` or `"localhost"`. The listener always binds IPv4 loopback. |
+| `redirect_port` | `8970`                         | Loopback port for the redirect URI `http://<redirect_host>:<port>/callback`. |
 
 The first time you connect, run `/mcp login <server>` inside the TUI. mini-agent
-prints an authorization URL and attempts to copy it to your clipboard; the TUI
-distinguishes a confirmed clipboard write from an unacknowledged OSC 52
-terminal request. Open the URL in a browser, approve access, and the redirect
-is caught on the loopback port. The browser wait runs in the background, so the
-TUI stays responsive (you can keep working or select the URL with the mouse to
-copy it). If you deny access, the redirect carrying `error=` for the active
+prints an authorization URL, attempts to open it in the desktop browser, and
+also attempts to copy it to your clipboard. Under WSL, Windows' URL protocol
+handler is invoked through `rundll32.exe`, opening the configured default Windows
+browser, with Windows Explorer as a Windows-only fallback. Linux browser openers
+are never tried under WSL, so the
+authorization flow cannot fall through to a Linux browser that lacks corporate
+certificates. The URL remains one direct argument and is never passed through
+`cmd.exe`. Native Unix uses
+`xdg-open` and then `open`, while native Windows uses `ShellExecuteW`. If no
+opener succeeds, use the printed or copied URL manually. The TUI distinguishes
+a confirmed clipboard write from an unacknowledged OSC 52 terminal request.
+Approve access and the redirect is caught on the configured loopback port. The
+browser wait runs in the background, so the TUI stays responsive. WSL requires
+Windows-to-WSL localhost forwarding for the browser callback. If you deny
+access, the redirect carrying `error=` for the active
 login ends the wait immediately with that error instead of waiting for the
 timeout; error redirects for another login are ignored. The token is saved to
 `<credentials_dir>/mcp-oauth/<opaque-server-identity>.json`; server display
 names never become filenames. `credentials_dir` defaults to
-`<local_data_dir>/credentials` (including `%LOCALAPPDATA%\zerostack\credentials`
-on Windows) and can be set explicitly with the absolute `ZS_CREDENTIALS_DIR`
+`<local_data_dir>/credentials` (including `%LOCALAPPDATA%\mini-agent\credentials`
+on Windows) and can be set explicitly with the absolute `MINI_AGENT_CREDENTIALS_DIR`
 override.
 
 The credential directory and every final, temporary, and lock file are private
@@ -2698,6 +2831,38 @@ model. Provider clients honour `--api-key` first for the startup provider only (
 configuration (`subagent_model`, `subagent_provider`, `task_max_turns`) at
 startup, so delegated read-only agents work over ACP.
 
+**Personas and prompt routing.** Each ACP session resolves its main-loop
+prompt exactly like interactive startup: `--load-prompt` (an unknown name
+refuses `session/new`), else `default_prompt`, else `code`. The prompt's
+`%%agent=` directive selects the main-agent persona from `agents/*.md`, its
+`%%mode=` directive narrows each turn's permission checker (it can never raise
+the operator-configured mode; see Prompt directives), and its
+`[prompt_to_model]` entry selects the turn's provider and model in place of the
+startup selection. An unmapped prompt runs on the startup selection. The
+`task` tool keeps the startup provider/model, as in the TUI.
+
+`session/new` advertises the loaded prompts both as session modes
+(`modes.availableModes`, `currentModeId`) and as one equivalent select config
+option with id `mode` and category `mode`. Each entry's description names its
+routed `provider/model` and permission mode. The extra id `mini-agent:none`
+selects no prompt: the session then runs on the startup selection with the
+operator-configured mode, as before persona routing. A client switches persona
+with `session/set_mode {modeId}` or `session/set_config_option {configId:
+"mode", value}`; the server answers the other selector with a
+`current_mode_update` or `config_option_update` notification. A switch applies
+from the next prompt; a turn already running keeps its persona.
+
+Persona routing never substitutes a provider. A switch whose route names a
+quick model that does not exist, a provider that is not configured, or a
+provider whose credential cannot be resolved is refused with a JSON-RPC error
+and the session keeps its current persona. When the active prompt's route
+becomes unusable (for example the default prompt routes to a provider without
+its key), every `session/prompt` fails with a bounded JSON-RPC error that names
+the prompt, quick model and provider but never a credential value, and no
+model is called. A persona that requests a permission mode while permission
+checks are disabled (`--dangerously-skip-permissions` with tools enabled) is
+refused the same way, because the mode could not be enforced.
+
 `session/new` accepts up to eight entries from the client's `mcpServers` list.
 Each stdio entry is connected for every tool-enabled prompt in that session
 alongside the configured `mcp_servers`. It uses an absolute `command`, the
@@ -2757,6 +2922,9 @@ permission choices, read proofs, hidden redo, instruction receipts or a question
 waiter. The VS Code command **Mini Agent: Resume Saved Session** selects from this
 workspace catalogue, closes the old conversation, and uses public ACP load/prompt
 requests with exact session-ID update routing. An active prompt blocks switching.
+**Mini Agent: Select Persona** lists the `mode` session config option that new and loaded
+sessions advertise and sends `session/set_config_option`; the persona and its
+`[prompt_to_model]` route apply from the next prompt, and an active prompt blocks the switch.
 
 Available commands are `/compact`, `/undo`, `/rename` and, with the goal feature,
 `/goal`. Only one original Text block can select a local command; resources,
@@ -2855,7 +3023,7 @@ same binding. Concurrent ACP sessions may therefore use different roots
 without changing or inheriting the server process working directory.
 Hooks follow the same rule: each ACP turn binds hook dispatch (prompt submit,
 tool hooks, `Stop`, and subagent hooks, including nested agent work) to its
-own session workspace, so `$ZEROSTACK_PROJECT_DIR`, the hook's working
+own session workspace, so `$MINI_AGENT_PROJECT_DIR`, the hook's working
 directory, and content-binding checks name that session's root even while
 sessions in other workspaces run concurrently. The process-wide hook root is
 only a fallback for dispatch outside a workspace-bound turn: it names the
@@ -2882,9 +3050,11 @@ closed. See [COMMANDS.md](COMMANDS.md#cron).
 TCP mode always fails closed unless an authentication key is available. The
 key is resolved in this order:
 
-1. The non-empty `MINI_AGENT_ACP_API_KEY` environment variable.
-2. The non-empty `api_key` from a TCP entry in `acp_servers` whose `host` and
+1. The `MINI_AGENT_ACP_API_KEY` environment variable.
+2. The `api_key` from a TCP entry in `acp_servers` whose `host` and
    `port` exactly match the resolved listener endpoint.
+
+The resolved key must contain at least 32 bytes; shorter values fail startup.
 
 Environment configuration is recommended so the secret is not stored in the
 configuration file. Restart the server after rotating the key. Stdio mode does
@@ -2965,7 +3135,7 @@ same spelling applies in TOML, YAML and JSON. Most keys are snake_case
 (`default_permission_mode`, `accept_all`, `max_tokens`); the permission,
 sandbox, JS, built-in MCP toggle, worktree and auto-update keys are kebab-case
 (`permission-allow`, `permission-ask`, `permission-deny`, `permission-regex`,
-`permission-modes`, `sandbox-backend`, `windows-appcontainer-read-roots`,
+`permission-modes`, `sandbox-backend`, `sandbox-profile`, `sandbox-toolchain-roots`, `sandbox-read-roots`, `sandbox-write-roots`, `windows-appcontainer-read-roots`,
 `windows-appcontainer-write-roots`, `js-fetch-origins` and the other `js-*`
 keys, `enable-exa-mcp`, `enable-context7-mcp`, `enable-grepapp-mcp`,
 `wt-auto-merge`, `wt-base-dir`, `auto-update-prompts`, `auto-update-themes`).
@@ -3072,9 +3242,9 @@ ignored and the current mode is kept. Ranking from least to most permissive:
 Prompts are loaded from three sources and the source decides whether directives
 are honored at all. Embedded prompts and the user's own prompts
 directory are trusted like the global config. Prompts from the project's
-`.zerostack/prompts/` are repository content: their `%%mode=`, `%%agent=`, and `%%next=`
+`.mini-agent/prompts/` are repository content: their `%%mode=`, `%%agent=`, and `%%next=`
 directives are dropped (with a warning) unless the project's
-`.zerostack/config.toml` has
+`.mini-agent/config.toml` has
 been explicitly trusted through the project-config trust store described
 under Trust model; `%%mode=last_user_mode` is always kept because it can
 only restore the user's selection.
@@ -3107,13 +3277,13 @@ are replaced when prompts are loaded:
 | --- | --- |
 | `{{config_file}}` | The global config file in use (first existing of `config.toml`, `config.yaml`, `config.yml`, `config.json` in the config root, else `config.toml`) |
 | `{{config_dir}}` | The global config root |
-| `{{project_config_file}}` | `<workspace>/.zerostack/config.toml` for the bound workspace |
+| `{{project_config_file}}` | `<workspace>/.mini-agent/config.toml` for the bound workspace |
 | `{{docs_dir}}` | The installed documentation root (`<data-dir>/docs`) |
 | `{{agent_docs_dir}}` | The installed copy of these guides (`<data-dir>/docs/agent`) |
 | `{{prompts_dir}}` | The user prompts directory |
 
 Unknown `{{...}}` text is left as written. Project prompts
-(`.zerostack/prompts/`) are never rendered.
+(`.mini-agent/prompts/`) are never rendered.
 
 ### Built-in scoped grants
 
@@ -3210,6 +3380,13 @@ With this config:
 When you run `/prompt default` (clearing the active prompt), the model
 reverts to the session's default model (from `model` / `provider` config
 or `--quick-model`).
+
+ACP sessions apply the same mapping to `default_prompt` (or `--load-prompt`)
+and to every `session/set_mode` or `session/set_config_option` switch (see the
+ACP section). Unlike the TUI, which keeps the current provider when a mapped
+provider's client cannot be created, ACP refuses the switch or the prompt
+instead of falling back, and an alias that names no quick model is refused
+rather than ignored.
 
 The model switch writes a line to chat:
 `switched to model: glm-52 (from prompt 'plan')`
@@ -3588,12 +3765,23 @@ change model-visible tool output or continuation history.
 mini-agent uses the `tracing` framework for structured logging. By default, only
 warnings and errors are printed to stderr at the `warn` level (with the `rig`
 crate silenced). Full debug and trace output is available via CLI flags.
-In the interactive TUI, diagnostics emitted while the alternate screen is active
-appear in the chat feed, so they do not overwrite the input prompt. The feed
-holds up to 256 pending records of at most 4 KiB each and reports how many
-additional records were omitted during a burst. Startup and suspended editor
-or pager output continues to use stderr. Headless and ACP output also uses
-stderr. File logging remains independent of these display limits.
+In the interactive TUI, tracing output never reaches the terminal while the TUI
+owns it (including while it is suspended for an external editor or pager):
+a log line would otherwise be painted between rendered rows. Those records go
+only to the `-v` / `--log-file` file layer; without one they are discarded, so
+use `-v` (or `--log-file`) to inspect warnings from an interactive session.
+Records emitted before the TUI attaches or after it exits still use stderr.
+Headless print mode (`-p`), loop mode and ACP have no TUI and keep writing
+records that pass `--log-level` / `RUST_LOG` to stderr, which stays separate
+from the printed response on stdout. User-facing notices that must be seen
+(for example the sandbox fallback notice) are rendered by the TUI itself, not
+through tracing.
+
+Errors a tool returns to the model for an invalid or out-of-policy request
+(for example an unbounded `read` of a file over the size cap, a `write` that
+is too large or targets an existing file, or a shell command that exits
+non-zero or hits a resource limit) are logged at `debug`, not `warn`: the model
+already receives the error, so they are not operator warnings.
 
 ### Verbose mode (`-v` / `--verbose`)
 
@@ -3602,8 +3790,8 @@ mini-agent -v
 ```
 
 Enables full trace-level logging to a timestamped log file below the state
-root's `logs/` directory (`ZS_STATE_DIR` overrides the state root). The log
-file is named `zerostack-YYYY-MM-DD_HH-MM-SS_<pid>.log`. A new file is created
+root's `logs/` directory (`MINI_AGENT_STATE_DIR` overrides the state root). The log
+file is named `mini-agent-YYYY-MM-DD_HH-MM-SS_<pid>.log`. A new file is created
 per instance — previous runs are never overwritten.
 
 With `-v`, visible diagnostic output stays at the default `warn` level. The
@@ -3641,14 +3829,14 @@ RUST_LOG=mini_agent::agent::tools=trace mini-agent  # trace only tool execution
 ```
 
 The crate's tracing target is the crate name, `mini_agent` (the `mini-agent`
-package name with `-` mapped to `_`), not `zerostack`; only the explicit audit
-events use `zerostack::audit::*` targets.
+package name with `-` mapped to `_`), not `mini-agent`; only the explicit audit
+events use `mini_agent::audit::*` targets.
 
 Priority (highest wins): `--log-level` > `RUST_LOG` env > default `warn,rig=off`.
 
 The `-v` / `--log-file` file layer is not affected by `RUST_LOG`: it always
-uses `mini_agent=trace,zerostack=trace,rig=off`, so every event from this
-crate plus the `zerostack::audit::*` targets reaches the file.
+uses `mini_agent=trace,rig=off`, so every event from this crate, including the
+`mini_agent::audit::*` targets, reaches the file.
 
 ### Logged subsystems
 
@@ -3719,7 +3907,7 @@ is not a full raw-file read. See [Notebook cells](TOOL_RUNTIME.md#notebook-cells
 for the bounded format and output limits.
 
 Instruction-only Agent Skills are available with the default `agent-skills` Cargo feature. Their
-captured project sources share the existing `.zerostack/config.toml` trust approval; no new trust
+captured project sources share the existing `.mini-agent/config.toml` trust approval; no new trust
 file or `allowed-tools` permission authority exists. Imported selections and all compatibility skill roots share a 64-package ceiling. Directory roots share a scan
 budget of 1,024 entries, depth 8, 48 KiB per `SKILL.md`, 1 MiB per resource and 8 MiB of
 content. Selected instruction bodies share a 48 KiB budget, referenced resources 32 KiB, and the

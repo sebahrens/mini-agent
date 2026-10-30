@@ -42,6 +42,11 @@ This is the single canonical checklist for Phase 6 containment. Agent instructio
 6. Worker stdout is protocol-only. Production results, logs, and diagnostics expose only closed error classes/codes and validated source-free stage/script-role metadata—never arbitrary exception messages, stacks, thrown values, source snippets, effect results, prompts, contents, or secrets.
 7. Stored-skill source initialization has no effects and no writer API. Parent policy remains authoritative even when every worker-supplied identity or attribution field is malicious.
 
+Model-script error guidance uses a closed `JsDiagnosticHint` enum (collection property,
+top-level return, unavailable global). The worker may classify its inspected exception locally,
+but no exception text crosses the protocol or appears in parent rendering. Unknown diagnostic
+fields, including a forged `message`, are rejected.
+
 ## Threat model
 
 Generated, retrieved, proposed, inherited, mutation-test, and held-out JavaScript is untrusted.
@@ -236,9 +241,22 @@ an old process cannot enter its protocol stream.
 
 On Unix, a worker exit caused by `SIGXCPU` (or its shell-compatible `128 + SIGXCPU` status) is a
 closed native-resource fault rather than a generic transport fault. The supervisor recycles the
-process, and skill verification maps it to source evaluation failure. This keeps an infinite source
-deterministic when the reused process reaches its cumulative 35-second native CPU ceiling before
-the request-local QuickJS interrupt can serialize its normal timeout diagnostic.
+process, and skill verification maps it to source evaluation failure. On Linux the worker's
+`RLIMIT_CPU` is armed with soft equal to hard (deliberate hardening: the worker can never raise its
+own soft limit past the ceiling), so the kernel's hard-limit action fires instead of its soft-limit
+one and the process receives a plain `SIGKILL` at the cumulative 35-second native CPU ceiling, not
+`SIGXCPU`. Before handing a reused idle worker another invocation, the supervisor reads its
+cumulative CPU time (`utime`+`stime` from `/proc/<pid>/stat`) and retires it — through the same
+path as an invocation-count or age retirement — once that time is within one step's worst-case CPU
+budget of the ceiling, so that a step which is admitted can never cross the ceiling mid-flight; the
+read is fail-closed, so a worker whose CPU time cannot be read is never reused. That same
+pre-invocation CPU sample is the evidence the supervisor uses to classify a plain `SIGKILL`: a kill
+is mapped to the closed `NativeCpuLimit` fault only when the dying worker's last sample was already
+within that margin of the ceiling, which keeps an infinite source deterministic when the reused
+process reaches the ceiling before the request-local QuickJS interrupt can serialize its normal
+timeout diagnostic. A `SIGKILL` with no such evidence (including every first-ever invocation on a
+freshly launched worker, which cannot reach the ceiling within one step) keeps its prior generic
+transport classification.
 
 Background skill verification enters one bounded FIFO queue owned by that same supervisor; it
 never starts a verifier process or worker pool. Interactive `RunStep` callers have priority while
@@ -489,7 +507,8 @@ still sends a distinct `RunStep`; the worker creates and destroys a fresh bounde
 context exactly as it does for the full profile. No QuickJS state or handle enters the parent.
 
 The authenticated request selects the closed `read_only` effect profile. The worker installs
-`read_file`, `list_dir`, and `grep` and omits `read_files`, `glob`, `write_file`, `fetch`, `spawn`,
+`read_file`, `read_lines`, `list_dir`, and `grep` (plus the pure `splitLines` and `json_exact`
+helpers) and omits `read_files`, `glob`, `write_file`, `fetch`, `spawn`,
 `result`, scratch state, and proposal globals. Independently, the parent issues a model grant and
 session capability set containing only `read_file`; the normal workspace-bound `AllowConfig`,
 permission bridge, deadline, cancellation, and durable audit paths still authorize each read.
@@ -683,6 +702,14 @@ already have happened, this fail-closed rule means no continuation or replay, no
 non-occurrence. Deterministic verification fakes write their verification transcript, not
 production effect-audit records.
 
+Reaching the configured segment ceiling returns the distinct retention-limit error and continues
+to deny new effects, but it does not poison the writer as a durability failure. An operator may
+archive and remove every segment file while no writer holds the lock; the next process start then
+creates a fresh zero-anchored chain even though the state-root initialization marker remains.
+Removing only part of a chain, changing a retained record, or losing the target-correlation key
+continues to fail closed. The archived chain is operational evidence and remains subject to the
+operator's retention policy; it is not consulted as authorization for the fresh generation.
+
 Authorization, intent, and completion records are evidence, not permission tokens. Recovery never
 turns an old record into a live grant, silently fills a missing completion, or replays an effect.
 
@@ -712,7 +739,10 @@ unavailable.
 The Linux launcher is a dedicated broker-only bubblewrap profile, not the general command
 sandbox. It starts from an empty root, mounts only the exact worker executable and the exact
 root-owned, non-group/other-writable regular system files already mapped into the parent runtime
-(shared objects need not carry an executable mode bit), creates private
+(shared objects need not carry an executable mode bit), plus only the root-owned loader-visible
+SONAME aliases that resolve to those same mapped files. Alias discovery scans a bounded set of
+trusted runtime directories and fails closed on untrusted paths, enumeration errors, or file and
+directory-entry ceilings; it never mounts a broad host library directory. The launcher creates private
 proc/dev/tmp views, clears the environment, closes non-protocol descriptors, and requests user, PID,
 network, IPC, UTS, and (where supported) cgroup namespaces while dropping every capability. After
 the authenticated `Hello` and before `Ready`, the already-exec'd worker applies
@@ -731,7 +761,9 @@ listeners even inside its isolated network namespace. Any trusted-path, namespac
 `no_new_privs`, or seccomp failure emits no `Ready`; there is no unconfined retry. Availability is
 cached only after an actual namespace/limit/seccomp preflight succeeds.
 
-The ignored `linux_js_worker_containment` probe is the runtime evidence gate. It must run on a real
+The ignored `linux_js_worker_containment` probe is the runtime evidence gate, and the ignored
+`loaded_runtime_closure_keeps_loader_visible_soname_aliases` test separately proves that the
+host closure retains a loader-visible shared-object alias. Both must run on a real
 Linux host with trusted bubblewrap and must be listed explicitly before execution so a cfg error
 cannot produce a zero-test success. macOS development can verify source ordering, owned teardown,
 and fail-closed construction, but cannot claim this Linux runtime evidence. The real gate requires
@@ -1070,8 +1102,12 @@ sends the closed connection-scoped `ContainmentProbe`; the child reports only `P
 self-checking AppContainer plus less-privileged token state, zero capability groups, three distinct
 valid pipe standard handles, and no console, window, or device authority. The parent then requires
 `6 * 7` to evaluate to `42`, performs the closed shutdown, and requires successful exit. Any
-failure or timeout becomes one fixed source-free unavailable reason. Later public launch never
-retries under a weaker token or an uncontained launcher.
+failure or timeout becomes the fixed source-free unavailable reason `Windows LPAC production
+runtime preflight failed`, optionally followed by `: ` and the trusted parent's own gate detail
+(for example the helper exit code and Job process count). That detail is control-character
+sanitized and bounded to 512 characters; it is never derived from worker output, JavaScript
+source, or diagnostics. Later public launch never retries under a weaker token or an uncontained
+launcher.
 
 The caller's five-second wait starts before profile/ACL preparation and the global creation-lock
 wait. The launcher propagates that absolute deadline and checks it immediately after acquiring the
@@ -1410,6 +1446,14 @@ bead is closed with its required regression tests, so all items are part of the 
    and checks the shared invocation cancellation/deadline between entries and file reads.
    Entries hidden by `read`/`js/read_file` or the effect's own path deny rules are omitted and
    denied directories pruned (mini-agent-c1o7m; see Capability broker).
+4a. **Ranged line reads and pure helpers** (mini-agent-u9xgn, q4uvl, h0hgk). `read_lines(path, from,
+   count?)` is the typed `read_lines` effect: a `read` capability effect narrowed, permission-checked
+   (`js/read_file`, `js-read-roots`) and audited exactly like `read_file`, one effect per call. The
+   parent streams the file instead of loading it: at most 64 MiB scanned, `count` <= 10,000, about
+   1 MiB of text returned (then `eof=false`), lines cut at 64 KiB, `\r\n` stripped, no phantom line
+   after a final newline; negative `from` returns the last N lines. `splitLines(text)` and
+   `json_exact(text)` are effect-free worker-side helpers (`pure_helpers.js`); `json_exact` returns
+   integers beyond +/-2^53 as BigInt because `JSON.parse` silently rounds them.
 5. **Batched effects** (mini-agent-ae65, delivered). `read_files([paths])` is one effect request carrying one
    intent and one completion record, while every path is narrowed, permission-checked, and bounded
    before any content is read. It accepts 1–256 paths with at most 1 MiB aggregate path text and
@@ -1582,3 +1626,59 @@ echoes exception messages unless the script catches and returns them. Coverage:
 `file_root_denials_carry_a_closed_reason_without_changing_the_code` (broker),
 `denial_reasons_extend_the_message_without_changing_the_code` (worker realm) and
 `contained_worker_read_file_denial_message_names_closed_reason` (contained worker).
+
+## Delivered corrections (2026-10-22 launch-thread fix)
+
+`mini-agent-hdl3i`: the Linux production launch's `Command::spawn()` of bwrap now runs on a
+dedicated, process-lifetime thread (`src/sandbox/spawner.rs`) instead of the transient
+`mini-agent-js-worker-launch` thread that delivers the `WorkerProcess` and exits. This is purely an
+implementation detail of invariant 1's "one parent-created, contained worker process"; no invariant,
+wire behavior, or launch-lease/cancellation semantics in "Worker lifecycle" above changes.
+
+Root cause: Linux's `PR_SET_PDEATHSIG`, which bubblewrap's `--die-with-parent` installs during its
+own startup, is delivered when the OS *thread* that forked the child exits, not when the owning
+process exits (`man 2 prctl`). The transient launch thread used to call `Command::spawn()` and then
+exit almost immediately after handing off the `WorkerProcess`. If bwrap finished installing its
+parent-death signal before that thread's ordinary exit, the kernel's `do_exit()` path for the
+now-dead launch thread walked its children, found bwrap, and delivered `SIGKILL` right there — which
+also tears down the worker inside bwrap's PID namespace. If bwrap's `prctl()` call instead lost that
+race (the launch thread had already exited and been reparented first), the worker was unaffected.
+The outcome is inherently timing-dependent, so it surfaced as the intermittent
+`linux-sandbox-policy:js_worker_resource_benchmark` `JS_TEST_WORKER_EXIT class=signal_kill` flake
+rather than a deterministic failure.
+
+Evidence: a standalone minimal reproduction (`bwrap --ro-bind / / --unshare-pid --die-with-parent --
+sleep N`, spawned from a short-lived `std::thread` that exits immediately after `Command::spawn()`
+returns) was independently killed in roughly 1 of 6 runs on the development host, confirming the
+race is real there. The same command spawned instead from a dedicated thread that never exits
+(the pattern `src/sandbox/spawner.rs` implements) survived every run. Against the full production
+`broker_only_command` (many more namespaces and binds than the minimal repro), the added real-worker
+regression test below did not itself reproduce a kill in roughly 80 pre-fix attempts on this host;
+the additional bwrap setup work apparently delays its `--die-with-parent` `prctl()` call enough,
+relative to this host's scheduling of the minimal-work Rust launch thread, that the race is rarely
+hit here even pre-fix. This matches the bead's own characterization of the bug as intermittent and
+worse under contention (observed on hosted CI runners), not a claim that the fix is unverifiable:
+the minimal repro isolates the exact kernel mechanism and shows the fix removes it deterministically,
+independent of how much setup work the spawned `--die-with-parent` child performs first.
+
+The fix is Linux-only (`#[cfg(all(feature = "js", target_os = "linux"))]`): `src/sandbox/spawner.rs`
+lazily starts one named (`mini-agent-js-worker-spawner`) thread on first use, backed by a channel the
+rest of the process holds for its lifetime, and routes only the `Command::spawn()` syscall for the
+bwrap launch through it; the surrounding `launch_executable` logic (containment-status check,
+trusted-bwrap/executable resolution, pipe wiring) stays on its existing caller. If the spawner
+thread fails to start, has disconnected, or does not reply, the launch fails closed with an I/O
+error; there is no fallback to spawning on the caller's thread, which would silently reintroduce the
+exact race. `supervisor.rs`'s launch-thread/launch-lease/cancellation machinery, the audited other
+`--die-with-parent` sites in `sandbox.rs` (general sandboxed tool/hook commands, all of which spawn
+synchronously inside an `async fn` running on a persistent Tokio executor thread rather than a
+transient one), and `linux.rs`'s preflight/probe spawns (which block their spawning thread until the
+probe child has already exited) are unaffected; none of them exits its spawning thread while a
+`--die-with-parent` child is still meant to be running.
+
+Coverage: `sandbox::spawner::tests::every_spawn_runs_on_the_same_dedicated_thread` is a deterministic
+unit test that every spawn — including ones requested from distinct, transient caller threads that
+exit immediately — runs on one stable, named, long-lived thread.
+`extras::js::tests::worker_containment::linux_js_worker_survives_transient_launch_thread_exit` is an
+ignored, real-backend regression, gated like `linux_js_worker_containment`, that launches through
+the real production path from a transient thread which then exits, waits past the race window, and
+asserts the worker is still alive, repeated 20 times.

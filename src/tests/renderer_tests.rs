@@ -8,7 +8,10 @@ use crate::ui::renderer::{
 
 #[cfg(unix)]
 mod desktop_process_tests {
-    use crate::ui::renderer::{open_url_with_commands, run_clipboard_command};
+    use crate::ui::renderer::{
+        open_url_with_commands, run_clipboard_command, url_opener_prefix_args, url_opener_programs,
+        wsl_markers_present,
+    };
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     use std::path::PathBuf;
@@ -76,6 +79,34 @@ mod desktop_process_tests {
     /// waits only poll for an event that must happen, so they can be generous
     /// for loaded CI runners without weakening any behavioural bound.
     const FIXTURE_OBSERVATION: Duration = Duration::from_secs(15);
+
+    #[test]
+    fn wsl_uses_only_windows_browser_openers() {
+        assert!(wsl_markers_present(true, false, None));
+        assert!(wsl_markers_present(false, true, None));
+        assert!(wsl_markers_present(
+            false,
+            false,
+            Some("6.6.87.2-microsoft-standard-WSL2")
+        ));
+        assert!(!wsl_markers_present(false, false, Some("6.8.0-generic")));
+        assert_eq!(
+            url_opener_programs(true),
+            [
+                "/mnt/c/Windows/System32/rundll32.exe",
+                "rundll32.exe",
+                "/mnt/c/Windows/explorer.exe",
+                "explorer.exe"
+            ]
+        );
+        assert_eq!(
+            url_opener_prefix_args("/mnt/c/Windows/System32/rundll32.exe"),
+            ["url.dll,FileProtocolHandler"]
+        );
+        assert!(url_opener_prefix_args("/mnt/c/Windows/explorer.exe").is_empty());
+        assert!(!url_opener_programs(true).contains(&"xdg-open"));
+        assert_eq!(url_opener_programs(false), ["xdg-open", "open"]);
+    }
 
     async fn assert_reaped(pid: i32) {
         tokio::time::timeout(FIXTURE_OBSERVATION, async {
@@ -1361,5 +1392,326 @@ mod paint_sanitisation_tests {
                 .any(|link| link.starts_with("https://ok.example"));
         }
         assert!(saw_link, "hyperlinks must still render");
+    }
+}
+
+/// mini-agent-ay2rm: tool results render as a compact, foldable summary.
+mod tool_output_folding {
+    use crate::config::{Config, ResolvedToolOutput, ShowToolDetails, ToolOutputMode};
+    use crate::ui::feed::{Block, BlockStyle, Feed};
+    use crate::ui::renderer::Renderer;
+    use crate::ui::tool_output::{
+        FoldTarget, fold_command, looks_like_error, parse_fold_target, tool_result_view,
+    };
+
+    fn long_output() -> String {
+        (1..=126)
+            .map(|n| format!("{n:>4}| line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn collapsed_is_the_default_and_preview_is_opt_in() {
+        assert_eq!(
+            Config::default().resolve_tool_output(),
+            ResolvedToolOutput::Collapsed
+        );
+        let preview = Config {
+            tool_output: Some(ToolOutputMode::Preview),
+            ..Default::default()
+        };
+        assert_eq!(
+            preview.resolve_tool_output(),
+            ResolvedToolOutput::Preview(3)
+        );
+        let preview_five = Config {
+            tool_output: Some(ToolOutputMode::Preview),
+            show_tool_details: Some(ShowToolDetails::Lines(5)),
+            ..Default::default()
+        };
+        assert_eq!(
+            preview_five.resolve_tool_output(),
+            ResolvedToolOutput::Preview(5)
+        );
+        let full = Config {
+            tool_output: Some(ToolOutputMode::Full),
+            ..Default::default()
+        };
+        assert_eq!(full.resolve_tool_output(), ResolvedToolOutput::Full);
+        // tool_output wins over the legacy key.
+        let collapsed = Config {
+            tool_output: Some(ToolOutputMode::Collapsed),
+            show_tool_details: Some(ShowToolDetails::Bool(true)),
+            ..Default::default()
+        };
+        assert_eq!(
+            collapsed.resolve_tool_output(),
+            ResolvedToolOutput::Collapsed
+        );
+    }
+
+    #[test]
+    fn legacy_show_tool_details_keeps_its_meaning_without_tool_output() {
+        let cases = [
+            (ShowToolDetails::Lines(3), ResolvedToolOutput::Preview(3)),
+            (ShowToolDetails::Lines(0), ResolvedToolOutput::Collapsed),
+            (ShowToolDetails::Bool(true), ResolvedToolOutput::Full),
+            (ShowToolDetails::Bool(false), ResolvedToolOutput::Collapsed),
+        ];
+        for (legacy, expected) in cases {
+            let cfg = Config {
+                show_tool_details: Some(legacy),
+                ..Default::default()
+            };
+            assert_eq!(cfg.resolve_tool_output(), expected, "{legacy:?}");
+        }
+    }
+
+    #[test]
+    fn tool_output_parses_from_yaml_and_toml() {
+        let yaml: Config = serde_yaml_ng::from_str("tool_output: preview\n").unwrap();
+        assert_eq!(yaml.tool_output, Some(ToolOutputMode::Preview));
+        let toml: Config = toml::from_str("tool_output = \"full\"\n").unwrap();
+        assert_eq!(toml.tool_output, Some(ToolOutputMode::Full));
+        assert!(serde_yaml_ng::from_str::<Config>("tool_output: loud\n").is_err());
+    }
+
+    #[test]
+    fn collapsed_result_is_one_summary_line_that_unfolds_to_everything() {
+        let output = long_output();
+        let view = tool_result_view(&output, false, ResolvedToolOutput::Collapsed);
+        assert!(view.foldable());
+        assert!(!view.start_expanded);
+        assert_eq!(view.collapsed.lines().count(), 1, "{}", view.collapsed);
+        assert!(view.collapsed.contains("126 lines"), "{}", view.collapsed);
+        assert!(view.collapsed.contains('▸'), "{}", view.collapsed);
+        assert!(!view.collapsed.contains("line 1"), "{}", view.collapsed);
+        assert!(view.expanded.contains('▾'));
+        assert!(view.expanded.contains("   1| line 1"));
+        assert!(view.expanded.contains(" 126| line 126"));
+    }
+
+    #[test]
+    fn short_single_line_result_is_shown_inline_and_not_foldable() {
+        let view = tool_result_view("ok: 3 files", false, ResolvedToolOutput::Collapsed);
+        assert!(!view.foldable());
+        assert_eq!(view.initial(), "  ⎿ ok: 3 files");
+        let empty = tool_result_view("\n", false, ResolvedToolOutput::Collapsed);
+        assert_eq!(empty.initial(), "  ⎿ (no output)");
+    }
+
+    #[test]
+    fn errors_stay_visible_with_their_first_line() {
+        let output = "Error: file not found: src/x.rs\nhint: check the path\nmore";
+        let view = tool_result_view(output, true, ResolvedToolOutput::Collapsed);
+        assert_eq!(view.collapsed.lines().count(), 1);
+        assert!(
+            view.collapsed
+                .starts_with("  ✗ Error: file not found: src/x.rs"),
+            "{}",
+            view.collapsed
+        );
+        assert!(view.collapsed.contains("3 lines"), "{}", view.collapsed);
+        assert!(view.expanded.contains("hint: check the path"));
+        // A one-line error shows in full with no size suffix.
+        let single = tool_result_view("Error: denied", true, ResolvedToolOutput::Collapsed);
+        assert_eq!(single.collapsed, "  ✗ Error: denied");
+        // A very long first line is cut.
+        let long = format!("Error: {}", "x".repeat(300));
+        let cut = tool_result_view(&long, true, ResolvedToolOutput::Collapsed);
+        assert!(cut.collapsed.contains('…'), "{}", cut.collapsed);
+        assert!(cut.collapsed.chars().count() < 140, "{}", cut.collapsed);
+    }
+
+    #[test]
+    fn replayed_errors_are_recognised_by_their_text() {
+        assert!(looks_like_error("Error: boom"));
+        assert!(looks_like_error("  error reading file"));
+        assert!(looks_like_error("Permission denied by user"));
+        assert!(!looks_like_error("File: src/main.rs (10 lines)"));
+    }
+
+    #[test]
+    fn preview_shows_the_first_lines_until_unfolded() {
+        let output = long_output();
+        let view = tool_result_view(&output, false, ResolvedToolOutput::Preview(3));
+        let lines: Vec<&str> = view.collapsed.lines().collect();
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert!(lines[1].contains("line 1"));
+        assert!(lines[3].contains("line 3"));
+        assert!(lines[4].contains("123 more lines"), "{lines:?}");
+        assert!(view.expanded.contains("line 126"));
+        // Output that fits the preview has nothing left to unfold.
+        let small = tool_result_view("a\nb", false, ResolvedToolOutput::Preview(3));
+        assert!(!small.foldable());
+        assert!(small.initial().ends_with("a\nb"), "{}", small.initial());
+    }
+
+    #[test]
+    fn full_mode_starts_unfolded_but_can_be_folded() {
+        let view = tool_result_view(&long_output(), false, ResolvedToolOutput::Full);
+        assert!(view.start_expanded);
+        assert!(view.foldable());
+        assert!(view.initial().contains("line 126"));
+    }
+
+    #[test]
+    fn tool_result_text_is_sanitized() {
+        let view = tool_result_view(
+            "a\x1b]52;c;SGk=\x07b\nline two",
+            false,
+            ResolvedToolOutput::Full,
+        );
+        assert!(!view.expanded.contains('\x1b'), "{:?}", view.expanded);
+        assert!(!view.expanded.contains("SGk="), "{:?}", view.expanded);
+    }
+
+    fn feed_with_results(count: usize) -> Feed {
+        let mut feed = Feed::new();
+        for n in 1..=count {
+            let id = format!("call-{n}");
+            feed.push_anchored_block(&id, BlockStyle::Tool, format!("◈ read \"f{n}\""));
+            let view = tool_result_view(
+                &format!("result {n}\n{}", long_output()),
+                false,
+                ResolvedToolOutput::Collapsed,
+            );
+            feed.place_block_after_anchor(
+                &id,
+                Block::foldable(
+                    BlockStyle::ToolResult,
+                    view.collapsed,
+                    view.expanded,
+                    view.start_expanded,
+                ),
+            );
+        }
+        feed
+    }
+
+    fn rows(feed: &Feed) -> Vec<String> {
+        let lines = feed.lines(80);
+        (0..lines.len())
+            .map(|i| lines[i].text.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn folding_toggles_the_latest_or_nth_result_in_place() {
+        let mut feed = feed_with_results(3);
+        assert_eq!(feed.fold_count(), 3);
+        let collapsed_rows = feed.lines(80).len();
+        assert_eq!(collapsed_rows, 6, "one call row and one summary row each");
+
+        assert_eq!(feed.set_fold(1, None), Some(true));
+        assert_eq!(feed.fold_expanded(1), Some(true));
+        assert_eq!(feed.fold_expanded(2), Some(false));
+        let rows = rows(&feed);
+        assert!(rows.iter().any(|row| row == "result 3"), "{rows:?}");
+        assert!(!rows.iter().any(|row| row == "result 1"), "{rows:?}");
+        assert!(rows.len() > collapsed_rows);
+
+        // Toggling again folds it back.
+        assert_eq!(feed.set_fold(1, None), Some(false));
+        assert_eq!(feed.lines(80).len(), collapsed_rows);
+
+        // The 3rd latest is the first call.
+        assert_eq!(feed.set_fold(3, Some(true)), Some(true));
+        assert_eq!(feed.fold_expanded(3), Some(true));
+        assert_eq!(feed.set_fold(4, Some(true)), None);
+        assert_eq!(feed.set_fold(0, Some(true)), None);
+    }
+
+    #[test]
+    fn expand_all_and_collapse_all_report_what_changed() {
+        let mut feed = feed_with_results(3);
+        feed.set_fold(2, Some(true));
+        assert_eq!(feed.set_all_folds(true), 2);
+        assert_eq!(feed.set_all_folds(true), 0);
+        assert_eq!(feed.set_all_folds(false), 3);
+        assert_eq!(feed.fold_expanded(1), Some(false));
+    }
+
+    #[test]
+    fn folding_bumps_the_generation_so_the_chat_redraws() {
+        let mut feed = feed_with_results(1);
+        let before = feed.generation();
+        feed.set_fold(1, Some(true));
+        assert!(feed.generation() > before);
+        let unchanged = feed.generation();
+        feed.set_fold(1, Some(true));
+        assert_eq!(feed.generation(), unchanged, "a no-op must not redraw");
+    }
+
+    #[test]
+    fn clicking_a_summary_row_toggles_only_that_result() {
+        let mut feed = feed_with_results(2);
+        // Rows: call-1, summary-1, call-2, summary-2.
+        assert_eq!(feed.toggle_fold_at_line(80, 0), None, "a call row");
+        assert_eq!(feed.toggle_fold_at_line(80, 1), Some(true));
+        assert_eq!(feed.fold_expanded(2), Some(true));
+        assert_eq!(feed.fold_expanded(1), Some(false));
+        // A body row of the unfolded result is not a toggle.
+        assert_eq!(feed.toggle_fold_at_line(80, 3), None);
+        let summary_2 = feed.lines(80).len() - 1;
+        assert_eq!(feed.toggle_fold_at_line(80, summary_2), Some(true));
+        assert_eq!(feed.toggle_fold_at_line(80, 1), Some(false));
+    }
+
+    #[test]
+    fn renderer_places_the_folded_result_under_its_call() {
+        let mut r = Renderer::new().unwrap();
+        r.feed_mut()
+            .push_anchored_block("a", BlockStyle::Tool, "◈ read \"a\"");
+        r.feed_mut()
+            .push_anchored_block("b", BlockStyle::Tool, "◈ read \"b\"");
+        let view = tool_result_view(&long_output(), false, ResolvedToolOutput::Collapsed);
+        r.write_tool_result("a", &view).unwrap();
+        assert_eq!(r.feed().block_text(1), Some(view.collapsed.as_str()));
+        assert_eq!(r.feed().block_count(), 3);
+        r.mark_chat_clean();
+        assert_eq!(r.set_tool_output_fold(1, None), Some(true));
+        assert!(r.chat_needs_redraw());
+        assert_eq!(r.feed().block_text(1), Some(view.expanded.as_str()));
+        assert_eq!(r.set_all_tool_output_folds(false), 1);
+        // A non-foldable result is a plain block.
+        let inline = tool_result_view("ok", false, ResolvedToolOutput::Collapsed);
+        r.write_tool_result("b", &inline).unwrap();
+        assert_eq!(r.feed().fold_count(), 1);
+    }
+
+    #[test]
+    fn retention_accounts_for_both_forms_of_a_folded_block() {
+        let mut feed = Feed::new();
+        let both = "short".len() + "a much longer form".len();
+        feed.place_block_after_anchor(
+            "",
+            Block::foldable(BlockStyle::ToolResult, "short", "a much longer form", false),
+        );
+        assert_eq!(feed.total_bytes_for_test(), both);
+        feed.set_fold(1, Some(true));
+        assert_eq!(feed.total_bytes_for_test(), both);
+    }
+
+    #[test]
+    fn fold_commands_parse_their_target() {
+        assert_eq!(fold_command("/expand"), Some((true, "")));
+        assert_eq!(fold_command("  /expand 3 "), Some((true, "3")));
+        assert_eq!(fold_command("/collapse all"), Some((false, "all")));
+        assert_eq!(fold_command("/expanded"), None);
+        assert_eq!(fold_command("/export x"), None);
+        assert_eq!(parse_fold_target(""), Ok(FoldTarget::Nth(1)));
+        assert_eq!(parse_fold_target("2"), Ok(FoldTarget::Nth(2)));
+        assert_eq!(parse_fold_target("all"), Ok(FoldTarget::All));
+        assert!(parse_fold_target("0").is_err());
+        assert!(parse_fold_target("latest").is_err());
+    }
+
+    #[test]
+    fn fold_commands_are_allowed_while_the_agent_runs() {
+        assert!(crate::ui::allowed_while_running("/expand"));
+        assert!(crate::ui::allowed_while_running("/collapse all"));
+        assert!(!crate::ui::allowed_while_running("/expandx"));
     }
 }

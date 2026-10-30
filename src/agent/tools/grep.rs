@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
+use std::path::Path;
 
 use regex::{Regex, RegexBuilder};
 use rig::tool::Tool;
 
-use super::find_files::{BoundDirectory, SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH};
+use super::find_files::{
+    BoundDirectory, BoundFile, SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH,
+};
 use crate::agent::tools::{
     AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_bound_path, check_perm_path,
     combine_coaching,
@@ -288,70 +291,103 @@ fn matched_source_lines(
     }
 }
 
-fn search_bound_directory(
-    bound_directory: BoundDirectory,
+/// What a grep call searches: a pinned directory tree, or one pinned regular
+/// file named explicitly as `path`.
+enum SearchTarget {
+    Directory(BoundDirectory),
+    File(BoundFile),
+}
+
+struct GrepSearch {
     re: Regex,
     include_re: Option<(Regex, bool)>,
     options: GrepSearchOptions,
-    cancellation: Option<crate::agent::runner::AgentWorkCancellation>,
-) -> Result<GrepSearchResult, ToolError> {
-    let mut walker = bound_directory
-        .walker()?
-        .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH)
-        .with_cancellation(cancellation);
-    // The include glob is evaluated on the name before a file is opened, so
-    // excluded files cost no open, fstat or read.
-    if let Some((re_include, path_aware)) = include_re {
-        walker = walker.with_file_filter(Box::new(move |relative_path, file_name| {
-            if path_aware {
-                re_include.is_match(&relative_path.to_string_lossy().replace('\\', "/"))
-            } else {
-                re_include.is_match(&file_name.to_string_lossy())
-            }
-        }));
-    }
-    let mut file_count = 0;
-    let mut files_with_matches = 0;
-    let mut results = Vec::with_capacity(options.max_results.min(64));
-    let mut emitted_results = 0_usize;
-    let mut limit_hit = false;
-    let mut work_limit_hit = false;
-    let mut remaining_bytes = MAX_SEARCH_TOTAL_BYTES;
-    let mut read_buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
+    file_count: usize,
+    files_with_matches: usize,
+    results: Vec<String>,
+    emitted_results: usize,
+    limit_hit: bool,
+    work_limit_hit: bool,
+    remaining_bytes: u64,
+    /// Reused across files so each read reuses one allocation.
+    read_buffer: Vec<u8>,
+}
 
-    for entry in walker.by_ref() {
-        if emitted_results >= options.max_results {
-            limit_hit = true;
-            break;
+impl GrepSearch {
+    fn new(re: Regex, include_re: Option<(Regex, bool)>, options: GrepSearchOptions) -> Self {
+        Self {
+            re,
+            include_re,
+            options,
+            file_count: 0,
+            files_with_matches: 0,
+            results: Vec::with_capacity(options.max_results.min(64)),
+            emitted_results: 0,
+            limit_hit: false,
+            work_limit_hit: false,
+            remaining_bytes: MAX_SEARCH_TOTAL_BYTES,
+            read_buffer: Vec::with_capacity(64 * 1024),
+        }
+    }
+
+    /// Search one file. `include_root` anchors path-aware include globs.
+    /// Returns `Break` once the result or work limit stops the search.
+    fn visit(&mut self, entry: BoundFile, include_root: &Path) -> ControlFlow<()> {
+        let options = self.options;
+        if self.emitted_results >= options.max_results {
+            self.limit_hit = true;
+            return ControlFlow::Break(());
+        }
+
+        // The walker already applies the include glob for a directory walk
+        // (see `search_target`), before a matching file is even opened; this
+        // check additionally covers an explicitly named single-file target,
+        // which bypasses the walker entirely.
+        if let Some((re_include, path_aware)) = &self.include_re {
+            let candidate = if *path_aware {
+                entry
+                    .path
+                    .strip_prefix(include_root)
+                    .unwrap_or(&entry.path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            } else {
+                entry.file_name.to_string_lossy().into_owned()
+            };
+            if !re_include.is_match(&candidate) {
+                return ControlFlow::Continue(());
+            }
         }
 
         if entry.metadata.len() > MAX_SEARCH_FILE_BYTES {
-            continue;
+            return ControlFlow::Continue(());
         }
 
         let capacity = entry.metadata.len() as usize;
         let mut file = entry.file;
         // Bind the read itself, not only the earlier metadata length: the file
         // may grow while its descriptor remains open.
-        let mut bounded = (&mut file).take(remaining_bytes);
-        let is_text =
-            GrepTool::read_non_binary(&mut bounded, &mut read_buffer, capacity).unwrap_or(false);
-        remaining_bytes = bounded.limit();
-        if remaining_bytes == 0 {
-            work_limit_hit = true;
-            break; // The final file may be only a prefix; never search that prefix.
+        let mut bounded = (&mut file).take(self.remaining_bytes);
+        let is_text = GrepTool::read_non_binary(&mut bounded, &mut self.read_buffer, capacity)
+            .unwrap_or(false);
+        self.remaining_bytes = bounded.limit();
+        if self.remaining_bytes == 0 {
+            self.work_limit_hit = true;
+            // The final file may be only a prefix; never search that prefix.
+            return ControlFlow::Break(());
         }
         if !is_text {
-            continue;
+            return ControlFlow::Continue(());
         }
-        file_count += 1;
-        let content = String::from_utf8_lossy(&read_buffer);
+        self.file_count += 1;
+        let re = &self.re;
+        let content = String::from_utf8_lossy(&self.read_buffer);
         // Whole-buffer rejection of files with no match, without splitting
         // lines. Per-line search is only a subset of whole-buffer matches when
         // the pattern has no anchors (line-relative `^`/`$` differ from
         // buffer-relative ones, and `\r` is stripped by `lines()`).
         if (options.multiline || prefilter_is_line_safe(re.as_str())) && !re.is_match(&content) {
-            continue;
+            return ControlFlow::Continue(());
         }
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
@@ -361,34 +397,35 @@ fn search_bound_directory(
             ranges: match_ranges,
             count: match_count,
             limit_hit: match_budget_hit,
-        } = matched_source_lines(&content, &lines, &re, options.multiline);
-        work_limit_hit |= match_budget_hit;
+        } = matched_source_lines(&content, &lines, re, options.multiline);
+        self.work_limit_hit |= match_budget_hit;
 
         if match_lines.is_empty() {
-            continue;
+            return ControlFlow::Continue(());
         }
-        files_with_matches += 1;
+        self.files_with_matches += 1;
         let path_str = entry.path.to_string_lossy().to_string();
 
         if options.files_only {
-            results.push(path_str);
-            emitted_results += 1;
-            continue;
+            self.results.push(path_str);
+            self.emitted_results += 1;
+            return ControlFlow::Continue(());
         }
         if options.count {
-            results.push(format!("{}:{}", path_str, match_count));
-            emitted_results += 1;
-            continue;
+            self.results.push(format!("{}:{}", path_str, match_count));
+            self.emitted_results += 1;
+            return ControlFlow::Continue(());
         }
 
         if options.context == 0 {
             for (match_index, &matched_line) in match_lines.iter().enumerate() {
                 let matched = match_ranges.get(&matched_line).cloned();
                 let displayed = truncate_output_line(lines[matched_line], matched);
-                results.push(format!("{}:{}:{}", path_str, matched_line + 1, displayed));
-                emitted_results += 1;
-                if emitted_results >= options.max_results {
-                    limit_hit = match_index + 1 < match_lines.len();
+                self.results
+                    .push(format!("{}:{}:{}", path_str, matched_line + 1, displayed));
+                self.emitted_results += 1;
+                if self.emitted_results >= options.max_results {
+                    self.limit_hit = match_index + 1 < match_lines.len();
                     break;
                 }
             }
@@ -410,57 +447,166 @@ fn search_bound_directory(
             }
 
             let mut index = 0;
-            while index < total && emitted_results < options.max_results {
+            while index < total && self.emitted_results < options.max_results {
                 if !shown[index] {
                     index += 1;
                     continue;
                 }
 
-                if !results.is_empty() {
-                    results.push("--".to_string());
+                if !self.results.is_empty() {
+                    self.results.push("--".to_string());
                 }
 
-                while index < total && shown[index] && emitted_results < options.max_results {
+                while index < total && shown[index] && self.emitted_results < options.max_results {
                     let is_match = match_lines.binary_search(&index).is_ok();
                     let separator = if is_match { ':' } else { '-' };
                     let matched = match_ranges.get(&index).cloned();
                     let displayed = truncate_output_line(lines[index], matched);
-                    results.push(format!(
+                    self.results.push(format!(
                         "{}:{}{} {}",
                         path_str,
                         index + 1,
                         separator,
                         displayed
                     ));
-                    emitted_results += 1;
+                    self.emitted_results += 1;
                     index += 1;
                 }
             }
 
-            if emitted_results >= options.max_results
+            if self.emitted_results >= options.max_results
                 && index < total
                 && shown[index..].iter().any(|&is_shown| is_shown)
             {
-                limit_hit = true;
+                self.limit_hit = true;
             }
         }
 
-        if limit_hit {
-            break;
+        if self.limit_hit {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     }
 
-    if walker.cancelled() {
-        return Err(ToolError::Msg("grep cancelled".into()));
+    fn finish(self, walker_work_limit_hit: bool) -> GrepSearchResult {
+        GrepSearchResult {
+            file_count: self.file_count,
+            files_with_matches: self.files_with_matches,
+            results: self.results,
+            emitted_results: self.emitted_results,
+            limit_hit: self.limit_hit,
+            work_limit_hit: self.work_limit_hit || walker_work_limit_hit,
+        }
     }
-    Ok(GrepSearchResult {
-        file_count,
-        files_with_matches,
-        results,
-        emitted_results,
-        limit_hit,
-        work_limit_hit: work_limit_hit || walker.work_limit_hit(),
+}
+
+fn search_target(
+    target: SearchTarget,
+    re: Regex,
+    include_re: Option<(Regex, bool)>,
+    options: GrepSearchOptions,
+    cancellation: Option<crate::agent::runner::AgentWorkCancellation>,
+) -> Result<GrepSearchResult, ToolError> {
+    // Cloned so the walker's own name-only filter can own a copy while
+    // `GrepSearch` still keeps the original for the per-file check below
+    // (needed for an explicitly named single-file target, which never goes
+    // through the walker).
+    let walker_include_re = include_re.clone();
+    let mut search = GrepSearch::new(re, include_re, options);
+    match target {
+        SearchTarget::Directory(bound_directory) => {
+            let include_root = bound_directory.approved_root().to_path_buf();
+            let mut walker = bound_directory
+                .walker()?
+                .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH)
+                .with_cancellation(cancellation);
+            // The include glob is evaluated on the name before a file is
+            // opened, so excluded files cost no open, fstat or read.
+            if let Some((re_include, path_aware)) = walker_include_re {
+                walker = walker.with_file_filter(Box::new(move |relative_path, file_name| {
+                    if path_aware {
+                        re_include.is_match(&relative_path.to_string_lossy().replace('\\', "/"))
+                    } else {
+                        re_include.is_match(&file_name.to_string_lossy())
+                    }
+                }));
+            }
+            for entry in walker.by_ref() {
+                if search.visit(entry, &include_root).is_break() {
+                    break;
+                }
+            }
+            if walker.cancelled() {
+                return Err(ToolError::Msg("grep cancelled".into()));
+            }
+            Ok(search.finish(walker.work_limit_hit()))
+        }
+        SearchTarget::File(entry) => {
+            // An explicitly named file is searched even when an ignore rule
+            // or skip-directory rule would omit it from a walk, matching the
+            // explicit-directory exception. Include globs, the size cap and
+            // binary detection still apply; include globs match the file name.
+            if cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
+            {
+                return Err(ToolError::Msg("grep cancelled".into()));
+            }
+            let include_root = entry
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let _ = search.visit(entry, &include_root);
+            Ok(search.finish(false))
+        }
+    }
+}
+
+fn bound_regular_file(path: &Path, file: std::fs::File) -> Result<BoundFile, ToolError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(ToolError::Msg(format!(
+            "Path changed after permission check: {}",
+            path.display()
+        )));
+    }
+    Ok(BoundFile {
+        path: path.to_path_buf(),
+        file_name: path.file_name().unwrap_or(path.as_os_str()).to_os_string(),
+        file,
+        metadata,
     })
+}
+
+/// Deny rules that would hide `path` (or prune a directory containing it)
+/// during a walk also refuse it as an explicit single-file target. `stop` is
+/// the first ancestor that is not checked (the workspace root for bound
+/// targets); external targets check every ancestor.
+fn file_hidden_by_deny_filter(
+    filter: Option<&super::find_files::PathFilter>,
+    path: &Path,
+    stop: Option<&Path>,
+) -> bool {
+    let Some(filter) = filter else {
+        return false;
+    };
+    if filter(path, false) {
+        return true;
+    }
+    path.ancestors()
+        .skip(1)
+        .take_while(|ancestor| stop.is_none_or(|stop| *ancestor != stop))
+        .filter(|ancestor| ancestor.parent().is_some())
+        .any(|ancestor| filter(ancestor, true))
+}
+
+fn denied_file_error(path: &Path) -> ToolError {
+    ToolError::Msg(format!(
+        "Permission denied: '{}' is excluded from search by a deny rule",
+        path.display()
+    ))
 }
 
 impl Tool for GrepTool {
@@ -472,7 +618,7 @@ impl Tool for GrepTool {
 
     fn description(&self) -> String {
         format!(
-            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped. Respects .gitignore. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.",
+            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped. Respects .gitignore. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly. `path` may name a single file to search only that file.",
             self.max_results, MAX_OUTPUT_LINE_CHARS
         )
     }
@@ -487,7 +633,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in (defaults to current working directory)"
+                    "description": "Directory to search in, or a single file to search (defaults to current working directory)"
                 },
                 "include": {
                     "type": "string",
@@ -563,30 +709,69 @@ impl Tool for GrepTool {
         let target =
             crate::agent::tools::resolve_tool_target(self.workspace.as_ref(), requested_path);
         let search_path = target.requested;
-        let (bound_directory, path_coaching) = if let Some(relative) =
-            target.bound_relative.as_deref()
+        crate::agent::tools::precheck_perm_path_deny(
+            &self.permission,
+            "grep",
+            &search_path.to_string_lossy(),
+        )?;
+        let (target, path_coaching) = if let Some(relative) = target.bound_relative.as_deref()
             && let Some(workspace) = &self.workspace
         {
             let logical = workspace.logical_relative_path(relative)?;
-            let directory = workspace.open_relative_directory_file(relative)?;
-            let bound = BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(
-                crate::agent::tools::walk_deny_filter(
-                    &self.permission,
-                    "grep",
-                    Some(workspace.root()),
-                ),
+            let hidden = crate::agent::tools::walk_deny_filter(
+                &self.permission,
+                "grep",
+                Some(workspace.root()),
             );
+            let target = match workspace.open_relative_directory_file(relative) {
+                Ok(directory) => SearchTarget::Directory(
+                    BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(hidden),
+                ),
+                // A regular file named as `path` is searched on its own
+                // rather than failing with a raw "Not a directory".
+                Err(_) if crate::agent::tools::names_regular_file(&logical) => {
+                    if file_hidden_by_deny_filter(hidden.as_ref(), &logical, Some(workspace.root()))
+                    {
+                        return Err(denied_file_error(&logical));
+                    }
+                    let file = workspace.open_relative(relative).map_err(|error| {
+                        crate::agent::tools::bound_open_error(workspace, relative, error)
+                    })?;
+                    SearchTarget::File(bound_regular_file(&logical, file)?)
+                }
+                Err(error) => {
+                    return Err(crate::agent::tools::bound_open_error(
+                        workspace, relative, error,
+                    ));
+                }
+            };
             let coaching =
                 check_perm_bound_path(&self.permission, &self.ask_tx, "grep", workspace, relative)
                     .await?;
-            (bound, coaching)
+            (target, coaching)
         } else {
             let traversal_root = tokio::fs::canonicalize(&search_path).await?;
             let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-            let bound =
-                BoundDirectory::open(&traversal_root, &authorized_metadata)?.with_hidden_filter(
-                    crate::agent::tools::walk_deny_filter(&self.permission, "grep", None),
-                );
+            let hidden = crate::agent::tools::walk_deny_filter(&self.permission, "grep", None);
+            let target = if authorized_metadata.is_file() {
+                if file_hidden_by_deny_filter(hidden.as_ref(), &traversal_root, None) {
+                    return Err(denied_file_error(&traversal_root));
+                }
+                // Pin the exact authorized file before an interactive
+                // permission wait can race a pathname replacement.
+                let file = crate::fs::open_stable_file(&traversal_root)
+                    .await?
+                    .into_std()
+                    .await;
+                let opened = crate::fs::checked_file_metadata(&file)?;
+                crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &opened)?;
+                SearchTarget::File(bound_regular_file(&traversal_root, file)?)
+            } else {
+                SearchTarget::Directory(
+                    BoundDirectory::open(&traversal_root, &authorized_metadata)?
+                        .with_hidden_filter(hidden),
+                )
+            };
             let coaching = check_perm_path(
                 &self.permission,
                 &self.ask_tx,
@@ -594,7 +779,7 @@ impl Tool for GrepTool {
                 &traversal_root.to_string_lossy(),
             )
             .await?;
-            (bound, coaching)
+            (target, coaching)
         };
         let coaching = combine_coaching(coaching, path_coaching);
         let context = args.context_lines.unwrap_or(0);
@@ -611,8 +796,8 @@ impl Tool for GrepTool {
         let count = args.count;
         let cancellation = crate::agent::runner::current_work_cancellation();
         let search = crate::agent::runner::spawn_blocking_scoped(move || {
-            search_bound_directory(
-                bound_directory,
+            search_target(
+                target,
                 re,
                 include_re,
                 GrepSearchOptions {
@@ -1844,5 +2029,165 @@ mod tests {
             .await
             .unwrap_err();
         assert!(denied.to_string().contains("Permission denied"), "{denied}");
+    }
+
+    // mini-agent-10dje: a regular file passed as `path` is searched on its
+    // own instead of failing with `Not a directory (os error 20)`.
+    #[tokio::test]
+    async fn grep_searches_a_single_workspace_file_named_as_path() {
+        let workspace = TempDir::new("single-file");
+        let root = workspace.path().canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "target\n.beads/\nbeads.log\n").unwrap();
+        std::fs::write(root.join("other.txt"), "beads elsewhere\n").unwrap();
+        let tool = GrepTool::new(Some(standard_permission(&root)), None, 50).with_workspace(&root);
+
+        let found = tool
+            .call(grep_args("beads", Some(".gitignore"), None))
+            .await
+            .unwrap();
+        let expected_path = root.join(".gitignore").to_string_lossy().into_owned();
+        assert_eq!(
+            found,
+            format!(
+                "2 results (searched 1 files):\n{expected_path}:2:.beads/\n{expected_path}:3:beads.log"
+            )
+        );
+        assert!(!found.contains("elsewhere"), "{found}");
+
+        let mut count = grep_args("beads", Some("./.gitignore"), None);
+        count.count = true;
+        assert_eq!(
+            tool.call(count).await.unwrap(),
+            format!("1 matching files (searched 1 files):\n{expected_path}:2")
+        );
+
+        let mut context = grep_args("^\\.beads", Some(".gitignore"), None);
+        context.context_lines = Some(1);
+        assert_eq!(
+            tool.call(context).await.unwrap(),
+            format!(
+                "3 results (searched 1 files):\n{expected_path}:1- target\n{expected_path}:2: .beads/\n{expected_path}:3- beads.log"
+            )
+        );
+
+        // Include globs still filter the explicit file by its name.
+        let filtered = tool
+            .call(grep_args("beads", Some(".gitignore"), Some("*.rs")))
+            .await
+            .unwrap();
+        assert_eq!(filtered, "No matches found.");
+    }
+
+    #[tokio::test]
+    async fn grep_single_file_searches_ignored_file_but_keeps_size_and_binary_rules() {
+        let workspace = TempDir::new("single-file-rules");
+        let root = workspace.path().canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.join("ignored.txt"), "needle ignored\n").unwrap();
+        std::fs::write(root.join("binary.bin"), b"needle\0binary").unwrap();
+        let large = std::fs::File::create(root.join("large.txt")).unwrap();
+        large.set_len(MAX_SEARCH_FILE_BYTES + 1).unwrap();
+        let tool = GrepTool::new(None, None, 50).with_workspace(&root);
+
+        // The walk skips the ignored file; naming it explicitly searches it.
+        let walked = tool.call(grep_args("needle", None, None)).await.unwrap();
+        assert!(!walked.contains("needle ignored"), "{walked}");
+        let explicit = tool
+            .call(grep_args("needle", Some("ignored.txt"), None))
+            .await
+            .unwrap();
+        assert!(
+            explicit.contains("ignored.txt:1:needle ignored"),
+            "{explicit}"
+        );
+
+        for skipped in ["binary.bin", "large.txt"] {
+            let found = tool
+                .call(grep_args("needle", Some(skipped), None))
+                .await
+                .unwrap();
+            assert_eq!(found, "No matches found.", "{skipped}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_searches_a_single_external_file_by_absolute_path() {
+        let directory = TempDir::new("single-external");
+        let root = directory.path().canonicalize().unwrap();
+        let file = root.join("notes.md");
+        std::fs::write(&file, "alpha\nneedle one\nbeta\nneedle two\n").unwrap();
+        std::fs::write(root.join("sibling.md"), "needle sibling\n").unwrap();
+        let file_arg = file.to_string_lossy().into_owned();
+
+        let found = GrepTool::new(None, None, 50)
+            .call(grep_args("needle", Some(&file_arg), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            format!(
+                "2 results (searched 1 files):\n{file_arg}:2:needle one\n{file_arg}:4:needle two"
+            )
+        );
+
+        // The external file goes through the same path permission prompt as
+        // an external directory root, keyed by its canonical path.
+        let permission = standard_permission(Path::new(env!("CARGO_MANIFEST_DIR")));
+        let denied = call_answering_path_permission(
+            permission,
+            grep_args("needle", Some(&file_arg), None),
+            &file,
+            UserDecision::Deny,
+        )
+        .await
+        .unwrap_err();
+        assert!(denied.to_string().contains("denied"), "{denied}");
+    }
+
+    #[tokio::test]
+    async fn grep_single_file_honors_read_and_grep_deny_rules() {
+        let workspace = TempDir::new("single-file-deny");
+        let root = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("config/secrets")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/nested")).unwrap();
+        std::fs::write(root.join("config/secrets/key.txt"), "TOKEN=hunter2\n").unwrap();
+        std::fs::write(root.join("vendor/nested/lib.txt"), "TOKEN=vendored\n").unwrap();
+        std::fs::write(root.join("config/app.txt"), "TOKEN=public\n").unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [("config/secrets/**".to_string(), Action::Deny)].into(),
+            )),
+            grep: Some(ToolPerm::Granular(
+                [("vendor".to_string(), Action::Deny)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let tool = GrepTool::new(Some(standard_permission_with(&root, config)), None, 50)
+            .with_workspace(&root);
+
+        let allowed = tool
+            .call(grep_args("TOKEN", Some("config/app.txt"), None))
+            .await
+            .unwrap();
+        assert!(allowed.contains("TOKEN=public"), "{allowed}");
+
+        let absolute_secret = root
+            .join("config/secrets/key.txt")
+            .to_string_lossy()
+            .into_owned();
+        for path in [
+            "config/secrets/key.txt",
+            absolute_secret.as_str(),
+            "vendor/nested/lib.txt",
+        ] {
+            let denied = tool
+                .call(grep_args("TOKEN", Some(path), None))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(denied.contains("Permission denied"), "{path}: {denied}");
+            assert!(!denied.contains("hunter2"), "{path}: {denied}");
+            assert!(!denied.contains("vendored"), "{path}: {denied}");
+        }
     }
 }

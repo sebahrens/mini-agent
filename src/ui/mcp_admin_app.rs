@@ -921,8 +921,25 @@ impl App<'_> {
             Ok(Completion::LoginReady(login)) => {
                 // This URL is shown only to the operator, after the exact
                 // launch definition/workspace was revalidated by this actor.
-                self.renderer
-                    .write_line("Open this URL to authorize:", C_AGENT)?;
+                // The WSL-aware opener hands it to the Windows browser there.
+                let browser_opened = renderer_mod::open_url(&login.auth_url).await.is_ok();
+                let copy_status = match copy_to_clipboard(&login.auth_url).await {
+                    Ok(ClipboardCopyOutcome::Confirmed) if browser_opened => {
+                        "Opened the authorization URL in your browser (also copied to clipboard):"
+                    }
+                    Ok(ClipboardCopyOutcome::Confirmed) => {
+                        "Open this URL to authorize (copied to clipboard):"
+                    }
+                    Ok(ClipboardCopyOutcome::FallbackRequested) if browser_opened => {
+                        "Opened the authorization URL in your browser (terminal copy also requested):"
+                    }
+                    Ok(ClipboardCopyOutcome::FallbackRequested) => {
+                        "Open this URL to authorize (terminal copy requested):"
+                    }
+                    Err(_) if browser_opened => "Opened the authorization URL in your browser:",
+                    Err(_) => "Open this URL to authorize:",
+                };
+                self.renderer.write_line(copy_status, C_AGENT)?;
                 self.renderer
                     .write_line(&sanitize_output(&login.auth_url), Color::Cyan)?;
                 self.renderer.write_line(

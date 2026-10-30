@@ -29,14 +29,19 @@ struct PrivateAce {
 /// The closed policy is structural. Trustee spellings in SDDL are not identity:
 /// Windows can render the current user's numeric SID using an account alias.
 #[cfg(any(windows, test))]
-fn closed_private_acl(protected: bool, aces: &[PrivateAce]) -> bool {
+/// `directory` additionally admits explicit object-and-container inheritance:
+/// private directories pass their owner-only grants to children so files other
+/// processes create there stay private and repairable. Inherited (`ID`) and
+/// partial inheritance flags are never part of the closed policy.
+fn closed_private_acl(protected: bool, aces: &[PrivateAce], directory: bool) -> bool {
     const ACCESS_ALLOWED: u8 = 0;
     const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+    const OBJECT_AND_CONTAINER_INHERIT: u8 = 0x01 | 0x02;
     protected
         && aces.len() == 2
         && aces.iter().all(|ace| {
             ace.kind == ACCESS_ALLOWED
-                && ace.flags == 0
+                && (ace.flags == 0 || (directory && ace.flags == OBJECT_AND_CONTAINER_INHERIT))
                 && ace.mask == FILE_ALL_ACCESS
                 && (ace.current_user || ace.system)
         })
@@ -688,10 +693,23 @@ mod windows {
     struct SecurityDescriptor(*mut c_void);
 
     impl SecurityDescriptor {
-        fn private() -> std::io::Result<Self> {
+        /// Owner-only protected descriptor granting SYSTEM and the current user.
+        ///
+        /// A directory's two ACEs are object- and container-inheritable.
+        /// Writing a directory DACL with `SetSecurityInfo` re-propagates
+        /// inheritance through every existing child, so a child that carried
+        /// only inherited ACEs (any file another process created there, such as
+        /// a hand-written or test-provisioned `config.toml`) was left with an
+        /// empty DACL. Ownership implies only `READ_CONTROL | WRITE_DAC`, while
+        /// `CreateFileW` always also requests `SYNCHRONIZE`, so the owner could
+        /// no longer open that child even to repair it (`ERROR_ACCESS_DENIED`).
+        /// Inheriting the same owner-only grants keeps such children private
+        /// and repairable; nothing broader is ever inherited.
+        fn private(directory: bool) -> std::io::Result<Self> {
             let current_user = current_user_sid_string()?;
+            let inheritance = if directory { "OICI" } else { "" };
             let sddl = wide(OsStr::new(&format!(
-                "O:{current_user}D:P(A;;FA;;;SY)(A;;FA;;;{current_user})"
+                "O:{current_user}D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;{current_user})"
             )));
             let mut descriptor = null_mut();
             if unsafe {
@@ -962,7 +980,7 @@ mod windows {
         // install the explicit user owner before writing any private bytes.
         // Existing destination readers/validators still reject foreign owners.
         let descriptor =
-            observe_private_temp!("private_descriptor", SecurityDescriptor::private())?;
+            observe_private_temp!("private_descriptor", SecurityDescriptor::private(false))?;
         let initialized = with_current_user_sid(|owner| {
             let status = unsafe {
                 SetSecurityInfo(
@@ -1006,7 +1024,7 @@ mod windows {
             ));
         }
         ensure_current_owner(handle)?;
-        let descriptor = SecurityDescriptor::private()?;
+        let descriptor = SecurityDescriptor::private(expect_directory)?;
         let status = unsafe {
             SetSecurityInfo(
                 handle,
@@ -1043,7 +1061,7 @@ mod windows {
     /// DACL installed at creation. Never repair or adopt an existing pathname.
     /// The caller owns cleanup after success and performs retained validation.
     pub(crate) fn create_directory_exclusive(path: &Path) -> std::io::Result<()> {
-        let descriptor = SecurityDescriptor::private()?;
+        let descriptor = SecurityDescriptor::private(true)?;
         let attributes = descriptor.attributes();
         let path_wide = wide(path.as_os_str());
         // SAFETY: the path and complete private descriptor remain live through
@@ -1107,7 +1125,7 @@ mod windows {
                 "private directory is a reparse point or has the wrong type",
             )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let descriptor = SecurityDescriptor::private()?;
+                let descriptor = SecurityDescriptor::private(true)?;
                 let attributes = descriptor.attributes();
                 let path_wide = wide(path.as_os_str());
                 if unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } == 0 {
@@ -1123,7 +1141,7 @@ mod windows {
     }
 
     fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
-        let descriptor = SecurityDescriptor::private()?;
+        let descriptor = SecurityDescriptor::private(false)?;
         let attributes = descriptor.attributes();
         let handle = open_handle(
             path,
@@ -1280,10 +1298,10 @@ mod windows {
             return Err(std::io::Error::from_raw_os_error(status as i32));
         }
         let _descriptor = LocalAllocation(descriptor);
-        validate_private_dacl(descriptor)
+        validate_private_dacl(descriptor, directory)
     }
 
-    fn validate_private_dacl(descriptor: *mut c_void) -> std::io::Result<()> {
+    fn validate_private_dacl(descriptor: *mut c_void, directory: bool) -> std::io::Result<()> {
         use windows_sys::Win32::Security::{
             ACCESS_ALLOWED_ACE, GetAce, GetSecurityDescriptorControl, IsValidAcl, IsValidSid,
             IsWellKnownSid, SE_DACL_PROTECTED, WinLocalSystemSid,
@@ -1343,7 +1361,7 @@ mod windows {
                     system: unsafe { IsWellKnownSid(sid.cast(), WinLocalSystemSid) } != 0,
                 });
             }
-            if super::closed_private_acl(control & SE_DACL_PROTECTED != 0, &aces) {
+            if super::closed_private_acl(control & SE_DACL_PROTECTED != 0, &aces, directory) {
                 Ok(())
             } else {
                 Err(super::private_file_error())
@@ -2633,7 +2651,7 @@ mod windows {
                 0
             );
             let descriptor = SecurityDescriptor(raw);
-            assert_eq!(validate_private_dacl(descriptor.0).is_ok(), expected);
+            assert_eq!(validate_private_dacl(descriptor.0, false).is_ok(), expected);
         }
         assert_eq!(
             std::fs::read(root.path().join("published.json")).unwrap(),
@@ -3019,9 +3037,9 @@ mod checked_tests {
             system: true,
             ..user
         };
-        assert!(closed_private_acl(true, &[user, system]));
-        assert!(closed_private_acl(true, &[system, user]));
-        assert!(!closed_private_acl(false, &[user, system]));
+        assert!(closed_private_acl(true, &[user, system], false));
+        assert!(closed_private_acl(true, &[system, user], false));
+        assert!(!closed_private_acl(false, &[user, system], false));
         for bad in [
             PrivateAce { kind: 1, ..user },
             PrivateAce {
@@ -3043,19 +3061,41 @@ mod checked_tests {
                 ..user
             },
         ] {
-            assert!(!closed_private_acl(true, &[system, bad]));
+            assert!(!closed_private_acl(true, &[system, bad], false));
         }
-        assert!(!closed_private_acl(true, &[]));
-        assert!(!closed_private_acl(true, &[user]));
-        assert!(!closed_private_acl(true, &[user, system, user]));
-        assert!(!closed_private_acl(true, &[user, user]));
-        assert!(!closed_private_acl(true, &[system, system]));
+        assert!(!closed_private_acl(true, &[], false));
+        assert!(!closed_private_acl(true, &[user], false));
+        assert!(!closed_private_acl(true, &[user, system, user], false));
+        assert!(!closed_private_acl(true, &[user, user], false));
+        assert!(!closed_private_acl(true, &[system, system], false));
         // A System-owned process still has exactly its user and System rights.
         let same = PrivateAce {
             system: true,
             ..user
         };
-        assert!(closed_private_acl(true, &[same, same]));
+        assert!(closed_private_acl(true, &[same, same], false));
+
+        // Directories may carry exactly object-and-container inheritance;
+        // files may not, and partial or inherited flags never pass.
+        let inheritable = |ace: PrivateAce| PrivateAce { flags: 0x03, ..ace };
+        assert!(closed_private_acl(
+            true,
+            &[inheritable(user), inheritable(system)],
+            true
+        ));
+        assert!(closed_private_acl(true, &[user, system], true));
+        assert!(!closed_private_acl(
+            true,
+            &[inheritable(user), inheritable(system)],
+            false
+        ));
+        for flags in [0x01, 0x02, 0x10, 0x13] {
+            assert!(!closed_private_acl(
+                true,
+                &[system, PrivateAce { flags, ..user }],
+                true
+            ));
+        }
     }
     #[cfg(any(unix, windows))]
     #[test]

@@ -8,7 +8,7 @@
 //! (see [`crate::ui::slash`]) and for providers not baked here (custom gateways,
 //! ollama).
 //!
-//! The data lives in `data/models.json`, keyed by *zerostack* provider name
+//! The data lives in `data/models.json`, keyed by *mini-agent* provider name
 //! (so `gemini`, not models.dev's `google`). Refresh it with
 //! `scripts/gen-models-catalog.sh`.
 

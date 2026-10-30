@@ -531,9 +531,9 @@ async fn prove_native_denied_notice_accepted_request_then_effect() {
     let root = crate::tests::OwnedTestDirectory::new("context63-native");
     let workspace_path = root.path().join("workspace");
     std::fs::create_dir_all(workspace_path.join("nested")).unwrap();
-    std::fs::create_dir_all(workspace_path.join(".zerostack")).unwrap();
+    std::fs::create_dir_all(workspace_path.join(".mini-agent")).unwrap();
     std::fs::write(
-        workspace_path.join(".zerostack/config.toml"),
+        workspace_path.join(".mini-agent/config.toml"),
         "model='fixture'\n",
     )
     .unwrap();
@@ -547,7 +547,7 @@ async fn prove_native_denied_notice_accepted_request_then_effect() {
     let mut paths = paths;
     paths.state_dir = root.path().join("state");
     crate::config::load::trust_project_config(
-        &workspace_path.join(".zerostack/config.toml"),
+        &workspace_path.join(".mini-agent/config.toml"),
         &paths.project_config_trust_file(),
     )
     .unwrap();
@@ -659,8 +659,8 @@ impl Fixture {
         let root = crate::tests::OwnedTestDirectory::new("context63-runner-isolation");
         let path = root.path().join("workspace");
         std::fs::create_dir_all(path.join("nested")).unwrap();
-        std::fs::create_dir_all(path.join(".zerostack")).unwrap();
-        std::fs::write(path.join(".zerostack/config.toml"), "model='fixture'\n").unwrap();
+        std::fs::create_dir_all(path.join(".mini-agent")).unwrap();
+        std::fs::write(path.join(".mini-agent/config.toml"), "model='fixture'\n").unwrap();
         std::fs::write(
             path.join("nested/CLAUDE.md"),
             "NESTED_INSTRUCTION_BEFORE_EFFECT\n",
@@ -669,7 +669,7 @@ impl Fixture {
         let mut paths = crate::paths::AppPaths::from_process(Some(path.clone())).unwrap();
         paths.state_dir = root.path().join("state");
         crate::config::load::trust_project_config(
-            &path.join(".zerostack/config.toml"),
+            &path.join(".mini-agent/config.toml"),
             &paths.project_config_trust_file(),
         )
         .unwrap();
@@ -813,12 +813,12 @@ async fn context63_actual_spilled_notice_is_not_restored_or_acknowledged() {
     let home = crate::tests::OwnedTestDirectory::new("context63-spill-home");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         ("MINI_AGENT_HOME", Some(home.path().as_os_str().to_owned())),
-        ("ZS_CONFIG_DIR", None),
-        ("ZS_DATA_DIR", None),
-        ("ZS_LOCAL_DATA_DIR", None),
-        ("ZS_STATE_DIR", None),
-        ("ZS_CACHE_DIR", None),
-        ("ZS_CREDENTIALS_DIR", None),
+        ("MINI_AGENT_CONFIG_DIR", None),
+        ("MINI_AGENT_DATA_DIR", None),
+        ("MINI_AGENT_LOCAL_DATA_DIR", None),
+        ("MINI_AGENT_STATE_DIR", None),
+        ("MINI_AGENT_CACHE_DIR", None),
+        ("MINI_AGENT_CREDENTIALS_DIR", None),
     ]);
     let fixture = Fixture::new();
     std::fs::write(
@@ -946,7 +946,7 @@ async fn context63_cached_sources_do_not_freeze_read_or_project_trust_authority(
             .is_some()
     );
     std::fs::write(
-        fixture.workspace.root().join(".zerostack/config.toml"),
+        fixture.workspace.root().join(".mini-agent/config.toml"),
         "model='changed-unapproved'\n",
     )
     .unwrap();
@@ -1388,7 +1388,7 @@ async fn context63_initial_snapshot_rechecks_read_and_trust_before_native_dispat
                 })
                 .unwrap(),
             "trust" => std::fs::write(
-                fixture.workspace.root().join(".zerostack/config.toml"),
+                fixture.workspace.root().join(".mini-agent/config.toml"),
                 "model='changed-after-prebuild'\n",
             )
             .unwrap(),
@@ -1769,6 +1769,8 @@ async fn context63_actual_readonly_child_factory_selects_own_protocol_and_never_
                 None,
                 None,
                 persona,
+                #[cfg(feature = "mcp")]
+                Vec::new(),
                 #[cfg(feature = "skills")]
                 None,
             )

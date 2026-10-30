@@ -292,7 +292,7 @@ impl GitRunner {
         sandbox: &Sandbox,
     ) -> Result<(), String> {
         self.validate()?;
-        sandbox.verify_workspace_service_capability(
+        sandbox.verify_git_workspace_service_capability(
             self.program.as_path(),
             &["--version".to_string()],
             workspace,
@@ -326,6 +326,26 @@ impl GitRunner {
         let mut argv = vec![OsString::from("-C"), repo_path.as_os_str().to_owned()];
         argv.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
         argv
+    }
+
+    #[cfg(any(test, feature = "git-worktree"))]
+    fn contained_argv<I, S>(&self, repo_path: &Path, args: I) -> Vec<OsString>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        #[cfg(target_os = "windows")]
+        {
+            // The AppContainer helper binds the verified workspace as the process cwd. Avoid a
+            // redundant absolute `-C` traversal through user-profile ancestors, which would
+            // otherwise require broadening their ACLs merely to reach the already-authorized cwd.
+            let _ = repo_path;
+            args.into_iter()
+                .map(|arg| arg.as_ref().to_owned())
+                .collect()
+        }
+        #[cfg(not(target_os = "windows"))]
+        self.argv(repo_path, args)
     }
 
     /// Builds a host-side (uncontained) Git command.
@@ -1041,19 +1061,13 @@ impl GitRunner {
         self.validate()?;
         workspace.validate()?;
         let argv = self
-            .argv(workspace.root(), args)
+            .contained_argv(workspace.root(), args)
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         let mut env = git_environment().to_vec();
         env.extend_from_slice(extra_env);
-        sandbox.wrap_workspace_service_for_execution(
-            self.program.as_path(),
-            &argv,
-            workspace.root(),
-            &env,
-            true,
-        )
+        sandbox.wrap_git_workspace_service(self.program.as_path(), &argv, workspace, &env)
     }
 
     /// Resolves the commit author/committer identity on the host.
@@ -1391,7 +1405,7 @@ impl GitRunner {
             .map_err(|_| format!("git {operation} runner failed"))?;
         if allow_nonzero_or_truncated
             && (matches!(output.status, CommandStatus::OutputLimitExceeded(_))
-                || output.status == CommandStatus::Completed)
+                || (output.status == CommandStatus::Completed && !is_silent_failure(&output)))
         {
             return Ok(output);
         }
@@ -2107,6 +2121,16 @@ pub(crate) fn command_result(
     }
 }
 
+/// A non-zero exit that wrote only to stderr. Callers that tolerate non-zero exits (diff-style
+/// commands exit 1 with output on stdout) must not mistake this for an empty result: a failed
+/// launch such as a bwrap error would otherwise read as "no commits" or "no changes".
+#[cfg(any(test, feature = "git-worktree"))]
+fn is_silent_failure(output: &CommandOutput) -> bool {
+    output.exit_status.is_some_and(|status| !status.success())
+        && output.stdout.is_empty()
+        && !output.stderr.iter().all(u8::is_ascii_whitespace)
+}
+
 pub(crate) fn command_failure(operation: &str, output: &CommandOutput) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
@@ -2179,10 +2203,56 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn silent_failure_is_a_nonzero_exit_with_only_stderr() {
+        use std::os::unix::process::ExitStatusExt;
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        let ok = std::process::ExitStatus::from_raw(0);
+        let output = |exit, stdout: &[u8], stderr: &[u8]| CommandOutput {
+            exit_status: Some(exit),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            status: CommandStatus::Completed,
+            descendants_escaped: false,
+        };
+        // bwrap launch error: nothing on stdout, a message on stderr, exit 1.
+        assert!(is_silent_failure(&output(
+            failed,
+            b"",
+            b"bwrap: Can't mkdir parents\n"
+        )));
+        // diff-style exit 1 with real output, a clean empty log, and a quiet exit 1 stay valid.
+        assert!(!is_silent_failure(&output(
+            failed,
+            b"diff --git a b\n",
+            b""
+        )));
+        assert!(!is_silent_failure(&output(ok, b"", b"")));
+        assert!(!is_silent_failure(&output(failed, b"", b"  \n")));
+    }
+
     #[test]
     fn command_failure_empty_stderr() {
         let out = make_output(CommandStatus::Failed, b"");
         assert_eq!(command_failure("log", &out), "git log failed");
+    }
+
+    #[test]
+    fn contained_argv_uses_the_bound_windows_cwd_without_absolute_c_flag() {
+        let runner = GitRunner::unavailable().unwrap();
+        let argv = runner.contained_argv(Path::new("workspace"), ["status"]);
+        #[cfg(target_os = "windows")]
+        assert_eq!(argv, vec![OsString::from("status")]);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("-C"),
+                OsString::from("workspace"),
+                OsString::from("status")
+            ]
+        );
     }
 
     #[test]
@@ -3096,7 +3166,7 @@ mod guarded_runtime_tests {
             let poison = [
                 ("PATH", Some(poisoned_path.clone())),
                 (
-                    "ZS_CACHE_DIR",
+                    "MINI_AGENT_CACHE_DIR",
                     Some(OsString::from("relative-poisoned-cache")),
                 ),
             ];
@@ -3130,7 +3200,7 @@ mod guarded_runtime_tests {
         assert!(matches!(
             worker.join().unwrap(),
             Some(crate::paths::AppPathError::RelativeOverride {
-                variable: "ZS_CACHE_DIR",
+                variable: "MINI_AGENT_CACHE_DIR",
                 ..
             })
         ));

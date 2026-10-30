@@ -1389,3 +1389,115 @@ fn every_fresh_runtime_gets_new_skill_and_model_realms() {
         });
     }
 }
+
+// mini-agent-dv0m7: a denied effect inside a bound skill must reach the calling script as an
+// Error carrying the same text and code a direct `write_file` call throws, not a bare 0.
+#[test]
+fn a_denied_skill_effect_reaches_the_script_as_the_direct_call_error() {
+    use crate::extras::js::protocol::{DenialReason, EffectError};
+
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).unwrap();
+    let manifest = test_manifest(
+        CapabilityTier::SideEffecting,
+        vec![HostCapability::WriteFile],
+    )
+    .unwrap();
+    let skill = SkillArtifact::new(
+        "function stampNote(cap, text) { return cap.write_file('tmp/note.txt', text); }\n\
+         async function stampLater(cap, text) { return cap.write_file('tmp/note.txt', text); }\n\
+         function swallow(cap, text) { try { cap.write_file('tmp/note.txt', text); } catch (_) {} return 'kept'; }"
+            .into(),
+        "Writes a note".into(),
+        vec![],
+        ["stampNote", "stampLater", "swallow"]
+            .map(|name| SkillExport {
+                name: name.into(),
+                signature: "(string)".into(),
+            })
+            .to_vec(),
+        vec!["true".into()],
+        manifest.clone(),
+    )
+    .unwrap();
+    let capabilities = InvocationCapabilityRuntime::new(|_| {
+        Ok(EffectResult::Error(EffectError::denied(
+            DenialReason::NoConfiguredRoots,
+        )))
+    });
+    let next_grant = Arc::new(std::sync::atomic::AtomicU8::new(10));
+    let bindings = ["stampNote", "stampLater", "swallow"]
+        .into_iter()
+        .map(|name| {
+            let call_capabilities = capabilities.clone();
+            let skill_id = skill.id.clone();
+            let manifest = manifest.clone();
+            let next_grant = next_grant.clone();
+            (
+                name.to_string(),
+                BoundExportInvocation {
+                    authorize: Arc::new(move |ordinal| {
+                        let invocation_id = InvocationId::new(format!("{name}-{ordinal}")).unwrap();
+                        let handle = call_capabilities
+                            .prepare(
+                                InvocationAuthorization::new(
+                                    invocation_id.clone(),
+                                    skill_id.clone(),
+                                    name.into(),
+                                    manifest.clone(),
+                                    [(
+                                        HostCapability::WriteFile,
+                                        grant(
+                                            next_grant
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                                        ),
+                                    )],
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        Ok((handle, invocation_id.to_string()))
+                    }),
+                    on_start: Arc::new(|_, _| Ok(())),
+                    on_terminal: Arc::new(|_, _| Ok(())),
+                },
+            )
+        })
+        .collect();
+    let _loaded =
+        load_artifact_with_bound_exports(&runtime, &model, &skill, capabilities, bindings).unwrap();
+
+    let expected = "js/write_file: denied (no js-write-roots configured)";
+    let sync = model
+        .with(|ctx| {
+            ctx.eval::<String, _>(
+                "try { stampNote('hello'); 'no error' } catch (e) { \
+                 (e instanceof Error) + '|' + e.message + '|' + e.code }",
+            )
+        })
+        .unwrap();
+    assert_eq!(sync, format!("true|{expected}|denied"));
+
+    // The later async rejection carries the same text.
+    model.with(|ctx| {
+        ctx.eval::<(), _>(
+            "globalThis.settled = 'pending'; \
+             stampLater('hello').then(() => { settled = 'resolved' }, \
+                 e => { settled = (e instanceof Error) + '|' + e.message + '|' + e.code }); void 0",
+        )
+        .unwrap();
+    });
+    while runtime.is_job_pending() {
+        runtime.execute_pending_job().unwrap();
+    }
+    assert_eq!(
+        model.with(|ctx| ctx.eval::<String, _>("settled")).unwrap(),
+        format!("true|{expected}|denied")
+    );
+
+    // A skill that handles the denial itself returns normally and leaks nothing.
+    let swallowed = model
+        .with(|ctx| ctx.eval::<String, _>("swallow('x')"))
+        .unwrap();
+    assert_eq!(swallowed, "kept");
+}

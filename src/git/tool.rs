@@ -165,6 +165,23 @@ impl GitTool {
     }
 
     #[cfg(feature = "git-worktree")]
+    pub(crate) async fn verify_runtime(
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+        sandbox: Sandbox,
+    ) -> Result<serde_json::Value, String> {
+        let tool = Self::capture(workspace, sandbox, None, None)?;
+        tool.call(GitArgs {
+            operation: GitOperation::Status,
+            paths: Vec::new(),
+            revision: None,
+            message: None,
+            max_count: None,
+        })
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "git-worktree")]
     pub(crate) fn selected_files_only(mut self) -> Self {
         self.exact_files = true;
         self

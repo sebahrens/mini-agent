@@ -40,6 +40,7 @@ pub(crate) mod slash;
 pub(crate) mod state;
 pub(crate) mod statusline;
 pub(crate) mod terminal;
+pub(crate) mod tool_output;
 pub(crate) mod utils;
 
 use std::collections::VecDeque;
@@ -915,6 +916,7 @@ pub(crate) fn allowed_while_running(text: &str) -> bool {
         || t == "/queue"
         || crate::ui::slash::is_input_control(t)
         || t.starts_with("/queue ")
+        || crate::ui::tool_output::fold_command(t).is_some()
         || t == "/steer"
         || t.starts_with("/steer ")
         || t == "/btw"

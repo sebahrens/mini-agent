@@ -155,12 +155,21 @@ async fn exercise_replacement(provider_changed: bool, foreign: bool) {
     std::fs::create_dir(root.0.join("foreign")).unwrap();
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(root.0.join("config").into_os_string()),
         ),
-        ("ZS_DATA_DIR", Some(root.0.join("data").into_os_string())),
-        ("ZS_STATE_DIR", Some(root.0.join("state").into_os_string())),
-        ("ZS_CACHE_DIR", Some(root.0.join("cache").into_os_string())),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(root.0.join("data").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(root.0.join("state").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_CACHE_DIR",
+            Some(root.0.join("cache").into_os_string()),
+        ),
     ]);
     let workspace =
         Arc::new(crate::paths::WorkspaceBinding::capture(&root.0.join("active")).unwrap());
@@ -751,12 +760,21 @@ async fn sessions_handler_selects_exact_names_and_refuses_active_deletion() {
     std::fs::create_dir_all(&root.0).unwrap();
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(root.0.join("config").into_os_string()),
         ),
-        ("ZS_DATA_DIR", Some(root.0.join("data").into_os_string())),
-        ("ZS_STATE_DIR", Some(root.0.join("state").into_os_string())),
-        ("ZS_CACHE_DIR", Some(root.0.join("cache").into_os_string())),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(root.0.join("data").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(root.0.join("state").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_CACHE_DIR",
+            Some(root.0.join("cache").into_os_string()),
+        ),
     ]);
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root.0).unwrap());
     let cli = Cli::parse_from([
@@ -900,19 +918,19 @@ async fn export_and_legacy_import_accept_public_and_legacy_filenames() {
     let root = crate::tests::OwnedTestDirectory::new("public-session-filenames");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(root.path().join("config").into_os_string()),
         ),
         (
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             Some(root.path().join("data").into_os_string()),
         ),
         (
-            "ZS_STATE_DIR",
+            "MINI_AGENT_STATE_DIR",
             Some(root.path().join("state").into_os_string()),
         ),
         (
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             Some(root.path().join("cache").into_os_string()),
         ),
     ]);

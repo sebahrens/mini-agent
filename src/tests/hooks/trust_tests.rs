@@ -22,7 +22,7 @@ fn unique_path(name: &str) -> std::path::PathBuf {
         .canonicalize()
         .expect("temporary directory must be canonicalizable")
         .join(format!(
-            "zerostack-hooks-trust-{name}-{}-{}",
+            "mini-agent-hooks-trust-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -59,6 +59,23 @@ fn hash_changes_when_command_changes() {
 }
 
 #[test]
+fn hash_changes_when_project_hook_script_content_changes() {
+    let artifact = unique_path("content-binding");
+    let root = artifact.parent().unwrap();
+    std::fs::create_dir_all(root).unwrap();
+    let script = root.join("guard.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    let configured = handler("./guard.sh");
+    let first = trust::hash_hook_binding(root, "PreToolUse", Some("Bash"), &configured);
+
+    std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+    let second = trust::hash_hook_binding(root, "PreToolUse", Some("Bash"), &configured);
+
+    assert_ne!(first, second);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn hash_stable_for_identical_binding() {
     let root = std::path::Path::new("/repo/a");
     let h1 = handler("echo one");
@@ -67,7 +84,7 @@ fn hash_stable_for_identical_binding() {
     let hash2 = trust::hash_hook_binding(root, "PreToolUse", Some("Bash"), &h2);
     assert_eq!(hash1, hash2);
     assert_eq!(
-        hash1, "d5df00cc29270670ed84842fffdfeb744cc602918f2f1e91d8fca15fb606e9e0",
+        hash1, "b8571d1c560ef49a81803613985ca571a32af260223cedcfad7d9397ba3bfb3c",
         "the persisted trust identity must not depend on Rust's default hasher"
     );
 }
@@ -447,7 +464,7 @@ fn hooks60_claude_project_settings_require_exact_trust_and_cannot_disable_global
     use std::sync::atomic::{AtomicUsize, Ordering};
     let root = crate::tests::OwnedTestDirectory::new("hooks60-claude-settings");
     let global = root.path().join("global.json");
-    let native = root.path().join(".zerostack/settings.json");
+    let native = root.path().join(".mini-agent/settings.json");
     let compatibility = root.path().join(".claude/settings.json");
     let managed = root.path().join("missing-managed.json");
     let store = root.path().join("trusted.json");

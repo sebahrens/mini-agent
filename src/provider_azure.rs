@@ -123,6 +123,7 @@ pub(crate) fn build_client(
                 .base_url(endpoint)
                 .http_client(ProviderHttpClient::new(http))
                 .build()?,
+            custom.is_some_and(|c| c.prompt_caching),
         ),
     };
     Ok(AnyClient::OpenAI(client))

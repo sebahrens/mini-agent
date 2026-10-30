@@ -189,6 +189,12 @@ struct WorkerConnection {
     /// Dedicated protocol handles cloned once when the connection is established.
     input_handle: Arc<Mutex<std::fs::File>>,
     output_handle: Arc<Mutex<std::fs::File>>,
+    /// This worker's cumulative CPU time (seconds) as of the most recent
+    /// [`WorkerReusePolicy::permits`] check, or `None` if that check has never run (a freshly
+    /// launched connection) or last found the worker's CPU time unreadable. On platforms other
+    /// than Linux this never becomes `Some`. `classify_worker_exit` uses it as the evidence that
+    /// a plain `SIGKILL` landed at the native CPU ceiling rather than from an unrelated cause.
+    last_sampled_cpu_seconds: Option<u64>,
 }
 
 /// Handle that cancels a parked generation's pending idle retirement.
@@ -227,10 +233,44 @@ impl WorkerReusePolicy {
         }
     }
 
-    fn permits(&self, connection: &WorkerConnection, now: Instant) -> bool {
+    /// Whether `connection` may be handed another invocation. Also samples and records the
+    /// worker's cumulative CPU time on `connection` as a side effect (Linux only; see
+    /// [`Self::cpu_time_permits`]), so this takes `connection` mutably even though the
+    /// age/invocation-count checks alone would not need to.
+    fn permits(&self, connection: &mut WorkerConnection, now: Instant) -> bool {
         self.max_invocations > 0
             && connection.completed_invocations < self.max_invocations
             && now.saturating_duration_since(connection.created_at) < self.max_age
+            && self.cpu_time_permits(connection)
+    }
+
+    /// Linux only: retire a worker whose cumulative CPU time has already reached
+    /// [`cpu_retirement_threshold_seconds`], the point [`CPU_RETIREMENT_MARGIN`] below the
+    /// hard `RLIMIT_CPU` ceiling. Fails closed: a worker whose CPU time cannot be read is never
+    /// reused. Records the sample (or its absence) on `connection` either way so a later
+    /// `classify_worker_exit` has the evidence this check itself used.
+    ///
+    /// Always permits reuse on non-Linux platforms, where the native ceiling and this
+    /// retirement mechanism do not apply.
+    fn cpu_time_permits(&self, connection: &mut WorkerConnection) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            match connection.process.cumulative_cpu_seconds() {
+                Ok(seconds) => {
+                    connection.last_sampled_cpu_seconds = Some(seconds);
+                    seconds < cpu_retirement_threshold_seconds()
+                }
+                Err(_) => {
+                    connection.last_sampled_cpu_seconds = None;
+                    false
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = connection;
+            true
+        }
     }
 }
 
@@ -238,6 +278,36 @@ impl Default for WorkerReusePolicy {
     fn default() -> Self {
         Self::new(MAX_PROCESS_AGE, MAX_PROCESS_INVOCATIONS)
     }
+}
+
+/// Worst-case additional CPU a single already-admitted step can add before the parent's own
+/// per-invocation deadline would intervene. `STEP_TIMEOUT` already bounds the *entire*
+/// invocation — queueing, startup, IPC, and JavaScript execution together (see `JsTool::call`'s
+/// single absolute `call_deadline`, and the `self.0.watchdog` default used everywhere else) — so
+/// no step can run longer than it, and a worker is single-threaded while executing a step, so its
+/// own cumulative CPU time cannot grow faster than wall-clock time. A worker whose CPU time is
+/// already within this margin of the hard ceiling is therefore retired before it is handed
+/// another step, so even a step that is 100% CPU-bound for its entire deadline cannot reach the
+/// ceiling before the normal deadline/timeout path would already have reclaimed the connection.
+#[cfg(target_os = "linux")]
+const CPU_RETIREMENT_MARGIN: Duration = STEP_TIMEOUT;
+
+/// The hard `RLIMIT_CPU` ceiling minus [`CPU_RETIREMENT_MARGIN`]: a worker at or above this many
+/// cumulative CPU seconds is retired instead of reused, and a worker last sampled at or above it
+/// is treated as evidence that a later plain `SIGKILL` landed at the ceiling (see
+/// `cpu_time_near_native_ceiling`, near `classify_worker_exit`).
+#[cfg(target_os = "linux")]
+fn cpu_retirement_threshold_seconds() -> u64 {
+    crate::sandbox::worker::linux_cpu_limit_seconds()
+        .saturating_sub(CPU_RETIREMENT_MARGIN.as_secs())
+}
+
+/// No native CPU ceiling applies outside Linux, so nothing should ever compare as "within the
+/// margin" of one; `last_sampled_cpu_seconds` also never becomes `Some` on these platforms (see
+/// [`WorkerReusePolicy::cpu_time_permits`]), so this value is never actually compared against.
+#[cfg(not(target_os = "linux"))]
+fn cpu_retirement_threshold_seconds() -> u64 {
+    u64::MAX
 }
 
 impl RetirementTicket {
@@ -535,6 +605,26 @@ impl JsWorkerSupervisor {
         Self::new(Arc::new(launcher), false, STEP_TIMEOUT)
     }
 
+    /// Same as [`Self::with_production_launcher_for_benchmark`], but with an explicit
+    /// [`WorkerReusePolicy`] instead of [`WorkerReusePolicy::default`].
+    ///
+    /// mini-agent-hdl3i: the resource benchmark drives one persistent worker through hundreds
+    /// of back-to-back requests to measure steady-state latency. The production default policy
+    /// (`MAX_PROCESS_INVOCATIONS`/`MAX_PROCESS_AGE`) is sized for real traffic, not a debug
+    /// build issuing continuous round trips on a slow or contended CI runner; that combination
+    /// can let one worker accumulate native CPU time close to its enforced `RLIMIT_CPU` ceiling
+    /// before the production reuse ceiling would ever retire it. Letting the benchmark request a
+    /// tighter policy keeps that recycling decision inside this already-tested
+    /// `WorkerReusePolicy`/`invoke_with_state` path instead of duplicating it, and leaves the
+    /// real production default untouched.
+    #[cfg(test)]
+    pub(crate) fn with_production_launcher_and_policy_for_benchmark(
+        launcher: impl WorkerLauncher + 'static,
+        reuse_policy: WorkerReusePolicy,
+    ) -> Self {
+        Self::new_with_policy(Arc::new(launcher), false, STEP_TIMEOUT, reuse_policy)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_launcher_and_watchdog_for_test(
         launcher: impl WorkerLauncher + 'static,
@@ -779,11 +869,18 @@ impl JsWorkerSupervisor {
         deadline: Instant,
     ) -> Result<InvocationTerminal, WorkerError> {
         let mut authority = InvocationAuthority::new(effects.take());
-        let mut connection = match state
-            .idle
-            .take()
-            .filter(|connection| self.0.reuse_policy.permits(connection, Instant::now()))
-        {
+        // `Option::filter` only exposes `&T` to its predicate, but `permits` needs `&mut` to
+        // record the CPU sample it takes (see `WorkerReusePolicy::cpu_time_permits`). An idle
+        // connection that fails the check (age, invocation count, or now-too-close-to-the-CPU-
+        // ceiling) is dropped here, which retires it (`Drop for WorkerConnection` terminates and
+        // reaps it) instead of offering it for reuse.
+        let reusable = state.idle.take().and_then(|mut idle| {
+            self.0
+                .reuse_policy
+                .permits(&mut idle, Instant::now())
+                .then_some(idle)
+        });
+        let mut connection = match reusable {
             Some(connection) => connection,
             None => {
                 let generation = allocate_counter(&mut state.next_generation)?;
@@ -850,7 +947,7 @@ impl JsWorkerSupervisor {
         } else {
             authority.recycle();
         }
-        if reusable_terminal && self.0.reuse_policy.permits(&connection, Instant::now()) {
+        if reusable_terminal && self.0.reuse_policy.permits(&mut connection, Instant::now()) {
             store_idle_with_retirement(&self.0, state, connection);
         }
         active.armed = false;
@@ -1791,6 +1888,7 @@ async fn launch_connection(
         retirement: None,
         input_handle: Arc::new(Mutex::new(input_handle)),
         output_handle: Arc::new(Mutex::new(output_handle)),
+        last_sampled_cpu_seconds: None,
     };
     let hello = WireFrame::connection(build, 0, ParentFrame::Hello(connection.protocol.hello()));
     connection
@@ -2032,7 +2130,10 @@ async fn run_invocation<H: InvocationEffectHandler>(
                         result = &mut effect => break EffectWait::Completed(result),
                         _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {
                             if let Some(exit_status) = connection.process.try_wait().map_err(|_| WorkerError::Transport)? {
-                                return Err(classify_worker_exit(exit_status));
+                                return Err(classify_worker_exit(
+                                    exit_status,
+                                    cpu_time_near_native_ceiling(connection),
+                                ));
                             }
                         }
                     }
@@ -2392,7 +2493,10 @@ async fn read_worker(
             {
                 Ok(frame)
             }
-            Some(status) => Err(classify_worker_exit(status)),
+            Some(status) => Err(classify_worker_exit(
+                status,
+                cpu_time_near_native_ceiling(connection),
+            )),
             None => Ok(frame),
         },
         Err(error) => {
@@ -2404,7 +2508,10 @@ async fn read_worker(
             let error = map_frame_error(error);
             if error == WorkerError::Transport {
                 match exit_status {
-                    Some(status) => Err(classify_worker_exit(status)),
+                    Some(status) => Err(classify_worker_exit(
+                        status,
+                        cpu_time_near_native_ceiling(connection),
+                    )),
                     None => Err(reconcile_transport_exit(connection, deadline).await),
                 }
             } else {
@@ -2421,7 +2528,9 @@ async fn reconcile_transport_exit(
     let deadline = invocation_deadline.min(Instant::now() + PROCESS_EXIT_RECONCILIATION_TIMEOUT);
     loop {
         match connection.process.try_wait() {
-            Ok(Some(status)) => return classify_worker_exit(status),
+            Ok(Some(status)) => {
+                return classify_worker_exit(status, cpu_time_near_native_ceiling(connection));
+            }
             Err(_) => return WorkerError::Transport,
             Ok(None) if Instant::now() >= deadline => return WorkerError::Transport,
             Ok(None) => {
@@ -2435,7 +2544,22 @@ fn reconciliation_poll_delay(now: Instant, deadline: Instant) -> Duration {
     PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(now))
 }
 
-fn classify_worker_exit(status: ExitStatus) -> WorkerError {
+/// Whether `connection`'s most recent pre-invocation CPU sample (see
+/// [`WorkerReusePolicy::cpu_time_permits`]) was already within [`CPU_RETIREMENT_MARGIN`] of the
+/// native ceiling. A freshly launched connection, one whose CPU time was last unreadable, or one
+/// running on a platform without a native CPU ceiling has no such sample and this returns
+/// `false` — "no evidence" always keeps a kill's prior, non-CPU classification.
+fn cpu_time_near_native_ceiling(connection: &WorkerConnection) -> bool {
+    connection
+        .last_sampled_cpu_seconds
+        .is_some_and(|seconds| seconds >= cpu_retirement_threshold_seconds())
+}
+
+/// Classifies a worker's exit status. `near_native_cpu_ceiling` is the caller's
+/// [`cpu_time_near_native_ceiling`] for the exiting connection: evidence, from the proactive
+/// retirement check that most recently admitted it, that its cumulative CPU time was already
+/// close to the native ceiling before this invocation ran.
+fn classify_worker_exit(status: ExitStatus, near_native_cpu_ceiling: bool) -> WorkerError {
     #[cfg(test)]
     {
         let _ = WORKER_EXIT_OBSERVER.try_with(|observer| observer.send(status));
@@ -2447,6 +2571,17 @@ fn classify_worker_exit(status: ExitStatus) -> WorkerError {
         use std::os::unix::process::ExitStatusExt;
 
         if status.signal() == Some(libc::SIGXCPU) || status.code() == Some(128 + libc::SIGXCPU) {
+            return WorkerError::NativeCpuLimit;
+        }
+        // Production Linux arms `RLIMIT_CPU` with soft == hard (deliberate hardening so the
+        // worker can never raise its own soft limit — see `linux::finalize_worker`), so the
+        // kernel's hard-limit action fires and the ceiling is reached via a plain `SIGKILL`
+        // instead of `SIGXCPU`. Proactive retirement (`WorkerReusePolicy::cpu_time_permits`)
+        // keeps a worker whose CPU time was safely below the ceiling from ever being handed a
+        // step that could cross it, so a `SIGKILL` is attributable to that ceiling only when the
+        // dying worker's last sample was already within one step's margin of it. Any other plain
+        // kill has no such evidence and keeps its prior generic classification.
+        if near_native_cpu_ceiling && status.signal() == Some(libc::SIGKILL) {
             return WorkerError::NativeCpuLimit;
         }
     }

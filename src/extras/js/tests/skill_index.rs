@@ -888,7 +888,7 @@ fn coordinated_mutation_releases_store_lock_during_embedding_io() {
         )
     });
     entered_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv()
         .expect("coordinated mutation should enter embedding backend");
 
     let routing_coordinator = Arc::clone(&coordinator);

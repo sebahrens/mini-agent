@@ -296,6 +296,11 @@ pub struct Config {
     // --- End subagent limits ---
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_enabled: Option<bool>,
+    /// Read project `.claude/agents/*.md` as specialist definitions (Claude Code
+    /// compatibility). `false` leaves only `.mini-agent/agents`, the user-global
+    /// and the built-in layers. Default: `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_project_agents: Option<bool>,
     /// Opt-in mid-turn compaction threshold, as a fraction of the context
     /// window (0.0–1.0) of real provider prompt pressure. `None` (default)
     /// disables mid-turn compaction entirely; the agent only compacts between
@@ -373,6 +378,32 @@ pub struct Config {
         alias = "sandbox_backend"
     )]
     pub sandbox_backend: Option<String>,
+    /// Global-only. When true, startup refuses `--no-sandbox`, `sandbox =
+    /// false`, and an unavailable sandbox backend instead of running
+    /// unsandboxed.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "sandbox-required",
+        alias = "sandbox_required"
+    )]
+    pub sandbox_required: Option<bool>,
+    /// Global-only. When true, startup refuses `--dangerously-skip-permissions`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "permission-checks-required",
+        alias = "permission_checks_required"
+    )]
+    pub permission_checks_required: Option<bool>,
+    /// Extra read-only toolchain roots for the Linux `bwrap` profiles. `None`
+    /// selects [`crate::sandbox::default_sandbox_read_roots`]; a configured
+    /// list (including an empty one) replaces the default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "sandbox-toolchain-roots",
+        alias = "sandbox_toolchain_roots"
+    )]
+    pub sandbox_toolchain_roots: Option<Vec<std::path::PathBuf>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         rename = "sandbox-profile",
@@ -467,7 +498,7 @@ pub struct Config {
         rename = "js-fetch-origins",
         alias = "js_fetch_origins"
     )]
-    pub js_fetch_origins: Option<Vec<String>>,
+    pub js_fetch_origins: Option<JsFetchOrigins>,
     #[cfg(feature = "js")]
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -539,6 +570,12 @@ pub struct Config {
     pub permission_mode_cycle: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_tool_details: Option<ShowToolDetails>,
+    /// How tool results appear in the TUI transcript: `collapsed` (a one-line
+    /// summary per call, the default), `preview` (summary plus the first
+    /// `show_tool_details` lines, default 3) or `full` (everything). Every
+    /// result can be unfolded with Ctrl+T or `/expand`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_output: Option<ToolOutputMode>,
     /// Context rows in successful edit/write previews (hard maximum 20).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff_context_lines: Option<usize>,
@@ -607,7 +644,7 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quick_models: Option<HashMap<String, types::QuickModelConfig>>,
     /// Map prompt names to quick-model names. When switching to a prompt,
-    /// zerostack looks up the quick model and switches provider+model.
+    /// mini-agent looks up the quick model and switches provider+model.
     /// Empty-string values are treated as "no change".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_to_model: Option<HashMap<String, String>>,
@@ -623,6 +660,9 @@ pub struct Config {
     #[cfg(feature = "acp")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_port: Option<u16>,
+    #[cfg(feature = "acp")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_accept_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_system: Option<types::EditSystem>,
     #[cfg(feature = "subagents")]
@@ -721,6 +761,24 @@ pub struct Config {
     /// Interactive startup presentation only; never persisted or sent to a model.
     #[serde(skip)]
     pub update_notice: Option<String>,
+}
+
+/// The result of [`Config::resolve_prompt_route`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PromptRoute<'a> {
+    /// The prompt has no (or an empty) `[prompt_to_model]` entry.
+    Unmapped,
+    /// The prompt routes to quick model `alias`.
+    Mapped {
+        alias: &'a str,
+        quick_model: &'a types::QuickModelConfig,
+    },
+    /// The prompt routes to `alias`, which names no `[quick_models]` entry.
+    Dangling {
+        // Only ACP persona refusals report the dangling alias.
+        #[cfg_attr(not(feature = "acp"), allow(dead_code))]
+        alias: &'a str,
+    },
 }
 
 impl Config {
@@ -1353,6 +1411,30 @@ impl Config {
         }
     }
 
+    /// The prompt the main loop starts with when `--load-prompt` names none:
+    /// `default_prompt`, or the embedded `code` prompt.
+    pub(crate) fn resolve_default_prompt(&self) -> &str {
+        self.default_prompt.as_deref().unwrap_or("code")
+    }
+
+    /// Where `[prompt_to_model]` routes prompt `prompt_name`: unmapped, to an
+    /// existing `[quick_models]` entry, or to an alias that names no quick
+    /// model. Startup, the TUI prompt switch and ACP sessions all resolve the
+    /// route here, so each surface agrees on which model a prompt selects.
+    pub(crate) fn resolve_prompt_route(&self, prompt_name: &str) -> PromptRoute<'_> {
+        let Some(alias) = self.resolve_prompt_model(prompt_name) else {
+            return PromptRoute::Unmapped;
+        };
+        match self.quick_models.as_ref().and_then(|qm| qm.get(alias)) {
+            Some(quick_model) => PromptRoute::Mapped { alias, quick_model },
+            None => PromptRoute::Dangling { alias },
+        }
+    }
+
+    pub fn resolve_claude_project_agents(&self) -> bool {
+        self.claude_project_agents.unwrap_or(true)
+    }
+
     #[cfg(feature = "mcp")]
     pub fn resolve_enable_exa_mcp(&self) -> bool {
         self.enable_exa_mcp.unwrap_or(true)
@@ -1449,6 +1531,13 @@ impl Config {
                         validate_action(field, &format!("external_directory.{pattern}"), action)?;
                     }
                 } else if crate::permission::is_configurable_tool_name(tool) {
+                    if matches!(tool.as_str(), "bash" | "shell")
+                        && configured.as_str() == Some("allow")
+                    {
+                        anyhow::bail!(
+                            "invalid `{field}` configuration at `{tool}`: shell allow rules must name the exact complete script"
+                        );
+                    }
                     if configured.is_string() {
                         validate_action(field, tool, configured)?;
                     } else {
@@ -1543,6 +1632,64 @@ where
     Ok(configured)
 }
 
+/// `js-fetch-origins`: the string `"all"` (no origin narrowing), the string
+/// `"none"` (deny every fetch), or an array of exact origins. The permission
+/// check on `js/fetch` applies in every form.
+#[cfg(feature = "js")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsFetchOrigins {
+    All,
+    None,
+    List(Vec<String>),
+}
+
+#[cfg(feature = "js")]
+impl JsFetchOrigins {
+    const EXPECTED: &'static str =
+        "js-fetch-origins must be \"all\", \"none\", or an array of exact origins";
+
+    /// The slice form `FetchPolicy::from_settings` takes: `None` is
+    /// unrestricted, an empty list denies everything.
+    pub fn as_policy_origins(&self) -> Option<&[String]> {
+        match self {
+            Self::All => None,
+            Self::None => Some(&[]),
+            Self::List(origins) => Some(origins),
+        }
+    }
+}
+
+#[cfg(feature = "js")]
+impl Serialize for JsFetchOrigins {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::All => serializer.serialize_str("all"),
+            Self::None => serializer.serialize_str("none"),
+            Self::List(origins) => origins.serialize(serializer),
+        }
+    }
+}
+
+#[cfg(feature = "js")]
+impl<'de> Deserialize<'de> for JsFetchOrigins {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Word(String),
+            List(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)
+            .map_err(|_| serde::de::Error::custom(Self::EXPECTED))?
+        {
+            Raw::Word(word) if word == "all" => Ok(Self::All),
+            Raw::Word(word) if word == "none" => Ok(Self::None),
+            Raw::Word(_) => Err(serde::de::Error::custom(Self::EXPECTED)),
+            Raw::List(origins) => Ok(Self::List(origins)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ShowToolDetails {
@@ -1571,6 +1718,54 @@ pub fn resolve_temperature(cli: &crate::cli::Cli, cfg: &Config, model_id: &str) 
 /// Convenience: resolves extra body params (quick model, global config).
 pub fn resolve_extra_body(cfg: &Config, model_id: &str) -> Option<serde_json::Value> {
     cfg.resolve_extra_body(model_id, quick_models_map(cfg))
+}
+
+/// The `tool_output` config value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolOutputMode {
+    Collapsed,
+    Preview,
+    Full,
+}
+
+/// How the TUI renders a tool result, after combining `tool_output` with the
+/// legacy `show_tool_details` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedToolOutput {
+    /// One summary line; the output is shown only when unfolded.
+    Collapsed,
+    /// Summary plus the first `n` lines while folded.
+    Preview(usize),
+    /// Summary plus the whole output, unfolded from the start.
+    Full,
+}
+
+/// Preview length used when `tool_output = "preview"` names no line count.
+pub const DEFAULT_TOOL_PREVIEW_LINES: usize = 3;
+
+impl Config {
+    /// Resolve the tool-result display mode. `tool_output` wins; without it an
+    /// explicit legacy `show_tool_details` keeps its old meaning (an integer
+    /// previews that many lines, `true` shows everything, `false` collapses),
+    /// and with neither results are collapsed.
+    pub fn resolve_tool_output(&self) -> ResolvedToolOutput {
+        let preview_lines = match self.show_tool_details {
+            Some(ShowToolDetails::Lines(n)) if n > 0 => n,
+            _ => DEFAULT_TOOL_PREVIEW_LINES,
+        };
+        match self.tool_output {
+            Some(ToolOutputMode::Collapsed) => ResolvedToolOutput::Collapsed,
+            Some(ToolOutputMode::Preview) => ResolvedToolOutput::Preview(preview_lines),
+            Some(ToolOutputMode::Full) => ResolvedToolOutput::Full,
+            None => match self.show_tool_details.map(|s| s.resolve()) {
+                None | Some(ResolvedShowToolDetails::Off) => ResolvedToolOutput::Collapsed,
+                Some(ResolvedShowToolDetails::Limited(0)) => ResolvedToolOutput::Collapsed,
+                Some(ResolvedShowToolDetails::Limited(n)) => ResolvedToolOutput::Preview(n),
+                Some(ResolvedShowToolDetails::Unlimited) => ResolvedToolOutput::Full,
+            },
+        }
+    }
 }
 
 impl ShowToolDetails {
@@ -1814,6 +2009,44 @@ mod tests {
     }
 
     #[test]
+    fn resolve_prompt_route_distinguishes_mapped_unmapped_and_dangling() {
+        let cfg: Config = toml::from_str(
+            r#"
+[quick_models.fast]
+provider = "acme"
+model = "acme-fast"
+
+[prompt_to_model]
+plan = "fast"
+review = "missing"
+brainstorm = ""
+"#,
+        )
+        .unwrap();
+        match cfg.resolve_prompt_route("plan") {
+            PromptRoute::Mapped { alias, quick_model } => {
+                assert_eq!(alias, "fast");
+                assert_eq!(quick_model.provider, "acme");
+                assert_eq!(quick_model.model, "acme-fast");
+            }
+            other => panic!("plan must be mapped: {other:?}"),
+        }
+        assert!(matches!(
+            cfg.resolve_prompt_route("review"),
+            PromptRoute::Dangling { alias: "missing" }
+        ));
+        assert!(matches!(
+            cfg.resolve_prompt_route("brainstorm"),
+            PromptRoute::Unmapped
+        ));
+        assert!(matches!(
+            cfg.resolve_prompt_route("code"),
+            PromptRoute::Unmapped
+        ));
+        assert_eq!(cfg.resolve_default_prompt(), "code");
+    }
+
+    #[test]
     fn resolve_prompt_model_returns_none_for_empty_map() {
         let cfg = make_config(HashMap::new());
         assert_eq!(cfg.resolve_prompt_model("plan"), None);
@@ -1918,12 +2151,64 @@ js-fetch-allow-http = true
         assert_eq!(cfg.js_write_unrestricted, Some(true));
         assert_eq!(
             cfg.js_fetch_origins,
-            Some(vec![
+            Some(JsFetchOrigins::List(vec![
                 "https://example.com".to_string(),
                 "http://public.example:8080".to_string()
-            ])
+            ]))
         );
         assert_eq!(cfg.js_fetch_allow_http, Some(true));
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn js_fetch_origins_accepts_all_none_and_lists() {
+        let parse = |value: &str| {
+            toml::from_str::<Config>(&format!("js-fetch-origins = {value}"))
+                .map(|cfg| cfg.js_fetch_origins)
+        };
+        assert_eq!(parse("\"all\"").unwrap(), Some(JsFetchOrigins::All));
+        assert_eq!(parse("\"none\"").unwrap(), Some(JsFetchOrigins::None));
+        assert_eq!(
+            parse("[\"https://docs.rs\"]").unwrap(),
+            Some(JsFetchOrigins::List(vec!["https://docs.rs".into()]))
+        );
+        assert_eq!(parse("[]").unwrap(), Some(JsFetchOrigins::List(vec![])));
+        let snake: Config = toml::from_str("js_fetch_origins = \"none\"").unwrap();
+        assert_eq!(snake.js_fetch_origins, Some(JsFetchOrigins::None));
+        for bad in ["\"any\"", "\"ALL\"", "\"\"", "true", "3"] {
+            let error = parse(bad).unwrap_err().to_string();
+            assert!(
+                error.contains("\"all\"") && error.contains("\"none\"") && error.contains("array"),
+                "{bad}: {error}"
+            );
+        }
+        let round_trip = |origins: JsFetchOrigins| {
+            let cfg = Config {
+                js_fetch_origins: Some(origins),
+                ..Config::default()
+            };
+            toml::from_str::<Config>(&toml::to_string(&cfg).unwrap())
+                .unwrap()
+                .js_fetch_origins
+        };
+        assert_eq!(round_trip(JsFetchOrigins::All), Some(JsFetchOrigins::All));
+        assert_eq!(round_trip(JsFetchOrigins::None), Some(JsFetchOrigins::None));
+    }
+
+    #[cfg(all(feature = "js", feature = "sandbox"))]
+    #[test]
+    fn js_fetch_origins_forms_drive_the_fetch_policy() {
+        use crate::agent::tools::web_http::FetchPolicy;
+        let url = "https://example.org/page";
+        let policy = |origins: JsFetchOrigins| {
+            FetchPolicy::from_settings(origins.as_policy_origins(), false)
+        };
+        assert!(policy(JsFetchOrigins::All).authorize(url).is_ok());
+        assert!(policy(JsFetchOrigins::None).authorize(url).is_err());
+        let docs = JsFetchOrigins::List(vec!["https://docs.rs".into()]);
+        assert!(policy(docs.clone()).authorize(url).is_err());
+        assert!(policy(docs).authorize("https://docs.rs/x").is_ok());
+        assert!(policy(JsFetchOrigins::List(vec![])).authorize(url).is_err());
     }
 }
 

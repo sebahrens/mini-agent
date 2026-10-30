@@ -346,6 +346,20 @@ pub(super) fn protected_host_paths_from(
     Ok(protected)
 }
 
+/// Protected runtime paths that still need their own readonly bind. A path
+/// equal to or inside a private mask is already unreachable: directory masks
+/// are readonly tmpfs mounts and file masks bind `/dev/null`, applied after
+/// the protected binds, so the child can neither write nor read it (as
+/// Seatbelt's protected-storage read denial). The retained Git runtime lives
+/// in the masked application data directory, so refusing this overlap made
+/// every profile with explicit roots or home mounts unavailable.
+fn unmasked_protected_paths(protected: Vec<PathBuf>, masks: &[(PathBuf, bool)]) -> Vec<PathBuf> {
+    protected
+        .into_iter()
+        .filter(|path| !masks.iter().any(|(mask, _)| path.starts_with(mask)))
+        .collect()
+}
+
 impl HostFilesystem {
     pub(super) fn capture(sandbox: &Sandbox, cwd: &Path, cache: &Path) -> Result<Self, String> {
         // Explicit roots are captured once per base and only re-validated on
@@ -420,16 +434,7 @@ impl HostFilesystem {
         // Protect the publisher's storage parent as well as current images:
         // an already-running host-full child must not gain writes to a later
         // retained Git generation. Only command scratch is carved back out.
-        let protected = protected_host_paths()?;
-        if protected
-            .iter()
-            .any(|path| covered.iter().any(|(mask, _)| path.starts_with(mask)))
-        {
-            return Err(
-                "sandbox profile unavailable: private mask overlaps a retained Git executable"
-                    .into(),
-            );
-        }
+        let protected = unmasked_protected_paths(protected_host_paths()?, &covered);
         let writable = std::iter::once(cwd)
             .chain(std::iter::once(cache))
             .chain(writes.iter().map(|root| root.root()))
@@ -579,21 +584,43 @@ impl HostFilesystem {
     }
 
     pub(super) fn append_denies(&self, command: &mut Command) {
+        self.append_denies_exposing(command, None);
+    }
+
+    /// [`Self::append_denies`] that re-exposes one read-only directory inside
+    /// the last directory mask that contains it. The bind must sit between the
+    /// mask's `--tmpfs` and `--remount-ro`: once the mask is read-only bwrap
+    /// can no longer create the bind target's parent directories. Returns
+    /// whether `expose` was mounted; `false` means no mask covers it and the
+    /// caller binds it normally.
+    pub(super) fn append_denies_exposing(
+        &self,
+        command: &mut Command,
+        expose: Option<&Path>,
+    ) -> bool {
         for path in &self.protected {
             command.arg("--ro-bind").arg(path).arg(path);
         }
         command.arg("--bind").arg(&self.scratch).arg(&self.scratch);
-        for (path, directory) in &self.masks {
+        let exposing = expose.and_then(|target| {
+            self.masks
+                .iter()
+                .rposition(|(mask, directory)| *directory && target.starts_with(mask))
+        });
+        for (index, (path, directory)) in self.masks.iter().enumerate() {
             if *directory {
-                command
-                    .arg("--tmpfs")
-                    .arg(path)
-                    .arg("--remount-ro")
-                    .arg(path);
+                command.arg("--tmpfs").arg(path);
+                if exposing == Some(index)
+                    && let Some(target) = expose
+                {
+                    command.arg("--ro-bind").arg(target).arg(target);
+                }
+                command.arg("--remount-ro").arg(path);
             } else {
                 command.arg("--ro-bind").arg("/dev/null").arg(path);
             }
         }
+        exposing.is_some()
     }
 }
 
@@ -696,19 +723,19 @@ mod tests {
             let env = crate::tests::ScopedProcessEnv::set(&[
                 ("HOME", Some(home.clone().into_os_string())),
                 (
-                    "ZS_CONFIG_DIR",
+                    "MINI_AGENT_CONFIG_DIR",
                     Some(root.path().join("config").into_os_string()),
                 ),
                 (
-                    "ZS_DATA_DIR",
+                    "MINI_AGENT_DATA_DIR",
                     Some(root.path().join("data").into_os_string()),
                 ),
                 (
-                    "ZS_STATE_DIR",
+                    "MINI_AGENT_STATE_DIR",
                     Some(root.path().join("state").into_os_string()),
                 ),
                 (
-                    "ZS_CACHE_DIR",
+                    "MINI_AGENT_CACHE_DIR",
                     Some(root.path().join("cache").into_os_string()),
                 ),
             ]);
@@ -744,6 +771,7 @@ mod tests {
                 cwd,
                 cache,
                 git_metadata::BwrapGitMetadataBinds::none(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap()
             .as_std()
@@ -1213,6 +1241,7 @@ mod tests {
                 &fixture.cwd,
                 &fixture.cache,
                 git_metadata::BwrapGitMetadataBinds::none(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         assert!(
@@ -1221,6 +1250,81 @@ mod tests {
         );
         assert!(roots(&vec![fixture.cwd.clone(); 33], &fixture.cwd).is_err());
         assert!(roots(&[PathBuf::from("/")], &fixture.cwd).is_err());
+    }
+
+    #[test]
+    fn exposed_runtime_is_bound_inside_its_mask_before_the_mask_is_read_only() {
+        let home = PathBuf::from("/home/user");
+        let data = home.join(".local/share/mini-agent");
+        let runtime = data.join("git-runtime/0123");
+        let plan = HostFilesystem {
+            masks: vec![(data.clone(), true), (home.join(".ssh"), true)],
+            #[cfg(unix)]
+            mounts: Vec::new(),
+            #[cfg(unix)]
+            files: Vec::new(),
+            protected: Vec::new(),
+            scratch: PathBuf::from("/scratch"),
+        };
+        let argv = |expose: Option<&Path>| {
+            let mut command = Command::new("bwrap");
+            let exposed = plan.append_denies_exposing(&mut command, expose);
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            (exposed, args)
+        };
+        let position = |args: &[String], needle: &[&str]| {
+            args.windows(needle.len())
+                .position(|window| window.iter().zip(needle).all(|(a, b)| a == b))
+        };
+        let data_str = data.to_string_lossy().into_owned();
+        let runtime_str = runtime.to_string_lossy().into_owned();
+
+        let (exposed, args) = argv(Some(&runtime));
+        assert!(exposed);
+        let tmpfs = position(&args, &["--tmpfs", &data_str]).unwrap();
+        let bind = position(&args, &["--ro-bind", &runtime_str, &runtime_str]).unwrap();
+        let remount = position(&args, &["--remount-ro", &data_str]).unwrap();
+        assert!(tmpfs < bind && bind < remount, "{args:?}");
+
+        // Without a target, or with one no directory mask covers, nothing is
+        // exposed and the caller binds it itself.
+        assert!(!argv(None).0);
+        assert!(!argv(Some(Path::new("/opt/git-runtime/0123"))).0);
+        assert!(position(&argv(None).1, &["--ro-bind", &runtime_str]).is_none());
+    }
+
+    #[test]
+    fn profile100_masked_retained_runtime_needs_no_separate_readonly_bind() {
+        let home = PathBuf::from("/home/user");
+        let data = home.join(".local/share/mini-agent");
+        let masks = vec![
+            (data.clone(), true),
+            (home.join(".gitconfig-secret"), false),
+        ];
+        let runtime = data.join("git-runtime/0123/git");
+        let cache = home.join(".cache/mini-agent");
+        let visible = unmasked_protected_paths(
+            vec![
+                runtime,
+                data.clone(),
+                cache.clone(),
+                home.join(".gitconfig-secret"),
+            ],
+            &masks,
+        );
+        // The masked runtime, the masked directory itself and an exactly
+        // masked file are hidden; an unmasked publisher cache stays bound.
+        assert_eq!(visible, vec![cache.clone()]);
+        // A sibling whose name merely shares the mask's prefix is not covered.
+        let sibling = home.join(".local/share/mini-agent-other/git");
+        assert_eq!(
+            unmasked_protected_paths(vec![sibling.clone()], &masks),
+            vec![sibling]
+        );
     }
 
     #[test]
@@ -1280,6 +1384,7 @@ mod tests {
                     &repository,
                     &fixture.cache,
                     metadata,
+                    &read_roots::BwrapReadRoots::none(),
                 )
                 .unwrap();
             let args = command

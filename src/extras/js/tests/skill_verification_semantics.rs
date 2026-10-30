@@ -431,6 +431,7 @@ mod tests {
             exception_class: None,
             line: None,
             column: None,
+            hint: None,
         };
         let error = crate::extras::js::skills::verify::test_result(Some(&internal))
             .expect_err("the worker's own internal failure is not a candidate test outcome");
@@ -446,6 +447,7 @@ mod tests {
             exception_class: None,
             line: None,
             column: None,
+            hint: None,
         };
         assert_eq!(
             crate::extras::js::skills::verify::test_result(Some(&contract))
@@ -785,6 +787,7 @@ mod failure_attribution {
             exception_class: None,
             line: None,
             column: None,
+            hint: None,
         }))
         .expect_err("the worker's own internal failure is not a candidate outcome");
         assert_not_rejected_by(error);

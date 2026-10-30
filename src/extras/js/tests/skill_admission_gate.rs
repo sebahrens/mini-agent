@@ -314,6 +314,7 @@ fn skill_source_diagnostic(class: DiagnosticClass, stage: DiagnosticStage) -> Di
         exception_class: None,
         line: None,
         column: None,
+        hint: None,
     }
 }
 

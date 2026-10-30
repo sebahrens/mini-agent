@@ -1220,7 +1220,6 @@ mod tests {
                 predecessor_id: None,
             })
             .unwrap();
-        services.service.reserve_attempt().unwrap();
         let result = services.service.execute_prepared(prepared).unwrap();
         assert!(
             crate::extras::js::skills::store::SkillStore::open_at(&paths)

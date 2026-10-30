@@ -50,13 +50,25 @@ thread_local! {
 }
 
 #[cfg(not(test))]
-pub(crate) fn set_edit_system(es: EditSystem) {
-    *EDIT_SYSTEM.lock().unwrap_or_else(|e| e.into_inner()) = es;
+pub(crate) fn set_edit_system(es: EditSystem) -> bool {
+    let mut current = EDIT_SYSTEM.lock().unwrap_or_else(|e| e.into_inner());
+    if *current == es {
+        return false;
+    }
+    *current = es;
+    true
 }
 
 #[cfg(test)]
-pub(crate) fn set_edit_system(es: EditSystem) {
-    TEST_EDIT_SYSTEM.set(es);
+pub(crate) fn set_edit_system(es: EditSystem) -> bool {
+    TEST_EDIT_SYSTEM.with(|current| {
+        if current.get() == es {
+            false
+        } else {
+            current.set(es);
+            true
+        }
+    })
 }
 
 #[cfg(not(test))]
@@ -181,6 +193,22 @@ pub(crate) fn bound_open_error(
         ));
     }
     error.into()
+}
+
+/// Diagnostic classification: whether `path` currently names a regular file
+/// without following a final symbolic link. It only selects which bound open
+/// (and which error message) applies; it never grants access.
+pub(crate) fn names_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Clear refusal for a directory-only tool (`list_dir`, `find_files`) whose
+/// `path` names a regular file, instead of a raw `Not a directory` error.
+pub(crate) fn not_a_directory_error(tool: &str, path: &Path, hint: &str) -> ToolError {
+    ToolError::Msg(format!(
+        "{tool}: '{}' is a file, not a directory. {hint}",
+        path.display()
+    ))
 }
 
 fn symlink_refusal_message(link: &Path, target: Option<&Path>) -> String {
@@ -402,11 +430,12 @@ impl ReadTracker {
         }) {
             return None;
         }
+        let start = offset.saturating_add(1);
         let end = offset.saturating_add(limit);
         Some(format!(
             "read blocked: {path} (lines {}-{}) was already read and has not been modified since. Reuse the earlier result if it is still available, or read a different section by changing offset or limit.",
-            offset + 1,
-            if end > 0 { end } else { offset + 1 }
+            start,
+            if end > 0 { end } else { start }
         ))
     }
 
@@ -1172,6 +1201,27 @@ pub(crate) async fn check_perm_bound_path(
         Vec::new(),
     )
     .await
+}
+
+pub(crate) fn precheck_perm_path_deny(
+    permission: &Option<PermCheck>,
+    tool: &str,
+    path: &str,
+) -> Result<(), ToolError> {
+    let Some(permission) = permission else {
+        return Ok(());
+    };
+    let denied = permission
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .path_is_denied_lexically(tool, path);
+    if denied {
+        Err(ToolError::Msg(
+            "Permission denied: Blocked by deny rule".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

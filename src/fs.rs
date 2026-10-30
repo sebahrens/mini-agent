@@ -2616,6 +2616,9 @@ fn atomic_write_platform(
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,
 ) -> std::io::Result<()> {
+    // Fault injection is test-only; production builds never read it.
+    #[cfg(not(test))]
+    let _ = failure;
     use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;

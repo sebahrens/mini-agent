@@ -184,17 +184,17 @@ See the [canonical environment reference](CONFIG.md#environment-variables) for p
 endpoint fallbacks, application paths, ACP credentials and OS/internal controls.
 
 Then, you can change your configuration file (`~/.mini-agent/config.toml`
-on a fresh install; an existing legacy install keeps
-`~/.config/zerostack/config.toml` on Linux,
-`~/Library/Application Support/zerostack/config.toml` on macOS, or
-`%APPDATA%\zerostack\config.toml` on Windows; `ZS_CONFIG_DIR` or
+on a fresh install; an existing install keeps
+`~/.config/mini-agent/config.toml` on Linux,
+`~/Library/Application Support/mini-agent/config.toml` on macOS, or
+`%APPDATA%\mini-agent\config.toml` on Windows; `MINI_AGENT_CONFIG_DIR` or
 `MINI_AGENT_HOME` override it; see [CONFIG.md](CONFIG.md)) by adding
 `provider = "provider_name"`.
 
-`ZS_MODEL` selects a model through the same CLI field as `--model`. For
+`MINI_AGENT_MODEL` selects a model through the same CLI field as `--model`. For
 compatibility, `OPENROUTER_MODEL` is also accepted as the next fallback when
 OpenRouter is the provider in effect, and then takes precedence over the
-config-file model; it is ignored for other providers. Prefer `ZS_MODEL` for
+config-file model; it is ignored for other providers. Prefer `MINI_AGENT_MODEL` for
 provider-neutral configuration.
 
 The config-file `model` is used only with the provider it belongs to (a quick
@@ -243,12 +243,19 @@ Now that you are in, you might want to be able to control the agent, and here's 
 
 By pressing `/` on an empty message, you can select any command to send the agent; here are the most useful commands:
 
+Commands with a fixed set of arguments open a second picker. You can also type
+or paste a command and press `Tab` to list and filter all valid choices, such as
+the three approval modes for `/permissions` or every available provider/model.
+If a command needs free-form input and you omit it, mini-agent prints that
+command's usage instead of silently guessing.
+
 | Command | What it does |
 | ------- | ------------ |
 | `/help` | List all commands |
 | `/models <name>` | Switch model mid-session using Quick Models |
 | `/clear` | Start with a fresh context |
 | `/mode readonly` | Lock down to read-only |
+| `/permissions yolo\|auto\|manual` | Change the interactive approval mode |
 | `/undo` | Undo the last exchange |
 | `/redo` | Redo the last undo action |
 | `/btw` | Ask a question to the agent without changing the context |
@@ -315,7 +322,7 @@ Here is some keybindings to speed up your coding experience:
 | `/` | Open the command picker; Tab inserts the highlight, Enter runs a command or argument typed in full |
 | `@<query>` | Open the file picker; Tab or Enter inserts the highlighted path, a space closes it |
 | `@agent:<name>` | Ask the model to delegate the request to that specialist persona through `task` (requires the `subagents` feature; see [SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent)); unknown names are refused |
-| `Tab` | Insert two spaces when no picker is active |
+| `Tab` | Complete slash-command arguments; otherwise insert two spaces when no picker is active |
 
 ## 5. CLI flags
 
@@ -347,7 +354,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--sandbox` | Explicitly require the platform general-process sandbox; fail if unavailable |
 | `--no-sandbox` | Disable the default-on general-process sandbox |
 | `--sandbox-profile workspace\|host-read\|host-full` | Select ordinary command filesystem reach; does not change permission mode or network policy. Unix host-full is explicit and warns; Windows uses workspace plus AppContainer root keys. |
-| `--shell <path>` | Select Bash/sh, or PowerShell/pwsh on Windows, for explicit shell execution and the compatibility tool. |
+| `--shell <path>` | Select Bash/sh; Windows also accepts Command Prompt (`cmd.exe`, the default), PowerShell/pwsh, and native Git Bash. |
 | `--no-color` | Disable colored TUI output. |
 | `--tutor` | Print the getting-started guide through the pager and exit. |
 | `--loop`, `--loop-prompt`, `--loop-plan`, `--loop-max`, `--loop-run` | Configure the bounded headless iterative loop and optional validation command. |
@@ -546,7 +553,7 @@ Sandboxing and memory support are compiled into the default build. The general-p
 enabled by default: Linux uses `bwrap` when installed and trusted, supported macOS hosts use the
 system-provided Seatbelt backend at `/usr/bin/sandbox-exec`, and Windows selects the attested
 AppContainer backend (`restricted-token` remains a compatibility alias). Windows availability
-requires its cached native production preflight. That probe has a five-second run deadline followed
+requires its cached native production preflight. That probe has a thirty-second run deadline followed
 by up to five seconds for whole-tree reaping and a fresh five-second profile/ACL recovery window.
 Before a new probe, a separate five-second bounded sweep recovers exact private roots preserved by
 an interrupted earlier process; malformed or active roots fail closed without deletion. Failure is cached and
@@ -621,12 +628,13 @@ denial; the delivered hosted canaries record those broader observations only for
 runner and do not prove identical ACL visibility on every Windows host.
 
 Everything else above, including ACP editor integration, lifecycle hooks, LSP diagnostics,
-and image/document message attachments, ships in the default/full build. Hooks do
+and image/audio/document message attachments, ships in the default/full build. Hooks do
 nothing without configuration. LSP automatically selects installed language servers
 and starts them lazily; `[lsp] enabled = false` disables it. `/toggle` lists captured
 runtime availability. No server is installed or downloaded. Lite archives keep their
 smaller explicit feature recipe. The second-model advisor remains optional
-(`--features advisor`); `--features pdf` remains an explicit attachment feature alias. PDF attachments
+(`--features advisor`); `--features pdf` remains an explicit attachment feature, which
+also enables multimodal support. PDF attachments
 are sent as raw document messages to a provider that supports them; mini-agent
 does not parse PDFs locally. Attachments must be regular files (or symlinks to
 them), and the 20 MiB limit is enforced while reading, including if a file grows.

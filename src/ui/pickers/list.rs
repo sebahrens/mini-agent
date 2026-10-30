@@ -14,6 +14,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/bottom",
     "/btw",
     "/clear",
+    "/collapse",
     "/compress",
     "/config",
     "/context",
@@ -24,6 +25,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/drop-all",
     "/editsys",
     "/effort",
+    "/expand",
     "/fork",
     "/help",
     "/history",
@@ -38,6 +40,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/models",
     "/models-add",
     "/new",
+    "/permissions",
     "/prompt",
     "/provider",
     "/queue",
@@ -232,6 +235,7 @@ pub struct ListPicker {
     /// The entry marked `(current)` and highlighted while the query is empty.
     current: Option<String>,
     monochrome: bool,
+    accent: Option<crossterm::style::Color>,
 }
 
 impl ListPicker {
@@ -248,6 +252,7 @@ impl ListPicker {
             descriptions: Vec::new(),
             current: None,
             monochrome: false,
+            accent: None,
         }
     }
 
@@ -286,6 +291,10 @@ impl ListPicker {
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
         self.monochrome = monochrome;
+    }
+
+    pub fn set_accent_color(&mut self, accent: Option<crossterm::style::Color>) {
+        self.accent = accent;
     }
 
     #[cfg(test)]
@@ -393,6 +402,27 @@ impl ListPicker {
         }
     }
 
+    pub fn delete(&mut self) {
+        if self.cursor < self.query.chars().count() {
+            let byte_pos = self
+                .query
+                .char_indices()
+                .nth(self.cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(self.query.len());
+            self.query.remove(byte_pos);
+            self.filter();
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.query.chars().count());
+    }
+
     fn filter(&mut self) {
         let query_lower = self.query.to_lowercase();
         if query_lower
@@ -497,6 +527,7 @@ impl ListPicker {
             |index| self.display_row(index),
             self.selected,
             self.monochrome,
+            self.accent,
             empty_message,
             floor_row,
             0,

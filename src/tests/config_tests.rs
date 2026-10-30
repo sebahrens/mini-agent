@@ -16,6 +16,8 @@ fn custom_provider(provider_type: &str) -> CustomProviderConfig {
         connect_timeout_secs: None,
         stream_idle_timeout_secs: None,
         model: None,
+        prompt_caching: false,
+        model_prices: std::collections::HashMap::new(),
     }
 }
 
@@ -462,6 +464,26 @@ fn unknown_legacy_permission_entry_tool_is_rejected_instead_of_discarded() {
 }
 
 #[test]
+fn simple_shell_allow_is_rejected_instead_of_silently_matching_nothing() {
+    for field in ["permission", "permission-regex"] {
+        for tool in ["bash", "shell"] {
+            let mut cfg = Config::default();
+            let value = serde_json::json!({(tool): "allow"});
+            if field == "permission" {
+                cfg.permission = Some(value);
+            } else {
+                cfg.permission_regex = Some(value);
+            }
+
+            let error = cfg.build_permission_config().unwrap_err().to_string();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains(tool), "{error}");
+            assert!(error.contains("exact complete script"), "{error}");
+        }
+    }
+}
+
+#[test]
 fn yaml_round_trips_scalar_and_nested_fields() {
     let cfg = Config {
         provider: Some(CompactString::new("openrouter")),
@@ -888,6 +910,128 @@ mod default_permission_mode {
             resolve_execution_authority(&cli, &cfg, SandboxPolicy::Disabled, "unused").is_err()
         );
     }
+
+    /// mini-agent-l7evb: without these keys `--no-sandbox` and
+    /// `--dangerously-skip-permissions` always won; the first two assertions
+    /// of each test pin that the unset default is unchanged.
+    #[test]
+    fn sandbox_required_refuses_no_sandbox_and_sandbox_false() {
+        let no_sandbox = Cli {
+            no_sandbox: true,
+            ..Cli::default()
+        };
+        let unset = Config::default();
+        assert!(
+            resolve_execution_authority(&no_sandbox, &unset, SandboxPolicy::Disabled, "bwrap")
+                .is_ok()
+        );
+        let required = Config {
+            sandbox_required: Some(true),
+            ..Config::default()
+        };
+        let error =
+            resolve_execution_authority(&no_sandbox, &required, SandboxPolicy::Disabled, "bwrap")
+                .expect_err("--no-sandbox must lose to sandbox-required");
+        assert!(error.to_string().contains("--no-sandbox"), "{error}");
+        let off = Config {
+            sandbox: Some(false),
+            sandbox_required: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            resolve_execution_authority(&Cli::default(), &off, SandboxPolicy::Disabled, "bwrap")
+                .is_err()
+        );
+        // Satisfied requirement and an explicit false both start normally.
+        assert!(
+            resolve_execution_authority(
+                &Cli::default(),
+                &required,
+                SandboxPolicy::RequiredAndAvailable,
+                "bwrap"
+            )
+            .is_ok()
+        );
+        let relaxed = Config {
+            sandbox_required: Some(false),
+            ..Config::default()
+        };
+        assert!(
+            resolve_execution_authority(&no_sandbox, &relaxed, SandboxPolicy::Disabled, "bwrap")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn sandbox_required_makes_an_unavailable_default_backend_fatal() {
+        let unset = Config::default();
+        let degraded = resolve_execution_authority(
+            &Cli::default(),
+            &unset,
+            SandboxPolicy::RequiredButUnavailable,
+            "bwrap",
+        );
+        if !cfg!(windows) {
+            assert!(degraded.is_ok(), "default degrades with a warning");
+        }
+        let required = Config {
+            sandbox_required: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            resolve_execution_authority(
+                &Cli::default(),
+                &required,
+                SandboxPolicy::RequiredButUnavailable,
+                "bwrap"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn permission_checks_required_refuses_dangerously_skip_permissions() {
+        let skip = Cli {
+            dangerously_skip_permissions: true,
+            ..Cli::default()
+        };
+        let unset = Config::default();
+        assert!(
+            !resolve_execution_authority(&skip, &unset, SandboxPolicy::Disabled, "unused")
+                .unwrap()
+                .permission_checks_enabled
+        );
+        let required = Config {
+            permission_checks_required: Some(true),
+            ..Config::default()
+        };
+        let error =
+            resolve_execution_authority(&skip, &required, SandboxPolicy::Disabled, "unused")
+                .expect_err("the bypass flag must lose to permission-checks-required");
+        assert!(error.to_string().contains("--dangerously-skip-permissions"));
+        assert!(
+            resolve_execution_authority(
+                &Cli::default(),
+                &required,
+                SandboxPolicy::Disabled,
+                "unused"
+            )
+            .unwrap()
+            .permission_checks_enabled
+        );
+    }
+
+    #[test]
+    fn required_keys_parse_in_both_spellings() {
+        let kebab: Config =
+            toml::from_str("sandbox-required = true\npermission-checks-required = true").unwrap();
+        let snake: Config =
+            toml::from_str("sandbox_required = true\npermission_checks_required = true").unwrap();
+        for cfg in [kebab, snake] {
+            assert_eq!(cfg.sandbox_required, Some(true));
+            assert_eq!(cfg.permission_checks_required, Some(true));
+        }
+    }
 }
 
 mod responses_extra_body_validation {
@@ -1301,6 +1445,71 @@ fn quick_model_price_presence_preserves_omission_free_partial_and_roundtrip() {
     }
 }
 
+/// mini-agent-9osxv: `custom_providers.<name>.model_prices` mirrors
+/// `QuickModelConfig`'s price resolution (explicit price, catalog fallback,
+/// missing model, non-negative validation, round trip) without needing a
+/// `quick_models` alias.
+#[test]
+fn custom_provider_model_prices_preserve_omission_free_partial_and_roundtrip() {
+    let catalog = Config::catalog_input_output_cost("anthropic", "claude-sonnet-5-5").unwrap();
+    for (fields, expected) in [
+        ("", Some(catalog)),
+        (
+            r#""input_token_cost":0,"output_token_cost":0"#,
+            Some((0.0, 0.0)),
+        ),
+        (
+            r#""input_token_cost":2,"output_token_cost":4"#,
+            Some((2.0, 4.0)),
+        ),
+        (r#""input_token_cost":0"#, Some((0.0, catalog.1))),
+        (r#""output_token_cost":7"#, Some((catalog.0, 7.0))),
+    ] {
+        let mut custom = custom_provider("anthropic");
+        let entry: crate::config::CustomProviderModelPrices =
+            serde_json::from_str(&format!("{{{fields}}}")).unwrap();
+        custom
+            .model_prices
+            .insert("claude-sonnet-5-5".to_string(), entry);
+        assert_eq!(
+            custom.resolved_prices_for("claude-sonnet-5-5"),
+            expected,
+            "{fields}"
+        );
+        // Round trips through JSON and back without losing the table.
+        let reloaded: CustomProviderConfig =
+            serde_json::from_value(serde_json::to_value(&custom).unwrap()).unwrap();
+        assert_eq!(reloaded.resolved_prices_for("claude-sonnet-5-5"), expected);
+    }
+
+    let mut custom = custom_provider("anthropic");
+    custom.model_prices.insert(
+        "claude-sonnet-5-5".to_string(),
+        serde_json::from_str(r#"{"input_token_cost":2}"#).unwrap(),
+    );
+    assert_eq!(
+        custom.resolved_prices_for("unlisted-model"),
+        None,
+        "a model absent from the table has no price, even when another model is priced"
+    );
+
+    for malformed in [
+        r#"{"input_token_cost":-1}"#,
+        r#"{"output_token_cost":"free"}"#,
+        r#"{"cache_write_1h_token_cost":-2}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<crate::config::CustomProviderModelPrices>(malformed).is_err(),
+            "{malformed}"
+        );
+    }
+    assert!(
+        serde_json::from_str::<crate::config::CustomProviderModelPrices>(r#"{"unknown_field":1}"#)
+            .is_err(),
+        "an unrecognized price key must be rejected, not silently dropped"
+    );
+}
+
 #[test]
 fn quick_model_price_presence_session_free_and_native_cache_survive_reload() {
     let mut session = crate::session::Session::new("anthropic", "unlisted", 128_000, "");
@@ -1332,7 +1541,7 @@ fn quick_model_price_presence_session_free_and_native_cache_survive_reload() {
 fn quick_model_price_presence_actual_config_save_does_not_invent_free_rates() {
     let root = crate::tests::OwnedTestDirectory::new("price-presence-config-save");
     let _environment = crate::tests::ScopedProcessEnv::set(&[(
-        "ZS_CONFIG_DIR",
+        "MINI_AGENT_CONFIG_DIR",
         Some(root.path().as_os_str().to_owned()),
     )]);
     crate::config::save_quick_model("paid", "anthropic", "claude-sonnet-5-5", None, None).unwrap();

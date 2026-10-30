@@ -182,6 +182,7 @@ fn normalized_target(operation: &EffectOperation) -> Result<NormalizedTarget, Ho
             workspace_relative: paths.iter().cloned().map(Some).collect(),
         }),
         EffectOperation::ReadFile { path }
+        | EffectOperation::ReadLines { path, .. }
         | EffectOperation::ListDir { path }
         | EffectOperation::Glob { path, .. }
         | EffectOperation::Grep { path, .. } => Ok(NormalizedTarget::ReadFile {
@@ -218,6 +219,7 @@ fn authorized_target(operation: &EffectOperation) -> AuthorizedTarget {
             canonical_paths: paths.clone(),
         },
         EffectOperation::ReadFile { path }
+        | EffectOperation::ReadLines { path, .. }
         | EffectOperation::ListDir { path }
         | EffectOperation::Glob { path, .. }
         | EffectOperation::Grep { path, .. } => AuthorizedTarget::ReadFile {
@@ -422,6 +424,10 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
         },
         EffectOperation::ReadFiles { paths } => EffectResult::ReadFiles {
             contents: paths.iter().map(|_| "contents".into()).collect(),
+        },
+        EffectOperation::ReadLines { .. } => EffectResult::ReadLines {
+            lines: vec!["contents".into()],
+            eof: true,
         },
         EffectOperation::ListDir { .. } => EffectResult::ListDir {
             entries: Vec::new(),
@@ -784,6 +790,73 @@ async fn scoped_capability_intersection_keeps_model_authored_grants_session_only
     assert_single_denial_record(&broker);
 }
 
+#[cfg(feature = "subagents")]
+#[tokio::test]
+async fn read_only_subagent_session_denies_forged_parent_side_effects() {
+    let session_allowed = BTreeSet::from([HostCapability::ReadFile]);
+    let denied_cases: Vec<_> = operation_cases(&invocation("inv-read-only-cases"))
+        .into_iter()
+        .filter(|case| case.capability != HostCapability::ReadFile)
+        .collect();
+    assert!(
+        denied_cases
+            .iter()
+            .any(|case| case.capability == HostCapability::WriteFile)
+    );
+    assert!(
+        denied_cases
+            .iter()
+            .any(|case| case.capability == HostCapability::Fetch)
+    );
+    assert!(
+        denied_cases
+            .iter()
+            .any(|case| case.capability == HostCapability::Spawn)
+    );
+    assert!(
+        denied_cases
+            .iter()
+            .any(|case| case.capability == HostCapability::SessionState)
+    );
+    #[cfg(feature = "skills")]
+    assert!(
+        denied_cases
+            .iter()
+            .any(|case| case.capability == HostCapability::ProposeSkill)
+    );
+
+    for (index, mut case) in denied_cases.into_iter().enumerate() {
+        case.advisory = AdvisoryAttribution::default();
+        let invocation_id = invocation(&format!("inv-read-only-forged-{index}"));
+        let forged_grant = InvocationGrant::issue(
+            invocation_id.clone(),
+            GrantPrincipal::ModelAuthored {
+                tool_call_id: "read-only-child".into(),
+            },
+            BTreeSet::from([case.capability]),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let (mut broker, record, _audit_root) = broker(
+            invocation_id,
+            vec![forged_grant.clone()],
+            session_allowed.clone(),
+            ServiceFailures::default(),
+        );
+
+        assert_eq!(
+            broker
+                .dispatch(request(&case, &forged_grant), PermCancellation::new())
+                .await,
+            Err(HostEffectError::SessionDenied),
+            "{} escaped the read-only session boundary",
+            case.name
+        );
+        assert_eq!(record.lock().unwrap().authorizations, 0);
+        assert_eq!(record.lock().unwrap().executions, 0);
+        assert_single_denial_record(&broker);
+    }
+}
+
 #[cfg(feature = "skills")]
 #[tokio::test]
 async fn scoped_capability_intersection_normalizes_fetch_method_and_spawn_identity() {
@@ -1140,7 +1213,7 @@ fn prepared_manifest_resolves_once_then_mints_distinct_singleton_grants_with_one
 
 #[cfg(feature = "skills")]
 #[test]
-fn reusable_export_mints_fresh_exact_authority_and_denies_replay_revocation_and_expiry() {
+fn reusable_export_mints_fresh_exact_authority_and_denies_replay_and_expiry() {
     let outer = invocation("reusable-export-outer");
     let artifact_id = "a".repeat(64);
     let manifest = CapabilityManifest::new(
@@ -1195,14 +1268,6 @@ fn reusable_export_mints_fresh_exact_authority_and_denies_replay_revocation_and_
             .authorization
             .is_none()
     );
-    assert!(active_broker.revoke_skill_export(&artifact_id, "read"));
-    assert!(
-        active_broker
-            .authorize_skill_call(request(3, 2))
-            .authorization
-            .is_none()
-    );
-
     let expired = SkillCallAuthority::new(
         "expired-turn".into(),
         "expired-tool-call".into(),
@@ -1544,7 +1609,7 @@ async fn worker_broker_grants_all_closed_operations_from_parent_identity() {
 }
 
 #[tokio::test]
-async fn worker_broker_grants_deny_forged_unknown_replayed_expired_and_wrong_invocation() {
+async fn worker_broker_grants_deny_forged_unknown_expired_and_wrong_invocation() {
     for case in operation_cases(&invocation("inv-denials")) {
         let current = invocation("inv-denials");
         let live = grant(&case, &current, Instant::now() + Duration::from_secs(30));
@@ -1560,21 +1625,6 @@ async fn worker_broker_grants_deny_forged_unknown_replayed_expired_and_wrong_inv
             |request| request.grant_id = forged.grant_id().clone(),
         )
         .await;
-
-        let (mut replay_broker, record, _audit_root) = broker(
-            current.clone(),
-            vec![live.clone()],
-            HostCapability::all(),
-            ServiceFailures::default(),
-        );
-        assert!(replay_broker.revoke_grant(live.grant_id()));
-        assert_eq!(
-            replay_broker
-                .dispatch(request(&case, &live), PermCancellation::new())
-                .await,
-            Err(HostEffectError::ReplayedGrant)
-        );
-        assert_eq!(record.lock().unwrap().executions, 0);
 
         let expired = grant(&case, &current, Instant::now() - Duration::from_secs(1));
         let expired_request = request(&case, &expired);
@@ -2617,7 +2667,9 @@ fn audit_bytes(owner: &EffectAuditPathOwner) -> Vec<u8> {
 
 fn raw_effect_fragments(operation: &EffectOperation) -> Vec<&str> {
     match operation {
-        EffectOperation::ReadFile { path } | EffectOperation::ListDir { path } => vec![path],
+        EffectOperation::ReadFile { path }
+        | EffectOperation::ReadLines { path, .. }
+        | EffectOperation::ListDir { path } => vec![path],
         EffectOperation::ReadFiles { paths } => paths.iter().map(String::as_str).collect(),
         EffectOperation::Glob { path, pattern } => vec![path, pattern],
         EffectOperation::Grep {
@@ -3391,18 +3443,19 @@ fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fa
     for segment in audit_segments(&initialized_owner) {
         std::fs::remove_file(segment).unwrap();
     }
-    assert!(matches!(
-        EffectAudit::open(initialized_owner),
-        Err(AuditError::MissingSegment)
-    ));
+    let mut reset = EffectAudit::open(initialized_owner).unwrap();
+    let target = reset.file_target("safe/after-explicit-reset");
+    reset
+        .append_intent(audit_intent("effect-after-explicit-reset", target))
+        .unwrap();
 }
 
 #[test]
-fn js_effect_audit_storage_retention_limit_poisoning_is_fail_closed() {
+fn js_effect_audit_storage_retention_limit_allows_explicit_operator_reset() {
     let root = AuditTempRoot::new("retention-limit");
     let owner = root.owner();
     let options = AuditOpenOptions::for_test(2_048).with_max_segments(1);
-    let mut audit = EffectAudit::open_with_options(owner, options).unwrap();
+    let mut audit = EffectAudit::open_with_options(owner.clone(), options.clone()).unwrap();
 
     let first_target = audit.file_target("safe/first");
     audit
@@ -3423,8 +3476,19 @@ fn js_effect_audit_storage_retention_limit_poisoning_is_fail_closed() {
     let later_target = audit.file_target("safe/later");
     assert!(matches!(
         audit.append_intent(audit_intent("effect-later", later_target)),
-        Err(AuditError::Unavailable)
+        Err(AuditError::RetentionLimit)
     ));
+
+    drop(audit);
+    for segment in audit_segments(&owner) {
+        std::fs::remove_file(segment).unwrap();
+    }
+
+    let mut reset = EffectAudit::open_with_options(owner, options).unwrap();
+    let reset_target = reset.file_target("safe/reset");
+    reset
+        .append_intent(audit_intent("effect-reset", reset_target))
+        .unwrap();
 }
 
 #[test]

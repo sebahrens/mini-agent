@@ -1702,7 +1702,7 @@ run_in_clean_replay_environment() {
         case "$name" in
             HOME|USER|USERNAME|LOGNAME|HOST|HOSTNAME|TERM|COLORTERM|LANG|LC_*|TZ|NO_COLOR|EDITOR|VISUAL|\
             XDG_RUNTIME_DIR|XDG_CACHE_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|\
-            *_API_KEY|*_TOKEN|OPENROUTER_MODEL|MCP_FIXTURE_*|ZS_*|\
+            *_API_KEY|*_TOKEN|OPENROUTER_MODEL|MCP_FIXTURE_*|MINI_AGENT_*|\
             HTTPS_PROXY|HTTP_PROXY|ALL_PROXY|NO_PROXY|SSL_CERT_FILE|SSL_CERT_DIR)
                 clean_env+=("$name=$value")
                 ;;

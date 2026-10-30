@@ -94,15 +94,15 @@ sync-version:
 aur-checksums:
     bash scripts/update-release-checksums.sh aur
 
-# Update the source tarball SHA256 in conda/zerostack/meta.yaml
+# Update the source tarball SHA256 in conda/mini-agent/meta.yaml
 conda-source-sha256:
     bash scripts/update-release-checksums.sh conda-source
 
-# Download release artifacts and update conda/zerostack-bin/meta.yaml checksums
+# Download release artifacts and update conda/mini-agent-bin/meta.yaml checksums
 conda-bin-checksums:
     bash scripts/update-release-checksums.sh conda-bin
 
-# Download release artifacts and update packaging/homebrew/zerostack.rb checksums
+# Download release artifacts and update packaging/homebrew/mini-agent.rb checksums
 homebrew-checksums:
     bash scripts/update-release-checksums.sh homebrew
 
@@ -187,6 +187,6 @@ post-release: canonical-installer-smoke release-checksums aur-regen-srcinfo
     python3 scripts/check-package-metadata.py --require-release-digests
     @echo "=== post-release done: all checksums updated + .SRCINFO regenerated ==="
     @echo "Ready for:"
-    @echo "  AUR: cd packaging/aur && pkgctl aur publish zerostack-bin"
+    @echo "  AUR: cd packaging/aur && pkgctl aur publish mini-agent-bin"
     @echo "  conda: submit PR to conda-forge/staged-recipes"
-    @echo "  homebrew: push packaging/homebrew/zerostack.rb to homebrew-tap repo"
+    @echo "  homebrew: push packaging/homebrew/mini-agent.rb to homebrew-tap repo"

@@ -30,6 +30,10 @@ use crate::event::AgentEvent;
 pub struct RoundCollector {
     tool_calls: u32,
     mutating_tool_calls: u32,
+    /// Ids of this round's mutating calls whose result is still awaited.
+    pending_mutating: std::collections::HashMap<String, String>,
+    failed_mutating: u32,
+    failure_hash: Option<u64>,
     verify_ran: bool,
     verify_passed: Option<bool>,
     input_tokens: u64,
@@ -64,10 +68,12 @@ impl RoundCollector {
     /// Fold one event into the round.
     pub fn observe(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::ToolCall { name, .. } => {
+            AgentEvent::ToolCall { id, name, .. } => {
                 self.tool_calls += 1;
                 if crate::agent::runner::tool_may_mutate_workspace(name.as_str()) {
                     self.mutating_tool_calls += 1;
+                    self.pending_mutating
+                        .insert(id.to_string(), name.to_string());
                 }
             }
             #[cfg(feature = "subagents")]
@@ -89,10 +95,15 @@ impl RoundCollector {
                 self.failure = Some(message.to_string());
             }
             AgentEvent::ToolResult {
+                id,
                 output,
                 is_error: true,
                 ..
             } => {
+                if let Some(name) = self.pending_mutating.remove(id.as_str()) {
+                    self.failed_mutating += 1;
+                    self.failure_hash = Some(fold_failure(self.failure_hash, &name, output));
+                }
                 if let Some(setting) = crate::agent::tools::user_gated_setting(output) {
                     self.user_gate = Some(setting.to_string());
                 }
@@ -178,8 +189,128 @@ impl RoundCollector {
             tokens_used: self.input_tokens + self.output_tokens,
             active: self.active,
             user_gate: self.user_gate.take(),
+            failure_fingerprint: (self.mutating_tool_calls > 0
+                && self.failed_mutating == self.mutating_tool_calls)
+                .then_some(self.failure_hash)
+                .flatten(),
         }
     }
+}
+
+/// Fold one failed mutating call into a round's failure fingerprint.
+///
+/// Keyed on the tool and its normalised error text, not the arguments: a retry
+/// loop with small variations fails the same way each time.
+fn fold_failure(acc: Option<u64>, tool: &str, error: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    acc.hash(&mut hasher);
+    tool.hash(&mut hasher);
+    normalize_failure_text(error).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Error text with the parts that differ between identical failures removed.
+///
+/// A retry loop rarely repeats its error byte for byte: timestamps, per-run
+/// temp directories, ids, durations and attempt counters change every time.
+/// Exit codes, line numbers and file names are kept, since those separate one
+/// failure from another.
+fn normalize_failure_text(error: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+        [
+            (
+                r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+                "<id>",
+            ),
+            (
+                r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?",
+                "<time>",
+            ),
+            (r"\b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b", "<time>"),
+            // The per-run segment under a temp root; the rest of the path stays.
+            (
+                r#"((?:/private)?/(?:tmp|var/folders/[^/\s]+/[^/\s]+/T|dev/shm)/)(?:\.tmp\w+|[^/\s'"]*\d[^/\s'"]*)"#,
+                "${1}<run>",
+            ),
+            (
+                r"\b\d+(?:\.\d+)?(?:ms|\x{b5}s|us|ns|secs?|seconds|s|min)\b",
+                "<dur>",
+            ),
+            (r"\b0x[0-9a-fA-F]+\b", "<addr>"),
+            (r"\b[0-9a-fA-F]{12,}\b", "<id>"),
+            (
+                r"(?i)\b(pid|attempt|retry|retries|try|elapsed|took|after|iteration)\W{0,3}\d+(?:/\d+)?",
+                "$1 <n>",
+            ),
+        ]
+        .into_iter()
+        .map(|(pattern, with)| (Regex::new(pattern).expect("static pattern"), with))
+        .collect()
+    });
+    let mut text = error.to_string();
+    for (rule, with) in RULES.iter() {
+        text = rule.replace_all(&text, *with).into_owned();
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The failure fingerprint of a headless round, from its recorded messages.
+///
+/// The counterpart of the live collector: `Some` only when the round made
+/// mutating calls and every one of them failed. A turn record keeps no error
+/// flag, so a failure is recognised from the result text, the same way replayed
+/// results are rendered.
+fn failure_fingerprint_from_turn(interactions: &[rig::completion::Message]) -> Option<u64> {
+    use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
+
+    let mut pending = std::collections::HashMap::new();
+    let mut mutating = 0u32;
+    let mut failed = 0u32;
+    let mut hash = None;
+    for message in interactions {
+        match message {
+            Message::Assistant { content, .. } => {
+                for item in content.iter() {
+                    if let AssistantContent::ToolCall(call) = item
+                        && crate::agent::runner::tool_may_mutate_workspace(&call.function.name)
+                    {
+                        mutating += 1;
+                        pending.insert(call.id.clone(), call.function.name.clone());
+                    }
+                }
+            }
+            Message::User { content } => {
+                for item in content.iter() {
+                    let UserContent::ToolResult(result) = item else {
+                        continue;
+                    };
+                    let Some(name) = pending.remove(&result.id) else {
+                        continue;
+                    };
+                    let text = result
+                        .content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ToolResultContent::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if crate::ui::tool_output::looks_like_error(&text) {
+                        failed += 1;
+                        hash = Some(fold_failure(hash, &name, &text));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (mutating > 0 && failed == mutating)
+        .then_some(hash)
+        .flatten()
 }
 
 /// What history the next round starts from.
@@ -473,6 +604,133 @@ mod tests {
             name: CompactString::new(name),
             args: serde_json::json!({}),
         }
+    }
+
+    fn headless_round(results: &[(&str, &str)], goal: &Goal) -> RoundSummary {
+        use rig::OneOrMany;
+        use rig::message::{AssistantContent, Message};
+        let mut interactions = Vec::new();
+        for (i, (_, output)) in results.iter().enumerate() {
+            let id = format!("call-{i}");
+            interactions.push(Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::tool_call(
+                    id.as_str(),
+                    "write_file",
+                    serde_json::json!({ "path": format!("f{i}") }),
+                )),
+            });
+            interactions.push(Message::tool_result(id.as_str(), *output));
+        }
+        let cost = RoundCost::default();
+        summary_from_headless_turn(goal, &interactions, &cost, None, 0, false)
+    }
+
+    #[test]
+    fn a_headless_retry_loop_of_the_same_failure_parks() {
+        let mut g = goal();
+        let mut parked = false;
+        for attempt in 0..=g.bounds.no_progress_rounds {
+            // The error carries volatile parts that change every round.
+            let error = format!(
+                "Error: write failed after {attempt} ms at 2026-10-28T08:0{attempt}:00Z in /tmp/.tmpAb{attempt}Cd/out"
+            );
+            let round = headless_round(&[("write_file", error.as_str())], &g);
+            assert!(round.failure_fingerprint.is_some());
+            let d = match gate::gate_pre(&g, &round) {
+                gate::Step::Decided(d) => d,
+                gate::Step::Verify(r) => panic!("unexpected verification {r:?}"),
+            };
+            if matches!(
+                d,
+                GateDecision::Stop {
+                    paused_reason: Some(crate::extras::goal::PauseReason::NoProgress),
+                    ..
+                }
+            ) {
+                parked = true;
+                break;
+            }
+            gate::apply(&mut g, &round, &d, None, None);
+        }
+        assert!(
+            parked,
+            "an identical failing headless retry loop must pause"
+        );
+    }
+
+    #[test]
+    fn headless_fingerprints_separate_distinct_failures_and_spare_successes() {
+        let g = goal();
+        let a = headless_round(&[("", "Error: permission denied: a.txt")], &g);
+        let b = headless_round(&[("", "Error: permission denied: a.txt")], &g);
+        let other = headless_round(&[("", "Error: disk full")], &g);
+        let exit1 = headless_round(&[("", "Error: command failed with exit code 1")], &g);
+        let exit2 = headless_round(&[("", "Error: command failed with exit code 2")], &g);
+        assert!(a.failure_fingerprint.is_some());
+        assert_eq!(a.failure_fingerprint, b.failure_fingerprint);
+        assert_ne!(a.failure_fingerprint, other.failure_fingerprint);
+        assert_ne!(exit1.failure_fingerprint, exit2.failure_fingerprint);
+        let mixed = headless_round(
+            &[
+                ("", "Error: permission denied: a.txt"),
+                ("", "wrote 12 bytes"),
+            ],
+            &g,
+        );
+        assert_eq!(mixed.failure_fingerprint, None, "one success is progress");
+        assert_eq!(headless_round(&[], &g).failure_fingerprint, None);
+    }
+
+    #[test]
+    fn failure_text_normalisation_strips_volatile_parts_only() {
+        let n = normalize_failure_text;
+        assert_eq!(
+            n("timeout after 30s at 12:01:02 pid 4242 id 3f2a9c1d-0000-4000-8000-123456789abc"),
+            n("timeout after 31s at 13:05:59 pid 77 id 11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(
+            n("cannot write /tmp/.tmpXyZ12/out.txt"),
+            n("cannot write /tmp/.tmpQrS99/out.txt")
+        );
+        assert_ne!(
+            n("cannot write /tmp/.tmpXyZ12/a.txt"),
+            n("cannot write /tmp/.tmpXyZ12/b.txt")
+        );
+        assert_ne!(n("exit code 1"), n("exit code 2"));
+        assert_ne!(n("syntax error at line 3"), n("syntax error at line 40"));
+    }
+
+    #[test]
+    fn the_collector_fingerprints_a_round_whose_mutations_all_failed() {
+        let g = goal();
+        let round = |ok_second: bool, err: &str| {
+            let mut c = RoundCollector::new();
+            for (id, is_error) in [("a", true), ("b", !ok_second)] {
+                c.observe(&AgentEvent::ToolCall {
+                    id: id.into(),
+                    name: "write_file".into(),
+                    args: serde_json::json!({ "path": id }),
+                });
+                c.observe(&AgentEvent::ToolResult {
+                    id: id.into(),
+                    name: "write_file".into(),
+                    output: err.into(),
+                    images: Vec::new(),
+                    is_error,
+                });
+            }
+            c.finish(&g, RoundEnd::Done, 0).failure_fingerprint
+        };
+        let first = round(false, "permission denied");
+        assert!(first.is_some());
+        assert_eq!(first, round(false, "permission denied"));
+        assert_ne!(first, round(false, "disk full"));
+        assert_eq!(
+            round(true, "permission denied"),
+            None,
+            "one success is progress"
+        );
     }
 
     #[test]
@@ -1274,10 +1532,10 @@ mod settle_tests {
 
     fn isolated_paths() -> IsolatedPaths {
         let path =
-            std::env::temp_dir().join(format!("zerostack-goal-tests-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("mini-agent-goal-tests-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         let environment = crate::tests::ScopedProcessEnv::set(&[(
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             Some(path.as_os_str().to_os_string()),
         )]);
         IsolatedPaths {
@@ -1808,6 +2066,7 @@ pub fn summary_from_headless_turn(
             .saturating_add(cost.usage.output_tokens),
         active: cost.active,
         user_gate,
+        failure_fingerprint: failure_fingerprint_from_turn(interactions),
     }
 }
 

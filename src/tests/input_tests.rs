@@ -1,4 +1,4 @@
-use crate::ui::input::InputEditor;
+use crate::ui::input::{InputEditor, Picker};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn press(code: KeyCode) -> KeyEvent {
@@ -9,6 +9,87 @@ fn type_str(editor: &mut InputEditor, s: &str) {
     for c in s.chars() {
         editor.handle_key(press(KeyCode::Char(c)));
     }
+}
+
+#[test]
+fn tab_opens_finite_argument_picker_after_paste_or_history_recall() {
+    let mut editor = InputEditor::new();
+    editor.load_text("/permissions ma");
+
+    editor.handle_key(press(KeyCode::Tab));
+
+    assert_eq!(editor.buffer.as_str(), "/permissions ma");
+    match editor.picker.as_ref() {
+        Some(Picker::Prefixed(picker, prefix)) => {
+            assert_eq!(*prefix, "/permissions ");
+            assert_eq!(picker.matches().collect::<Vec<_>>(), ["manual"]);
+        }
+        _ => panic!("Tab should open the permissions argument picker"),
+    }
+}
+
+#[test]
+fn command_picker_hands_permissions_to_its_argument_picker() {
+    let mut editor = InputEditor::new();
+    editor.handle_key(press(KeyCode::Char('/')));
+    for character in "permissions".chars() {
+        assert!(editor.handle_picker_key(press(KeyCode::Char(character))));
+    }
+
+    assert!(editor.handle_picker_key(press(KeyCode::Tab)));
+
+    assert_eq!(editor.buffer.as_str(), "/permissions ");
+    match editor.picker.as_ref() {
+        Some(Picker::Prefixed(picker, prefix)) => {
+            assert_eq!(*prefix, "/permissions ");
+            assert_eq!(
+                picker.matches().collect::<Vec<_>>(),
+                ["yolo", "auto", "manual"]
+            );
+        }
+        _ => panic!("the command picker should hand off to the permissions picker"),
+    }
+}
+
+#[test]
+fn every_finite_argument_command_supports_shell_style_tab_completion() {
+    for command in crate::ui::pickers::handlers::FINITE_ARGUMENT_COMMANDS {
+        let mut editor = InputEditor::new();
+        editor.load_text(command);
+        editor.handle_key(press(KeyCode::Tab));
+        assert!(
+            matches!(editor.picker, Some(Picker::Prefixed(_, _))),
+            "{command} did not open an argument picker"
+        );
+    }
+}
+
+#[test]
+fn model_tab_completion_uses_provider_models_for_singular_command() {
+    let mut editor = InputEditor::new();
+    editor.set_quick_model_names(vec!["quick".to_string()]);
+    editor.set_live_model_names(vec!["provider/model".to_string()]);
+    editor.load_text("/model");
+
+    editor.handle_key(press(KeyCode::Tab));
+
+    assert_eq!(editor.buffer.as_str(), "/model ");
+    match editor.picker.as_ref() {
+        Some(Picker::Models(picker)) => {
+            assert_eq!(picker.prefix, "/model ");
+            assert_eq!(picker.matches, ["provider/model"]);
+        }
+        _ => panic!("Tab should open the singular model picker"),
+    }
+}
+
+#[test]
+fn tab_keeps_indentation_behavior_for_non_command_text() {
+    let mut editor = InputEditor::new();
+    editor.load_text("ordinary text");
+    editor.handle_key(press(KeyCode::Tab));
+    assert_eq!(editor.buffer.as_str(), "ordinary text  ");
+    assert!(editor.picker.is_none());
 }
 
 #[test]

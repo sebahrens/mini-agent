@@ -67,6 +67,10 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
 fn handle_status(ctx: &mut SlashCtx<'_>) {
     let mem = Mem::open();
     write_ok(ctx.renderer, "memory status:");
+    write_result(
+        ctx.renderer,
+        "usage: /memory <status|search|read|write|editor|clear>  (press Tab for options)",
+    );
 
     let long_term = mem.memory_md();
     if long_term.exists() {

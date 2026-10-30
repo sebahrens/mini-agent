@@ -132,7 +132,7 @@ fn oauth_false_disables() {
 fn oauth_object_parses_fields() {
     let json = r#"{
         "url": "https://example.com/mcp",
-        "oauth": { "scopes": ["read", "write"], "client_id": "abc", "redirect_port": 9123 }
+        "oauth": { "scopes": ["read", "write"], "client_id": "abc", "redirect_host": "localhost", "redirect_port": 9123 }
     }"#;
     let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
     let McpServerConfig::Url { oauth, .. } = cfg else {
@@ -145,7 +145,17 @@ fn oauth_object_parses_fields() {
     );
     assert_eq!(settings.client_id.as_deref(), Some("abc"));
     assert_eq!(settings.redirect_port(), 9123);
-    assert_eq!(settings.redirect_uri(), "http://127.0.0.1:9123/callback");
+    assert_eq!(settings.redirect_uri(), "http://localhost:9123/callback");
+}
+
+#[test]
+fn oauth_redirect_host_rejects_non_loopback_values() {
+    assert!(
+        serde_json::from_str::<McpServerConfig>(
+            r#"{"url":"https://example.com/mcp","oauth":{"redirect_host":"example.com"}}"#,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -189,6 +199,14 @@ fn token_filename_uses_complete_canonical_server_identity() {
         first,
         oauth::token_filename("Exa Web Search", "https://example.com/mcp", Some("other")).unwrap()
     );
+}
+
+#[test]
+fn oauth_identity_rejects_cleartext_server_endpoints() {
+    let error = oauth::token_filename("server", "http://api.example.com/mcp", None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("HTTPS"), "{error}");
 }
 
 #[test]

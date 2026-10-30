@@ -330,6 +330,7 @@ impl DoctorReport {
             ] {
                 use crate::provider::RuntimeAvailability;
                 let value = match state {
+                    RuntimeAvailability::Pending => "preflight pending".into(),
                     RuntimeAvailability::Available => "recorded available".into(),
                     RuntimeAvailability::NotCompiled => "not compiled".into(),
                     RuntimeAvailability::Unavailable { reason } => {

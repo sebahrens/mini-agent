@@ -90,12 +90,12 @@ def isolated_env(root: Path) -> dict[str, str]:
     env.update(
         {
             "MINI_AGENT_GYM": "1",
-            "ZS_CONFIG_DIR": str(root / "config"),
-            "ZS_CREDENTIALS_DIR": str(root / "credentials"),
-            "ZS_DATA_DIR": str(root / "data"),
-            "ZS_LOCAL_DATA_DIR": str(root / "local"),
-            "ZS_STATE_DIR": str(root / "state"),
-            "ZS_CACHE_DIR": str(root / "cache"),
+            "MINI_AGENT_CONFIG_DIR": str(root / "config"),
+            "MINI_AGENT_CREDENTIALS_DIR": str(root / "credentials"),
+            "MINI_AGENT_DATA_DIR": str(root / "data"),
+            "MINI_AGENT_LOCAL_DATA_DIR": str(root / "local"),
+            "MINI_AGENT_STATE_DIR": str(root / "state"),
+            "MINI_AGENT_CACHE_DIR": str(root / "cache"),
             "TMPDIR": str(root / "tmp"),
         }
     )

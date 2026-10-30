@@ -97,6 +97,16 @@ class ConditionParserTests(unittest.TestCase):
 
 
 class Phase6CiWorkflowTests(unittest.TestCase):
+    def test_linux_runtime_changes_keep_exact_native_probe_discovery_and_execution(self) -> None:
+        linux = job_body(WORKFLOW.read_text(encoding="utf-8"), "linux-sandbox-policy")
+        for name in (
+            "loaded_runtime_closure_keeps_loader_visible_soname_aliases",
+            "linux_js_worker_survives_transient_launch_thread_exit",
+        ):
+            self.assertEqual(linux.count(name), 2, name)
+        self.assertIn('grep -Fxc "$probe: test"', linux)
+        self.assertIn("--ignored --nocapture --test-threads=1", linux)
+
     def test_spawn_parity_gate_batches_only_its_feature_consumers(self) -> None:
         linux = job_body(WORKFLOW.read_text(encoding="utf-8"), "linux-sandbox-policy")
         step = linux.split("- name: Test JS spawn parity through the shared sandbox", 1)[1].split("- name:", 1)[0]
@@ -125,7 +135,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("name: Archive native Linux workspace proof\n        if: always()", linux)
         self.assertIn("name: Retire owned native workspace fixtures\n        if: always()", linux)
         # Existing worker checks remain enforced on the new native runner.
-        self.assertIn("linux_js_worker_containment -- --ignored --nocapture", linux)
+        self.assertIn("-- linux_js_worker_containment", linux)
         self.assertIn("Run Phase 6 adversarial suites under js and skills", linux)
 
     def test_native_linux_compiled_cache_is_partitioned_by_pinned_runner_abi(self) -> None:
@@ -1860,8 +1870,8 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
         normalized = re.sub(r"\s+", "", direct)
         for item in [
             "run_bounded_preflight_helper(&mutcommand,run_deadline,cleanup_deadline,None)",
-            "run_deadline=started+Duration::from_secs(3)",
-            "cleanup_deadline=run_deadline+Duration::from_secs(3)",
+            "run_deadline=started+GENERAL_PREFLIGHT_RUN_TIMEOUT",
+            "cleanup_deadline=run_deadline+GENERAL_PREFLIGHT_CLEANUP_TIMEOUT",
             ".stdout(Stdio::null())", ".stderr(Stdio::null())",
         ]:
             if item not in normalized:
@@ -1869,7 +1879,7 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
         if any(item in direct for item in ["PreflightDiagnostics::new", "record_preflight", "println!", "write_all"]):
             raise AssertionError("ordinary direct command must not collect or emit self-check diagnostics")
         for item in [
-            "const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration = Duration::from_secs(5);",
+            "const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration = Duration::from_secs(30);",
             "const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);",
             "general_sandbox_preflight_observed(None)",
         ]:
@@ -1898,14 +1908,14 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
             with self.subTest(before=before), self.assertRaises(AssertionError):
                 self.validate(original.replace(before, after), source)
 
-    def test_direct_verification_remains_silent_with_unchanged_deadlines(self) -> None:
+    def test_direct_verification_remains_silent_with_shared_bounded_deadlines(self) -> None:
         workflow = WORKFLOW.read_text()
         original = (REPOSITORY_ROOT / "src/sandbox/windows.rs").read_text()
         prefix, tail = original.split("pub(crate) fn verify_direct_command(", 1)
         body, rest = tail.split("\nfn build_helper(", 1)
         for before, after in [
             ("cleanup_deadline, None", "cleanup_deadline, diagnostics"),
-            ("Duration::from_secs(3)", "Duration::from_secs(30)"),
+            ("started + GENERAL_PREFLIGHT_RUN_TIMEOUT", "started + Duration::from_secs(300)"),
             (".stderr(Stdio::null())", ".stderr(Stdio::piped())"),
         ]:
             with self.subTest(before=before), self.assertRaises(AssertionError):

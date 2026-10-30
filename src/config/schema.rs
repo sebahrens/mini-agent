@@ -13,6 +13,10 @@ fn shape(shape: ConfigShape) -> Value {
         ConfigShape::Number => json!({"type":"number"}),
         ConfigShape::String => json!({"type":"string"}),
         ConfigShape::Strings => json!({"type":"array","items":{"type":"string"}}),
+        ConfigShape::AllNoneOrStrings => json!({"anyOf":[
+            {"type":"string","enum":["all","none"]},
+            {"type":"array","items":{"type":"string"}}
+        ]}),
         ConfigShape::Object => json!({"type":"object"}),
         ConfigShape::StringMap => json!({"type":"object","additionalProperties":{"type":"string"}}),
         ConfigShape::StringArrayMap => {

@@ -238,18 +238,29 @@ pub(super) fn existing_session_dir() -> anyhow::Result<Option<PathBuf>> {
 fn read_private_string(path: &Path) -> anyhow::Result<String> {
     #[cfg(test)]
     FULL_SESSION_READS.with(|reads| reads.set(reads.get() + 1));
-    let mut file = crate::fs::open_private_file(path).map_err(|error| {
+    let file = crate::fs::open_private_file(path).map_err(|error| {
         anyhow::anyhow!("refusing unsafe session file {}: {}", path.display(), error)
     })?;
-    let mut content = String::new();
-    file.by_ref()
-        .take((MAX_SESSION_BYTES + 1) as u64)
-        .read_to_string(&mut content)?;
+    // Reject an oversized file from its recorded length before allocating,
+    // then bound the read itself in case the file grows concurrently.
+    let recorded = file.metadata()?.len();
     anyhow::ensure!(
-        content.len() <= MAX_SESSION_BYTES,
-        "persisted session exceeds the byte limit"
+        recorded <= MAX_SESSION_BYTES as u64,
+        "persisted session {} exceeds the session size limit ({} byte limit)",
+        path.display(),
+        MAX_SESSION_BYTES
     );
-    Ok(content)
+    let mut bytes = Vec::with_capacity(recorded as usize);
+    file.take((MAX_SESSION_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_SESSION_BYTES,
+        "persisted session {} exceeds the session size limit ({} byte limit) while reading",
+        path.display(),
+        MAX_SESSION_BYTES
+    );
+    String::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("session file {} is not UTF-8: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -1518,19 +1529,19 @@ mod readonly_import_tests {
         let root = crate::tests::OwnedTestDirectory::new("session-save-bound");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -1822,21 +1833,27 @@ mod readonly_import_tests {
     }
 
     fn scoped_state(root: &crate::tests::OwnedTestDirectory) -> crate::tests::ScopedProcessEnv {
+        // These must be the canonical `MINI_AGENT_*_DIR` override names that
+        // `paths::resolve_override` actually reads (see `process_override`);
+        // the stale `ZS_*` prefix used here previously matched nothing, so
+        // every test using this helper silently fell through to the real
+        // default path roots and shared on-disk state with every other test
+        // (and process) doing the same, instead of this directory.
         crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ])

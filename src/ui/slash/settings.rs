@@ -83,6 +83,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         }
         "/reasoning" | "/thinking" => handle_reasoning(parts, ctx).await,
         "/mode" => handle_mode(parts, ctx).await,
+        "/permissions" => handle_permissions(parts, ctx).await,
         "/sandbox" => handle_sandbox(parts, ctx).await,
         "/toggle" => handle_toggle(parts, ctx).await,
         "/editsys" => handle_editsys(parts, ctx).await,
@@ -405,6 +406,52 @@ async fn handle_mode(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
     Ok(())
 }
 
+/// Present the permission policies using approval-oriented names while keeping
+/// `/mode` as the complete low-level security-mode interface.
+async fn handle_permissions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    if parts.len() < 2 {
+        ctx.input
+            .start_argument_picker("/permissions ", ["yolo", "auto", "manual"]);
+        return Ok(());
+    }
+
+    match parse_permission_mode(parts[1]) {
+        Some((mode, label)) => set_permission_mode(ctx, mode, label),
+        None => write_error(
+            ctx.renderer,
+            format!(
+                "unknown permissions mode: {} (use yolo, auto, or manual)",
+                parts[1]
+            ),
+        ),
+    }
+    Ok(())
+}
+
+fn parse_permission_mode(value: &str) -> Option<(SecurityMode, &'static str)> {
+    match value {
+        "yolo" => Some((SecurityMode::Yolo, "yolo")),
+        "auto" | "auto-approval" => Some((SecurityMode::Standard, "auto-approval")),
+        "manual" | "manual-approval" => Some((SecurityMode::Restrictive, "manual-approval")),
+        _ => None,
+    }
+}
+
+fn set_permission_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode, label: &str) {
+    if let Some(permission) = ctx.permission {
+        permission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_mode(mode);
+        write_ok(ctx.renderer, format!("permissions: {label}"));
+    } else {
+        write_error(
+            ctx.renderer,
+            "permission system disabled at startup; restart without --dangerously-skip-permissions",
+        );
+    }
+}
+
 /// The `/mode` listing: the current mode, then one line per mode in
 /// [`SecurityMode::NAMES`] order with its description.
 pub(crate) fn mode_listing(current: SecurityMode) -> Vec<String> {
@@ -593,10 +640,11 @@ fn runtime_status_lines(
     lines
 }
 
-/// `on` / `off (<verbatim reason>)` / `not compiled`, matching the `on`/`off`
-/// vocabulary the rest of `/toggle` uses.
+/// `checking` / `on` / `off (<verbatim reason>)` / `not compiled`, matching
+/// the `on`/`off` vocabulary the rest of `/toggle` uses.
 fn availability_label(state: &crate::provider::RuntimeAvailability) -> String {
     match state {
+        crate::provider::RuntimeAvailability::Pending => "checking".to_string(),
         crate::provider::RuntimeAvailability::Available => "on".to_string(),
         crate::provider::RuntimeAvailability::Unavailable { reason } => format!("off ({reason})"),
         crate::provider::RuntimeAvailability::NotCompiled => "not compiled".to_string(),
@@ -619,13 +667,15 @@ async fn handle_editsys(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
     }
     match parts[1] {
         "similarity" => {
-            tools::set_edit_system(EditSystem::Similarity);
-            ctx.rebuild_agent().await;
+            if tools::set_edit_system(EditSystem::Similarity) {
+                ctx.rebuild_agent().await;
+            }
             write_ok(ctx.renderer, "edit system: similarity (SEARCH/REPLACE)");
         }
         "hashedit" => {
-            tools::set_edit_system(EditSystem::Hashedit);
-            ctx.rebuild_agent().await;
+            if tools::set_edit_system(EditSystem::Hashedit) {
+                ctx.rebuild_agent().await;
+            }
             write_ok(ctx.renderer, "edit system: hashedit (tag-based)");
         }
         _ => write_error(
@@ -875,7 +925,8 @@ mod mode_tests {
 
 #[cfg(test)]
 mod runtime_status_tests {
-    use super::runtime_status_lines;
+    use super::{parse_permission_mode, runtime_status_lines};
+    use crate::permission::SecurityMode;
     use crate::provider::{JsRuntimeReport, RuntimeAvailability};
 
     #[test]
@@ -909,6 +960,27 @@ mod runtime_status_tests {
     }
 
     #[test]
+    fn permission_command_names_map_to_existing_audited_modes() {
+        for (name, expected_mode, expected_label) in [
+            ("yolo", SecurityMode::Yolo, "yolo"),
+            ("auto", SecurityMode::Standard, "auto-approval"),
+            ("auto-approval", SecurityMode::Standard, "auto-approval"),
+            ("manual", SecurityMode::Restrictive, "manual-approval"),
+            (
+                "manual-approval",
+                SecurityMode::Restrictive,
+                "manual-approval",
+            ),
+        ] {
+            assert_eq!(
+                parse_permission_mode(name),
+                Some((expected_mode, expected_label))
+            );
+        }
+        assert_eq!(parse_permission_mode("unknown"), None);
+    }
+
+    #[test]
     fn available_runtime_reports_on_without_a_reason() {
         let report = JsRuntimeReport {
             javascript: RuntimeAvailability::Available,
@@ -926,6 +998,26 @@ mod runtime_status_tests {
             assert!(line.trim_end().ends_with("on"), "{line}");
             assert!(!line.contains('('), "{line}");
         }
+    }
+
+    #[test]
+    fn pending_runtime_reports_checking_instead_of_off() {
+        let report = JsRuntimeReport {
+            javascript: RuntimeAvailability::Pending,
+            learned_skills: RuntimeAvailability::Pending,
+        };
+
+        let lines = runtime_status_lines(
+            &report,
+            #[cfg(feature = "skills")]
+            None,
+        );
+
+        assert!(
+            lines.iter().all(|line| line.contains("checking")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|line| !line.contains("off")), "{lines:?}");
     }
 
     #[test]
@@ -1038,19 +1130,19 @@ mod profile100_tests {
         let root = crate::tests::OwnedTestDirectory::new("profile100-slash");
         let _env = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);

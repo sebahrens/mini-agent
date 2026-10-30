@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use super::channel::{ChannelResult, interpret_hook_output};
 use super::envelope::{EventFields, build_envelope, build_tool_envelope};
@@ -36,7 +36,9 @@ impl CompiledMatcher {
                     .collect();
                 Ok(CompiledMatcher::Names(names))
             }
-            Some(s) => Regex::new(s)
+            Some(s) => RegexBuilder::new(&canonicalize_matcher_regex(s))
+                .case_insensitive(true)
+                .build()
                 .map(CompiledMatcher::Regex)
                 .map_err(|e| format!("hooks: invalid matcher regex `{s}`: {e}")),
         }
@@ -49,6 +51,68 @@ impl CompiledMatcher {
             CompiledMatcher::Regex(re) => re.is_match(name),
         }
     }
+}
+
+fn canonicalize_matcher_regex(matcher: &str) -> String {
+    let mut output = String::with_capacity(matcher.len());
+    let mut identifier = String::new();
+    let mut escaped = false;
+    let mut character_class = false;
+    // MCP names (`mcp__<server>__<tool>`) are exact provenance, not built-in
+    // aliases: every token from an `mcp__` prefix up to the next alternation or
+    // group boundary stays literal.
+    let mut mcp_name = false;
+    let flush = |output: &mut String, identifier: &mut String, mcp_name: &mut bool| {
+        if identifier.is_empty() {
+            return;
+        }
+        if !*mcp_name && identifier.to_ascii_lowercase().starts_with("mcp__") {
+            *mcp_name = true;
+        }
+        if *mcp_name {
+            output.push_str(identifier);
+        } else {
+            output.push_str(&canonical_tool_name(identifier));
+        }
+        identifier.clear();
+    };
+    for character in matcher.chars() {
+        if escaped {
+            flush(&mut output, &mut identifier, &mut mcp_name);
+            output.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            flush(&mut output, &mut identifier, &mut mcp_name);
+            output.push(character);
+            escaped = true;
+            continue;
+        }
+        if character == '[' {
+            flush(&mut output, &mut identifier, &mut mcp_name);
+            character_class = true;
+            output.push(character);
+            continue;
+        }
+        if character == ']' {
+            flush(&mut output, &mut identifier, &mut mcp_name);
+            character_class = false;
+            output.push(character);
+            continue;
+        }
+        if !character_class && (character.is_alphanumeric() || character == '_') {
+            identifier.push(character);
+        } else {
+            flush(&mut output, &mut identifier, &mut mcp_name);
+            if !character_class && matches!(character, '|' | '(' | ')') {
+                mcp_name = false;
+            }
+            output.push(character);
+        }
+    }
+    flush(&mut output, &mut identifier, &mut mcp_name);
+    output
 }
 
 fn is_plain_name_list(s: &str) -> bool {
@@ -176,7 +240,7 @@ impl HookExecutionRootLease {
 }
 
 /// The rig-free dispatcher seam: accepts only strings/JSON and returns only
-/// zerostack-owned `Decision`/`PreDecision` values. See hook-dispatch spec's
+/// mini-agent-owned `Decision`/`PreDecision` values. See hook-dispatch spec's
 /// "rig-free dispatcher seam" requirement.
 pub(crate) struct HookDispatcher {
     events: HashMap<String, Vec<MatcherEntry>>,

@@ -265,9 +265,15 @@ impl PreSyncGate {
         if self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
-        std::fs::write(
-            self.root.join("started"),
-            serde_json::to_vec(&account.snapshot()).unwrap(),
+        // Readers poll `started.exists()` and then parse its content without a
+        // retry. A plain `std::fs::write` opens (making `exists()` true) and
+        // fills the file in separate steps, so a reader can observe a created
+        // but still-empty file and fail to parse it. Writing through a
+        // same-directory temp file and renaming into place means the file is
+        // never visible at this path until it is complete.
+        crate::fs::atomic_create_sync(
+            &self.root.join("started"),
+            &serde_json::to_vec(&account.snapshot()).unwrap(),
         )
         .unwrap();
         while !self.root.join("release").exists() {

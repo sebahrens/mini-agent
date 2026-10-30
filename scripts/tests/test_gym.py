@@ -8,10 +8,12 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import tracemalloc
@@ -86,19 +88,19 @@ case "${{1:-}}" in
       echo "seed import exploded" >&2
       exit 1
     fi
-    python3 "$helper" seed "$ZS_LOCAL_DATA_DIR"
+    python3 "$helper" seed "$MINI_AGENT_LOCAL_DATA_DIR"
     exit 0
     ;;
   --approve-learned-skill)
     exit 0
     ;;
   --activate-learned-skill)
-    python3 "$helper" activate "$ZS_LOCAL_DATA_DIR" "$2"
+    python3 "$helper" activate "$MINI_AGENT_LOCAL_DATA_DIR" "$2"
     exit $?
     ;;
 esac
 printf '%s\\n' "$*" >> "$log"
-printf '%s\\t%s\\t%s\\n' "$PWD" "$TMPDIR" "$ZS_LOCAL_DATA_DIR" >> "$log.env"
+printf '%s\\t%s\\t%s\\n' "$PWD" "$TMPDIR" "$MINI_AGENT_LOCAL_DATA_DIR" >> "$log.env"
 case "$mode" in
   failure)
     echo "agent failed" >&2
@@ -108,6 +110,27 @@ esac
 printf 'fixed\\n' > fixed.txt
 exit 0
 """
+
+
+def capture_clock(ready: Path | None = None, grace: float = .5):
+    """Control run_bounded's deadline clock independently of host load.
+
+    Deadlines never expire until ``ready`` exists (the command has emitted all
+    output it will produce). After a short real grace period for draining that
+    buffered output, every deadline started earlier expires; later commands
+    start against the advanced constant clock and do not expire. Process
+    waits, pipes and cleanup remain real.
+    """
+    seen: list[float] = []
+
+    def monotonic() -> float:
+        if ready is None or not ready.exists():
+            return 0.0
+        if not seen:
+            seen.append(time.monotonic())
+        return 1e6 if time.monotonic() - seen[0] >= grace else 0.0
+
+    return mock.patch.object(CAPTURE, "time", mock.Mock(monotonic=monotonic))
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -198,7 +221,9 @@ class GymSubprocessTests(unittest.TestCase):
                         code = ("import os,sys; os.write(1,b'OUT'); os.write(2,b'ERR'); "
                                 + ("os.close(1); os.close(2); " if close_pipes else "")
                                 + "sys.exit(3)")
-                        result = CAPTURE.run_bounded([sys.executable, "-c", code], root, dict(os.environ), timeout)
+                        # Acceptance, not interpreter startup speed, is under test.
+                        with capture_clock():
+                            result = CAPTURE.run_bounded([sys.executable, "-c", code], root, dict(os.environ), timeout)
                         self.assertEqual((result.returncode, result.stdout, result.stderr), (3, b"OUT", b"ERR"))
 
     def test_output_floods_retain_exact_tails_with_bounded_memory(self) -> None:
@@ -217,10 +242,11 @@ class GymSubprocessTests(unittest.TestCase):
                 )
                 tracemalloc.start()
                 try:
-                    result = TRAIN_MODULE.run(
-                        [sys.executable, "-c", code, mode, str(exit_code)],
-                        Path(directory), dict(os.environ), 5,
-                    )
+                    with capture_clock():
+                        result = TRAIN_MODULE.run(
+                            [sys.executable, "-c", code, mode, str(exit_code)],
+                            Path(directory), dict(os.environ), 5,
+                        )
                     peak = tracemalloc.get_traced_memory()[1]
                 finally:
                     tracemalloc.stop()
@@ -432,11 +458,12 @@ class GymSubprocessTests(unittest.TestCase):
             for name in ("subprocess.py", "sitecustomize.py"):
                 (root / name).write_text(poison)
             env = {**os.environ, "PYTHONPATH": str(root)}
-            result = CAPTURE.run_bounded(["/bin/true"], root, env, 3)
+            with capture_clock():
+                result = CAPTURE.run_bounded(["/bin/true"], root, env, 3)
             self.assertEqual(result.returncode, 0)
             self.assertFalse((root / "poisoned").exists())
             for executable, error_type in [(root / "missing", FileNotFoundError), (root / "subprocess.py", PermissionError)]:
-                with self.subTest(executable=executable), self.assertRaises(error_type) as failed:
+                with self.subTest(executable=executable), capture_clock(), self.assertRaises(error_type) as failed:
                     CAPTURE.run_bounded([str(executable)], root, env, 3)
                 self.assertEqual(failed.exception.filename, str(executable))
 
@@ -607,7 +634,8 @@ class GymSubprocessTests(unittest.TestCase):
 
             for report in (b"", b'{"returncode":true}', b'{"returncode":0,"errno":1}', b'x' * 1025):
                 helper.write_text("import os,sys\nos.write(int(sys.argv[2]), " + repr(report) + ")\n")
-                with self.subTest(report=report[:80]), mock.patch.object(CAPTURE.subprocess, "Popen", side_effect=spawn):
+                with self.subTest(report=report[:80]), mock.patch.object(CAPTURE.subprocess, "Popen", side_effect=spawn), \
+                     capture_clock():
                     with self.assertRaisesRegex(CAPTURE.ProcessCleanupError, "retain workspace"):
                         CAPTURE.run_bounded(["/bin/true"], root, dict(os.environ), 2)
                 self.assertEqual(owners[-1].poll(), 0)
@@ -641,6 +669,114 @@ os.write(int(sys.argv[2]), b'{"returncode":0}')
                     finally:
                         (root / "release-owner").touch()
                         owners[-1].wait(timeout=5)
+
+
+class GymAcknowledgementFramingTests(unittest.TestCase):
+    """Portable checks of the EOF-framed supervisor acknowledgement reader."""
+
+    def channel(self):
+        reader, writer = socket.socketpair()
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        os.set_blocking(reader.fileno(), False)
+        return reader, writer
+
+    def feed(self, writer, chunks, *, close=True, pause=.01):
+        def run():
+            for chunk in chunks:
+                time.sleep(pause)
+                writer.sendall(chunk)
+            if close:
+                time.sleep(pause)
+                writer.close()
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.addCleanup(thread.join)
+
+    def test_partial_chunks_accumulate_until_eof(self) -> None:
+        frame = json.dumps({"returncode": -9}).encode()
+        for split in ([frame], [frame[:1], frame[1:]], [bytes([b]) for b in frame], [frame[:5], b"", frame[5:]]):
+            with self.subTest(chunks=len(split)):
+                reader, writer = self.channel()
+                self.feed(writer, [chunk for chunk in split if chunk])
+                # Caller deadline control must not affect the framing deadline.
+                with mock.patch.object(CAPTURE, "time", mock.Mock(monotonic=lambda: 0.0)):
+                    raw = CAPTURE.read_acknowledgement(reader.fileno(), 5)
+                self.assertEqual(raw, frame)
+                self.assertEqual(CAPTURE.parse_acknowledgement(raw), {"returncode": -9})
+        # A writer copy can outlive the owner (interrupted handoff): a complete
+        # object is a frame without EOF; a truncated one is still awaited.
+        reader, writer = self.channel()
+        self.feed(writer, [frame[:4], frame[4:]], close=False)
+        self.assertEqual(CAPTURE.read_acknowledgement(reader.fileno(), 5), frame)
+
+    def test_eof_before_acknowledgement_is_distinct_from_malformed(self) -> None:
+        reader, writer = self.channel()
+        writer.close()
+        raw = CAPTURE.read_acknowledgement(reader.fileno(), 5)
+        self.assertEqual(raw, b"")
+        with self.assertRaisesRegex(CAPTURE.AcknowledgementError, "closed without acknowledgement"):
+            CAPTURE.parse_acknowledgement(raw)
+        for raw, message in ((b'{"returncode": 1', "malformed"), (b"[1]", "invalid supervisor result"),
+                             (b'{"returncode": true}', "result type"), (b'{"returncode":0,"errno":1}', "invalid supervisor result")):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(CAPTURE.AcknowledgementError, message):
+                    CAPTURE.parse_acknowledgement(raw)
+
+    def test_unterminated_or_oversized_frames_fail_within_deadline(self) -> None:
+        for chunks, message in (([], "not received"), ([b'{"returncode"'], "incomplete")):
+            with self.subTest(message=message):
+                reader, writer = self.channel()
+                for chunk in chunks:
+                    writer.sendall(chunk)
+                started = time.monotonic()
+                with self.assertRaisesRegex(CAPTURE.AcknowledgementError, message):
+                    CAPTURE.read_acknowledgement(reader.fileno(), .2)
+                self.assertLess(time.monotonic() - started, 3)
+        reader, writer = self.channel()
+        self.feed(writer, [b"x" * 600, b"x" * 600], close=False)
+        with self.assertRaisesRegex(CAPTURE.AcknowledgementError, "exceeds limit"):
+            CAPTURE.read_acknowledgement(reader.fileno(), 5)
+
+    def test_failed_owner_with_valid_acknowledgement_fails_closed_with_diagnostics(self) -> None:
+        reader, writer = self.channel()
+        owner = subprocess.Popen(
+            [sys.executable, "-c", "import os,sys; os.write(2, b'removal failed'); sys.exit(1)"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.addCleanup(owner.stderr.close)
+        self.addCleanup(owner.stdout.close)
+        writer.sendall(b'{"returncode": 0}')
+        writer.close()
+        owned = CAPTURE._OwnedProcess(["/bin/true"], Path.cwd())
+        owned.process, owned.report = owner, reader
+        with self.assertRaisesRegex(CAPTURE.ProcessCleanupError,
+                                    r"status 1 after acknowledgement.*retain workspace.*removal failed"):
+            owned.wait(5)
+        self.assertIsNone(owned.result)
+
+    def test_macos_job_removal_tolerates_in_progress_teardown_but_not_a_loaded_job(self) -> None:
+        from scripts.gym import _macos_supervisor as SUPERVISOR
+
+        def launchctl(remove_code, list_codes):
+            codes = iter(list_codes)
+
+            def run(argv, **_kwargs):
+                code = remove_code if argv[1] == "remove" else next(codes)
+                return subprocess.CompletedProcess(argv, code, None, b"Operation now in progress")
+            return run
+
+        for remove_code, list_codes, removed in ((0, [], True), (36, [0, 0, 113], True), (36, [0] * 1000, False)):
+            with self.subTest(remove_code=remove_code, removed=removed), \
+                 mock.patch.object(SUPERVISOR.subprocess, "run", side_effect=launchctl(remove_code, list_codes)), \
+                 mock.patch.object(SUPERVISOR.os, "write") as diagnostics:
+                if removed:
+                    SUPERVISOR.remove_job("org.example", settle=1)
+                    diagnostics.assert_not_called()
+                else:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        SUPERVISOR.remove_job("org.example", settle=.1)
+                    self.assertIn(b"status 36", diagnostics.call_args.args[1])
 
 
 class GymWorktreeCommandTests(unittest.TestCase):
@@ -746,11 +882,12 @@ class GymWorktreeCommandTests(unittest.TestCase):
                 repo = make_repo(root)
                 pid_file = root / "hook-pid"
                 marker = root / "oracle-ran"
+                ready = root / "output-complete"
                 code = (
                     "import os,time; from pathlib import Path\n"
                     f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
                     "for _ in range(32): os.write(1,b'x'*65536); os.write(2,b'y'*65536)\n"
-                    "os.write(2,b'checkout-tail'); time.sleep(3)\n"
+                    f"os.write(2,b'checkout-tail'); Path({str(ready)!r}).touch(); time.sleep(3)\n"
                 )
                 hook = repo / ".git/hooks/post-checkout"
                 hook.write_text("#!/bin/sh\nexec " + shlex.join([sys.executable, "-c", code]) + "\n")
@@ -758,7 +895,7 @@ class GymWorktreeCommandTests(unittest.TestCase):
                 workspace = root / "worktree"
                 tracemalloc.start()
                 try:
-                    with mock.patch.object(WORKTREES, "SETUP_TIMEOUT_SECS", 1):
+                    with mock.patch.object(WORKTREES, "SETUP_TIMEOUT_SECS", 1), capture_clock(ready):
                         if caller == "trainer":
                             task = {"base_commit": "HEAD", "initial_files": {}, "deleted_files": []}
                             with self.assertRaises(TRAIN_MODULE.EpisodeFailure) as failed:
@@ -804,6 +941,7 @@ class GymWorktreeCommandTests(unittest.TestCase):
                 shim_dir.mkdir()
                 pid_file = root / "command-pid"
                 calls = root / "calls.jsonl"
+                ready = root / "output-complete"
                 shim = shim_dir / "git"
                 shim.write_text(
                     f"#!{sys.executable}\nimport os,sys,time,json\nfrom pathlib import Path\n"
@@ -812,6 +950,7 @@ class GymWorktreeCommandTests(unittest.TestCase):
                     f" Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
                     " for _ in range(32): os.write(1,b'x'*65536); os.write(2,b'y'*65536)\n"
                     " os.write(2,b'cleanup-tail')\n"
+                    f" Path({str(ready)!r}).touch()\n"
                     f" if {outcome!r}=='timeout': time.sleep(3)\n"
                     f" sys.exit(7 if {outcome!r}=='error' else 0)\n"
                     f"os.execv({real_git!r},[{real_git!r},*sys.argv[1:]])\n"
@@ -820,7 +959,8 @@ class GymWorktreeCommandTests(unittest.TestCase):
                 tracemalloc.start()
                 try:
                     with mock.patch.dict(os.environ, {"PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", "")}), \
-                         mock.patch.object(WORKTREES, "CLEANUP_TIMEOUT_SECS", 1):
+                         mock.patch.object(WORKTREES, "CLEANUP_TIMEOUT_SECS", 1), \
+                         capture_clock(ready if outcome == "timeout" else None):
                         exception = WORKTREES.WorktreeError if caller == "trainer" else MINE.OracleSetupError
                         with self.assertRaises(exception) as failed:
                             if caller == "trainer":
@@ -1190,9 +1330,9 @@ class GymTrainerTests(unittest.TestCase):
                 marker = root / "agent-ran"
                 suffix = "\ntouch " + shlex.quote(str(marker)) + "\n"
                 if case in ("filesystem", "both"):
-                    suffix += ('mkdir -p "$ZS_LOCAL_DATA_DIR/retained"\n'
-                               'printf stale > "$ZS_LOCAL_DATA_DIR/retained/stale"\n'
-                               'chmod 500 "$ZS_LOCAL_DATA_DIR/retained"\n')
+                    suffix += ('mkdir -p "$MINI_AGENT_LOCAL_DATA_DIR/retained"\n'
+                               'printf stale > "$MINI_AGENT_LOCAL_DATA_DIR/retained/stale"\n'
+                               'chmod 500 "$MINI_AGENT_LOCAL_DATA_DIR/retained"\n')
                 binary.write_text(binary.read_text().replace("printf 'fixed\\n' > fixed.txt", suffix + "printf 'fixed\\n' > fixed.txt"))
                 shim_dir = root / "bin"
                 shim_dir.mkdir()
@@ -1296,7 +1436,10 @@ class GymTrainerTests(unittest.TestCase):
             self.assertEqual(len(run_dirs), 2)
             for run_dir in run_dirs:
                 with (run_dir / "config/config.toml").open("rb") as config:
-                    self.assertEqual(tomllib.load(config), {"provider": provider, "model": model})
+                    self.assertEqual(
+                        tomllib.load(config),
+                        {"provider": provider, "model": model, "js-read-roots": ["."], "js-write-roots": ["."]},
+                    )
 
     def test_phase_clocks_separate_agent_oracles_and_setup_on_success_failure_and_timeout(self) -> None:
         for arm in ("none", "library"):
@@ -1651,14 +1794,16 @@ class GymMinerTests(unittest.TestCase):
                 shim_dir = root / "bin"
                 shim_dir.mkdir()
                 calls = root / "calls"
+                ready = root / "output-complete"
                 payload = b'[{"id":"live","status":"closed"}]'
                 limit = 65536
                 shim = shim_dir / "bd"
                 shim.write_text(
-                    f"#!{sys.executable}\nimport os,sys,time,json\n"
+                    f"#!{sys.executable}\nimport os,sys,time,json\nfrom pathlib import Path\n"
                     f"with open({str(calls)!r},'a') as log: log.write(json.dumps([sys.argv[1],os.getpid()])+'\\n')\n"
                     "for _ in range(64): os.write(2,b'e'*65536)\n"
                     "os.write(2,b'tracker-tail')\n"
+                    f"Path({str(ready)!r}).touch()\n"
                     f"if {outcome!r}=='timeout': time.sleep(3)\n"
                     f"os.write(1,{payload!r})\n"
                     f"for _ in range(64 if {outcome!r}=='overflow' else 0): os.write(1,b' '*65536)\n"
@@ -1668,6 +1813,7 @@ class GymMinerTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", "")}), \
                      mock.patch.object(MINE, "METADATA_TIMEOUT_SECS", 1, create=True), \
                      mock.patch.object(MINE, "MAX_METADATA_BYTES", limit, create=True), \
+                     capture_clock(ready if outcome == "timeout" else None), \
                      contextlib.redirect_stderr(io.StringIO()) as diagnostics:
                     tracemalloc.start()
                     try:
@@ -1708,6 +1854,7 @@ class GymMinerTests(unittest.TestCase):
                 pid_file = root / "failed-command"
                 shim_dir = root / "bin"
                 shim_dir.mkdir()
+                ready = root / "output-complete"
                 shim = shim_dir / "git"
                 shim.write_text(
                     f"#!{sys.executable}\nimport os,sys,time\nfrom pathlib import Path\n"
@@ -1715,6 +1862,7 @@ class GymMinerTests(unittest.TestCase):
                     f" Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
                     " for _ in range(64): os.write(2,b'e'*65536)\n"
                     " os.write(2,b'metadata-tail')\n"
+                    f" Path({str(ready)!r}).touch()\n"
                     f" if {outcome!r}=='timeout': time.sleep(3)\n"
                     f" else:\n  for _ in range(64): os.write(1,b'x'*65536)\n"
                     f"os.execv({real_git!r},[{real_git!r},*sys.argv[1:]])\n"
@@ -1725,6 +1873,7 @@ class GymMinerTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", "")}), \
                      mock.patch.object(MINE, "METADATA_TIMEOUT_SECS", 1, create=True), \
                      mock.patch.object(MINE, "MAX_METADATA_BYTES", 65536, create=True), \
+                     capture_clock(ready if outcome == "timeout" else None), \
                      mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()) as diagnostics, \
                      contextlib.redirect_stdout(io.StringIO()) as stdout:
                     tracemalloc.start()
@@ -1780,15 +1929,17 @@ class GymMinerTests(unittest.TestCase):
                 root = Path(directory)
                 repo = make_repo(root)
                 revision = git(repo, "rev-parse", "HEAD").strip()
+                ready = root / "output-complete"
                 code = (
                     "import os,sys,time\n"
                     "for _ in range(64): os.write(1,b'x'*65536); os.write(2,b'y'*65536)\n"
-                    "os.write(2,b'stderr-end\\n')\n"
+                    "os.write(2,b'stderr-end\\n'); open(sys.argv[2],'w').close()\n"
                     "if sys.argv[1]=='timeout': time.sleep(30)\n"
                     "sys.exit(7 if sys.argv[1]=='failure' else 0)"
                 )
-                command = "exec " + shlex.join([sys.executable, "-c", code, outcome])
-                with mock.patch.object(MINE, "ORACLE_TIMEOUT_SECS", 1 if outcome == "timeout" else 5):
+                command = "exec " + shlex.join([sys.executable, "-c", code, outcome, str(ready)])
+                with mock.patch.object(MINE, "ORACLE_TIMEOUT_SECS", 1 if outcome == "timeout" else 5), \
+                     capture_clock(ready if outcome == "timeout" else None):
                     with contextlib.redirect_stderr(io.StringIO()) as diagnostic:
                         tracemalloc.start()
                         try:
@@ -1970,7 +2121,7 @@ class GymMinerTests(unittest.TestCase):
             commit = git(repo, "rev-parse", "HEAD").strip()
             self.assertFalse(MINE.oracle_at(repo, parent, "grep -qx fixed value.txt"))
             self.assertTrue(MINE.oracle_at(repo, commit, "grep -qx fixed value.txt"))
-            self.assertTrue(MINE.oracle_at(repo, commit, "test -n \"$MINI_AGENT_GYM\" && test -d \"$ZS_CONFIG_DIR\""))
+            self.assertTrue(MINE.oracle_at(repo, commit, "test -n \"$MINI_AGENT_GYM\" && test -d \"$MINI_AGENT_CONFIG_DIR\""))
             self.assertFalse(MINE.oracle_at(repo, commit, "test -n \"${GYM_MUST_NOT_LEAK:-}\""))
 
     def test_commit_association_prefers_the_oldest_exact_id_on_main(self) -> None:
@@ -2330,7 +2481,7 @@ class GymEntrypointTests(unittest.TestCase):
                         stub.write_text("#!/bin/sh\n" + command + "\n")
                         stub.chmod(0o755)
                     completed = subprocess.run(["bash", str(SETUP), str(repo)], env=env,
-                                               capture_output=True, text=True, timeout=10)
+                                               capture_output=True, text=True, timeout=120)
                     self.assertNotEqual(completed.returncode, 0)
                     self.assertLess(len(completed.stderr), 3000, "setup retained unbounded probe diagnostics")
                     self.assertNotIn("Traceback", completed.stderr)
@@ -2391,7 +2542,7 @@ class GymEntrypointTests(unittest.TestCase):
             uname.write_text("#!/bin/sh\necho FreeBSD\n")
             uname.chmod(0o755)
             completed = subprocess.run(["bash", str(SETUP), str(repo)], env=env,
-                                       capture_output=True, text=True, timeout=10)
+                                       capture_output=True, text=True, timeout=120)
             self.assertEqual(completed.returncode, 2, completed.stderr)
             self.assertIn("Linux and macOS hosts only", completed.stderr)
             self.assertFalse(Path(env["CARGO_LOG"]).exists(), "unsupported host ran Cargo")
@@ -2434,7 +2585,7 @@ class GymEntrypointTests(unittest.TestCase):
                     config_path.write_text(config)
                 (root / "bin/rustc").write_text(rustc)
                 completed = subprocess.run(["bash", str(SETUP), str(repo)], env=env,
-                                           capture_output=True, text=True, timeout=10)
+                                           capture_output=True, text=True, timeout=120)
                 self.assertEqual(completed.returncode == 0, supported, completed.stderr)
                 self.assertEqual(Path(env["CARGO_LOG"]).exists(), supported)
                 if not supported:

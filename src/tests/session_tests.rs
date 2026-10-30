@@ -490,7 +490,7 @@ fn detect_git_branch_in_repo_returns_nonempty() {
 
 #[test]
 fn detect_git_branch_outside_repo_is_none() {
-    let p = std::env::temp_dir().join("zerostack-definitely-not-a-repo-xyz123");
+    let p = std::env::temp_dir().join("mini-agent-definitely-not-a-repo-xyz123");
     assert!(Session::detect_git_branch(p.to_str().unwrap()).is_none());
 }
 

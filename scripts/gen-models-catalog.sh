@@ -32,7 +32,7 @@ OPENROUTER_VENDORS='["anthropic","openai","google","deepseek","x-ai","meta-llama
 #   openai/gemini/openrouter — ZERO stale ids found (these providers keep listed
 #                models valid, and openrouter prunes its own), so NO cutoff: a
 #                cutoff would only delete still-valid models (e.g. gemini-2.0-flash,
-#                gpt-4o). Keys are by zerostack provider name; "0000-00-00" = keep all.
+#                gpt-4o). Keys are by mini-agent provider name; "0000-00-00" = keep all.
 # This is a heuristic snapshot — the authoritative list is always the provider's
 # live API, reachable via `/models refresh`. Re-tune when a vendor retires a line.
 CUTOFFS='{"anthropic":"2025-04-01"}'
@@ -54,7 +54,7 @@ api="$(curl -fsSL --max-time 120 "$SRC")"
 #  - `denied` : drop non-chat models (embeddings/audio/image/etc.) by id substring,
 #               mirroring crate::provider::is_agent_model's denylist, and keep only
 #               models that can output text.
-#  - emits keys by *zerostack* provider name (gemini <- models.dev "google").
+#  - emits keys by *mini-agent* provider name (gemini <- models.dev "google").
 echo "$api" | jq --argjson orv "$OPENROUTER_VENDORS" --argjson cut "$CUTOFFS" '
   def deny: [
     "embedding","embed-","text-embedding","gemini-embedding","whisper","transcribe",

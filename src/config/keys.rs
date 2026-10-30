@@ -27,6 +27,8 @@ pub(crate) enum ConfigShape {
     Number,
     String,
     Strings,
+    /// The string `all`, the string `none`, or an array of strings.
+    AllNoneOrStrings,
     Object,
     StringMap,
     StringArrayMap,
@@ -188,6 +190,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("subagents", "subagent_max_find_results").shaped(ConfigShape::Integer),
     gated("subagents", "subagent_max_list_dir_entries").shaped(ConfigShape::Integer),
     key("compact_enabled").shaped(ConfigShape::Bool),
+    key("claude_project_agents").shaped(ConfigShape::Bool),
     key("mid_turn_compact_threshold").described("Opt-in mid-turn compaction threshold, as a fraction of the context window (0.0–1.0) of real provider prompt pressure.").shaped(ConfigShape::Number),
     key("always_show_welcome").shaped(ConfigShape::Bool),
     aliased("auto-update-prompts", &["auto_update_prompts"]).shaped(ConfigShape::Bool),
@@ -211,10 +214,17 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .described("Enable process containment")
         .shaped(ConfigShape::Bool),
     aliased("sandbox-backend", &["sandbox_backend"]).shaped(ConfigShape::String),
+    aliased("sandbox-required", &["sandbox_required"])
+        .described("Global-only: refuse to start with --no-sandbox, sandbox = false, or an unavailable backend.")
+        .shaped(ConfigShape::Bool),
+    aliased("permission-checks-required", &["permission_checks_required"])
+        .described("Global-only: refuse to start with --dangerously-skip-permissions.")
+        .shaped(ConfigShape::Bool),
     aliased("sandbox-profile", &["sandbox_profile"])
         .shaped(ConfigShape::Enum(crate::sandbox::SandboxProfile::NAMES)),
     aliased("sandbox-read-roots", &["sandbox_read_roots"]).shaped(ConfigShape::Strings),
     aliased("sandbox-write-roots", &["sandbox_write_roots"]).shaped(ConfigShape::Strings),
+    aliased("sandbox-toolchain-roots", &["sandbox_toolchain_roots"]).described("Read-only toolchain binds for the Linux bwrap sandbox (absolute or ~/). Absent selects the built-in default; a list, even empty, replaces it.").shaped(ConfigShape::Strings),
     aliased("sandbox-home-mounts", &["sandbox_home_mounts"])
         .described("HOME-relative dot paths exposed to contained commands; `:rw` suffix for writable directories")
         .shaped(ConfigShape::Strings),
@@ -238,7 +248,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .shaped(ConfigShape::Bool),
     gated_aliased("js", "js-write-unrestricted", &["js_write_unrestricted"])
         .shaped(ConfigShape::Bool),
-    gated_aliased("js", "js-fetch-origins", &["js_fetch_origins"]).shaped(ConfigShape::Strings),
+    gated_aliased("js", "js-fetch-origins", &["js_fetch_origins"])
+        .described("JS fetch() origin narrowing: \"all\" (no narrowing), \"none\" (deny every fetch), or an array of exact origins. Absent is unrestricted; the js/fetch permission check always applies.")
+        .shaped(ConfigShape::AllNoneOrStrings),
     gated_aliased("js", "js-fetch-allow-http", &["js_fetch_allow_http"]).shaped(ConfigShape::Bool),
     aliased("allow_all_mcp_calls", &["allow-all-mcp-calls"]).shaped(ConfigShape::Bool),
     gated("mcp", "mcp_tool_timeout_secs").described("Bound on one MCP `tools/call` round trip, in seconds. Default: 120.").shaped(ConfigShape::Integer),
@@ -249,6 +261,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("permission-modes", &["permission_modes"]).shaped(ConfigShape::Strings),
     key("permission_mode_cycle").described("Explicit-user Shift+Tab cycle, independent of the rule-application modes.").shaped(ConfigShape::Strings),
     key("show_tool_details").shaped(ConfigShape::BoolOrInteger),
+    key("tool_output").described("Tool-result display in the TUI transcript: collapsed (default), preview, or full.").shaped(ConfigShape::Enum(&["collapsed", "preview", "full"])),
     key("diff_context_lines").described("Context rows in successful edit/write previews (hard maximum 20).").shaped(ConfigShape::Integer),
     key("max_diff_lines").described("Preview row cap (hard maximum 1000); zero disables mutation previews.").shaped(ConfigShape::Integer),
     key("show_reasoning").shaped(ConfigShape::Bool),
@@ -272,7 +285,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .described("Provider credentials (values hidden)")
         .shaped(ConfigShape::StringMap),
     key("quick_models").shaped(ConfigShape::Object),
-    key("prompt_to_model").described("Map prompt names to quick-model names. When switching to a prompt, zerostack looks up the quick model and switches provider+model. Empty-string values are treated as \"no change\".").shaped(ConfigShape::StringMap),
+    key("prompt_to_model").described("Map prompt names to quick-model names. When switching to a prompt, mini-agent looks up the quick model and switches provider+model. Empty-string values are treated as \"no change\".").shaped(ConfigShape::StringMap),
     gated("mcp", "mcp_servers").shaped(ConfigShape::Object),
     gated("acp", "acp_servers").shaped(ConfigShape::Object),
     gated("acp", "acp_host").shaped(ConfigShape::String),

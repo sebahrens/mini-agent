@@ -510,7 +510,9 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         // task while the picker shows "loading sessions…".
         ctx.input
             .start_loading_session_picker(ctx.workspace.clone(), all);
-    } else if parts[1] == "delete" && parts.len() >= 3 {
+    } else if parts[1] == "delete" && parts.len() < 3 {
+        write_error(ctx.renderer, "usage: /sessions delete <id-or-name>");
+    } else if parts[1] == "delete" {
         let prefix = parts[2].trim();
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
         match crate::session::storage::select_session(prefix, sessions) {

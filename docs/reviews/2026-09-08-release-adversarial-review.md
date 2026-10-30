@@ -41,8 +41,8 @@ Twenty-seven atomic findings are filed: **14 P1, 13 P2**. Each bead records the 
 - VS Code `npm run typecheck`, `npm run lint`, `npm test`: passed, **57 tests across nine files**.
 - Package metadata for `v1.8.0`, feature graph, workspace boundary, Windows MSI source/wiring and dependency-policy checkers: passed.
 - `cargo install --path . --debug --locked --offline --root /tmp/mini-agent-release-review`: passed. Installed binary reports `mini-agent 1.8.0`; `--help` succeeded. The first non-offline install attempt failed because the restricted environment could not resolve crates.io; no compilation defect was inferred.
-- [Main CI 34190987872](https://github.com/sebahrens/mini-agent/actions/runs/34190987872): success at the reviewed SHA.
-- [Nightly evaluation 34199175478](https://github.com/sebahrens/mini-agent/actions/runs/34199175478): failure at the reviewed SHA. Its first persona metric shares libtest's progress line, so the anchored extractor finds eight of nine records. The library-axis step is skipped (finding .10).
+- Pre-migration main CI run 34190987872: success at the reviewed SHA.
+- Pre-migration nightly evaluation run 34199175478: failure at the reviewed SHA. Its first persona metric shares libtest's progress line, so the anchored extractor finds eight of nine records. The library-axis step is skipped (finding .10).
 
 ## Reproducing the experimental findings
 

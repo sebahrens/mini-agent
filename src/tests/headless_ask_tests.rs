@@ -153,9 +153,18 @@ async fn headless_read_of_current_session_spill_reaches_the_model_without_asking
     let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
     let root = crate::tests::OwnedTestDirectory::new("headless-spill");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
-        ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
-        ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
-        ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(root.path().as_os_str().to_owned()),
+        ),
+        (
+            "MINI_AGENT_CONFIG_DIR",
+            Some(root.path().as_os_str().to_owned()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(root.path().as_os_str().to_owned()),
+        ),
     ]);
     let mut checker = guarded_checker();
     checker.bind_tool_output_session("active-session").unwrap();

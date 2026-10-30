@@ -1,0 +1,25 @@
+#!/bin/sh
+# Save a GitHub token for ghagent-mcp without echoing it or touching history.
+# Usage: run in a terminal, paste the token, press Enter.
+set -eu
+dir="$HOME/.config/ghagent"
+file="$dir/token"
+umask 077
+mkdir -p "$dir"
+chmod 700 "$dir"
+printf 'Paste the fine-grained token (input hidden): ' >&2
+stty -echo 2>/dev/null || true
+IFS= read -r token || true
+stty echo 2>/dev/null || true
+printf '\n' >&2
+case "$token" in
+  github_pat_*) ;;
+  "") echo "no token entered; nothing saved" >&2; exit 1 ;;
+  *) echo "that is not a fine-grained token (expected github_pat_...); nothing saved" >&2; exit 1 ;;
+esac
+tmp="$file.tmp.$$"
+printf '%s\n' "$token" > "$tmp"
+chmod 600 "$tmp"
+mv "$tmp" "$file"
+unset token
+echo "saved to $file (mode 600)" >&2

@@ -835,6 +835,18 @@ pub enum IdentityError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn workspace_prefix_without_a_trailing_slash_is_the_only_accepted_spelling() {
+        assert_eq!(canonical_workspace_prefix("src").unwrap(), "src");
+        assert_eq!(canonical_workspace_prefix("out/data").unwrap(), "out/data");
+        for rejected in ["src/", "/src", "./src", "src//a", ""] {
+            assert!(
+                canonical_workspace_prefix(rejected).is_err(),
+                "{rejected:?} must be rejected"
+            );
+        }
+    }
+
     fn export(name: &str, signature: &str) -> SkillExport {
         SkillExport {
             name: name.to_string(),

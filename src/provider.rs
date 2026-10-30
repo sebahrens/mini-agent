@@ -341,17 +341,23 @@ where
 ///
 /// The two cannot share a single type, so we wrap them in an inner enum and let
 /// `ApiStyle` decide which one to build.
+///
+/// `Completions` additionally carries this route's resolved
+/// `custom_providers.<name>.prompt_caching` opt-in (mini-agent-u9jj3), baked
+/// in at client construction so `completion_model_with_cache_ttl` can apply
+/// Claude-family `cache_control` markers without threading config through
+/// every caller of that function.
 #[derive(Clone)]
 pub enum OpenAiClient {
     Responses(openai::Client<ProviderHttpClient>),
-    Completions(openai::CompletionsClient<ProviderHttpClient>),
+    Completions(openai::CompletionsClient<ProviderHttpClient>, bool),
 }
 
 impl OpenAiClient {
     fn completion_model(&self, name: String) -> OpenAiModel {
         match self {
             OpenAiClient::Responses(c) => OpenAiModel::Responses(c.completion_model(name)),
-            OpenAiClient::Completions(c) => OpenAiModel::Completions(c.completion_model(name)),
+            OpenAiClient::Completions(c, _) => OpenAiModel::Completions(c.completion_model(name)),
         }
     }
 }
@@ -398,6 +404,25 @@ pub(crate) fn openrouter_anthropic_routing(model_id: &str) -> Option<serde_json:
             "cache_control": { "type": "ephemeral" }
         })
     })
+}
+
+/// Whether `model_id` names a model in the Claude family, matched on a
+/// leading prefix or a `/`-delimited path segment rather than a bare
+/// substring, so neither `declaude-mini` nor `not-claude-at-all` matches.
+/// Covers the gateway route prefixes seen on OpenAI-compatible custom
+/// providers (`bedrock.anthropic.*`, `vertex.anthropic.*`) plus the bare
+/// `claude-*` family and an OpenRouter-style `anthropic/claude-3.5-sonnet`
+/// model id reused on a custom gateway (segment split on `/` only, since
+/// Claude version numbers themselves contain dots, e.g. `claude-3.5-sonnet`).
+pub(crate) fn is_claude_model_family(model_id: &str) -> bool {
+    let slug = model_id.strip_prefix('~').unwrap_or(model_id);
+    slug.starts_with("claude-")
+        || slug.starts_with("bedrock.anthropic.")
+        || slug.starts_with("vertex.anthropic.")
+        || slug
+            .rsplit('/')
+            .next()
+            .is_some_and(|segment| segment.starts_with("claude-"))
 }
 
 /// Shallow-merges user-configured `extra_body` into provider-internal routing
@@ -548,8 +573,8 @@ pub(crate) fn provider_request_params(
         AnyModel::OpenAI(OpenAiModel::Responses(_)) => {
             openai_responses_extra_body(provider_extra_body, session_id, reasoning)
         }
-        AnyModel::OpenAI(OpenAiModel::Completions(_)) => {
-            openai_completions_extra_body(provider_extra_body, reasoning)
+        AnyModel::OpenAI(OpenAiModel::Completions(m)) => {
+            openai_completions_extra_body(provider_extra_body, session_id, &m.model, reasoning)
         }
         AnyModel::Anthropic(_)
         | AnyModel::Gemini(_)
@@ -626,23 +651,48 @@ pub(crate) fn openai_responses_extra_body(
     merge_extra_body(Some(serde_json::Value::Object(base)), extra)
 }
 
-/// Maps the typed reasoning config onto the Chat Completions request body.
-///
+/// Maps the typed reasoning config onto the Chat Completions request body and
+/// adds the same opaque, stable per-session `prompt_cache_key` the Responses
+/// path sends (mini-agent-fb20s), for every OpenAI-family model id. Chat
 /// Completions has no `reasoning` object and no summary or encrypted-content
 /// concept; only the top-level `reasoning_effort` key exists, so everything
 /// else in [`ReasoningConfig`] is deliberately dropped here rather than sent
 /// under a key the endpoint would ignore.
+///
+/// `prompt_cache_key` is skipped for a Claude-family `model_id`: those models
+/// use the explicit `cache_control` markers from `prompt_caching`
+/// (mini-agent-u9jj3) instead, and a routing key alongside them would be
+/// redundant at best. Explicit user `extra_body` configuration keeps
+/// precedence over every generated default, matching the Responses path's
+/// merge order.
 pub(crate) fn openai_completions_extra_body(
     extra: Option<serde_json::Value>,
+    session_id: &str,
+    model_id: &str,
     reasoning: Option<&ReasoningConfig>,
 ) -> Option<serde_json::Value> {
-    let Some(effort) = reasoning.and_then(|config| config.effort) else {
+    let mut base = serde_json::Map::new();
+    if !is_claude_model_family(model_id) {
+        use std::fmt::Write as _;
+        let mut prompt_cache_key = String::with_capacity(64);
+        for byte in Sha256::digest(session_id.as_bytes()) {
+            write!(&mut prompt_cache_key, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        base.insert(
+            "prompt_cache_key".to_string(),
+            serde_json::Value::String(prompt_cache_key),
+        );
+    }
+    if let Some(effort) = reasoning.and_then(|config| config.effort) {
+        base.insert(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String(effort.as_wire_str().to_string()),
+        );
+    }
+    if base.is_empty() {
         return extra;
-    };
-    merge_extra_body(
-        Some(serde_json::json!({"reasoning_effort": effort.as_wire_str()})),
-        extra,
-    )
+    }
+    merge_extra_body(Some(serde_json::Value::Object(base)), extra)
 }
 
 impl AnyClient {
@@ -664,7 +714,7 @@ impl AnyClient {
             Self::Anthropic(_) => HistoryProtocol::AnthropicMessages,
             Self::OpenRouter(_) => HistoryProtocol::OpenRouterChatCompletions,
             Self::OpenAI(OpenAiClient::Responses(_)) => HistoryProtocol::OpenAIResponses,
-            Self::OpenAI(OpenAiClient::Completions(_)) => HistoryProtocol::OpenAIChatCompletions,
+            Self::OpenAI(OpenAiClient::Completions(..)) => HistoryProtocol::OpenAIChatCompletions,
             Self::Gemini(_) => HistoryProtocol::GeminiGenerateContent,
             Self::Ollama(_) => HistoryProtocol::OllamaChat,
             Self::Copilot(_) => HistoryProtocol::OpenAIChatCompletions,
@@ -860,7 +910,30 @@ impl AnyClient {
                 let extra = openrouter_anthropic_routing(&name);
                 AnyModel::OpenRouter(c.completion_model(name).with_prompt_caching(), extra)
             }
-            AnyClient::OpenAI(c) => AnyModel::OpenAI(c.completion_model(name)),
+            AnyClient::OpenAI(c) => {
+                let prompt_caching = matches!(c, OpenAiClient::Completions(_, true));
+                let model = c.completion_model(name.clone());
+                let model = if prompt_caching && is_claude_model_family(&name) {
+                    match model {
+                        OpenAiModel::Completions(model) => {
+                            OpenAiModel::Completions(match cache_ttl {
+                                crate::config::PromptCacheTtl::FiveMinutes => {
+                                    model.with_prompt_caching()
+                                }
+                                crate::config::PromptCacheTtl::OneHour => {
+                                    model.with_prompt_caching_1h()
+                                }
+                            })
+                        }
+                        // The Responses API has no `cache_control` concept;
+                        // this opt-in only applies to Chat Completions.
+                        other => other,
+                    }
+                } else {
+                    model
+                };
+                AnyModel::OpenAI(model)
+            }
             AnyClient::Anthropic(c) => {
                 let model = c.completion_model(name).with_prompt_caching();
                 AnyModel::Anthropic(match cache_ttl {
@@ -4228,6 +4301,7 @@ impl AnyAgent {
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         retry_config: &RetryConfig,
         usage_ledger: runner::SharedUsageLedger,
+        token_budget: Option<u64>,
     ) -> runner::SubagentRunOutput {
         self.run_subagent_with_history(
             prompt,
@@ -4236,11 +4310,13 @@ impl AnyAgent {
             event_tx,
             retry_config,
             usage_ledger,
+            token_budget,
         )
         .await
     }
 
     #[cfg(feature = "subagents")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_subagent_with_history(
         &self,
         prompt: &str,
@@ -4249,6 +4325,7 @@ impl AnyAgent {
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         retry_config: &RetryConfig,
         usage_ledger: runner::SharedUsageLedger,
+        token_budget: Option<u64>,
     ) -> runner::SubagentRunOutput {
         let future = crate::startup::heap_future(|| async {
             #[cfg(feature = "skills")]
@@ -4279,6 +4356,7 @@ impl AnyAgent {
                         event_tx,
                         retry_config,
                         usage_ledger,
+                        token_budget,
                     )
                     .await
                 }
@@ -4292,6 +4370,7 @@ impl AnyAgent {
                             event_tx,
                             retry_config,
                             usage_ledger,
+                            token_budget,
                         )
                         .await
                     }
@@ -4304,6 +4383,7 @@ impl AnyAgent {
                             event_tx,
                             retry_config,
                             usage_ledger,
+                            token_budget,
                         )
                         .await
                     }
@@ -4317,6 +4397,7 @@ impl AnyAgent {
                         event_tx,
                         retry_config,
                         usage_ledger,
+                        token_budget,
                     )
                     .await
                 }
@@ -4329,6 +4410,7 @@ impl AnyAgent {
                         event_tx,
                         retry_config,
                         usage_ledger,
+                        token_budget,
                     )
                     .await
                 }
@@ -4341,6 +4423,7 @@ impl AnyAgent {
                         event_tx,
                         retry_config,
                         usage_ledger,
+                        token_budget,
                     )
                     .await
                 }
@@ -4353,6 +4436,7 @@ impl AnyAgent {
                         event_tx,
                         retry_config,
                         usage_ledger,
+                        token_budget,
                     )
                     .await
                 }
@@ -4983,7 +5067,10 @@ fn build_openai_client(
                     .http_client(ProviderHttpClient::new(http_client))
                     .build()?,
             };
-            Ok(OpenAiClient::Completions(client))
+            Ok(OpenAiClient::Completions(
+                client,
+                custom.is_some_and(|c| c.prompt_caching),
+            ))
         }
     }
 }
@@ -5009,6 +5096,43 @@ where
     Ok(crate::auth::oauth::official_api_base(
         resolve_base_url_with_env(&config, get_env).as_deref(),
     ))
+}
+
+/// Check that [`create_client`] can find `provider_name` and its credential
+/// without building the HTTP client, which loads the platform trust store.
+/// Resolution follows `create_client`'s precedence (a saved ChatGPT login on
+/// the official route, `--api-key`, the provider's `api_key_env`, then
+/// `config.api_keys`), so the error is the one `create_client` would return;
+/// neither names a credential value.
+#[cfg(feature = "acp")]
+pub fn check_client_credentials(
+    provider_name: &str,
+    api_key: Option<&str>,
+    custom_providers: &HashMap<String, CustomProviderConfig>,
+    config_api_keys: Option<&HashMap<String, String>>,
+) -> anyhow::Result<()> {
+    if chatgpt_login_route_with_env(provider_name, api_key, custom_providers, |name| {
+        std::env::var(name)
+    })? && crate::auth::oauth::selected()?.is_some()
+    {
+        return Ok(());
+    }
+    let get_env = |name: &str| std::env::var(name);
+    let config = resolve_provider_config(provider_name, custom_providers)?;
+    if config.kind == ProviderKind::Vertex {
+        vertex::route(&get_env)?;
+    }
+    if config.kind == ProviderKind::Bedrock {
+        bedrock::region(&get_env)?;
+    }
+    AuthResolver::new(config.kind)
+        .with_cli_key(api_key)
+        .with_env_override(config.api_key_env.as_deref())
+        .with_config_keys(config_api_keys)
+        .with_custom_provider_name(Some(provider_name))
+        .with_credential_isolation(config.credential_isolation)
+        .resolve_credential_with_env(get_env)?;
+    Ok(())
 }
 
 /// The `--api-key` value together with the one provider it was given for.
@@ -5416,40 +5540,48 @@ async fn build_openai_agent(
             )
             .await,
         ),
-        OpenAiModel::Completions(m) => OpenAiAgent::Completions(
-            builder::build_agent_inner_with_snapshot(
-                context_snapshot,
-                #[cfg(feature = "lsp")]
-                diagnostic_lsp,
-                m,
-                crate::context::instructions::InstructionProtocol::Chat,
-                cli,
-                cfg,
-                context,
-                workspace,
-                permission,
-                ask_tx,
-                sandbox,
-                read_tracker,
-                todo_store,
-                #[cfg(feature = "goal")]
-                goal_store.clone(),
-                tool_output_session_id,
-                tool_result_spills,
-                reasoning_enabled,
-                temperature,
-                openai_completions_extra_body(extra_body, cfg.reasoning.as_ref()),
-                #[cfg(feature = "js")]
-                js_worker_containment_status,
-                #[cfg(feature = "js")]
-                js_scratch,
-                #[cfg(feature = "skills")]
-                skill_services,
-                #[cfg(feature = "mcp")]
-                mcp_manager,
+        OpenAiModel::Completions(m) => {
+            let model_id = m.model.clone();
+            OpenAiAgent::Completions(
+                builder::build_agent_inner_with_snapshot(
+                    context_snapshot,
+                    #[cfg(feature = "lsp")]
+                    diagnostic_lsp,
+                    m,
+                    crate::context::instructions::InstructionProtocol::Chat,
+                    cli,
+                    cfg,
+                    context,
+                    workspace,
+                    permission,
+                    ask_tx,
+                    sandbox,
+                    read_tracker,
+                    todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store.clone(),
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    openai_completions_extra_body(
+                        extra_body,
+                        tool_output_session_id,
+                        &model_id,
+                        cfg.reasoning.as_ref(),
+                    ),
+                    #[cfg(feature = "js")]
+                    js_worker_containment_status,
+                    #[cfg(feature = "js")]
+                    js_scratch,
+                    #[cfg(feature = "skills")]
+                    skill_services,
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                )
+                .await,
             )
-            .await,
-        ),
+        }
     }
 }
 
@@ -5591,10 +5723,9 @@ async fn build_agent_with_probe_snapshot(
         cfg.enable_skill_proposals.unwrap_or(false),
     )
     .await;
-    // The containment preflight decided here is the only place the specific
-    // refusal reason exists. Record it so the operator surface can name it;
-    // otherwise the JS tool and the whole learned-skill subsystem vanish with
-    // nothing on screen to say why.
+    // Finalize the startup report now that learned-skill initialization has
+    // settled. The containment result is the same process-cached decision that
+    // was recorded before the first operator surface rendered.
     #[cfg(feature = "js")]
     record_js_runtime_report(js_runtime_report_from(
         &js_worker_containment_status,
@@ -5629,208 +5760,228 @@ async fn build_agent_with_probe_snapshot(
         tracker.image_support = model.image_read_support(extra_body.as_ref());
         tracker
     };
+    // Each arm's build_agent_inner_with_snapshot/build_openai_agent future is
+    // large (it folds in every feature-gated tool/context builder) and these
+    // six near-identical arms are called directly, not through any other
+    // boxed boundary: unboxed, the callee's full state is reserved inline in
+    // this match's own poll frame and overflowed the 1 MiB all-features
+    // stack test (mini-agent-session-picker-one-mib). Box each one right
+    // where it is awaited, matching the heap_future pattern used throughout
+    // startup/app.rs for the same reason.
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
-            builder::build_agent_inner_with_snapshot(
-                &mut context_snapshot,
-                #[cfg(feature = "lsp")]
-                &mut diagnostic_lsp,
-                m,
-                crate::context::instructions::InstructionProtocol::Chat,
-                cli,
-                cfg,
-                context,
-                workspace.clone(),
-                permission,
-                ask_tx,
-                sandbox.clone(),
-                read_tracker,
-                todo_store,
-                #[cfg(feature = "goal")]
-                goal_store.clone(),
-                tool_output_session_id,
-                tool_result_spills,
-                reasoning_enabled,
-                temperature,
-                merge_extra_body(routing, extra_body),
-                #[cfg(feature = "js")]
-                js_worker_containment_status.clone(),
-                #[cfg(feature = "js")]
-                js_scratch.clone(),
-                #[cfg(feature = "skills")]
-                skills.clone(),
-                #[cfg(feature = "mcp")]
-                mcp_manager,
-            )
+            crate::startup::heap_future(|| {
+                builder::build_agent_inner_with_snapshot(
+                    &mut context_snapshot,
+                    #[cfg(feature = "lsp")]
+                    &mut diagnostic_lsp,
+                    m,
+                    crate::context::instructions::InstructionProtocol::Chat,
+                    cli,
+                    cfg,
+                    context,
+                    workspace.clone(),
+                    permission,
+                    ask_tx,
+                    sandbox.clone(),
+                    read_tracker,
+                    todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store.clone(),
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    merge_extra_body(routing, extra_body),
+                    #[cfg(feature = "js")]
+                    js_worker_containment_status.clone(),
+                    #[cfg(feature = "js")]
+                    js_scratch.clone(),
+                    #[cfg(feature = "skills")]
+                    skills.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                )
+            })
             .await,
         ),
         AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(
-            build_openai_agent(
-                &mut context_snapshot,
-                #[cfg(feature = "lsp")]
-                &mut diagnostic_lsp,
-                m,
-                cli,
-                cfg,
-                context,
-                workspace.clone(),
-                permission,
-                ask_tx,
-                sandbox.clone(),
-                read_tracker,
-                todo_store,
-                #[cfg(feature = "goal")]
-                goal_store.clone(),
-                tool_output_session_id,
-                tool_result_spills,
-                reasoning_enabled,
-                temperature,
-                extra_body,
-                #[cfg(feature = "js")]
-                js_worker_containment_status.clone(),
-                #[cfg(feature = "js")]
-                js_scratch.clone(),
-                #[cfg(feature = "skills")]
-                skills.clone(),
-                #[cfg(feature = "mcp")]
-                mcp_manager,
-            )
+            crate::startup::heap_future(|| {
+                build_openai_agent(
+                    &mut context_snapshot,
+                    #[cfg(feature = "lsp")]
+                    &mut diagnostic_lsp,
+                    m,
+                    cli,
+                    cfg,
+                    context,
+                    workspace.clone(),
+                    permission,
+                    ask_tx,
+                    sandbox.clone(),
+                    read_tracker,
+                    todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store.clone(),
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                    #[cfg(feature = "js")]
+                    js_worker_containment_status.clone(),
+                    #[cfg(feature = "js")]
+                    js_scratch.clone(),
+                    #[cfg(feature = "skills")]
+                    skills.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                )
+            })
             .await,
         ),
         AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(
-            builder::build_agent_inner_with_snapshot(
-                &mut context_snapshot,
-                #[cfg(feature = "lsp")]
-                &mut diagnostic_lsp,
-                m,
-                crate::context::instructions::InstructionProtocol::Anthropic,
-                cli,
-                cfg,
-                context,
-                workspace.clone(),
-                permission,
-                ask_tx,
-                sandbox.clone(),
-                read_tracker,
-                todo_store,
-                #[cfg(feature = "goal")]
-                goal_store.clone(),
-                tool_output_session_id,
-                tool_result_spills,
-                reasoning_enabled,
-                temperature,
-                extra_body,
-                #[cfg(feature = "js")]
-                js_worker_containment_status.clone(),
-                #[cfg(feature = "js")]
-                js_scratch.clone(),
-                #[cfg(feature = "skills")]
-                skills.clone(),
-                #[cfg(feature = "mcp")]
-                mcp_manager,
-            )
+            crate::startup::heap_future(|| {
+                builder::build_agent_inner_with_snapshot(
+                    &mut context_snapshot,
+                    #[cfg(feature = "lsp")]
+                    &mut diagnostic_lsp,
+                    m,
+                    crate::context::instructions::InstructionProtocol::Anthropic,
+                    cli,
+                    cfg,
+                    context,
+                    workspace.clone(),
+                    permission,
+                    ask_tx,
+                    sandbox.clone(),
+                    read_tracker,
+                    todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store.clone(),
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                    #[cfg(feature = "js")]
+                    js_worker_containment_status.clone(),
+                    #[cfg(feature = "js")]
+                    js_scratch.clone(),
+                    #[cfg(feature = "skills")]
+                    skills.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                )
+            })
             .await,
         ),
         AnyModel::Gemini(m) => AnyAgentInner::Gemini(
-            builder::build_agent_inner_with_snapshot(
-                &mut context_snapshot,
-                #[cfg(feature = "lsp")]
-                &mut diagnostic_lsp,
-                m,
-                crate::context::instructions::InstructionProtocol::Gemini,
-                cli,
-                cfg,
-                context,
-                workspace.clone(),
-                permission,
-                ask_tx,
-                sandbox.clone(),
-                read_tracker,
-                todo_store,
-                #[cfg(feature = "goal")]
-                goal_store.clone(),
-                tool_output_session_id,
-                tool_result_spills,
-                reasoning_enabled,
-                temperature,
-                extra_body,
-                #[cfg(feature = "js")]
-                js_worker_containment_status.clone(),
-                #[cfg(feature = "js")]
-                js_scratch.clone(),
-                #[cfg(feature = "skills")]
-                skills.clone(),
-                #[cfg(feature = "mcp")]
-                mcp_manager,
-            )
+            crate::startup::heap_future(|| {
+                builder::build_agent_inner_with_snapshot(
+                    &mut context_snapshot,
+                    #[cfg(feature = "lsp")]
+                    &mut diagnostic_lsp,
+                    m,
+                    crate::context::instructions::InstructionProtocol::Gemini,
+                    cli,
+                    cfg,
+                    context,
+                    workspace.clone(),
+                    permission,
+                    ask_tx,
+                    sandbox.clone(),
+                    read_tracker,
+                    todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store.clone(),
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                    #[cfg(feature = "js")]
+                    js_worker_containment_status.clone(),
+                    #[cfg(feature = "js")]
+                    js_scratch.clone(),
+                    #[cfg(feature = "skills")]
+                    skills.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                )
+            })
             .await,
         ),
         AnyModel::Ollama(m) => AnyAgentInner::Ollama(
-            builder::build_agent_inner_with_snapshot(
-                &mut context_snapshot,
-                #[cfg(feature = "lsp")]
-                &mut diagnostic_lsp,
-                m,
-                crate::context::instructions::InstructionProtocol::Ollama,
-                cli,
-                cfg,
-                context,
-                workspace,
-                permission,
-                ask_tx,
-                sandbox,
-                read_tracker,
-                todo_store,
-                #[cfg(feature = "goal")]
-                goal_store.clone(),
-                tool_output_session_id,
-                tool_result_spills,
-                reasoning_enabled,
-                temperature,
-                extra_body,
-                #[cfg(feature = "js")]
-                js_worker_containment_status,
-                #[cfg(feature = "js")]
-                js_scratch,
-                #[cfg(feature = "skills")]
-                skills.clone(),
-                #[cfg(feature = "mcp")]
-                mcp_manager,
-            )
+            crate::startup::heap_future(|| {
+                builder::build_agent_inner_with_snapshot(
+                    &mut context_snapshot,
+                    #[cfg(feature = "lsp")]
+                    &mut diagnostic_lsp,
+                    m,
+                    crate::context::instructions::InstructionProtocol::Ollama,
+                    cli,
+                    cfg,
+                    context,
+                    workspace,
+                    permission,
+                    ask_tx,
+                    sandbox,
+                    read_tracker,
+                    todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store.clone(),
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                    #[cfg(feature = "js")]
+                    js_worker_containment_status,
+                    #[cfg(feature = "js")]
+                    js_scratch,
+                    #[cfg(feature = "skills")]
+                    skills.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                )
+            })
             .await,
         ),
         AnyModel::Copilot(m) => AnyAgentInner::Copilot(
-            builder::build_agent_inner_with_snapshot(
-                &mut context_snapshot,
-                #[cfg(feature = "lsp")]
-                &mut diagnostic_lsp,
-                m.clone(),
-                copilot::instruction_protocol(&m),
-                cli,
-                cfg,
-                context,
-                workspace,
-                permission,
-                ask_tx,
-                sandbox,
-                read_tracker,
-                todo_store,
-                #[cfg(feature = "goal")]
-                goal_store.clone(),
-                tool_output_session_id,
-                tool_result_spills,
-                reasoning_enabled,
-                temperature,
-                extra_body,
-                #[cfg(feature = "js")]
-                js_worker_containment_status,
-                #[cfg(feature = "js")]
-                js_scratch,
-                #[cfg(feature = "skills")]
-                skills.clone(),
-                #[cfg(feature = "mcp")]
-                mcp_manager,
-            )
+            crate::startup::heap_future(|| {
+                builder::build_agent_inner_with_snapshot(
+                    &mut context_snapshot,
+                    #[cfg(feature = "lsp")]
+                    &mut diagnostic_lsp,
+                    m.clone(),
+                    copilot::instruction_protocol(&m),
+                    cli,
+                    cfg,
+                    context,
+                    workspace,
+                    permission,
+                    ask_tx,
+                    sandbox,
+                    read_tracker,
+                    todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store.clone(),
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                    #[cfg(feature = "js")]
+                    js_worker_containment_status,
+                    #[cfg(feature = "js")]
+                    js_scratch,
+                    #[cfg(feature = "skills")]
+                    skills.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                )
+            })
             .await,
         ),
     };
@@ -5939,6 +6090,8 @@ async fn resolve_skill_services(
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAvailability {
+    /// Startup has not finished establishing the subsystem's availability.
+    Pending,
     /// Requested, compiled in, and the containment preflight passed.
     Available,
     /// Compiled in but not live. `reason` is the verbatim preflight reason.
@@ -6013,6 +6166,47 @@ fn record_js_runtime_report(report: JsRuntimeReport) {
     }
 }
 
+// Startup's background worker probe (`StartupWorkerProbe`) now owns the
+// preflight; this mapping stays covered by the preflight-report tests below.
+#[cfg(all(test, feature = "js"))]
+fn js_runtime_preflight_report_from(
+    containment: &crate::sandbox::worker::WorkerContainmentStatus,
+) -> JsRuntimeReport {
+    let javascript = runtime_availability_from_containment(containment);
+    #[cfg(feature = "skills")]
+    let learned_skills = match &javascript {
+        RuntimeAvailability::Unavailable { reason } => RuntimeAvailability::Unavailable {
+            reason: format!("requires the contained JavaScript worker: {reason}"),
+        },
+        RuntimeAvailability::Available | RuntimeAvailability::Pending => {
+            RuntimeAvailability::Pending
+        }
+        RuntimeAvailability::NotCompiled => RuntimeAvailability::NotCompiled,
+    };
+    #[cfg(not(feature = "skills"))]
+    let learned_skills = RuntimeAvailability::NotCompiled;
+    JsRuntimeReport {
+        javascript,
+        learned_skills,
+    }
+}
+
+#[cfg(feature = "js")]
+fn runtime_availability_from_containment(
+    containment: &crate::sandbox::worker::WorkerContainmentStatus,
+) -> RuntimeAvailability {
+    match containment {
+        crate::sandbox::worker::WorkerContainmentStatus::Available { .. } => {
+            RuntimeAvailability::Available
+        }
+        crate::sandbox::worker::WorkerContainmentStatus::Unavailable { reason, .. } => {
+            RuntimeAvailability::Unavailable {
+                reason: reason.clone(),
+            }
+        }
+    }
+}
+
 /// Turns the containment preflight outcome into the operator-facing report.
 ///
 /// Pure so the reason-propagation contract is unit-testable without launching a
@@ -6022,16 +6216,7 @@ fn js_runtime_report_from(
     containment: &crate::sandbox::worker::WorkerContainmentStatus,
     #[cfg(feature = "skills")] skills_active: bool,
 ) -> JsRuntimeReport {
-    let javascript = match containment {
-        crate::sandbox::worker::WorkerContainmentStatus::Available { .. } => {
-            RuntimeAvailability::Available
-        }
-        crate::sandbox::worker::WorkerContainmentStatus::Unavailable { reason, .. } => {
-            RuntimeAvailability::Unavailable {
-                reason: reason.clone(),
-            }
-        }
-    };
+    let javascript = runtime_availability_from_containment(containment);
     #[cfg(feature = "skills")]
     let learned_skills = if skills_active {
         RuntimeAvailability::Available
@@ -6043,6 +6228,7 @@ fn js_runtime_report_from(
             RuntimeAvailability::Unavailable { reason } => RuntimeAvailability::Unavailable {
                 reason: format!("requires the contained JavaScript worker: {reason}"),
             },
+            RuntimeAvailability::Pending => RuntimeAvailability::Pending,
             RuntimeAvailability::NotCompiled => RuntimeAvailability::NotCompiled,
         }
     };
@@ -6093,7 +6279,9 @@ fn resolve_js_worker_containment(
 mod startup_capability_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::resolve_js_worker_containment;
+    use super::{
+        RuntimeAvailability, js_runtime_preflight_report_from, resolve_js_worker_containment,
+    };
     use crate::sandbox::worker::{
         WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus,
     };
@@ -6132,6 +6320,44 @@ mod startup_capability_tests {
             containment,
             WorkerContainmentStatus::Available { .. }
         ));
+    }
+
+    #[test]
+    fn successful_preflight_keeps_skills_pending_until_services_initialize() {
+        let report = js_runtime_preflight_report_from(&WorkerContainmentStatus::Available {
+            backend: WorkerBackend::for_current_platform(),
+            assurance: WorkerContainmentAssurance::Enforced,
+        });
+
+        assert_eq!(report.javascript, RuntimeAvailability::Available);
+        #[cfg(feature = "skills")]
+        assert_eq!(report.learned_skills, RuntimeAvailability::Pending);
+        #[cfg(not(feature = "skills"))]
+        assert_eq!(report.learned_skills, RuntimeAvailability::NotCompiled);
+    }
+
+    #[test]
+    fn refused_preflight_is_immediately_available_to_operator_surfaces() {
+        let reason = "test containment refusal";
+        let report = js_runtime_preflight_report_from(&WorkerContainmentStatus::Unavailable {
+            backend: WorkerBackend::for_current_platform(),
+            assurance: WorkerContainmentAssurance::Enforced,
+            reason: reason.to_string(),
+        });
+
+        assert_eq!(
+            report.javascript,
+            RuntimeAvailability::Unavailable {
+                reason: reason.to_string()
+            }
+        );
+        #[cfg(feature = "skills")]
+        assert_eq!(
+            report.learned_skills,
+            RuntimeAvailability::Unavailable {
+                reason: format!("requires the contained JavaScript worker: {reason}")
+            }
+        );
     }
 
     #[cfg(feature = "skills")]
@@ -6254,29 +6480,38 @@ pub async fn build_btw_agent(
                 })
                 .await,
             ),
-            OpenAiModel::Completions(m) => OpenAiAgent::Completions(
-                crate::startup::heap_future(|| {
-                    builder::build_btw_agent_inner(
-                        m,
-                        crate::context::instructions::InstructionProtocol::Chat,
-                        #[cfg(feature = "multimodal")]
-                        image_support,
-                        cli,
-                        cfg,
-                        context,
-                        workspace,
-                        captured_instructions.clone(),
-                        permission,
-                        ask_tx,
-                        tool_output_session_id,
-                        tool_result_spills.clone(),
-                        reasoning_enabled,
-                        temperature,
-                        openai_completions_extra_body(extra_body, cfg.reasoning.as_ref()),
-                    )
-                })
-                .await,
-            ),
+            OpenAiModel::Completions(m) => {
+                let model_id = m.model.clone();
+                let completions_extra_body = openai_completions_extra_body(
+                    extra_body,
+                    tool_output_session_id,
+                    &model_id,
+                    cfg.reasoning.as_ref(),
+                );
+                OpenAiAgent::Completions(
+                    crate::startup::heap_future(|| {
+                        builder::build_btw_agent_inner(
+                            m,
+                            crate::context::instructions::InstructionProtocol::Chat,
+                            #[cfg(feature = "multimodal")]
+                            image_support,
+                            cli,
+                            cfg,
+                            context,
+                            workspace,
+                            captured_instructions.clone(),
+                            permission,
+                            ask_tx,
+                            tool_output_session_id,
+                            tool_result_spills.clone(),
+                            reasoning_enabled,
+                            temperature,
+                            completions_extra_body,
+                        )
+                    })
+                    .await,
+                )
+            }
         }),
         AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(
             crate::startup::heap_future(|| {

@@ -166,6 +166,17 @@ fn track_read_duplicate_returns_blocking_message() {
 }
 
 #[test]
+fn track_read_duplicate_saturates_untrusted_range_arithmetic() {
+    let tracker = ReadTracker::new(true);
+    assert!(tracker.track_read("huge_range", 1, usize::MAX).is_none());
+
+    let message = tracker
+        .track_read("huge_range", 1, usize::MAX)
+        .expect("identical read should be blocked");
+    assert!(message.contains(&format!("lines 2-{}", usize::MAX)));
+}
+
+#[test]
 fn track_read_different_offset_not_duplicate() {
     let tracker = ReadTracker::new(true);
 

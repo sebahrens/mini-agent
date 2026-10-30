@@ -14,6 +14,8 @@ export interface ConversationSession {
     signal: AbortSignal,
   ): Promise<acp.StopReason>;
   close(): Promise<void>;
+  configOptions?(): readonly acp.SessionConfigOption[];
+  setConfigOption?(configId: string, value: string): Promise<void>;
 }
 
 export type ConversationSessionFactory = () => Promise<ConversationSession>;
@@ -65,6 +67,12 @@ export class Conversation {
   }
 
   get isPrompting(): boolean { return this.prompting; }
+
+  /** The attached session, created on demand while no prompt is running. */
+  async current(): Promise<ConversationSession> {
+    if (this.prompting) { throw new Error('Wait for the current prompt to settle.'); }
+    return this.ensureSession();
+  }
 
   async adopt(session: ConversationSession): Promise<void> {
     if (this.prompting) { throw new Error('Wait for the current ACP prompt to settle before resuming a saved session.'); }

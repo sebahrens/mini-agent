@@ -402,6 +402,66 @@ impl QuickModelConfig {
     }
 }
 
+/// Per-model token prices on a `custom_providers` entry
+/// (`custom_providers.<name>.model_prices.<model id>`), mirroring
+/// [`QuickModelConfig`]'s price fields so an operator-run gateway can report
+/// `/cost` without needing a separate `quick_models` alias for every model it
+/// serves (mini-agent-9osxv). All fields are USD per million tokens and
+/// default to absent; `resolved_prices` falls back to the embedded catalog by
+/// `provider_type` when a tier is not set here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CustomProviderModelPrices {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_token_price"
+    )]
+    pub input_token_cost: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_token_price"
+    )]
+    pub output_token_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_token_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_token_cost: Option<f64>,
+    /// Independent native one-hour cache-write rate. Omission inherits 2x the
+    /// selected input price, not a configured five-minute write rate.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_token_price"
+    )]
+    pub cache_write_1h_token_cost: Option<f64>,
+}
+
+impl CustomProviderModelPrices {
+    /// Cache ratios require only a known input rate. A missing output tier
+    /// must not discard this independently declared or catalogued price.
+    /// `provider_type` and `model` select the catalog fallback (the
+    /// `custom_providers` entry's own vendor type, not its alias name).
+    pub fn resolved_input_price(&self, provider_type: &str, model: &str) -> Option<f64> {
+        self.input_token_cost
+            .or_else(|| {
+                super::Config::catalog_input_output_cost(provider_type, model).map(|price| price.0)
+            })
+            .filter(|price| price.is_finite() && *price >= 0.0)
+    }
+
+    /// Declared tiers override catalogue rates independently. Explicit zero
+    /// is a known free tier; omission never creates a free rate.
+    pub fn resolved_prices(&self, provider_type: &str, model: &str) -> Option<(f64, f64)> {
+        let catalog = super::Config::catalog_input_output_cost(provider_type, model);
+        let input = self.resolved_input_price(provider_type, model)?;
+        let output = self.output_token_cost.or(catalog.map(|price| price.1))?;
+        (input.is_finite() && input >= 0.0 && output.is_finite() && output >= 0.0)
+            .then_some((input, output))
+    }
+}
+
 fn optional_token_price<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -559,6 +619,40 @@ pub struct CustomProviderConfig {
     pub stream_idle_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<CompactString>,
+    /// Opt-in Anthropic-style `cache_control` prompt-caching markers on Chat
+    /// Completions requests (`api_style = "completions"`, the default once
+    /// `base_url` is set) whose model id is in the Claude family
+    /// (`bedrock.anthropic.*`, `vertex.anthropic.*`, `claude-*`). Off by
+    /// default. A gateway that forwards `cache_control` to a native
+    /// Anthropic/Bedrock/Vertex backend reports prefix-cache hits on repeat
+    /// turns instead of re-billing the same system prompt, tools, and
+    /// settled history every time; a gateway that ignores or rejects the
+    /// field is unaffected while this stays off, and one that silently
+    /// accepts but does not honor it is also unaffected. Has no effect for
+    /// non-Claude model ids or the Responses API style. See
+    /// `docs/agent/CONFIG.md`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prompt_caching: bool,
+    /// Per-model token prices, keyed by the exact model id (e.g.
+    /// `bedrock.anthropic.claude-sonnet-5-5`). Mirrors [`QuickModelConfig`]'s
+    /// price fields so this provider alone (no `quick_models` entry needed)
+    /// can report `/cost` instead of `cost:?`, for both the main session and
+    /// subagent calls. See `docs/agent/CONFIG.md`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_prices: HashMap<String, CustomProviderModelPrices>,
+}
+
+impl CustomProviderConfig {
+    /// Resolved (input, output) USD-per-million-token prices for `model` from
+    /// this provider's `model_prices` table (falling back to the embedded
+    /// catalog keyed by this entry's `provider_type`). `None` when `model`
+    /// has no `model_prices` entry, or neither the entry nor the catalog
+    /// prices it.
+    pub fn resolved_prices_for(&self, model: &str) -> Option<(f64, f64)> {
+        self.model_prices
+            .get(model)?
+            .resolved_prices(&self.provider_type, model)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -606,6 +700,8 @@ pub struct ColorsConfig {
     pub chat_background: Option<CompactString>,
     pub input_background: Option<CompactString>,
     pub status_background: Option<CompactString>,
+    /// Semantic highlight used for user messages, success states, and picker selection.
+    pub accent: Option<CompactString>,
     pub user: Option<CompactString>,
     pub agent: Option<CompactString>,
     pub tool: Option<CompactString>,

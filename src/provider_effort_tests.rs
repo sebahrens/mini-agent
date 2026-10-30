@@ -9,6 +9,9 @@ mod instruction_wire_tests;
 #[path = "provider_cache_tests.rs"]
 mod cache_tests;
 
+#[path = "provider_prompt_caching_tests.rs"]
+mod prompt_caching_tests;
+
 #[cfg(feature = "js")]
 #[path = "provider_startup_tests.rs"]
 mod startup_tests;

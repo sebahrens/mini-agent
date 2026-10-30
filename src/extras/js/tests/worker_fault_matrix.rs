@@ -147,6 +147,11 @@ async fn worker_fault_matrix_reuses_only_success_and_allowlisted_javascript_erro
             StepOutcome::Error(crate::extras::js::protocol::JsErrorCode::Exception),
             AuthorityTerminal::Finished,
         ),
+        (
+            "structured-success",
+            StepOutcome::Structured(serde_json::json!({"status": "ok"})),
+            AuthorityTerminal::Finished,
+        ),
     ] {
         let effects = MatrixEffects::default();
         let witness = effects.clone();

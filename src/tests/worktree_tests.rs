@@ -281,7 +281,9 @@ mod tests {
         }
     }
 
-    const TEST_MUTATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(15);
+    // Hang guard only: every wait is released by an event, so the bound just has
+    // to outlast a heavily loaded full-suite run (mini-agent-volhx; 15 s did not).
+    const TEST_MUTATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
 
     async fn acquire_released_mutation_lock(
         repo_path: &Path,
@@ -964,6 +966,14 @@ mod tests {
     }
     #[test]
     fn worktree_rebind_preserves_no_context_files() {
+        // `rebind_worktree_workspace` publishes this repo's path to the
+        // process-global `active_workspace` on success (feature = "hooks").
+        // Hold the same guard sibling rebind tests use so a concurrent test
+        // reading `best_effort_ctx()`/`active_workspace()` can never observe
+        // this test's (soon-to-be-deleted) temp repo, and so this test
+        // restores whatever was active before it ran.
+        #[cfg(feature = "hooks")]
+        let _active_workspace_guard = ScopedActiveWorkspace::capture();
         let repo = TempRepo::new("no context rebind");
         std::fs::write(repo.path().join("AGENTS.md"), "DO_NOT_INJECT_CONTEXT\n").unwrap();
         git(repo.path(), ["add", "AGENTS.md"]);
@@ -1023,7 +1033,7 @@ mod tests {
             command: Some("sh".to_string()),
             args: Some(vec![
                 "-c".to_string(),
-                "printf '%s\\n%s\\n' \"$PWD\" \"$ZEROSTACK_PROJECT_DIR\" > \"$1\"; cat >> \"$1\""
+                "printf '%s\\n%s\\n' \"$PWD\" \"$MINI_AGENT_PROJECT_DIR\" > \"$1\"; cat >> \"$1\""
                     .to_string(),
                 "hook-workspace-observer".to_string(),
                 observed.to_string_lossy().into_owned(),
@@ -1808,7 +1818,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::sync::{Arc, Condvar, Mutex};
 
-        const FIXTURE_GUARD: Duration = Duration::from_secs(15);
+        const FIXTURE_GUARD: Duration = Duration::from_secs(120);
         type GitTask = tokio::task::JoinHandle<Result<(), String>>;
 
         struct ReleaseState {
@@ -2710,7 +2720,7 @@ mod tests {
         use crate::tests::process_state::{ProcessIdentity, ProcessState};
         use futures::FutureExt;
 
-        const FIXTURE_GUARD: Duration = Duration::from_secs(15);
+        const FIXTURE_GUARD: Duration = Duration::from_secs(120);
         const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
         enum Stop {

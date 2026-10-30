@@ -195,6 +195,34 @@ fn deny_rule_blocks_regardless_of_mode() {
 }
 
 #[test]
+fn legacy_permission_entry_aliases_enforce_canonical_runtime_keys() {
+    let mut configs = PermissionConfigs::default();
+    configs.glob.deny_entries = Some(
+        [
+            ("fetch".to_string(), vec!["**".to_string()]),
+            ("write_todo_list".to_string(), vec!["**".to_string()]),
+        ]
+        .into(),
+    );
+    let mut checker = PermissionChecker::new(
+        &configs,
+        SecurityMode::Standard,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        checker.check("js/fetch", "https://example.invalid"),
+        CheckResult::Denied(_)
+    ));
+    assert!(matches!(
+        checker.check("todo_write", "replace task list"),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[test]
 fn deny_rule_is_denied_in_yolo() {
     let mut checker = make_checker(SecurityMode::Yolo);
     let result = checker.check("bash", "rm -rf /home/user/project");
@@ -429,6 +457,42 @@ fn session_allowlist_bypasses_rules() {
         checker.check("bash", "cargo test --workspace"),
         CheckResult::Ask
     ));
+}
+
+#[test]
+fn session_allowlist_still_obeys_doom_loop_denial_on_every_surface() {
+    let path = workspace_path("session-repeat.txt");
+    for surface in ["tool", "path", "bound"] {
+        let config = PermissionConfig {
+            doom_loop: Some(Action::Deny),
+            ..Default::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &config.into(),
+            SecurityMode::Restrictive,
+            Some(test_workspace()),
+            default_modes(),
+        )
+        .unwrap();
+        checker.add_session_allowlist("read".into(), &path);
+
+        for repetition in 1..=3 {
+            let result = match surface {
+                "tool" => checker.check("read", &path),
+                "path" => checker.check_path("read", &path),
+                "bound" => checker.check_bound_path("read", &path),
+                _ => unreachable!(),
+            };
+            if repetition < 3 {
+                assert_eq!(result, CheckResult::Allowed, "{surface} {repetition}");
+            } else {
+                assert!(
+                    matches!(result, CheckResult::Denied(ref reason) if reason.contains("Doom loop")),
+                    "{surface}: {result:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1659,6 +1723,94 @@ fn external_directory_deny_overrides_matching_read_and_lsp_allow_rules() {
 }
 
 #[test]
+fn broad_tool_allow_does_not_bypass_external_directory_gate() {
+    for (tool, permission) in [
+        ("read", ToolPerm::Simple(Action::Allow)),
+        ("write", ToolPerm::Simple(Action::Allow)),
+    ] {
+        let config = PermissionConfig {
+            read: (tool == "read").then_some(permission.clone()),
+            write: (tool == "write").then_some(permission),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &configs_from(config),
+            SecurityMode::Standard,
+            Some(test_workspace()),
+            default_modes(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            checker.check_path(tool, "/tmp/outside-workspace"),
+            CheckResult::Ask
+        ));
+    }
+}
+
+#[test]
+fn stricter_modes_do_not_auto_allow_external_reads() {
+    for mode in [
+        SecurityMode::ReadOnly,
+        SecurityMode::PlanWrite,
+        SecurityMode::Restrictive,
+        SecurityMode::Guarded,
+        SecurityMode::Standard,
+    ] {
+        let mut checker = make_checker(mode);
+        let result = checker.check_path("read", "/tmp/outside-workspace");
+        assert!(
+            matches!(result, CheckResult::Ask),
+            "{mode:?} unexpectedly widened an external read: {result:?}"
+        );
+    }
+
+    let mut yolo = make_checker(SecurityMode::Yolo);
+    assert!(matches!(
+        yolo.check_path("read", "/tmp/outside-workspace"),
+        CheckResult::Allowed
+    ));
+}
+
+#[test]
+fn external_directory_allow_only_lifts_modes_that_would_otherwise_allow() {
+    let config = PermissionConfig {
+        external_directory: Some([("/tmp/work/**".to_string(), Action::Allow)].into()),
+        ..PermissionConfig::default()
+    };
+    for mode in [
+        SecurityMode::ReadOnly,
+        SecurityMode::PlanWrite,
+        SecurityMode::Guarded,
+        SecurityMode::Standard,
+    ] {
+        let mut checker = PermissionChecker::new(
+            &configs_from(config.clone()),
+            mode,
+            Some(test_workspace()),
+            default_modes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            checker.check_path("read", "/tmp/work/notes.txt"),
+            CheckResult::Allowed
+        ));
+    }
+
+    let mut restrictive = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Restrictive,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .unwrap();
+    assert!(matches!(
+        restrictive.check_path("read", "/tmp/work/notes.txt"),
+        CheckResult::Ask
+    ));
+}
+
+#[test]
 fn external_directory_deny_overrides_broad_session_allow_always_scope() {
     let config = PermissionConfig {
         external_directory: Some([("/tmp/restricted/**".to_string(), Action::Deny)].into()),
@@ -1723,8 +1875,9 @@ fn guarded_asks_for_external_path_write() {
 #[test]
 fn guarded_allows_internal_path_read() {
     let mut checker = make_checker(SecurityMode::Guarded);
+    let path = test_workspace().join("src/main.rs");
     assert!(matches!(
-        checker.check_path("read", "/home/user/project/src/main.rs"),
+        checker.check_path("read", path.to_string_lossy().as_ref()),
         CheckResult::Allowed,
     ));
 }
@@ -1815,6 +1968,34 @@ fn yolo_destructive_patterns_are_denied() {
         checker.check("bash", "rm -rf /sensitive/data"),
         CheckResult::Denied(_)
     ));
+}
+
+#[test]
+fn configured_bash_rules_do_not_remove_destructive_deny_baseline() {
+    let config = PermissionConfig {
+        ask_entries: Some([("bash".to_string(), vec!["rm **".to_string()])].into()),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Yolo,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .unwrap();
+
+    for command in [
+        "rm -rf /",
+        "dd if=/dev/zero of=/dev/sda",
+        "mkfs /dev/sda1",
+        "fdisk /dev/sda",
+        "mkswap /dev/sda2",
+    ] {
+        assert!(
+            matches!(checker.check("bash", command), CheckResult::Denied(_)),
+            "built-in destructive baseline did not deny {command:?}"
+        );
+    }
 }
 
 #[test]

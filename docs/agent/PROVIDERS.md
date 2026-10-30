@@ -22,7 +22,7 @@ definitions for OpenAI-compatible endpoints.
 | Ollama     | `ollama`            | (no key required)           |
 
 Select a provider via the config file, the `--provider` CLI flag, or the
-`ZS_PROVIDER` environment variable:
+`MINI_AGENT_PROVIDER` environment variable:
 
 ```
 mini-agent --provider anthropic
@@ -104,7 +104,7 @@ is workspace-scoped API authentication and does not establish a Pro/Max
 integration contract for another client. `/login anthropic` explains this
 limitation; mini-agent does not impersonate Claude Code or import its tokens.
 
-The model is set with `--model` or `ZS_MODEL`:
+The model is set with `--model` or `MINI_AGENT_MODEL`:
 
 ```
 mini-agent --provider openai --model gpt-4o
@@ -277,7 +277,7 @@ the `custom_providers` key in the config file:
 | `timeout_secs`                | integer | Optional. Total deadline for a request, from connect until the response body finishes. Unset by default, because a long streamed turn has no meaningful total bound.           |
 | `connect_timeout_secs`        | integer | Optional. Deadline for establishing the connection. Defaults to 30.                                                                                                           |
 | `stream_idle_timeout_secs`    | integer | Optional. Deadline between successive reads of a response, covering the wait for headers and the wait between streamed events. It resets on every read, so a long healthy stream is never interrupted. Defaults to 120. |
-| `model`                       | string  | Optional. Default model name for this provider. Used when no model is specified via `--model` or `ZS_MODEL`.                                                                  |
+| `model`                       | string  | Optional. Default model name for this provider. Used when no model is specified via `--model` or `MINI_AGENT_MODEL`.                                                                  |
 
 ### Connection and stream deadlines
 
@@ -469,8 +469,8 @@ OpenRouter models keep their provider-native caching behavior.
 
 | Flag                | Env var       | Description                         |
 | ------------------- | ------------- | ----------------------------------- |
-| `--provider`        | `ZS_PROVIDER` | Provider name                       |
-| `--model`           | `ZS_MODEL`    | Model name                          |
+| `--provider`        | `MINI_AGENT_PROVIDER` | Provider name                       |
+| `--model`           | `MINI_AGENT_MODEL`    | Model name                          |
 | `--quick-model`     | —             | Use a named quick model from config |
 | `--api-key`         | —             | API key (visible in `ps`)           |
 | `--max-tokens`      | —             | Maximum response tokens             |

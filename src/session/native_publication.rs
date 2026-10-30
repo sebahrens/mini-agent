@@ -1605,19 +1605,19 @@ mod tests {
     fn environment(roots: &crate::tests::OwnedTestDirectory) -> crate::tests::ScopedProcessEnv {
         crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(roots.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(roots.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(roots.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(roots.path().join("cache").into_os_string()),
             ),
         ])

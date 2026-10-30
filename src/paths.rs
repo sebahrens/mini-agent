@@ -135,6 +135,12 @@ impl WorkspaceBinding {
 
     pub(crate) fn capture(path: &Path) -> io::Result<Self> {
         let root = std::fs::canonicalize(path)?;
+        if root.parent().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "filesystem root cannot be used as a workspace",
+            ));
+        }
         let capability = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority())?;
         #[cfg(not(windows))]
         let directory = std::fs::File::open(&root)?;
@@ -1301,6 +1307,13 @@ mod workspace_binding_tests {
     }
 
     #[test]
+    fn filesystem_root_cannot_be_captured_as_a_workspace() {
+        let error = WorkspaceBinding::capture(Path::new("/")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("filesystem root"));
+    }
+
+    #[test]
     fn ancestor_context_is_limited_to_the_captured_workspace_root() {
         let container = temp_root("root-context").canonicalize().unwrap();
         let root = container.join("workspace");
@@ -1695,7 +1708,8 @@ pub use portable::{
     PortablePathError, contained_join, ensure_contained, validate_portable_relative_path,
 };
 
-const APP_COMPONENT: &str = crate::product::LEGACY_APP_COMPONENT;
+const APP_COMPONENT: &str = crate::product::APP_COMPONENT;
+const LEGACY_APP_COMPONENT: &str = crate::product::LEGACY_APP_COMPONENT;
 const MIGRATION_VERSION: u32 = 1;
 pub(crate) const PRIVATE_PATH_LINK_POLICY: &str = "reject symlinked path components";
 
@@ -1828,15 +1842,30 @@ impl PathOverrides {
     fn read_process() -> Self {
         Self {
             home_dir: std::env::var_os(crate::product::GLOBAL_HOME_ENV),
-            config_dir: std::env::var_os("ZS_CONFIG_DIR"),
-            data_dir: std::env::var_os("ZS_DATA_DIR"),
-            local_data_dir: std::env::var_os("ZS_LOCAL_DATA_DIR"),
-            state_dir: std::env::var_os("ZS_STATE_DIR"),
-            cache_dir: std::env::var_os("ZS_CACHE_DIR"),
-            credentials_dir: std::env::var_os("ZS_CREDENTIALS_DIR"),
+            config_dir: process_override("MINI_AGENT_CONFIG_DIR", "CONFIG_DIR"),
+            data_dir: process_override("MINI_AGENT_DATA_DIR", "DATA_DIR"),
+            local_data_dir: process_override("MINI_AGENT_LOCAL_DATA_DIR", "LOCAL_DATA_DIR"),
+            state_dir: process_override("MINI_AGENT_STATE_DIR", "STATE_DIR"),
+            cache_dir: process_override("MINI_AGENT_CACHE_DIR", "CACHE_DIR"),
+            credentials_dir: process_override("MINI_AGENT_CREDENTIALS_DIR", "CREDENTIALS_DIR"),
             default_layout: DefaultLayout::LegacyPlatform,
         }
     }
+}
+
+fn process_override(canonical: &str, legacy_suffix: &str) -> Option<OsString> {
+    let legacy = || {
+        let legacy = format!("{}{legacy_suffix}", crate::product::LEGACY_ENV_PREFIX);
+        std::env::var_os(format!("ZS_{legacy_suffix}")).or_else(|| std::env::var_os(legacy))
+    };
+    select_process_override(std::env::var_os(canonical), legacy())
+}
+
+fn select_process_override(
+    canonical: Option<OsString>,
+    legacy: Option<OsString>,
+) -> Option<OsString> {
+    canonical.or(legacy)
 }
 
 /// All host inputs used to resolve application paths.
@@ -1858,6 +1887,23 @@ pub struct PathEnvironment {
 
 impl PathEnvironment {
     pub fn from_process(workspace_root: Option<PathBuf>) -> Result<Self, AppPathError> {
+        // `dirs::home_dir()` and friends read HOME/XDG_* directly; guard them
+        // the same way `PathOverrides::from_process` already guards its own
+        // reads, so a test never observes a torn mix of one reader seeing a
+        // concurrent `ScopedProcessEnv` writer's temporary value and another
+        // (or this same call's `PathOverrides::from_process`) seeing the
+        // restored one.
+        #[cfg(test)]
+        {
+            crate::tests::with_shared_process_env(|| Self::read_process(workspace_root))
+        }
+        #[cfg(not(test))]
+        {
+            Self::read_process(workspace_root)
+        }
+    }
+
+    fn read_process(workspace_root: Option<PathBuf>) -> Result<Self, AppPathError> {
         let mut environment = Self {
             platform: PathPlatform::current()?,
             home_dir: dirs::home_dir(),
@@ -1904,7 +1950,10 @@ pub fn probe_default_layout(environment: &PathEnvironment) -> DefaultLayout {
     ]
     .into_iter()
     .flatten()
-    .any(|base| exists(&join_component(platform, base, APP_COMPONENT)));
+    .any(|base| {
+        exists(&join_component(platform, base, APP_COMPONENT))
+            || exists(&join_component(platform, base, LEGACY_APP_COMPONENT))
+    });
     if legacy_present {
         DefaultLayout::LegacyPlatform
     } else {
@@ -1976,22 +2025,22 @@ impl AppPaths {
         let global_home = resolve_global_home(environment)?;
         let config_override = resolve_override(
             environment,
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             environment.overrides.config_dir.as_deref(),
         )?;
         let data_override = resolve_override(
             environment,
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             environment.overrides.data_dir.as_deref(),
         )?;
         let local_data_override = resolve_override(
             environment,
-            "ZS_LOCAL_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
             environment.overrides.local_data_dir.as_deref(),
         )?;
         let state_override = resolve_override(
             environment,
-            "ZS_STATE_DIR",
+            "MINI_AGENT_STATE_DIR",
             environment.overrides.state_dir.as_deref(),
         )?;
 
@@ -2030,7 +2079,7 @@ impl AppPaths {
         };
         let cache_override = resolve_override(
             environment,
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             environment.overrides.cache_dir.as_deref(),
         )?;
         let cache_dir = match (cache_override, &global_home) {
@@ -2051,7 +2100,7 @@ impl AppPaths {
         };
         let credentials_dir = match resolve_override(
             environment,
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
             environment.overrides.credentials_dir.as_deref(),
         )? {
             Some(path) => path,
@@ -2065,7 +2114,7 @@ impl AppPaths {
                 Ok(join_component(
                     platform,
                     root,
-                    crate::product::LEGACY_PROJECT_DIRECTORY,
+                    crate::product::PROJECT_DIRECTORY,
                 ))
             })
             .transpose()?;
@@ -2090,7 +2139,7 @@ impl AppPaths {
         paths.project_dir = Some(join_component(
             platform,
             workspace_root,
-            crate::product::LEGACY_PROJECT_DIRECTORY,
+            crate::product::PROJECT_DIRECTORY,
         ));
         Ok(paths)
     }
@@ -2260,11 +2309,26 @@ impl AppPaths {
         self.state_dir.join("migrations").join("v1")
     }
 
-    #[cfg(any(feature = "js", test))]
+    /// Slot 0 owner; production opens through [`Self::effect_audit_slot`], so this is test-only.
+    #[cfg(test)]
     pub fn effect_audit(&self) -> EffectAuditPathOwner {
+        self.effect_audit_slot(0)
+    }
+
+    /// Audit owner for writer `slot`. The audit allows one writer per directory, so
+    /// concurrent mini-agent processes each claim the first free slot: slot 0 is the
+    /// historical `js-effects` directory and slot `n` is `js-effects-n`. A slot is a fixed
+    /// child of the audit root derived from an integer, so it can never be redirected.
+    #[cfg(any(feature = "js", test))]
+    pub fn effect_audit_slot(&self, slot: u32) -> EffectAuditPathOwner {
+        let name = if slot == 0 {
+            "js-effects".to_string()
+        } else {
+            format!("js-effects-{slot}")
+        };
         EffectAuditPathOwner {
             state_root: self.state_dir.clone(),
-            directory: self.state_dir.join("audit").join("js-effects"),
+            directory: self.state_dir.join("audit").join(name),
         }
     }
 }
@@ -2863,8 +2927,16 @@ fn converge_legacy_config(
 
 fn documented_legacy_config_roots(paths: &AppPaths) -> Vec<PathBuf> {
     let mut roots = vec![paths.config_dir.clone()];
-    if let Some(root) = dirs::config_dir() {
-        roots.push(root.join(APP_COMPONENT));
+    // Only add the OS-default legacy sibling when nothing explicitly
+    // redirected the canonical config directory. `dirs::config_dir()` is the
+    // real machine-wide default regardless of any `MINI_AGENT_CONFIG_DIR` (or
+    // legacy `ZEROSTACK_CONFIG_DIR`) override; including it unconditionally
+    // would migrate unrelated host content into whatever directory the
+    // override selected (for example an isolated test or container profile).
+    if PathOverrides::from_process().config_dir.is_none()
+        && let Some(root) = dirs::config_dir()
+    {
+        roots.push(root.join(crate::product::LEGACY_APP_COMPONENT));
     }
     roots.sort();
     roots.dedup();
@@ -2873,8 +2945,13 @@ fn documented_legacy_config_roots(paths: &AppPaths) -> Vec<PathBuf> {
 
 fn documented_legacy_data_roots(paths: &AppPaths) -> Vec<PathBuf> {
     let mut roots = vec![paths.data_dir.clone()];
-    if let Some(root) = dirs::data_dir() {
-        roots.push(root.join(APP_COMPONENT));
+    // See `documented_legacy_config_roots`: skip the OS-default legacy
+    // sibling when `MINI_AGENT_DATA_DIR`/`ZEROSTACK_DATA_DIR` overrides the
+    // canonical data directory.
+    if PathOverrides::from_process().data_dir.is_none()
+        && let Some(root) = dirs::data_dir()
+    {
+        roots.push(root.join(crate::product::LEGACY_APP_COMPONENT));
     }
     roots.sort();
     roots.dedup();
@@ -3538,18 +3615,52 @@ fn join_component(platform: PathPlatform, base: &Path, component: &str) -> PathB
 mod tests {
     use super::*;
 
+    #[test]
+    fn process_path_overrides_keep_both_legacy_prefixes_with_canonical_precedence() {
+        for (canonical, prior, expected) in [
+            (Some("/canonical"), Some("/existing-main"), "/canonical"),
+            (None, Some("/existing-main"), "/existing-main"),
+            (None, None, "/legacy-fork"),
+        ] {
+            let _environment = crate::tests::ScopedProcessEnv::set(&[
+                ("MINI_AGENT_CONFIG_DIR", canonical.map(OsString::from)),
+                ("ZS_CONFIG_DIR", prior.map(OsString::from)),
+                ("ZEROSTACK_CONFIG_DIR", Some("/legacy-fork".into())),
+            ]);
+            assert_eq!(
+                process_override("MINI_AGENT_CONFIG_DIR", "CONFIG_DIR"),
+                Some(expected.into())
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_path_override_wins_over_legacy_fallback() {
+        assert_eq!(
+            select_process_override(
+                Some(OsString::from("/canonical")),
+                Some(OsString::from("/legacy")),
+            ),
+            Some(OsString::from("/canonical"))
+        );
+        assert_eq!(
+            select_process_override(None, Some(OsString::from("/legacy"))),
+            Some(OsString::from("/legacy"))
+        );
+    }
+
     fn set_override(
         overrides: &mut PathOverrides,
         variable: &'static str,
         value: Option<OsString>,
     ) {
         match variable {
-            "ZS_CONFIG_DIR" => overrides.config_dir = value,
-            "ZS_DATA_DIR" => overrides.data_dir = value,
-            "ZS_LOCAL_DATA_DIR" => overrides.local_data_dir = value,
-            "ZS_STATE_DIR" => overrides.state_dir = value,
-            "ZS_CACHE_DIR" => overrides.cache_dir = value,
-            "ZS_CREDENTIALS_DIR" => overrides.credentials_dir = value,
+            "MINI_AGENT_CONFIG_DIR" => overrides.config_dir = value,
+            "MINI_AGENT_DATA_DIR" => overrides.data_dir = value,
+            "MINI_AGENT_LOCAL_DATA_DIR" => overrides.local_data_dir = value,
+            "MINI_AGENT_STATE_DIR" => overrides.state_dir = value,
+            "MINI_AGENT_CACHE_DIR" => overrides.cache_dir = value,
+            "MINI_AGENT_CREDENTIALS_DIR" => overrides.credentials_dir = value,
             _ => unreachable!("unknown path override"),
         }
     }
@@ -3574,28 +3685,28 @@ mod tests {
 
         assert_eq!(
             paths.config_dir,
-            PathBuf::from("/home/alice/.config/zerostack")
+            PathBuf::from("/home/alice/.config/mini-agent")
         );
         assert_eq!(
             paths.data_dir,
-            PathBuf::from("/home/alice/.local/share/zerostack")
+            PathBuf::from("/home/alice/.local/share/mini-agent")
         );
         assert_eq!(paths.local_data_dir, paths.data_dir);
         assert_eq!(
             paths.state_dir,
-            PathBuf::from("/home/alice/.local/state/zerostack")
+            PathBuf::from("/home/alice/.local/state/mini-agent")
         );
         assert_eq!(
             paths.cache_dir,
-            PathBuf::from("/home/alice/.cache/zerostack")
+            PathBuf::from("/home/alice/.cache/mini-agent")
         );
         assert_eq!(
             paths.credentials_dir,
-            PathBuf::from("/home/alice/.local/share/zerostack/credentials")
+            PathBuf::from("/home/alice/.local/share/mini-agent/credentials")
         );
         assert_eq!(
             paths.project_dir,
-            Some(PathBuf::from("/work/project/.zerostack"))
+            Some(PathBuf::from("/work/project/.mini-agent"))
         );
     }
 
@@ -3615,21 +3726,21 @@ mod tests {
 
         let paths = AppPaths::resolve(&environment).unwrap();
         let application_support =
-            PathBuf::from("/Users/alice/Library/Application Support/zerostack");
+            PathBuf::from("/Users/alice/Library/Application Support/mini-agent");
         assert_eq!(paths.config_dir, application_support);
         assert_eq!(paths.data_dir, application_support);
         assert_eq!(paths.local_data_dir, application_support);
         assert_eq!(
             paths.state_dir,
-            PathBuf::from("/Users/alice/Library/Application Support/zerostack/state")
+            PathBuf::from("/Users/alice/Library/Application Support/mini-agent/state")
         );
         assert_eq!(
             paths.cache_dir,
-            PathBuf::from("/Users/alice/Library/Caches/zerostack")
+            PathBuf::from("/Users/alice/Library/Caches/mini-agent")
         );
         assert_eq!(
             paths.credentials_dir,
-            PathBuf::from("/Users/alice/Library/Application Support/zerostack/credentials")
+            PathBuf::from("/Users/alice/Library/Application Support/mini-agent/credentials")
         );
         assert_eq!(paths.project_dir, None);
     }
@@ -3651,28 +3762,28 @@ mod tests {
         let paths = AppPaths::resolve(&environment).unwrap();
         assert_eq!(
             paths.config_dir,
-            PathBuf::from(r"C:\Users\Alice\AppData\Roaming\zerostack")
+            PathBuf::from(r"C:\Users\Alice\AppData\Roaming\mini-agent")
         );
         assert_eq!(paths.config_dir, paths.data_dir);
         assert_eq!(
             paths.local_data_dir,
-            PathBuf::from(r"C:\Users\Alice\AppData\Local\zerostack")
+            PathBuf::from(r"C:\Users\Alice\AppData\Local\mini-agent")
         );
         assert_eq!(
             paths.state_dir,
-            PathBuf::from(r"C:\Users\Alice\AppData\Local\zerostack\state")
+            PathBuf::from(r"C:\Users\Alice\AppData\Local\mini-agent\state")
         );
         assert_eq!(
             paths.cache_dir,
-            PathBuf::from(r"C:\Users\Alice\AppData\Local\zerostack\cache")
+            PathBuf::from(r"C:\Users\Alice\AppData\Local\mini-agent\cache")
         );
         assert_eq!(
             paths.credentials_dir,
-            PathBuf::from(r"C:\Users\Alice\AppData\Local\zerostack\credentials")
+            PathBuf::from(r"C:\Users\Alice\AppData\Local\mini-agent\credentials")
         );
         assert_eq!(
             paths.project_dir,
-            Some(PathBuf::from(r"C:\work\project\.zerostack"))
+            Some(PathBuf::from(r"C:\work\project\.mini-agent"))
         );
 
         environment.overrides.data_dir = Some(OsString::from(r"\\server\share\portable"));
@@ -3728,27 +3839,27 @@ mod tests {
         assert_eq!(
             paths.config_dir,
             PathBuf::from("/home/alice/config"),
-            "ZS_DATA_DIR must not select the configuration root"
+            "MINI_AGENT_DATA_DIR must not select the configuration root"
         );
 
         environment.overrides.config_dir = None;
         let paths = AppPaths::resolve(&environment).unwrap();
         assert_eq!(
             paths.config_dir,
-            PathBuf::from("/home/alice/.config/zerostack"),
-            "ZS_DATA_DIR must fall through to the platform configuration base"
+            PathBuf::from("/home/alice/.config/mini-agent"),
+            "MINI_AGENT_DATA_DIR must fall through to the platform configuration base"
         );
     }
 
     #[test]
     fn app_paths_matrix_rejects_invalid_overrides_and_missing_bases() {
         const VARIABLES: [&str; 6] = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ];
         for variable in VARIABLES {
             let mut environment = linux_environment();
@@ -3851,7 +3962,7 @@ mod tests {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
-            .join(format!("zerostack-app-paths-{}", uuid::Uuid::new_v4()));
+            .join(format!("mini-agent-app-paths-{}", uuid::Uuid::new_v4()));
         let environment = PathEnvironment {
             platform: PathPlatform::current().unwrap(),
             home_dir: Some(root.join("home")),
@@ -3872,7 +3983,7 @@ mod tests {
 
         assert!(is_first_startup);
         assert!(root.join("config.toml").is_file());
-        assert!(!root.join("workspace/.zerostack/config.toml").exists());
+        assert!(!root.join("workspace/.mini-agent/config.toml").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3880,7 +3991,7 @@ mod tests {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
-            .join(format!("zerostack-path-owner-{}", uuid::Uuid::new_v4()));
+            .join(format!("mini-agent-path-owner-{}", uuid::Uuid::new_v4()));
         let paths = AppPaths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
@@ -3888,7 +3999,7 @@ mod tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
-            project_dir: Some(root.join("workspace/.zerostack")),
+            project_dir: Some(root.join("workspace/.mini-agent")),
         };
         (root, paths)
     }
@@ -4368,6 +4479,48 @@ mod tests {
         assert!(!canonical.exists());
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    // mini-agent: an explicit MINI_AGENT_DATA_DIR/MINI_AGENT_CONFIG_DIR (or
+    // legacy ZEROSTACK_*_DIR) override must suppress the real OS-default
+    // legacy sibling as a migration candidate. Before this test existed,
+    // `documented_legacy_data_roots`/`documented_legacy_config_roots` called
+    // `dirs::data_dir()`/`dirs::config_dir()` unconditionally, so an
+    // overridden (for example sandboxed, test, or container) install still
+    // scanned and migrated unrelated content from the host's real default
+    // `~/.local/share/zerostack` (etc.) into whatever directory the override
+    // selected.
+    #[test]
+    fn documented_legacy_roots_exclude_the_os_default_when_overridden() {
+        let (_root, paths) = isolated_paths();
+        let marker = Some(std::ffi::OsString::from("/explicit-override-marker"));
+        let overridden = crate::tests::ScopedProcessEnv::set(&[
+            ("MINI_AGENT_DATA_DIR", marker.clone()),
+            ("MINI_AGENT_CONFIG_DIR", marker),
+        ]);
+        assert_eq!(
+            documented_legacy_data_roots(&paths),
+            vec![paths.data_dir.clone()]
+        );
+        assert_eq!(
+            documented_legacy_config_roots(&paths),
+            vec![paths.config_dir.clone()]
+        );
+        drop(overridden);
+        // Without an override, the real OS-default legacy sibling is still a
+        // candidate wherever the host actually exposes one.
+        if let Some(default_data) = dirs::data_dir() {
+            assert!(
+                documented_legacy_data_roots(&paths)
+                    .contains(&default_data.join(crate::product::LEGACY_APP_COMPONENT))
+            );
+        }
+        if let Some(default_config) = dirs::config_dir() {
+            assert!(
+                documented_legacy_config_roots(&paths)
+                    .contains(&default_config.join(crate::product::LEGACY_APP_COMPONENT))
+            );
+        }
     }
 }
 

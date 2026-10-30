@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -21,10 +21,17 @@ use crate::process_creation::TokioCommandCreationExt;
 
 mod general_profile;
 mod git_metadata;
+mod read_roots;
+pub(crate) use read_roots::default_sandbox_read_roots;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod linux_workspace_tests;
 #[cfg(any(windows, test))]
 mod profile_journal;
+/// Dedicated process-lifetime thread for `--die-with-parent` spawns (mini-agent-hdl3i).
+/// See `src/sandbox/spawner.rs` for why this exists: only the Linux JS worker launcher
+/// currently needs it, so it is gated the same way.
+#[cfg(all(feature = "js", target_os = "linux"))]
+pub(crate) mod spawner;
 #[cfg(feature = "js")]
 pub(crate) mod worker;
 mod workspace_layout;
@@ -380,6 +387,7 @@ pub struct SandboxConfig {
     /// private masks and validated at capture.
     home_masks: Vec<String>,
     shell: String,
+    shell_prefix_args: Vec<String>,
     shell_command_arg: String,
     /// Resolved executable retained across workspace probes so a failed bound
     /// workspace cannot permanently poison later rebinds.
@@ -393,6 +401,8 @@ pub struct SandboxConfig {
     working_dir: Option<PathBuf>,
     windows_appcontainer_read_roots: Vec<PathBuf>,
     windows_appcontainer_write_roots: Vec<PathBuf>,
+    /// Configured `sandbox-read-roots` for the Linux `bwrap` profiles.
+    bwrap_read_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -428,6 +438,7 @@ pub struct Sandbox {
 pub(crate) enum ShellDialect {
     Posix,
     PowerShell,
+    Cmd,
 }
 
 impl ShellDialect {
@@ -438,6 +449,7 @@ impl ShellDialect {
             "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" if cfg!(windows) => {
                 Some(Self::PowerShell)
             }
+            "cmd" | "cmd.exe" if cfg!(windows) => Some(Self::Cmd),
             _ => None,
         }
     }
@@ -446,6 +458,15 @@ impl ShellDialect {
         match self {
             Self::Posix => "-c",
             Self::PowerShell => "-Command",
+            Self::Cmd => "/C",
+        }
+    }
+
+    fn prefix_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Posix => &[],
+            Self::PowerShell => &["-NoProfile", "-NonInteractive"],
+            Self::Cmd => &["/D", "/S"],
         }
     }
 
@@ -453,6 +474,7 @@ impl ShellDialect {
         match self {
             Self::Posix => "POSIX shell",
             Self::PowerShell => "PowerShell",
+            Self::Cmd => "Windows Command Prompt",
         }
     }
 }
@@ -464,6 +486,7 @@ impl ShellDialect {
 pub(crate) struct ShellCapability {
     executable: PathBuf,
     dialect: ShellDialect,
+    prefix_args: &'static [&'static str],
     command_arg: &'static str,
     identity: crate::fs::CheckedMetadata,
     #[cfg(any(feature = "git-worktree", test))]
@@ -511,6 +534,7 @@ impl ShellCapability {
         Some(Self {
             executable,
             dialect,
+            prefix_args: dialect.prefix_args(),
             command_arg: dialect.command_arg(),
             identity,
             #[cfg(any(feature = "git-worktree", test))]
@@ -533,6 +557,7 @@ impl ShellCapability {
             identity,
             executable,
             dialect,
+            prefix_args: dialect.prefix_args(),
             command_arg: dialect.command_arg(),
             workspace_relative_config: None,
         }
@@ -544,6 +569,16 @@ impl ShellCapability {
 
     pub(crate) fn command_arg(&self) -> &'static str {
         self.command_arg
+    }
+
+    #[allow(dead_code)]
+    fn invocation_args(&self, command: &str) -> Vec<String> {
+        self.prefix_args
+            .iter()
+            .copied()
+            .chain([self.command_arg, command])
+            .map(str::to_string)
+            .collect()
     }
 
     pub(crate) fn model_guidance(&self) -> String {
@@ -1218,6 +1253,18 @@ fn bwrap_supports_bind_fd(_bwrap: &Path) -> bool {
     false
 }
 
+/// The guarded Git runtime directory that holds `program`, if it is one.
+/// Only a directory the runtime registry already protects is returned, so an
+/// arbitrary service program never causes a host path to be mounted.
+#[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
+fn guarded_runtime_dir_of(program: &Path) -> Option<PathBuf> {
+    let dir = program.parent()?;
+    crate::git::runtime::protected_runtime_paths()
+        .ok()?
+        .into_iter()
+        .find(|protected| protected == dir)
+}
+
 /// The workspace Git metadata binds for a bubblewrap launch rooted at the
 /// canonical `workspace_root`; unsupported descriptor binding denies launch.
 fn bwrap_git_metadata_binds(
@@ -1576,6 +1623,7 @@ pub enum SandboxPolicy {
 pub struct SandboxCapabilityMatrix {
     pub backend: String,
     pub status: &'static str,
+    pub reason: Option<String>,
     pub filesystem_reads: &'static str,
     pub filesystem_writes: &'static str,
     pub process_namespace: &'static str,
@@ -2373,6 +2421,7 @@ impl Sandbox {
                 home_mounts: Vec::new(),
                 home_masks: Vec::new(),
                 shell: "bash".to_string(),
+                shell_prefix_args: Vec::new(),
                 shell_command_arg: "-c".to_string(),
                 shell_candidate: None,
                 shell_capability: None,
@@ -2382,6 +2431,7 @@ impl Sandbox {
                 working_dir: None,
                 windows_appcontainer_read_roots: Vec::new(),
                 windows_appcontainer_write_roots: Vec::new(),
+                bwrap_read_roots: read_roots::default_sandbox_read_roots(),
             }),
             workspace_binding: None,
             git_write_roots: Arc::new(Mutex::new(Vec::new())),
@@ -2422,6 +2472,79 @@ impl Sandbox {
         self
     }
 
+    /// Replace the extra read-only roots mounted by the Linux `bwrap`
+    /// profiles (`sandbox-read-roots`). Other backends ignore them.
+    pub fn with_bwrap_read_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.bwrap_read_roots = roots;
+        self
+    }
+
+    /// Validate the configured read-only roots against the protected paths
+    /// of one launch: the canonical workspace, the application cache, the
+    /// user's home, and mini-agent's private directories.
+    ///
+    /// Only the empty-root `Workspace` profile mounts them: the host
+    /// filesystem profiles already expose the host tree through their `/`
+    /// bind (with their own private-path masks), and re-binding a toolchain
+    /// root read-only there would silently narrow a `HostFull` grant.
+    fn resolve_bwrap_read_roots(
+        &self,
+        workspace_root: &Path,
+        cache_dir: &Path,
+    ) -> Result<read_roots::BwrapReadRoots, String> {
+        if self.bwrap_read_roots.is_empty() || self.profile != SandboxProfile::Workspace {
+            return Ok(read_roots::BwrapReadRoots::none());
+        }
+        // `AppPaths::from_process` and `dirs::home_dir()` both read HOME; take
+        // both reads from the same environment snapshot so a concurrent
+        // `ScopedProcessEnv` writer scope elsewhere cannot start and finish
+        // between them and leave the two disagreeing about which HOME was
+        // live.
+        let resolve = || -> Result<read_roots::ProtectedPaths, String> {
+            let paths = crate::paths::AppPaths::from_process(None).map_err(|error| {
+                format!("sandbox: failed to resolve private application paths: {error}")
+            })?;
+            let canonical_or_lexical = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
+            Ok(read_roots::ProtectedPaths {
+                home: dirs::home_dir().map(canonical_or_lexical),
+                writable: vec![workspace_root.to_path_buf(), cache_dir.to_path_buf()],
+                private: [paths.config_dir, paths.credentials_dir, paths.state_dir]
+                    .into_iter()
+                    .map(canonical_or_lexical)
+                    .collect(),
+            })
+        };
+        #[cfg(test)]
+        let protected = crate::tests::with_shared_process_env(resolve)?;
+        #[cfg(not(test))]
+        let protected = resolve()?;
+        read_roots::resolve(&self.bwrap_read_roots, &protected)
+    }
+
+    /// Effective `sandbox-read-roots` for `--print-config`, resolved against
+    /// the current workspace exactly as a launch would resolve them.
+    pub(crate) fn bwrap_read_roots_summary(&self) -> String {
+        if self.backend != "bwrap" {
+            return "not applicable (bwrap backend only)".to_string();
+        }
+        if self.profile != SandboxProfile::Workspace {
+            return "not applicable (host filesystem profile already exposes the host tree)"
+                .to_string();
+        }
+        let workspace = match self.working_dir() {
+            Ok(dir) => std::fs::canonicalize(&dir).unwrap_or(dir),
+            Err(error) => return format!("unavailable: {error}"),
+        };
+        let cache_dir = crate::paths::process_paths()
+            .map(|paths| paths.cache_dir.join("sandbox-runtime"))
+            .unwrap_or_default();
+        let cache_dir = std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir);
+        match self.resolve_bwrap_read_roots(&workspace, &cache_dir) {
+            Ok(roots) => roots.describe(),
+            Err(error) => format!("invalid; subprocess launch denied: {error}"),
+        }
+    }
+
     /// Explicit three-state policy derived from the requested configuration
     /// and the cached result of a real backend preflight.
     pub fn policy(&self) -> SandboxPolicy {
@@ -2440,6 +2563,10 @@ impl Sandbox {
             _ => false,
         };
         self.policy_from_backend_availability(available)
+    }
+
+    fn preserves_private_helper_stdin(&self) -> bool {
+        cfg!(target_os = "windows") && self.enabled && self.backend == "appcontainer"
     }
 
     /// Closed, operator-actionable reason this backend's preflight failed, when known.
@@ -2537,6 +2664,7 @@ impl Sandbox {
             SandboxPolicy::Disabled => SandboxCapabilityMatrix {
                 backend: self.backend.clone(),
                 status: "disabled",
+                reason: None,
                 filesystem_reads: "host visibility inherited",
                 filesystem_writes: "host permissions inherited",
                 process_namespace: "host namespaces inherited",
@@ -2548,6 +2676,7 @@ impl Sandbox {
             SandboxPolicy::RequiredButUnavailable => SandboxCapabilityMatrix {
                 backend: self.backend.clone(),
                 status: "requested-but-unavailable; subprocess launch denied",
+                reason: self.unavailable_reason(),
                 filesystem_reads: "none; subprocess launch denied",
                 filesystem_writes: "none; subprocess launch denied",
                 process_namespace: "none; subprocess launch denied",
@@ -2564,7 +2693,8 @@ impl Sandbox {
                 SandboxCapabilityMatrix {
                     backend: self.backend.clone(),
                     status: "required-and-available",
-                    filesystem_reads: "workspace, dedicated sandbox cache, explicit read-only runtime assets, and proc kernel metadata",
+                    reason: None,
+                    filesystem_reads: "workspace, dedicated sandbox cache, explicit read-only runtime assets, configured read-only sandbox-read-roots, and proc kernel metadata",
                     filesystem_writes: "workspace except its Git config, hooks, info, and modules (read-only with bubblewrap 0.8.0 or later), dedicated sandbox cache, and private ephemeral /tmp only",
                     process_namespace: "user, PID, IPC, UTS, and cgroup namespaces isolated",
                     devices: "minimal synthetic /dev",
@@ -2577,6 +2707,7 @@ impl Sandbox {
                 SandboxCapabilityMatrix {
                     backend: self.backend.clone(),
                     status: "required-and-available",
+                    reason: None,
                     filesystem_reads: "host-readable files remain readable (Seatbelt read confinement is not claimed)",
                     filesystem_writes: "workspace except its Git config, hooks, info, and modules, dedicated sandbox cache including private temporary storage, and /dev/null only",
                     process_namespace: "no namespace isolation; child processes inherit the Seatbelt profile",
@@ -2590,6 +2721,7 @@ impl Sandbox {
                 SandboxCapabilityMatrix {
                     backend: self.backend.clone(),
                     status: "required-and-available",
+                    reason: None,
                     filesystem_reads: "explicit user-file roots plus pre-existing resources readable to ALL APPLICATION PACKAGES; read confidentiality is not claimed",
                     filesystem_writes: "the sandbox adds write access only for the canonical workspace and explicit roots; pre-existing ALL APPLICATION PACKAGES grants remain ambient",
                     process_namespace: "no namespace isolation; a creation-time bounded Job owns the complete descendant tree",
@@ -2602,6 +2734,7 @@ impl Sandbox {
             SandboxPolicy::RequiredAndAvailable => SandboxCapabilityMatrix {
                 backend: self.backend.clone(),
                 status: "required-and-available",
+                reason: None,
                 filesystem_reads: "backend-defined",
                 filesystem_writes: "workspace allowed; other behavior backend-defined",
                 process_namespace: "backend-defined",
@@ -2641,6 +2774,14 @@ impl Sandbox {
         matrix
     }
 
+    fn unavailable_reason(&self) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        if self.backend == "appcontainer" {
+            return windows::unavailable_reason();
+        }
+        None
+    }
+
     /// Whether this sandbox owns the complete descendant lifetime independently of process-group
     /// membership. JS spawn authority is issued only when this stronger boundary is available.
     #[cfg(any(feature = "js", test))]
@@ -2665,6 +2806,15 @@ impl Sandbox {
     /// not run the backend and mask checks `policy` performs.
     pub(crate) fn containment_requested(&self) -> bool {
         self.enabled
+    }
+
+    /// `off`, or `<backend>/<profile>`, for comparing environments across runs.
+    pub(crate) fn environment_label(&self) -> String {
+        if self.enabled {
+            format!("{}/{}", self.backend, self.profile.name())
+        } else {
+            "off".into()
+        }
     }
 
     /// Whether the default sandbox degraded to unsandboxed explicit shells;
@@ -2714,6 +2864,11 @@ impl Sandbox {
     pub(crate) fn with_resolved_shell(mut self, capability: Option<ShellCapability>) -> Self {
         if let Some(capability) = &capability {
             self.shell = capability.executable().to_string_lossy().into_owned();
+            self.shell_prefix_args = capability
+                .prefix_args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect();
             self.shell_command_arg = capability.command_arg().to_string();
         }
         self.shell_candidate = capability.clone();
@@ -2736,6 +2891,11 @@ impl Sandbox {
             match self.verify_shell_candidate(&candidate, workspace) {
                 Ok(()) => {
                     self.shell = candidate.executable().to_string_lossy().into_owned();
+                    self.shell_prefix_args = candidate
+                        .prefix_args
+                        .iter()
+                        .map(|arg| (*arg).to_string())
+                        .collect();
                     self.shell_command_arg = candidate.command_arg().to_string();
                     Some(candidate)
                 }
@@ -2778,7 +2938,7 @@ impl Sandbox {
                     })?;
                     windows::verify_direct_command(
                         capability.executable(),
-                        &[capability.command_arg().to_string(), "exit 0".to_string()],
+                        &capability.invocation_args("exit 0"),
                         workspace.root(),
                         &cache_dir,
                         &self.windows_appcontainer_read_roots,
@@ -2913,6 +3073,7 @@ impl Sandbox {
             self.shell = shell.to_string();
         }
         if !command_arg.is_empty() {
+            self.shell_prefix_args.clear();
             self.shell_command_arg = command_arg.to_string();
         }
         self.shell_capability = None;
@@ -3111,9 +3272,17 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
         })?;
+        self.reject_private_paths_within_workspace(&cwd)?;
+        let read_roots = self.resolve_bwrap_read_roots(&workspace_root, &cache_dir)?;
         let git_metadata = bwrap_git_metadata_binds(bwrap, &workspace_root)?;
-        let mut command =
-            self.build_bwrap_snapshot_command(bwrap, &cwd, &cache_dir, arguments, git_metadata)?;
+        let mut command = self.build_bwrap_snapshot_command(
+            bwrap,
+            &cwd,
+            &cache_dir,
+            arguments,
+            git_metadata,
+            &read_roots,
+        )?;
         self.bind_workspace_cwd(&mut command)?;
         Ok(ExecutionCommand::from(command).retaining_roots(&self.git_write_roots))
     }
@@ -3155,7 +3324,9 @@ impl Sandbox {
         match self.policy() {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
-                cmd.arg(&self.shell_command_arg).arg(command);
+                cmd.args(&self.shell_prefix_args)
+                    .arg(&self.shell_command_arg)
+                    .arg(command);
                 cmd.current_dir(&requested_cwd);
                 // Model-authored commands never inherit provider credentials,
                 // even when the operator explicitly disables OS containment.
@@ -3176,6 +3347,9 @@ impl Sandbox {
             }
             SandboxPolicy::RequiredAndAvailable => {}
         }
+        if let Some(workspace) = &self.workspace_binding {
+            canonical_non_root(workspace.root(), "working directory")?;
+        }
         let cwd = match (self.workspace_authority_path(), resolved_cwd.as_ref()) {
             (Some(alias), _) => alias,
             (None, Some(resolved)) => resolved.clone(),
@@ -3187,6 +3361,7 @@ impl Sandbox {
             let cache_dir = self.get_cached_cache_dir()?;
             return windows::build_shell_helper(
                 &self.shell,
+                &self.shell_prefix_args,
                 &self.shell_command_arg,
                 command,
                 &cwd,
@@ -3242,12 +3417,13 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
         })?;
-        let git_metadata = bwrap_git_metadata_binds(
-            bwrap,
-            &self.canonical_workspace_root_from(&requested_cwd, resolved_cwd.as_deref())?,
-        )?;
+        self.reject_private_paths_within_workspace(&cwd)?;
+        let workspace_root =
+            self.canonical_workspace_root_from(&requested_cwd, resolved_cwd.as_deref())?;
+        let read_roots = self.resolve_bwrap_read_roots(&workspace_root, &cache_dir)?;
+        let git_metadata = bwrap_git_metadata_binds(bwrap, &workspace_root)?;
         let mut command =
-            self.build_bwrap_command(bwrap, command, &cwd, &cache_dir, git_metadata)?;
+            self.build_bwrap_command(bwrap, command, &cwd, &cache_dir, git_metadata, &read_roots)?;
         self.bind_workspace_cwd(&mut command)?;
         Ok(command.into())
     }
@@ -3380,7 +3556,9 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run hook unsandboxed"
                 .to_string()
         })?;
+        self.reject_private_paths_within_workspace(&cwd)?;
         let readiness_shell = hook_readiness_shell()?;
+        let read_roots = self.resolve_bwrap_read_roots(&cwd, &cache_dir)?;
         let git_metadata = bwrap_git_metadata_binds(bwrap, &cwd)?;
         self.build_hook_bwrap_command(
             bwrap,
@@ -3391,6 +3569,7 @@ impl Sandbox {
             &cache_dir,
             explicit_env,
             git_metadata,
+            &read_roots,
         )
     }
 
@@ -3408,6 +3587,7 @@ impl Sandbox {
         cache_dir: &Path,
         explicit_env: &std::collections::BTreeMap<String, String>,
         git_metadata: git_metadata::BwrapGitMetadataBinds,
+        read_roots: &read_roots::BwrapReadRoots,
     ) -> Result<Command, String> {
         let expanded = self.expanded_filesystem(cwd, cache_dir)?;
         let mut cmd = Command::new(bwrap);
@@ -3416,6 +3596,15 @@ impl Sandbox {
             cmd.env(key, value);
         }
         cmd.envs(explicit_env).env("TMPDIR", "/tmp");
+        let hook_path = explicit_env.get("PATH").map(OsString::from).or_else(|| {
+            self.get_essential_env()
+                .iter()
+                .find(|(key, _)| *key == "PATH")
+                .map(|(_, value)| OsString::from(value))
+        });
+        if let Some(path) = read_roots.sandbox_path(hook_path.as_deref()) {
+            cmd.env("PATH", path);
+        }
         if self.profile != SandboxProfile::Workspace {
             cmd.args([
                 if self.profile == SandboxProfile::HostFull {
@@ -3427,16 +3616,19 @@ impl Sandbox {
                 "/",
             ]);
         } else {
-            for path in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix"] {
+            for path in read_roots::BWRAP_DEFAULT_RUNTIME_ROOTS {
                 cmd.args(["--ro-bind-try", path, path]);
             }
             cmd.args(["--dir", "/etc"]);
-            for path in ["/etc/localtime", "/etc/ld.so.cache"] {
+            for path in ["/etc/localtime", "/etc/ld.so.cache", "/etc/alternatives"] {
                 cmd.args(["--ro-bind-try", path, path]);
             }
         }
-        cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
-            .arg("--bind")
+        cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+        // After the synthetic mounts (so a root under /tmp stays visible) and
+        // before the writable workspace bind it never overlaps.
+        read_roots.apply(&mut cmd);
+        cmd.arg("--bind")
             .arg(cwd)
             .arg(cwd)
             .arg("--bind")
@@ -3628,6 +3820,7 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing workspace-service launch"
                 .to_string()
         })?;
+        self.reject_private_paths_within_workspace(&cwd)?;
         let git_metadata = bwrap_git_metadata_binds(bwrap, &cwd)?;
         Ok(self
             .build_workspace_service_bwrap_command(
@@ -3682,7 +3875,7 @@ impl Sandbox {
                 cmd.args(["--ro-bind-try", path, path]);
             }
             cmd.args(["--dir", "/etc"]);
-            for path in ["/etc/localtime", "/etc/ld.so.cache"] {
+            for path in ["/etc/localtime", "/etc/ld.so.cache", "/etc/alternatives"] {
                 cmd.args(["--ro-bind-try", path, path]);
             }
         }
@@ -3695,8 +3888,19 @@ impl Sandbox {
         // After the writable workspace bind, so the read-only Git metadata
         // binds cover it.
         git_metadata.apply(&mut cmd, cwd);
-        if let Some(expanded) = &expanded {
-            expanded.append_denies(&mut cmd);
+        // The guarded Git runtime lives in the application data directory,
+        // which the Workspace profile never mounts and every explicit-roots
+        // profile masks. Expose only the runtime directory, read-only, so the
+        // service can exec it and the helpers beside it. Inside a mask the bind
+        // is emitted before the mask turns read-only (bwrap cannot create the
+        // target's parents afterwards); otherwise it is a plain bind.
+        let runtime = guarded_runtime_dir_of(program);
+        let exposed = match &expanded {
+            Some(expanded) => expanded.append_denies_exposing(&mut cmd, runtime.as_deref()),
+            None => false,
+        };
+        if let (Some(runtime), false) = (&runtime, exposed) {
+            cmd.arg("--ro-bind").arg(runtime).arg(runtime);
         }
         cmd.args([
             "--unshare-user",
@@ -3723,6 +3927,41 @@ impl Sandbox {
             .args(args);
         configure_new_session_child_lifetime(&mut cmd);
         Ok(cmd)
+    }
+
+    #[cfg(any(test, feature = "git-worktree"))]
+    pub(crate) fn wrap_git_workspace_service(
+        &self,
+        program: &Path,
+        args: &[String],
+        workspace: &crate::paths::WorkspaceBinding,
+        _env: &[(OsString, OsString)],
+    ) -> Result<ExecutionCommand, String> {
+        #[cfg(target_os = "windows")]
+        {
+            workspace.validate()?;
+            if self.policy() != SandboxPolicy::RequiredAndAvailable
+                || self.backend != "appcontainer"
+            {
+                return Err("Windows structured Git requires AppContainer".to_string());
+            }
+            let cwd = canonical_non_root(workspace.root(), "workspace-service working directory")?;
+            let cache_dir = self.get_cached_cache_dir()?;
+            self.retain_canonical_git_write_roots(&cwd)?;
+            return windows::build_git_direct_helper(
+                program,
+                args,
+                &cwd,
+                &cwd,
+                &cache_dir,
+                &self.windows_appcontainer_read_roots,
+                &self.windows_appcontainer_write_roots,
+            )
+            .map(ExecutionCommand::appcontainer_helper)
+            .map(|command| command.retaining_roots(&self.git_write_roots));
+        }
+        #[cfg(not(target_os = "windows"))]
+        self.wrap_workspace_service_for_execution(program, args, workspace.root(), _env, true)
     }
 
     /// Validate that a direct executable can cross the exact bound workspace
@@ -3761,6 +4000,38 @@ impl Sandbox {
             self.wrap_workspace_service(program, args, workspace.root(), &[], true)
                 .map(|_| ())
         }
+    }
+
+    #[cfg(feature = "git-worktree")]
+    pub(crate) fn verify_git_workspace_service_capability(
+        &self,
+        program: &Path,
+        args: &[String],
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        {
+            workspace.validate()?;
+            if self.policy() != SandboxPolicy::RequiredAndAvailable
+                || self.backend != "appcontainer"
+            {
+                return Err("Windows structured Git requires AppContainer".to_string());
+            }
+            let cache_dir = self
+                .get_cached_cache_dir()
+                .map_err(|_| "application cache is unavailable".to_string())?;
+            return windows::verify_git_direct_command(
+                program,
+                args,
+                workspace.root(),
+                workspace.root(),
+                &cache_dir,
+                &self.windows_appcontainer_read_roots,
+                &self.windows_appcontainer_write_roots,
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        self.verify_workspace_service_capability(program, args, workspace)
     }
 
     #[cfg(target_os = "windows")]
@@ -3834,8 +4105,10 @@ impl Sandbox {
         cwd: &Path,
         cache_dir: &Path,
         git_metadata: git_metadata::BwrapGitMetadataBinds,
+        read_roots: &read_roots::BwrapReadRoots,
     ) -> Result<Command, String> {
-        let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata)?;
+        let mut cmd =
+            self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata, read_roots)?;
         let sandbox_cwd = self.sandbox_cwd(cwd);
         append_bwrap_isolation(
             &mut cmd,
@@ -3872,8 +4145,10 @@ impl Sandbox {
         cache_dir: &Path,
         arguments: &[String],
         git_metadata: git_metadata::BwrapGitMetadataBinds,
+        read_roots: &read_roots::BwrapReadRoots,
     ) -> Result<Command, String> {
-        let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata)?;
+        let mut cmd =
+            self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata, read_roots)?;
         let executable = if self.profile == SandboxProfile::Workspace {
             cmd.args(["--dir", "/run", "--dir", "/run/mini-agent"]);
             SNAPSHOT_EXECUTABLE_PATH
@@ -3902,6 +4177,7 @@ impl Sandbox {
         cwd: &Path,
         cache_dir: &Path,
         git_metadata: git_metadata::BwrapGitMetadataBinds,
+        read_roots: &read_roots::BwrapReadRoots,
     ) -> Result<Command, String> {
         let layout =
             workspace_layout::WorkspaceLayout::new(self.workspace_binding.as_deref(), cwd)?;
@@ -3921,8 +4197,16 @@ impl Sandbox {
         }
         let mut cmd = Command::new(bwrap);
         cmd.arg("--clearenv");
+        let mut host_path = None;
         for (key, value) in self.get_essential_env() {
+            if *key == "PATH" {
+                host_path = Some(value.as_str());
+                continue;
+            }
             cmd.arg("--setenv").arg(key).arg(value);
+        }
+        if let Some(path) = read_roots.sandbox_path(host_path.map(OsStr::new)) {
+            cmd.arg("--setenv").arg("PATH").arg(path);
         }
         cmd.args(["--setenv", "TMPDIR", "/tmp"]);
         if host {
@@ -3941,7 +4225,7 @@ impl Sandbox {
                 cmd.arg("--ro-bind-try").arg(source).arg(destination);
             }
             cmd.args(["--dir", "/etc"]);
-            for path in ["/etc/localtime", "/etc/ld.so.cache"] {
+            for path in ["/etc/localtime", "/etc/ld.so.cache", "/etc/alternatives"] {
                 cmd.args(["--ro-bind-try", path, path]);
             }
             cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs"])
@@ -3954,6 +4238,10 @@ impl Sandbox {
             for (path, target) in &layout.aliases {
                 cmd.arg("--symlink").arg(target).arg(path);
             }
+            // Configured read-only roots follow the synthetic mounts (so a
+            // root under /tmp stays visible) and precede the writable
+            // workspace bind, which they never overlap (see `read_roots`).
+            read_roots.apply(&mut cmd);
         }
         if self.workspace_binding.is_some() && cfg!(unix) {
             // --bind-fd additionally checks the mounted dev/inode against
@@ -3976,6 +4264,26 @@ impl Sandbox {
             expanded.append_denies(&mut cmd);
         }
         Ok(cmd)
+    }
+
+    fn reject_private_paths_within_workspace(&self, workspace: &Path) -> Result<(), String> {
+        let paths = crate::paths::AppPaths::from_process(None).map_err(|error| {
+            format!("sandbox: failed to resolve private application paths: {error}")
+        })?;
+        for (label, path) in [
+            ("configuration", paths.config_dir),
+            ("credential", paths.credentials_dir),
+            ("state", paths.state_dir),
+        ] {
+            if private_path_conflicts_with_workspace(workspace, &path) {
+                return Err(format!(
+                    "sandbox: refusing writable workspace {} because it contains the private {label} directory {}",
+                    workspace.display(),
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn sandbox_cwd(&self, cwd: &Path) -> PathBuf {
@@ -4718,7 +5026,26 @@ impl Sandbox {
             return;
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        if input.is_some() {
+        let preserves_private_helper_stdin = self.preserves_private_helper_stdin();
+        if preserves_private_helper_stdin && input.is_some() {
+            let output = CommandOutput {
+                exit_status: None,
+                stdout: Vec::new(),
+                stderr: b"sandbox: Windows AppContainer commands cannot accept caller stdin"
+                    .to_vec(),
+                status: CommandStatus::Failed,
+                descendants_escaped: false,
+            };
+            if let Some(audit) = &audit {
+                audit.emit(&output);
+            }
+            let _ = response_tx.send(output);
+            return;
+        } else if preserves_private_helper_stdin {
+            // The fixed-function Windows helper receives its launch request on
+            // stdin. The contained target still receives a separately created
+            // null handle, so it never inherits the user's terminal.
+        } else if input.is_some() {
             cmd.stdin(Stdio::piped());
         } else {
             // Captured/model-authored commands never own the user's terminal.
@@ -5080,6 +5407,10 @@ pub(crate) fn hook_containment_supported(backend: &str) -> bool {
     cfg!(unix) && matches!(backend, "bwrap" | "seatbelt" | "zerobox")
 }
 
+fn private_path_conflicts_with_workspace(workspace: &Path, private_path: &Path) -> bool {
+    private_path.starts_with(workspace)
+}
+
 /// The last trusted `sh` and the `PATH` it was resolved under.
 #[cfg(feature = "hooks")]
 static HOOK_SH_PATH: Mutex<Option<(std::ffi::OsString, PathBuf)>> = Mutex::new(None);
@@ -5156,7 +5487,7 @@ fn audit_explicit_shell(audit: &ExplicitShellAudit, output: &CommandOutput) {
     let descendants_escaped = output.descendants_escaped;
     if succeeded {
         tracing::info!(
-            target: "zerostack::audit::explicit_shell",
+            target: "mini_agent::audit::explicit_shell",
             trust_class = "TC-EXPLICIT-USER-SHELL",
             command = audit.command,
             cwd = %audit.cwd.display(),
@@ -5167,7 +5498,7 @@ fn audit_explicit_shell(audit: &ExplicitShellAudit, output: &CommandOutput) {
         );
     } else {
         tracing::warn!(
-            target: "zerostack::audit::explicit_shell",
+            target: "mini_agent::audit::explicit_shell",
             trust_class = "TC-EXPLICIT-USER-SHELL",
             command = audit.command,
             cwd = %audit.cwd.display(),
@@ -5193,7 +5524,7 @@ fn audit_support_command(audit: &OwnedSupportCommandAudit, output: &CommandOutpu
     let descendants_escaped = output.descendants_escaped;
     if succeeded {
         tracing::info!(
-            target: "zerostack::audit::support_utility",
+            target: "mini_agent::audit::support_utility",
             trust_class = "TC-SUPPORT-UTILITY",
             utility = audit.metadata.utility,
             cwd = %audit.cwd.display(),
@@ -5204,7 +5535,7 @@ fn audit_support_command(audit: &OwnedSupportCommandAudit, output: &CommandOutpu
         );
     } else {
         tracing::warn!(
-            target: "zerostack::audit::support_utility",
+            target: "mini_agent::audit::support_utility",
             trust_class = "TC-SUPPORT-UTILITY",
             utility = audit.metadata.utility,
             cwd = %audit.cwd.display(),
@@ -6285,7 +6616,7 @@ pub(crate) fn select_macos_runtime_cache(
         return Ok(configured);
     }
     let fallback = system_cache
-        .ok_or_else(|| "sandbox: system cache is unavailable; set ZS_CACHE_DIR outside private application directories".to_string())?
+        .ok_or_else(|| "sandbox: system cache is unavailable; set MINI_AGENT_CACHE_DIR outside private application directories".to_string())?
         .join(crate::product::LEGACY_APP_COMPONENT)
         .join("sandbox-runtime");
     validate_macos_runtime_cache(&fallback, paths)?;
@@ -6311,7 +6642,7 @@ fn validate_macos_runtime_cache(
                 if cache_spelling.starts_with(private_spelling)
                     || private_spelling.starts_with(cache_spelling)
                 {
-                    return Err("sandbox: command cache overlaps private application directories; set ZS_CACHE_DIR outside configuration and credentials directories".into());
+                    return Err("sandbox: command cache overlaps private application directories; set MINI_AGENT_CACHE_DIR outside configuration and credentials directories".into());
                 }
             }
         }
@@ -6524,6 +6855,16 @@ mod sandbox_tests {
             Sandbox::new(false, "bwrap").policy_from_backend_availability(true),
             SandboxPolicy::Disabled
         );
+    }
+
+    #[test]
+    fn only_enabled_windows_appcontainer_commands_preserve_private_helper_stdin() {
+        assert_eq!(
+            Sandbox::new(true, "appcontainer").preserves_private_helper_stdin(),
+            cfg!(target_os = "windows")
+        );
+        assert!(!Sandbox::new(false, "appcontainer").preserves_private_helper_stdin());
+        assert!(!Sandbox::new(true, "bwrap").preserves_private_helper_stdin());
     }
 
     #[test]
@@ -6901,6 +7242,15 @@ mod sandbox_tests {
         .unwrap();
         assert_eq!(powershell.dialect(), ShellDialect::PowerShell);
         assert_eq!(powershell.command_arg(), "-Command");
+        assert_eq!(
+            powershell.invocation_args("Write-Output exact"),
+            [
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output exact"
+            ]
+        );
 
         let (bash_workspace, _) = shell_fixture("bash.exe");
         let bash =
@@ -6908,18 +7258,35 @@ mod sandbox_tests {
                 .unwrap();
         assert_eq!(bash.dialect(), ShellDialect::Posix);
         assert_eq!(bash.command_arg(), "-c");
+        assert_eq!(bash.invocation_args("printf exact"), ["-c", "printf exact"]);
 
-        drop((powershell, bash));
+        let (cmd_workspace, _) = shell_fixture("cmd.exe");
+        let cmd =
+            ShellCapability::resolve("cmd", &cmd_workspace, Some(std::ffi::OsStr::new("bin")))
+                .unwrap();
+        assert_eq!(cmd.dialect(), ShellDialect::Cmd);
+        assert_eq!(
+            cmd.invocation_args("echo exact"),
+            ["/D", "/S", "/C", "echo exact"]
+        );
+
+        drop((powershell, bash, cmd));
         std::fs::remove_dir_all(powershell_workspace).unwrap();
         std::fs::remove_dir_all(bash_workspace).unwrap();
+        std::fs::remove_dir_all(cmd_workspace).unwrap();
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_resolved_shell_contract_reaches_the_process_argv() {
-        for (name, dialect, expected_flag) in [
-            ("pwsh.exe", ShellDialect::PowerShell, "-Command"),
-            ("bash.exe", ShellDialect::Posix, "-c"),
+        for (name, dialect, expected_args) in [
+            (
+                "pwsh.exe",
+                ShellDialect::PowerShell,
+                &["-NoProfile", "-NonInteractive", "-Command"] as &[&str],
+            ),
+            ("bash.exe", ShellDialect::Posix, &["-c"] as &[&str]),
+            ("cmd.exe", ShellDialect::Cmd, &["/D", "/S", "/C"] as &[&str]),
         ] {
             let (workspace, executable) = shell_fixture(name);
             let capability =
@@ -6932,13 +7299,13 @@ mod sandbox_tests {
             let command = sandbox.wrap_command("Write-Output exact").unwrap();
             let command = command.as_std();
             assert_eq!(command.get_program(), executable.canonicalize().unwrap());
-            assert_eq!(
-                command.get_args().collect::<Vec<_>>(),
-                [
-                    std::ffi::OsStr::new(expected_flag),
-                    std::ffi::OsStr::new("Write-Output exact")
-                ]
-            );
+            let expected = expected_args
+                .iter()
+                .copied()
+                .chain(["Write-Output exact"])
+                .map(std::ffi::OsStr::new)
+                .collect::<Vec<_>>();
+            assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
 
             drop((sandbox, command));
             std::fs::remove_dir_all(workspace).unwrap();
@@ -7150,7 +7517,11 @@ mod sandbox_tests {
             source.contains(".stdin(Stdio::from"),
             "helper requests must use inherited stdin, not argv/env/temp files"
         );
-        assert!(!source.contains("GetNamedSecurityInfo"));
+        assert_eq!(
+            source.matches("GetNamedSecurityInfoW(").count(),
+            1,
+            "name-based DACL reads are limited to protected machine-file effective-rights checks"
+        );
         assert!(!source.contains("SetNamedSecurityInfo"));
         assert!(!source.contains("S-1-5-21-3380456832"));
         assert!(!source.contains("SECURITY_CAPABILITY_INTERNET_CLIENT"));
@@ -7173,7 +7544,7 @@ mod sandbox_tests {
             "configured writable root",
             "private AppContainer control root",
             "project subdirectory",
-            "ZS_CACHE_DIR outside the workspace",
+            "MINI_AGENT_CACHE_DIR outside the workspace",
         ] {
             assert!(
                 source.contains(diagnostic),
@@ -7235,17 +7606,26 @@ mod sandbox_tests {
         assert!(control_candidate.contains("reject_reparse_components(&candidate)?"));
         assert!(control_candidate.contains("reject_reparse_components(&canonical)?"));
         assert!(!control_candidate.contains(".display()"));
-        assert!(source.contains("fn grant_access_root(\n    root: &Path,\n    grants: &mut AccessGrants,\n    parent: &Handle,\n    permissions: u32,\n    require_single_link: bool,"));
-        assert!(source.contains("FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,\n        false,"));
+        assert!(source.contains("fn grant_access_root(\n    root: &Path,\n    grants: &mut AccessGrants,\n    parent: &Handle,\n    permissions: u32,\n    require_single_link: bool,\n    inherit_to_children: bool,"));
+        assert!(
+            source.contains(
+                "FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,\n        false,\n        true,"
+            )
+        );
         assert!(source.contains(
-            "FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD,\n        true,"
+            "FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD,\n        true,\n        true,"
         ));
+        assert!(source.contains(
+            "grant_access_root(&root, &mut grants, &parent, FILE_TRAVERSE, false, false)?"
+        ));
+        assert!(source.contains("let traverse_roots = workspace\n        .ancestors()"));
         let root_grant = source
             .split("fn grant_access_root(")
             .nth(1)
             .and_then(|source| source.split("fn validate_write_root_tree(").next())
             .expect("root-scoped ACL grant missing");
         assert_eq!(root_grant.matches("update_access_ace(").count(), 1);
+        assert!(root_grant.contains("directory && inherit_to_children"));
         assert!(!root_grant.contains("read_dir("));
         assert!(root_grant.contains("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE"));
         let root_revoke = source
@@ -7262,8 +7642,13 @@ mod sandbox_tests {
             "fn run_production_preflight(diagnostics: Option<&PreflightDiagnostics>) -> Result<(), String>"
         ));
         assert!(source.contains("general_sandbox_preflight_observed(None)"));
+        assert!(source.contains("protect_and_attest_preflight_root(&path)"));
+        assert!(source.contains("ProfileJournalRootAuthority::new_preflight("));
+        assert!(source.contains("attest_existing_preflight_root(&canonical)?"));
+        assert!(source.contains("GRANT_ACCESS,\n        FILE_TRAVERSE,"));
         assert!(source.contains("const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration"));
         assert!(source.contains("const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration"));
+        assert!(source.contains("const GENERAL_PREFLIGHT_RECOVERY_TIMEOUT: Duration"));
         assert!(source.contains(".spawn_guarded_until(run_deadline)"));
         assert!(source.contains("terminate_and_reap_owned_helper"));
         assert!(source.contains("sweep_stale_profiles_until(&journal_root, deadline)?"));
@@ -7329,6 +7714,14 @@ mod sandbox_tests {
             cooperative_termination.find("SetEvent(event.raw())")
                 < cooperative_termination.find("TerminateProcess(process.raw(), 125)")
         );
+        let owned_termination = source
+            .split("pub(crate) fn terminate_owned_child(")
+            .nth(1)
+            .and_then(|source| source.split("pub(crate) fn terminate_helper(").next())
+            .expect("Windows owned-child termination router missing");
+        assert!(owned_termination.contains("helper_cancel_event_is_ready(pid)"));
+        assert!(owned_termination.contains("terminate_process_tree(pid)"));
+        assert!(!owned_termination.contains("Duration::from_secs(4)"));
 
         let profile_creation = source
             .split("fn create_appcontainer_profile(")
@@ -7362,7 +7755,13 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn sweep_stale_profile_intent(").next())
             .expect("stale profile journal sweep missing");
-        assert!(stale_journal.contains("revoke_tree_until(&root, sid.0, deadline)?"));
+        assert!(stale_journal.contains("if trusted_machine_read_file(&root)?"));
+        assert!(
+            stale_journal.contains("let stale_effective = effective_path_rights(&root, sid.0)?")
+        );
+        assert!(stale_journal.contains("if stale_effective == 0"));
+        assert!(stale_journal.contains("revoke_tree_until(&root, sid.0, deadline)"));
+        assert!(profile_creation.contains("if !trusted_machine_read_file(root)?"));
 
         let update = source
             .split("fn update_handle_ace(")
@@ -7888,6 +8287,7 @@ mod sandbox_tests {
                 Path::new("/workspace"),
                 Path::new("/cache/mini-agent"),
                 git_metadata::BwrapGitMetadataBinds::none(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         let args: Vec<String> = cmd
@@ -7943,6 +8343,276 @@ mod sandbox_tests {
         );
     }
 
+    /// Index of the `flag source mount_point` triple whose mount point is
+    /// `mount_point`, for any of the given flags.
+    #[cfg(unix)]
+    fn bind_position(args: &[String], flags: &[&str], mount_point: &str) -> Option<usize> {
+        args.windows(3)
+            .position(|w| flags.contains(&w[0].as_str()) && w[2] == mount_point)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bwrap_command_binds_default_read_roots_read_only_before_the_workspace() {
+        // Hold the process-environment lock for the whole test: it derives
+        // its own expected `~/.cargo/bin`, `~/.local/bin`, and `~/.rustup`
+        // paths from `dirs::home_dir()` after calling `build_bwrap_command`,
+        // which independently resolves HOME (via `resolve_bwrap_read_roots`)
+        // while building the command. A concurrent `ScopedProcessEnv` writer
+        // completing between those two reads would make them disagree about
+        // HOME and fail the "must be a default read-only bind" assertions.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        let (_scratch, root) = canonical_scratch();
+        let workspace = root.join("workspace");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let sandbox = Sandbox::new(true, "bwrap");
+        let read_roots = sandbox
+            .resolve_bwrap_read_roots(&workspace, &cache)
+            .unwrap();
+        let command = sandbox
+            .build_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                "true",
+                &workspace,
+                &cache,
+                git_metadata::BwrapGitMetadataBinds::none(),
+                &read_roots,
+            )
+            .unwrap();
+        let args = command_argv(&command);
+        let read_only = ["--ro-bind", "--ro-bind-try"];
+
+        let brew = bind_position(&args, &read_only, "/home/linuxbrew")
+            .expect("/home/linuxbrew must be a default read-only bind");
+        let workspace_bind = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == workspace.to_string_lossy())
+            .unwrap();
+        assert!(
+            brew < workspace_bind,
+            "read roots precede the workspace bind"
+        );
+        let tmpfs = args.iter().position(|arg| arg == "--tmpfs").unwrap();
+        assert!(brew > tmpfs, "read roots follow the private /tmp mount");
+        assert!(
+            bind_position(&args, &["--bind"], "/home/linuxbrew").is_none(),
+            "default read roots are never writable"
+        );
+
+        let home = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
+        if !workspace.starts_with(&home) {
+            for relative in [".cargo/bin", ".local/bin", ".rustup"] {
+                let expanded = home.join(relative);
+                let expanded = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+                assert!(
+                    bind_position(&args, &read_only, &expanded.to_string_lossy()).is_some(),
+                    "~/{relative} must be a default read-only bind: {args:?}"
+                );
+            }
+            assert!(
+                bind_position(&args, &read_only, &home.join(".cargo").to_string_lossy()).is_none(),
+                "~/.cargo (credentials.toml) must not be bound"
+            );
+        }
+
+        let path = args
+            .windows(3)
+            .find(|w| w[0] == "--setenv" && w[1] == "PATH")
+            .map(|w| w[2].clone());
+        let host_path = sandbox
+            .get_essential_env()
+            .iter()
+            .find(|(key, _)| *key == "PATH")
+            .map(|(_, value)| value.clone());
+        assert_eq!(
+            path.map(OsString::from),
+            read_roots.sandbox_path(host_path.as_deref().map(OsStr::new))
+        );
+        let path_settings = args
+            .windows(2)
+            .filter(|w| w[0] == "--setenv" && w[1] == "PATH")
+            .count();
+        assert!(path_settings <= 1, "PATH is set at most once: {args:?}");
+        if host_path.is_some() {
+            assert_eq!(path_settings, 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_read_roots_replace_the_default_and_refuse_unsafe_entries() {
+        // Hold the process-environment lock for the whole test: it derives
+        // `paths.credentials_dir` from the environment itself and then feeds
+        // it to `resolve_bwrap_read_roots`, which independently re-resolves
+        // `AppPaths` (and `dirs::home_dir()`) from the same environment. A
+        // concurrent `ScopedProcessEnv` writer (e.g. a sandbox-profile test
+        // that retargets HOME) completing between those two reads would make
+        // them disagree, so the "credentials dir is private" entry would no
+        // longer match and the expected error would never fire.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        let (_scratch, root) = canonical_scratch();
+        let workspace = root.join("workspace");
+        let tools = root.join("tools");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(tools.join("bin")).unwrap();
+        let cache = root.join("cache");
+
+        let sandbox = Sandbox::new(true, "bwrap").with_bwrap_read_roots(vec![tools.clone()]);
+        let read_roots = sandbox
+            .resolve_bwrap_read_roots(&workspace, &cache)
+            .unwrap();
+        let mut command = Command::new("bwrap");
+        read_roots.apply(&mut command);
+        let tools = tools.to_string_lossy().into_owned();
+        assert_eq!(
+            command_argv(&command),
+            ["--ro-bind", tools.as_str(), tools.as_str()]
+        );
+
+        let empty = Sandbox::new(true, "bwrap").with_bwrap_read_roots(Vec::new());
+        assert!(
+            empty
+                .resolve_bwrap_read_roots(&workspace, &cache)
+                .unwrap()
+                .roots()
+                .is_empty()
+        );
+
+        for (entry, expected) in [
+            (PathBuf::from("/"), "filesystem root"),
+            (PathBuf::from("~"), "home directory"),
+            (root.clone(), "contains the writable workspace"),
+            (PathBuf::from("relative"), "absolute path"),
+        ] {
+            let error = Sandbox::new(true, "bwrap")
+                .with_bwrap_read_roots(vec![entry.clone()])
+                .resolve_bwrap_read_roots(&workspace, &cache)
+                .unwrap_err();
+            assert!(error.contains(expected), "{}: {error}", entry.display());
+        }
+        let paths = crate::paths::AppPaths::from_process(None).unwrap();
+        let error = Sandbox::new(true, "bwrap")
+            .with_bwrap_read_roots(vec![paths.credentials_dir])
+            .resolve_bwrap_read_roots(&workspace, &cache)
+            .unwrap_err();
+        assert!(
+            error.contains("private configuration, credential, or state"),
+            "{error}"
+        );
+    }
+
+    #[cfg(all(unix, feature = "hooks"))]
+    #[test]
+    fn hook_bwrap_command_applies_read_roots_and_sandbox_path() {
+        let (_scratch, root) = canonical_scratch();
+        let workspace = root.join("workspace");
+        let tool_bin = root.join("tool/bin");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&tool_bin).unwrap();
+        let sandbox = Sandbox::new(true, "bwrap").with_bwrap_read_roots(vec![tool_bin.clone()]);
+        let read_roots = sandbox
+            .resolve_bwrap_read_roots(&workspace, &root.join("cache"))
+            .unwrap();
+        let env = std::collections::BTreeMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let command = sandbox
+            .build_hook_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                Path::new("/bin/sh"),
+                "/usr/bin/hook",
+                &[],
+                &workspace,
+                Path::new("/cache/mini-agent"),
+                &env,
+                git_metadata::BwrapGitMetadataBinds::none(),
+                &read_roots,
+            )
+            .unwrap();
+        let args = command_argv(&command);
+        let tool_bin = tool_bin.to_string_lossy().into_owned();
+        assert!(
+            bind_position(&args, &["--ro-bind"], &tool_bin).is_some(),
+            "{args:?}"
+        );
+        let path = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(path, OsStr::new(&format!("/usr/bin:{tool_bin}")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend (0.8.0 or later)"]
+    async fn bwrap_shell_runs_tools_from_configured_read_roots_read_only() {
+        assert!(bwrap_exists(), "bubblewrap is unavailable");
+        let (_scratch, root) = canonical_scratch();
+        let workspace = root.join("workspace");
+        let tool_bin = root.join("tools/bin");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&tool_bin).unwrap();
+        let tool = tool_bin.join("mini-agent-read-root-probe");
+        std::fs::write(&tool, "#!/bin/sh\necho read-root-tool-ran\n").unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let probe = format!(
+            "mini-agent-read-root-probe; if touch {}/written 2>/dev/null; then echo WRITABLE; else echo READ_ONLY; fi",
+            tool_bin.display()
+        );
+
+        let without = Sandbox::new(true, "bwrap")
+            .with_bwrap_read_roots(Vec::new())
+            .with_working_dir(&workspace);
+        let output = without
+            .output_command_with_limits(&probe, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("read-root-tool-ran"), "{stdout}");
+
+        let with = Sandbox::new(true, "bwrap")
+            .with_bwrap_read_roots(vec![tool_bin.clone()])
+            .with_working_dir(&workspace);
+        let output = with
+            .output_command_with_limits(&probe, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("read-root-tool-ran") && stdout.contains("READ_ONLY"),
+            "stdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!tool_bin.join("written").exists());
+    }
+
+    #[test]
+    fn sandboxed_hook_and_workspace_service_profiles_detach_from_the_terminal() {
+        let source = include_str!("sandbox.rs");
+        let hook_start = source.find("fn build_hook_bwrap_command(").unwrap();
+        let service_start = source[hook_start..]
+            .find("pub(crate) fn wrap_workspace_service(")
+            .map(|offset| hook_start + offset)
+            .unwrap();
+        let service_end = source[service_start..]
+            .find("pub(crate) fn verify_workspace_service_capability(")
+            .map(|offset| service_start + offset)
+            .unwrap();
+        let hook = &source[hook_start..service_start];
+        let service = &source[service_start..service_end];
+
+        for (name, profile) in [("hook", hook), ("workspace service", service)] {
+            assert!(profile.contains("--new-session"), "{name}");
+            assert!(
+                profile.contains("configure_new_session_child_lifetime(&mut cmd)"),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn bound_bwrap_command_closes_workspace_authority_before_model_shell() {
         // Hold the process-environment lock: test builds derive
@@ -7959,6 +8629,7 @@ mod sandbox_tests {
                 Path::new("/proc/self/fd/197"),
                 Path::new("/cache/mini-agent"),
                 git_metadata::BwrapGitMetadataBinds::none(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         let args: Vec<String> = command
@@ -8012,6 +8683,7 @@ mod sandbox_tests {
                 Path::new("/proc/self/fd/197"),
                 Path::new("/cache/mini-agent"),
                 git_metadata::BwrapGitMetadataBinds::none(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         let args: Vec<_> = command.as_std().get_args().collect();
@@ -8152,6 +8824,7 @@ mod sandbox_tests {
                 Path::new("/cache/mini-agent"),
                 &std::collections::BTreeMap::new(),
                 git_metadata::BwrapGitMetadataBinds::none(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         let args = command_argv(&command);
@@ -8311,6 +8984,7 @@ mod sandbox_tests {
                 &workspace,
                 Path::new("/cache/mini-agent"),
                 binds,
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
@@ -8332,6 +9006,7 @@ mod sandbox_tests {
                 &workspace,
                 Path::new("/cache/mini-agent"),
                 git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
@@ -8358,6 +9033,7 @@ mod sandbox_tests {
                     &sandbox.canonical_workspace_root(&workspace).unwrap(),
                 )
                 .unwrap(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), authority, &workspace);
@@ -8379,6 +9055,7 @@ mod sandbox_tests {
                 &worktree,
                 Path::new("/cache/mini-agent"),
                 git_metadata::BwrapGitMetadataBinds::open(&worktree).unwrap(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         assert_eq!(
@@ -8409,9 +9086,93 @@ mod sandbox_tests {
                 Path::new("/cache/mini-agent"),
                 &std::collections::BTreeMap::new(),
                 git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
+                &read_roots::BwrapReadRoots::none(),
             )
             .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bwrap_workspace_service_binds_guarded_git_runtime_after_masks() {
+        // Hold the process-environment lock: test builds derive
+        // application paths from the environment on every call.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        let runtime_home = crate::tests::OwnedTestDirectory::new("service-git-runtime");
+        let runtime = crate::git::runtime::GuardedRuntime::materialize(
+            crate::git::runtime::bundled_approval().expect("test requires approved bundle"),
+            &runtime_home.path().join("runtime"),
+            &[],
+        )
+        .unwrap();
+        let build = |program: &Path| {
+            command_argv(
+                &Sandbox::new(true, "bwrap")
+                    .build_workspace_service_bwrap_command(
+                        Path::new("/usr/bin/bwrap"),
+                        program,
+                        &[],
+                        Path::new("/workspace"),
+                        Path::new("/cache/mini-agent"),
+                        &[],
+                        true,
+                        git_metadata::BwrapGitMetadataBinds::none(),
+                    )
+                    .unwrap(),
+            )
+        };
+
+        let dir = runtime.directory().to_string_lossy().into_owned();
+        let args = build(runtime.program());
+        let bind = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == dir && w[2] == dir)
+            .unwrap_or_else(|| panic!("runtime directory is ro-bound: {args:?}"));
+        let cache_bind = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/cache/mini-agent")
+            .unwrap();
+        assert!(cache_bind < bind, "runtime bind follows the writable binds");
+        assert!(
+            bind < args.iter().position(|a| a == "--unshare-user").unwrap(),
+            "runtime bind precedes the namespace options"
+        );
+
+        // A program outside the guarded runtime never mounts its directory.
+        let other = build(Path::new("/usr/bin/service"));
+        assert_eq!(
+            other.iter().filter(|a| a.as_str() == "--ro-bind").count(),
+            args.iter().filter(|a| a.as_str() == "--ro-bind").count() - 1
+        );
+    }
+
+    #[cfg(all(unix, feature = "hooks"))]
+    #[test]
+    fn bwrap_hook_command_binds_etc_alternatives_for_the_toolchain_symlinks() {
+        // Debian/Ubuntu: /usr/bin/cc -> /etc/alternatives/cc -> gcc.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        let (_scratch, root) = canonical_scratch();
+        let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
+        let command = Sandbox::new(true, "bwrap")
+            .build_hook_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                Path::new("/bin/sh"),
+                "/usr/bin/hook",
+                &[],
+                &workspace,
+                Path::new("/cache/mini-agent"),
+                &std::collections::BTreeMap::new(),
+                git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
+                &read_roots::BwrapReadRoots::none(),
+            )
+            .unwrap();
+        let argv = command_argv(&command);
+        let binds_alternatives = argv.windows(3).any(|window| {
+            window[0] == "--ro-bind-try"
+                && window[1] == "/etc/alternatives"
+                && window[2] == "/etc/alternatives"
+        });
+        assert!(binds_alternatives, "{argv:?}");
     }
 
     #[cfg(unix)]
@@ -9167,6 +9928,7 @@ echo COMMITTED"#;
         let matrix = SandboxCapabilityMatrix {
             backend: "seatbelt".to_string(),
             status: "required-and-available",
+            reason: None,
             filesystem_reads: "host-readable files remain readable (Seatbelt read confinement is not claimed)",
             filesystem_writes: "workspace except its Git config, hooks, info, and modules, dedicated sandbox cache including private temporary storage, and /dev/null only",
             process_namespace: "no namespace isolation; child processes inherit the Seatbelt profile",
@@ -9855,12 +10617,12 @@ printf {pass_token}
         let _env = crate::tests::ScopedProcessEnv::set(&[
             ("HOME", Some(home.as_os_str().to_owned())),
             ("MINI_AGENT_HOME", Some(app_home.as_os_str().to_owned())),
-            ("ZS_CONFIG_DIR", None),
-            ("ZS_DATA_DIR", None),
-            ("ZS_LOCAL_DATA_DIR", None),
-            ("ZS_STATE_DIR", None),
-            ("ZS_CACHE_DIR", None),
-            ("ZS_CREDENTIALS_DIR", None),
+            ("MINI_AGENT_CONFIG_DIR", None),
+            ("MINI_AGENT_DATA_DIR", None),
+            ("MINI_AGENT_LOCAL_DATA_DIR", None),
+            ("MINI_AGENT_STATE_DIR", None),
+            ("MINI_AGENT_CACHE_DIR", None),
+            ("MINI_AGENT_CREDENTIALS_DIR", None),
         ]);
         let workspace = std::fs::canonicalize(workspace).unwrap();
         let config_secret = app_home.join("config.toml");
@@ -10096,6 +10858,7 @@ echo PRIVATE_TEMP_PASS"#,
             seatbelt_string_literal(&app_paths.credentials_dir, "credential directory").unwrap();
         let config_str =
             seatbelt_string_literal(&app_paths.config_dir, "configuration directory").unwrap();
+        let state_str = seatbelt_string_literal(&app_paths.state_dir, "state directory").unwrap();
         let mut protected = crate::git::runtime::protected_runtime_paths().unwrap();
         protected.push(app_paths.cache_dir.clone());
         let storage = seatbelt_private_read_denies(
@@ -10136,6 +10899,7 @@ echo PRIVATE_TEMP_PASS"#,
         );
         assert!(cached_profile.contains(&format!("(subpath \"{credentials_str}\")")));
         assert!(cached_profile.contains(&format!("(subpath \"{config_str}\")")));
+        assert!(cached_profile.contains(&format!("(subpath \"{state_str}\")")));
 
         // A second call must yield the same profile text. Pointer identity is
         // deliberately not asserted: `get_seatbelt_profile` hands back an owned
@@ -10332,6 +11096,75 @@ echo PRIVATE_TEMP_PASS"#,
                 .collect::<HashSet<_>>()
                 .len(),
             "every ancestor literal appears once"
+        );
+    }
+
+    #[test]
+    fn private_application_paths_inside_a_writable_workspace_are_rejected() {
+        assert!(private_path_conflicts_with_workspace(
+            Path::new("/home/alice"),
+            Path::new("/home/alice/.config/mini-agent")
+        ));
+        assert!(!private_path_conflicts_with_workspace(
+            Path::new("/work/project"),
+            Path::new("/home/alice/.config/mini-agent")
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_seatbelt_profile_denies_reads_beneath_private_carve_outs() {
+        if !seatbelt_exists() {
+            eprintln!("skipping real macOS sandbox probe because Seatbelt preflight is denied");
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-seatbelt-private-read-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let credentials = root.join("credentials");
+        let config = root.join("config");
+        let state = root.join("state");
+        let workspace = root.join("workspace");
+        let cache = root.join("cache");
+        for directory in [&credentials, &config, &state, &workspace, &cache] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let secret = credentials.join("secret.txt");
+        std::fs::write(&secret, b"must-not-be-readable").unwrap();
+        let private_read_denies = seatbelt_private_read_denies(&[
+            (credentials.as_path(), "credentials"),
+            (config.as_path(), "config"),
+            (state.as_path(), "state"),
+        ])
+        .unwrap();
+        let profile = seatbelt_shell_profile(
+            &seatbelt_string_literal(&workspace, "workspace").unwrap(),
+            &seatbelt_string_literal(&cache, "cache").unwrap(),
+            &private_read_denies,
+            "",
+            true,
+        );
+
+        let output = std::process::Command::new(seatbelt_path().unwrap())
+            .arg("-p")
+            .arg(profile)
+            .arg("/bin/cat")
+            .arg(&secret)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            !output.status.success(),
+            "private read unexpectedly succeeded"
+        );
+        assert!(
+            !output
+                .stdout
+                .windows(20)
+                .any(|bytes| bytes == b"must-not-be-readable")
         );
     }
 

@@ -107,6 +107,15 @@ where
     with_config_value(guard.as_ref(), f)
 }
 
+pub(crate) fn is_initialized() -> bool {
+    let guard = CONFIG.lock().unwrap_or_else(|error| error.into_inner());
+    is_config_initialized(guard.as_ref())
+}
+
+fn is_config_initialized(config: Option<&SubagentConfig>) -> bool {
+    config.is_some()
+}
+
 fn with_config_value<F, R>(config: Option<&SubagentConfig>, f: F) -> Result<R, ConfigNotInitialized>
 where
     F: FnOnce(&SubagentConfig) -> R,
@@ -465,6 +474,28 @@ mod tests {
     fn with_config_without_init_returns_error() {
         let result = with_config_value(None, |_| ());
         assert!(matches!(result, Err(ConfigNotInitialized)));
+    }
+
+    #[test]
+    fn initialization_state_matches_the_supplied_config_slot() {
+        assert!(!is_config_initialized(None));
+        let config = SubagentConfig {
+            client: crate::provider::create_client(
+                "openrouter",
+                Some("fixture-key"),
+                &std::collections::HashMap::new(),
+                None,
+            )
+            .unwrap(),
+            provider_name: "openrouter".to_string(),
+            model_name: "fixture-model".to_string(),
+            session_provider: "openrouter".to_string(),
+            api_key: Some("fixture-key".to_string()),
+            max_turns: 1,
+            config: crate::config::Config::default().into(),
+            fallback_notice: None,
+        };
+        assert!(is_config_initialized(Some(&config)));
     }
 }
 

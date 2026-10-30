@@ -211,6 +211,9 @@ def load_tasks(path: Path, default_timeout: int) -> list[dict[str, object]]:
     return tasks
 
 
+JS_FILE_ROOTS = ["."]
+
+
 def episode_env(root: Path, provider: str | None, model: str | None, forwarded: list[str]) -> dict[str, str]:
     """Build the curated environment and gym-owned config/credentials tree."""
     names = list(BASE_ENV_ALLOWLIST) + list(PROVIDER_ENV_ALLOWLIST) + list(forwarded)
@@ -224,16 +227,21 @@ def episode_env(root: Path, provider: str | None, model: str | None, forwarded: 
             # forbids a literal DEL. Keep non-BMP Unicode out of surrogate escapes.
             quoted = json.dumps(value, ensure_ascii=False).replace("\x7f", r"\u007f")
             settings.append(f"{key} = {quoted}\n")
+    # Brokered JS file effects are denied without roots. Relative roots resolve
+    # from the episode workspace (the process cwd), which is a disposable
+    # worktree whose task oracles read and write files anywhere inside it.
+    settings.append(f"js-read-roots = {json.dumps(JS_FILE_ROOTS)}\n")
+    settings.append(f"js-write-roots = {json.dumps(JS_FILE_ROOTS)}\n")
     (root / "config" / "config.toml").write_text("".join(settings), encoding="utf-8")
     env.update(
         {
             "MINI_AGENT_GYM": "1",
-            "ZS_CONFIG_DIR": str(root / "config"),
-            "ZS_CREDENTIALS_DIR": str(root / "credentials"),
-            "ZS_DATA_DIR": str(root / "data"),
-            "ZS_LOCAL_DATA_DIR": str(root / "local"),
-            "ZS_STATE_DIR": str(root / "state"),
-            "ZS_CACHE_DIR": str(root / "cache"),
+            "MINI_AGENT_CONFIG_DIR": str(root / "config"),
+            "MINI_AGENT_CREDENTIALS_DIR": str(root / "credentials"),
+            "MINI_AGENT_DATA_DIR": str(root / "data"),
+            "MINI_AGENT_LOCAL_DATA_DIR": str(root / "local"),
+            "MINI_AGENT_STATE_DIR": str(root / "state"),
+            "MINI_AGENT_CACHE_DIR": str(root / "cache"),
             "TMPDIR": str(root / "tmp"),
         }
     )
@@ -241,7 +249,7 @@ def episode_env(root: Path, provider: str | None, model: str | None, forwarded: 
 
 
 def skills_database(env: dict[str, str]) -> Path:
-    databases = sorted(Path(env["ZS_LOCAL_DATA_DIR"]).rglob("skills.db"))
+    databases = sorted(Path(env["MINI_AGENT_LOCAL_DATA_DIR"]).rglob("skills.db"))
     if len(databases) != 1:
         raise EpisodeFailure(
             "library_install_failed",
@@ -261,7 +269,7 @@ def install_library(binary: str, library: str, env: dict[str, str]) -> list[str]
     Runs from a gym-owned neutral directory so no project-local config.toml in a
     checked-out workspace can influence the import.
     """
-    neutral = Path(env["ZS_CONFIG_DIR"]).parent / "neutral"
+    neutral = Path(env["MINI_AGENT_CONFIG_DIR"]).parent / "neutral"
     command = [binary, "--install-learned-skill-seeds"] if library == "seeds" else [binary, "--import-learned-skill", library]
     try:
         result = run(command, neutral, env, INSTALL_TIMEOUT_SECS)

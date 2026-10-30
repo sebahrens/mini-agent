@@ -66,6 +66,20 @@ impl Picker {
         }
     }
 
+    pub fn set_accent_color(&mut self, accent: Option<crossterm::style::Color>) {
+        match self {
+            Picker::Config(p) => p.list.set_accent_color(accent),
+            Picker::File(p) => p.set_accent_color(accent),
+            Picker::Command(p) => p.set_accent_color(accent),
+            Picker::Prefixed(p, _) => p.set_accent_color(accent),
+            Picker::Models(p) => p.set_accent_color(accent),
+            Picker::Rewind(p) => p.set_accent_color(accent),
+            // The sessions overlay paints its own fixed palette.
+            Picker::Sessions(_) => {}
+            Picker::Bang(p) => p.set_accent_color(accent),
+        }
+    }
+
     /// Draw the open overlay through the renderer, which owns the writer and
     /// the geometry: rows are queued and flushed once, and no picker queries
     /// the terminal size itself.
@@ -202,6 +216,7 @@ impl InputEditor {
                     // A sub-picker opened from the command picker draws in
                     // the same colour mode as every other picker.
                     new.set_monochrome(self.monochrome);
+                    new.set_accent_color(self.accent);
                     self.picker = Some(new);
                 }
                 handled

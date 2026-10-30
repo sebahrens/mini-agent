@@ -2,10 +2,7 @@ use std::backtrace::Backtrace;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-
-use tokio::sync::mpsc;
+use std::sync::Mutex;
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
@@ -24,7 +21,7 @@ pub fn resolve_crash_log_path() -> PathBuf {
     let dir = crash_log_dir();
     let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
     let pid = std::process::id();
-    dir.join(format!("zerostack-crash-{ts}_{pid}.log"))
+    dir.join(format!("mini-agent-crash-{ts}_{pid}.log"))
 }
 
 pub fn install_panic_hook() {
@@ -49,7 +46,7 @@ fn write_crash_report(info: &std::panic::PanicHookInfo) -> Option<PathBuf> {
         return None;
     }
 
-    let mut content = String::from("zerostack crash report\n");
+    let mut content = String::from("mini-agent crash report\n");
     content.push_str(&format!("time: {}\n", chrono::Local::now().to_rfc3339()));
     if let Some(version) = option_env!("CARGO_PKG_VERSION") {
         content.push_str(&format!("version: {version}\n"));
@@ -95,7 +92,7 @@ pub fn resolve_log_path(cli: &Cli) -> Option<PathBuf> {
         ensure_private_log_directory(&logs_dir).ok();
         let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
         let pid = std::process::id();
-        return Some(logs_dir.join(format!("zerostack-{ts}_{pid}.log")));
+        return Some(logs_dir.join(format!("mini-agent-{ts}_{pid}.log")));
     }
     None
 }
@@ -121,84 +118,33 @@ pub fn build_stderr_filter(cli: &Cli) -> EnvFilter {
 /// The crate's own events carry the crate name as their tracing target
 /// (`mini_agent`, derived from the `mini-agent` package name), so that target
 /// is enabled at `trace` from `CARGO_CRATE_NAME` rather than hard-coded. The
-/// explicit `zerostack::audit::*` targets stay enabled and `rig` stays silent.
+/// explicit `mini_agent::audit::*` targets stay enabled and `rig` stays silent.
 pub fn file_filter_directive() -> String {
-    format!("{}=trace,zerostack=trace,rig=off", env!("CARGO_CRATE_NAME"))
+    format!("{}=trace,rig=off", env!("CARGO_CRATE_NAME"))
 }
 
 pub fn build_file_filter() -> EnvFilter {
     EnvFilter::new(file_filter_directive())
 }
 
-const TUI_LOG_CAPACITY: usize = 256;
-const TUI_LOG_MAX_BYTES: usize = 4096;
-static TUI_LOGS: OnceLock<Mutex<Option<mpsc::Receiver<String>>>> = OnceLock::new();
-static TUI_LOG_SENDER: OnceLock<mpsc::Sender<String>> = OnceLock::new();
-static TUI_LOG_DROPPED: AtomicUsize = AtomicUsize::new(0);
-
-/// Take the receiver after the TUI is attached. Formatted records produced
-/// during attachment remain queued until the event loop starts.
-pub fn take_tui_diagnostics() -> Option<mpsc::Receiver<String>> {
-    TUI_LOGS.get()?.lock().ok()?.take()
+/// Where the stderr layer's formatted records go.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DisplayTarget {
+    Stderr,
+    /// Discarded: the interactive TUI owns the terminal. Records still
+    /// reach the `-v` / `--log-file` file layer, which is independent.
+    Suppressed,
 }
 
-/// Whether dropped-record warnings are waiting to be taken.
-pub fn has_dropped_tui_diagnostics() -> bool {
-    TUI_LOG_DROPPED.load(Ordering::Relaxed) > 0
-}
-
-pub fn take_dropped_tui_diagnostics() -> usize {
-    TUI_LOG_DROPPED.swap(0, Ordering::Relaxed)
-}
-
-#[derive(Default)]
-struct TuiLogWriter(Vec<u8>);
-
-impl Write for TuiLogWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for TuiLogWriter {
-    fn drop(&mut self) {
-        if self.0.is_empty() {
-            return;
-        }
-        if crate::ui::terminal::is_attached()
-            && let Some(sender) = TUI_LOG_SENDER.get()
-            && enqueue_tui_diagnostic(&self.0, sender, &TUI_LOG_DROPPED)
-        {
-            return;
-        }
-        // Before attachment and during editor/pager suspension, stderr is
-        // again owned by the ordinary terminal. It also handles a closed UI.
-        let _ = io::stderr().write_all(&self.0);
-    }
-}
-
-fn enqueue_tui_diagnostic(
-    bytes: &[u8],
-    sender: &mpsc::Sender<String>,
-    dropped: &AtomicUsize,
-) -> bool {
-    let mut message =
-        String::from_utf8_lossy(&bytes[..bytes.len().min(TUI_LOG_MAX_BYTES)]).into_owned();
-    if bytes.len() > TUI_LOG_MAX_BYTES {
-        message.push_str("… [diagnostic truncated]");
-    }
-    match sender.try_send(message) {
-        Ok(()) => true,
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            dropped.fetch_add(1, Ordering::Relaxed);
-            true
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+/// Interactive sessions never write tracing output to the terminal while the
+/// TUI owns it (attached or suspended for an editor or pager): a log line
+/// would be painted between rendered rows. Before the TUI attaches and after
+/// it exits, and in every headless mode (`-p`, loop, ACP), stderr is used.
+pub(crate) fn display_target(is_interactive: bool, tui_owns_terminal: bool) -> DisplayTarget {
+    if is_interactive && tui_owns_terminal {
+        DisplayTarget::Suppressed
+    } else {
+        DisplayTarget::Stderr
     }
 }
 
@@ -337,28 +283,26 @@ pub fn init(cli: &Cli, is_interactive: bool) {
     let headless = cli.is_headless();
     let file_filter = build_file_filter();
 
-    let (sender, receiver) = mpsc::channel(TUI_LOG_CAPACITY);
-    if is_interactive {
-        let _ = TUI_LOG_SENDER.set(sender);
-        let _ = TUI_LOGS.set(Mutex::new(Some(receiver)));
-    }
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_ansi(!is_interactive)
         .with_writer(move || {
-            if is_interactive {
-                LogWriter::Tui(TuiLogWriter::default())
-            } else if headless
-                && let Some((pending, cancellation)) =
-                    crate::agent::runner::current_headless_diagnostics()
-            {
-                LogWriter::Headless(HeadlessLogWriter {
-                    bytes: Vec::new(),
-                    clipped: false,
-                    pending,
-                    cancellation,
-                })
-            } else {
-                LogWriter::Stderr(io::stderr())
+            match display_target(is_interactive, crate::ui::terminal::tui_owns_terminal()) {
+                DisplayTarget::Suppressed => LogWriter::Sink,
+                DisplayTarget::Stderr => {
+                    if headless
+                        && let Some((pending, cancellation)) =
+                            crate::agent::runner::current_headless_diagnostics()
+                    {
+                        LogWriter::Headless(HeadlessLogWriter {
+                            bytes: Vec::new(),
+                            clipped: false,
+                            pending,
+                            cancellation,
+                        })
+                    } else {
+                        LogWriter::Stderr(io::stderr())
+                    }
+                }
             }
         })
         .with_filter(stderr_filter);
@@ -389,7 +333,7 @@ pub fn init(cli: &Cli, is_interactive: bool) {
 }
 
 enum LogWriter {
-    Tui(TuiLogWriter),
+    Sink,
     Headless(HeadlessLogWriter),
     Stderr(io::Stderr),
 }
@@ -397,7 +341,7 @@ enum LogWriter {
 impl Write for LogWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
-            Self::Tui(writer) => writer.write(bytes),
+            Self::Sink => Ok(bytes.len()),
             Self::Headless(writer) => writer.write(bytes),
             Self::Stderr(writer) => writer.write(bytes),
         }
@@ -405,7 +349,7 @@ impl Write for LogWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Self::Tui(writer) => writer.flush(),
+            Self::Sink => Ok(()),
             Self::Headless(writer) => writer.flush(),
             Self::Stderr(writer) => writer.flush(),
         }
@@ -470,33 +414,28 @@ fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<
 }
 
 #[cfg(test)]
-mod tui_diagnostic_tests {
+mod display_target_tests {
     use super::*;
 
     #[test]
-    fn bounded_queue_keeps_first_record_and_counts_overflow() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let dropped = AtomicUsize::new(0);
-        assert!(enqueue_tui_diagnostic(b"first", &sender, &dropped));
-        assert!(enqueue_tui_diagnostic(b"second", &sender, &dropped));
-        assert_eq!(receiver.try_recv().unwrap(), "first");
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    fn interactive_tui_suppresses_terminal_log_output() {
+        assert_eq!(display_target(true, true), DisplayTarget::Suppressed);
     }
 
     #[test]
-    fn large_record_is_capped_and_closed_receiver_returns_to_stderr_path() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let dropped = AtomicUsize::new(0);
-        assert!(enqueue_tui_diagnostic(
-            &vec![b'x'; TUI_LOG_MAX_BYTES + 100],
-            &sender,
-            &dropped
-        ));
-        let record = receiver.try_recv().unwrap();
-        assert!(record.ends_with("… [diagnostic truncated]"));
-        assert!(record.len() <= TUI_LOG_MAX_BYTES + 32);
-        drop(receiver);
-        assert!(!enqueue_tui_diagnostic(b"later", &sender, &dropped));
+    fn startup_exit_and_headless_modes_keep_stderr() {
+        // Interactive before the TUI attaches or after it exits.
+        assert_eq!(display_target(true, false), DisplayTarget::Stderr);
+        // Print (-p), loop and ACP modes are never interactive.
+        assert_eq!(display_target(false, false), DisplayTarget::Stderr);
+        assert_eq!(display_target(false, true), DisplayTarget::Stderr);
+    }
+
+    #[test]
+    fn sink_writer_discards_bytes() {
+        let mut writer = LogWriter::Sink;
+        assert_eq!(writer.write(b"WARN leaked").unwrap(), 11);
+        writer.flush().unwrap();
     }
 }
 

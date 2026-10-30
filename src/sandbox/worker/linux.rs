@@ -28,6 +28,9 @@ use super::{
     WorkerContainmentAssurance, WorkerContainmentStatus, WorkerLaunchError, WorkerProcess,
 };
 
+#[path = "linux/cpu_time.rs"]
+mod cpu_time;
+
 const BACKEND: WorkerBackend = WorkerBackend::Bubblewrap;
 const WORKER_PATH: &str = "/mini-agent-worker/mini-agent";
 const ADDRESS_SPACE_LIMIT: u64 = 256 * 1024 * 1024;
@@ -35,6 +38,8 @@ const CPU_LIMIT_SECONDS: u64 = 35;
 const FILE_DESCRIPTOR_LIMIT: u64 = 64;
 const FILE_SIZE_LIMIT: u64 = 1024 * 1024;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RUNTIME_DIRECTORY_ENTRIES: usize = 32 * 1024;
+const MAX_RUNTIME_FILES: usize = 4 * 1024;
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
@@ -115,10 +120,21 @@ fn launch_executable(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {
-        backend: BACKEND,
-        source,
-    })?;
+    // `PR_SET_PDEATHSIG`, which `--die-with-parent` installs during bwrap's own startup,
+    // is delivered when the OS *thread* that forked this child exits — not when the
+    // owning process exits. Performing this spawn on the calling thread (which, for the
+    // production launch, is a transient thread that delivers the `WorkerProcess` and then
+    // exits almost immediately) can race bwrap's own startup and get the freshly launched
+    // worker SIGKILLed if bwrap installs the signal before that thread's ordinary exit
+    // (mini-agent-hdl3i). Routing the spawn through the process-lifetime spawner thread
+    // pins every launch to the same never-exiting kernel-tracked parent thread.
+    let mut child =
+        crate::sandbox::spawner::spawn_die_with_parent_child(command).map_err(|source| {
+            WorkerLaunchError::Io {
+                backend: BACKEND,
+                source,
+            }
+        })?;
     let input = child
         .stdin
         .take()
@@ -164,6 +180,13 @@ fn production_worker_args() -> &'static [&'static str] {
     ]
 }
 
+/// mini-agent-hdl3i: the enforced native CPU ceiling, for benchmark diagnostics only. Never
+/// used to decide containment; the real ceiling stays enforced entirely by `finalize_worker`.
+#[cfg(test)]
+pub(super) fn cpu_limit_seconds_for_test() -> u64 {
+    CPU_LIMIT_SECONDS
+}
+
 pub(super) fn finalize_worker() -> io::Result<()> {
     set_limit(Resource::As, ADDRESS_SPACE_LIMIT)?;
     set_limit(Resource::Cpu, CPU_LIMIT_SECONDS)?;
@@ -205,6 +228,20 @@ pub(super) fn finalize_worker() -> io::Result<()> {
     .map_err(|error| io::Error::other(format!("failed to compile seccomp policy: {error}")))?;
     seccompiler::apply_filter_all_threads(&filter)
         .map_err(|error| io::Error::other(format!("failed to install seccomp policy: {error}")))
+}
+
+/// This platform's hard `RLIMIT_CPU` ceiling (seconds), as armed by [`finalize_worker`]. Exposed
+/// so the supervisor can retire a reused worker before its cumulative CPU time nears it, without
+/// duplicating the constant.
+pub(super) fn cpu_limit_seconds() -> u64 {
+    CPU_LIMIT_SECONDS
+}
+
+/// The worker's cumulative CPU time in whole seconds, fail-closed on any read or parse failure.
+/// `outer_pid` is the PID this crate directly launched (bubblewrap); see
+/// [`cpu_time::innermost_descendant_pid`] for why that is not the worker's own PID.
+pub(super) fn cumulative_cpu_seconds(outer_pid: u32) -> io::Result<u64> {
+    cpu_time::cumulative_cpu_seconds(outer_pid)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -493,7 +530,10 @@ fn trusted_runtime_files() -> Result<Vec<PathBuf>, WorkerLaunchError> {
         if !is_trusted_runtime_file(&path) {
             return Err(WorkerLaunchError::Unavailable {
                 backend: BACKEND,
-                reason: "the loaded system runtime closure contains an untrusted path".into(),
+                reason: format!(
+                    "the loaded system runtime closure contains untrusted path {}",
+                    bounded_runtime_path(&path)
+                ),
             });
         }
         files.insert(path);
@@ -510,6 +550,7 @@ fn trusted_runtime_files() -> Result<Vec<PathBuf>, WorkerLaunchError> {
             files.insert(path);
         }
     }
+    add_loader_visible_aliases(&mut files)?;
     if files.is_empty() {
         return Err(WorkerLaunchError::Unavailable {
             backend: BACKEND,
@@ -517,6 +558,136 @@ fn trusted_runtime_files() -> Result<Vec<PathBuf>, WorkerLaunchError> {
         });
     }
     Ok(files.into_iter().collect())
+}
+
+fn add_loader_visible_aliases(
+    files: &mut std::collections::BTreeSet<PathBuf>,
+) -> Result<(), WorkerLaunchError> {
+    let canonical_targets = files
+        .iter()
+        .map(|path| {
+            path.canonicalize()
+                .map_err(|source| WorkerLaunchError::Unavailable {
+                    backend: BACKEND,
+                    reason: format!(
+                        "could not resolve loaded runtime file {}: {source}",
+                        bounded_runtime_path(path)
+                    ),
+                })
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    let mut loader_directories = std::collections::BTreeSet::new();
+    for target in &canonical_targets {
+        let Some(parent) = target.parent() else {
+            continue;
+        };
+        loader_directories.insert(parent.to_path_buf());
+        for root in system_runtime_roots() {
+            let Ok(canonical_root) = root.canonicalize() else {
+                continue;
+            };
+            let Ok(suffix) = parent.strip_prefix(&canonical_root) else {
+                continue;
+            };
+            let candidate = root.join(suffix);
+            if candidate.canonicalize().ok().as_deref() == Some(parent) {
+                loader_directories.insert(candidate);
+            }
+        }
+    }
+
+    let mut aliases = std::collections::BTreeSet::new();
+    let mut inspected = 0_usize;
+    for directory in loader_directories {
+        let entries =
+            std::fs::read_dir(&directory).map_err(|source| WorkerLaunchError::Unavailable {
+                backend: BACKEND,
+                reason: format!(
+                    "could not enumerate loader directory {}: {source}",
+                    bounded_runtime_path(&directory)
+                ),
+            })?;
+        for entry in entries {
+            inspected = inspected.saturating_add(1);
+            if inspected > MAX_RUNTIME_DIRECTORY_ENTRIES {
+                return Err(WorkerLaunchError::Unavailable {
+                    backend: BACKEND,
+                    reason: "the loader runtime closure exceeded the directory-entry limit".into(),
+                });
+            }
+            let entry = entry.map_err(|source| WorkerLaunchError::Unavailable {
+                backend: BACKEND,
+                reason: format!(
+                    "could not inspect loader directory {}: {source}",
+                    bounded_runtime_path(&directory)
+                ),
+            })?;
+            let alias = entry.path();
+            let Ok(target) = alias.canonicalize() else {
+                continue;
+            };
+            if !canonical_targets.contains(&target) || alias == target {
+                continue;
+            }
+            if !is_trusted_runtime_alias(&alias) {
+                return Err(WorkerLaunchError::Unavailable {
+                    backend: BACKEND,
+                    reason: format!(
+                        "loader alias {} is not a trusted root-owned path",
+                        bounded_runtime_path(&alias)
+                    ),
+                });
+            }
+            aliases.insert(alias);
+            if files.len().saturating_add(aliases.len()) > MAX_RUNTIME_FILES {
+                return Err(WorkerLaunchError::Unavailable {
+                    backend: BACKEND,
+                    reason: "the loader runtime closure exceeded the file limit".into(),
+                });
+            }
+        }
+    }
+    files.extend(aliases);
+    Ok(())
+}
+
+fn bounded_runtime_path(path: &Path) -> String {
+    const LIMIT: usize = 256;
+    let value = path.to_string_lossy();
+    let mut bounded = value.chars().take(LIMIT).collect::<String>();
+    if value.chars().count() > LIMIT {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn is_trusted_runtime_alias(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !is_system_runtime_path(path)
+        || path
+            .canonicalize()
+            .ok()
+            .as_deref()
+            .is_none_or(|target| !is_trusted_runtime_file(target))
+    {
+        return false;
+    }
+    for (index, ancestor) in path.ancestors().enumerate() {
+        let Ok(metadata) = ancestor.symlink_metadata() else {
+            return false;
+        };
+        if metadata.uid() != 0 {
+            return false;
+        }
+        if !metadata.file_type().is_symlink() && metadata.permissions().mode() & 0o022 != 0 {
+            return false;
+        }
+        if index == 0 && !metadata.is_file() && !metadata.file_type().is_symlink() {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_trusted_runtime_file(path: &Path) -> bool {
@@ -561,14 +732,38 @@ fn interpreter_aliases() -> &'static [&'static str] {
 }
 
 fn is_system_runtime_path(path: &Path) -> bool {
+    system_runtime_roots()
+        .into_iter()
+        .any(|root| path.starts_with(root))
+}
+
+fn system_runtime_roots() -> [&'static Path; 4] {
     [
         Path::new("/lib"),
         Path::new("/lib64"),
         Path::new("/usr/lib"),
         Path::new("/usr/lib64"),
     ]
-    .into_iter()
-    .any(|root| path.starts_with(root))
+}
+
+#[cfg(test)]
+mod runtime_closure_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires root-owned host runtime libraries outside an enclosing sandbox"]
+    fn loaded_runtime_closure_keeps_loader_visible_soname_aliases() {
+        let files = trusted_runtime_files().expect("resolve trusted runtime closure");
+        assert!(files.len() <= MAX_RUNTIME_FILES);
+        assert!(files.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".so"))
+                && path
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        }));
+    }
 }
 
 fn runtime_directories(files: &[PathBuf]) -> Vec<PathBuf> {
@@ -1661,7 +1856,6 @@ impl WorkerChild {
         Self { child }
     }
 
-    #[cfg(test)]
     pub(super) fn id(&self) -> u32 {
         self.child.id()
     }

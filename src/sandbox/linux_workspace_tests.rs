@@ -141,11 +141,14 @@ async fn linux_native_workspace_control_destination_uses_visible_nonroot_fallbac
         b"/workspace is literal output, not a replacement token\nNATIVE_REAL_PATH_PASS"
     );
     assert_eq!(std::fs::read(root.join("created.txt")).unwrap(), b"shared");
-    let root_binding = bound(Path::new("/"), &cache);
-    let refused = root_binding
-        .wrap_command("printf must-not-run")
-        .unwrap_err();
-    assert!(refused.contains("refusing to expose filesystem root"));
+    // The filesystem root is refused before any sandbox can be bound to it,
+    // so no command can ever be wrapped with it as the workspace.
+    let refused = crate::paths::WorkspaceBinding::capture(Path::new("/")).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("filesystem root cannot be used as a workspace")
+    );
 }
 
 #[tokio::test]

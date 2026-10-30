@@ -1168,22 +1168,27 @@ fn fingerprint(query: &str) -> String {
 }
 
 /// Emit discovery diagnostics through `tracing` instead of the model-facing
-/// trusted block. Genuine unavailability warns; everything else is debug.
+/// trusted block. Genuine component outages warn; expected capability limits
+/// of the configured backend remain debug diagnostics.
 fn log_skill_diagnostics(diagnostics: &[String]) {
     for diagnostic in diagnostics {
-        let kind = diagnostic
-            .split_once(':')
-            .map_or(diagnostic.as_str(), |(kind, _)| kind);
-        if diagnostic == "semantic_retrieval_unavailable:deterministic_embedding_backend" {
-            // The default backend intentionally uses healthy lexical-only
-            // retrieval; retain the diagnostic without alarming TUI users.
-            tracing::debug!(diagnostic = %diagnostic, "skill discovery diagnostic");
-        } else if kind.ends_with("_unavailable") {
+        // The default backend intentionally uses healthy lexical-only
+        // retrieval; `skill_diagnostic_is_warning` keeps that diagnostic at
+        // debug level without alarming TUI users.
+        if skill_diagnostic_is_warning(diagnostic) {
             tracing::warn!(diagnostic = %diagnostic, "skill discovery diagnostic");
         } else {
             tracing::debug!(diagnostic = %diagnostic, "skill discovery diagnostic");
         }
     }
+}
+
+fn skill_diagnostic_is_warning(diagnostic: &str) -> bool {
+    let kind = diagnostic
+        .split_once(':')
+        .map_or(diagnostic, |(kind, _)| kind);
+    kind.ends_with("_unavailable")
+        && diagnostic != "semantic_retrieval_unavailable:deterministic_embedding_backend"
 }
 
 /// Render the model-facing trusted block. Diagnostics are deliberately excluded
@@ -1478,6 +1483,19 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn expected_deterministic_retrieval_limit_is_not_an_outage_warning() {
+        assert!(!skill_diagnostic_is_warning(
+            "semantic_retrieval_unavailable:deterministic_embedding_backend"
+        ));
+        assert!(skill_diagnostic_is_warning(
+            "agent_skill_catalog_unavailable:store busy"
+        ));
+        assert!(!skill_diagnostic_is_warning(
+            "learned_skill_budget_truncated"
+        ));
     }
 
     fn attribution_skill(id: &str) -> ResolvedSkill {

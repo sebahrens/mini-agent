@@ -1764,8 +1764,14 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "TC-BROKER-JS-WORKER",
     ),
     (
-        "src/sandbox/worker/linux.rs",
-        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        "src/sandbox/spawner.rs",
+        ".spawn(move || spawner_loop(receiver))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/spawner.rs",
+        "let result = job.command.spawn();",
         1,
         "TC-BROKER-JS-WORKER",
     ),
@@ -1865,7 +1871,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ") -> Result<tokio::process::Command, String> {",
-        6,
+        7,
         "NON-PROCESS",
     ),
     (
@@ -1908,7 +1914,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".spawn(move || {",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -1998,13 +2004,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/renderer.rs",
-        "tokio::process::Command::new(\"open\"),",
-        1,
-        "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/ui/renderer.rs",
-        "tokio::process::Command::new(\"xdg-open\"),",
+        "let mut command = tokio::process::Command::new(program);",
         1,
         "TC-SUPPORT-UTILITY",
     ),
@@ -3193,7 +3193,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/agent/tools/bash.rs",
-        "tracing::warn!(\"tool shell stopped before completion: {:?}\", output.status);",
+        "tracing::debug!(\"tool shell stopped before completion: {:?}\", output.status);",
         1,
         "NON-PROCESS",
     ),
@@ -4385,7 +4385,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "de107f2c0dc302621f93592167955ba5a4b893704e701a03dd8e3add083f7dc4",
+                "e601ac14d92758c7985acd681e935910e3c51caf457e448c436171c885728374",
                 1,
             ),
             (
@@ -5115,7 +5115,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "842d29cd63634e7d8359ed65fd83710f1b986f46e826f81235b6c5a6c07e71c4",
+                "6eb9f9893492e75602197e2c9cdc86fb779ac28b07c86dc8969eb75d55fad6fb",
                 1,
             ),
             (
@@ -6168,8 +6168,14 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "TC-BROKER-JS-WORKER",
     ),
     (
-        "src/sandbox/worker/linux.rs",
-        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        "src/sandbox/spawner.rs",
+        ".spawn(move || spawner_loop(receiver))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/spawner.rs",
+        "let result = job.command.spawn();",
         1,
         "TC-BROKER-JS-WORKER",
     ),
@@ -6269,7 +6275,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ") -> Result<tokio::process::Command, String> {",
-        6,
+        7,
         "NON-PROCESS",
     ),
     (
@@ -6313,7 +6319,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".spawn(move || {",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -6592,6 +6598,97 @@ fn rust_sources(root: &Path) -> Vec<PathBuf> {
     sources
 }
 
+fn cfg_value_without_tests(meta: &syn::Meta) -> Option<bool> {
+    match meta {
+        syn::Meta::Path(path) if path.is_ident("test") => Some(false),
+        syn::Meta::Path(_) | syn::Meta::NameValue(_) => None,
+        syn::Meta::List(list) => {
+            let nested = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .ok()?;
+            if list.path.is_ident("all") {
+                let values: Vec<_> = nested.iter().map(cfg_value_without_tests).collect();
+                if values.contains(&Some(false)) {
+                    Some(false)
+                } else if values.iter().all(|value| *value == Some(true)) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("any") {
+                let values: Vec<_> = nested.iter().map(cfg_value_without_tests).collect();
+                if values.contains(&Some(true)) {
+                    Some(true)
+                } else if values.iter().all(|value| *value == Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("not") && nested.len() == 1 {
+                cfg_value_without_tests(&nested[0]).map(|value| !value)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn production_source(source: &str) -> Result<String, String> {
+    let file =
+        syn::parse_file(source).map_err(|error| format!("Rust source did not parse: {error}"))?;
+    let mut lines: Vec<_> = source.split('\n').collect();
+    for item in file.items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let test_only = module.attrs.iter().any(|attribute| {
+            attribute.path().is_ident("cfg")
+                && attribute
+                    .parse_args::<syn::Meta>()
+                    .ok()
+                    .and_then(|meta| cfg_value_without_tests(&meta))
+                    == Some(false)
+        });
+        if !test_only {
+            continue;
+        }
+        let start = module
+            .attrs
+            .first()
+            .map_or_else(
+                || module.span().start().line,
+                |attribute| attribute.span().start().line,
+            )
+            .saturating_sub(1);
+        let end = module.span().end().line.min(lines.len());
+        lines[start..end].fill("");
+    }
+    Ok(lines.join("\n"))
+}
+
+#[test]
+fn production_source_excludes_test_only_modules() {
+    let source = r#"
+fn production() {
+    std::process::Command::new("production");
+}
+
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        std::process::Command::new("fixture");
+    }
+}
+"#;
+
+    let production = production_source(source).unwrap();
+    assert!(production.contains("Command::new(\"production\")"));
+    assert!(!production.contains("Command::new(\"fixture\")"));
+    assert_eq!(production.lines().count(), source.lines().count());
+}
+
 fn is_inventory_line(line: &str) -> bool {
     line.contains("Command::new")
         || line.contains("tokio::process")
@@ -6690,6 +6787,8 @@ fn production_subprocess_sites_have_a_trust_classification() {
     let expected = checked_inventory();
     let mut seen = BTreeMap::<(String, String), usize>::new();
     let mut observed = BTreeSet::<(String, String, usize)>::new();
+    let mut all_seen = BTreeMap::<(String, String), usize>::new();
+    let mut all_observed = BTreeSet::<(String, String, usize)>::new();
 
     for source in rust_sources(&source_root) {
         let relative = source
@@ -6713,6 +6812,20 @@ fn production_subprocess_sites_have_a_trust_classification() {
                 continue;
             }
             let fingerprint = (relative.clone(), normalized);
+            let occurrence = all_seen.entry(fingerprint.clone()).or_default();
+            *occurrence += 1;
+            all_observed.insert((fingerprint.0, fingerprint.1, *occurrence));
+        }
+        let contents = production_source(&contents).expect("Rust source must be inspectable");
+        for line in contents.lines().map(str::trim) {
+            let normalized = normalized_inventory_line(line);
+            let explicitly_inventoried = expected
+                .keys()
+                .any(|(path, source, _)| path == &relative && source == &normalized);
+            if !is_inventory_line(line) && !explicitly_inventoried {
+                continue;
+            }
+            let fingerprint = (relative.clone(), normalized);
             let occurrence = seen.entry(fingerprint.clone()).or_default();
             *occurrence += 1;
             observed.insert((fingerprint.0, fingerprint.1, *occurrence));
@@ -6725,7 +6838,7 @@ fn production_subprocess_sites_have_a_trust_classification() {
         .collect();
     let stale: Vec<_> = expected
         .keys()
-        .filter(|site| !observed.contains(*site))
+        .filter(|site| !all_observed.contains(*site))
         .collect();
     assert!(
         unclassified.is_empty() && stale.is_empty(),
@@ -6772,7 +6885,9 @@ fn windows_capable_production_process_terminals_use_creation_boundary() {
             || relative == "src/process_creation.rs"
             || matches!(
                 relative.as_str(),
-                "src/sandbox/worker/linux.rs" | "src/sandbox/worker/macos.rs"
+                "src/sandbox/worker/linux.rs"
+                    | "src/sandbox/worker/macos.rs"
+                    | "src/sandbox/spawner.rs"
             )
         {
             continue;
@@ -6789,6 +6904,7 @@ fn windows_capable_production_process_terminals_use_creation_boundary() {
                 ));
             }
         }
+        let contents = production_source(&contents).expect("Rust source must be inspectable");
         unguarded.extend(
             creation_boundary_violations(&relative, &contents, &expected, &macro_non_process)
                 .unwrap_or_else(|error| panic!("could not inspect {relative}: {error}")),

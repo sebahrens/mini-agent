@@ -1285,7 +1285,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
         ),
         "README.md": (
             f"The Cargo package, installed CLI, and every binary release archive use the executable name\n`{binary}`.",
-            "The default build enables `loop`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,\n`status-signals`, `multithread`, `export`, `js`, `sandbox`, `memory`, `agent-skills`, `lsp`, `hooks`, and `multimodal`.",
+            "The default build enables `loop`, `goal`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,\n`status-signals`, `multithread`, `export`, `js`, `sandbox`, `memory`, `agent-skills`, `lsp`, `hooks`, `multimodal`, `bedrock`, and `vertex`.",
             f"https://raw.githubusercontent.com/{CANONICAL_REPOSITORY}/main/install.sh | bash -s -- --release X.Y.Z",
             f"gh attestation verify mini-agent-<arch>-<os>.tar.gz --repo {CANONICAL_REPOSITORY}",
         ),
@@ -1352,7 +1352,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f'pub const REPOSITORY_SLUG: &str = "{CANONICAL_REPOSITORY}";',
             f'pub const REPOSITORY_URL: &str = "{CANONICAL_REPOSITORY_URL}";',
             'pub const LEGACY_APP_COMPONENT: &str = "zerostack";',
-            'pub const LEGACY_PROJECT_DIRECTORY: &str = ".zerostack";',
+            'pub const PROJECT_DIRECTORY: &str = ".mini-agent";',
             'pub const LEGACY_ENV_PREFIX: &str = "ZEROSTACK_";',
         ),
         "src/provider.rs": (
@@ -1371,7 +1371,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             ".header(reqwest::header::USER_AGENT, crate::product::PUBLIC_NAME)",
         ),
         "src/ui/events.rs": (
-            'format!("  Website: {}", crate::product::REPOSITORY_URL)',
+            'format!("  Website: {}", crate::product::WEBSITE_URL)',
             "crate::product::PUBLIC_NAME",
         ),
         "src/setup/mod.rs": ("crate::product::PUBLIC_NAME.to_uppercase()",),

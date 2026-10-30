@@ -22,9 +22,18 @@ mod tool_output_read_tests {
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let _environment = crate::tests::ScopedProcessEnv::set(&[
-            ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
-            ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
-            ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
         ]);
         let first = crate::session::storage::save_tool_output("first", "tool", "first").unwrap();
         let second = crate::session::storage::save_tool_output("second", "tool", "second").unwrap();
@@ -124,9 +133,18 @@ mod tool_output_read_tests {
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let _environment = crate::tests::ScopedProcessEnv::set(&[
-            ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
-            ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
-            ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
         ]);
         let path = crate::session::storage::save_tool_output("active", "tool", "original").unwrap();
         let other = root.path().join("unrelated.txt");
@@ -721,6 +739,8 @@ impl PermissionChecker {
                                     "invalid `{config_field}` rule for tool `{tool_name}` pattern `{pat}`: {error}"
                                 )
                             })?
+                        } else if tool_name == "js/fetch" && *action == Action::Deny {
+                            Pattern::new(&fetch_deny_glob(pat))
                         } else {
                             Pattern::new(pat)
                         };
@@ -808,13 +828,16 @@ impl PermissionChecker {
         Self::merge_entries(&mut rules, &configs.glob.ask_entries, Action::Ask);
         Self::merge_entries(&mut rules, &configs.glob.deny_entries, Action::Deny);
 
-        if !rules.contains_key("shell") {
-            let mut defaults = Vec::new();
-            for (pat, action) in crate::permission::default_bash_rules_for(sandbox) {
-                defaults.push((Pattern::new(pat), action));
+        let user_configured_shell = rules.contains_key("shell") || rules.contains_key("bash");
+        for key in ["shell", "bash"] {
+            let entry = rules.entry(key.to_string()).or_default();
+            for (pattern, action) in crate::permission::default_bash_rules_for(sandbox) {
+                // User rules replace the built-in convenience allows, but the
+                // destructive deny baseline always remains in force.
+                if action == Action::Deny || !user_configured_shell {
+                    entry.push((Pattern::new(pattern), action));
+                }
             }
-            rules.insert("shell".to_string(), defaults.clone());
-            rules.insert("bash".to_string(), defaults);
         }
 
         for (tool, regex) in crate::permission::default_deny_regex_rules() {
@@ -967,6 +990,8 @@ impl PermissionChecker {
                                 entry.push((Pattern::new_path(&canonical), action));
                             }
                             Pattern::new_path(pat)
+                        } else if alias == "js/fetch" && action == Action::Deny {
+                            Pattern::new(&fetch_deny_glob(pat))
                         } else {
                             Pattern::new(pat)
                         };
@@ -1181,7 +1206,7 @@ impl PermissionChecker {
             return Action::Deny;
         }
         let base = Self::resolve_matched(matched);
-        match self.mode {
+        let action = match self.mode {
             SecurityMode::Restrictive => base.unwrap_or(Action::Ask),
             SecurityMode::ReadOnly => base.unwrap_or_else(|| {
                 if self.is_read_tool(tool) {
@@ -1249,6 +1274,25 @@ impl PermissionChecker {
                 Some(other) => other,
                 None => Action::Allow,
             },
+        };
+
+        // The read-friendly modes only auto-allow paths inside the bound
+        // workspace. An unmatched external path still needs an explicit
+        // absolute tool rule or `external_directory` grant. Yolo is the sole
+        // mode whose contract intentionally permits unmatched external paths.
+        if external
+            && !capability_contained
+            && matched.is_empty()
+            && action == Action::Allow
+            && (external_action == Some(Action::Ask)
+                || (external_action.is_none() && self.mode != SecurityMode::Yolo))
+        {
+            // An explicit `external_directory` ask is honoured in every mode
+            // (guarded reads and yolo included); only the *absence* of a
+            // matching rule is mode-dependent.
+            Action::Ask
+        } else {
+            action
         }
     }
 
@@ -1485,14 +1529,14 @@ impl PermissionChecker {
         }
         #[cfg(feature = "hooks")]
         let hook_approved = self.take_pending_one_shot(tool).is_some();
-        if tool == "todo_write" {
+        if tool == "todo_write" && !self.rules.contains_key(tool) {
             return CheckResult::Allowed;
         }
         if self.allow_all_mcp_calls && tool == "mcp_tool" {
             return CheckResult::Allowed;
         }
         if self.is_session_allowed(tool, identity) {
-            return CheckResult::Allowed;
+            return self.doom_loop_check(tool, identity, Action::Allow);
         }
         if tool == "mcp_tool"
             && matches!(self.mode, SecurityMode::ReadOnly | SecurityMode::PlanWrite)
@@ -1670,6 +1714,12 @@ impl PermissionChecker {
         if self.matches_deny_rule(tool, &inputs) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
+        // Built-in baseline: process secrets in procfs, in every mode.
+        if is_proc_secret_path(Path::new(abs_path), is_proc_walker_tool(tool))
+            || is_proc_secret_path(Path::new(expanded), is_proc_walker_tool(tool))
+        {
+            return CheckResult::Denied(PROC_SECRET_DENIAL.to_string());
+        }
         if let Some(denial) = self.isolation_denial(tool, &inputs) {
             return denial;
         }
@@ -1700,7 +1750,7 @@ impl PermissionChecker {
             .iter()
             .any(|input| self.is_session_allowed(tool, input))
         {
-            return CheckResult::Allowed;
+            return self.doom_loop_check(tool, abs_path, Action::Allow);
         }
 
         // Outside the workspace, a relative or match-anything allow such as
@@ -1871,7 +1921,7 @@ impl PermissionChecker {
         #[cfg(feature = "hooks")]
         let hook_approved = self.take_pending_one_shot(tool).is_some();
         if self.is_session_allowed(tool, &logical) || self.is_session_allowed(tool, &relative) {
-            return CheckResult::Allowed;
+            return self.doom_loop_check(tool, &logical, Action::Allow);
         }
 
         let matched = self.match_path_rules(tool, &[&logical, &relative], false);
@@ -1897,6 +1947,24 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
         result
+    }
+
+    /// Evaluate only explicit deny rules against a lexical path identity.
+    /// This is side-effect free and intentionally performs no filesystem I/O,
+    /// session approval, prompting, or doom-loop accounting. File tools use it
+    /// before opening a target so a deny cannot become an existence oracle.
+    pub(crate) fn path_is_denied_lexically(&self, tool: &str, path: &str) -> bool {
+        let tool = canonical_permission_tool(tool);
+        let normalized = normalize_path(Path::new(path));
+        let logical = normalized.to_string_lossy();
+        let relative = normalized
+            .strip_prefix(normalize_path(Path::new(&self.working_dir)))
+            .ok()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_string_lossy();
+        is_proc_secret_path(&normalized, is_proc_walker_tool(tool))
+            || self.matches_deny_rule(tool, &[logical.as_ref(), relative.as_ref(), path])
     }
 
     /// Check whether any deny rule matches the given inputs. Deny rules are
@@ -2008,6 +2076,7 @@ impl PermissionChecker {
             working_dir: normalize_path(Path::new(&self.working_dir)),
             rules,
             ext_dir_deny,
+            proc_walker: is_proc_walker_tool(canonical),
         }
     }
 
@@ -2089,7 +2158,15 @@ impl PermissionChecker {
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
         for (tool, pat) in entries {
-            let tool = canonical_permission_tool(tool).to_string();
+            // Persisted grants keep their stored tool identity: a legacy runtime
+            // alias (`fetch`, `write_todo_list`) must not revive an allow on the
+            // canonical tool. Configured rules canonicalize those aliases instead.
+            let tool = if tool == "bash" {
+                "shell"
+            } else {
+                tool.as_str()
+            }
+            .to_string();
             let generated_path_scope = if matches!(tool.as_str(), "web_fetch" | "web_search") {
                 Pattern::new_generated_web_origin_scope(pat)
             } else if self.is_path_tool(&tool) {
@@ -2667,6 +2744,9 @@ pub(crate) struct PathDenyProbe {
     /// the case-folding deny semantics).
     rules: Vec<(Pattern, bool)>,
     ext_dir_deny: Vec<Pattern>,
+    /// The probe serves a recursive walker, which must not enter procfs
+    /// process directories.
+    proc_walker: bool,
 }
 
 impl PathDenyProbe {
@@ -2695,6 +2775,9 @@ impl PathDenyProbe {
                 .then_some(relative);
             (absolute, relative)
         };
+        if is_proc_secret_path(&absolute, self.proc_walker) {
+            return true;
+        }
         let absolute = absolute.to_string_lossy();
         let relative = relative.as_ref().map(|relative| relative.to_string_lossy());
         let mut inputs: SmallVec<[&str; 2]> = SmallVec::new();
@@ -2720,6 +2803,58 @@ impl PathDenyProbe {
                 .ext_dir_deny
                 .iter()
                 .any(|pattern| ext_dir_deny_matches(pattern, &absolute))
+    }
+}
+
+const PROC_SECRET_DENIAL: &str =
+    "Blocked: procfs process environment, command line and memory are never readable";
+
+/// Tools that recurse below the path they are given.
+fn is_proc_walker_tool(tool: &str) -> bool {
+    matches!(
+        canonical_permission_tool(tool),
+        "grep" | "find_files" | "js/grep" | "js/glob"
+    )
+}
+
+/// Whether `path` selects a procfs file that exposes a process's secrets: the
+/// environment (`environ`, which carries env-held tokens), `cmdline`, or the
+/// address space (`mem`) of `self`, `thread-self`, or any pid, including the
+/// per-thread `task/<tid>/` spellings. With `walker` set, the directories
+/// that contain those files (`/proc` and the process directories) are
+/// refused too so a recursive grep or find cannot reach them. Built in and
+/// not configurable: no rule, mode, or session grant widens it.
+fn is_proc_secret_path(path: &Path, walker: bool) -> bool {
+    use std::path::Component;
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return false;
+    }
+    let mut names = components.filter_map(|component| match component {
+        Component::Normal(name) => name.to_str(),
+        _ => None,
+    });
+    if names.next() != Some("proc") {
+        return false;
+    }
+    let rest: SmallVec<[&str; 6]> = names.collect();
+    let Some((process, tail)) = rest.split_first() else {
+        return walker;
+    };
+    let is_process = matches!(*process, "self" | "thread-self")
+        || (!process.is_empty() && process.bytes().all(|b| b.is_ascii_digit()));
+    if !is_process {
+        return false;
+    }
+    let leaf = match tail {
+        ["task", _, leaf @ ..] => leaf,
+        ["task"] => return walker,
+        leaf => leaf,
+    };
+    match leaf.first() {
+        Some(&"environ" | &"cmdline" | &"mem") => true,
+        None => walker,
+        Some(_) => false,
     }
 }
 
@@ -2788,6 +2923,25 @@ pub(crate) fn exact_allow_scope_for_input(tool: &str, input: &str) -> Option<Str
     ))
 }
 
+/// A `js/fetch` deny glob with every `*` run widened to `**`. Fetch identities
+/// are URLs, so a deny of `https://example.com/*` or `*` must not stop matching
+/// at the first `/` (mini-agent-ewqgo); a narrower deny would let a path through.
+fn fetch_deny_glob(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 2);
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '*' {
+            while chars.peek() == Some(&'*') {
+                chars.next();
+            }
+            out.push_str("**");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn is_path_tool_name(tool: &str) -> bool {
     matches!(
         tool,
@@ -2815,7 +2969,12 @@ fn permission_tool_aliases(tool: &str) -> &'static [&'static str] {
 }
 
 fn canonical_permission_tool(tool: &str) -> &str {
-    if tool == "bash" { "shell" } else { tool }
+    match tool {
+        "bash" => "shell",
+        "fetch" => "js/fetch",
+        "write_todo_list" => "todo_write",
+        _ => tool,
+    }
 }
 
 fn resolve_absolute(path: &str, working_dir: &str) -> String {
@@ -3394,6 +3553,33 @@ mod tests {
     }
 
     #[test]
+    fn lexical_path_deny_precheck_needs_no_target_metadata_and_changes_no_state() {
+        let temp = TempDir::new_canonical("permission-checker");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [("secrets/**".to_string(), Action::Deny)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["standard".to_string()]),
+        )
+        .unwrap();
+        let missing = workspace.join("secrets/does-not-exist");
+
+        assert!(checker.path_is_denied_lexically("read", &missing.to_string_lossy()));
+        assert_eq!(
+            checker.check_bound_path("read", &missing.to_string_lossy()),
+            CheckResult::Denied("Blocked by deny rule".to_string())
+        );
+    }
+
+    #[test]
     fn js_file_tools_inherit_path_rules_and_component_containment() {
         let temp = TempDir::new_canonical("permission-checker");
         let workspace = temp.path().join("safe");
@@ -3439,6 +3625,25 @@ mod tests {
             default_checker.is_external_path(&sibling.join("outside.txt").to_string_lossy()),
             "sibling-prefix path must remain outside the workspace"
         );
+    }
+
+    #[test]
+    fn single_star_fetch_deny_matches_urls_with_path_separators() {
+        let identity = "https://example.com/path destinations=[93.184.216.34:443]";
+        for pattern in ["*", "https://example.com/*"] {
+            let deny_entries = Some([("fetch".to_owned(), vec![pattern.to_owned()])].into());
+            let configs = PermissionConfigs::from(PermissionConfig {
+                deny_entries,
+                ..PermissionConfig::default()
+            });
+            let mut checker =
+                PermissionChecker::new(&configs, SecurityMode::Yolo, None, None).unwrap();
+            assert!(
+                matches!(checker.check("js/fetch", identity), CheckResult::Denied(_)),
+                "deny `fetch:{pattern}` must deny {identity}"
+            );
+        }
+        assert_eq!(fetch_deny_glob("a*b***c?"), "a**b**c?");
     }
 
     #[test]
@@ -5290,5 +5495,146 @@ mod resolve_path_equivalence_tests {
             assert_eq!(direct, canonical, "{path}");
         }
         std::fs::remove_dir_all(&temp).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod proc_secret_and_external_ask_tests {
+    use super::*;
+
+    fn checker(
+        workspace: &Path,
+        mode: SecurityMode,
+        config: PermissionConfig,
+    ) -> PermissionChecker {
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            mode,
+            Some(workspace.to_path_buf()),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("ma_proc_ext_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const ALL_MODES: [SecurityMode; 6] = [
+        SecurityMode::Restrictive,
+        SecurityMode::ReadOnly,
+        SecurityMode::PlanWrite,
+        SecurityMode::Guarded,
+        SecurityMode::Standard,
+        SecurityMode::Yolo,
+    ];
+
+    /// mini-agent-pnd3j: before the built-in baseline, `read` of
+    /// `/proc/self/environ` resolved to Allowed under yolo (no rule matched
+    /// and yolo permits unmatched external paths), leaking env-held tokens.
+    #[test]
+    fn proc_process_secrets_are_denied_in_every_mode_even_with_allow_rules() {
+        let base = scratch();
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let pid = std::process::id();
+        let paths = [
+            "/proc/self/environ".to_string(),
+            "/proc/thread-self/environ".to_string(),
+            "/proc/self/cmdline".to_string(),
+            "/proc/self/mem".to_string(),
+            format!("/proc/{pid}/environ"),
+            format!("/proc/{pid}/task/{pid}/environ"),
+            "/proc/1/environ".to_string(),
+            "/proc/self/../self/environ".to_string(),
+        ];
+        let allow_all = PermissionConfig {
+            external_directory: Some([("/**".to_string(), Action::Allow)].into()),
+            ..PermissionConfig::default()
+        };
+        for mode in ALL_MODES {
+            for config in [PermissionConfig::default(), allow_all.clone()] {
+                let mut checker = checker(&workspace, mode, config);
+                for path in &paths {
+                    for tool in ["read", "grep", "find_files", "list_dir"] {
+                        assert!(
+                            matches!(checker.check_path(tool, path), CheckResult::Denied(_)),
+                            "{mode:?} {tool} {path}"
+                        );
+                    }
+                    assert!(checker.path_is_denied_lexically("read", path), "{path}");
+                }
+                // Recursive walkers may not be rooted at a directory that holds them.
+                for root in ["/proc", "/proc/self", "/proc/1", "/proc/self/task"] {
+                    for tool in ["grep", "find_files"] {
+                        assert!(
+                            matches!(checker.check_path(tool, root), CheckResult::Denied(_)),
+                            "{mode:?} {tool} {root}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn proc_baseline_leaves_unrelated_paths_alone() {
+        for path in [
+            "/proc/self/status",
+            "/proc/cpuinfo",
+            "/proc/self",
+            "/proc",
+            "/procfs/self/environ",
+            "/tmp/proc/self/environ",
+            "/proc/net/environ",
+            "relative/proc/self/environ",
+        ] {
+            assert!(!is_proc_secret_path(Path::new(path), false), "{path}");
+        }
+        assert!(is_proc_secret_path(Path::new("/proc/self"), true));
+        assert!(!is_proc_secret_path(Path::new("/proc/self/status"), true));
+    }
+
+    /// mini-agent-w6732: an explicit `external_directory` ask used to resolve
+    /// to Allowed for guarded reads and for yolo.
+    #[test]
+    fn external_directory_ask_is_honoured_in_guarded_and_yolo() {
+        let base = scratch();
+        let workspace = base.join("workspace");
+        let shared = base.join("shared");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let file = shared.join("notes.md");
+        std::fs::write(&file, "x").unwrap();
+        let file = file.to_string_lossy().into_owned();
+        let config = PermissionConfig {
+            external_directory: Some(
+                [(format!("{}/**", shared.to_string_lossy()), Action::Ask)].into(),
+            ),
+            ..PermissionConfig::default()
+        };
+        for mode in [
+            SecurityMode::Guarded,
+            SecurityMode::Standard,
+            SecurityMode::Yolo,
+        ] {
+            let mut checker = checker(&workspace, mode, config.clone());
+            for tool in ["read", "grep", "write"] {
+                assert_eq!(
+                    checker.check_path(tool, &file),
+                    CheckResult::Ask,
+                    "{mode:?} {tool}"
+                );
+            }
+        }
+        // Yolo still allows an unmatched external path (its documented contract).
+        let mut yolo = checker(&workspace, SecurityMode::Yolo, config);
+        let other = base.join("other.md").to_string_lossy().into_owned();
+        assert_eq!(yolo.check_path("read", &other), CheckResult::Allowed);
     }
 }

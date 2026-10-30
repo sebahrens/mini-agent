@@ -990,6 +990,7 @@ fn worker_protocol_exception_metadata_is_closed_in_v6() {
         exception_class: Some(JsExceptionClass::TypeError),
         line: Some(12),
         column: Some(7),
+        hint: None,
     };
     let encoded = serde_json::to_string(&diagnostic).unwrap();
     assert_eq!(

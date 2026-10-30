@@ -288,10 +288,22 @@ fn environment_with(
     additional: &[(&str, Option<std::ffi::OsString>)],
 ) -> crate::tests::ScopedProcessEnv {
     let mut bindings = vec![
-        ("ZS_CONFIG_DIR", Some(root.join("config").into_os_string())),
-        ("ZS_DATA_DIR", Some(root.join("data").into_os_string())),
-        ("ZS_STATE_DIR", Some(root.join("state").into_os_string())),
-        ("ZS_CACHE_DIR", Some(root.join("cache").into_os_string())),
+        (
+            "MINI_AGENT_CONFIG_DIR",
+            Some(root.join("config").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(root.join("data").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(root.join("state").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_CACHE_DIR",
+            Some(root.join("cache").into_os_string()),
+        ),
     ];
     bindings.extend_from_slice(additional);
     crate::tests::ScopedProcessEnv::set(&bindings)
@@ -2772,7 +2784,7 @@ async fn native_deferred_case(case: &str) {
         if eager {
             assert_eq!(wire[0]["tools"].as_array().unwrap().iter().map(|tool|tool["name"].as_str().unwrap()).collect::<Vec<_>>(),["owned_echo"]);
             assert!(wire[0]["tools"][0].get("defer_loading").is_none());
-            assert!(manager.take_notices().iter().any(|notice| notice.contains("remain eager")));
+            assert!(manager.take_notices().iter().any(|notice| notice.message().contains("remain eager")));
         } else {
             assert_eq!(wire[0]["tools"].as_array().unwrap().iter().map(|tool|tool["name"].as_str().unwrap()).collect::<Vec<_>>(),["mcp_search","owned_echo"]);
             assert_eq!(wire[0]["tools"][1]["defer_loading"],true);

@@ -4,6 +4,8 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -15,8 +17,10 @@ use crate::extras::js::protocol::{
     EffectOperation, EffectRequest, EffectResult, GrantId, RunStep, StepOutcome,
 };
 use crate::extras::js::supervisor::{
-    EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
+    EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError, WorkerReusePolicy,
 };
+#[cfg(target_os = "linux")]
+use crate::extras::js::supervisor::{WORKER_EXIT_OBSERVER, test_worker_exit_class};
 use crate::extras::js::types::PermCancellation;
 use crate::sandbox::worker::{
     BenchmarkWorkerLauncher, TestWorkerLauncher, WorkerContainmentAssurance,
@@ -25,6 +29,13 @@ use crate::sandbox::worker::{
 
 const WARMUPS: usize = 10;
 const SAMPLES: usize = 100;
+/// Bounded resamples for a single benchmark iteration whose native worker died in a way the
+/// cgroup evidence corroborates as host memory pressure rather than a containment regression.
+/// mini-agent-hdl3i: hosted Linux runners intermittently SIGKILL the worker under memory
+/// pressure during `linux-sandbox-policy`; retrying the one affected sample keeps a transient
+/// host kill from discarding the whole benchmark run while any other kill still fails the test.
+#[cfg(target_os = "linux")]
+const HOST_RESOURCE_RETRY_ATTEMPTS: u32 = 2;
 const IPC_PAYLOAD_BYTES: usize = 4 * 1024;
 const DOCUMENTED_P95_VARIANCE_RATIO: f64 = 0.15;
 const LINUX_COLD_READY_TARGET_US: f64 = 250_000.0;
@@ -796,6 +807,47 @@ fn production_supervisor(launcher: BenchmarkWorkerLauncher) -> Arc<JsWorkerSuper
     ))
 }
 
+/// Matches `extras::js::supervisor::MAX_PROCESS_AGE` (the production reuse policy's age
+/// ceiling). Only the invocation ceiling below needs tightening for this benchmark.
+const BENCHMARK_WORKER_REUSE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+/// mini-agent-hdl3i: the warm/ipc/memory/post-cancel-recovery phases share ONE persistent
+/// worker across up to `WARMUPS + SAMPLES` calls each, by design: steady-state latency must
+/// reflect a reused production worker, not a fresh process every call. Production's default
+/// reuse ceiling (`WorkerReusePolicy::default()`, 256 invocations / 15 minutes) is sized for
+/// real traffic. A debug build issuing hundreds of back-to-back trivial calls on a slow or
+/// contended CI runner can spend far more native CPU per call than that assumption expects, so
+/// the shared worker could accumulate close to its full enforced `RLIMIT_CPU` ceiling (35
+/// seconds; see `src/sandbox/worker/linux.rs`) before the production ceiling would ever retire
+/// it, producing an uncorroborated SIGKILL that `classify_worker_kill` correctly cannot call
+/// host resource exhaustion (CI run 39639586216 and 39689562062 on mini-agent-hdl3i). Recycling
+/// far more often than production keeps every single worker's own accumulated CPU time well
+/// below the ceiling even under much worse host slowdown than observed. Recycling is also
+/// already-tested production machinery (`WorkerReusePolicy`/`invoke_with_state`); this only
+/// tightens the invocation count it recycles on for THIS benchmark's own persistent supervisor.
+/// A few of the ~220 warm/ipc samples land right after a recycle and measure a relaunch instead
+/// of steady-state latency; those phases are already documented as informational-only (see "without
+/// gating noisy timing percentiles" in the CI job name), so a handful of inflated samples is an
+/// accepted trade-off, exactly like the existing host-resource-retry resampling below.
+const BENCHMARK_WORKER_MAX_INVOCATIONS: u64 = 25;
+
+/// Like [`production_supervisor`], but recycles its worker far more often than the production
+/// default so no single worker process can approach the enforced native CPU ceiling. Used only
+/// for the persistent supervisor shared across the warm/ipc/memory/recovery phases; the cold
+/// loop's per-iteration supervisors already discard their worker after one invocation.
+fn production_supervisor_with_bounded_cpu_budget(
+    launcher: BenchmarkWorkerLauncher,
+) -> Arc<JsWorkerSupervisor> {
+    Arc::new(
+        JsWorkerSupervisor::with_production_launcher_and_policy_for_benchmark(
+            launcher,
+            WorkerReusePolicy::new(
+                BENCHMARK_WORKER_REUSE_MAX_AGE,
+                BENCHMARK_WORKER_MAX_INVOCATIONS,
+            ),
+        ),
+    )
+}
+
 fn benchmark_executable() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let configured = std::env::var_os("MINI_AGENT_JS_WORKER_BENCH_EXE").ok_or(
         "set MINI_AGENT_JS_WORKER_BENCH_EXE to the cargo-installed debug mini-agent binary",
@@ -829,11 +881,502 @@ fn assurance_label(assurance: WorkerContainmentAssurance) -> String {
     .into()
 }
 
+/// Host memory-pressure counters read from this process's own cgroup v2 `memory.events`.
+/// `oom_kill` increases once per process the kernel's out-of-memory killer actually terminated
+/// inside this cgroup; `oom` increases once per out-of-memory event the cgroup handled by any
+/// means. The benchmark's native worker is a plain child process launched from this same test
+/// binary: `bwrap --unshare-cgroup[-try]` only hides the cgroup path from the sandboxed worker's
+/// own view, it does not move cgroup membership, so this process's counters are the worker's
+/// counters too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+struct CgroupMemoryEvents {
+    oom: u64,
+    oom_kill: u64,
+}
+
+/// Parse the `key value` lines of a cgroup v2 `memory.events` file. Unknown counters and
+/// malformed lines are ignored rather than rejected, since the kernel is free to add new
+/// counters and this benchmark only ever needs `oom`/`oom_kill`.
+fn parse_cgroup_memory_events(contents: &str) -> CgroupMemoryEvents {
+    let mut events = CgroupMemoryEvents::default();
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(key), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(value) = value.parse::<u64>() else {
+            continue;
+        };
+        match key {
+            "oom" => events.oom = value,
+            "oom_kill" => events.oom_kill = value,
+            _ => {}
+        }
+    }
+    events
+}
+
+/// Read this process's current cgroup v2 `memory.events`, if cgroup v2 accounting is mounted
+/// and reachable at all. Absence (no `/proc/self/cgroup`, a non-cgroup-v2 hierarchy, or an
+/// unreadable `memory.events`) is reported as `None` rather than an error: cgroup evidence is
+/// optional corroboration for a kill the benchmark already observed, never a prerequisite.
+#[cfg(target_os = "linux")]
+fn read_cgroup_memory_events() -> Option<CgroupMemoryEvents> {
+    let cgroup = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim();
+    if relative.is_empty() {
+        return None;
+    }
+    let contents = fs::read_to_string(format!("/sys/fs/cgroup{relative}/memory.events")).ok()?;
+    Some(parse_cgroup_memory_events(&contents))
+}
+
+/// The kernel's 1-minute load average alongside the number of logical CPUs available to this
+/// process. `/proc/loadavg`'s load average counts runnable (and briefly uninterruptibly
+/// blocked) tasks system-wide, not just this process's own threads, so a value above the CPU
+/// count means more runnable work exists than the host has cores for right now. This
+/// corroborates a parent-initiated launch/handshake timeout (mini-agent-hdl3i) as an
+/// explainable slow host rather than a hang.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+struct HostCpuContention {
+    load_average_1m: f64,
+    logical_cpus: usize,
+}
+
+/// Pure threshold check over already-read evidence: no filesystem access.
+fn host_cpu_is_contended(contention: &HostCpuContention) -> bool {
+    contention.logical_cpus > 0 && contention.load_average_1m > contention.logical_cpus as f64
+}
+
+/// Read this process's view of `/proc/loadavg` and logical CPU count. `None` whenever either is
+/// unreadable; unreadable contention evidence can never corroborate a parent timeout, the same
+/// fail-closed stance `read_cgroup_memory_events` takes for cgroup accounting.
+#[cfg(target_os = "linux")]
+fn read_host_cpu_contention() -> Option<HostCpuContention> {
+    let contents = fs::read_to_string("/proc/loadavg").ok()?;
+    let load_average_1m = contents.split_whitespace().next()?.parse().ok()?;
+    let logical_cpus = std::thread::available_parallelism().ok()?.get();
+    Some(HostCpuContention {
+        load_average_1m,
+        logical_cpus,
+    })
+}
+
+/// What the benchmark observed about one lost worker connection, gathered before deciding
+/// whether to resample it as transient host pressure or fail the benchmark outright.
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkerKillEvidence {
+    /// The closed exit-signal class from `test_worker_exit_class`, when the native worker's
+    /// exit was actually observed for this attempt. `None` when no exit was observed (for
+    /// example, a protocol error that was not caused by worker death).
+    exit_class: Option<&'static str>,
+    /// Whether this process's own cgroup v2 `memory.events` could be read both before and
+    /// after the attempt. Unreadable cgroup accounting can never corroborate host exhaustion.
+    cgroup_available: bool,
+    /// Increase in the cgroup's `oom_kill` counter observed across the attempt.
+    oom_kill_delta: u64,
+    /// mini-agent-hdl3i: whether the attempt's own top-level error was `WorkerError::TimedOut`.
+    /// `classify_worker_exit` (src/extras/js/supervisor.rs) never produces `TimedOut`: every one
+    /// of its branches examines an actually-observed `ExitStatus`. `TimedOut` can only come from
+    /// a `tokio::select!` deadline branch firing before the worker's exit was ever observed
+    /// (launch-gate wait, launch-thread handoff, or the Hello/Ready read/write deadline in
+    /// `read_worker`/`write_parent_encoded`). So `true` here unambiguously means the PARENT gave
+    /// up on its own `STEP_TIMEOUT` watchdog, not that the kernel killed the worker.
+    parent_timeout: bool,
+    /// Host CPU contention measured at classification time, when `/proc/loadavg` was readable.
+    host_cpu_contention: Option<HostCpuContention>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerKillCause {
+    /// A generic SIGKILL coincides with this process's own cgroup recording a fresh
+    /// `oom_kill` during the attempt: the host's out-of-memory killer, not worker containment,
+    /// is the most likely source. Safe to resample.
+    HostResourceExhaustion,
+    /// mini-agent-hdl3i: the attempt's top-level error was `WorkerError::TimedOut` (the parent's
+    /// own launch/handshake `STEP_TIMEOUT` watchdog), corroborated by host CPU contention
+    /// measured at classification time. Safe to resample: a slower host legitimately exceeding a
+    /// generous parent-side deadline is not a containment regression.
+    ParentTimeoutUnderContention,
+    /// Every other observed failure: a different signal, a plain SIGKILL with no corroborating
+    /// `oom_kill` evidence, cgroup accounting that could not be read at all, or a parent timeout
+    /// with no corroborating host CPU contention. Must still fail the benchmark so a deliberate
+    /// containment regression, or a genuine hang, stays red.
+    ContainmentRegression,
+}
+
+/// Pure classification over already-parsed evidence: no filesystem or process access.
+///
+/// A parent-initiated timeout (`parent_timeout`) is resampleable only when host CPU contention
+/// was both readable and above the logical CPU count; an uncorroborated timeout stays a
+/// containment regression, since it could equally be a genuine hang. Otherwise, a plain
+/// `signal_kill` is host resource exhaustion only when the host's own cgroup accounting both was
+/// readable and recorded a fresh `oom_kill` while this attempt was running; every other signal
+/// (abort/segv/bus/other) and every uncorroborated kill is a containment regression.
+fn classify_worker_kill(evidence: &WorkerKillEvidence) -> WorkerKillCause {
+    if evidence.parent_timeout {
+        return match evidence.host_cpu_contention {
+            Some(contention) if host_cpu_is_contended(&contention) => {
+                WorkerKillCause::ParentTimeoutUnderContention
+            }
+            _ => WorkerKillCause::ContainmentRegression,
+        };
+    }
+    if evidence.exit_class == Some("signal_kill")
+        && evidence.cgroup_available
+        && evidence.oom_kill_delta > 0
+    {
+        WorkerKillCause::HostResourceExhaustion
+    } else {
+        WorkerKillCause::ContainmentRegression
+    }
+}
+
+/// Snapshot the cgroup counters before an attempt and reconcile them with whatever exit status
+/// the attempt's scoped `WORKER_EXIT_OBSERVER` channel received, if any, plus host CPU
+/// contention evidence for a parent-initiated `error`.
+#[cfg(target_os = "linux")]
+fn classify_benchmark_exit(
+    before: Option<CgroupMemoryEvents>,
+    exit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExitStatus>,
+    error: &WorkerError,
+) -> WorkerKillEvidence {
+    let after = read_cgroup_memory_events();
+    let exit_class = exit_rx.try_recv().ok().map(test_worker_exit_class);
+    WorkerKillEvidence {
+        exit_class,
+        cgroup_available: before.is_some() && after.is_some(),
+        oom_kill_delta: match (before, after) {
+            (Some(before), Some(after)) => after.oom_kill.saturating_sub(before.oom_kill),
+            _ => 0,
+        },
+        parent_timeout: matches!(error, WorkerError::TimedOut),
+        host_cpu_contention: read_host_cpu_contention(),
+    }
+}
+
+/// Every retry for one sample was still classified as host resource exhaustion. Carries only
+/// closed diagnostic labels/counts and the worker's own closed `WorkerError` message, never
+/// worker stdout/stderr, exception text, or raw exit numbers.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct HostResourceExhausted {
+    last_error: WorkerError,
+    exit_class: Option<&'static str>,
+    oom_kill_delta: u64,
+    attempts: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for HostResourceExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "js worker benchmark sample repeatedly lost its worker to host resource exhaustion \
+             across {} attempts (exit_class={:?}, oom_kill_delta={}): {}",
+            self.attempts, self.exit_class, self.oom_kill_delta, self.last_error
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for HostResourceExhausted {}
+
+/// mini-agent-hdl3i: every retry for one sample was still classified as a parent-initiated
+/// launch/handshake timeout corroborated by host CPU contention. Carries only closed
+/// diagnostic labels/counts and the worker's own closed `WorkerError` message, never worker
+/// stdout/stderr, exception text, or raw exit numbers.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ParentTimeoutSkip {
+    last_error: WorkerError,
+    exit_class: Option<&'static str>,
+    host_cpu_contention: Option<HostCpuContention>,
+    step_timeout_seconds: u64,
+    attempts: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for ParentTimeoutSkip {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "js worker benchmark sample repeatedly lost its worker to its own parent-side \
+             launch/handshake watchdog ({}s) under corroborated host CPU contention across {} \
+             attempts (exit_class={:?}, host_cpu_contention={:?}): {}",
+            self.step_timeout_seconds,
+            self.attempts,
+            self.exit_class,
+            self.host_cpu_contention,
+            self.last_error
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for ParentTimeoutSkip {}
+
+/// A sample-loop attempt failed in a way `classify_worker_kill` could not call host resource
+/// exhaustion or a corroborated parent timeout (a different signal, an uncorroborated SIGKILL,
+/// an uncorroborated parent timeout, or no observed worker exit at all). This still becomes a
+/// hard test failure; it exists only to carry the same closed diagnostic evidence
+/// `HostResourceExhausted`/`ParentTimeoutSkip` carry for the resampled cases, so a genuine
+/// containment regression is just as diagnosable from the failure artifact — including whether
+/// the parent gave up on its own watchdog (`parent_timeout`) or the kernel delivered a signal
+/// the worker's own exit status reported (`exit_class`).
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ContainmentRegressionKill {
+    source: WorkerError,
+    exit_class: Option<&'static str>,
+    parent_timeout: bool,
+    host_cpu_contention: Option<HostCpuContention>,
+    attempts: u32,
+    memory_events_before: Option<CgroupMemoryEvents>,
+    memory_events_after: Option<CgroupMemoryEvents>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for ContainmentRegressionKill {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "js worker benchmark sample lost its worker in a way that was not corroborated host \
+             resource exhaustion or a corroborated parent timeout, across {} attempt(s) \
+             (exit_class={:?}, parent_timeout={}, host_cpu_contention={:?}, memory.events \
+             before={:?}, after={:?}): {}",
+            self.attempts,
+            self.exit_class,
+            self.parent_timeout,
+            self.host_cpu_contention,
+            self.memory_events_before,
+            self.memory_events_after,
+            self.source
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for ContainmentRegressionKill {}
+
+/// Retry the wrapped single-sample attempt expression up to `HOST_RESOURCE_RETRY_ATTEMPTS`
+/// additional times when its failure is corroborated host resource exhaustion OR a corroborated
+/// parent-initiated launch/handshake timeout (mini-agent-hdl3i). Any other failure, or
+/// exhausting the retries while still in one of those two classes, returns an error: the caller
+/// decides whether an exhausted-retries `HostResourceExhausted`/`ParentTimeoutSkip` becomes a
+/// recorded skip or an ordinary containment-regression failure becomes a hard test failure.
+///
+/// Timing samples that were resampled include the discarded attempts' wait-for-death latency;
+/// this benchmark's timing targets are already informational only (see "without gating noisy
+/// timing percentiles" in the CI job), so a small number of inflated latency samples is an
+/// accepted trade-off for not discarding an otherwise-complete run.
+#[cfg(target_os = "linux")]
+macro_rules! retry_sample_on_host_resource_exhaustion {
+    ($attempt:expr) => {{
+        let mut retries_left = HOST_RESOURCE_RETRY_ATTEMPTS;
+        let mut attempts = 1u32;
+        loop {
+            let (exit_tx, mut exit_rx) = tokio::sync::mpsc::unbounded_channel();
+            let before = read_cgroup_memory_events();
+            match WORKER_EXIT_OBSERVER.scope(exit_tx, $attempt).await {
+                Ok(value) => break Ok(value),
+                Err(error) => {
+                    let evidence = classify_benchmark_exit(before, &mut exit_rx, &error);
+                    let cause = classify_worker_kill(&evidence);
+                    if retries_left > 0
+                        && matches!(
+                            cause,
+                            WorkerKillCause::HostResourceExhaustion
+                                | WorkerKillCause::ParentTimeoutUnderContention
+                        )
+                    {
+                        match cause {
+                            WorkerKillCause::HostResourceExhaustion => eprintln!(
+                                "JS_WORKER_BENCHMARK_HOST_RESOURCE_RETRY exit_class={:?} \
+                                 oom_kill_delta={} attempt={attempts} retries_left={retries_left}",
+                                evidence.exit_class, evidence.oom_kill_delta,
+                            ),
+                            WorkerKillCause::ParentTimeoutUnderContention => eprintln!(
+                                "JS_WORKER_BENCHMARK_PARENT_TIMEOUT_RETRY \
+                                 host_cpu_contention={:?} attempt={attempts} \
+                                 retries_left={retries_left}",
+                                evidence.host_cpu_contention,
+                            ),
+                            WorkerKillCause::ContainmentRegression => unreachable!(
+                                "the outer match already excludes ContainmentRegression"
+                            ),
+                        }
+                        retries_left -= 1;
+                        attempts += 1;
+                        continue;
+                    }
+                    break Err(match cause {
+                        WorkerKillCause::HostResourceExhaustion => Box::new(HostResourceExhausted {
+                            last_error: error,
+                            exit_class: evidence.exit_class,
+                            oom_kill_delta: evidence.oom_kill_delta,
+                            attempts,
+                        })
+                            as Box<dyn std::error::Error>,
+                        WorkerKillCause::ParentTimeoutUnderContention => {
+                            Box::new(ParentTimeoutSkip {
+                                last_error: error,
+                                exit_class: evidence.exit_class,
+                                host_cpu_contention: evidence.host_cpu_contention,
+                                step_timeout_seconds: crate::extras::js::types::STEP_TIMEOUT
+                                    .as_secs(),
+                                attempts,
+                            }) as Box<dyn std::error::Error>
+                        }
+                        WorkerKillCause::ContainmentRegression => {
+                            Box::new(ContainmentRegressionKill {
+                                source: error,
+                                exit_class: evidence.exit_class,
+                                parent_timeout: evidence.parent_timeout,
+                                host_cpu_contention: evidence.host_cpu_contention,
+                                attempts,
+                                memory_events_before: before,
+                                memory_events_after: read_cgroup_memory_events(),
+                            }) as Box<dyn std::error::Error>
+                        }
+                    });
+                }
+            }
+        }
+    }};
+}
+
+/// Parse the `utime`/`stime` fields (in clock ticks) out of a `/proc/<pid>/stat` line. Pure
+/// over already-read text: no filesystem access, so this runs identically on every host
+/// regardless of whether `/proc` is mounted. The `comm` field can itself contain `") "`, so the
+/// split anchors on the LAST `") "` the same way `crate::tests::process_state` already does.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_cpu_ticks(stat: &str) -> Option<(u64, u64)> {
+    let (_, tail) = stat.rsplit_once(") ")?;
+    let fields: Vec<_> = tail.split_whitespace().collect();
+    let utime = fields.get(11)?.parse().ok()?;
+    let stime = fields.get(12)?.parse().ok()?;
+    Some((utime, stime))
+}
+
+/// The kernel's clock ticks per second, for converting `/proc/<pid>/stat` CPU fields to
+/// seconds. `None` only if the host's `sysconf` itself refuses the query.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_clock_ticks_per_second() -> Option<u64> {
+    // SAFETY: `sysconf` with the fixed `_SC_CLK_TCK` name takes no pointers and performs no
+    // side effects; it is always safe to call.
+    u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()
+}
+
+/// Best-effort native CPU time (user + system) the given process has consumed so far, read
+/// from its own `/proc/<pid>/stat`. `None` whenever the process is gone, `/proc` is
+/// unavailable, or the host's clock-tick rate could not be read; this is diagnostic evidence
+/// only and never gates the benchmark's pass/fail decision.
+#[cfg(target_os = "linux")]
+fn read_worker_cpu_seconds(pid: u32) -> Option<f64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (utime, stime) = parse_proc_stat_cpu_ticks(&stat)?;
+    let ticks_per_second = linux_clock_ticks_per_second()?;
+    if ticks_per_second == 0 {
+        return None;
+    }
+    Some((utime + stime) as f64 / ticks_per_second as f64)
+}
+
+/// Snapshot the persistent worker's own accumulated native CPU time, for the diagnostic
+/// context attached to a sample-loop failure below. Reads the supervisor's currently idle
+/// connection's PID; `None` whenever there is none (for example, a prior iteration's failure
+/// already tore it down) or the CPU time itself could not be read.
+#[cfg(target_os = "linux")]
+async fn capture_worker_cpu_seconds(supervisor: &JsWorkerSupervisor) -> Option<f64> {
+    let pid = supervisor.process_id_for_test().await?;
+    read_worker_cpu_seconds(pid)
+}
+
+/// Diagnostic context for a sample-loop attempt that failed in a way `annotate_sample_loop_failure`
+/// decided was not an already-handled host-resource-exhaustion resample. Carries which phase and
+/// iteration failed, how long the benchmark had been running, and (best effort) the persistent
+/// worker's own native CPU time against its configured ceiling, so the failure is diagnosable
+/// from the written JSON artifact alone without needing to reproduce it.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct SampleLoopFailure {
+    phase: &'static str,
+    iteration: usize,
+    total_elapsed_seconds: f64,
+    worker_cpu_seconds_before_attempt: Option<f64>,
+    worker_cpu_limit_seconds: u64,
+    source: Box<dyn std::error::Error>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for SampleLoopFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} sample loop failed at iteration {} ({:.1}s into the benchmark run; the worker \
+             had consumed {} of its {}s native CPU ceiling before this attempt started): {}",
+            self.phase,
+            self.iteration,
+            self.total_elapsed_seconds,
+            self.worker_cpu_seconds_before_attempt
+                .map(|seconds| format!("{seconds:.1}s"))
+                .unwrap_or_else(|| "an unreadable amount".into()),
+            self.worker_cpu_limit_seconds,
+            self.source,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for SampleLoopFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Attach sample-loop diagnostic context to a failed attempt, unless it is already the
+/// existing `HostResourceExhausted` or `ParentTimeoutSkip` carrier that the caller's top-level
+/// match still needs to recognize by exact type to trigger the established skip-and-record
+/// path. Every other failure (an uncorroborated kill, a crash signal, or any other error) is
+/// wrapped so it can be diagnosed from the artifact alone.
+#[cfg(target_os = "linux")]
+fn annotate_sample_loop_failure(
+    error: Box<dyn std::error::Error>,
+    phase: &'static str,
+    iteration: usize,
+    total_elapsed: Duration,
+    worker_cpu_seconds_before_attempt: Option<f64>,
+) -> Box<dyn std::error::Error> {
+    if error.downcast_ref::<HostResourceExhausted>().is_some()
+        || error.downcast_ref::<ParentTimeoutSkip>().is_some()
+    {
+        return error;
+    }
+    Box::new(SampleLoopFailure {
+        phase,
+        iteration,
+        total_elapsed_seconds: total_elapsed.as_secs_f64(),
+        worker_cpu_seconds_before_attempt,
+        worker_cpu_limit_seconds: crate::sandbox::worker::linux_worker_cpu_limit_seconds_for_test(),
+        source: error,
+    })
+}
+
 #[cfg(target_os = "linux")]
 async fn observe_worker_processes(
     supervisor: &JsWorkerSupervisor,
     worker_executable: &Path,
 ) -> Result<ProcessObservation, Box<dyn std::error::Error>> {
+    // The reuse policy may retire the worker when a call finishes (the benchmark's bounded
+    // invocation budget, or the Linux native-CPU retirement threshold), leaving no idle
+    // connection. Observation runs outside every timed section, so re-establish a ready
+    // worker here rather than inside the next measured call.
+    supervisor.prepare_ready_for_benchmark_for_test().await?;
     let launcher_pid = supervisor
         .process_id_for_test()
         .await
@@ -891,6 +1434,11 @@ async fn observe_worker_processes(
     supervisor: &JsWorkerSupervisor,
     _worker_executable: &Path,
 ) -> Result<ProcessObservation, Box<dyn std::error::Error>> {
+    // The reuse policy may retire the worker when a call finishes (the benchmark's bounded
+    // invocation budget, or the Linux native-CPU retirement threshold), leaving no idle
+    // connection. Observation runs outside every timed section, so re-establish a ready
+    // worker here rather than inside the next measured call.
+    supervisor.prepare_ready_for_benchmark_for_test().await?;
     let observation = supervisor
         .windows_process_observation_for_test()
         .await?
@@ -912,6 +1460,11 @@ async fn observe_worker_processes(
     supervisor: &JsWorkerSupervisor,
     _worker_executable: &Path,
 ) -> Result<ProcessObservation, Box<dyn std::error::Error>> {
+    // The reuse policy may retire the worker when a call finishes (the benchmark's bounded
+    // invocation budget, or the Linux native-CPU retirement threshold), leaving no idle
+    // connection. Observation runs outside every timed section, so re-establish a ready
+    // worker here rather than inside the next measured call.
+    supervisor.prepare_ready_for_benchmark_for_test().await?;
     let guardian_pid = supervisor
         .process_id_for_test()
         .await
@@ -1106,14 +1659,46 @@ async fn run_production_benchmark(
         )
     };
 
+    // mini-agent-hdl3i: wall-clock elapsed since this benchmark run started, attached to any
+    // sample-loop failure below so it can be compared against the ~30-31s observed in CI run
+    // 39639586216 and 39689562062.
+    #[cfg(target_os = "linux")]
+    let test_started = Instant::now();
+
     let mut process_counts = ProcessCountAccumulator::default();
     let mut cold = Vec::with_capacity(SAMPLES);
     for iteration in 0..(WARMUPS + SAMPLES) {
         let supervisor = production_supervisor(launcher.clone());
         let started = Instant::now();
+        // mini-agent-hdl3i: this iteration's supervisor is brand new, so there is no
+        // already-established worker whose CPU time could be read before this attempt.
+        #[cfg(target_os = "linux")]
+        {
+            let result: Result<(), Box<dyn std::error::Error>> = retry_sample_on_host_resource_exhaustion!(
+                supervisor.prepare_ready_for_benchmark_for_test()
+            );
+            if let Err(error) = result {
+                return Err(annotate_sample_loop_failure(
+                    error,
+                    "cold_ready",
+                    iteration,
+                    test_started.elapsed(),
+                    None,
+                ));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         supervisor.prepare_ready_for_benchmark_for_test().await?;
         let elapsed = elapsed_us(started);
-        assert_eq!(supervisor.generation_for_test().await, Some(1));
+        // A retried attempt launches more than one generation on this same fresh supervisor
+        // before succeeding, so only the lower bound (this iteration never reused an older
+        // supervisor's worker) is asserted here, not an exact count.
+        assert!(
+            supervisor
+                .generation_for_test()
+                .await
+                .is_some_and(|generation| generation >= 1)
+        );
         process_counts.observe(observe_worker_processes(&supervisor, &worker_executable).await?);
         if iteration >= WARMUPS {
             cold.push(elapsed);
@@ -1138,13 +1723,30 @@ async fn run_production_benchmark(
         supervisor.shutdown_for_test().await?;
     }
 
-    let supervisor = production_supervisor(launcher);
+    let supervisor = production_supervisor_with_bounded_cpu_budget(launcher);
     supervisor.prepare_ready_for_benchmark_for_test().await?;
     process_counts.observe(observe_worker_processes(&supervisor, &worker_executable).await?);
 
     let mut warm = Vec::with_capacity(SAMPLES);
     for iteration in 0..(WARMUPS + SAMPLES) {
+        #[cfg(target_os = "linux")]
+        let worker_cpu_before_attempt = capture_worker_cpu_seconds(&supervisor).await;
         let started = Instant::now();
+        #[cfg(target_os = "linux")]
+        {
+            let result: Result<(), Box<dyn std::error::Error>> =
+                retry_sample_on_host_resource_exhaustion!(pure_call(&supervisor));
+            if let Err(error) = result {
+                return Err(annotate_sample_loop_failure(
+                    error,
+                    "warm_pure_call",
+                    iteration,
+                    test_started.elapsed(),
+                    worker_cpu_before_attempt,
+                ));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         pure_call(&supervisor).await?;
         let elapsed = elapsed_us(started);
         process_counts.observe(observe_worker_processes(&supervisor, &worker_executable).await?);
@@ -1155,7 +1757,24 @@ async fn run_production_benchmark(
 
     let mut ipc = Vec::with_capacity(SAMPLES);
     for iteration in 0..(WARMUPS + SAMPLES) {
+        #[cfg(target_os = "linux")]
+        let worker_cpu_before_attempt = capture_worker_cpu_seconds(&supervisor).await;
         let started = Instant::now();
+        #[cfg(target_os = "linux")]
+        {
+            let result: Result<(), Box<dyn std::error::Error>> =
+                retry_sample_on_host_resource_exhaustion!(ipc_call(&supervisor));
+            if let Err(error) = result {
+                return Err(annotate_sample_loop_failure(
+                    error,
+                    "broker_ipc_4kib",
+                    iteration,
+                    test_started.elapsed(),
+                    worker_cpu_before_attempt,
+                ));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         ipc_call(&supervisor).await?;
         let elapsed = elapsed_us(started);
         process_counts.observe(observe_worker_processes(&supervisor, &worker_executable).await?);
@@ -1176,7 +1795,24 @@ async fn run_production_benchmark(
 
     let mut recovery = Vec::with_capacity(SAMPLES);
     for iteration in 0..(WARMUPS + SAMPLES) {
+        #[cfg(target_os = "linux")]
+        let worker_cpu_before_attempt = capture_worker_cpu_seconds(&supervisor).await;
         let started = Instant::now();
+        #[cfg(target_os = "linux")]
+        {
+            let result: Result<(), Box<dyn std::error::Error>> =
+                retry_sample_on_host_resource_exhaustion!(cancel_and_recover(supervisor.clone()));
+            if let Err(error) = result {
+                return Err(annotate_sample_loop_failure(
+                    error,
+                    "post_cancel_recovery",
+                    iteration,
+                    test_started.elapsed(),
+                    worker_cpu_before_attempt,
+                ));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         cancel_and_recover(supervisor.clone()).await?;
         let elapsed = elapsed_us(started);
         process_counts.observe(observe_worker_processes(&supervisor, &worker_executable).await?);
@@ -1517,6 +2153,149 @@ fn windows_powershell(arguments: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// mini-agent-hdl3i diagnostic record for a sample that exhausted its host-resource retries.
+/// Deliberately not a `BenchmarkReport`: this is a skip notice, not a measurement, and must
+/// never be mistaken for reviewed evidence by `js_worker_resource_aggregate` or the checked-in
+/// baseline validator.
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct HostResourceSkipRecord {
+    schema_version: u32,
+    benchmark: &'static str,
+    status: &'static str,
+    exit_class: Option<&'static str>,
+    oom_kill_delta: u64,
+    attempts: u32,
+    cause: String,
+}
+
+#[cfg(target_os = "linux")]
+fn write_host_resource_skip(
+    output: &Path,
+    exhausted: &HostResourceExhausted,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let record = HostResourceSkipRecord {
+        schema_version: 1,
+        benchmark: "mini-agent-js-worker",
+        status: "host_resource_exhaustion_skip",
+        exit_class: exhausted.exit_class,
+        oom_kill_delta: exhausted.oom_kill_delta,
+        attempts: exhausted.attempts,
+        cause: exhausted.last_error.to_string(),
+    };
+    let json = serde_json::to_string_pretty(&record)?;
+    fs::write(output, format!("{json}\n"))?;
+    Ok(())
+}
+
+/// mini-agent-hdl3i diagnostic record for a sample that exhausted its retries on a
+/// corroborated parent-initiated launch/handshake timeout. Deliberately not a `BenchmarkReport`
+/// for the same reason as `HostResourceSkipRecord`: a skip notice is never reviewed evidence.
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct ParentTimeoutSkipRecord {
+    schema_version: u32,
+    benchmark: &'static str,
+    status: &'static str,
+    exit_class: Option<&'static str>,
+    host_cpu_contention: Option<HostCpuContention>,
+    step_timeout_seconds: u64,
+    attempts: u32,
+    cause: String,
+}
+
+#[cfg(target_os = "linux")]
+fn write_parent_timeout_skip(
+    output: &Path,
+    skip: &ParentTimeoutSkip,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let record = ParentTimeoutSkipRecord {
+        schema_version: 1,
+        benchmark: "mini-agent-js-worker",
+        status: "parent_timeout_under_contention_skip",
+        exit_class: skip.exit_class,
+        host_cpu_contention: skip.host_cpu_contention,
+        step_timeout_seconds: skip.step_timeout_seconds,
+        attempts: skip.attempts,
+        cause: skip.last_error.to_string(),
+    };
+    let json = serde_json::to_string_pretty(&record)?;
+    fs::write(output, format!("{json}\n"))?;
+    Ok(())
+}
+
+/// mini-agent-hdl3i best-effort diagnostic record for an ordinary (non-host-resource) failure.
+/// Written before the test still returns its real error, so the CI artifact-upload step finds
+/// a file regardless of which `cargo test` invocation in the job step failed. A write failure
+/// here is logged and swallowed: it must never replace or mask the original test failure.
+///
+/// The `phase`/`iteration`/`total_elapsed_seconds`/`worker_cpu_*` fields are present whenever
+/// the failure happened inside one of the warm/ipc/recovery/cold sample loops (a
+/// `SampleLoopFailure`); `exit_class`/`parent_timeout`/`host_cpu_contention`/`attempts`/
+/// `memory_events_*` are present whenever that failure's cause was a classified worker kill (a
+/// `ContainmentRegressionKill`) — `parent_timeout=true` means the PARENT gave up on its own
+/// `STEP_TIMEOUT` watchdog before the worker's exit was ever observed; `parent_timeout=false`
+/// with a populated `exit_class` means the worker's own exit status (a kernel-delivered signal,
+/// for example) was observed. Every field is `None` for a failure from outside those loops,
+/// leaving only `cause`.
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct BenchmarkFailureRecord {
+    schema_version: u32,
+    benchmark: &'static str,
+    status: &'static str,
+    cause: String,
+    phase: Option<&'static str>,
+    iteration: Option<usize>,
+    total_elapsed_seconds: Option<f64>,
+    worker_cpu_seconds_before_attempt: Option<f64>,
+    worker_cpu_limit_seconds: Option<u64>,
+    exit_class: Option<&'static str>,
+    parent_timeout: Option<bool>,
+    host_cpu_contention: Option<HostCpuContention>,
+    attempts: Option<u32>,
+    memory_events_before: Option<CgroupMemoryEvents>,
+    memory_events_after: Option<CgroupMemoryEvents>,
+}
+
+#[cfg(target_os = "linux")]
+fn write_benchmark_failure(output: &Path, error: &(dyn std::error::Error + 'static)) {
+    let sample_loop = error.downcast_ref::<SampleLoopFailure>();
+    let regression =
+        sample_loop.and_then(|failure| failure.source.downcast_ref::<ContainmentRegressionKill>());
+    let record = BenchmarkFailureRecord {
+        schema_version: 1,
+        benchmark: "mini-agent-js-worker",
+        status: "failed",
+        cause: error.to_string(),
+        phase: sample_loop.map(|failure| failure.phase),
+        iteration: sample_loop.map(|failure| failure.iteration),
+        total_elapsed_seconds: sample_loop.map(|failure| failure.total_elapsed_seconds),
+        worker_cpu_seconds_before_attempt: sample_loop
+            .and_then(|failure| failure.worker_cpu_seconds_before_attempt),
+        worker_cpu_limit_seconds: sample_loop.map(|failure| failure.worker_cpu_limit_seconds),
+        exit_class: regression.and_then(|kill| kill.exit_class),
+        parent_timeout: regression.map(|kill| kill.parent_timeout),
+        host_cpu_contention: regression.and_then(|kill| kill.host_cpu_contention),
+        attempts: regression.map(|kill| kill.attempts),
+        memory_events_before: regression.and_then(|kill| kill.memory_events_before),
+        memory_events_after: regression.and_then(|kill| kill.memory_events_after),
+    };
+    match serde_json::to_string_pretty(&record) {
+        Ok(json) => {
+            if let Err(write_error) = fs::write(output, format!("{json}\n")) {
+                eprintln!(
+                    "JS_WORKER_BENCHMARK_DIAGNOSTIC_WRITE_FAILED path={} error={write_error}",
+                    output.display()
+                );
+            }
+        }
+        Err(serialize_error) => {
+            eprintln!("JS_WORKER_BENCHMARK_DIAGNOSTIC_SERIALIZE_FAILED error={serialize_error}");
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "run explicitly on an OS reference host and upload the JSON artifact"]
 async fn js_worker_resource_benchmark() -> Result<(), Box<dyn std::error::Error>> {
@@ -1529,19 +2308,78 @@ async fn js_worker_resource_benchmark() -> Result<(), Box<dyn std::error::Error>
     report.evidence_state = "single_platform_record".into();
     let worker_executable = benchmark_executable()?;
     let launcher = BenchmarkWorkerLauncher::new(worker_executable.clone());
+    // Resolved once up front: every exit path below, including the mini-agent-hdl3i host-
+    // resource skip and ordinary-failure diagnostics, writes to this same path so the CI
+    // artifact-upload step always finds a file.
+    let output = std::env::var_os("MINI_AGENT_JS_WORKER_BENCH_OUTPUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "mini-agent-js-worker-benchmark-{}.json",
+                uuid::Uuid::new_v4()
+            ))
+        });
     let evidence = match launcher.containment_status() {
         WorkerContainmentStatus::Available { backend, assurance } => {
-            let mut run = run_production_benchmark(
+            match run_production_benchmark(
                 worker_executable,
                 launcher,
                 backend.to_string(),
                 assurance_label(assurance),
             )
-            .await?;
-            if let Some(previous) = std::env::var_os("MINI_AGENT_JS_WORKER_BENCH_COMPARE") {
-                add_comparison(&mut run, Path::new(&previous))?;
+            .await
+            {
+                Ok(mut run) => {
+                    if let Some(previous) = std::env::var_os("MINI_AGENT_JS_WORKER_BENCH_COMPARE") {
+                        add_comparison(&mut run, Path::new(&previous))?;
+                    }
+                    PlatformEvidence::Measured { run: Box::new(run) }
+                }
+                // mini-agent-hdl3i: every resample attempt was corroborated host resource
+                // exhaustion (a plain SIGKILL alongside this process's own cgroup recording a
+                // fresh oom_kill). Record the skip and let the job stay green; a deliberate
+                // containment regression never reaches this arm, since `classify_worker_kill`
+                // requires cgroup-corroborated evidence of a plain `signal_kill`.
+                #[cfg(target_os = "linux")]
+                Err(error) if error.downcast_ref::<HostResourceExhausted>().is_some() => {
+                    let exhausted = error
+                        .downcast::<HostResourceExhausted>()
+                        .expect("downcast_ref above just proved this succeeds");
+                    write_host_resource_skip(&output, &exhausted)?;
+                    println!(
+                        "JS_WORKER_BENCHMARK_HOST_RESOURCE_SKIP output={}",
+                        output.display()
+                    );
+                    return Ok(());
+                }
+                // mini-agent-hdl3i: every resample attempt was a parent-initiated launch/
+                // handshake timeout (`WorkerError::TimedOut`, which `classify_worker_exit` never
+                // produces) corroborated by host CPU contention measured at classification time.
+                // Record the skip and let the job stay green; an uncorroborated timeout, or any
+                // kernel-observed exit signal, never reaches this arm (see `classify_worker_kill`).
+                #[cfg(target_os = "linux")]
+                Err(error) if error.downcast_ref::<ParentTimeoutSkip>().is_some() => {
+                    let skip = error
+                        .downcast::<ParentTimeoutSkip>()
+                        .expect("downcast_ref above just proved this succeeds");
+                    write_parent_timeout_skip(&output, &skip)?;
+                    println!(
+                        "JS_WORKER_BENCHMARK_PARENT_TIMEOUT_SKIP output={}",
+                        output.display()
+                    );
+                    return Ok(());
+                }
+                // Any other kill or transport error still fails the test: write a best-effort
+                // diagnostic record first so the archive step finds a file either way, then
+                // propagate the original failure so the job stays red.
+                #[cfg(target_os = "linux")]
+                Err(error) => {
+                    write_benchmark_failure(&output, error.as_ref());
+                    return Err(error);
+                }
+                #[cfg(not(target_os = "linux"))]
+                Err(error) => return Err(error),
             }
-            PlatformEvidence::Measured { run: Box::new(run) }
         }
         WorkerContainmentStatus::Unavailable {
             backend, assurance, ..
@@ -1558,14 +2396,6 @@ async fn js_worker_resource_benchmark() -> Result<(), Box<dyn std::error::Error>
     let value = serde_json::to_value(&report)?;
     validate_report(&value)?;
     let json = serde_json::to_string_pretty(&report)?;
-    let output = std::env::var_os("MINI_AGENT_JS_WORKER_BENCH_OUTPUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!(
-                "mini-agent-js-worker-benchmark-{}.json",
-                uuid::Uuid::new_v4()
-            ))
-        });
     fs::write(&output, format!("{json}\n"))?;
     println!("JS_WORKER_BENCHMARK_OUTPUT={}", output.display());
     println!("{json}");
@@ -1664,6 +2494,300 @@ fn worker_resource_memory_units_are_parsed_deterministically() {
     assert_eq!(parse_scaled_bytes("12.5M"), Some(13_107_200));
     assert_eq!(parse_scaled_bytes(" 1024 K "), Some(1_048_576));
     assert_eq!(parse_scaled_bytes("unavailable"), None);
+}
+
+// mini-agent-hdl3i: pure classification over already-parsed `memory.events` content and
+// closed exit-signal classes, with no filesystem or process access, so these run identically
+// on every platform's `cargo test` regardless of whether cgroup v2 is mounted on this host.
+
+#[test]
+fn cgroup_memory_events_are_parsed_from_the_real_kernel_file_format() {
+    let contents = "low 0\nhigh 0\nmax 0\noom 2\noom_kill 1\noom_group_kill 0\n";
+    assert_eq!(
+        parse_cgroup_memory_events(contents),
+        CgroupMemoryEvents {
+            oom: 2,
+            oom_kill: 1
+        }
+    );
+}
+
+#[test]
+fn cgroup_memory_events_parsing_ignores_unknown_counters_and_malformed_lines() {
+    let contents = "oom_kill 3\ngarbage\nsome_future_counter not-a-number\n";
+    assert_eq!(
+        parse_cgroup_memory_events(contents),
+        CgroupMemoryEvents {
+            oom: 0,
+            oom_kill: 3
+        }
+    );
+    assert_eq!(
+        parse_cgroup_memory_events(""),
+        CgroupMemoryEvents::default()
+    );
+}
+
+#[test]
+fn worker_kill_classification_requires_cgroup_corroborated_oom_kill_for_a_plain_signal_kill() {
+    let host_resource_exhaustion = WorkerKillEvidence {
+        exit_class: Some("signal_kill"),
+        cgroup_available: true,
+        oom_kill_delta: 1,
+        parent_timeout: false,
+        host_cpu_contention: None,
+    };
+    assert_eq!(
+        classify_worker_kill(&host_resource_exhaustion),
+        WorkerKillCause::HostResourceExhaustion
+    );
+}
+
+#[test]
+fn worker_kill_classification_rejects_an_uncorroborated_plain_signal_kill() {
+    let kill_without_oom_evidence = WorkerKillEvidence {
+        exit_class: Some("signal_kill"),
+        cgroup_available: true,
+        oom_kill_delta: 0,
+        parent_timeout: false,
+        host_cpu_contention: None,
+    };
+    assert_eq!(
+        classify_worker_kill(&kill_without_oom_evidence),
+        WorkerKillCause::ContainmentRegression
+    );
+
+    let kill_without_cgroup_accounting = WorkerKillEvidence {
+        exit_class: Some("signal_kill"),
+        cgroup_available: false,
+        oom_kill_delta: 0,
+        parent_timeout: false,
+        host_cpu_contention: None,
+    };
+    assert_eq!(
+        classify_worker_kill(&kill_without_cgroup_accounting),
+        WorkerKillCause::ContainmentRegression
+    );
+}
+
+#[test]
+fn worker_kill_classification_rejects_crash_signals_even_with_oom_evidence() {
+    // A real crash (abort/segv/bus) must stay a containment regression even if the host
+    // happened to be under memory pressure at the same time: only a plain SIGKILL is ever
+    // ambiguous between "the host OOM-killer did this" and "containment let something escape".
+    for exit_class in ["signal_abort", "signal_segv", "signal_bus", "other_signal"] {
+        let evidence = WorkerKillEvidence {
+            exit_class: Some(exit_class),
+            cgroup_available: true,
+            oom_kill_delta: 1,
+            parent_timeout: false,
+            host_cpu_contention: None,
+        };
+        assert_eq!(
+            classify_worker_kill(&evidence),
+            WorkerKillCause::ContainmentRegression,
+            "{exit_class} must not be classified as host resource exhaustion"
+        );
+    }
+}
+
+#[test]
+fn worker_kill_classification_rejects_a_failure_with_no_observed_exit() {
+    let no_observed_exit = WorkerKillEvidence {
+        exit_class: None,
+        cgroup_available: true,
+        oom_kill_delta: 1,
+        parent_timeout: false,
+        host_cpu_contention: None,
+    };
+    assert_eq!(
+        classify_worker_kill(&no_observed_exit),
+        WorkerKillCause::ContainmentRegression
+    );
+}
+
+// mini-agent-hdl3i: pure threshold/classification logic for distinguishing a parent-initiated
+// launch/handshake timeout under corroborated host CPU contention from an unexplained one. No
+// filesystem or process access, so these run identically on every host.
+
+#[test]
+fn host_cpu_contention_requires_load_average_above_logical_cpus() {
+    assert!(!host_cpu_is_contended(&HostCpuContention {
+        load_average_1m: 2.0,
+        logical_cpus: 4,
+    }));
+    // Exactly at the CPU count is not oversubscribed: every runnable task can have a core.
+    assert!(!host_cpu_is_contended(&HostCpuContention {
+        load_average_1m: 4.0,
+        logical_cpus: 4,
+    }));
+    assert!(host_cpu_is_contended(&HostCpuContention {
+        load_average_1m: 4.1,
+        logical_cpus: 4,
+    }));
+    // An unreadable CPU count (0) can never corroborate contention, however high the load.
+    assert!(!host_cpu_is_contended(&HostCpuContention {
+        load_average_1m: 50.0,
+        logical_cpus: 0,
+    }));
+}
+
+#[test]
+fn worker_kill_classification_treats_a_corroborated_parent_timeout_as_resampleable() {
+    let evidence = WorkerKillEvidence {
+        exit_class: None,
+        cgroup_available: false,
+        oom_kill_delta: 0,
+        parent_timeout: true,
+        host_cpu_contention: Some(HostCpuContention {
+            load_average_1m: 50.0,
+            logical_cpus: 4,
+        }),
+    };
+    assert_eq!(
+        classify_worker_kill(&evidence),
+        WorkerKillCause::ParentTimeoutUnderContention
+    );
+}
+
+#[test]
+fn worker_kill_classification_rejects_an_uncorroborated_parent_timeout() {
+    let timeout_without_contention = WorkerKillEvidence {
+        exit_class: None,
+        cgroup_available: false,
+        oom_kill_delta: 0,
+        parent_timeout: true,
+        host_cpu_contention: Some(HostCpuContention {
+            load_average_1m: 1.0,
+            logical_cpus: 4,
+        }),
+    };
+    assert_eq!(
+        classify_worker_kill(&timeout_without_contention),
+        WorkerKillCause::ContainmentRegression,
+        "a parent timeout on an otherwise-idle host must not be resampled: it could be a hang"
+    );
+
+    let timeout_with_unreadable_load = WorkerKillEvidence {
+        exit_class: None,
+        cgroup_available: false,
+        oom_kill_delta: 0,
+        parent_timeout: true,
+        host_cpu_contention: None,
+    };
+    assert_eq!(
+        classify_worker_kill(&timeout_with_unreadable_load),
+        WorkerKillCause::ContainmentRegression,
+        "unreadable load-average evidence must never corroborate a parent timeout"
+    );
+}
+
+#[test]
+fn worker_kill_classification_prefers_parent_timeout_classification_over_exit_class() {
+    // `parent_timeout` and a populated `exit_class` are mutually exclusive by construction
+    // (classify_benchmark_exit never observes an exit status once `WorkerError::TimedOut` fired
+    // first), but the classifier must still check `parent_timeout` first defensively.
+    let evidence = WorkerKillEvidence {
+        exit_class: Some("signal_kill"),
+        cgroup_available: true,
+        oom_kill_delta: 1,
+        parent_timeout: true,
+        host_cpu_contention: Some(HostCpuContention {
+            load_average_1m: 1.0,
+            logical_cpus: 4,
+        }),
+    };
+    assert_eq!(
+        classify_worker_kill(&evidence),
+        WorkerKillCause::ContainmentRegression,
+        "parent_timeout must gate on contention, not fall through to the oom_kill check"
+    );
+}
+
+// mini-agent-hdl3i: pure parsing over an already-read `/proc/<pid>/stat` line, and pure
+// context-attachment logic over already-classified errors. Neither touches the filesystem or
+// a real process, so both run identically on every host regardless of Linux specifics.
+
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_stat_cpu_ticks_are_parsed_from_the_utime_and_stime_fields() {
+    let stat = "123 (mini-agent) R 1 123 1 0 -1 0 0 0 0 0 4200 1300 0 0 20 0 1 0 987 0";
+    assert_eq!(parse_proc_stat_cpu_ticks(stat), Some((4200, 1300)));
+    // A `comm` field containing a literal ") " must not desynchronize the field split; anchor
+    // on the LAST ") ", matching crate::tests::process_state's own stat parser.
+    let tricky_comm = "41 (name with ) spaces) S 1 41 1 0 -1 0 0 0 0 0 10 5 0 0 0 0 0 0 0 0";
+    assert_eq!(parse_proc_stat_cpu_ticks(tricky_comm), Some((10, 5)));
+    assert_eq!(parse_proc_stat_cpu_ticks("too short"), None);
+    assert_eq!(
+        parse_proc_stat_cpu_ticks("41 (p) R 1 41 1 0 -1 0 0 0 0 0 notanumber 5 0 0 0 0 0 0 0 0"),
+        None
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sample_loop_failure_annotation_preserves_host_resource_exhaustion_for_the_existing_skip_path() {
+    let exhausted = HostResourceExhausted {
+        last_error: WorkerError::Transport,
+        exit_class: Some("signal_kill"),
+        oom_kill_delta: 1,
+        attempts: 3,
+    };
+    let annotated = annotate_sample_loop_failure(
+        Box::new(exhausted),
+        "warm_pure_call",
+        5,
+        Duration::from_secs(12),
+        Some(3.5),
+    );
+    assert!(
+        annotated.downcast_ref::<HostResourceExhausted>().is_some(),
+        "the top-level skip-and-record match must still see the exact HostResourceExhausted type"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sample_loop_failure_annotation_wraps_every_other_failure_with_diagnostic_context() {
+    let regression = ContainmentRegressionKill {
+        source: WorkerError::Transport,
+        exit_class: Some("signal_kill"),
+        parent_timeout: false,
+        host_cpu_contention: None,
+        attempts: 1,
+        memory_events_before: Some(CgroupMemoryEvents {
+            oom: 0,
+            oom_kill: 0,
+        }),
+        memory_events_after: Some(CgroupMemoryEvents {
+            oom: 0,
+            oom_kill: 0,
+        }),
+    };
+    let annotated = annotate_sample_loop_failure(
+        Box::new(regression),
+        "broker_ipc_4kib",
+        42,
+        Duration::from_secs(30),
+        Some(33.2),
+    );
+    let failure = annotated
+        .downcast_ref::<SampleLoopFailure>()
+        .expect("non-host-resource failures must gain sample-loop diagnostic context");
+    assert_eq!(failure.phase, "broker_ipc_4kib");
+    assert_eq!(failure.iteration, 42);
+    assert_eq!(failure.total_elapsed_seconds, 30.0);
+    assert_eq!(failure.worker_cpu_seconds_before_attempt, Some(33.2));
+    assert_eq!(
+        failure.worker_cpu_limit_seconds,
+        crate::sandbox::worker::linux_worker_cpu_limit_seconds_for_test()
+    );
+    assert!(
+        failure
+            .source
+            .downcast_ref::<ContainmentRegressionKill>()
+            .is_some()
+    );
 }
 
 #[test]

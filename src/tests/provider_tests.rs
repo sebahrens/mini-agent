@@ -504,6 +504,8 @@ fn cfg(api_style: Option<ApiStyle>) -> CustomProviderConfig {
         connect_timeout_secs: None,
         stream_idle_timeout_secs: None,
         model: None,
+        prompt_caching: false,
+        model_prices: std::collections::HashMap::new(),
     }
 }
 
@@ -543,15 +545,18 @@ fn expand_env_passthrough() {
 #[test]
 fn expand_env_reads_var() {
     let _environment = crate::tests::ScopedProcessEnv::set(&[(
-        "ZS_TEST_HDR",
+        "MINI_AGENT_TEST_HDR",
         Some(std::ffi::OsString::from("secret-value")),
     )]);
-    assert_eq!(expand_env("${ZS_TEST_HDR}").unwrap(), "secret-value");
+    assert_eq!(
+        expand_env("${MINI_AGENT_TEST_HDR}").unwrap(),
+        "secret-value"
+    );
 }
 
 #[test]
 fn expand_env_missing_var_errors() {
-    assert!(expand_env("${ZS_DEFINITELY_NOT_SET_98237}").is_err());
+    assert!(expand_env("${MINI_AGENT_DEFINITELY_NOT_SET_98237}").is_err());
 }
 
 // --- is_agent_model tests ---
@@ -804,6 +809,8 @@ fn resolve_custom_provider() {
             connect_timeout_secs: None,
             stream_idle_timeout_secs: None,
             model: None,
+            prompt_caching: false,
+            model_prices: std::collections::HashMap::new(),
         },
     );
     let cfg = resolve_provider_config("my-gw", &custom).unwrap();
@@ -863,6 +870,8 @@ async fn anthropic_custom_base_appends_v1_messages() {
             connect_timeout_secs: None,
             stream_idle_timeout_secs: None,
             model: None,
+            prompt_caching: false,
+            model_prices: std::collections::HashMap::new(),
         },
     );
 
@@ -1067,6 +1076,8 @@ async fn openrouter_anthropic_request_sends_automatic_tail_cache_control() {
             connect_timeout_secs: None,
             stream_idle_timeout_secs: None,
             model: None,
+            prompt_caching: false,
+            model_prices: std::collections::HashMap::new(),
         },
     );
 
@@ -1165,23 +1176,94 @@ fn openai_completions_maps_only_reasoning_effort() {
         encrypted_content: Some(true),
         store: Some(false),
     };
-    let body = openai_completions_extra_body(None, Some(&reasoning)).unwrap();
+    let body =
+        openai_completions_extra_body(None, "session-a", "gpt-5.5", Some(&reasoning)).unwrap();
     assert_eq!(body["reasoning_effort"], "xhigh");
     assert!(body.get("reasoning").is_none());
     assert!(body.get("include").is_none());
     assert!(body.get("store").is_none());
 }
 
+/// fb20s: Chat Completions gets the same opaque, stable per-session
+/// `prompt_cache_key` the Responses path sends, for an OpenAI-family model.
+#[test]
+fn openai_completions_cache_key_is_stable_per_session_and_user_overridable() {
+    let first = openai_completions_extra_body(None, "session-a", "gpt-5.5", None).unwrap();
+    let repeated = openai_completions_extra_body(None, "session-a", "gpt-5.5", None).unwrap();
+    let other = openai_completions_extra_body(None, "session-b", "gpt-5.5", None).unwrap();
+
+    assert_eq!(first, repeated);
+    assert_ne!(first["prompt_cache_key"], other["prompt_cache_key"]);
+    assert_eq!(first["prompt_cache_key"].as_str().unwrap().len(), 64);
+    // Matches the Responses path's key for the same session id, so a
+    // session that switches api_style keeps routing to the same cache.
+    let responses_equivalent = openai_responses_extra_body(None, "session-a", None).unwrap();
+    assert_eq!(
+        first["prompt_cache_key"],
+        responses_equivalent["prompt_cache_key"]
+    );
+
+    let overridden = openai_completions_extra_body(
+        Some(serde_json::json!({"prompt_cache_key": "configured"})),
+        "session-a",
+        "gpt-5.5",
+        None,
+    )
+    .unwrap();
+    assert_eq!(overridden["prompt_cache_key"], "configured");
+}
+
+/// fb20s/u9jj3: a Claude-family model id (served through an OpenAI-compatible
+/// gateway) uses explicit `cache_control` markers instead (mini-agent-u9jj3),
+/// so `prompt_cache_key` would be redundant and is skipped.
+#[test]
+fn openai_completions_skips_cache_key_for_claude_model_family() {
+    for model_id in [
+        "claude-opus-5-5",
+        "bedrock.anthropic.claude-sonnet-5-5",
+        "vertex.anthropic.claude-opus-5-5",
+    ] {
+        assert_eq!(
+            openai_completions_extra_body(None, "session-a", model_id, None),
+            None,
+            "{model_id} must not get a prompt_cache_key"
+        );
+    }
+    // reasoning_effort is unaffected by the Claude-family skip.
+    let reasoning = ReasoningConfig {
+        effort: Some(ReasoningEffort::High),
+        ..Default::default()
+    };
+    let body = openai_completions_extra_body(
+        None,
+        "session-a",
+        "bedrock.anthropic.claude-sonnet-5-5",
+        Some(&reasoning),
+    )
+    .unwrap();
+    assert_eq!(body["reasoning_effort"], "high");
+    assert!(body.get("prompt_cache_key").is_none());
+}
+
 #[test]
 fn openai_completions_preserves_extra_body_without_reasoning_config() {
     let user = serde_json::json!({"logit_bias": {"1": -100}});
+    let merged =
+        openai_completions_extra_body(Some(user.clone()), "session-a", "gpt-5.5", None).unwrap();
+    assert_eq!(merged["logit_bias"], user["logit_bias"]);
+    assert_eq!(merged["prompt_cache_key"].as_str().unwrap().len(), 64);
+
+    // A Claude-family model id with no reasoning and no cache key to add
+    // leaves user extra_body completely untouched.
     assert_eq!(
-        openai_completions_extra_body(Some(user.clone()), None),
+        openai_completions_extra_body(Some(user.clone()), "session-a", "claude-opus-5-5", None),
         Some(user)
     );
-    assert_eq!(openai_completions_extra_body(None, None), None);
     let empty = ReasoningConfig::default();
-    assert_eq!(openai_completions_extra_body(None, Some(&empty)), None);
+    assert_eq!(
+        openai_completions_extra_body(None, "session-a", "claude-opus-5-5", Some(&empty)),
+        None
+    );
 }
 
 // ── Provider connect and stream-inactivity deadlines ───────────────────
@@ -1201,6 +1283,8 @@ fn timeout_cfg(connect_secs: u64, idle_secs: u64) -> CustomProviderConfig {
         connect_timeout_secs: Some(connect_secs),
         stream_idle_timeout_secs: Some(idle_secs),
         model: None,
+        prompt_caching: false,
+        model_prices: std::collections::HashMap::new(),
     }
 }
 
@@ -1676,6 +1760,8 @@ fn shadowing_provider(provider_type: &str, base_url: &str) -> CustomProviderConf
         connect_timeout_secs: None,
         stream_idle_timeout_secs: None,
         model: None,
+        prompt_caching: false,
+        model_prices: std::collections::HashMap::new(),
     }
 }
 
@@ -1924,7 +2010,7 @@ fn environment_endpoint_fallbacks_preserve_configured_routes_and_provider_scope(
     };
     let client =
         crate::provider::create_client_with_env("openai", None, &empty, None, env).unwrap();
-    let crate::provider::AnyClient::OpenAI(crate::provider::OpenAiClient::Completions(client)) =
+    let crate::provider::AnyClient::OpenAI(crate::provider::OpenAiClient::Completions(client, _)) =
         client
     else {
         panic!("gateway env endpoint must select native completions style")

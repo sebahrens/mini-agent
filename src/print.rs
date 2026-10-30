@@ -373,9 +373,43 @@ fn read_stdin_bounded(mut reader: impl io::Read) -> anyhow::Result<String> {
     String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("piped stdin is not UTF-8"))
 }
 
-pub(crate) async fn read_headless_stdin(quiet: bool) -> anyhow::Result<String> {
+/// How long an explicit `-p` prompt waits for an open stdin pipe to show data
+/// or EOF before running without stdin.
+const HEADLESS_STDIN_IDLE_MS: i32 = 2000;
+
+/// Whether `fd` is readable (data, EOF or error) within `timeout_ms`. Always
+/// true where it cannot be probed, which keeps the blocking read.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn fd_readable_within(fd: std::os::fd::RawFd, timeout_ms: i32) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `descriptor` is a valid pollfd for the call's duration; poll
+    // reports HUP/ERR as readiness, for which read returns EOF or the error.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    ready != 0
+}
+
+#[cfg(not(unix))]
+fn fd_readable_within(_fd: i32, _timeout_ms: i32) -> bool {
+    true
+}
+
+/// Read piped stdin for a headless run. With an explicit prompt, a pipe that
+/// stays silent for [`HEADLESS_STDIN_IDLE_MS`] (an open stdin that never closes,
+/// as under a supervisor or subagent) is treated as empty instead of hanging.
+pub(crate) async fn read_headless_stdin(
+    quiet: bool,
+    explicit_prompt: bool,
+) -> anyhow::Result<String> {
     let turn = run_headless_turn(async {
         let read = crate::agent::runner::spawn_blocking_scoped(move || {
+            if explicit_prompt && !fd_readable_within(0, HEADLESS_STDIN_IDLE_MS) {
+                return Ok(String::new());
+            }
             // This notice shares the reader's owned blocking job. Emitting it
             // here gates readiness without an async gap before the read; even
             // a stalled stderr write cannot hold the event-loop thread.
@@ -1109,6 +1143,10 @@ pub(crate) struct HeadlessJsonOutput {
     pub tool_calls: HeadlessToolCalls,
     pub usage: Usage,
     pub cost: f64,
+    /// Present (true) only when the model has no known token price, so a
+    /// `cost` of 0 means "not priced" rather than "free" (mini-agent-ftrhc).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cost_unpriced: bool,
     pub stop_reason: HeadlessStopReason,
     /// Present only when the run carried a goal, so existing output is
     /// byte-identical for every run that does not.
@@ -1247,6 +1285,11 @@ impl HeadlessPricing {
             output_token_cost: session.output_token_cost,
             cache_prices,
         }
+    }
+
+    /// No input or output price is known, so any reported cost is 0 by lack of data.
+    pub(crate) fn is_unpriced(self) -> bool {
+        !(self.input_token_cost > 0.0 || self.output_token_cost > 0.0)
     }
 
     pub(crate) fn cost(self, usage: Usage) -> f64 {
@@ -1446,6 +1489,7 @@ pub(crate) fn render_headless_json(
         tool_calls,
         usage,
         cost,
+        cost_unpriced: pricing.is_unpriced(),
         stop_reason,
         #[cfg(feature = "goal")]
         goal: goal.map(HeadlessGoal::from_goal),
@@ -2062,6 +2106,36 @@ fn sandbox_profile_entry(cli: &cli::Cli, cfg: &config::Config) -> (&'static str,
     )
 }
 
+/// `--print-config` entry for `sandbox-toolchain-roots`: the configured list
+/// and the effective binds after validation against the current workspace.
+fn sandbox_toolchain_roots_entry(
+    cli: &cli::Cli,
+    cfg: &config::Config,
+    sandbox: &Sandbox,
+) -> String {
+    let configured = cli.resolve_sandbox_toolchain_roots(cfg);
+    let source = if !cli.sandbox_toolchain_roots.is_empty() {
+        "--sandbox-toolchain-root"
+    } else if cfg.sandbox_toolchain_roots.is_some() {
+        "sandbox-toolchain-roots"
+    } else {
+        "default"
+    };
+    let configured = if configured.is_empty() {
+        "[]".to_string()
+    } else {
+        configured
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "configured ({source}): {configured}; effective: {}",
+        sandbox.bwrap_read_roots_summary()
+    )
+}
+
 pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<()> {
     let rules_cfg =
         crate::permission::cli_rules::report_config(cli, cfg).map_err(io::Error::other)?;
@@ -2090,7 +2164,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let sandbox = cli.resolve_sandbox(cfg);
     let sandbox_backend = cli.resolve_sandbox_backend(cfg);
     let shell = cli.resolve_shell(cfg);
-    let sandbox_capabilities = Sandbox::new(
+    let capability_sandbox = Sandbox::new(
         sandbox && cli.general_sandbox_is_eligible(cfg),
         &sandbox_backend,
     )
@@ -2108,7 +2182,9 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         cli.resolve_windows_appcontainer_read_roots(cfg),
         cli.resolve_windows_appcontainer_write_roots(cfg),
     )
-    .capability_matrix();
+    .with_bwrap_read_roots(cli.resolve_sandbox_toolchain_roots(cfg));
+    let sandbox_capabilities = capability_sandbox.capability_matrix();
+    let sandbox_toolchain_roots = sandbox_toolchain_roots_entry(cli, cfg, &capability_sandbox);
     let edit_system = cli.resolve_edit_system(cfg);
     let compact = cfg.resolve_compact_enabled();
 
@@ -2259,16 +2335,22 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         ],
     );
 
+    let sandbox_reason = sandbox_capabilities
+        .reason
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
     append_section(
         &mut output,
         "Sandbox capabilities",
         &[
             ("backend", sandbox_capabilities.backend),
             ("status", sandbox_capabilities.status.to_string()),
+            ("reason", sandbox_reason),
             (
                 "filesystem reads",
                 sandbox_capabilities.filesystem_reads.to_string(),
             ),
+            ("read-only toolchain roots", sandbox_toolchain_roots),
             (
                 "filesystem writes",
                 sandbox_capabilities.filesystem_writes.to_string(),
@@ -2546,6 +2628,28 @@ fn system_instruction_entries(cli: &cli::Cli) -> Vec<(&'static str, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn stdin_probe_distinguishes_silent_open_pipe_from_data_and_eof() {
+        let mut fds = [0i32; 2];
+        // SAFETY: fds is a valid two-element array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        assert!(!super::fd_readable_within(r, 50), "open silent pipe");
+        // SAFETY: w is a live descriptor owned by this test.
+        assert_eq!(unsafe { libc::write(w, b"x".as_ptr().cast(), 1) }, 1);
+        assert!(super::fd_readable_within(r, 50), "pipe with data");
+        let mut b = [0u8; 1];
+        // SAFETY: r is live and b is one writable byte.
+        unsafe { libc::read(r, b.as_mut_ptr().cast(), 1) };
+        assert!(!super::fd_readable_within(r, 50));
+        // SAFETY: closing the descriptors this test opened.
+        unsafe { libc::close(w) };
+        assert!(super::fd_readable_within(r, 50), "closed pipe is EOF");
+        unsafe { libc::close(r) };
+    }
+
     use std::io;
 
     use rig::OneOrMany;
@@ -3162,6 +3266,42 @@ mod tests {
             serde_json::json!(["docs/report.md", "git-only.rs", "src/lib.rs"])
         );
         assert!((value["cost"].as_f64().unwrap() - 0.01128).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn headless_json_flags_unpriced_models_and_reports_cached_tokens() {
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            cached_input_tokens: 4,
+            ..Usage::default()
+        };
+        let render = |input_token_cost, output_token_cost| {
+            let rendered = render_headless_json(
+                std::path::Path::new("."),
+                "ok",
+                &[],
+                usage,
+                Vec::new(),
+                super::HeadlessPricing {
+                    anthropic_native: false,
+                    input_token_cost,
+                    output_token_cost,
+                    cache_prices: crate::pricing::CachePrices::default(),
+                },
+                super::HeadlessStopReason::Completed,
+                #[cfg(feature = "goal")]
+                None,
+            )
+            .unwrap();
+            serde_json::from_str::<serde_json::Value>(&rendered).unwrap()
+        };
+        let unpriced = render(0.0, 0.0);
+        assert_eq!(unpriced["cost"], 0.0);
+        assert_eq!(unpriced["cost_unpriced"], true);
+        assert_eq!(unpriced["usage"]["cached_input_tokens"], 4);
+        assert!(render(3.0, 15.0).get("cost_unpriced").is_none());
     }
 
     #[tokio::test]

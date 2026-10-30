@@ -25,8 +25,15 @@ fn detect_media_audio_extensions() {
 }
 
 #[test]
+#[cfg(feature = "pdf")]
 fn detect_media_document_extension() {
     assert_eq!(detect_media(Path::new("doc.pdf")), Some("application/pdf"));
+}
+
+#[test]
+#[cfg(not(feature = "pdf"))]
+fn detect_media_pdf_requires_pdf_feature() {
+    assert_eq!(detect_media(Path::new("doc.pdf")), None);
 }
 
 #[test]
@@ -64,11 +71,12 @@ fn load_attachment_rejects_extension_signature_mismatch() {
         "mini-agent-media-mismatch-{}.png",
         uuid::Uuid::new_v4()
     ));
-    std::fs::write(&path, b"%PDF-1.7\n").unwrap();
+    // A signature every build recognizes; PDF sniffing depends on the `pdf` feature.
+    std::fs::write(&path, b"GIF89a\x01\x00\x01\x00").unwrap();
     let error = load_attachment(&path).unwrap_err();
     std::fs::remove_file(path).unwrap();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert!(error.to_string().contains("does not match"));
+    assert!(error.to_string().contains("does not match"), "{error}");
 }
 
 // --- media_to_messages tests ---
@@ -78,18 +86,21 @@ fn loaded_attachments_preserve_order_types_and_bytes_in_messages() {
     use crate::agent::runner::media_to_messages;
     use rig::completion::Message;
     use rig::message::{
-        Audio, AudioMediaType, Document, DocumentMediaType, DocumentSourceKind, Image,
-        ImageMediaType, UserContent,
+        Audio, AudioMediaType, DocumentSourceKind, Image, ImageMediaType, UserContent,
     };
+    #[cfg(feature = "pdf")]
+    use rig::message::{Document, DocumentMediaType};
 
-    let fixtures: [(&str, &[u8]); 3] = [
+    #[allow(unused_mut)]
+    let mut fixtures: Vec<(&str, &[u8])> = vec![
         ("png", b"\x89PNG\r\n\x1a\npayload"),
         ("wav", b"RIFF\x04\x00\x00\x00WAVE"),
-        (
-            "pdf",
-            b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
-        ),
     ];
+    #[cfg(feature = "pdf")]
+    fixtures.push((
+        "pdf",
+        b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    ));
     let media: Vec<_> = fixtures
         .iter()
         .map(|(extension, bytes)| {
@@ -109,9 +120,11 @@ fn loaded_attachments_preserve_order_types_and_bytes_in_messages() {
         .collect();
     assert!(matches!(media[0], MediaAttachment::Image { .. }));
     assert!(matches!(media[1], MediaAttachment::Audio { .. }));
+    #[cfg(feature = "pdf")]
     assert!(matches!(media[2], MediaAttachment::Document { .. }));
 
-    let expected = [
+    #[allow(unused_mut)]
+    let mut expected = vec![
         UserContent::Image(Image {
             data: DocumentSourceKind::Raw(fixtures[0].1.to_vec()),
             media_type: Some(ImageMediaType::PNG),
@@ -122,12 +135,13 @@ fn loaded_attachments_preserve_order_types_and_bytes_in_messages() {
             media_type: Some(AudioMediaType::WAV),
             ..Default::default()
         }),
-        UserContent::Document(Document {
-            data: DocumentSourceKind::Raw(fixtures[2].1.to_vec()),
-            media_type: Some(DocumentMediaType::PDF),
-            ..Default::default()
-        }),
     ];
+    #[cfg(feature = "pdf")]
+    expected.push(UserContent::Document(Document {
+        data: DocumentSourceKind::Raw(fixtures[2].1.to_vec()),
+        media_type: Some(DocumentMediaType::PDF),
+        ..Default::default()
+    }));
     let messages = media_to_messages(&media);
     assert_eq!(messages.len(), expected.len());
     for (message, expected_content) in messages.into_iter().zip(expected) {

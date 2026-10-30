@@ -24,8 +24,15 @@ or Session allowlist; no-check/no-tools modes still validate input. Headless, TU
 and ACP use the same merge and retain their existing approval transports. See
 [CLI seed precedence](CONFIG.md#rule-precedence) for mode and external-directory rules.
 
-`/editsys` rebuilds the agent immediately after changing the edit system, so the memoized
-`read`/`edit` definitions and their runtime behavior always switch together.
+`/editsys` rebuilds the agent only when the requested edit system differs from
+the active one, so the memoized `read`/`edit` definitions and their runtime
+behavior always switch together without needless MCP catalog refreshes.
+
+When MCP servers expose colliding tool names, collection namespaces each alias
+as `<server>__<tool>`. The stable alias mapping is announced once per MCP
+manager, even if an actual agent rebuild collects the catalog again. Rename
+announcements are informational system messages; connection and catalog
+failures retain error styling.
 
 Session restoration and import prepare every rebuilt tool from the incoming
 session: read tracking, todos, JS scratch, spill registration, and the session ID
@@ -1470,6 +1477,9 @@ owner may then terminate the child; forced termination is not a writer-join
 claim. `Mini Agent: Resume Saved Session` lists the current trusted workspace
 and explicitly selects one saved ID. A busy prompt blocks switching, and no
 saved permission grant or private SDK constructor is adopted.
+`Mini Agent: Select Persona` reads the persona selector (`mode` config option) from the
+`session/new` or `session/load` response and later `config_option_update` notifications,
+then switches it with `session/set_config_option`; a busy prompt blocks the switch.
 
 The focused offline editor-host gate is
 `npm run test:integration -- <candidate.vsix> <target> resume`. It uses the

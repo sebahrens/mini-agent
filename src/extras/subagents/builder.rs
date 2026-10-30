@@ -125,6 +125,10 @@ pub(crate) struct PersonaExecution {
     /// Provider request parameters resolved from the persona's quick-model
     /// alias. These win over every inherited provider parameter.
     pub(crate) additional_params: Option<serde_json::Value>,
+    /// Exact server -> wire-level tool names granted to this persona. `None`
+    /// means no MCP authority; outer-agent connections are never inherited.
+    #[cfg(feature = "mcp")]
+    pub(crate) mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 /// Provider request-body parameters a child sends before persona overrides:
@@ -171,6 +175,36 @@ impl SubagentAuthorization {
     ) -> Self {
         self.workspace = workspace;
         self
+    }
+
+    #[cfg(feature = "mcp")]
+    fn independent_mcp_permission(
+        &self,
+        cfg: &crate::config::Config,
+    ) -> Result<Option<PermCheck>, String> {
+        let Some(parent) = &self.permission else {
+            return Ok(None);
+        };
+        let mode = parent
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .mode();
+        let permission_config = cfg.build_permission_config().map_err(|error| {
+            format!("task: persona MCP permission configuration is invalid: {error}")
+        })?;
+        let working_dir = self
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf());
+        let checker = crate::permission::checker::PermissionChecker::new_for_sandbox(
+            &permission_config,
+            mode,
+            working_dir,
+            cfg.permission_modes.clone(),
+            crate::permission::SandboxResolution::Enforced,
+        )
+        .map_err(|error| format!("task: persona MCP permission scope failed: {error}"))?;
+        Ok(Some(std::sync::Arc::new(std::sync::Mutex::new(checker))))
     }
 
     /// The authorization of a worktree-isolated write child: every tool, the
@@ -433,6 +467,92 @@ impl SubagentAuthorization {
     }
 }
 
+#[cfg(feature = "mcp")]
+pub(crate) async fn build_persona_mcp(
+    persona: &PersonaExecution,
+    cfg: &crate::config::Config,
+    authorization: &SubagentAuthorization,
+) -> Result<
+    (
+        Option<crate::extras::mcp::McpClientManager>,
+        Vec<Box<dyn rig::tool::ToolDyn>>,
+    ),
+    String,
+> {
+    let Some(allowlist) = persona.mcp_servers.as_ref() else {
+        return Ok((None, Vec::new()));
+    };
+    if allowlist.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let configured = cfg
+        .mcp_servers
+        .as_ref()
+        .ok_or_else(|| "task: persona requests MCP servers but none are configured".to_string())?;
+    let mut selected = std::collections::HashMap::with_capacity(allowlist.len());
+    for server in allowlist.keys() {
+        let config = configured
+            .get(server)
+            .ok_or_else(|| format!("task: persona MCP server '{server}' is not configured"))?;
+        selected.insert(server.clone(), config.clone());
+    }
+    let workspace = authorization
+        .workspace
+        .as_ref()
+        .ok_or_else(|| "task: persona MCP requires a captured workspace".to_string())?;
+    let mut manager =
+        crate::extras::mcp::McpClientManager::connect_all_in_binding(&selected, workspace).await;
+    let permission = authorization.independent_mcp_permission(cfg)?;
+    let timeouts = crate::extras::mcp::McpToolTimeouts::from_config_secs(cfg.mcp_tool_timeout_secs);
+    let mut tools = crate::agent::builder::collect_mcp_tools(
+        &manager,
+        permission,
+        authorization.ask_tx.clone(),
+        timeouts,
+    )
+    .await;
+    let mut discovered = std::collections::BTreeSet::new();
+    tools.retain(|tool| {
+        let server = tool.server_name.as_str();
+        let name = tool.definition.name.as_ref();
+        let allowed = allowlist
+            .get(server)
+            .is_some_and(|names| names.iter().any(|allowed| allowed == name));
+        if allowed {
+            discovered.insert((server.to_string(), name.to_string()));
+        }
+        allowed
+    });
+    let missing = allowlist
+        .iter()
+        .flat_map(|(server, names)| names.iter().map(move |name| (server, name)))
+        .filter(|(server, name)| !discovered.contains(&(server.to_string(), name.to_string())))
+        .map(|(server, name)| format!("{server}:{name}"))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let notices = manager
+            .take_notices()
+            .into_iter()
+            .map(|notice| notice.to_string())
+            .collect::<Vec<_>>();
+        manager.shutdown().await;
+        let detail = if notices.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notices.join("; "))
+        };
+        return Err(format!(
+            "task: persona MCP allowlist requested unavailable tool(s): {}{detail}",
+            missing.join(", ")
+        ));
+    }
+    let tools = tools
+        .into_iter()
+        .map(|tool| Box::new(tool) as Box<dyn rig::tool::ToolDyn>)
+        .collect();
+    Ok((Some(manager), tools))
+}
+
 /// The memory tools a subagent is granted: read-only access ONLY
 /// (`memory_read`, `memory_search`). `memory_write` and `memory_edit` are
 /// deliberately absent, so a subagent can never mutate the user's memory. This
@@ -608,6 +728,7 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
         specialization,
         suffix.as_deref(),
         persona,
+        Vec::new(),
         #[cfg(feature = "skills")]
         skill_services,
     )
@@ -635,6 +756,7 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     // The user's prompt suffix, loaded once per task call by the caller.
     suffix: Option<&str>,
     persona: &PersonaExecution,
+    mut additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     #[cfg(feature = "skills")] skill_services: Option<
         &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
@@ -684,6 +806,10 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
         #[cfg(feature = "skills")]
         skill_services,
     );
+    // Persona-scoped MCP tools are connected and narrowed by the caller
+    // (`build_persona_mcp`); outer-agent MCP connections are never inherited.
+    let mut tools = tools;
+    tools.append(&mut additional_tools);
     let tools = tools::memoize::definitions(tools);
 
     #[cfg(feature = "hooks")]
@@ -780,6 +906,7 @@ pub(crate) async fn build_explore_agent(
     #[cfg(feature = "archmd")] architecture: Option<String>,
     specialization: Option<String>,
     persona: PersonaExecution,
+    #[cfg(feature = "mcp")] mcp_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     #[cfg(feature = "skills")] skill_services: Option<
         std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
@@ -795,6 +922,8 @@ pub(crate) async fn build_explore_agent(
         specialization,
         suffix.as_deref(),
         persona,
+        #[cfg(feature = "mcp")]
+        mcp_tools,
         #[cfg(feature = "skills")]
         skill_services,
     )
@@ -813,6 +942,7 @@ pub(crate) async fn build_explore_agent_with_suffix(
     specialization: Option<String>,
     suffix: Option<&str>,
     persona: PersonaExecution,
+    #[cfg(feature = "mcp")] mcp_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     #[cfg(feature = "skills")] skill_services: Option<
         std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
@@ -878,6 +1008,10 @@ pub(crate) async fn build_explore_agent_with_suffix(
                 spec_ref,
                 suffix,
                 &persona,
+                #[cfg(feature = "mcp")]
+                mcp_tools,
+                #[cfg(not(feature = "mcp"))]
+                Vec::new(),
                 #[cfg(feature = "skills")]
                 skill_services.as_ref(),
             ))
@@ -902,6 +1036,10 @@ pub(crate) async fn build_explore_agent_with_suffix(
                     spec_ref,
                     suffix,
                     &persona,
+                    #[cfg(feature = "mcp")]
+                    mcp_tools,
+                    #[cfg(not(feature = "mcp"))]
+                    Vec::new(),
                     #[cfg(feature = "skills")]
                     skill_services.as_ref(),
                 ))
@@ -925,6 +1063,10 @@ pub(crate) async fn build_explore_agent_with_suffix(
                     spec_ref,
                     suffix,
                     &persona,
+                    #[cfg(feature = "mcp")]
+                    mcp_tools,
+                    #[cfg(not(feature = "mcp"))]
+                    Vec::new(),
                     #[cfg(feature = "skills")]
                     skill_services.as_ref(),
                 ))
@@ -948,6 +1090,10 @@ pub(crate) async fn build_explore_agent_with_suffix(
             spec_ref,
             suffix,
             &persona,
+            #[cfg(feature = "mcp")]
+            mcp_tools,
+            #[cfg(not(feature = "mcp"))]
+            Vec::new(),
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
         )),
@@ -969,6 +1115,10 @@ pub(crate) async fn build_explore_agent_with_suffix(
             spec_ref,
             suffix,
             &persona,
+            #[cfg(feature = "mcp")]
+            mcp_tools,
+            #[cfg(not(feature = "mcp"))]
+            Vec::new(),
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
         )),
@@ -990,6 +1140,10 @@ pub(crate) async fn build_explore_agent_with_suffix(
             spec_ref,
             suffix,
             &persona,
+            #[cfg(feature = "mcp")]
+            mcp_tools,
+            #[cfg(not(feature = "mcp"))]
+            Vec::new(),
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
         )),
@@ -1011,6 +1165,10 @@ pub(crate) async fn build_explore_agent_with_suffix(
             spec_ref,
             suffix,
             &persona,
+            #[cfg(feature = "mcp")]
+            mcp_tools,
+            #[cfg(not(feature = "mcp"))]
+            Vec::new(),
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
         )),
@@ -1026,6 +1184,85 @@ pub(crate) async fn build_explore_agent_with_suffix(
         None => agent,
     };
     agent
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod persona_mcp_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{PersonaExecution, SubagentAuthorization, build_persona_mcp};
+    use crate::permission::SecurityMode;
+    use crate::permission::checker::{CheckResult, PermissionChecker};
+
+    fn workspace() -> Arc<crate::paths::WorkspaceBinding> {
+        Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn persona_mcp_permission_does_not_inherit_outer_allow_all() {
+        let mut config = crate::config::Config {
+            permission: Some(serde_json::json!({"mcp_tool": "ask"})),
+            ..crate::config::Config::default()
+        };
+        config.permission_modes = Some(vec!["standard".to_string()]);
+        let permission_config = config.build_permission_config().unwrap();
+        let mut parent = PermissionChecker::new(
+            &permission_config,
+            SecurityMode::Standard,
+            Some(workspace().root().to_path_buf()),
+            config.permission_modes.clone(),
+        )
+        .unwrap();
+        parent.set_allow_all_mcp_calls(true);
+        let parent = Arc::new(Mutex::new(parent));
+        let authorization = SubagentAuthorization::new(Some(parent.clone()), None, true)
+            .with_workspace_binding(Some(workspace()));
+        let child = authorization
+            .independent_mcp_permission(&config)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            parent
+                .lock()
+                .unwrap()
+                .check("mcp_tool", "mcp_tool:docs:search"),
+            CheckResult::Allowed
+        ));
+        assert!(matches!(
+            child
+                .lock()
+                .unwrap()
+                .check("mcp_tool", "mcp_tool:docs:search"),
+            CheckResult::Ask
+        ));
+        assert!(!Arc::ptr_eq(&parent, &child));
+    }
+
+    #[tokio::test]
+    async fn persona_mcp_rejects_unknown_server_before_connecting() {
+        let persona = PersonaExecution {
+            mcp_servers: Some(std::collections::BTreeMap::from([(
+                "missing".to_string(),
+                vec!["search".to_string()],
+            )])),
+            ..PersonaExecution::default()
+        };
+        let config = crate::config::Config {
+            mcp_servers: Some(std::collections::HashMap::new()),
+            ..crate::config::Config::default()
+        };
+        let authorization =
+            SubagentAuthorization::new(None, None, true).with_workspace_binding(Some(workspace()));
+
+        let error = match build_persona_mcp(&persona, &config, &authorization).await {
+            Ok(_) => panic!("unknown persona MCP server was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("not configured"), "{error}");
+    }
 }
 
 #[cfg(all(test, feature = "js"))]
@@ -1047,6 +1284,79 @@ mod js_isolation_tests {
                 },
                 &crate::config::Config::default(),
             )
+    }
+
+    // mini-agent-f3jjk: non-pure skills are filtered out of a read-only child's bundle before
+    // the tool's own guard runs, so the literal fail-closed error is unreachable end to end
+    // unless the filter regresses. Inject a non-pure skill straight into the forked child
+    // context and prove the real builder-wired read-only tool still refuses it.
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn read_only_child_js_tool_refuses_an_injected_non_pure_skill() {
+        use crate::extras::js::skills::turn::{ResolvedSkill, TurnSkillBundle};
+        use crate::extras::js::skills::{CapabilityManifest, CapabilityScope, CapabilityTier};
+
+        let root = crate::tests::support::temp::TempDir::new("read-only-child-guard");
+        let paths = crate::paths::AppPaths::resolve(&crate::paths::PathEnvironment {
+            platform: if cfg!(target_os = "macos") {
+                crate::paths::PathPlatform::MacOs
+            } else if cfg!(target_os = "windows") {
+                crate::paths::PathPlatform::Windows
+            } else {
+                crate::paths::PathPlatform::Linux
+            },
+            home_dir: None,
+            config_base: Some(root.path().join("config")),
+            data_base: Some(root.path().join("data")),
+            local_data_base: Some(root.path().join("local")),
+            state_base: Some(root.path().join("state")),
+            cache_base: Some(root.path().join("cache")),
+            workspace_root: None,
+            overrides: Default::default(),
+        })
+        .unwrap();
+        let parent = crate::extras::js::skills::session::SkillSessionServices::for_test(&paths);
+        let child = parent.fork_for_read_only_child();
+        child.turn_context().replace(TurnSkillBundle {
+            turn_id: "read-only-child".to_string(),
+            query_fingerprint: "fixture".to_string(),
+            embedding_model_revision: "fixture".to_string(),
+            index_generation: 1,
+            skills: vec![ResolvedSkill {
+                id: "effectful-fixture".to_string(),
+                identity_version: 2,
+                abi_version: 1,
+                description: "must not enter a read-only child".to_string(),
+                tags: Vec::new(),
+                exports: Vec::new(),
+                tests: Vec::new(),
+                capability: CapabilityManifest::new(
+                    CapabilityTier::SideEffecting,
+                    vec![CapabilityScope::WriteFile {
+                        workspace_prefixes: vec!["tmp".to_string()],
+                    }],
+                )
+                .unwrap(),
+                source: String::new(),
+                score_bits: 1.0_f32.to_bits(),
+                rank: 1,
+                route: None,
+            }],
+        });
+
+        let tool = configured_authorization()
+            .read_only_js_tool(Some(&child))
+            .expect("the configured read-only JS tool is built");
+        let error = tool
+            .call(r#"{"code":"1"}"#.to_string())
+            .await
+            .expect_err("a non-pure skill in the child context must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("read-only JS skill bundle contains a non-pure capability"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1072,6 +1382,7 @@ mod js_isolation_tests {
             None,
             Some("HOISTED_SUFFIX_MARKER"),
             &PersonaExecution::default(),
+            Vec::new(),
             #[cfg(feature = "skills")]
             None,
         );
@@ -2120,6 +2431,8 @@ mod provider_param_tests {
                 connect_timeout_secs: None,
                 stream_idle_timeout_secs: None,
                 model: None,
+                prompt_caching: false,
+                model_prices: std::collections::HashMap::new(),
             },
         )]);
         let client = create_client("openai-capture", Some("test-key"), &custom, None).unwrap();
@@ -2169,6 +2482,8 @@ mod provider_param_tests {
             tools: None,
             provider_extra_body: config.extra_body.clone(),
             additional_params: Some(serde_json::json!({"user": "persona-tenant"})),
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
         }
     }
 

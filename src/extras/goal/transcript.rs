@@ -223,6 +223,7 @@ mod tests {
             tokens_used: 100,
             active: std::time::Duration::from_secs(5),
             user_gate: None,
+            failure_fingerprint: None,
         }
     }
 

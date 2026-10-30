@@ -29,7 +29,7 @@ function reportFailure(stage, error) {
     ? error.stack.split('\n').slice(1).map(line => line.match(/\bresume\.integration\.cjs:(\d{1,7}):(\d{1,5})\b/)).find(Boolean)
     : undefined;
   let detail = `${typeof error?.name === 'string' ? error.name : 'Error'}: ${typeof error?.message === 'string' ? error.message : ''}`;
-  for (const key of ['MINI_AGENT_VSIX_PROFILE_ROOT', 'ZS_CONFIG_DIR', 'MINI_AGENT_HOME', 'MINI_AGENT_IDE_PROVIDER_EVENTS']) {
+  for (const key of ['MINI_AGENT_VSIX_PROFILE_ROOT', 'MINI_AGENT_CONFIG_DIR', 'MINI_AGENT_HOME', 'MINI_AGENT_IDE_PROVIDER_EVENTS']) {
     const value = process.env[key];
     if (value) { detail = detail.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '<fixture>'); }
   }
@@ -74,7 +74,7 @@ exports.run = async () => {
     const installed = cacheMatches[0].exports;
     const context = { extensionUri: extension.extensionUri, extension: { packageJSON: extension.packageJSON }, subscriptions: [] };
     const events = () => fs.readFileSync(process.env.MINI_AGENT_IDE_PROVIDER_EVENTS, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
-    const sessions = path.join(process.env.ZS_STATE_DIR, 'sessions');
+    const sessions = path.join(process.env.MINI_AGENT_STATE_DIR, 'sessions');
     const first = 'ACP53_SAVED_SENTINEL literal $HOME @never-fetch';
     restoreConfig = true;
     await config.update('executablePath', bundled, vscode.ConfigurationTarget.Global);

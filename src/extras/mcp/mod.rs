@@ -12,6 +12,7 @@ pub(crate) mod project;
 pub mod tool;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,17 +61,67 @@ impl McpToolTimeouts {
     }
 }
 
+/// Presentation severity for a user-visible MCP diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpNoticeLevel {
+    Info,
+    Error,
+}
+
+/// A bounded, user-visible MCP diagnostic and its presentation severity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpNotice {
+    level: McpNoticeLevel,
+    message: CompactString,
+}
+
+impl McpNotice {
+    pub(crate) fn error(message: impl Into<CompactString>) -> Self {
+        Self {
+            level: McpNoticeLevel::Error,
+            message: message.into(),
+        }
+    }
+
+    fn info(message: impl Into<CompactString>) -> Self {
+        Self {
+            level: McpNoticeLevel::Info,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn level(&self) -> McpNoticeLevel {
+        self.level
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for McpNotice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[derive(Default)]
+struct ToolNoticeState {
+    pending: Vec<McpNotice>,
+    last_info: Option<CompactString>,
+}
+
 pub struct McpClientManager {
     pub handles: Vec<client::McpClientHandle>,
     /// Connection failures collected during `connect_all`, to be surfaced by the
     /// TUI via the renderer. We do NOT log these at `warn` because that writes to
     /// stderr, which corrupts the alt-screen TUI (overlapping the input box).
-    pub notices: Vec<CompactString>,
+    pub(crate) notices: Vec<McpNotice>,
     /// Notices produced while collecting tools (`tools/list` failures, tool
     /// name collisions). Collection runs through a shared reference during
     /// agent construction, so these are kept behind a mutex and drained
     /// together with `notices` by [`Self::take_notices`].
-    tool_notices: Mutex<Vec<CompactString>>,
+    tool_notices: Mutex<ToolNoticeState>,
     /// Opaque private-storage scope shared by every tool collected from this
     /// manager. MCP calls do not own a durable mini-agent Session, so their
     /// oversized result artifacts use a process-manager scope instead.
@@ -97,7 +148,7 @@ impl McpClientManager {
         Self {
             handles,
             notices: Vec::new(),
-            tool_notices: Mutex::new(Vec::new()),
+            tool_notices: Mutex::new(ToolNoticeState::default()),
             spill_scope: CompactString::new(uuid::Uuid::new_v4().to_string()),
             health,
             origins: Default::default(),
@@ -218,7 +269,7 @@ impl McpClientManager {
             .finish(health::AttemptOutcome::Removed);
     }
 
-    fn with_notices(handles: Vec<client::McpClientHandle>, notices: Vec<CompactString>) -> Self {
+    fn with_notices(handles: Vec<client::McpClientHandle>, notices: Vec<McpNotice>) -> Self {
         let mut manager = Self::from_handles(handles);
         manager.notices = notices;
         manager
@@ -230,10 +281,28 @@ impl McpClientManager {
         self.tool_notices
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .push(CompactString::new(notice));
+            .pending
+            .push(McpNotice::error(notice));
     }
 
-    #[cfg(test)]
+    /// Queue an informational catalog notice once for this manager. Agent
+    /// rebuilds enumerate the same MCP catalog repeatedly, so stable rename
+    /// mappings should not be re-announced on every rebuild.
+    fn push_tool_info_once(&self, notice: String) {
+        tracing::info!("{notice}");
+        let notice = CompactString::new(notice);
+        let mut state = self
+            .tool_notices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.last_info.as_ref() != Some(&notice) {
+            state.last_info = Some(notice.clone());
+            state.pending.push(McpNotice::info(notice));
+        }
+    }
+
+    /// Connect a selected server subset (persona-scoped child MCP routes).
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
     pub(crate) async fn connect_all_in_binding(
         configs: &HashMap<String, config::McpServerConfig>,
         workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
@@ -241,7 +310,7 @@ impl McpClientManager {
         if let Err(error) = workspace.validate() {
             return Self::with_notices(
                 Vec::new(),
-                vec![CompactString::new(format!(
+                vec![McpNotice::error(format!(
                     "MCP workspace is no longer valid: {error}"
                 ))],
             );
@@ -354,7 +423,7 @@ impl McpClientManager {
                     // Transport errors may contain an expanded URL or header
                     // credential. Health retains the typed outcome separately.
                     tracing::debug!("Failed to connect to MCP server '{}'", name);
-                    notices.push(CompactString::new(format!(
+                    notices.push(McpNotice::error(format!(
                         "MCP server '{name}' not connected (credential values omitted)"
                     )));
                 }
@@ -366,12 +435,14 @@ impl McpClientManager {
     }
 
     /// Drain and return any pending connection and tool-collection notices.
-    pub fn take_notices(&mut self) -> Vec<CompactString> {
+    pub(crate) fn take_notices(&mut self) -> Vec<McpNotice> {
         let mut notices = std::mem::take(&mut self.notices);
         notices.append(
-            self.tool_notices
+            &mut self
+                .tool_notices
                 .get_mut()
-                .unwrap_or_else(|error| error.into_inner()),
+                .unwrap_or_else(|error| error.into_inner())
+                .pending,
         );
         notices
     }
@@ -575,7 +646,7 @@ impl McpClientManager {
         let mut notice = String::from("MCP tool names adjusted; registered as ");
         notice.push_str(&renamed.join(", "));
         notice.push_str(" (permission keys keep the bare tool name)");
-        self.push_tool_notice(notice);
+        self.push_tool_info_once(notice);
     }
 
     /// (Re)connect a single server, replacing any existing handle for it.
@@ -865,11 +936,11 @@ mod tests {
         assert!(manager.handles.is_empty());
         assert_eq!(manager.notices.len(), 2);
         assert!(
-            manager.notices[0].contains("alpha"),
+            manager.notices[0].message().contains("alpha"),
             "first notice should name alpha"
         );
         assert!(
-            manager.notices[1].contains("beta"),
+            manager.notices[1].message().contains("beta"),
             "second notice should name beta"
         );
     }
@@ -885,9 +956,9 @@ mod tests {
         let workspace = std::env::current_dir().unwrap();
         let manager = McpClientManager::connect_all_in(&configs, &workspace).await;
         assert_eq!(manager.notices.len(), 3);
-        assert!(manager.notices[0].contains("alpha"));
-        assert!(manager.notices[1].contains("mu"));
-        assert!(manager.notices[2].contains("zeta"));
+        assert!(manager.notices[0].message().contains("alpha"));
+        assert!(manager.notices[1].message().contains("mu"));
+        assert!(manager.notices[2].message().contains("zeta"));
     }
 
     #[tokio::test]
@@ -923,7 +994,23 @@ mod tests {
     fn take_notices_drains_tool_notices_once() {
         let mut manager = McpClientManager::from_handles(Vec::new());
         manager.push_tool_notice("first".to_string());
-        assert_eq!(manager.take_notices(), vec![CompactString::new("first")]);
+        let notices = manager.take_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].level(), McpNoticeLevel::Error);
+        assert_eq!(notices[0].message(), "first");
+        assert!(manager.take_notices().is_empty());
+    }
+
+    #[test]
+    fn informational_tool_notices_are_queued_only_once() {
+        let mut manager = McpClientManager::from_handles(Vec::new());
+        manager.push_tool_info_once("stable rename".to_string());
+        manager.push_tool_info_once("stable rename".to_string());
+
+        let notices = manager.take_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].level(), McpNoticeLevel::Info);
+        assert_eq!(notices[0].message(), "stable rename");
         assert!(manager.take_notices().is_empty());
     }
 

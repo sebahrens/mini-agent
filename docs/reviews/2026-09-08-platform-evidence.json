@@ -1,5 +1,5 @@
 {
-  "source_run": "https://github.com/sebahrens/mini-agent/actions/runs/34190987872",
+  "source_run": "pre-migration-run:34190987872",
   "source_revision": "6021ba1cee1725d52930e17d239b305d6ed9ad66",
   "artifact_ids": {
     "js-worker-resource-baseline": 10042741041,

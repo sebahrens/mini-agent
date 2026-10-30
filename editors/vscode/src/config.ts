@@ -50,7 +50,7 @@ function overridePath(
   return paths.normalize(expanded);
 }
 
-/** Legacy per-OS `zerostack` roots whose presence marks an existing install. */
+/** Legacy per-OS `mini-agent` roots whose presence marks an existing install. */
 function legacyRoots(
   platform: NodeJS.Platform,
   homeDirectory: string,
@@ -66,11 +66,11 @@ function legacyRoots(
     const dataBase = xdgData && paths.isAbsolute(xdgData)
       ? xdgData
       : paths.join(homeDirectory, '.local', 'share');
-    const config = paths.join(configBase, 'zerostack');
-    return { config, markers: [config, paths.join(dataBase, 'zerostack')] };
+    const config = paths.join(configBase, 'mini-agent');
+    return { config, markers: [config, paths.join(dataBase, 'mini-agent')] };
   }
   if (platform === 'darwin') {
-    const config = paths.join(homeDirectory, 'Library', 'Application Support', 'zerostack');
+    const config = paths.join(homeDirectory, 'Library', 'Application Support', 'mini-agent');
     return { config, markers: [config] };
   }
   if (platform === 'win32') {
@@ -82,16 +82,16 @@ function legacyRoots(
     const localBase = local && paths.isAbsolute(local)
       ? local
       : paths.join(homeDirectory, 'AppData', 'Local');
-    const config = paths.join(roamingBase, 'zerostack');
-    return { config, markers: [config, paths.join(localBase, 'zerostack')] };
+    const config = paths.join(roamingBase, 'mini-agent');
+    return { config, markers: [config, paths.join(localBase, 'mini-agent')] };
   }
   throw new Error(`Mini Agent does not support configuration paths on ${platform}.`);
 }
 
 /**
  * Resolve the same configuration root as Rust `AppPaths`:
- * `ZS_CONFIG_DIR`, then `MINI_AGENT_HOME`, then `~/.mini-agent` when it exists
- * or no legacy `zerostack` root exists, otherwise the legacy per-OS root.
+ * `MINI_AGENT_CONFIG_DIR`, then `MINI_AGENT_HOME`, then `~/.mini-agent` when it
+ * exists or no legacy per-OS root exists, otherwise the legacy per-OS root.
  */
 export function resolveConfigDirectory(
   platform: NodeJS.Platform,
@@ -101,7 +101,7 @@ export function resolveConfigDirectory(
 ): string {
   const paths = pathApi(platform);
   const configOverride = overridePath(
-    'ZS_CONFIG_DIR', environment.ZS_CONFIG_DIR, homeDirectory, paths,
+    'MINI_AGENT_CONFIG_DIR', environment.MINI_AGENT_CONFIG_DIR, homeDirectory, paths,
   );
   if (configOverride !== undefined) { return configOverride; }
   const homeOverride = overridePath(

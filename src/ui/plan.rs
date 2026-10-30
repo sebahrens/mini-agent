@@ -222,12 +222,12 @@ mod tests {
     fn approval_binds_exact_turn_workspace_prompt_and_mode_without_auxiliary_metadata() {
         let root = crate::tests::OwnedTestDirectory::new("plan-approval-binding");
         let bindings = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&bindings);

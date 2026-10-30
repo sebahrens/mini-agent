@@ -203,6 +203,9 @@ jobs:
       - name: Test loop lifecycle
         run: python3 -m unittest scripts.tests.test_loop_lifecycle
 
+      - name: Test ghagent MCP companion
+        run: python3 -I -m unittest discover -s tools/ghagent-mcp
+
       - name: Test Cargo feature graph gate
         run: python3 -m unittest scripts.tests.test_check_feature_graph
 
@@ -1332,6 +1335,11 @@ jobs:
           skills_tests=$(cargo test --locked --no-default-features --features skills -- --list)
           containment_count=$(printf '%s\n' "$js_tests" | grep -c '^extras::js::tests::worker_containment::linux_js_worker_containment: test$')
           test "$containment_count" -eq 1
+          for probe in \
+            sandbox::worker::platform::tests::loaded_runtime_closure_keeps_loader_visible_soname_aliases \
+            extras::js::tests::worker_containment::linux_js_worker_survives_transient_launch_thread_exit; do
+            test "$(printf '%s\n' "$js_tests" | grep -Fxc "$probe: test")" -eq 1
+          done
 
           require_suite() {
             listing=$1
@@ -1363,7 +1371,10 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --no-default-features --features js \
-            linux_js_worker_containment -- --ignored --nocapture
+            -- linux_js_worker_containment \
+            loaded_runtime_closure_keeps_loader_visible_soname_aliases \
+            linux_js_worker_survives_transient_launch_thread_exit \
+            --ignored --nocapture --test-threads=1
           echo 'PHASE6_REAL_PROBE=passed' >> "$GITHUB_ENV"
 
       - name: Measure Linux JS worker resources without gating noisy timing percentiles
@@ -2966,7 +2977,7 @@ jobs:
             migration-silent-conflict \
             reserved-name-accepted
           do
-            if ZS_PLATFORM_PATH_NEGATIVE_CONTROL="$control" \
+            if MINI_AGENT_PLATFORM_PATH_NEGATIVE_CONTROL="$control" \
               cargo test --locked platform_paths_acceptance_intentional_negative_controls
             then
               echo "negative control unexpectedly passed: $control" >&2
@@ -3048,12 +3059,12 @@ jobs:
             $env:USERPROFILE = $cleanHome
           }
 
-          $env:ZS_CONFIG_DIR = Join-Path $smokeRoot 'config'
-          $env:ZS_DATA_DIR = Join-Path $smokeRoot 'data'
-          $env:ZS_LOCAL_DATA_DIR = Join-Path $smokeRoot 'local-data'
-          $env:ZS_STATE_DIR = Join-Path $smokeRoot 'state'
-          $env:ZS_CACHE_DIR = Join-Path $smokeRoot 'cache'
-          $env:ZS_CREDENTIALS_DIR = Join-Path $smokeRoot 'credentials'
+          $env:MINI_AGENT_CONFIG_DIR = Join-Path $smokeRoot 'config'
+          $env:MINI_AGENT_DATA_DIR = Join-Path $smokeRoot 'data'
+          $env:MINI_AGENT_LOCAL_DATA_DIR = Join-Path $smokeRoot 'local-data'
+          $env:MINI_AGENT_STATE_DIR = Join-Path $smokeRoot 'state'
+          $env:MINI_AGENT_CACHE_DIR = Join-Path $smokeRoot 'cache'
+          $env:MINI_AGENT_CREDENTIALS_DIR = Join-Path $smokeRoot 'credentials'
 
           $binaryName = if ($IsWindows) { 'mini-agent.exe' } else { 'mini-agent' }
           $binary = Join-Path (Join-Path $env:RUNNER_TEMP 'zerostack-platform-install/bin') $binaryName
@@ -3068,12 +3079,12 @@ jobs:
           }
           $text = $output -join [Environment]::NewLine
           $roots = @{
-            config = $env:ZS_CONFIG_DIR
-            data = $env:ZS_DATA_DIR
-            local_data = $env:ZS_LOCAL_DATA_DIR
-            state = $env:ZS_STATE_DIR
-            cache = $env:ZS_CACHE_DIR
-            credentials = $env:ZS_CREDENTIALS_DIR
+            config = $env:MINI_AGENT_CONFIG_DIR
+            data = $env:MINI_AGENT_DATA_DIR
+            local_data = $env:MINI_AGENT_LOCAL_DATA_DIR
+            state = $env:MINI_AGENT_STATE_DIR
+            cache = $env:MINI_AGENT_CACHE_DIR
+            credentials = $env:MINI_AGENT_CREDENTIALS_DIR
           }
           foreach ($entry in $roots.GetEnumerator()) {
             if (-not (Test-Path -PathType Container $entry.Value)) {

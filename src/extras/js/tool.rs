@@ -31,6 +31,8 @@ use crate::extras::js::host::{
 use crate::extras::js::host::{
     FETCH_REQUEST_BODY_MAX_BYTES, FETCH_RESPONSE_BODY_MAX_BYTES, FetchEffectService,
 };
+#[cfg(test)]
+use crate::extras::js::protocol::JsDiagnosticHint;
 use crate::extras::js::protocol::{
     ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass, DiagnosticStage, InvocationId,
     JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES, MAX_CONSOLE_RECORD_BYTES,
@@ -56,7 +58,8 @@ use crate::extras::js::supervisor::{JsWorkerSupervisor, WorkerError};
 use crate::extras::js::types::{
     MEMORY_LIMIT, PermCancellation, PermOutcome, PermRequest, PermRequestBuildError, PermResponse,
     PermResponseRejection, PermissionBackendFailure, PermissionDenial, READ_FILE_MAX_BYTES,
-    READ_FILES_MAX_PATHS, READ_FILES_MAX_RESULT_BYTES, STACK_LIMIT, STEP_TIMEOUT,
+    READ_FILES_MAX_PATHS, READ_FILES_MAX_RESULT_BYTES, READ_LINES_MAX_COUNT,
+    READ_LINES_MAX_LINE_BYTES, READ_LINES_MAX_SCAN_BYTES, STACK_LIMIT, STEP_TIMEOUT,
     WRITE_FILE_MAX_BYTES,
 };
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
@@ -680,7 +683,9 @@ pub struct JsTool {
     sandbox: Sandbox,
     allow_config: AllowConfig,
     supervisor: Arc<JsWorkerSupervisor>,
-    audit: Result<SharedEffectAudit, AuditError>,
+    // Production construction leaves the audit unopened. The first JS call
+    // performs retained-history validation on Tokio's blocking pool.
+    audit: Option<Result<SharedEffectAudit, AuditError>>,
     permission_bridge: PermissionBridgeOwner,
     scratch: ScratchStore,
     #[cfg(feature = "sandbox")]
@@ -713,7 +718,7 @@ impl JsTool {
             ask_tx,
             allow_config,
             JsWorkerSupervisor::shared(),
-            shared_effect_audit(),
+            None,
         )
     }
 
@@ -755,7 +760,7 @@ impl JsTool {
         ask_tx: Option<AskSender>,
         allow_config: AllowConfig,
         supervisor: Arc<JsWorkerSupervisor>,
-        audit: Result<SharedEffectAudit, AuditError>,
+        audit: Option<Result<SharedEffectAudit, AuditError>>,
     ) -> Self {
         let permission_bridge = PermissionBridgeOwner::new(permission, ask_tx, STEP_TIMEOUT);
         #[cfg(feature = "sandbox")]
@@ -794,6 +799,27 @@ impl JsTool {
     pub(crate) fn with_scratch_store(mut self, scratch: ScratchStore) -> Self {
         self.scratch = scratch;
         self
+    }
+
+    fn spawn_available(&self) -> bool {
+        self.profile == ModelEffectProfile::Full && self.sandbox.owns_complete_process_tree()
+    }
+
+    fn model_capabilities(&self) -> std::collections::BTreeSet<HostCapability> {
+        let mut capabilities = if self.profile == ModelEffectProfile::ReadOnly {
+            std::collections::BTreeSet::from([HostCapability::ReadFile])
+        } else {
+            std::collections::BTreeSet::from([
+                HostCapability::ReadFile,
+                HostCapability::WriteFile,
+                HostCapability::Fetch,
+                HostCapability::SessionState,
+            ])
+        };
+        if self.spawn_available() {
+            capabilities.insert(HostCapability::Spawn);
+        }
+        capabilities
     }
 
     #[cfg(feature = "skills")]
@@ -853,7 +879,7 @@ impl JsTool {
             ask_tx,
             allow_config,
             supervisor,
-            Ok(audit),
+            Some(Ok(audit)),
         )
     }
 
@@ -864,7 +890,14 @@ impl JsTool {
         supervisor: Arc<JsWorkerSupervisor>,
         error: AuditError,
     ) -> Self {
-        Self::new_with_runtime(sandbox, None, None, allow_config, supervisor, Err(error))
+        Self::new_with_runtime(
+            sandbox,
+            None,
+            None,
+            allow_config,
+            supervisor,
+            Some(Err(error)),
+        )
     }
 }
 
@@ -877,7 +910,7 @@ pub(crate) fn warm_shared_effect_audit() {
 /// Terminal group-commit barrier for one invocation: one `fsync` (on the blocking pool, never
 /// under the executor) covers every completion appended since the last intent/denial sync.
 async fn flush_pending_audit(audit: SharedEffectAudit) -> Result<(), ToolError> {
-    let unavailable = || ToolError::Msg("JS effect audit unavailable".into());
+    let unavailable = || audit_error(AuditError::Unavailable);
     crate::agent::runner::spawn_blocking_scoped(move || {
         audit
             .lock()
@@ -886,13 +919,104 @@ async fn flush_pending_audit(audit: SharedEffectAudit) -> Result<(), ToolError> 
     })
     .await
     .map_err(|_| unavailable())?
-    .map_err(|_| unavailable())
+    .map_err(|error| {
+        tracing::warn!(%error, "JS effect audit terminal sync failed");
+        audit_error(error)
+    })
+}
+
+/// Model-facing text for an audit failure: the failure class and a remediation, never a path.
+/// The detailed stage/errno is logged where the failure happens.
+fn audit_unavailable_message(error: AuditError) -> &'static str {
+    match error {
+        AuditError::WriterLocked => {
+            "JS effect audit unavailable: every audit slot is held by other mini-agent sessions; close one and retry later, or use read, grep or shell"
+        }
+        AuditError::PathUnavailable => {
+            "JS effect audit unavailable: audit storage is not accessible (check permissions of the mini-agent state directory)"
+        }
+        AuditError::SyncFailed => {
+            "JS effect audit unavailable: durable write failed (check free disk space in the mini-agent state directory)"
+        }
+        AuditError::CorruptRecord
+        | AuditError::HashMismatch
+        | AuditError::MissingSegment
+        | AuditError::InvalidMetadata => {
+            "JS effect audit unavailable: audit data is corrupt or incomplete (move the js-effects state directory aside to start a fresh audit)"
+        }
+        AuditError::RetentionLimit => {
+            "JS effect audit unavailable: audit retention limit reached (archive or remove old audit segments)"
+        }
+        AuditError::KeyUnavailable => {
+            "JS effect audit unavailable: audit target-correlation key is unavailable"
+        }
+        _ => {
+            "JS effect audit unavailable; retrying will not help in this session; use read, grep or shell"
+        }
+    }
+}
+
+fn audit_error(error: AuditError) -> ToolError {
+    ToolError::Msg(audit_unavailable_message(error).into())
+}
+
+/// Maximum failed `WriterLocked` opens retried within one process before the failure is final.
+const AUDIT_OPEN_MAX_RETRIES: u32 = 64;
+/// Minimum spacing between retried opens, so a held-slot storm cannot make every call re-scan.
+const AUDIT_OPEN_RETRY_SPACING: Duration = Duration::from_secs(2);
+
+/// Process-wide audit handle. A successful open and any permanent failure are cached; a
+/// `WriterLocked` failure (every slot held by other sessions) is transient and retried later.
+#[derive(Default)]
+struct SharedAuditCell {
+    state: std::sync::Mutex<SharedAuditState>,
+}
+
+#[derive(Default)]
+struct SharedAuditState {
+    result: Option<Result<SharedEffectAudit, AuditError>>,
+    transient_failures: u32,
+    last_attempt: Option<Instant>,
+}
+
+impl SharedAuditCell {
+    fn get_or_open(
+        &self,
+        now: Instant,
+        open: impl FnOnce() -> Result<SharedEffectAudit, AuditError>,
+    ) -> Result<SharedEffectAudit, AuditError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match &state.result {
+            Some(Ok(audit)) => return Ok(audit.clone()),
+            Some(Err(AuditError::WriterLocked)) => {
+                let spaced = state.last_attempt.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= AUDIT_OPEN_RETRY_SPACING
+                });
+                if state.transient_failures >= AUDIT_OPEN_MAX_RETRIES || !spaced {
+                    return Err(AuditError::WriterLocked);
+                }
+            }
+            Some(Err(error)) => return Err(*error),
+            None => {}
+        }
+        state.last_attempt = Some(now);
+        let result = open();
+        if matches!(result, Err(AuditError::WriterLocked)) {
+            state.transient_failures = state.transient_failures.saturating_add(1);
+        }
+        state.result = Some(result.clone());
+        result
+    }
 }
 
 fn shared_effect_audit() -> Result<SharedEffectAudit, AuditError> {
-    static SHARED: OnceLock<Result<SharedEffectAudit, AuditError>> = OnceLock::new();
+    static SHARED: OnceLock<SharedAuditCell> = OnceLock::new();
     SHARED
-        .get_or_init(|| {
+        .get_or_init(SharedAuditCell::default)
+        .get_or_open(Instant::now(), || {
             #[cfg(test)]
             let paths = {
                 let root = std::env::temp_dir().join(format!(
@@ -913,10 +1037,78 @@ fn shared_effect_audit() -> Result<SharedEffectAudit, AuditError> {
             #[cfg(not(test))]
             let paths =
                 crate::paths::process_paths_ref().map_err(|_| AuditError::PathUnavailable)?;
-            EffectAudit::open(paths.effect_audit())
-                .map(|audit| Arc::new(std::sync::Mutex::new(audit)))
+            {
+                #[cfg(test)]
+                let audit = open_first_free_audit_slot(&paths);
+                // Outside tests `paths` is already a reference to the process paths.
+                #[cfg(not(test))]
+                let audit = open_first_free_audit_slot(paths);
+                audit
+            }
         })
-        .clone()
+}
+
+/// The audit allows one writer per directory, and every mini-agent on the machine shares the
+/// state directory. A process therefore claims the first slot whose writer lock is free, so
+/// parallel agents (other panes, headless goals) never lose the `js` tool to each other. Any
+/// failure other than a held lock is final: it is logged and returned, not retried.
+fn open_first_free_audit_slot(
+    paths: &crate::paths::AppPaths,
+) -> Result<SharedEffectAudit, AuditError> {
+    for slot in 0..MAX_AUDIT_SLOTS {
+        match EffectAudit::open(paths.effect_audit_slot(slot)) {
+            Ok(audit) => return Ok(Arc::new(std::sync::Mutex::new(audit))),
+            Err(AuditError::WriterLocked) => continue,
+            Err(error) => {
+                tracing::warn!(%error, slot, "JS effect audit could not be opened");
+                return Err(error);
+            }
+        }
+    }
+    tracing::warn!(
+        slots = MAX_AUDIT_SLOTS,
+        "every JS effect audit slot is locked"
+    );
+    Err(AuditError::WriterLocked)
+}
+
+/// Upper bound on concurrent audit writers (one slot directory per live mini-agent process).
+const MAX_AUDIT_SLOTS: u32 = 64;
+
+/// Idioms taught in the full description; each line addresses a measured wrong answer.
+const IDIOMS: &str = "Idioms: one script per question. If the format is unknown, log one \
+    sample first. `console.log` is for debugging; the answer is `result(x)` or the last \
+    expression (scripts are not functions: no top-level `return`; a plain string answer is \
+    capped by the result limit). Count lines with `splitLines(t).length`, never `t.split('\\n')`. \
+    Parse JSON that may hold integers above 2^53 with `json_exact`; `JSON.parse` silently \
+    rounds them. Use `grep` or `read_lines` for huge files, not `read_file`. To explore a \
+    repo, use one script: list the tree with `list_dir`/`glob`, then print the first ~15 lines \
+    of each interesting file via `read_lines(path, 1, 15).lines`, not many separate calls. Other \
+    pure helpers are listed by `help()`.";
+
+const READ_ONLY_IDIOMS: &str = "Idioms: one script per question; log one sample first if the \
+    format is unknown; answer with the last expression, not `return`; count with \
+    `splitLines(t).length`, not `split('\\n')`; use `json_exact` for integers above 2^53; use `grep` \
+    or `read_lines` for huge files. Other pure helpers are listed by `help()`.";
+
+/// Contracts for `splitLines`, `json_exact`, and `read_lines`, shared by both description variants.
+fn helper_globals_doc() -> [String; 4] {
+    [
+        "`splitLines(text: string): string[]` (pure; handles \\r\\n; no phantom last element)."
+            .to_string(),
+        "`json_exact(text: string): any` (pure; JSON.parse that returns integers beyond 2^53 as BigInt, not rounded; output with `String(x)`)."
+            .to_string(),
+        "`toml_parse(text: string): object` and `csv_parse(text: string, {header?: boolean}): string[][] | object[]` (pure; 4 MiB max; TOML inline tables/arrays of tables/quoted keys, CSV quotes/CRLF; integers beyond 2^53 are BigInt)."
+            .to_string(),
+        format!(
+            "`read_lines(path: string, from: number, count?: number): {{lines: string[], eof: boolean}}` (synchronous; one read effect; 1-based `from`, negative = last N lines; files over {} MiB ok, scans max {} MiB, count max {}, about {} MiB returned else eof=false, lines cut at {} KiB). Example: `read_lines('app.log', -50).lines`.",
+            READ_FILE_MAX_BYTES / (1024 * 1024),
+            READ_LINES_MAX_SCAN_BYTES / (1024 * 1024),
+            READ_LINES_MAX_COUNT,
+            READ_FILE_MAX_BYTES / (1024 * 1024),
+            READ_LINES_MAX_LINE_BYTES / 1024,
+        ),
+    ]
 }
 
 impl Tool for JsTool {
@@ -936,11 +1128,13 @@ impl Tool for JsTool {
                  'file'|'directory', size: number}}[], truncated: boolean}}`, and \
                  `grep(pattern: string, options?: {{path?: string, include?: string, \
                  case_sensitive?: boolean}}): {{matches: {{path: string, line: number, text: \
-                 string}}[], truncated: boolean}}`. `console.log` is available for bounded \
-                 diagnostics. Writer, network, process, session-state, proposal, batch-read, and \
+                 string}}[], truncated: boolean}}`, plus `splitLines`, `json_exact`, and \
+                 `read_lines`. {} `console.log` is available for bounded diagnostics. {} Writer, network, process, session-state, proposal, batch-read, and \
                  glob globals are absent. Return a string, finite number, boolean, or \
                  accessor-free plain JSON value. Limits per call: {} s total, {} MiB JavaScript \
                  heap, {} KiB JavaScript stack, {} KiB result, and {} read effects.",
+                helper_globals_doc().join(" "),
+                READ_ONLY_IDIOMS,
                 STEP_TIMEOUT.as_secs(),
                 MEMORY_LIMIT / (1024 * 1024),
                 STACK_LIMIT / 1024,
@@ -958,6 +1152,7 @@ impl Tool for JsTool {
                 READ_FILES_MAX_PATHS,
                 READ_FILES_MAX_RESULT_BYTES / (1024 * 1024)
             ),
+            helper_globals_doc().join(" "),
             "`list_dir(path?: string): {entries: {name: string, kind: 'file'|'directory', size: number}[], truncated: boolean}` (synchronous; defaults to '.').".to_string(),
             "`glob(pattern: string, options?: {path?: string}): {paths: string[], truncated: boolean}` (synchronous, recursive, respects ignore files). Example: `const files = glob('**/*.rs').paths;`".to_string(),
             "`grep(pattern: string, options?: {path?: string, include?: string, case_sensitive?: boolean}): {matches: {path: string, line: number, text: string}[], truncated: boolean}` (synchronous Rust regex search; case-sensitive by default; matched lines only).".to_string(),
@@ -966,8 +1161,9 @@ impl Tool for JsTool {
                 WRITE_FILE_MAX_BYTES / (1024 * 1024)
             ),
             format!(
-                "`result(value): never` (synchronous terminal structured result; strict plain JSON, max {} KiB). Example: `result({{files: 3, ok: true}});`",
-                STRUCTURED_RESULT_MAX_BYTES / 1024
+                "`result(value): never` (synchronous terminal structured result; strict plain JSON, max {} KiB; a plain returned value is capped at {} KiB; still accepted after the effect limit, so a catch block can return partial data). Example: `result({{files: 3, ok: true}});`",
+                STRUCTURED_RESULT_MAX_BYTES / 1024,
+                MAX_RESULT_BYTES / 1024
             ),
             format!(
                 "`scratch_put(key: string, value): void` / `scratch_get(key: string): JSON|null` (synchronous, parent-owned across fresh runtimes; keys max {} bytes, values max {} MiB, {} MiB/{} entries per session).",
@@ -1008,7 +1204,10 @@ impl Tool for JsTool {
             );
             proposal_guidance = " After a pattern proves repeated and generalizable, curate it with \
                 propose_skill({source, description, exports: [{name, signature}], tests, \
-                capability: {tier, grants}, tags?, predecessor_id?}). Every test must be a \
+                capability: {tier, grants}, tags?, predecessor_id?}). The stored source declares \
+                a hidden capability parameter FIRST in every export: write `function name(_cap, \
+                a, b) {...}`, while callers (and tests) omit it and write `name(a, b)`; \
+                `signature` shows the caller's view without `_cap`. Every test must be a \
                 JavaScript expression that returns exactly true. Tier is pure, read_only, or \
                 side_effecting. Grants use {kind: 'read_file'|'write_file', workspace_prefixes}, \
                 {kind: 'fetch', origins, methods}, or {kind: 'spawn', programs}; use [] when no \
@@ -1038,7 +1237,7 @@ impl Tool for JsTool {
              `undefined`, NaN/Infinity, holes, accessors, Date, Map, Set, or class instances, end \
              with `JSON.stringify(value)` or return a string explicitly. Use `result(value)` for \
              a validated structured result and `scratch_put`/`scratch_get` for JSON values that \
-             must survive the next fresh-runtime call. \
+             must survive the next fresh-runtime call. {} \
              Limits per call: {} s total, {} MiB JavaScript heap, {} KiB JavaScript stack, {} KiB \
              result, and {} effect calls. The next effect returns a closed effect-limit error while \
              preserving bounded console output. Catchable effect failures are plain `Error` \
@@ -1046,6 +1245,7 @@ impl Tool for JsTool {
              `invalid_target`, or `too_large`; messages never include the target. Runtime failures \
              use closed, source-free error classes.{}",
             globals.join(" "),
+            IDIOMS,
             STEP_TIMEOUT.as_secs(),
             MEMORY_LIMIT / (1024 * 1024),
             STACK_LIMIT / 1024,
@@ -1071,6 +1271,14 @@ impl Tool for JsTool {
             .check_async("js", &args.code)
             .await
             .map_err(|error| ToolError::Msg(error.to_string()))?;
+
+        let audit = match &self.audit {
+            Some(audit) => audit.clone(),
+            None => tokio::task::spawn_blocking(shared_effect_audit)
+                .await
+                .map_err(|_| audit_error(AuditError::Unavailable))?,
+        }
+        .map_err(audit_error)?;
 
         // Create one absolute deadline for the entire invocation (30s from start)
         let call_deadline = Instant::now()
@@ -1105,19 +1313,7 @@ impl Tool for JsTool {
         let prepared_skill_manifests =
             prepare_skill_manifests(&skill_bundle, call_deadline, cancellation.clone()).await?;
         let grant_expires_at = call_deadline;
-        let mut model_capabilities = if self.profile == ModelEffectProfile::ReadOnly {
-            std::collections::BTreeSet::from([HostCapability::ReadFile])
-        } else {
-            std::collections::BTreeSet::from([
-                HostCapability::ReadFile,
-                HostCapability::WriteFile,
-                HostCapability::Fetch,
-                HostCapability::SessionState,
-            ])
-        };
-        if self.profile == ModelEffectProfile::Full && self.sandbox.owns_complete_process_tree() {
-            model_capabilities.insert(HostCapability::Spawn);
-        }
+        let model_capabilities = self.model_capabilities();
         let grant = InvocationGrant::issue(
             invocation_id.clone(),
             GrantPrincipal::ModelAuthored {
@@ -1186,10 +1382,6 @@ impl Tool for JsTool {
         } else {
             service
         };
-        let audit = self
-            .audit
-            .clone()
-            .map_err(|_| ToolError::Msg("JS effect audit unavailable".into()))?;
         let structured_result_receipt = super::session::StructuredResultReceipt::default();
         let terminal_audit = Arc::clone(&audit);
         let broker = InvocationBroker::new(
@@ -1209,10 +1401,7 @@ impl Tool for JsTool {
         let run_step = RunStep::new(model_source.clone())
             .with_model_grant(model_grant_id)
             .with_model_effect_profile(self.profile)
-            .with_spawn_available(
-                self.profile == ModelEffectProfile::Full
-                    && self.sandbox.owns_complete_process_tree(),
-            );
+            .with_spawn_available(self.spawn_available());
         #[cfg(feature = "skills")]
         let run_step = if let Some(grant_id) = proposal_grant_id {
             run_step.with_proposal_grant(grant_id)
@@ -1268,18 +1457,24 @@ impl Tool for JsTool {
             return Ok(PERMISSION_PROMPT_TIMEOUT_MESSAGE.to_string());
         }
 
+        // mini-agent-pff43: a read-only child runs without a telemetry dispatcher by design
+        // (`fork_for_read_only_child`), so its skill events have nowhere to go. That is not an
+        // observability loss: nothing is reported or marked lost. A parent tool without a
+        // dispatcher still fails closed inside `dispatch_skill_telemetry`.
         #[cfg(feature = "skills")]
-        dispatch_skill_telemetry(
-            self.telemetry.as_deref(),
-            &self.skill_turn_context,
-            &skill_bundle,
-            &skill_tool_call_id,
-            &response.outcome,
-            &response.skill_events,
-            response.evidence_complete,
-            capability_denials.snapshot(),
-            self.skill_production,
-        );
+        if self.profile != ModelEffectProfile::ReadOnly || self.telemetry.is_some() {
+            dispatch_skill_telemetry(
+                self.telemetry.as_deref(),
+                &self.skill_turn_context,
+                &skill_bundle,
+                &skill_tool_call_id,
+                &response.outcome,
+                &response.skill_events,
+                response.evidence_complete,
+                capability_denials.snapshot(),
+                self.skill_production,
+            );
+        }
 
         let output = render_step_result(&response);
         #[cfg(feature = "skills")]
@@ -1322,6 +1517,7 @@ pub(crate) fn with_settled_proposal_outcomes(
                     "proposal_id": outcome.proposal_id,
                     "status": outcome.status.as_str(),
                     "reason_code": outcome.reason_code,
+                    "detail": outcome.detail,
                 })
             })
             .collect::<Vec<_>>();
@@ -1340,6 +1536,10 @@ pub(crate) fn with_settled_proposal_outcomes(
             output.push_str(" (reason: ");
             output.push_str(reason_code);
             output.push(')');
+        }
+        if let Some(detail) = outcome.detail.as_deref() {
+            output.push_str(" Detail: ");
+            output.push_str(detail);
         }
         output.push('.');
     }
@@ -1441,7 +1641,7 @@ fn dispatch_skill_telemetry(
     tool_call_id: &str,
     step_outcome: &StepOutcome,
     worker_events: &[crate::extras::js::skills::telemetry::SkillEvent],
-    _worker_claimed_evidence_complete: bool,
+    worker_claimed_evidence_complete: bool,
     capability_denials: Option<crate::extras::js::broker::SkillDenialSnapshot>,
     production: bool,
 ) -> bool {
@@ -1489,7 +1689,7 @@ fn dispatch_skill_telemetry(
         scope_misses,
     };
 
-    let batch = match bind_worker_events(&context, worker_events) {
+    let mut batch = match bind_worker_events(&context, worker_events) {
         Ok(batch) => batch,
         Err(_) => {
             turn_context.mark_evidence_lost();
@@ -1503,6 +1703,10 @@ fn dispatch_skill_telemetry(
             return false;
         }
     };
+    if !worker_claimed_evidence_complete {
+        turn_context.mark_evidence_lost();
+        batch.mark_evidence_incomplete();
+    }
     if batch.events().is_empty() {
         return true;
     }
@@ -1681,6 +1885,15 @@ fn validate_step_diagnostic(result: &StepResult, model_source: &str) -> Result<(
     ) {
         return Err(());
     }
+    if diagnostic.hint.is_some()
+        && (diagnostic.script_role != ScriptRole::Model
+            || !matches!(
+                diagnostic.class,
+                DiagnosticClass::Exception | DiagnosticClass::Syntax
+            ))
+    {
+        return Err(());
+    }
     let location = match (diagnostic.line, diagnostic.column) {
         (None, None) => None,
         (Some(line), Some(column))
@@ -1777,6 +1990,10 @@ fn render_failure(headline: &str, result: &StepResult) -> String {
         if let (Some(line), Some(column)) = (diagnostic.line, diagnostic.column) {
             text.push_str(&format!(" at {line}:{column}"));
         }
+        if let Some(hint) = diagnostic.hint {
+            text.push_str(": ");
+            text.push_str(hint.text());
+        }
         text.push_str(" (");
         render_diagnostic(diagnostic, &mut text);
         text.push(')');
@@ -1791,16 +2008,25 @@ fn render_failure(headline: &str, result: &StepResult) -> String {
 
 fn js_error_headline(code: JsErrorCode, diagnostic: Option<&Diagnostic>) -> String {
     if code == JsErrorCode::InvalidResult {
-        return "JS error: invalid result; return a string/plain JSON value or end with JSON.stringify(value)"
-            .into();
+        return format!(
+            "JS error: invalid result; return a string/plain JSON value of at most {} KiB or end with JSON.stringify(value) (cap for returned values; result(value), where available, allows {} KiB)",
+            MAX_RESULT_BYTES / 1024,
+            STRUCTURED_RESULT_MAX_BYTES / 1024
+        );
+    }
+    if code == JsErrorCode::EffectLimit {
+        return format!(
+            "JS error: effect limit exceeded ({MAX_EFFECTS_PER_STEP} per call); batch with read_files(paths) or glob()"
+        );
     }
     let Some(exception_class) = diagnostic.and_then(|diagnostic| diagnostic.exception_class) else {
         return format!("JS error: {}", js_error_code(code));
     };
     if code == JsErrorCode::StackLimit {
         return format!(
-            "JS {}: stack limit exceeded",
-            js_exception_class_name(exception_class)
+            "JS {}: stack limit exceeded ({} KiB stack)",
+            js_exception_class_name(exception_class),
+            STACK_LIMIT / 1024
         );
     }
     if exception_class == JsExceptionClass::Other {
@@ -1886,6 +2112,11 @@ pub struct JsArgs {
     pub code: String,
 }
 
+// Tests of the `pack_diff.js` / `pack_iac.js` segments, kept in their own file.
+#[cfg(test)]
+#[path = "pack_diff_iac_tests.rs"]
+mod pack_diff_iac_tests;
+
 #[cfg(test)]
 mod js_permission_bridge {
     use std::sync::Mutex;
@@ -1933,6 +2164,18 @@ mod js_permission_bridge {
     fn reply(envelope: PermissionEnvelope, outcome: PermOutcome) {
         let request_id = envelope.request.id();
         envelope.reply.send(PermResponse::new(request_id, outcome));
+    }
+
+    #[tokio::test]
+    async fn js_tool_constructor_defers_shared_audit_open() {
+        let tool = JsTool::new(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        );
+
+        assert!(tool.audit.is_none());
     }
 
     #[tokio::test]
@@ -2482,6 +2725,35 @@ mod js_permission_bridge {
 
     #[cfg(feature = "skills")]
     #[test]
+    fn valid_worker_batch_with_incomplete_claim_cannot_be_promoted_to_complete() {
+        use crate::extras::js::skills::telemetry::TelemetryDispatcher;
+
+        let (bundle, injected) = telemetry_fixture();
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let dispatcher = TelemetryDispatcher::from_sender_for_test(tx);
+        let turn_context = crate::extras::js::skills::turn::SkillTurnContext::new(bundle.clone());
+
+        assert!(dispatch_skill_telemetry(
+            Some(&dispatcher),
+            &turn_context,
+            &bundle,
+            "parent-turn:js:0",
+            &StepOutcome::Value("ok".into()),
+            &[injected],
+            false,
+            Some(Default::default()),
+            false,
+        ));
+        let batch = rx.try_recv().expect("canonical batch should be queued");
+        assert!(
+            batch.events().iter().all(|event| !event.evidence_complete),
+            "the worker's incomplete ceiling must apply to parent-added events"
+        );
+        assert!(!turn_context.evidence_complete());
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
     fn saturated_and_disconnected_dispatchers_fail_closed_for_positive_evidence() {
         use crate::extras::js::skills::telemetry::TelemetryDispatcher;
 
@@ -2545,7 +2817,10 @@ mod js_permission_bridge {
             .await
             .expect_err("unavailable audit must fail before worker launch");
 
-        assert_eq!(error.to_string(), "JS effect audit unavailable");
+        assert_eq!(
+            error.to_string(),
+            "JS effect audit unavailable; retrying will not help in this session; use read, grep or shell"
+        );
         assert_eq!(supervisor.generation_for_test().await, None);
         assert_eq!(supervisor.active_generation_for_test().await, None);
     }
@@ -2717,6 +2992,24 @@ mod js_permission_bridge {
         );
     }
 
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn read_only_constructor_narrows_parent_authority_even_with_process_tree_ownership() {
+        let tool = JsTool::new_read_only(
+            Sandbox::new(false, "bwrap").with_complete_process_tree_for_test(),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        );
+
+        assert_eq!(tool.profile, ModelEffectProfile::ReadOnly);
+        assert_eq!(
+            tool.model_capabilities(),
+            std::collections::BTreeSet::from([HostCapability::ReadFile])
+        );
+        assert!(!tool.spawn_available());
+    }
+
     #[cfg(feature = "skills")]
     #[tokio::test]
     async fn read_only_tool_rejects_a_non_pure_bundle_before_worker_launch() {
@@ -2772,6 +3065,47 @@ mod js_permission_bridge {
             "read-only JS skill bundle contains a non-pure capability"
         );
         assert_eq!(supervisor.generation_for_test().await, None);
+    }
+
+    // mini-agent-pff43: a read-only child has no telemetry dispatcher by design, so calling a
+    // pure skill there must not log `observability_lost` or mark its evidence lost; a parent
+    // (non-read-only) tool without a dispatcher still fails closed.
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn read_only_child_pure_skill_call_is_not_an_observability_loss() {
+        use crate::extras::js::skills::turn::SkillTurnContext;
+        use rig::tool::Tool;
+
+        for (profile, expect_complete) in [
+            (ModelEffectProfile::ReadOnly, true),
+            (ModelEffectProfile::Full, false),
+        ] {
+            let (bundle, _) = telemetry_fixture();
+            let context = Arc::new(SkillTurnContext::new(bundle));
+            let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+                crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+            ));
+            let mut tool = JsTool::new_with_runtime_for_test(
+                Sandbox::new(false, "bwrap"),
+                None,
+                None,
+                AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+                supervisor,
+                shared_effect_audit().expect("test effect audit"),
+            )
+            .with_skill_turn_context(context.clone());
+            tool.profile = profile;
+            assert!(tool.telemetry.is_none());
+
+            let out = tool
+                .call(JsArgs {
+                    code: "run()".into(),
+                })
+                .await
+                .expect("the pure skill call runs");
+            assert_eq!(out, "1", "{profile:?}");
+            assert_eq!(context.evidence_complete(), expect_complete, "{profile:?}");
+        }
     }
 
     #[tokio::test]
@@ -3006,7 +3340,40 @@ mod js_permission_bridge {
         let error = flush_pending_audit(audit.clone())
             .await
             .expect_err("a failed terminal sync must replace the step result");
-        assert_eq!(error.to_string(), "JS effect audit unavailable");
+        assert_eq!(
+            error.to_string(),
+            audit_unavailable_message(AuditError::SyncFailed)
+        );
+    }
+
+    #[test]
+    fn audit_failures_map_to_distinct_source_free_classes() {
+        let all = [
+            AuditError::PathUnavailable,
+            AuditError::WriterLocked,
+            AuditError::SyncFailed,
+            AuditError::CorruptRecord,
+            AuditError::RetentionLimit,
+            AuditError::KeyUnavailable,
+            AuditError::Unavailable,
+        ];
+        let messages: Vec<_> = all.into_iter().map(audit_unavailable_message).collect();
+        let distinct: std::collections::HashSet<_> = messages.iter().collect();
+        assert_eq!(distinct.len(), messages.len());
+        for message in &messages {
+            assert!(message.starts_with("JS effect audit unavailable"));
+            assert!(!message.contains('/'));
+        }
+        for same in [
+            AuditError::HashMismatch,
+            AuditError::MissingSegment,
+            AuditError::InvalidMetadata,
+        ] {
+            assert_eq!(
+                audit_unavailable_message(same),
+                audit_unavailable_message(AuditError::CorruptRecord)
+            );
+        }
     }
 
     #[tokio::test]
@@ -3038,6 +3405,797 @@ mod js_permission_bridge {
             .expect("an accepted structured result must keep the worker");
         assert_eq!(tool.call(JsArgs { code: "1".into() }).await.unwrap(), "1");
         assert_eq!(supervisor.generation_for_test().await, Some(generation));
+    }
+
+    fn helper_tool(profile: ModelEffectProfile, root: &std::path::Path) -> JsTool {
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let mut tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(root),
+            supervisor,
+            shared_effect_audit().expect("test effect audit"),
+        );
+        tool.profile = profile;
+        tool
+    }
+
+    async fn run_js(tool: &JsTool, code: &str) -> String {
+        tool.call(JsArgs { code: code.into() })
+            .await
+            .unwrap_or_else(|error| format!("TOOL ERROR: {error}"))
+    }
+
+    // Data-oriented pack segments (path/tally/stats, semver, yaml); shares the helpers above.
+    mod pack_data_tests;
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mini-agent-read-lines-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every helper of `pack_helpers.js`; each must be listed by `help()` and installed.
+    const PACK_HELPER_NAMES: [&str; 4] = ["date_parse", "date_fmt", "glob_match", "glob_filter"];
+
+    #[tokio::test]
+    async fn description_mentions_every_helper_global_and_each_is_installed() {
+        let root = std::env::current_dir().unwrap();
+        for profile in [ModelEffectProfile::Full, ModelEffectProfile::ReadOnly] {
+            let tool = helper_tool(profile, &root);
+            let description = tool.description();
+            for name in [
+                "splitLines",
+                "json_exact",
+                "read_lines",
+                "toml_parse",
+                "csv_parse",
+            ] {
+                assert!(
+                    description.contains(&format!("`{name}")),
+                    "{profile:?} description must document {name}"
+                );
+                assert_eq!(
+                    run_js(&tool, &format!("typeof {name}")).await,
+                    "function",
+                    "{profile:?} must install {name}"
+                );
+            }
+            assert!(description.contains("Idioms:"));
+            // Pack helpers stay out of the always-sent description: they are asserted through
+            // the `help()` catalogue and `typeof` (which triggers the lazy load).
+            assert!(description.contains("`help()`"), "{profile:?}");
+            assert_eq!(
+                run_js(&tool, "typeof help").await,
+                "function",
+                "{profile:?}"
+            );
+            let catalogue = run_js(&tool, "help()").await;
+            for name in PACK_HELPER_NAMES {
+                assert!(
+                    catalogue.contains(&format!("{name}(")),
+                    "{profile:?} help() must list {name}: {catalogue}"
+                );
+                assert!(
+                    !description.contains(&format!("`{name}")),
+                    "{profile:?} description must not carry pack helper {name}"
+                );
+                assert_eq!(
+                    run_js(&tool, &format!("typeof {name}")).await,
+                    "function",
+                    "{profile:?} must install {name}"
+                );
+                assert!(
+                    run_js(&tool, &format!("help('{name}')"))
+                        .await
+                        .contains(name)
+                );
+            }
+        }
+        // The description is paid on every request: it grew by about 1.3 KB over the 3384-byte
+        // baseline plus 227 bytes for toml_parse/csv_parse (4831 measured); it must stay modest.
+        // The bound later absorbed other work (4956 bytes before the help() sentence) and rises
+        // by exactly the 43 bytes of " Other pure helpers are listed by `help()`." (4999 measured).
+        let full = helper_tool(ModelEffectProfile::Full, &root)
+            .description()
+            .len();
+        assert!(
+            full < 3384 + 1350 + 230 + 43,
+            "full description is {full} bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_lines_has_no_phantom_trailing_element_and_handles_crlf() {
+        let root = std::env::current_dir().unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &root);
+        let code = r"JSON.stringify([
+            splitLines('a\nb\n'), splitLines('a\nb'), splitLines('a\r\nb\r\n'), splitLines(''), splitLines('\n'),
+            splitLines('a\n\nb\n'), splitLines('x\n'.repeat(4218)).length,
+        ])";
+        assert_eq!(
+            run_js(&tool, code).await,
+            r#"[["a","b"],["a","b"],["a","b"],[],[""],["a","","b"],4218]"#
+        );
+        let bad = run_js(&tool, "splitLines(1)").await;
+        assert!(bad.contains("JS"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn a_script_may_name_its_variable_lines_without_a_collision() {
+        let root = std::env::current_dir().unwrap();
+        for profile in [ModelEffectProfile::Full, ModelEffectProfile::ReadOnly] {
+            let tool = helper_tool(profile, &root);
+            let ok = run_js(
+                &tool,
+                "const text = 'a\\nb\\n'; const lines = splitLines(text); lines.length + ':' + lines[1]",
+            )
+            .await;
+            assert_eq!(ok, "2:b", "{profile:?}");
+            // The old global is gone: nothing named `lines` is predefined, so the natural
+            // variable name can never hit a temporal-dead-zone ReferenceError.
+            assert_eq!(
+                run_js(&tool, "typeof lines").await,
+                "undefined",
+                "{profile:?}"
+            );
+            assert!(!tool.description().contains("`lines("), "{profile:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_limit_errors_state_the_limit_and_the_remedy() {
+        let root = std::env::current_dir().unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &root);
+        let count = run_js(
+            &tool,
+            "try { read_lines('Cargo.toml', 1, 20000) } catch (e) { e.message + '|' + e.code }",
+        )
+        .await;
+        assert_eq!(
+            count,
+            "read_lines: too_large (count max 10000, scan max 64 MiB per call; read a smaller from/count range or use grep())|too_large"
+        );
+        assert!(count.chars().count() <= 300, "{count}");
+        let scratch = scratch_dir();
+        let big = scratch.join("big.txt");
+        std::fs::write(&big, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &scratch);
+        let file = run_js(
+            &tool,
+            &format!(
+                "try {{ read_file('{}') }} catch (e) {{ e.message }}",
+                big.display()
+            ),
+        )
+        .await;
+        assert_eq!(
+            file,
+            "read_file: too_large (limit 1 MiB; use read_lines(path, from, count) or grep() for large files)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_collection_type_errors_get_a_property_hint() {
+        let root = std::env::current_dir().unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &root);
+        for code in [
+            "for (const f of list_dir('.')) {}",
+            "read_files(glob('*.toml'))",
+            "const [a] = grep('x', {path: '.'});",
+        ] {
+            let out = run_js(&tool, code).await;
+            assert!(out.starts_with("JS TypeError"), "{code}: {out}");
+            assert!(
+                out.contains("glob() returns {paths}, list_dir() returns {entries}, grep() returns {matches}: use the array property"),
+                "{code}: {out}"
+            );
+            assert!(
+                out.chars().count() <= 330,
+                "{code}: {}",
+                out.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn collection_hint_only_applies_to_matching_type_errors() {
+        use JsExceptionClass::{RangeError, TypeError};
+        let hinted = |class, text: &str| JsDiagnosticHint::from_exception(class, text).is_some();
+        assert!(hinted(TypeError, "value is not iterable"));
+        assert!(hinted(
+            TypeError,
+            "Error converting from js object into type 'array'"
+        ));
+        assert!(!hinted(TypeError, "x is not a function"));
+        assert!(!hinted(RangeError, "value is not iterable"));
+        let long = format!("{} is not iterable", "y".repeat(500));
+        let out = JsDiagnosticHint::from_exception(TypeError, &long)
+            .unwrap()
+            .text();
+        assert!(!out.contains(&"y".repeat(500)), "{out}");
+    }
+
+    #[tokio::test]
+    async fn json_exact_keeps_integers_beyond_2_pow_53() {
+        let root = std::env::current_dir().unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &root);
+        // Plain JSON.parse rounds 2^53+1; json_exact does not.
+        let code = r#"
+            const text = '{"a": 9007199254740993, "b": [12345678901234567890, -9007199254740993], "c": 1.5e300, "d": "9007199254740993", "e": 7, "f": 9007199254740991}';
+            const v = json_exact(text);
+            JSON.stringify([String(v.a), String(v.b[0]), String(v.b[1]), String(v.a + v.b[0]),
+                typeof v.a, v.c, v.d, v.e, v.f, typeof v.e, String(JSON.parse(text).a)])"#;
+        assert_eq!(
+            run_js(&tool, code).await,
+            r#"["9007199254740993","12345678901234567890","-9007199254740993","12354686100489308883","bigint",1.5e+300,"9007199254740993",7,9007199254740991,"number","9007199254740992"]"#
+        );
+        let malformed = run_js(&tool, "json_exact('{\"a\": 1,}')").await;
+        assert!(malformed.contains("JS"), "{malformed}");
+    }
+
+    #[tokio::test]
+    async fn date_helpers_are_utc_only_exact_and_bounded() {
+        let root = std::env::current_dir().unwrap();
+        for profile in [ModelEffectProfile::Full, ModelEffectProfile::ReadOnly] {
+            let tool = helper_tool(profile, &root);
+            let code = r##"
+                const p = (...a) => date_parse(...a);
+                JSON.stringify([
+                  p('2025-10-10'), p('2025-10-10T13:55:36Z'), p('2025-10-10T13:55:36.123456+05:30'),
+                  p('2025-10-10 13:55'), p('2024-02-29'), p('0005-01-01'), p('2025-10-10T01:00:00-0130'),
+                  p('2025-02-30'), p('2023-02-29'), p('2025-13-01'), p('2025-10-10T24:00:00Z'),
+                  p('2025-10-10T13:55:36+25:00'), p('2025-04-31'), p('25-10-10'),
+                  p('Fri, 10 Oct 2025 13:55:36 +0200'), p('Thu, 10 Oct 2025 13:55:36 +0200'),
+                  p('10 Oct 2025 13:55 GMT'), p('Fri, 31 Feb 2025 13:55:36 +0000'),
+                  p('10/Oct/2025:13:55:36 +0200'), p('[10/Oct/2025:13:55:36 -0700]'),
+                  p('31/Feb/2025:10:00:00 +0000'), p('10/Foo/2025:10:00:00 +0000'),
+                  p('10/31/2025'), p('02/30/2025'), p('12/25/2025 1:05 PM'), p('12/25/2025 12:05 AM'),
+                  p('13/01/2025'), p('12/25/2025 13:05 PM'),
+                  p('1760097336'), p(1760097336), p(1760097336000), p('1760097336.5'), p('5', 'epoch_ms'),
+                  p('5', 'epoch_s'), p(5, 'epoch_ms'),
+                  p('hello'), p(''), p('   '), p('2025-10-10', 'us'), p('10/31/2025', 'iso'),
+                  p('2025-10-10T13:55:36Z', 'iso'), p('x'.repeat(1000000)), p('1'.repeat(1000000)),
+                  p(NaN), p(Infinity),
+                ])"##;
+            let out = run_js(&tool, code).await;
+            let expected = serde_json::json!([
+                "2025-10-10T00:00:00.000Z",
+                "2025-10-10T13:55:36.000Z",
+                "2025-10-10T08:25:36.123Z",
+                "2025-10-10T13:55:00.000Z",
+                "2024-02-29T00:00:00.000Z",
+                "0005-01-01T00:00:00.000Z",
+                "2025-10-10T02:30:00.000Z",
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                "2025-10-10T11:55:36.000Z",
+                null,
+                "2025-10-10T13:55:00.000Z",
+                null,
+                "2025-10-10T11:55:36.000Z",
+                "2025-10-10T20:55:36.000Z",
+                null,
+                null,
+                "2025-10-31T00:00:00.000Z",
+                null,
+                "2025-12-25T13:05:00.000Z",
+                "2025-12-25T00:05:00.000Z",
+                null,
+                null,
+                "2025-10-10T11:55:36.000Z",
+                "2025-10-10T11:55:36.000Z",
+                "2025-10-10T11:55:36.000Z",
+                "2025-10-10T11:55:36.500Z",
+                "1970-01-01T00:00:00.005Z",
+                "1970-01-01T00:00:05.000Z",
+                "1970-01-01T00:00:00.005Z",
+                null,
+                null,
+                null,
+                null,
+                null,
+                "2025-10-10T13:55:36.000Z",
+                null,
+                null,
+                null,
+                null,
+            ]);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&out)
+                    .unwrap_or_else(|_| out.clone().into()),
+                expected,
+                "{profile:?}: {out}"
+            );
+
+            let fmt = r##"
+                const t = Date.UTC(2025, 9, 10, 13, 55, 36, 7);
+                JSON.stringify([
+                  date_fmt(t), date_fmt(t, 'iso'), date_fmt(t, 'date'), date_fmt(t, 'us'),
+                  date_fmt(t, 'rfc2822'), date_fmt(t, 'nginx'),
+                  date_fmt(t, 'YYYY-MM-DD HH:mm:ss.SSS'), date_fmt(t, 'epoch_s'), date_fmt(t, 'epoch_ms'),
+                  date_fmt(Date.UTC(2025, 9, 10), 'YYYY-MM-DD HH:mm'), date_fmt(0, 'constructor'),
+                  // Round trips through every text format.
+                  ['iso', 'rfc2822', 'nginx'].map(f => date_parse(date_fmt(t, f)) === date_fmt(Math.floor(t / 1000) * 1000, 'iso')
+                    || date_parse(date_fmt(t, f)) === date_fmt(t, 'iso')),
+                  date_parse(date_fmt(t, 'us')),
+                  (() => { try { date_fmt(NaN) } catch (e) { return e.name } })(),
+                  (() => { try { date_parse('2025-10-10', 'weird') } catch (e) { return e.name } })(),
+                  (() => { try { date_parse({}) } catch (e) { return e.name } })(),
+                ])"##;
+            let out = run_js(&tool, fmt).await;
+            let expected = serde_json::json!([
+                "2025-10-10T13:55:36.007Z",
+                "2025-10-10T13:55:36.007Z",
+                "2025-10-10",
+                "10/10/2025",
+                "Fri, 10 Oct 2025 13:55:36 +0000",
+                "10/Oct/2025:13:55:36 +0000",
+                "2025-10-10 13:55:36.007",
+                1760104536u64,
+                1760104536007u64,
+                "2025-10-10 00:00",
+                "constructor",
+                [true, true, true],
+                "2025-10-10T00:00:00.000Z",
+                "RangeError",
+                "RangeError",
+                "TypeError",
+            ]);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&out)
+                    .unwrap_or_else(|_| out.clone().into()),
+                expected,
+                "{profile:?}: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn date_parse_matches_date_utc_arithmetic_for_every_day_of_a_leap_cycle() {
+        let root = std::env::current_dir().unwrap();
+        for profile in [ModelEffectProfile::Full, ModelEffectProfile::ReadOnly] {
+            let tool = helper_tool(profile, &root);
+            // Every calendar day of 2023-2028 in four formats equals the Date.UTC instant, and
+            // the day after each month end is rejected; nothing depends on the host timezone.
+            let code = r##"
+                const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                let bad = 0, n = 0;
+                for (let ms = Date.UTC(2023, 0, 1); ms < Date.UTC(2029, 0, 1); ms += 86400000) {
+                  const d = new Date(ms), y = d.getUTCFullYear(), m = d.getUTCMonth() + 1, day = d.getUTCDate();
+                  const z = (v, w = 2) => String(v).padStart(w, '0');
+                  const iso = new Date(ms).toISOString();
+                  for (const s of [`${y}-${z(m)}-${z(day)}`, `${z(day)}/${months[m - 1]}/${y}:00:00:00 +0000`,
+                                   `${z(m)}/${z(day)}/${y}`, String(ms / 1000), String(ms)]) {
+                    n++;
+                    if (date_parse(s) !== iso) bad++;
+                  }
+                  const dim = new Date(Date.UTC(y, m, 0)).getUTCDate();
+                  if (day === dim && date_parse(`${y}-${z(m)}-${z(dim + 1)}`) !== null) bad++;
+                }
+                bad + ':' + n"##;
+            assert_eq!(run_js(&tool, code).await, "0:10960", "{profile:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn date_parse_is_bounded_on_adversarial_input() {
+        let root = std::env::current_dir().unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &root);
+        let started = std::time::Instant::now();
+        let code = r##"
+            const hostile = ['0'.repeat(99) + 'x', '1-'.repeat(50), '/'.repeat(99), ' '.repeat(5000) + '1',
+                             '2025-10-10T' + '9'.repeat(5000), 'Fri, '.repeat(20), '1'.repeat(5000000)];
+            hostile.map(s => date_parse(s)).join(',')"##;
+        assert_eq!(run_js(&tool, code).await, ",,,,,,");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_match_and_filter_follow_star_globstar_class_and_brace_rules() {
+        let root = std::env::current_dir().unwrap();
+        for profile in [ModelEffectProfile::Full, ModelEffectProfile::ReadOnly] {
+            let tool = helper_tool(profile, &root);
+            let code = r##"
+                const cases = [
+                  ['*.rs', 'a.rs', true], ['*.rs', 'd/a.rs', false], ['*', '', true], ['*', 'a/b', false],
+                  ['**/*.rs', 'a.rs', true], ['**/*.rs', 'd/e/a.rs', true], ['**/*.rs', 'a.rsx', false],
+                  ['src/**/*.rs', 'src/a.rs', true], ['src/**/*.rs', 'src/x/y/a.rs', true],
+                  ['src/**/*.rs', 'srcx/a.rs', false], ['src/**/*.rs', 'lib/src/a.rs', false],
+                  ['src/**', 'src/a/b', true], ['src/**', 'src', false], ['**', '', true], ['**', 'a/b', true],
+                  ['**/x', 'x', true], ['**/x', 'a/b/x', true], ['**/x', 'a/bx', false],
+                  ['a**b', 'axb', true], ['a**b', 'a/b', false], ['a/**/**/b', 'a/b', true],
+                  ['a?c', 'abc', true], ['a?c', 'a/c', false], ['a?c', 'ac', false],
+                  ['[a-c]x', 'bx', true], ['[a-c]x', 'dx', false], ['[!a-c]x', 'bx', false],
+                  ['[!a-c]x', 'dx', true], ['[^a]x', 'bx', true], ['[!a]x', '/x', false],
+                  ['[]a]x', ']x', true], ['[a\\]]x', ']x', true],
+                  ['*.{js,ts}', 'a.ts', true], ['*.{js,ts}', 'a.rs', false],
+                  ['{a,b{c,d}}e', 'bde', true], ['{a,b{c,d}}e', 'bee', false], ['x{,y}', 'x', true],
+                  ['{src,lib}/**/*.rs', 'lib/a/b.rs', true], ['[{]', '{', true],
+                  ['\\*', '*', true], ['\\*', 'a', false], ['a.b', 'axb', false], ['A', 'a', false],
+                  ['.*', '.gitignore', true], ['*', '.gitignore', true], ['./a', 'a', false],
+                  ['(a)+', '(a)+', true], ['a+b', 'aab', false], ['^a$', 'a', false],
+                ];
+                const bad = cases.filter(([p, s, e]) => glob_match(p, s) !== e).map(([p, s, e]) => p + ' ' + s + ' ' + e);
+                const throws = (f) => { try { f(); return 'no' } catch (e) { return e.name } };
+                JSON.stringify([bad,
+                  glob_filter('**/*.md', ['a.md', 'b/c.md', 'd.txt']),
+                  glob_filter(['docs/**', '!docs/a/**'], ['docs/b.md', 'docs/a/b.md', 'x']),
+                  glob_filter(['**/*.md', '!docs/**', 'docs/keep.md'], ['a.md', 'docs/x.md', 'docs/keep.md']),
+                  glob_filter([], ['a']), glob_filter('*', []),
+                  throws(() => glob_match('[abc', 'a')), throws(() => glob_match('{a,b', 'a')),
+                  throws(() => glob_match('[z-a]', 'a')), throws(() => glob_match('a'.repeat(1025), 'a')),
+                  throws(() => glob_match('a', 'a'.repeat(4097))), throws(() => glob_match(1, 'a')),
+                  throws(() => glob_match('a', null)), throws(() => glob_filter(1, [])),
+                  throws(() => glob_filter('a', 'a')), throws(() => glob_match('{a,b}'.repeat(8), 'a')),
+                  glob_match('{a,b}'.repeat(7), 'abababa'),
+                ])"##;
+            let out = run_js(&tool, code).await;
+            let expected = serde_json::json!([
+                [],
+                ["a.md", "b/c.md"],
+                ["docs/b.md"],
+                ["a.md", "docs/keep.md"],
+                [],
+                [],
+                "SyntaxError",
+                "SyntaxError",
+                "SyntaxError",
+                "RangeError",
+                "RangeError",
+                "TypeError",
+                "TypeError",
+                "TypeError",
+                "TypeError",
+                "RangeError",
+                true,
+            ]);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&out)
+                    .unwrap_or_else(|_| out.clone().into()),
+                expected,
+                "{profile:?}: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_match_agrees_with_a_reference_regex_on_small_exhaustive_inputs() {
+        let root = std::env::current_dir().unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &root);
+        // Reference: the naive glob-to-regex translation (fine here: tiny inputs).
+        let code = r##"
+            const atoms = ['a', 'b', '/', '*', '?', '[ab]', '[!a]'];
+            const re = { 'a': 'a', 'b': 'b', '/': '\\/', '*': '[^/]*', '?': '[^/]', '[ab]': '[ab]', '[!a]': '[^a/]' };
+            const patterns = [''];
+            let layer = [''];
+            for (let k = 0; k < 4; k++) {
+              const next = [];
+              for (const p of layer) for (const a of atoms) next.push(p + a);
+              patterns.push(...next); layer = next;
+            }
+            const paths = [''];
+            let pl = [''];
+            for (let k = 0; k < 4; k++) {
+              const next = [];
+              for (const p of pl) for (const a of ['a', 'b', '/']) next.push(p + a);
+              paths.push(...next); pl = next;
+            }
+            let diff = 0, checks = 0, first = '';
+            for (const p of patterns) {
+              if (p.includes('**')) continue;
+              const r = new RegExp('^' + p.split(/(\[!a\]|\[ab\]|.)/).filter(Boolean).map(t => re[t]).join('') + '$');
+              for (const s of paths) {
+                checks++;
+                if (glob_match(p, s) !== r.test(s)) { diff++; if (!first) first = p + ' vs ' + s; }
+              }
+            }
+            diff + ':' + checks + ':' + first"##;
+        let out = run_js(&tool, code).await;
+        assert!(out.starts_with("0:"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn glob_match_is_bounded_on_pathological_patterns_and_paths() {
+        let root = std::env::current_dir().unwrap();
+        for profile in [ModelEffectProfile::Full, ModelEffectProfile::ReadOnly] {
+            let tool = helper_tool(profile, &root);
+            let started = std::time::Instant::now();
+            let code = r##"
+                const out = [
+                  glob_match('a*'.repeat(25), 'a'.repeat(10) + 'a'.repeat(3990) + 'b'),
+                  glob_match('a*'.repeat(500) + 'b', 'a'.repeat(4000)),
+                  glob_match('*a'.repeat(400) + 'c', 'ab'.repeat(2000)),
+                  glob_match('**/'.repeat(100) + 'x', 'a/'.repeat(2000)),
+                  glob_match('{a,b}*'.repeat(4) + 'c', 'ab'.repeat(2000)),
+                  glob_match('[ab]*'.repeat(150) + 'c', 'ab'.repeat(2000)),
+                  glob_match('?'.repeat(1000), 'a'.repeat(1000)),
+                  glob_match('*', 'x'.repeat(4096)),
+                ];
+                out.join(',')"##;
+            assert_eq!(
+                run_js(&tool, code).await,
+                "true,false,false,false,false,false,true,true",
+                "{profile:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "{profile:?} {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn toml_parse_counts_dependencies_inline_tables_and_arrays_of_tables() {
+        let root = std::env::current_dir().unwrap();
+        for profile in [ModelEffectProfile::Full, ModelEffectProfile::ReadOnly] {
+            let tool = helper_tool(profile, &root);
+            let code = r##"
+                const t = toml_parse(`# manifest
+name = "demo # not a comment" # real comment
+big = 12345678901234567890
+list = [1, 2, # c
+  3,
+]
+ml = """
+a \\
+   b"""
+[package]
+version = "1"
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1" }
+rand = "0.8"
+'quoted.key' = 1
+[[bin]]
+name = "a"
+[[bin]]
+name = "b"
+[bin.extra]
+k = true
+`);
+                JSON.stringify([t.name, String(t.big), typeof t.big, t.list, t.ml,
+                    Object.keys(t.dependencies).length,
+                    Object.values(t.dependencies).filter(v => typeof v === 'object').length,
+                    t.dependencies['quoted.key'], t.bin.map(b => b.name), t.bin[1].extra.k])"##;
+            assert_eq!(
+                run_js(&tool, code).await,
+                r##"["demo # not a comment","12345678901234567890","bigint",[1,2,3],"a b",4,2,1,["a","b"],true]"##,
+                "{profile:?}"
+            );
+            let bad = run_js(
+                &tool,
+                "try { toml_parse('a = 1\\na = 2') } catch (error) { error.message }",
+            )
+            .await;
+            assert!(bad.contains("duplicate key"), "{bad}");
+            let huge = run_js(
+                &tool,
+                "try { toml_parse('#'.repeat(5 * 1024 * 1024)) } catch (error) { error.message }",
+            )
+            .await;
+            assert!(huge.contains("exceeds"), "{huge}");
+        }
+    }
+
+    #[tokio::test]
+    async fn csv_parse_handles_quotes_crlf_and_headers() {
+        let root = std::env::current_dir().unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &root);
+        let code = r#"JSON.stringify([
+            csv_parse('id,note\r\n1,"a, ""b"""\r\n2,"x\ny"\r\n'),
+            csv_parse('id,note\n1,a\n2', {header: true}),
+            csv_parse(''), csv_parse('a,\n'),
+        ])"#;
+        assert_eq!(
+            run_js(&tool, code).await,
+            r#"[[["id","note"],["1","a, \"b\""],["2","x\ny"]],[{"id":"1","note":"a"},{"id":"2","note":""}],[],[["a",""]]]"#
+        );
+        let bad = run_js(
+            &tool,
+            "try { csv_parse('\"abc') } catch (error) { error.message }",
+        )
+        .await;
+        assert!(bad.contains("unterminated"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn grep_accepts_a_single_file_path_and_truncates_deterministically() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let text: String = (1..=20_000)
+            .map(|n| format!("ERROR line {n:06} {}\n", "x".repeat(40)))
+            .collect();
+        std::fs::write(dir.join("logs/app.log"), &text).unwrap();
+        std::fs::write(dir.join("logs/other.log"), "ERROR elsewhere\n").unwrap();
+        std::fs::write(dir.join("small.txt"), "alpha\nERROR beta\n").unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &dir);
+
+        let relative = run_js(
+            &tool,
+            "const r = grep('ERROR beta', {path: 'small.txt'}); JSON.stringify([r.matches.map(m => m.path + ':' + m.line), r.truncated])",
+        )
+        .await;
+        assert_eq!(relative, r#"[["small.txt:2"],false]"#);
+
+        let absolute = dir.join("small.txt").to_string_lossy().replace('\\', "/");
+        let by_absolute = run_js(
+            &tool,
+            &format!("grep('ERROR', {{path: '{absolute}'}}).matches.length"),
+        )
+        .await;
+        assert_eq!(by_absolute, "1");
+
+        // Only the named file is searched, never its siblings, and a miss is not an error.
+        let only = run_js(
+            &tool,
+            "JSON.stringify(grep('elsewhere', {path: 'logs/app.log'}).matches)",
+        )
+        .await;
+        assert_eq!(only, "[]");
+
+        // Truncation is reported and repeatable: the first lines in file order.
+        let code = "const r = grep('ERROR', {path: 'logs/app.log'}); \
+            JSON.stringify([r.truncated, r.matches.length, r.matches[0].line, r.matches[r.matches.length - 1].line])";
+        let first = run_js(&tool, code).await;
+        assert!(first.starts_with("[true,"), "{first}");
+        assert!(first.contains(",1,"), "{first}");
+        assert_eq!(first, run_js(&tool, code).await);
+
+        let missing = run_js(
+            &tool,
+            "try { grep('x', {path: 'logs/nope.log'}) } catch (error) { error.message }",
+        )
+        .await;
+        assert!(
+            missing.contains("path must be an existing directory or regular file"),
+            "{missing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_lines_reads_ranges_and_tails_files_larger_than_one_mib() {
+        let dir = scratch_dir();
+        // 40,000 lines of 62 bytes is about 2.4 MB, above the read_file cap.
+        let text: String = (1..=40_000)
+            .map(|n| format!("line {n:06} {}\n", "x".repeat(50)))
+            .collect();
+        assert!(text.len() > READ_FILE_MAX_BYTES * 2);
+        std::fs::write(dir.join("big.log"), &text).unwrap();
+        std::fs::write(dir.join("crlf.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        std::fs::write(
+            dir.join("long.txt"),
+            format!("{}\nshort\n", "y".repeat(200_000)),
+        )
+        .unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &dir);
+        let path = |name: &str| dir.join(name).to_string_lossy().replace('\\', "/");
+        let (big, crlf, long) = (path("big.log"), path("crlf.txt"), path("long.txt"));
+
+        let capped = run_js(&tool, &format!("read_file('{big}').length")).await;
+        assert!(
+            capped.contains("JS"),
+            "read_file must stay capped: {capped}"
+        );
+
+        let head = format!(
+            "const r = read_lines('{big}', 3, 2); JSON.stringify([r.lines.map(l => l.slice(0, 11)), r.eof])"
+        );
+        assert_eq!(
+            run_js(&tool, &head).await,
+            r#"[["line 000003","line 000004"],false]"#
+        );
+        let tail = format!(
+            "const r = read_lines('{big}', -2); JSON.stringify([r.lines.map(l => l.slice(0, 11)), r.eof])"
+        );
+        assert_eq!(
+            run_js(&tool, &tail).await,
+            r#"[["line 039999","line 040000"],true]"#
+        );
+        // A range ending exactly at the last line reports eof; past the end is empty.
+        let exact =
+            format!("const r = read_lines('{big}', 39999, 2); r.lines.length + ',' + r.eof");
+        assert_eq!(run_js(&tool, &exact).await, "2,true");
+        let past = format!("const r = read_lines('{big}', 50000); r.lines.length + ',' + r.eof");
+        assert_eq!(run_js(&tool, &past).await, "0,true");
+        // Paging the whole file yields the true line count with no phantom line.
+        let paging = format!(
+            "let n = 0, from = 1; for (;;) {{ const r = read_lines('{big}', from, 10000); n += r.lines.length; from += r.lines.length; if (r.eof) break; }} n"
+        );
+        assert_eq!(run_js(&tool, &paging).await, "40000");
+        assert_eq!(
+            run_js(
+                &tool,
+                &format!("JSON.stringify(read_lines('{crlf}', 1).lines)")
+            )
+            .await,
+            r#"["a","b","c"]"#
+        );
+        let long_line =
+            format!("const r = read_lines('{long}', 1); r.lines[0].length + ',' + r.lines[1]");
+        assert_eq!(run_js(&tool, &long_line).await, "65536,short");
+        for bad in ["0", "1.5", "NaN"] {
+            let out = run_js(&tool, &format!("read_lines('{crlf}', {bad})")).await;
+            assert!(out.contains("JS"), "from={bad}: {out}");
+        }
+        let many = run_js(&tool, &format!("read_lines('{crlf}', 1, 10001)")).await;
+        assert!(many.contains("JS"), "{many}");
+        let missing = run_js(&tool, &format!("read_lines('{crlf}.nope', 1)")).await;
+        assert!(missing.contains("JS"), "{missing}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_lines_counts_against_the_effect_budget() {
+        let dir = scratch_dir();
+        std::fs::write(dir.join("f.txt"), "s\n").unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &dir);
+        let path = dir.join("f.txt").to_string_lossy().replace('\\', "/");
+        let code = format!(
+            "let n = 0; try {{ for (let i = 0; i < 1000; i++) {{ read_lines('{path}', 1, 1); n++; }} }} catch (e) {{ console.log(e.code); }} n"
+        );
+        let out = run_js(&tool, &code).await;
+        assert!(out.contains("effect limit exceeded"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod audit_slots {
+    use super::*;
+
+    fn paths(root: &std::path::Path) -> crate::paths::AppPaths {
+        crate::paths::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_audits_claim_distinct_slots_and_reuse_freed_ones() {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-audit-slots-{}", uuid::Uuid::new_v4()));
+        let paths = paths(&root);
+        let audit_dir = |slot: u32| paths.effect_audit_slot(slot).directory().to_path_buf();
+
+        let first = open_first_free_audit_slot(&paths).expect("first writer");
+        let second = open_first_free_audit_slot(&paths).expect("second writer is not locked out");
+        let third = open_first_free_audit_slot(&paths).expect("third writer is not locked out");
+        for slot in 0..3 {
+            assert!(
+                audit_dir(slot).join("writer.lock").exists(),
+                "slot {slot} directory exists"
+            );
+        }
+        assert!(!audit_dir(3).exists(), "no slot beyond the live writers");
+        assert_eq!(audit_dir(0).file_name().unwrap(), "js-effects");
+        assert_eq!(audit_dir(1).file_name().unwrap(), "js-effects-1");
+
+        // Releasing a writer frees its slot for the next process; nothing accumulates.
+        drop(second);
+        let reused = open_first_free_audit_slot(&paths).expect("freed slot is reused");
+        assert!(!audit_dir(3).exists());
+        drop((first, third, reused));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -3078,6 +4236,7 @@ mod step_result_rendering {
             exception_class: None,
             line: None,
             column: None,
+            hint: None,
         }
     }
 
@@ -3136,7 +4295,7 @@ mod step_result_rendering {
         );
         assert_eq!(
             render_step_result(&effect_limit),
-            "JS error: effect limit exceeded (stage: evaluation; script: model)\n[console.log] before limit"
+            "JS error: effect limit exceeded (256 per call); batch with read_files(paths) or glob() (stage: evaluation; script: model)\n[console.log] before limit"
         );
         let invalid_result = step(
             StepOutcome::Error(JsErrorCode::InvalidResult),
@@ -3145,7 +4304,7 @@ mod step_result_rendering {
         );
         assert_eq!(
             render_step_result(&invalid_result),
-            "JS error: invalid result; return a string/plain JSON value or end with JSON.stringify(value) (stage: result_conversion; script: model)"
+            "JS error: invalid result; return a string/plain JSON value of at most 64 KiB or end with JSON.stringify(value) (cap for returned values; result(value), where available, allows 256 KiB) (stage: result_conversion; script: model)"
         );
         let oom = step(
             StepOutcome::OutOfMemory,
@@ -3175,6 +4334,7 @@ mod step_result_rendering {
                 exception_class: Some(JsExceptionClass::TypeError),
                 line: Some(12),
                 column: Some(7),
+                hint: None,
             }),
         );
         assert_eq!(
@@ -3192,11 +4352,12 @@ mod step_result_rendering {
                 exception_class: Some(JsExceptionClass::RangeError),
                 line: Some(3),
                 column: Some(2),
+                hint: None,
             }),
         );
         assert_eq!(
             render_step_result(&stack_limit),
-            "JS RangeError: stack limit exceeded at 3:2 (stage: evaluation; script: model)"
+            "JS RangeError: stack limit exceeded (512 KiB stack) at 3:2 (stage: evaluation; script: model)"
         );
     }
 
@@ -3339,6 +4500,7 @@ mod step_result_rendering {
                 exception_class: Some(JsExceptionClass::TypeError),
                 line: Some(2),
                 column: Some(3),
+                hint: None,
             }),
         );
         assert!(validate_step_result_bounds(&valid, source).is_ok());
@@ -3380,6 +4542,252 @@ mod step_result_rendering {
             ),
         ] {
             assert!(validate_step_result_bounds(&invalid, source).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_ergonomics_tests {
+    use super::*;
+    use crate::extras::js::protocol::DiagnosticClass;
+
+    fn failure(message: Option<&str>, role: ScriptRole, class: DiagnosticClass) -> StepResult {
+        StepResult {
+            outcome: StepOutcome::Error(JsErrorCode::Exception),
+            console: Vec::new(),
+            diagnostic: Some(Diagnostic {
+                class,
+                stage: DiagnosticStage::Evaluation,
+                script_role: role,
+                exception_class: Some(JsExceptionClass::Other),
+                line: None,
+                column: None,
+                hint: message.and_then(|text| {
+                    JsDiagnosticHint::from_exception(JsExceptionClass::Other, text)
+                }),
+            }),
+            #[cfg(feature = "skills")]
+            skill_events: Vec::new(),
+            #[cfg(feature = "skills")]
+            evidence_complete: true,
+        }
+    }
+
+    #[test]
+    fn arbitrary_exception_text_never_enters_the_wire_or_rendering() {
+        let raw = "FILE_CONTENTS_SECRET";
+        let result = failure(Some(raw), ScriptRole::Model, DiagnosticClass::Exception);
+        assert!(!render_step_result(&result).contains(raw));
+        assert!(!serde_json::to_string(&result).unwrap().contains(raw));
+        let forged = serde_json::json!({
+            "class": "exception", "stage": "evaluation", "script_role": "model",
+            "exception_class": "Other", "message": raw
+        });
+        assert!(serde_json::from_value::<Diagnostic>(forged).is_err());
+    }
+
+    fn classed(class: JsExceptionClass, message: &str) -> String {
+        let mut result = failure(Some(message), ScriptRole::Model, DiagnosticClass::Exception);
+        result.diagnostic.as_mut().unwrap().exception_class = Some(class);
+        result.diagnostic.as_mut().unwrap().hint = JsDiagnosticHint::from_exception(class, message);
+        render_step_result(&result)
+    }
+
+    #[test]
+    fn top_level_return_gets_a_result_hint() {
+        // mini-agent-zk4co
+        let text = classed(JsExceptionClass::SyntaxError, "return not in a function");
+        assert!(
+            text.contains("scripts are not functions: use result(value)"),
+            "{text}"
+        );
+        assert!(text.chars().count() <= 300, "{text}");
+        let other = classed(JsExceptionClass::SyntaxError, "unexpected token: ';'");
+        assert!(!other.contains("scripts are not functions"), "{other}");
+    }
+
+    #[test]
+    fn node_globals_get_an_availability_hint() {
+        // mini-agent-6g00q
+        for name in [
+            "require",
+            "process",
+            "module",
+            "exports",
+            "fs",
+            "Buffer",
+            "__dirname",
+        ] {
+            let text = classed(
+                JsExceptionClass::ReferenceError,
+                &format!("{name} is not defined"),
+            );
+            assert!(
+                text.contains("not available: only the listed globals exist"),
+                "{text}"
+            );
+            assert!(text.chars().count() <= 300, "{text}");
+        }
+        let other = classed(JsExceptionClass::ReferenceError, "foo is not defined");
+        assert!(!other.contains("not available"), "{other}");
+        let wrong_class = classed(JsExceptionClass::TypeError, "require is not defined");
+        assert!(!wrong_class.contains("not available"), "{wrong_class}");
+    }
+
+    #[test]
+    fn invalid_result_headline_names_both_caps() {
+        // mini-agent-vy9fw
+        let headline = js_error_headline(JsErrorCode::InvalidResult, None);
+        assert!(
+            headline.contains("64 KiB") && headline.contains("256 KiB"),
+            "{headline}"
+        );
+        assert!(headline.chars().count() <= 300, "{headline}");
+    }
+
+    #[test]
+    fn validator_rejects_hints_outside_model_exception_diagnostics() {
+        let mut result = failure(None, ScriptRole::Model, DiagnosticClass::Exception);
+        result.diagnostic.as_mut().unwrap().hint = Some(JsDiagnosticHint::CollectionProperty);
+        assert!(validate_step_diagnostic(&result, "x").is_ok());
+        result.diagnostic.as_mut().unwrap().script_role = ScriptRole::SkillSource;
+        assert!(validate_step_diagnostic(&result, "x").is_err());
+    }
+
+    #[test]
+    fn limit_headlines_state_the_limit_and_remedy() {
+        let diag = None;
+        assert_eq!(
+            js_error_headline(JsErrorCode::EffectLimit, diag),
+            "JS error: effect limit exceeded (256 per call); batch with read_files(paths) or glob()"
+        );
+        assert!(js_error_headline(JsErrorCode::InvalidResult, diag).contains("at most 64 KiB"));
+    }
+
+    #[test]
+    fn unavailable_audit_message_says_retrying_will_not_help() {
+        let permanent = audit_unavailable_message(AuditError::Unavailable);
+        assert!(
+            permanent.contains("retrying will not help in this session; use read, grep or shell")
+        );
+        let locked = audit_unavailable_message(AuditError::WriterLocked);
+        assert!(locked.contains("close one and retry later"), "{locked}");
+    }
+
+    #[test]
+    fn shared_audit_cell_retries_writer_locked_but_caches_permanent_failures() {
+        let good = shared_effect_audit().expect("test effect audit");
+        let cell = SharedAuditCell::default();
+        let start = Instant::now();
+        let mut opens = 0;
+        let first = cell.get_or_open(start, || {
+            opens += 1;
+            Err(AuditError::WriterLocked)
+        });
+        assert!(matches!(first, Err(AuditError::WriterLocked)));
+        // Too soon: not retried.
+        let early = cell.get_or_open(start + Duration::from_millis(10), || {
+            opens += 1;
+            Ok(good.clone())
+        });
+        assert!(matches!(early, Err(AuditError::WriterLocked)));
+        assert_eq!(opens, 1);
+        // Slot freed later: the next spaced call recovers and the success is cached.
+        let later = start + AUDIT_OPEN_RETRY_SPACING;
+        assert!(
+            cell.get_or_open(later, || {
+                opens += 1;
+                Ok(good.clone())
+            })
+            .is_ok()
+        );
+        assert!(
+            cell.get_or_open(later, || panic!("cached success must not reopen"))
+                .is_ok()
+        );
+        assert_eq!(opens, 2);
+
+        let permanent = SharedAuditCell::default();
+        assert!(matches!(
+            permanent.get_or_open(start, || Err(AuditError::PathUnavailable)),
+            Err(AuditError::PathUnavailable)
+        ));
+        let again = permanent.get_or_open(later + Duration::from_secs(60), || panic!("reopened"));
+        assert!(matches!(again, Err(AuditError::PathUnavailable)));
+    }
+
+    #[test]
+    fn shared_audit_cell_bounds_transient_retries() {
+        let cell = SharedAuditCell::default();
+        let start = Instant::now();
+        let mut opens = 0u32;
+        for attempt in 0..(AUDIT_OPEN_MAX_RETRIES + 10) {
+            let now = start + AUDIT_OPEN_RETRY_SPACING * (attempt + 1);
+            let _ = cell.get_or_open(now, || {
+                opens += 1;
+                Err(AuditError::WriterLocked)
+            });
+        }
+        assert_eq!(opens, AUDIT_OPEN_MAX_RETRIES);
+    }
+}
+
+#[cfg(test)]
+mod xml_bpmn_pack_tests {
+    use super::*;
+    use rig::tool::Tool;
+
+    fn tool(profile: ModelEffectProfile, root: &std::path::Path) -> JsTool {
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let mut tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(root),
+            supervisor,
+            shared_effect_audit().expect("test effect audit"),
+        );
+        tool.profile = profile;
+        tool
+    }
+
+    /// The XML and BPMN helpers are pure, so both effect profiles install them and keep them out
+    /// of the always-sent description (they are listed by `help()` only).
+    #[tokio::test]
+    async fn xml_and_bpmn_helpers_work_in_both_profiles_without_growing_the_description() {
+        let root = std::env::current_dir().unwrap();
+        let code = r##"
+            const x = xml_parse('<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="d"><bpmn:process id="p"/></bpmn:definitions>');
+            const outline = bpmn_from_outline([{id: 's', type: 'start', next: 'e'}, {id: 'e', type: 'end'}]);
+            JSON.stringify([x.children[0].attrs.id, xml_build({name: 'a', text: '<'}),
+              bpmn_validate(outline).filter((f) => f.level === 'error').length, bpmn_summary(outline).counts,
+              (() => { try { xml_parse('<!DOCTYPE a><a/>'); } catch (e) { return e.name; } })()])"##;
+        for profile in [ModelEffectProfile::Full, ModelEffectProfile::ReadOnly] {
+            let tool = tool(profile, &root);
+            let description = tool.description();
+            let help = tool
+                .call(JsArgs {
+                    code: "help()".into(),
+                })
+                .await
+                .unwrap();
+            for name in [
+                "xml_parse",
+                "xml_build",
+                "bpmn_validate",
+                "bpmn_summary",
+                "bpmn_from_outline",
+            ] {
+                assert!(!description.contains(name), "{profile:?} {name}");
+                assert!(help.contains(&format!("{name}(")), "{profile:?}: {help}");
+            }
+            let out = tool.call(JsArgs { code: code.into() }).await.unwrap();
+            assert_eq!(
+                out, r#"["p","<a>&lt;</a>",0,{"endEvent":1,"startEvent":1},"SyntaxError"]"#,
+                "{profile:?}"
+            );
         }
     }
 }

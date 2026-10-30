@@ -13,11 +13,17 @@ const MAX_SESSIONS: usize = 128;
 const MAX_QUERY_BYTES: usize = 2048;
 const MAX_SEARCH_RESULTS: usize = 8;
 const MAX_SEARCH_BYTES: usize = 128 * 1024;
+/// Returned only with an empty result, so a model does not mistake a query
+/// that matched nothing for an unavailable server.
+const NO_MATCH_HINT: &str = "No catalogue tool name or description contains any query word. Search with exact names from the MCP tool index; several names may be listed in one query.";
 
 /// Runtime metadata only. It contains no SDK handle, tool implementation,
 /// persisted approval, credential, answer or permission grant.
 #[derive(Clone, Default)]
-pub(crate) struct DiscoverySessions(Arc<Mutex<BTreeMap<String, Arc<Activation>>>>);
+pub(crate) struct DiscoverySessions(
+    Arc<Mutex<BTreeMap<String, Arc<Activation>>>>,
+    Arc<Mutex<BTreeMap<String, Weak<DiscoveryView>>>>,
+);
 
 pub(crate) struct Activation {
     workspace: Weak<crate::paths::WorkspaceBinding>,
@@ -28,6 +34,10 @@ pub(crate) struct Activation {
 
 impl DiscoverySessions {
     pub(crate) fn retire(&self, session_id: &str) {
+        self.1
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session_id);
         if let Some(state) = self
             .0
             .lock()
@@ -37,6 +47,25 @@ impl DiscoverySessions {
             state.current.store(false, Ordering::Release);
         }
     }
+    /// Remember the newest view built for a session, so a run whose own view
+    /// was retired by a rebuild can search the replacement instead of failing
+    /// for the rest of the run (mini-agent-23lx1). Held weakly.
+    pub(crate) fn register_view(&self, session_id: &str, view: &Arc<DiscoveryView>) {
+        self.1
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(session_id.to_owned(), Arc::downgrade(view));
+    }
+
+    fn latest_view(&self, session_id: &str) -> Option<Arc<DiscoveryView>> {
+        self.1
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .and_then(Weak::upgrade)
+            .filter(|view| view.activation.is_current())
+    }
+
     pub(crate) fn capture(
         &self,
         session_id: &str,
@@ -242,6 +271,7 @@ impl ToolDyn for SharedTool {
 pub(crate) struct SearchBinding {
     view: Arc<OnceLock<Arc<DiscoveryView>>>,
     server: Arc<OnceLock<WeakToolServerHandle>>,
+    session: Arc<OnceLock<(DiscoverySessions, String)>>,
     native_references: bool,
 }
 
@@ -254,6 +284,21 @@ impl SearchBinding {
         self.view
             .set(view)
             .map_err(|_| "MCP discovery view already bound")
+    }
+    /// Let searches fall back to the session's newest view once this build's
+    /// own view has been retired by a rebuild.
+    pub(crate) fn follow_session(&self, sessions: DiscoverySessions, session_id: &str) {
+        let _ = self.session.set((sessions, session_id.to_owned()));
+    }
+    fn effective_view(&self) -> Option<Arc<DiscoveryView>> {
+        let bound = self.view.get()?;
+        if bound.activation.is_current() {
+            return Some(bound.clone());
+        }
+        let (sessions, session_id) = self.session.get()?;
+        sessions
+            .latest_view(session_id)
+            .or_else(|| Some(bound.clone()))
     }
     pub(crate) fn set_server(&self, server: WeakToolServerHandle) -> Result<(), &'static str> {
         self.server
@@ -270,8 +315,29 @@ struct SearchArgs {
     query: String,
 }
 
-fn discovery_error(message: &'static str) -> ToolError {
+fn discovery_error(message: impl Into<compact_str::CompactString>) -> ToolError {
     ToolError::ToolCallError(Box::new(super::tool::McpToolError(message.into())))
+}
+
+/// Names why a matched selection can no longer be published. A disconnected
+/// server or a changed source does not heal within the run, so the message
+/// says so instead of looking transient (models otherwise sleep and retry).
+fn stale_selection_error(selected: &[&DeferredEntry]) -> ToolError {
+    if let Some(entry) = selected.iter().find(|entry| !(entry.is_live)()) {
+        tracing::warn!(server = %entry.server_name, "mcp_search: server client is no longer live");
+        return discovery_error(format!(
+            "MCP server '{}' is disconnected; its tools stay unavailable until it is reconnected (/mcp). This is not transient: do not retry.",
+            entry.server_name
+        ));
+    }
+    if let Some(entry) = selected.iter().find(|entry| !entry.is_current()) {
+        tracing::warn!(server = %entry.server_name, "mcp_search: server source or trust changed");
+        return discovery_error(format!(
+            "MCP server '{}' configuration changed since this run started; restart to use its tools. This is not transient: do not retry.",
+            entry.server_name
+        ));
+    }
+    discovery_error("MCP discovery invocation has retired")
 }
 
 impl McpSearch {
@@ -294,9 +360,9 @@ impl McpSearch {
             .ok_or_else(|| discovery_error("MCP discovery requires an owned invocation"))?;
         let view = self
             .0
-            .view
-            .get()
+            .effective_view()
             .ok_or_else(|| discovery_error("MCP discovery view is unavailable"))?;
+        let view = &view;
         let server = self
             .0
             .server
@@ -325,15 +391,22 @@ impl McpSearch {
             .filter_map(|entry| {
                 let name = entry.definition.name.to_lowercase();
                 let description = entry.definition.description.to_lowercase();
+                // Every word is matched independently, so one query may name
+                // several tools; entries matching more words rank first.
+                let matched = words
+                    .iter()
+                    .filter(|word| name.contains(*word) || description.contains(*word))
+                    .count();
                 let score = if name == query {
                     0
-                } else if words.iter().all(|word| name.contains(word)) {
+                } else if words.contains(&name.as_str()) {
                     1
-                } else if words
-                    .iter()
-                    .all(|word| name.contains(word) || description.contains(word))
-                {
+                } else if words.iter().all(|word| name.contains(word)) {
                     2
+                } else if matched == words.len() {
+                    3
+                } else if matched > 0 {
+                    4 + (words.len() - matched)
                 } else {
                     return None;
                 };
@@ -368,12 +441,14 @@ impl McpSearch {
         }
         // Validate the whole selection before publishing ANY definition.
         if !current() || selected.iter().any(|entry| !entry.is_current()) {
-            return Err(discovery_error(
-                "MCP discovery source or invocation has changed",
-            ));
+            return Err(stale_selection_error(&selected));
         }
         let definitions: Vec<_> = selected.iter().map(|entry| &entry.definition).collect();
-        let result = serde_json::to_string(&serde_json::json!({"matches":definitions,"omitted":total>selected.len(),"permissions_changed":false})).map_err(ToolError::JsonError)?;
+        let mut result = serde_json::json!({"matches":definitions,"omitted":total>selected.len(),"permissions_changed":false});
+        if total == 0 {
+            result["hint"] = NO_MATCH_HINT.into();
+        }
+        let result = serde_json::to_string(&result).map_err(ToolError::JsonError)?;
         if result.len() > MAX_SEARCH_BYTES {
             return Err(discovery_error(
                 "MCP discovery result exceeds its byte limit",
@@ -415,13 +490,14 @@ impl McpSearch {
             .await
             .map_err(|_| discovery_error("MCP schema publication failed"))?;
         if !admitted {
-            return Err(discovery_error(
-                "MCP discovery source or invocation has changed",
-            ));
+            return Err(stale_selection_error(&selected));
         }
         let result = if self.0.native_references {
-            serde_json::to_string(&serde_json::json!({"matches": names, "omitted": total > selected.len(), "permissions_changed": false}))
-                .map_err(ToolError::JsonError)?
+            let mut result = serde_json::json!({"matches": names, "omitted": total > selected.len(), "permissions_changed": false});
+            if total == 0 {
+                result["hint"] = NO_MATCH_HINT.into();
+            }
+            serde_json::to_string(&result).map_err(ToolError::JsonError)?
         } else {
             result
         };
@@ -434,7 +510,7 @@ impl ToolDyn for McpSearch {
         "mcp_search".into()
     }
     fn description(&self) -> String {
-        "Search the captured MCP tool catalogue by names and descriptions. Returns matching schemas and enables those exact tools for this session. Does not grant tool permission or call an external server.".into()
+        "Search the captured MCP tool catalogue by names and descriptions. Each query word matches independently, so several exact tool names may be listed in one query; tools matching more words rank first. Returns at most eight matching schemas and enables those exact tools for this session. Does not grant tool permission or call an external server.".into()
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({"type":"object","properties":{"query":{"type":"string","maxLength":MAX_QUERY_BYTES}},"required":["query"],"additionalProperties":false})
@@ -1015,6 +1091,201 @@ mod tests {
         scope.cancellation_handle().cancel();
         scope.wait_idle().await;
     }
+    #[tokio::test]
+    async fn actual_search_matches_each_word_so_one_query_can_name_several_tools() {
+        use super::*;
+        let root = crate::tests::OwnedTestDirectory::new("mcp-search-words");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let activation = DiscoverySessions::default()
+            .capture("words-session", &workspace, "words-catalogue".into())
+            .unwrap();
+        let entries = [
+            (
+                "ci_annotations_load",
+                "Load .code-indexer/annotations.json.",
+            ),
+            (
+                "ci_get_impl",
+                "Get exact implementation for a symbol in a file.",
+            ),
+            ("ci_grep", "Regex search indexed files."),
+            (
+                "ci_search_symbols",
+                "Search indexed symbols by name/signature.",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, description)| {
+            let definition = ToolDefinition {
+                name: name.into(),
+                description: description.into(),
+                parameters: serde_json::json!({"type":"object"}),
+            };
+            DeferredEntry {
+                server_name: "code-indexer".into(),
+                tool: Arc::new(MetadataOnlyTool(definition.clone())),
+                definition,
+                source: None,
+                is_live: Arc::new(|| true),
+            }
+        })
+        .collect();
+        let binding = SearchBinding::default();
+        binding
+            .set_view(Arc::new(DiscoveryView::new(activation.clone(), entries)))
+            .unwrap();
+        let server = ToolServer::new().run();
+        server.add_tool(McpSearch(binding.clone())).await.unwrap();
+        binding.set_server(server.downgrade()).unwrap();
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let extensions = ToolCallExtensions::new();
+        let search = |query: &str| {
+            let args = serde_json::json!({ "query": query }).to_string();
+            let server = server.clone();
+            let extensions = &extensions;
+            let scope = &scope;
+            async move {
+                let result = scope
+                    .run(server.call_tool_structured("mcp_search", &args, extensions))
+                    .await;
+                assert!(matches!(result.outcome(), ToolOutcome::Success));
+                serde_json::from_str::<serde_json::Value>(result.model_output()).unwrap()
+            }
+        };
+
+        // The query shape that previously matched nothing: several exact
+        // names plus free words. Named tools rank before partial matches.
+        let named = search("ci_search_symbols ci_get_impl symbol implementation callers").await;
+        let names: Vec<_> = named["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|definition| definition["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(&names[..2], ["ci_get_impl", "ci_search_symbols"]);
+        assert!(named.get("hint").is_none());
+        assert!(activation.is_active("ci_search_symbols") && activation.is_active("ci_get_impl"));
+
+        let none = search("zzzz qqqq").await;
+        assert!(none["matches"].as_array().unwrap().is_empty());
+        assert_eq!(none["hint"], NO_MATCH_HINT);
+        scope.cancellation_handle().cancel();
+        scope.wait_idle().await;
+    }
+
+    /// mini-agent-23lx1: a rebuild for the same session retires the running
+    /// agent's activation; its searches must use the replacement view
+    /// instead of failing for the rest of the run.
+    #[tokio::test]
+    async fn search_recovers_through_the_sessions_newest_view_after_retirement() {
+        use super::*;
+        let root = crate::tests::OwnedTestDirectory::new("mcp-search-recover");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let sessions = DiscoverySessions::default();
+        let entry = || {
+            let definition = ToolDefinition {
+                name: "push_files".into(),
+                description: "push files".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            };
+            DeferredEntry {
+                server_name: "github".into(),
+                tool: Arc::new(MetadataOnlyTool(definition.clone())),
+                definition,
+                source: None,
+                is_live: Arc::new(|| true),
+            }
+        };
+        let first_activation = sessions
+            .capture("recover-session", &workspace, "catalogue-1".into())
+            .unwrap();
+        let first = Arc::new(DiscoveryView::new(first_activation, vec![entry()]));
+        sessions.register_view("recover-session", &first);
+        let binding = SearchBinding::default();
+        binding.follow_session(sessions.clone(), "recover-session");
+        binding.set_view(first.clone()).unwrap();
+        let server = ToolServer::new().run();
+        server.add_tool(McpSearch(binding.clone())).await.unwrap();
+        binding.set_server(server.downgrade()).unwrap();
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let extensions = ToolCallExtensions::new();
+        let search = || {
+            scope.run(server.call_tool_structured(
+                "mcp_search",
+                r#"{"query":"push_files"}"#,
+                &extensions,
+            ))
+        };
+        assert!(matches!(search().await.outcome(), ToolOutcome::Success));
+
+        // A rebuild with a different catalogue retires the first activation.
+        let second_activation = sessions
+            .capture("recover-session", &workspace, "catalogue-2".into())
+            .unwrap();
+        assert!(!first.activation.is_current());
+        let result = search().await;
+        assert!(
+            !matches!(result.outcome(), ToolOutcome::Success),
+            "no replacement view yet: clear error"
+        );
+
+        let second = Arc::new(DiscoveryView::new(second_activation.clone(), vec![entry()]));
+        sessions.register_view("recover-session", &second);
+        let result = search().await;
+        assert!(
+            matches!(result.outcome(), ToolOutcome::Success),
+            "{}",
+            result.model_output()
+        );
+        assert!(second_activation.is_active("push_files"));
+        scope.cancellation_handle().cancel();
+        scope.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn search_names_a_disconnected_server_instead_of_a_generic_change() {
+        use super::*;
+        let root = crate::tests::OwnedTestDirectory::new("mcp-search-disconnected");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let activation = DiscoverySessions::default()
+            .capture("dead-session", &workspace, "dead-catalogue".into())
+            .unwrap();
+        let definition = ToolDefinition {
+            name: "dead_tool".into(),
+            description: "dead".into(),
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+        };
+        let entry = DeferredEntry {
+            server_name: "github".into(),
+            tool: Arc::new(MetadataOnlyTool(definition.clone())),
+            definition,
+            source: None,
+            is_live: Arc::new(|| false),
+        };
+        let binding = SearchBinding::default();
+        binding
+            .set_view(Arc::new(DiscoveryView::new(activation, vec![entry])))
+            .unwrap();
+        let server = ToolServer::new().run();
+        server.add_tool(McpSearch(binding.clone())).await.unwrap();
+        binding.set_server(server.downgrade()).unwrap();
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let result = scope
+            .run(server.call_tool_structured(
+                "mcp_search",
+                r#"{"query":"dead_tool"}"#,
+                &ToolCallExtensions::new(),
+            ))
+            .await;
+        assert!(!matches!(result.outcome(), ToolOutcome::Success));
+        let output = result.model_output();
+        assert!(output.contains("'github' is disconnected"), "{output}");
+        assert!(output.contains("do not retry"), "{output}");
+        assert!(!output.contains("has changed"), "{output}");
+        scope.cancellation_handle().cancel();
+        scope.wait_idle().await;
+    }
+
     #[tokio::test]
     async fn actual_search_reserves_full_result_envelope_before_atomic_publication() {
         use super::*;

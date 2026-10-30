@@ -121,6 +121,8 @@ pub(crate) fn prepare(
             | "max_session_total_tokens"
             | "cache_ttl"
             | "permission_mode_cycle"
+            | "sandbox_required"
+            | "permission_checks_required"
     ) {
         return Err("This setting can only be changed in global configuration");
     }
@@ -130,9 +132,9 @@ pub(crate) fn prepare(
         .map(|layers| Arc::clone(&layers.source))
         .unwrap_or_else(|| Arc::clone(&workspace));
     let relative = PathBuf::from(if target == Target::Project {
-        ".zerostack/config.toml"
+        ".mini-agent/config.toml"
     } else {
-        ".zerostack/config.local.toml"
+        ".mini-agent/config.local.toml"
     });
     let (content, identity, digest) = match root.open_regular_relative(&relative) {
         Ok(file) => {
@@ -165,8 +167,8 @@ pub(crate) fn prepare(
     layers::validate_toml_bounds(&changed)?;
     let mut composed = base;
     for candidate in [
-        Path::new(".zerostack/config.toml"),
-        Path::new(".zerostack/config.local.toml"),
+        Path::new(".mini-agent/config.toml"),
+        Path::new(".mini-agent/config.local.toml"),
     ] {
         let text = if candidate == relative {
             changed.clone()
@@ -298,7 +300,7 @@ mod tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
-            project_dir: Some(workspace.join(".zerostack")),
+            project_dir: Some(workspace.join(".mini-agent")),
         };
         let path = paths.config_dir.join("config.toml");
         let binding = Arc::new(WorkspaceBinding::capture(&workspace).unwrap());
@@ -342,7 +344,7 @@ mod tests {
     #[test]
     fn config68_sensitive_local_decline_and_exact_independent_trust() {
         let (_owner, paths, root, path) = fixture();
-        let relative = Path::new(".zerostack/config.toml");
+        let relative = Path::new(".mini-agent/config.toml");
         let edit = prepare_at(
             &paths,
             &path,
@@ -370,7 +372,7 @@ mod tests {
             &root,
             relative
         ));
-        let local = Path::new(".zerostack/config.local.toml");
+        let local = Path::new(".mini-agent/config.local.toml");
         let edit = prepare_at(&paths, &path, &root, Target::Local, "sandbox", "false");
         assert!(edit.confirmation.is_some());
         assert!(!load::project_config_relative_is_trusted_at_readonly(
@@ -405,7 +407,7 @@ mod tests {
             "provider",
             "\"anthropic\"",
         );
-        let target = root.root().join(".zerostack/config.toml");
+        let target = root.root().join(".mini-agent/config.toml");
         std::fs::write(&target, "model='editor-change'\n").unwrap();
         assert!(edit.publish(true).is_err());
         assert_eq!(
@@ -418,8 +420,8 @@ mod tests {
         std::fs::rename(root.root(), &moved).unwrap();
         std::fs::create_dir(root.root()).unwrap();
         assert!(edit.publish(true).is_err());
-        assert!(!root.root().join(".zerostack").exists());
-        assert!(!moved.join(".zerostack/config.local.toml").exists());
+        assert!(!root.root().join(".mini-agent").exists());
+        assert!(!moved.join(".mini-agent/config.local.toml").exists());
     }
     #[test]
     fn config68_validation_rejects_secret_errors_and_project_global_ceiling_without_writes() {
@@ -435,7 +437,7 @@ mod tests {
                 .unwrap();
             assert!(!error.contains("secret"));
             assert!(!path.exists());
-            assert!(!root.root().join(".zerostack").exists());
+            assert!(!root.root().join(".mini-agent").exists());
         }
     }
 }

@@ -1,16 +1,16 @@
 ---
-description: "Use MiniMax models with zerostack through an OpenAI-compatible custom provider."
+description: "Use MiniMax models with mini-agent through an OpenAI-compatible custom provider."
 ---
 
 # MiniMax
 
-MiniMax is available in zerostack through custom provider definitions. The
+MiniMax is available in mini-agent through custom provider definitions. The
 configuration below keeps the API protocol and region explicit while sharing a
 single `MINIMAX_API_KEY` environment variable.
 
 ## Credentials
 
-Set the API key in your shell instead of storing it in the zerostack config:
+Set the API key in your shell instead of storing it in the mini-agent config:
 
 ```bash
 export MINIMAX_API_KEY="your-api-key"
@@ -18,7 +18,7 @@ export MINIMAX_API_KEY="your-api-key"
 
 ## Provider Routes
 
-Add the routes you need to `~/.config/zerostack/config.toml`:
+Add the routes you need to `~/.config/mini-agent/config.toml`:
 
 ```toml
 [custom_providers.minimax-global-openai]
@@ -79,7 +79,7 @@ service-tier pricing:
 | priority | over 512,000 tokens | $0.90 | $3.60 | $0.18 |
 
 The optional quick-model entries below use the standard tier at up to 512,000
-tokens for zerostack's local cost estimate:
+tokens for mini-agent's local cost estimate:
 
 ```toml
 [quick_models.minimax-m3]

@@ -267,28 +267,15 @@ async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
                     format!("warning: theme choice not saved: {}", e),
                 );
             }
-            if let Some(colors) = &ctx.cfg.colors {
-                let chat_bg = colors
-                    .chat_background
-                    .as_deref()
-                    .and_then(crate::ui::utils::parse_color);
-                let input_bg = colors
-                    .input_background
-                    .as_deref()
-                    .and_then(crate::ui::utils::parse_color);
-                let status_bg = colors
-                    .status_background
-                    .as_deref()
-                    .and_then(crate::ui::utils::parse_color);
-                ctx.renderer
-                    .set_background_colors(chat_bg, input_bg, status_bg);
-            }
+            let defaults = crate::config::ColorsConfig::default();
+            let colors = ctx.cfg.colors.as_ref().unwrap_or(&defaults);
+            crate::context::themes::apply_colors(colors, ctx.renderer, ctx.input);
             write_ok(ctx.renderer, "theme cleared (using config colors)");
         }
     } else {
         let name = parts[1].trim();
         if let Some(content) = ctx.context.themes.get(name) {
-            if let Err(error) = crate::context::themes::apply(content, ctx.renderer) {
+            if let Err(error) = crate::context::themes::apply(content, ctx.renderer, ctx.input) {
                 write_error(
                     ctx.renderer,
                     format!("could not apply theme '{}': {}", name, error),
@@ -401,19 +388,19 @@ mod theme_selection_tests {
         let root = crate::tests::OwnedTestDirectory::new("theme-selection-errors");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -517,8 +504,13 @@ mod theme_selection_tests {
         );
         ctx.context.themes.insert("broken".into(), "{".into());
         assert!(
-            context::themes::apply_initial(ctx.context, ctx.cfg.colors.as_ref(), ctx.renderer)
-                .is_some()
+            context::themes::apply_initial(
+                ctx.context,
+                ctx.cfg.colors.as_ref(),
+                ctx.renderer,
+                ctx.input,
+            )
+            .is_some()
         );
         assert_eq!(ctx.context.current_theme_name, None);
         assert_eq!(storage::load_theme_name().as_deref(), Some("broken"));

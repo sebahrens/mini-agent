@@ -1424,12 +1424,12 @@ mod tests {
     fn fixture() -> (crate::tests::OwnedTestDirectory, Arc<WorkspaceInstructions>) {
         let root = crate::tests::OwnedTestDirectory::new("context63-loader");
         let path = root.path().join("workspace");
-        std::fs::create_dir_all(path.join(".zerostack")).unwrap();
-        std::fs::write(path.join(".zerostack/config.toml"), "model='fixture'\n").unwrap();
+        std::fs::create_dir_all(path.join(".mini-agent")).unwrap();
+        std::fs::write(path.join(".mini-agent/config.toml"), "model='fixture'\n").unwrap();
         let mut paths = crate::paths::AppPaths::from_process(Some(path.clone())).unwrap();
         paths.state_dir = root.path().join("state");
         crate::config::load::trust_project_config(
-            &path.join(".zerostack/config.toml"),
+            &path.join(".mini-agent/config.toml"),
             &paths.project_config_trust_file(),
         )
         .unwrap();

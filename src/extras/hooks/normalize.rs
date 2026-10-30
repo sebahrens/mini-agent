@@ -1,5 +1,5 @@
-/// Canonicalizes a tool name into zerostack's own name, accepting either
-/// zerostack's own name or Claude Code's equivalent name. Case-insensitive
+/// Canonicalizes a tool name into mini-agent's own name, accepting either
+/// mini-agent's own name or Claude Code's equivalent name. Case-insensitive
 /// and idempotent for builtins. Explicit `mcp__` matcher labels retain raw
 /// component case; they are never parsed back into MCP provenance.
 pub(crate) fn canonical_tool_name(name: &str) -> String {

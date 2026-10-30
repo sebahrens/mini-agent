@@ -49,15 +49,28 @@ impl Roots {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mini-agent"));
         command.current_dir(&self.0);
         for name in [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ] {
             command.env(name, &self.0);
         }
+        // Legacy discovery also consults the platform's former default roots;
+        // point them at this fixture so a developer's real sessions or
+        // configuration cannot leak into the session-file assertions.
+        #[cfg(target_os = "linux")]
+        command
+            .env("XDG_CONFIG_HOME", &self.0)
+            .env("XDG_DATA_HOME", &self.0)
+            .env("XDG_STATE_HOME", &self.0)
+            .env("XDG_CACHE_HOME", &self.0);
+        #[cfg(target_os = "macos")]
+        command.env("HOME", &self.0);
+        #[cfg(target_os = "windows")]
+        command.env("APPDATA", &self.0).env("LOCALAPPDATA", &self.0);
         command
             .env("HEADLESS_LOCAL_TEST_KEY", "fixture-only")
             .env("NO_PROXY", "127.0.0.1,localhost")
@@ -450,10 +463,19 @@ fn acp53_stdio_ordered_images_retry_private_save_load_and_literal_commands() {
             .any(|row| row["sessionId"] == id && row["title"] == "[literal saved name]"),
         "{list}"
     );
-    peer.request(
+    let loaded = peer.request(
         7,
         "session/load",
         serde_json::json!({"sessionId":id,"cwd":roots.0,"mcpServers":[]}),
+    );
+    // Editors re-read the persona selector from the load response.
+    assert!(
+        loaded["configOptions"]
+            .as_array()
+            .is_some_and(|options| options
+                .iter()
+                .any(|option| option["id"] == "mode" && option["type"] == "select")),
+        "{loaded}"
     );
     assert!(
         peer.notifications

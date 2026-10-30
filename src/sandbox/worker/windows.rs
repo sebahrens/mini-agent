@@ -23,6 +23,35 @@ use super::{
 
 const BACKEND: WorkerBackend = WorkerBackend::WindowsLpac;
 const PREFLIGHT_FAILURE_REASON: &str = "Windows LPAC production runtime preflight failed";
+const MAX_PREFLIGHT_DIAGNOSTIC_CHARS: usize = 512;
+
+fn bounded_preflight_failure(error: &feasibility::GateError) -> String {
+    let mut detail = String::with_capacity(error.0.len().min(MAX_PREFLIGHT_DIAGNOSTIC_CHARS));
+    let mut kept = 0usize;
+    let mut truncated = false;
+    for character in error.0.chars() {
+        if kept >= MAX_PREFLIGHT_DIAGNOSTIC_CHARS {
+            truncated = true;
+            break;
+        }
+        if character.is_control() {
+            if !detail.ends_with(' ') {
+                detail.push(' ');
+            }
+        } else {
+            detail.push(character);
+        }
+        kept += 1;
+    }
+    let detail = detail.trim();
+    if detail.is_empty() {
+        PREFLIGHT_FAILURE_REASON.to_string()
+    } else if truncated {
+        format!("{PREFLIGHT_FAILURE_REASON}: {detail}...")
+    } else {
+        format!("{PREFLIGHT_FAILURE_REASON}: {detail}")
+    }
+}
 
 static STATUS: OnceLock<WorkerContainmentStatus> = OnceLock::new();
 
@@ -164,16 +193,21 @@ fn probe_containment() -> WorkerContainmentStatus {
             backend: BACKEND,
             assurance: WorkerContainmentAssurance::Enforced,
         },
-        Err(_) => WorkerContainmentStatus::Unavailable {
+        Err(error) => WorkerContainmentStatus::Unavailable {
             backend: BACKEND,
             assurance: WorkerContainmentAssurance::Enforced,
-            reason: PREFLIGHT_FAILURE_REASON.to_string(),
+            reason: bounded_preflight_failure(&error),
         },
+    };
+    let reason = match &containment {
+        WorkerContainmentStatus::Unavailable { reason, .. } => reason.as_str(),
+        WorkerContainmentStatus::Available { .. } => "none",
     };
     tracing::debug!(
         phase = "windows_js_worker_preflight",
         elapsed_ms = started.elapsed().as_millis() as u64,
         available = matches!(&containment, WorkerContainmentStatus::Available { .. }),
+        reason,
         "completed closed Windows JavaScript-worker startup phase"
     );
     containment
@@ -208,10 +242,10 @@ pub(super) fn containment_status_for_benchmark(
             backend: BACKEND,
             assurance: WorkerContainmentAssurance::Enforced,
         },
-        Err(_) => WorkerContainmentStatus::Unavailable {
+        Err(error) => WorkerContainmentStatus::Unavailable {
             backend: BACKEND,
             assurance: WorkerContainmentAssurance::Enforced,
-            reason: PREFLIGHT_FAILURE_REASON.to_string(),
+            reason: bounded_preflight_failure(&error),
         },
     }
 }
@@ -973,10 +1007,10 @@ mod feasibility {
     }
 
     #[derive(Debug)]
-    struct OwnedSid(Vec<usize>);
+    pub(super) struct OwnedSid(Vec<usize>);
 
     impl OwnedSid {
-        fn as_psid(&self) -> PSID {
+        pub(super) fn as_psid(&self) -> PSID {
             self.0.as_ptr().cast_mut().cast()
         }
 
@@ -1125,17 +1159,17 @@ mod feasibility {
         !left.is_null() && !right.is_null() && unsafe { EqualSid(left, right) } != 0
     }
 
-    struct SidPolicy {
-        user: OwnedSid,
-        system: OwnedSid,
-        administrators: OwnedSid,
+    pub(super) struct SidPolicy {
+        pub(super) user: OwnedSid,
+        pub(super) system: OwnedSid,
+        pub(super) administrators: OwnedSid,
         trusted_installer: Option<OwnedSid>,
         broad: Vec<OwnedSid>,
         restricted_packages: LocalMemory,
     }
 
     impl SidPolicy {
-        fn current() -> Result<Self, GateError> {
+        pub(super) fn current() -> Result<Self, GateError> {
             let mut restricted_packages = null_mut();
             let restricted_text = wide_string("S-1-15-2-2");
             // SAFETY: the SID string is NUL terminated; LocalFree owns the
@@ -1162,7 +1196,7 @@ mod feasibility {
             })
         }
 
-        fn trusted_writer(&self, sid: PSID) -> bool {
+        pub(super) fn trusted_writer(&self, sid: PSID) -> bool {
             sid_equal(sid, self.user.as_psid())
                 || sid_equal(sid, self.system.as_psid())
                 || sid_equal(sid, self.administrators.as_psid())
@@ -1510,9 +1544,12 @@ mod feasibility {
         let security = read_file_security(&executable)?;
         let protected_machine_wide = location == InstallLocation::ProtectedMachineWide;
         observe(RuntimePreflightFailureStage::AclOwner);
-        if !protected_machine_wide && !sid_equal(security.owner, policy.user.as_psid()) {
+        // Per-user MSI payloads can be materialized by the Windows Installer service and retain
+        // SYSTEM, Administrators, or TrustedInstaller ownership even beneath LOCALAPPDATA. The
+        // same closed writer set is already enforced for every image-path ancestor and ACE.
+        if !protected_machine_wide && !policy.trusted_writer(security.owner) {
             return Err(GateError(
-                "current user does not own the executable; ACL mutation refused".to_string(),
+                "an untrusted principal owns the executable; ACL mutation refused".to_string(),
             ));
         }
         // Ordinary per-user installs may inherit host Users read/execute. That
@@ -3600,9 +3637,12 @@ mod feasibility {
                     };
                     if !status.success() || active != 0 {
                         terminate_and_reap_preflight_helper(&helper, cleanup_deadline)?;
-                        return Err(GateError(
-                            "Windows production runtime preflight helper failed".to_string(),
-                        ));
+                        let exit_code = status
+                            .code()
+                            .map_or_else(|| "terminated".to_string(), |code| code.to_string());
+                        return Err(GateError(format!(
+                            "Windows production runtime preflight helper failed: exit_code={exit_code}, active_processes={active}"
+                        )));
                     }
                     return Ok(());
                 }
@@ -5465,6 +5505,36 @@ mod tests {
         WaitForSingleObject,
     };
 
+    #[test]
+    fn worker_preflight_failure_is_sanitized_and_bounded() {
+        let error = super::feasibility::GateError(format!(
+            "stage\n{}",
+            "x".repeat(super::MAX_PREFLIGHT_DIAGNOSTIC_CHARS + 32)
+        ));
+        let diagnostic = super::bounded_preflight_failure(&error);
+
+        assert!(!diagnostic.contains('\n'));
+        assert!(diagnostic.starts_with(&format!("{}: stage ", super::PREFLIGHT_FAILURE_REASON)));
+        assert!(diagnostic.ends_with("..."));
+        assert!(
+            diagnostic.chars().count()
+                <= super::PREFLIGHT_FAILURE_REASON.chars().count()
+                    + 2
+                    + super::MAX_PREFLIGHT_DIAGNOSTIC_CHARS
+                    + 3
+        );
+    }
+
+    #[test]
+    fn windows_installer_service_owners_are_trusted_for_per_user_payloads() {
+        let policy = super::feasibility::SidPolicy::current()
+            .expect("resolve the Windows installer ownership policy");
+
+        assert!(policy.trusted_writer(policy.user.as_psid()));
+        assert!(policy.trusted_writer(policy.system.as_psid()));
+        assert!(policy.trusted_writer(policy.administrators.as_psid()));
+    }
+
     /// Serializes complete production-launch observation windows in this test process.
     ///
     /// This is deliberately separate from `PROCESS_CREATION_LOCK`: these tests must be able to
@@ -5674,7 +5744,22 @@ mod tests {
                     assurance,
                     crate::sandbox::worker::WorkerContainmentAssurance::Enforced
                 );
-                assert_eq!(reason, "Windows LPAC production runtime preflight failed");
+                // The reason is the fixed closed prefix, optionally followed by the bounded,
+                // control-character-sanitized parent-side gate detail from
+                // `bounded_preflight_failure`; it never carries worker output.
+                assert!(
+                    reason == super::PREFLIGHT_FAILURE_REASON
+                        || reason.starts_with(&format!("{}: ", super::PREFLIGHT_FAILURE_REASON)),
+                    "unexpected unavailable reason: {reason}"
+                );
+                assert!(!reason.chars().any(char::is_control));
+                assert!(
+                    reason.chars().count()
+                        <= super::PREFLIGHT_FAILURE_REASON.chars().count()
+                            + 2
+                            + super::MAX_PREFLIGHT_DIAGNOSTIC_CHARS
+                            + 3
+                );
             }
             status => {
                 panic!("libtest image unexpectedly reported production available: {status:?}")

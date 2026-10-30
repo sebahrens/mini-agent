@@ -274,6 +274,14 @@ pub(crate) fn cache_prices_for_model(
             .min_by(|(a, _), (b, _)| a.cmp(b))
             .map(|(_, entry)| entry)
     });
+    // An explicit custom_providers.<name>.model_prices.<model> entry
+    // (mini-agent-9osxv) ranks between a selected quick-model alias and the
+    // published catalog: more specific than the catalog, but a quick-model
+    // alias explicitly chosen for this session still wins.
+    let custom = cfg
+        .custom_providers_map()
+        .get(provider)
+        .and_then(|custom| custom.model_prices.get(model));
     let tier = |read: bool| {
         let get = |entry: &crate::config::QuickModelConfig| {
             (if read {
@@ -283,8 +291,17 @@ pub(crate) fn cache_prices_for_model(
             })
             .filter(|price| valid_price(*price))
         };
+        let get_custom = |entry: &crate::config::CustomProviderModelPrices| {
+            (if read {
+                entry.cache_read_token_cost
+            } else {
+                entry.cache_write_token_cost
+            })
+            .filter(|price| valid_price(*price))
+        };
         selected
             .and_then(get)
+            .or_else(|| custom.and_then(get_custom))
             .or(if read {
                 published.read
             } else {
@@ -315,6 +332,13 @@ pub(crate) fn cache_prices_for_model(
                 entry
                     .cache_write_1h_token_cost
                     .filter(|price| valid_price(*price))
+            })
+            .or_else(|| {
+                custom.and_then(|entry| {
+                    entry
+                        .cache_write_1h_token_cost
+                        .filter(|price| valid_price(*price))
+                })
             })
             .or_else(|| {
                 let entry = matching?;
@@ -833,6 +857,66 @@ mod cache_pricing_tests {
             )
             .read,
             Some(0.25)
+        );
+    }
+
+    /// mini-agent-9osxv: a `custom_providers.<name>.model_prices` entry
+    /// prices cache tiers with no `quick_models` alias involved, and a
+    /// selected alias (when one does exist for this exact provider/model)
+    /// still wins.
+    #[test]
+    fn custom_provider_model_prices_price_cache_tiers_without_a_quick_model_alias() {
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "custom_providers": { "litellm-gw": {
+                "provider_type": "openai",
+                "base_url": "http://127.0.0.1:1/v1",
+                "model_prices": {
+                    "bedrock.anthropic.claude-sonnet-5-5": {
+                        "input_token_cost": 3.0,
+                        "output_token_cost": 15.0,
+                        "cache_read_token_cost": 0.3,
+                        "cache_write_token_cost": 3.75,
+                        "cache_write_1h_token_cost": 6.0
+                    }
+                }
+            } }
+        }))
+        .unwrap();
+        let rates = cache_prices_for_model(
+            "litellm-gw",
+            "bedrock.anthropic.claude-sonnet-5-5",
+            &cfg,
+            None,
+            3.0,
+        );
+        assert_eq!(
+            rates,
+            CachePrices {
+                read: Some(0.3),
+                write: Some(3.75),
+                write_1h: Some(6.0),
+                split_required: false,
+            }
+        );
+
+        // An invalid (negative) price in the table is rejected at config
+        // load, not silently accepted.
+        let invalid = serde_json::json!({
+            "provider_type": "openai",
+            "base_url": "http://127.0.0.1:1/v1",
+            "model_prices": { "m": { "input_token_cost": -1.0 } }
+        });
+        assert!(serde_json::from_value::<crate::config::CustomProviderConfig>(invalid).is_err());
+
+        // An unrecognized key in a model_prices entry is rejected rather
+        // than silently ignored.
+        let unknown_key = serde_json::json!({
+            "provider_type": "openai",
+            "base_url": "http://127.0.0.1:1/v1",
+            "model_prices": { "m": { "typo_token_cost": 1.0 } }
+        });
+        assert!(
+            serde_json::from_value::<crate::config::CustomProviderConfig>(unknown_key).is_err()
         );
     }
 }

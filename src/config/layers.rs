@@ -43,7 +43,7 @@ pub(crate) fn discover(
             Arc::new(WorkspaceBinding::capture(&root).map_err(|_| "config root unavailable")?)
         };
         source.validate().map_err(|_| "config root changed")?;
-        match std::fs::symlink_metadata(root.join(".zerostack")) {
+        match std::fs::symlink_metadata(root.join(".mini-agent")) {
             Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
                 return Err("nearest config directory is not a regular directory");
             }
@@ -52,8 +52,8 @@ pub(crate) fn discover(
             }
             _ => {}
         }
-        let project = root.join(".zerostack/config.toml");
-        let local = root.join(".zerostack/config.local.toml");
+        let project = root.join(".mini-agent/config.toml");
+        let local = root.join(".mini-agent/config.local.toml");
         let has_project = exists(&project)?;
         let has_local = exists(&local)?;
         workspace.validate().map_err(|_| "workspace changed")?;
@@ -874,20 +874,20 @@ mod tests {
         let child = repo.join("src/nested");
         std::fs::create_dir_all(&child).unwrap();
         std::fs::create_dir(repo.join(".git")).unwrap();
-        std::fs::create_dir(repo.join(".zerostack")).unwrap();
-        std::fs::write(repo.join(".zerostack/config.toml"), "model='repo'").unwrap();
+        std::fs::create_dir(repo.join(".mini-agent")).unwrap();
+        std::fs::write(repo.join(".mini-agent/config.toml"), "model='repo'").unwrap();
         let workspace = Arc::new(WorkspaceBinding::capture(&child).unwrap());
         let found = discover(&workspace, None).unwrap().unwrap();
         assert_eq!(found.source.root(), repo.canonicalize().unwrap());
         assert!(found.local.is_none());
         assert_eq!(workspace.root(), child.canonicalize().unwrap());
-        std::fs::create_dir(child.join(".zerostack")).unwrap();
-        std::fs::write(child.join(".zerostack/config.local.toml"), "model='local'").unwrap();
+        std::fs::create_dir(child.join(".mini-agent")).unwrap();
+        std::fs::write(child.join(".mini-agent/config.local.toml"), "model='local'").unwrap();
         let found = discover(&workspace, None).unwrap().unwrap();
         assert_eq!(found.source.root(), workspace.root());
         assert!(found.project.is_none());
         assert!(found.local.is_some());
-        std::fs::remove_dir_all(child.join(".zerostack")).unwrap();
+        std::fs::remove_dir_all(child.join(".mini-agent")).unwrap();
         std::fs::write(child.join(".git"), "gitdir: ignored external target").unwrap();
         assert!(discover(&workspace, None).unwrap().is_none());
     }
@@ -898,14 +898,14 @@ mod tests {
         let root = crate::tests::OwnedTestDirectory::new("config69-discovery-refusal");
         let home = root.path().join("home");
         let child = home.join("work");
-        std::fs::create_dir_all(home.join(".zerostack")).unwrap();
+        std::fs::create_dir_all(home.join(".mini-agent")).unwrap();
         std::fs::create_dir(&child).unwrap();
-        std::fs::write(home.join(".zerostack/config.toml"), "model='home'").unwrap();
+        std::fs::write(home.join(".mini-agent/config.toml"), "model='home'").unwrap();
         let workspace = Arc::new(WorkspaceBinding::capture(&child).unwrap());
         assert!(discover(&workspace, Some(&home)).unwrap().is_none());
-        std::os::unix::fs::symlink(home.join(".zerostack"), child.join(".zerostack")).unwrap();
+        std::os::unix::fs::symlink(home.join(".mini-agent"), child.join(".mini-agent")).unwrap();
         assert!(discover(&workspace, Some(&home)).is_err());
-        std::fs::remove_file(child.join(".zerostack")).unwrap();
+        std::fs::remove_file(child.join(".mini-agent")).unwrap();
         std::fs::rename(&child, home.join("old-work")).unwrap();
         std::fs::create_dir(&child).unwrap();
         assert!(discover(&workspace, Some(&home)).is_err());

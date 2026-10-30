@@ -1,10 +1,10 @@
 # JavaScript Runtime — Implementation Overview
 
 - **Document role**: non-normative implementation overview
-- **Overview version**: 2.1.0
+- **Overview version**: 2.2.0
 - **Delivery status**: Phase 6 delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-06
+- **Last reconciled**: 2026-09-15
 
 The sole normative JS corpus is
 [`docs/specs/00-index.md`](docs/specs/00-index.md) and the specifications it indexes. This file maps
@@ -48,6 +48,11 @@ Normative specification: [`platform-paths.md`](docs/specs/platform-paths.md)
 - Validate Agent Skill directories/ZIPs without execution; `allowed-tools` is metadata only.
 - Keep platform storage/security claims qualified by their resolver, ACL, migration, archive, CI,
   and release gates.
+- Use `mini-agent` for every new user-global application component, `.mini-agent` for project
+  policy, and `MINI_AGENT_*` for public environment variables. Pre-rename `zerostack` global roots,
+  `ZEROSTACK_*_DIR` path overrides, and `zerostack-session-jsonl` imports are migration inputs only;
+  canonical values always win. Repository-controlled `.zerostack` policy is never auto-loaded or
+  copied because it must be reviewed and trusted again under `.mini-agent`.
 
 ## Phase 1 — preserved engine semantics
 
@@ -154,6 +159,7 @@ the parent before initialization is attempted again.
 | Same-executable bootstrap and fresh runtimes | `src/extras/js/worker.rs` |
 | Private realms, export wrappers, verifier loader | `src/extras/js/realm.rs` |
 | Linux empty-root containment | `src/sandbox/worker/linux.rs` |
+| Linux process-lifetime `--die-with-parent` spawner thread | `src/sandbox/spawner.rs` |
 | macOS one-time-image/Seatbelt/guardian launcher | `src/sandbox/worker/macos.rs` |
 | Windows LPAC/Job and attestation | `src/sandbox/worker/windows.rs` |
 

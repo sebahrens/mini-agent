@@ -68,16 +68,13 @@ pub fn detect_media(path: &Path) -> Option<&'static str> {
         "flac" => Some("audio/flac"),
         "m4a" => Some("audio/mp4"),
         "aac" => Some("audio/aac"),
+        #[cfg(feature = "pdf")]
         "pdf" => Some("application/pdf"),
         _ => None,
     }
 }
 
 fn sniff_media(data: &[u8]) -> Option<&'static str> {
-    let pdf_offset = data
-        .iter()
-        .take(1024)
-        .position(|byte| !byte.is_ascii_whitespace());
     if data.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
@@ -100,7 +97,13 @@ fn sniff_media(data: &[u8]) -> Option<&'static str> {
         Some("audio/mp4")
     } else if data.len() >= 2 && data[0] == 0xff && data[1] & 0xf6 == 0xf0 {
         Some("audio/aac")
-    } else if pdf_offset.is_some_and(|offset| data[offset..].starts_with(b"%PDF-")) {
+    } else if cfg!(feature = "pdf")
+        && data
+            .iter()
+            .take(1024)
+            .position(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|offset| data[offset..].starts_with(b"%PDF-"))
+    {
         Some("application/pdf")
     } else {
         None

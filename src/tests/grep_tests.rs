@@ -120,6 +120,13 @@ fn text_reader_preserves_the_sniffed_prefix_and_remaining_bytes() {
 }
 
 #[test]
+fn growing_text_reader_is_bounded_by_the_search_file_limit() {
+    let mut reader = std::io::repeat(b'x');
+    let mut buf = Vec::new();
+    assert!(!GrepTool::read_non_binary(&mut reader, &mut buf, 0).unwrap());
+}
+
+#[test]
 fn shared_read_buffer_is_not_polluted_by_a_previous_file() {
     let mut buf = Vec::new();
     let mut binary = std::io::Cursor::new(b"abc\0def".to_vec());

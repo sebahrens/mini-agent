@@ -439,7 +439,8 @@ pub(super) fn prepare(
     cache: &Path,
     ready_path: Option<PathBuf>,
 ) -> Result<Pending, String> {
-    let request = prepare_launch_request(program, arguments, cwd, cache, ready_path, &[], &[])?;
+    let request =
+        prepare_launch_request(program, arguments, cwd, cache, ready_path, &[], &[], None)?;
     let cell = Cell::new()?;
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -604,6 +605,8 @@ mod tests {
             },
             arguments: vec!["PRIVATE_ARGUMENT".into()],
             cwd: "PRIVATE_WORKSPACE".into(),
+            workspace: "PRIVATE_WORKSPACE".into(),
+            traverse_roots: vec![],
             cache: "PRIVATE_CACHE".into(),
             read_roots: vec![],
             write_roots: vec![],

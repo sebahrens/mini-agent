@@ -149,6 +149,7 @@ where
             strict_tools: self.strict_tools,
             tool_result_array_content: self.tool_result_array_content,
             prompt_caching: self.prompt_caching,
+            prompt_caching_ttl_1h: self.prompt_caching_ttl_1h,
         };
         let mut request = self.client.ext().build_completion_request(
             self.model.clone(),

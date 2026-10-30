@@ -34,7 +34,7 @@ fn shell_quote(path: &std::path::Path) -> String {
 #[tokio::test]
 async fn bash_compound_command_permission_denies_before_starting_any_child() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-bash-permission-sentinel-{}",
+        "mini-agent-bash-permission-sentinel-{}",
         std::process::id()
     ));
     let quoted_marker = shell_quote(&marker);

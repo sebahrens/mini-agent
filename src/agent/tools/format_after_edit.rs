@@ -505,6 +505,8 @@ fn command(template: &str, operand: &str, dialect: ShellDialect) -> Option<Strin
     let mut rendered = match dialect {
         ShellDialect::Posix => String::new(),
         ShellDialect::PowerShell => "& ".into(),
+        // cmd.exe has no quoting that keeps arbitrary paths literal.
+        ShellDialect::Cmd => return None,
     };
     for (i, arg) in args.iter().enumerate() {
         if i > 0 {
@@ -524,7 +526,7 @@ fn command(template: &str, operand: &str, dialect: ShellDialect) -> Option<Strin
                 '\'',
                 match dialect {
                     ShellDialect::Posix => "'\"'\"'",
-                    ShellDialect::PowerShell => "''",
+                    ShellDialect::PowerShell | ShellDialect::Cmd => "''",
                 },
             ));
             rendered.push('\'');

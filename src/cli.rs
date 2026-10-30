@@ -204,6 +204,13 @@ pub struct Cli {
     )]
     pub js_runtime_check: bool,
 
+    #[cfg(feature = "git-worktree")]
+    #[arg(
+        long = "git-runtime-check",
+        help = "Execute an offline structured Git status self-check and exit"
+    )]
+    pub git_runtime_check: bool,
+
     #[cfg(feature = "skills")]
     #[arg(
         long = "learned-skill-stats",
@@ -723,10 +730,10 @@ pub struct Cli {
     #[arg(long = "no-session", help = "Ephemeral mode, do not save")]
     pub no_session: bool,
 
-    #[arg(long = "provider", env = "ZS_PROVIDER", help = "API provider")]
+    #[arg(long = "provider", env = "MINI_AGENT_PROVIDER", help = "API provider")]
     pub provider: Option<String>,
 
-    #[arg(long = "model", env = "ZS_MODEL", help = "Model name")]
+    #[arg(long = "model", env = "MINI_AGENT_MODEL", help = "Model name")]
     pub model: Option<String>,
 
     #[arg(long = "quick-model", help = "Use a named quick model from config")]
@@ -852,6 +859,13 @@ pub struct Cli {
     pub sandbox_backend: Option<String>,
 
     #[arg(
+        long = "sandbox-toolchain-root",
+        value_name = "PATH",
+        help = "Add a read-only toolchain bind for the Linux bwrap sandbox (repeatable; absolute or ~/; replaces sandbox-toolchain-roots and its default)"
+    )]
+    pub sandbox_toolchain_roots: Vec<std::path::PathBuf>,
+
+    #[arg(
         long = "sandbox-profile",
         value_enum,
         help = "Filesystem profile for contained commands; does not change permission mode or network policy"
@@ -921,6 +935,13 @@ pub struct Cli {
     #[cfg(feature = "acp")]
     #[arg(long = "acp-port", help = "ACP TCP bind port [default: 7243]")]
     pub acp_port: Option<u16>,
+
+    #[cfg(feature = "acp")]
+    #[arg(
+        long = "acp-accept-timeout-secs",
+        help = "Seconds to wait for the first authenticated ACP TCP peer [default: 300]"
+    )]
+    pub acp_accept_timeout_secs: Option<u64>,
 
     #[cfg(feature = "loop")]
     #[arg(long = "loop-prompt", help = "Prompt for each loop iteration")]
@@ -1184,7 +1205,7 @@ impl Cli {
         cfg: &config::Config,
         openrouter_model: Option<&str>,
     ) -> CompactString {
-        // CLI --model (or ZS_MODEL) takes a raw model string.
+        // CLI --model (or MINI_AGENT_MODEL) takes a raw model string.
         if let Some(m) = self.model.as_deref() {
             return CompactString::new(m);
         }
@@ -1401,6 +1422,18 @@ impl Cli {
             .unwrap_or_else(default_sandbox_backend)
     }
 
+    /// Effective `sandbox-toolchain-roots`: CLI entries replace the
+    /// configured list, which replaces the built-in default.
+    pub fn resolve_sandbox_toolchain_roots(&self, cfg: &config::Config) -> Vec<std::path::PathBuf> {
+        if !self.sandbox_toolchain_roots.is_empty() {
+            self.sandbox_toolchain_roots.clone()
+        } else if let Some(roots) = &cfg.sandbox_toolchain_roots {
+            roots.clone()
+        } else {
+            crate::sandbox::default_sandbox_read_roots()
+        }
+    }
+
     pub fn resolve_sandbox_profile(&self, cfg: &config::Config) -> crate::sandbox::SandboxProfile {
         self.sandbox_profile
             .or(cfg.sandbox_profile)
@@ -1435,7 +1468,7 @@ impl Cli {
             .or_else(|| cfg.shell.clone())
             .unwrap_or_else(|| {
                 if cfg!(target_os = "windows") {
-                    "powershell.exe".to_string()
+                    "cmd.exe".to_string()
                 } else {
                     "bash".to_string()
                 }
@@ -1654,7 +1687,7 @@ mod tests {
                 "--exact",
                 "cli::tests::shell_completion_command_ignores_ambient_model_choices_without_changing_normal_cli",
                 "--nocapture", "--test-threads=1",
-            ]).env(CHILD, &fifo).env("ZS_PROVIDER", "anthropic").env("ZS_MODEL", "ambient-model");
+            ]).env(CHILD, &fifo).env("MINI_AGENT_PROVIDER", "anthropic").env("MINI_AGENT_MODEL", "ambient-model");
             let output = crate::sandbox::Sandbox::new(false, "none")
                 .output_built_command_with_limits(
                     completion_env_child,
@@ -2150,6 +2183,37 @@ output_token_cost = 0.0
 
         cli.sandbox_backend = Some("command-line".to_string());
         assert_eq!(cli.resolve_sandbox_backend(&cfg), "command-line");
+    }
+
+    #[test]
+    fn sandbox_toolchain_roots_default_then_config_then_cli_replace_each_other() {
+        use std::path::PathBuf;
+        let mut cli = Cli::default();
+        let mut cfg = config::Config::default();
+        let defaults = cli.resolve_sandbox_toolchain_roots(&cfg);
+        assert_eq!(defaults, crate::sandbox::default_sandbox_read_roots());
+        for expected in [
+            "/home/linuxbrew",
+            "~/.cargo/bin",
+            "~/.local/bin",
+            "~/.rustup",
+        ] {
+            assert!(defaults.contains(&PathBuf::from(expected)), "{expected}");
+        }
+
+        cfg.sandbox_toolchain_roots = Some(Vec::new());
+        assert!(cli.resolve_sandbox_toolchain_roots(&cfg).is_empty());
+        cfg.sandbox_toolchain_roots = Some(vec!["/opt/tools".into()]);
+        assert_eq!(
+            cli.resolve_sandbox_toolchain_roots(&cfg),
+            vec![PathBuf::from("/opt/tools")]
+        );
+
+        cli.sandbox_toolchain_roots = vec!["/srv/cli".into()];
+        assert_eq!(
+            cli.resolve_sandbox_toolchain_roots(&cfg),
+            vec![PathBuf::from("/srv/cli")]
+        );
     }
 
     #[test]

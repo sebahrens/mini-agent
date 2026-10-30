@@ -94,6 +94,14 @@ pub(crate) fn run_linux_cpu_limit_child_probe() -> io::Result<()> {
     platform::run_cpu_limit_child_probe()
 }
 
+/// mini-agent-hdl3i: the enforced Linux native CPU ceiling (`RLIMIT_CPU`), for the resource
+/// benchmark's own diagnostics only. Reports the same value `finalize_worker` enforces; never
+/// used to decide containment.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn linux_worker_cpu_limit_seconds_for_test() -> u64 {
+    platform::cpu_limit_seconds_for_test()
+}
+
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn run_linux_core_limit_child_probe() -> io::Result<()> {
     platform::run_core_limit_child_probe()
@@ -324,9 +332,20 @@ pub(crate) struct WindowsWorkerProcessObservation {
 }
 
 impl WorkerProcess {
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(test, target_os = "macos", target_os = "linux"))]
     pub(crate) fn id(&self) -> u32 {
         self.process.id()
+    }
+
+    /// The worker's cumulative CPU time in whole seconds, fail-closed on any read or parse
+    /// failure. Used only to retire a reused worker before its cumulative CPU time nears the
+    /// native `RLIMIT_CPU` ceiling (see `WorkerReusePolicy` in the JS supervisor) and to provide
+    /// evidence for classifying a subsequent plain `SIGKILL`; this crate's own PID is not the
+    /// worker's PID (bubblewrap forks an inner namespace-init process before it execs the
+    /// worker), which `platform::cumulative_cpu_seconds` accounts for.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cumulative_cpu_seconds(&self) -> io::Result<u64> {
+        platform::cumulative_cpu_seconds(self.id())
     }
 
     /// Completes platform cleanup that is safe only after an exact, challenge-bound Ready.
@@ -465,6 +484,13 @@ impl Drop for WorkerProcess {
         // synchronous destruction cannot hang an async executor indefinitely.
         let _ = self.terminate_and_reap(Duration::from_millis(500));
     }
+}
+
+/// This platform's hard `RLIMIT_CPU` ceiling (seconds), for the JS supervisor's proactive
+/// retirement margin. See [`WorkerProcess::cumulative_cpu_seconds`].
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_cpu_limit_seconds() -> u64 {
+    platform::cpu_limit_seconds()
 }
 
 #[cfg(unix)]

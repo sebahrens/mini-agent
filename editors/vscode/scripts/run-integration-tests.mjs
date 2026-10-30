@@ -1,4 +1,5 @@
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -68,8 +69,9 @@ try {
   const dataRoot = join(testRoot, 'data');
   const providerEvents = join(testRoot, 'provider-events.jsonl');
   const fixtureFile = join(workspace, 'fixture.txt');
+  const extensionsDir = join(profileRoot, 'extensions');
   const profileArgs = [
-    `--extensions-dir=${join(profileRoot, 'extensions')}`,
+    `--extensions-dir=${extensionsDir}`,
     `--user-data-dir=${join(profileRoot, 'user-data')}`,
   ];
   stage('workspace-setup');
@@ -158,6 +160,23 @@ try {
     if (!stdout.split(/\r?\n/).includes(`mini-agent.mini-agent@${manifest.version}`)) {
       throw new Error(`Installed candidate was not listed by clean VS Code:\n${stdout}`);
     }
+    // The installed Windows binary can only execute on a Windows host.
+    if (target === 'win32-x64' && process.platform === 'win32') {
+      const installedName = readdirSync(extensionsDir).find((name) => (
+        name.startsWith(`mini-agent.mini-agent-${manifest.version}`)
+      ));
+      if (!installedName) {
+        throw new Error(`Cannot locate installed mini-agent extension under ${extensionsDir}`);
+      }
+      const installedBinary = join(extensionsDir, installedName, 'bin', target, TARGETS[target].binary);
+      const runtimeCheck = execFileSync(installedBinary, ['--js-runtime-check'], {
+        cwd: join(extensionsDir, installedName),
+        encoding: 'utf8',
+      }).trim();
+      if (runtimeCheck !== 'JS runtime check: PASS (2)') {
+        throw new Error(`Installed VSIX JavaScript containment check failed: ${runtimeCheck}`);
+      }
+    }
     console.log(`Installed and discovered ${vsix} in clean VS Code ${version}`);
 
     // Install/discovery alone misses activation and ACP startup failures. The
@@ -171,18 +190,18 @@ try {
       launchArgs: [workspace, '--disable-workspace-trust', ...profileArgs],
       extensionTestsEnv: {
         MINI_AGENT_HOME: configRoot,
-        ZS_CONFIG_DIR: configRoot,
-        ZS_DATA_DIR: dataRoot,
-        ZS_LOCAL_DATA_DIR: configRoot,
-        ZS_STATE_DIR: configRoot,
-        ZS_CACHE_DIR: configRoot,
-        ZS_CREDENTIALS_DIR: configRoot,
-        MINI_AGENT_VSIX_PROFILE_ROOT: join(profileRoot, 'extensions'),
+        MINI_AGENT_CONFIG_DIR: configRoot,
+        MINI_AGENT_DATA_DIR: dataRoot,
+        MINI_AGENT_LOCAL_DATA_DIR: configRoot,
+        MINI_AGENT_STATE_DIR: configRoot,
+        MINI_AGENT_CACHE_DIR: configRoot,
+        MINI_AGENT_CREDENTIALS_DIR: configRoot,
+        MINI_AGENT_VSIX_PROFILE_ROOT: extensionsDir,
         MINI_AGENT_IDE_PROVIDER_EVENTS: providerEvents,
         MINI_AGENT_IDE_FIXTURE_KEY: 'unused-local-fixture-key',
         OPENROUTER_API_KEY: 'unused-vscode-host-smoke-key',
-        ...(process.env.ZS_LOCAL_DATA_DIR
-          ? { ZS_LOCAL_DATA_DIR: process.env.ZS_LOCAL_DATA_DIR }
+        ...(process.env.MINI_AGENT_LOCAL_DATA_DIR
+          ? { MINI_AGENT_LOCAL_DATA_DIR: process.env.MINI_AGENT_LOCAL_DATA_DIR }
           : {}),
       },
     });

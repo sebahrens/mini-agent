@@ -223,6 +223,7 @@ fn kind(shape: ConfigShape) -> &'static str {
         ConfigShape::Number => "number",
         ConfigShape::String => "string",
         ConfigShape::Strings => "string array",
+        ConfigShape::AllNoneOrStrings => "\"all\", \"none\" or string array",
         ConfigShape::Enum(_) => "enum",
         ConfigShape::BoolOrInteger => "bool/integer",
         _ => "table",

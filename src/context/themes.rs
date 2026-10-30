@@ -5,6 +5,7 @@ use include_dir::{Dir, include_dir};
 
 use crate::config::{ColorsConfig, SchemeType};
 use crate::ui::feed::ForegroundPalette;
+use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
 use crate::ui::utils::{parse_color, to_ansi_256};
 
@@ -45,9 +46,13 @@ pub(crate) fn regen_preview() -> (usize, Vec<String>) {
     crate::context::edited_embedded_files(&EMBEDDED, &global_dir())
 }
 
-pub fn apply(content: &str, renderer: &mut Renderer) -> Result<(), serde_json::Error> {
+pub fn apply(
+    content: &str,
+    renderer: &mut Renderer,
+    input: &mut InputEditor,
+) -> Result<(), serde_json::Error> {
     let colors = serde_json::from_str::<ColorsConfig>(content)?;
-    apply_colors(&colors, renderer);
+    apply_colors(&colors, renderer, input);
     Ok(())
 }
 
@@ -78,7 +83,7 @@ fn resolve_foregrounds(colors: &ColorsConfig, mut palette: ForegroundPalette) ->
     palette
 }
 
-fn apply_colors(colors: &ColorsConfig, renderer: &mut Renderer) {
+pub fn apply_colors(colors: &ColorsConfig, renderer: &mut Renderer, input: &mut InputEditor) {
     let light = colors
         .chat_background
         .as_deref()
@@ -107,15 +112,20 @@ fn apply_colors(colors: &ColorsConfig, renderer: &mut Renderer) {
     let chat_bg = colors.chat_background.as_deref().and_then(parse_color);
     let input_bg = colors.input_background.as_deref().and_then(parse_color);
     let status_bg = colors.status_background.as_deref().and_then(parse_color);
-    if matches!(colors.scheme_type, SchemeType::Ansi) {
-        renderer.set_background_colors(
-            chat_bg.map(to_ansi_256),
-            input_bg.map(to_ansi_256),
-            status_bg.map(to_ansi_256),
-        );
-    } else {
-        renderer.set_background_colors(chat_bg, input_bg, status_bg);
-    }
+    let accent = colors.accent.as_deref().and_then(parse_color);
+    let convert = |color: Option<crossterm::style::Color>| {
+        if matches!(colors.scheme_type, SchemeType::Ansi) {
+            color.map(to_ansi_256)
+        } else {
+            color
+        }
+    };
+    renderer.set_background_colors(convert(chat_bg), convert(input_bg), convert(status_bg));
+    // The theme accent recolours the welcome banner and picker highlights;
+    // both the renderer and the input pickers must see the same value.
+    let accent = convert(accent);
+    renderer.set_accent_color(accent);
+    input.set_accent_color(accent);
 }
 
 /// Restore the saved theme or use config colors with an actionable diagnostic.
@@ -124,10 +134,11 @@ pub(crate) fn apply_initial(
     context: &mut crate::context::ContextFiles,
     colors: Option<&ColorsConfig>,
     renderer: &mut Renderer,
+    input: &mut InputEditor,
 ) -> Option<String> {
     let warning = if let Some(name) = context.current_theme_name.as_deref() {
         match context.themes.get(name) {
-            Some(content) => match apply(content, renderer) {
+            Some(content) => match apply(content, renderer, input) {
                 Ok(()) => return None,
                 Err(error) => Some(format!(
                     "could not apply saved theme '{name}': {error}; using config colors"
@@ -144,9 +155,9 @@ pub(crate) fn apply_initial(
         context.current_theme_name = None;
     }
     if let Some(colors) = colors {
-        apply_colors(colors, renderer);
+        apply_colors(colors, renderer, input);
     } else {
-        apply_colors(&ColorsConfig::default(), renderer);
+        apply_colors(&ColorsConfig::default(), renderer, input);
     }
     warning
 }
@@ -160,7 +171,11 @@ mod themes_tests {
     fn themes_default_uses_retained_osc_background_and_explicit_colors_win() {
         let mut renderer = Renderer::for_app_test().unwrap();
         renderer.set_terminal_background(Some(Color::White));
-        apply_colors(&ColorsConfig::default(), &mut renderer);
+        apply_colors(
+            &ColorsConfig::default(),
+            &mut renderer,
+            &mut InputEditor::new(),
+        );
         assert_eq!(
             renderer.foreground_palette_for_test().text,
             Color::Rgb {
@@ -170,7 +185,11 @@ mod themes_tests {
             }
         );
         renderer.set_terminal_background(Some(Color::Black));
-        apply_colors(&ColorsConfig::default(), &mut renderer);
+        apply_colors(
+            &ColorsConfig::default(),
+            &mut renderer,
+            &mut InputEditor::new(),
+        );
         assert_eq!(
             renderer.foreground_palette_for_test().text,
             Color::Rgb {
@@ -184,7 +203,7 @@ mod themes_tests {
             text: Some("#123456".into()),
             ..ColorsConfig::default()
         };
-        apply_colors(&explicit, &mut renderer);
+        apply_colors(&explicit, &mut renderer, &mut InputEditor::new());
         let palette = renderer.foreground_palette_for_test();
         assert_eq!(
             palette.tool,
@@ -207,6 +226,7 @@ mod themes_tests {
         apply(
             include_str!("../../data/themes/default-light.json"),
             &mut renderer,
+            &mut InputEditor::new(),
         )
         .unwrap();
         assert_eq!(
@@ -217,7 +237,11 @@ mod themes_tests {
                 b: 47
             }
         );
-        apply_colors(&ColorsConfig::default(), &mut renderer);
+        apply_colors(
+            &ColorsConfig::default(),
+            &mut renderer,
+            &mut InputEditor::new(),
+        );
         assert_eq!(
             renderer.foreground_palette_for_test().text,
             Color::Rgb {
@@ -250,6 +274,7 @@ mod themes_tests {
             "diff_add":"#040506","diff_del":"#050607","error":"#060708",
             "agent":"#070809","code":"#08090a"}"##,
             &mut renderer,
+            &mut InputEditor::new(),
         )
         .unwrap();
         let after = renderer.feed().lines(80);
@@ -282,7 +307,7 @@ mod themes_tests {
         let _environment =
             crate::tests::ScopedProcessEnv::set(&[("COLORFGBG", Some("0;15".into()))]);
         let mut renderer = Renderer::for_app_test().unwrap();
-        apply("{}", &mut renderer).unwrap();
+        apply("{}", &mut renderer, &mut InputEditor::new()).unwrap();
         let light = renderer.foreground_palette_for_test();
         assert_eq!(
             light.agent,
@@ -295,6 +320,7 @@ mod themes_tests {
         apply(
             r##"{"chat_background":"#000000","agent":"#112233"}"##,
             &mut renderer,
+            &mut InputEditor::new(),
         )
         .unwrap();
         let explicit = renderer.foreground_palette_for_test();
@@ -317,6 +343,7 @@ mod themes_tests {
         apply(
             r##"{"chat_background":"#ffffff","agent":"#ff0000","scheme_type":"ansi"}"##,
             &mut renderer,
+            &mut InputEditor::new(),
         )
         .unwrap();
         assert_eq!(
@@ -332,6 +359,7 @@ mod themes_tests {
         apply(
             include_str!("../../data/themes/default-light.json"),
             &mut renderer,
+            &mut InputEditor::new(),
         )
         .unwrap();
         renderer
@@ -375,7 +403,12 @@ mod themes_tests {
     fn themes_invalid_json_reports_location_and_preserves_renderer() {
         let mut renderer = Renderer::new().unwrap();
         renderer.set_background_colors(Some(Color::Blue), None, Some(Color::Red));
-        let error = apply("{\n  \"chat_background\":\n}", &mut renderer).unwrap_err();
+        let error = apply(
+            "{\n  \"chat_background\":\n}",
+            &mut renderer,
+            &mut InputEditor::new(),
+        )
+        .unwrap_err();
         assert_eq!((error.line(), error.column()), (3, 1));
         assert!(
             error
@@ -391,7 +424,12 @@ mod themes_tests {
     #[test]
     fn themes_valid_json_applies_full_and_ansi_colors() {
         let mut renderer = Renderer::new().unwrap();
-        apply(r##"{"chat_background":"#ff0000"}"##, &mut renderer).unwrap();
+        apply(
+            r##"{"chat_background":"#ff0000"}"##,
+            &mut renderer,
+            &mut InputEditor::new(),
+        )
+        .unwrap();
         assert_eq!(
             renderer.background_colors_for_test(),
             (Some(Color::Rgb { r: 255, g: 0, b: 0 }), None, None)
@@ -399,6 +437,7 @@ mod themes_tests {
         apply(
             r##"{"chat_background":"#ff0000","scheme_type":"ansi"}"##,
             &mut renderer,
+            &mut InputEditor::new(),
         )
         .unwrap();
         assert_eq!(
@@ -412,19 +451,19 @@ mod themes_tests {
         let root = crate::tests::OwnedTestDirectory::new("broken-startup-theme");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -443,7 +482,13 @@ mod themes_tests {
             ..Default::default()
         };
         let mut renderer = Renderer::new().unwrap();
-        let warning = apply_initial(&mut context, Some(&colors), &mut renderer).unwrap();
+        let warning = apply_initial(
+            &mut context,
+            Some(&colors),
+            &mut renderer,
+            &mut InputEditor::new(),
+        )
+        .unwrap();
         assert!(warning.contains("could not apply saved theme 'broken'"));
         assert!(warning.contains("line 3 column 1"));
         assert_eq!(context.current_theme_name, None);
@@ -457,15 +502,71 @@ mod themes_tests {
         );
         context.current_theme_name = Some("missing".into());
         assert!(
-            apply_initial(&mut context, Some(&colors), &mut renderer)
-                .unwrap()
-                .contains("saved theme 'missing' is unavailable")
+            apply_initial(
+                &mut context,
+                Some(&colors),
+                &mut renderer,
+                &mut InputEditor::new(),
+            )
+            .unwrap()
+            .contains("saved theme 'missing' is unavailable")
         );
         assert_eq!(context.current_theme_name, None);
         context.current_theme_name = Some("broken".into());
         context.themes.insert("broken".into(), "{}".into());
-        assert!(apply_initial(&mut context, Some(&colors), &mut renderer).is_none());
+        assert!(
+            apply_initial(
+                &mut context,
+                Some(&colors),
+                &mut renderer,
+                &mut InputEditor::new(),
+            )
+            .is_none()
+        );
         assert_eq!(context.current_theme_name.as_deref(), Some("broken"));
         assert_eq!(renderer.background_colors_for_test(), (None, None, None));
+    }
+
+    #[test]
+    fn theme_accent_reaches_renderer_and_input_pickers() {
+        use crate::ui::renderer::LineEntry;
+
+        let mut renderer = Renderer::new().expect("renderer");
+        let mut input = InputEditor::new();
+
+        apply(
+            r##"{"accent":"#FD5108","chat_background":"#111113"}"##,
+            &mut renderer,
+            &mut input,
+        )
+        .unwrap();
+
+        let orange_rgb = Color::Rgb {
+            r: 0xfd,
+            g: 0x51,
+            b: 0x08,
+        };
+        let orange = Some(orange_rgb);
+        assert_eq!(renderer.accent_color(), orange);
+        assert_eq!(input.accent_color(), orange);
+
+        let welcome = LineEntry {
+            text: "welcome".into(),
+            color: Color::Cyan,
+            theme_accent: true,
+            syntax_spans: None,
+        };
+        let markdown_heading = LineEntry {
+            text: "heading".into(),
+            color: Color::Cyan,
+            theme_accent: false,
+            syntax_spans: None,
+        };
+        assert_eq!(renderer.line_color_for_test(&welcome), orange_rgb);
+        assert_eq!(
+            renderer.line_color_for_test(&markdown_heading),
+            Color::Cyan,
+            "unrelated cyan content must retain its semantic color"
+        );
     }
 }

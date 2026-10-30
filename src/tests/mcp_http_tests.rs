@@ -3,12 +3,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use compact_str::CompactString;
-use futures::FutureExt;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
 use crate::extras::mcp::client::McpClientHandle;
+
+/// Upper bound that only distinguishes a bounded outcome from a hang. It is
+/// deliberately generous so scheduler stalls during a loaded full test run
+/// cannot turn a correct deadline or cancellation into a failure.
+const HUNG_BOUND: Duration = Duration::from_secs(30);
 
 /// Accept requests and drain their bytes without replying. The notification
 /// lets cancellation target an actual in-flight network operation.
@@ -52,12 +56,12 @@ async fn mcp_http_initialization_honors_deadlines_and_scope_cancellation() {
     std::fs::create_dir_all(&root).unwrap();
     let root = CredentialRoot(root.canonicalize().unwrap());
     let overrides = [
-        "ZS_CONFIG_DIR",
-        "ZS_DATA_DIR",
-        "ZS_LOCAL_DATA_DIR",
-        "ZS_STATE_DIR",
-        "ZS_CACHE_DIR",
-        "ZS_CREDENTIALS_DIR",
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
     ]
     .map(|name| (name, Some(root.0.join(name).into_os_string())));
     let _environment = crate::tests::ScopedProcessEnv::set(&overrides);
@@ -65,8 +69,22 @@ async fn mcp_http_initialization_honors_deadlines_and_scope_cancellation() {
     assert!(paths.credentials_dir.starts_with(&root.0));
     assert!(paths.data_dir.starts_with(&root.0));
     for oauth_enabled in [false, true] {
-        for cancel in [false, true] {
-            let (url, listener, received) = spawn_silent_listener().await;
+        // The cancellation run goes first: it waits until the request reaches
+        // the fixture, so it measures how long this host currently needs to
+        // put an initialization request on the wire. The deadline run then
+        // uses a budget scaled from that measurement, so a loaded host cannot
+        // make a fixed deadline fire before the request has even been sent.
+        let mut observed_arrival = Duration::ZERO;
+        for cancel in [true, false] {
+            let (http_url, listener, received) = spawn_silent_listener().await;
+            // OAuth endpoints must be HTTPS. The silent TCP fixture does not
+            // complete TLS, which is exactly what this deadline/cancellation
+            // test needs: the request reaches the network and then blocks.
+            let url = if oauth_enabled {
+                http_url.replacen("http://", "https://", 1)
+            } else {
+                http_url
+            };
             let oauth =
                 oauth_enabled.then_some(crate::extras::mcp::config::OAuthConfig::Enabled(true));
             if let Some(oauth) = &oauth {
@@ -85,7 +103,17 @@ async fn mcp_http_initialization_honors_deadlines_and_scope_cancellation() {
                 store.write_blocking(&credentials).unwrap();
             }
             let headers = HashMap::new();
+            let initialize_timeout = if cancel {
+                // Never reached: cancellation fires once the request has
+                // arrived, however long the host takes to send it.
+                Duration::from_secs(120)
+            } else {
+                // Far below the production 10 s bound, but always several
+                // times what this host just needed to send the same request.
+                (observed_arrival * 4).clamp(Duration::from_secs(2), Duration::from_secs(30))
+            };
             let scope = crate::agent::runner::AgentWorkScope::new();
+            let started = std::time::Instant::now();
             let result = {
                 let connecting = scope.run(McpClientHandle::connect_http_with_timeout(
                     CompactString::new("silent-server"),
@@ -93,23 +121,42 @@ async fn mcp_http_initialization_honors_deadlines_and_scope_cancellation() {
                     &headers,
                     oauth.as_ref(),
                     None,
-                    if cancel {
-                        Duration::from_secs(10)
-                    } else {
-                        Duration::from_millis(300)
-                    },
+                    initialize_timeout,
                 ));
                 tokio::pin!(connecting);
-                tokio::time::timeout(Duration::from_secs(5), async {
+                // Generous bound that only separates "honored its deadline or
+                // cancellation" from "hung"; it is never the tight edge.
+                tokio::time::timeout(initialize_timeout + HUNG_BOUND, async {
                     if cancel {
                         tokio::select! {
                             result = &mut connecting => panic!("connection finished before cancellation: {}", result.is_ok()),
-                            _ = received.notified() => scope.cancellation_handle().cancel(),
+                            _ = received.notified() => {
+                                observed_arrival = started.elapsed();
+                                scope.cancellation_handle().cancel();
+                            }
                         }
+                        // Cancellation must stop initialization promptly, far
+                        // inside its still-running 120 s initialize deadline.
+                        return tokio::time::timeout(HUNG_BOUND, connecting)
+                            .await
+                            .expect("scope cancellation must stop HTTP initialization promptly");
                     }
                     connecting.await
-                }).await
+                })
+                .await
             };
+            if !cancel {
+                // The request bytes may already sit in the fixture's socket
+                // buffer while its reader task has not been scheduled yet.
+                // Let the reader drain them before tearing the fixture down,
+                // so this proof does not race the scheduler.
+                assert!(
+                    tokio::time::timeout(HUNG_BOUND, received.notified())
+                        .await
+                        .is_ok(),
+                    "the timeout must cover a real network request (OAuth: {oauth_enabled})"
+                );
+            }
             listener.abort();
             assert!(listener.await.is_err_and(|error| error.is_cancelled()));
             let error = result
@@ -120,10 +167,6 @@ async fn mcp_http_initialization_honors_deadlines_and_scope_cancellation() {
             if cancel {
                 assert_eq!(message, "MCP HTTP connection cancelled");
             } else {
-                assert!(
-                    received.notified().now_or_never().is_some(),
-                    "the timeout must cover a real network request"
-                );
                 assert!(message.contains("silent-server"), "{message}");
                 assert!(message.contains("timed out"), "{message}");
             }

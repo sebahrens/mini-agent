@@ -22,6 +22,7 @@ pub struct ModelsPicker {
     provider_lower: Vec<String>,
     pub group: usize,
     monochrome: bool,
+    accent: Option<Color>,
     /// The command whose argument this picker completes: `/model ` (the
     /// selector) or `/models ` (kept for compatibility).
     pub prefix: &'static str,
@@ -44,6 +45,7 @@ impl ModelsPicker {
             provider_lower: Vec::new(),
             group: 0,
             monochrome: false,
+            accent: None,
             prefix: "/models ",
             current: None,
         }
@@ -80,6 +82,10 @@ impl ModelsPicker {
         self.monochrome = monochrome;
     }
 
+    pub fn set_accent_color(&mut self, accent: Option<Color>) {
+        self.accent = accent;
+    }
+
     #[cfg(test)]
     pub(crate) fn is_monochrome(&self) -> bool {
         self.monochrome
@@ -93,6 +99,11 @@ impl ModelsPicker {
     }
 
     fn color(&self, color: Color) -> Color {
+        let color = if color == Color::Green {
+            self.accent.unwrap_or(color)
+        } else {
+            color
+        };
         resolve_color(color, self.monochrome)
     }
 
@@ -144,6 +155,27 @@ impl ModelsPicker {
             self.query.remove(byte_pos);
             self.filter();
         }
+    }
+
+    pub fn delete(&mut self) {
+        if self.cursor < self.query.chars().count() {
+            let byte_pos = self
+                .query
+                .char_indices()
+                .nth(self.cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(self.query.len());
+            self.query.remove(byte_pos);
+            self.filter();
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.query.chars().count());
     }
 
     fn filter(&mut self) {
@@ -232,6 +264,7 @@ impl ModelsPicker {
             |index| self.display_row(index),
             self.selected,
             self.monochrome,
+            self.accent,
             None,
             floor_row,
             1,

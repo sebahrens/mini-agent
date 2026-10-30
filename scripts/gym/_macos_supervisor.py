@@ -175,6 +175,43 @@ def job(path):
         os.close(report)
 
 
+def await_job_exit(peer, timeout=2.0):
+    # The job closes this connection only after releasing its control/report
+    # endpoints. Waiting for that EOF keeps launchd removal from racing a job
+    # that is still finishing (bounded; removal below tolerates the race).
+    peer.settimeout(timeout)
+    try:
+        while peer.recv(64):
+            pass
+    except OSError:
+        pass
+
+
+def remove_job(label, settle=3.0):
+    """Remove the launchd job, tolerating an asynchronous in-progress teardown.
+
+    ``launchctl remove`` can report failure (for example EINPROGRESS) while
+    launchd is still tearing down a job that is exiting. Success is defined by
+    the label no longer being loaded, observed within a bounded settle period.
+    """
+    removed = subprocess.run(["/bin/launchctl", "remove", label], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, timeout=10)
+    if removed.returncode == 0:
+        return
+    deadline = time.monotonic() + settle
+    while True:
+        listed = subprocess.run(["/bin/launchctl", "list", label], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=10)
+        if listed.returncode != 0:
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    os.write(2, f"Gym launchd job removal failed with status {removed.returncode}: ".encode()
+             + removed.stderr[-512:] + b"\n")
+    raise subprocess.CalledProcessError(removed.returncode, removed.args, stderr=removed.stderr)
+
+
 def broker(control, report, argv):
     label = "org.mini-agent.gym." + uuid.uuid4().hex
     directory = tempfile.mkdtemp(prefix="ma-gym-", dir="/tmp")
@@ -203,6 +240,8 @@ def broker(control, report, argv):
                 # The job keeps the control endpoint and coalition alive if the
                 # trainer dies; never kill that owner to meet a caller deadline.
                 confirmed = receive_exact(peer, 4) == b"done"
+                if confirmed:
+                    await_job_exit(peer)
     finally:
         if not handed_off or confirmed:
             if submitted:
@@ -213,18 +252,6 @@ def broker(control, report, argv):
         raise RuntimeError("Gym coalition cleanup not acknowledged")
 
 
-def remove_job(label):
-    """Unload the submitted job. A job that already exited may have been
-    unloaded before this runs; accept a failed remove only when launchd
-    confirms the label is no longer loaded, and fail closed otherwise."""
-    removed = subprocess.run(["/bin/launchctl", "remove", label],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-    if removed.returncode == 0:
-        return
-    loaded = subprocess.run(["/bin/launchctl", "list", label],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-    if loaded.returncode == 0:
-        raise subprocess.CalledProcessError(removed.returncode, removed.args)
 
 if __name__ == "__main__":
     if sys.argv[1] == "--job":

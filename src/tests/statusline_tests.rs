@@ -4,7 +4,7 @@ use crate::ui::statusline::{self, StatusContext, StatusSpan};
 
 fn ctx() -> StatusContext<'static> {
     StatusContext {
-        workspace: std::path::Path::new("/var/lib/zerostack-demo/project"),
+        workspace: std::path::Path::new("/var/lib/mini-agent-demo/project"),
         loop_label: None,
         cron_label: None,
         goal_label: None,
@@ -299,7 +299,7 @@ fn cwd_full_vs_cwd_folder() {
     // cwd = folder name, cwd_full = full path (no $HOME prefix here, unchanged)
     assert_eq!(
         line_text(&lines[0]),
-        "project /var/lib/zerostack-demo/project"
+        "project /var/lib/mini-agent-demo/project"
     );
 }
 

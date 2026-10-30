@@ -76,6 +76,7 @@ impl HostCapability {
         match operation {
             EffectOperation::ReadFile { .. }
             | EffectOperation::ReadFiles { .. }
+            | EffectOperation::ReadLines { .. }
             | EffectOperation::ListDir { .. }
             | EffectOperation::Glob { .. }
             | EffectOperation::Grep { .. } => Self::ReadFile,
@@ -360,7 +361,6 @@ pub(crate) struct SkillExportAuthoritySpec {
 struct SkillExportAuthority {
     prepared_manifest: PreparedSkillManifest,
     next_call_ordinal: u32,
-    revoked: bool,
 }
 
 /// Parent-only authority source for reusable persisted exports in one outer JS step.
@@ -392,7 +392,6 @@ impl SkillCallAuthority {
                     SkillExportAuthority {
                         prepared_manifest: spec.prepared_manifest,
                         next_call_ordinal: 0,
-                        revoked: false,
                     },
                 )
                 .is_some()
@@ -406,18 +405,6 @@ impl SkillCallAuthority {
             expires_at,
             exports,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn revoke_export(&mut self, artifact_id: &str, export_name: &str) -> bool {
-        let Some(authority) = self
-            .exports
-            .get_mut(&(artifact_id.to_string(), export_name.to_string()))
-        else {
-            return false;
-        };
-        authority.revoked = true;
-        true
     }
 }
 
@@ -1170,7 +1157,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             .exports
             .get_mut(&(request.artifact_id.clone(), request.export_name.clone()))
             .ok_or(())?;
-        if export.revoked || export.next_call_ordinal != request.call_ordinal {
+        if export.next_call_ordinal != request.call_ordinal {
             return Err(());
         }
         let invocation_id = super::skills::telemetry::stable_invocation_id(
@@ -1236,13 +1223,6 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             invocation_id: wire_invocation_id,
             grants: wire_grants,
         })
-    }
-
-    #[cfg(all(test, feature = "skills"))]
-    pub(crate) fn revoke_skill_export(&mut self, artifact_id: &str, export_name: &str) -> bool {
-        self.skill_calls
-            .as_mut()
-            .is_some_and(|authority| authority.revoke_export(artifact_id, export_name))
     }
 
     pub(crate) async fn dispatch(
@@ -1576,16 +1556,9 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         }
     }
 
-    // Test-only: production retires grants through erase_authority / consume paths.
-    #[cfg(test)]
-    pub(crate) fn revoke_grant(&mut self, grant_id: &GrantId) -> bool {
-        if self.grants.remove(grant_id).is_some() {
-            self.retired_grants.insert(grant_id.clone());
-            true
-        } else {
-            false
-        }
-    }
+    // Capability grants intentionally remain live for the bounded outer
+    // invocation. Production retirement happens only on expiry or when the
+    // invocation finishes, is cancelled, or is recycled.
 
     pub(crate) fn finish(&mut self) {
         self.erase_authority(InvocationState::Terminal);

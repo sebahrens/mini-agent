@@ -148,6 +148,14 @@ pub(crate) enum ExecutionAuthorityError {
     InvalidDefaultPermissionMode { value: String, accepted: String },
     #[error("{reason}")]
     InvalidPermissionModeCycle { reason: String },
+    #[error(
+        "`sandbox-required = true` is set in the user configuration, so {conflict} is refused (remove the setting from the global config to run unsandboxed)"
+    )]
+    SandboxRequired { conflict: &'static str },
+    #[error(
+        "`permission-checks-required = true` is set in the user configuration, so --dangerously-skip-permissions is refused (remove the setting from the global config to bypass permission checks)"
+    )]
+    PermissionChecksRequired,
 }
 
 /// Resolve every user/config input that changes model execution authority.
@@ -199,13 +207,30 @@ pub(crate) fn resolve_execution_authority(
         configured_default
     };
 
+    // User-global opt-in guards: a flag may tighten a session but never
+    // remove a protection the user made mandatory.
+    if cfg.permission_checks_required == Some(true) && cli.dangerously_skip_permissions {
+        return Err(ExecutionAuthorityError::PermissionChecksRequired);
+    }
+    if cfg.sandbox_required == Some(true) && !cli.resolve_sandbox(cfg) {
+        return Err(ExecutionAuthorityError::SandboxRequired {
+            conflict: if cli.no_sandbox {
+                "--no-sandbox"
+            } else {
+                "`sandbox = false`"
+            },
+        });
+    }
+
     let tools_enabled = !cli.resolve_no_tools(cfg);
     let permission_checks_enabled = tools_enabled && !cli.dangerously_skip_permissions;
     let sandbox = match sandbox_policy {
         crate::sandbox::SandboxPolicy::Disabled => SandboxResolution::Disabled,
         crate::sandbox::SandboxPolicy::RequiredAndAvailable => SandboxResolution::Enforced,
         crate::sandbox::SandboxPolicy::RequiredButUnavailable
-            if cli.sandbox_explicitly_requested(cfg) =>
+            if cli.sandbox_explicitly_requested(cfg)
+                || cfg.sandbox_required == Some(true)
+                || (cfg!(windows) && !cli.no_sandbox) =>
         {
             return Err(ExecutionAuthorityError::SandboxUnavailable {
                 backend: sandbox_backend.to_string(),
@@ -238,6 +263,7 @@ pub(crate) struct ConfiguredSandboxKey {
     home_masks: Vec<String>,
     appcontainer_read_roots: Vec<std::path::PathBuf>,
     appcontainer_write_roots: Vec<std::path::PathBuf>,
+    toolchain_roots: Vec<std::path::PathBuf>,
 }
 
 #[cfg(test)]
@@ -262,6 +288,7 @@ impl ConfiguredSandboxKey {
             home_masks: cfg.sandbox_home_masks.clone(),
             appcontainer_read_roots: cli.resolve_windows_appcontainer_read_roots(cfg),
             appcontainer_write_roots: cli.resolve_windows_appcontainer_write_roots(cfg),
+            toolchain_roots: cli.resolve_sandbox_toolchain_roots(cfg),
         }
     }
 
@@ -283,6 +310,7 @@ impl ConfiguredSandboxKey {
                 self.appcontainer_read_roots.clone(),
                 self.appcontainer_write_roots.clone(),
             )
+            .with_bwrap_read_roots(self.toolchain_roots.clone())
     }
 }
 
@@ -1046,14 +1074,20 @@ mod execution_authority_tests {
                 sandbox: Ok(SandboxResolution::Disabled),
             },
             Case {
-                name: "default unavailable sandbox degrades explicitly",
+                name: "default unavailable sandbox follows platform fail-closed policy",
                 cli: Cli::default(),
                 cfg: Config::default(),
                 sandbox_policy: SandboxPolicy::RequiredButUnavailable,
                 expected_mode: SecurityMode::Standard,
                 tools_enabled: true,
                 permission_checks_enabled: true,
-                sandbox: Ok(SandboxResolution::DegradedUnavailable),
+                sandbox: if cfg!(windows) {
+                    Err(
+                        "sandbox backend 'missing' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)",
+                    )
+                } else {
+                    Ok(SandboxResolution::DegradedUnavailable)
+                },
             },
             Case {
                 name: "cli explicit unavailable sandbox rejects",

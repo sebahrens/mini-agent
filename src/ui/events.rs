@@ -2,7 +2,7 @@ use chrono::Datelike;
 use compact_str::CompactString;
 
 use crate::cli::Cli;
-use crate::config::{Config, ResolvedShowToolDetails};
+use crate::config::Config;
 use crate::context::ContextFiles;
 use crate::session::{MessageRole, Session};
 use crate::ui::feed::BlockStyle;
@@ -286,11 +286,9 @@ fn push_session_records(
                 }
             }
             MessageRole::ToolResult => {
-                let Some(text) = tool_result_text(&msg.content, cfg) else {
-                    continue;
-                };
+                let block = tool_result_block(&msg.content, cfg);
                 let anchor = msg.tool_call_id.as_deref().unwrap_or("");
-                if feed.place_after_anchor(anchor, BlockStyle::ToolResult, text) {
+                if feed.place_block_after_anchor(anchor, block) {
                     // Sits under its call, before the call's own spacer.
                     continue;
                 }
@@ -322,44 +320,28 @@ fn push_runtime_availability(
     }
 }
 
-/// The transcript text for a stored tool result, shortened per
-/// `show_tool_details` like the live view.
-fn tool_result_text(content: &str, cfg: &Config) -> Option<String> {
+/// The transcript block for a stored tool result: folded per `tool_output`
+/// like the live view. The live `is_error` flag is not persisted, so a
+/// replayed failure is recognised by its text.
+fn tool_result_block(content: &str, cfg: &Config) -> crate::ui::feed::Block {
     let (name, output) = content.split_once(":\n").unwrap_or(("", content));
-    // Task-list updates have their own live rendering regardless of the
-    // generic tool-preview preference; preserve that exception on replay.
     if name == "todo_write" {
-        return Some(sanitize_output(output).to_string());
+        return crate::ui::feed::Block::new(BlockStyle::ToolResult, sanitize_output(output));
     }
-    let show_details = cfg
-        .show_tool_details
-        .as_ref()
-        .map(|s| s.resolve())
-        .unwrap_or(ResolvedShowToolDetails::Limited(3));
-    match show_details {
-        ResolvedShowToolDetails::Off => None,
-        ResolvedShowToolDetails::Limited(max_lines) => {
-            let sanitized = sanitize_output(output);
-            let char_count = sanitized.chars().count();
-            let lines: Vec<&str> = sanitized.lines().collect();
-            if lines.len() > max_lines {
-                let shown = lines[..max_lines].join("\n");
-                Some(format!(
-                    "◈ result ({} chars, {} lines, showing {}):\n{}",
-                    char_count,
-                    lines.len(),
-                    max_lines,
-                    shown
-                ))
-            } else {
-                Some(format!("◈ result ({} chars):\n{}", char_count, sanitized))
-            }
-        }
-        ResolvedShowToolDetails::Unlimited => {
-            let sanitized = sanitize_output(output);
-            let char_count = sanitized.chars().count();
-            Some(format!("◈ result ({} chars):\n{}", char_count, sanitized))
-        }
+    let view = crate::ui::tool_output::tool_result_view(
+        output,
+        crate::ui::tool_output::looks_like_error(output),
+        cfg.resolve_tool_output(),
+    );
+    if view.foldable() {
+        crate::ui::feed::Block::foldable(
+            BlockStyle::ToolResult,
+            view.collapsed,
+            view.expanded,
+            view.start_expanded,
+        )
+    } else {
+        crate::ui::feed::Block::new(BlockStyle::ToolResult, view.initial())
     }
 }
 
@@ -402,6 +384,7 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
         BlockStyle::Plain,
         "    /prompt       List / activate prompts",
     );
+    feed.push_line(BlockStyle::Plain, "    /permissions  Change approval mode");
     feed.push_line(BlockStyle::Plain, "    /mode         Change security mode");
     feed.push_line(BlockStyle::Plain, "    /clear        Clear session");
     feed.push_line(BlockStyle::Plain, "    /undo         Undo last exchange");
@@ -416,6 +399,10 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     feed.push_line(BlockStyle::Plain, "    Ctrl+O     Launch lazygit");
     feed.push_line(
         BlockStyle::Plain,
+        "    Ctrl+T     Fold/unfold the latest tool result (/expand n)",
+    );
+    feed.push_line(
+        BlockStyle::Plain,
         "    /command   Command picker (Tab inserts, Enter runs)",
     );
     feed.push_line(
@@ -424,7 +411,7 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     );
     feed.push_line(
         BlockStyle::Plain,
-        format!("  Website: {}", crate::product::REPOSITORY_URL),
+        format!("  Website: {}", crate::product::WEBSITE_URL),
     );
     feed.push_line(BlockStyle::Plain, "");
     feed.push_line(
@@ -927,14 +914,14 @@ mod tests {
         push_runtime_availability(
             &mut quiet,
             &JsRuntimeReport {
-                javascript: RuntimeAvailability::Available,
-                learned_skills: RuntimeAvailability::Available,
+                javascript: RuntimeAvailability::Pending,
+                learned_skills: RuntimeAvailability::Pending,
             },
         );
         assert_eq!(
             quiet.block_count(),
             0,
-            "a live runtime must add no banner line"
+            "a pending runtime must not be reported as unavailable"
         );
 
         let mut warned = Feed::new();
@@ -1049,8 +1036,8 @@ mod replay_tests {
         assert_eq!(rows[result_a + 1], "");
         assert_eq!(rows.len(), 6, "{rows:?}");
 
-        // Off matches live rendering: retain calls and their spacing, but
-        // add neither output nor one placeholder/spacer per hidden result.
+        // Off matches live rendering: results fold to their compact
+        // one-line summary under each call, with no extra spacer per result.
         let mut hidden = Feed::new();
         let off = Config {
             show_tool_details: Some(crate::config::ShowToolDetails::Bool(false)),
@@ -1058,12 +1045,13 @@ mod replay_tests {
         };
         push_session_messages(&mut hidden, &session.messages, &off);
         let rows = texts(&hidden);
-        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert_eq!(rows.len(), 6, "{rows:?}");
         assert!(rows[0].contains("◈ read"), "{rows:?}");
-        assert_eq!(rows[1], "");
-        assert!(rows[2].contains("◈ grep"), "{rows:?}");
-        assert_eq!(rows[3], "");
-        assert!(rows.iter().all(|row| !row.contains("result")), "{rows:?}");
+        assert!(rows[1].contains("result-a"), "{rows:?}");
+        assert_eq!(rows[2], "");
+        assert!(rows[3].contains("◈ grep"), "{rows:?}");
+        assert!(rows[4].contains("result-b"), "{rows:?}");
+        assert_eq!(rows[5], "");
 
         let mut tasks = Session::new("openrouter", "test-model", 128_000, "/workspace");
         tasks.add_tool_call_with_id("tasks", "todo_write", &args);

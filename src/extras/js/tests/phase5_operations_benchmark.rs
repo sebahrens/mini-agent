@@ -51,9 +51,12 @@ fn evidence(skill_id: &str, prefix: &str) -> Vec<InvocationEvidence> {
 }
 
 #[test]
-#[ignore = "set ZS_SKILL_BENCH_FULL=1 to run the 100,000-revision Phase 5 audit"]
+#[ignore = "set MINI_AGENT_SKILL_BENCH_FULL=1 to run the 100,000-revision Phase 5 audit"]
 fn phase5_operations_benchmark() {
-    assert_eq!(std::env::var("ZS_SKILL_BENCH_FULL").as_deref(), Ok("1"));
+    assert_eq!(
+        std::env::var("MINI_AGENT_SKILL_BENCH_FULL").as_deref(),
+        Ok("1")
+    );
     let root = std::env::temp_dir().join(format!("phase5-benchmark-{}", uuid::Uuid::new_v4()));
     let mut store = SkillStore::open_at(&paths(&root)).unwrap();
     let seed_started = Instant::now();

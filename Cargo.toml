@@ -166,7 +166,7 @@ tokio-native-tls = { version = "0.3", optional = true }
 lsp-types = { version = "0.97", optional = true }
 rquickjs = { version = "0.12", default-features = false, features = ["std"], optional = true }
 url = { version = "2", optional = true }
-zip = { version = "=9.0.3", default-features = false, features = ["deflate"] }
+zip = { version = "=9.0.5", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 matrixmultiply = { version = "0.3.11", optional = true, features = ["threading"] }
 hnsw_rs = { version = "0.3.4", optional = true }

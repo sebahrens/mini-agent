@@ -70,6 +70,17 @@ fn unsupported_handler_type_is_a_parse_error() {
 }
 
 #[test]
+fn unsupported_event_name_is_a_parse_error() {
+    let value = json!({
+        "PreToolUSe": [{"hooks": [{"type": "command", "command": "guard"}]}]
+    });
+
+    let error = parse_hooks_config(&value).unwrap_err();
+    assert!(error.contains("PreToolUSe"), "{error}");
+    assert!(error.contains("PreToolUse"), "{error}");
+}
+
+#[test]
 fn args_field_parses_as_string_list() {
     let value = json!({
         "PreToolUse": [

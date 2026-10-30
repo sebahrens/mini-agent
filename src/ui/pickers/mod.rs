@@ -199,6 +199,7 @@ pub(crate) fn draw_picker_list(
         |index| std::borrow::Cow::Borrowed(matches[index].as_str()),
         selected,
         monochrome,
+        None,
         empty_message,
         floor_row,
         reserved_above,
@@ -216,6 +217,7 @@ pub(crate) fn draw_picker_rows<'a>(
     row: impl Fn(usize) -> std::borrow::Cow<'a, str>,
     selected: usize,
     monochrome: bool,
+    accent: Option<Color>,
     empty_message: Option<&str>,
     floor_row: u16,
     reserved_above: u16,
@@ -227,6 +229,7 @@ pub(crate) fn draw_picker_rows<'a>(
         |index| (row(index), None),
         selected,
         monochrome,
+        accent,
         empty_message,
         floor_row,
         reserved_above,
@@ -244,6 +247,7 @@ pub(crate) fn draw_picker_described_rows<'a>(
     row: impl Fn(usize) -> (std::borrow::Cow<'a, str>, Option<&'a str>),
     selected: usize,
     monochrome: bool,
+    accent: Option<Color>,
     empty_message: Option<&str>,
     floor_row: u16,
     reserved_above: u16,
@@ -271,7 +275,7 @@ pub(crate) fn draw_picker_described_rows<'a>(
         let available = cols.saturating_sub(3) as usize;
         let truncated = crate::ui::utils::display_prefix(&item, available);
         let (color, marker) = if i == selected {
-            (Color::Green, '▸')
+            (accent.unwrap_or(Color::Green), '▸')
         } else {
             (Color::DarkGrey, ' ')
         };

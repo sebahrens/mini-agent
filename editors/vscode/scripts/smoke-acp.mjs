@@ -31,6 +31,11 @@ const app = acp.client({ name: 'mini-agent-vscode-artifact-smoke' })
   }));
 const connection = app.connect(acp.ndJsonStream(output, input));
 let session;
+// A cold Windows release runner must create and validate both AppContainer
+// profiles while ACP initializes and opens its first session. Keep every
+// lifecycle request bounded without confusing cold containment setup with an
+// ACP protocol failure.
+const lifecycleTimeout = process.platform === 'win32' ? 90_000 : 10_000;
 
 function within(promise, milliseconds, label) {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -66,8 +71,12 @@ try {
     protocolVersion: acp.PROTOCOL_VERSION,
     clientCapabilities: {},
     clientInfo: { name: 'mini-agent-vscode-artifact-smoke', version: manifest.version },
-  }), 10_000, 'initialize');
-  session = await within(connection.agent.buildSession(process.cwd()).start(), 10_000, 'session/new');
+  }), lifecycleTimeout, 'initialize');
+  session = await within(
+    connection.agent.buildSession(process.cwd()).start(),
+    lifecycleTimeout,
+    'session/new',
+  );
 
   const cancellation = new AbortController();
   void session.prompt(
@@ -79,12 +88,12 @@ try {
   // ACP clients and agents that use the explicit lifecycle notification.
   cancellation.abort();
   await connection.agent.notify(acp.methods.agent.session.cancel, { sessionId: session.sessionId });
-  const reason = await within(readStop(session), 20_000, 'cancelled prompt');
+  const reason = await within(readStop(session), lifecycleTimeout, 'cancelled prompt');
   if (reason !== 'cancelled') { throw new Error(`Expected cancelled stop reason, received ${reason}`); }
 
   await within(connection.agent.request(acp.methods.agent.session.close, {
     sessionId: session.sessionId,
-  }), 10_000, 'session/close');
+  }), lifecycleTimeout, 'session/close');
   console.log(`Verified ACP initialize/new/prompt/cancel/close for ${executable}`);
 } catch (error) {
   if (stderr) { console.error(stderr); }

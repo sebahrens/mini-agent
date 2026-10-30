@@ -57,9 +57,10 @@ The Command Palette exposes six commands:
 | **Mini Agent: Show Output** | Reveal the Mini Agent output channel without moving keyboard focus. |
 
 Open Config resolves the global configuration root exactly like the binary:
-`ZS_CONFIG_DIR`, then `MINI_AGENT_HOME`, then `~/.mini-agent` when it exists
-or no legacy `zerostack` root exists, otherwise the legacy platform-native
-`zerostack` root. It opens an existing TOML/YAML/JSON config when present.
+`MINI_AGENT_CONFIG_DIR`, then `MINI_AGENT_HOME`, then `~/.mini-agent` when it
+exists or no prior platform-native root exists, otherwise the existing
+platform-native `mini-agent` root. It opens an existing TOML/YAML/JSON config
+when present.
 
 ### Settings
 
@@ -145,9 +146,9 @@ openssl rand -hex 32
 ### 3. Configure mini-agent
 
 Add to your global config (for example `~/.mini-agent/config.toml`, or
-`~/.config/zerostack/config.toml` for an existing legacy Linux install) or
+`~/.config/mini-agent/config.toml` for an existing Linux install) or
 project-local
-`.zerostack/config.toml`. The `type` key selects the transport; the `host`
+`.mini-agent/config.toml`. The `type` key selects the transport; the `host`
 and `port` must match the listener you start in the next step:
 
 ```toml
@@ -159,7 +160,9 @@ api_key = "<your-key>"
 ```
 
 Alternatively, export `MINI_AGENT_ACP_API_KEY=<your-key>` instead of storing
-the key in the config file. The environment variable takes precedence.
+the key in the config file. The environment variable takes precedence. Keys
+must contain at least 32 bytes; generate one from a cryptographically secure
+random source.
 
 ### 4. Start mini-agent in TCP mode
 
@@ -174,6 +177,8 @@ session is unencrypted and the client cannot authenticate the server. To reach
 the agent from another machine, keep it on loopback and tunnel (for example
 `ssh -L 7890:127.0.0.1:7890 host`).
 The default port when only `--acp-host` is given is `7243`.
+The server waits up to 300 seconds for the first authenticated peer by default;
+use `--acp-accept-timeout-secs` to select a different positive deadline.
 
 ### 5. Point your client at the agent
 

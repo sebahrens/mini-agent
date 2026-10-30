@@ -6,7 +6,7 @@ use crate::logging;
 use clap::Parser;
 
 fn parse_cli(args: &[&str]) -> Cli {
-    let mut full = vec!["zerostack"];
+    let mut full = vec!["mini-agent"];
     full.extend(args);
     Cli::parse_from(full)
 }
@@ -24,7 +24,7 @@ fn test_resolve_log_path_verbose() {
     let log_path = logging::resolve_log_path(&cli);
     assert!(log_path.is_some());
     let path = log_path.unwrap();
-    assert!(path.to_string_lossy().contains("zerostack-"));
+    assert!(path.to_string_lossy().contains("mini-agent-"));
     assert!(path.to_string_lossy().ends_with(".log"));
     assert!(
         path.to_string_lossy()
@@ -34,9 +34,9 @@ fn test_resolve_log_path_verbose() {
 
 #[test]
 fn test_resolve_log_path_cli_override() {
-    let cli = parse_cli(&["--log-file", "/tmp/test-zerostack.log"]);
+    let cli = parse_cli(&["--log-file", "/tmp/test-mini-agent.log"]);
     let log_path = logging::resolve_log_path(&cli);
-    assert_eq!(log_path, Some(PathBuf::from("/tmp/test-zerostack.log")));
+    assert_eq!(log_path, Some(PathBuf::from("/tmp/test-mini-agent.log")));
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn test_crash_log_path_format() {
     let path = logging::resolve_crash_log_path();
     let s = path.to_string_lossy();
     assert!(s.contains("crashes"));
-    assert!(s.contains("zerostack-crash-"));
+    assert!(s.contains("mini-agent-crash-"));
     assert!(s.ends_with(".log"));
     assert!(s.contains(&std::process::id().to_string()));
 }
@@ -113,7 +113,6 @@ fn test_file_filter_directive_targets_this_crate_and_audit_targets() {
         directive.contains(&format!("{}=trace", env!("CARGO_CRATE_NAME"))),
         "file filter must enable this crate's own tracing target: {directive}"
     );
-    assert!(directive.contains("zerostack=trace"), "{directive}");
     assert!(directive.contains("rig=off"), "{directive}");
 }
 
@@ -150,7 +149,7 @@ fn test_file_filter_passes_debug_events_from_this_crate() {
     tracing::subscriber::with_default(subscriber, || {
         tracing::debug!("file-filter-probe-crate-debug");
         tracing::event!(
-            target: "zerostack::audit::explicit_shell",
+            target: "mini_agent::audit::explicit_shell",
             tracing::Level::TRACE,
             "file-filter-probe-audit-trace"
         );
@@ -168,7 +167,7 @@ fn test_file_filter_passes_debug_events_from_this_crate() {
     );
     assert!(
         captured.contains("file-filter-probe-audit-trace"),
-        "explicit zerostack audit targets must still be captured: {captured:?}"
+        "explicit mini-agent audit targets must still be captured: {captured:?}"
     );
     assert!(
         !captured.contains("file-filter-probe-rig-error"),

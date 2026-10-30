@@ -1278,12 +1278,12 @@ fn configure_parent_death_canary_command(
         .env(HOSTED_WORKSPACE_SENTINEL, &probes.workspace)
         .env(HOSTED_SKILL_SENTINEL, &probes.skill)
         .env(HOSTED_CREDENTIAL_SENTINEL, &probes.credential)
-        .env("ZS_CONFIG_DIR", &process_paths.config_dir)
-        .env("ZS_DATA_DIR", &process_paths.data_dir)
-        .env("ZS_LOCAL_DATA_DIR", &process_paths.local_data_dir)
-        .env("ZS_STATE_DIR", &process_paths.state_dir)
-        .env("ZS_CACHE_DIR", &process_paths.cache_dir)
-        .env("ZS_CREDENTIALS_DIR", &process_paths.credentials_dir)
+        .env("MINI_AGENT_CONFIG_DIR", &process_paths.config_dir)
+        .env("MINI_AGENT_DATA_DIR", &process_paths.data_dir)
+        .env("MINI_AGENT_LOCAL_DATA_DIR", &process_paths.local_data_dir)
+        .env("MINI_AGENT_STATE_DIR", &process_paths.state_dir)
+        .env("MINI_AGENT_CACHE_DIR", &process_paths.cache_dir)
+        .env("MINI_AGENT_CREDENTIALS_DIR", &process_paths.credentials_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -6034,12 +6034,15 @@ mod tests {
             (HOSTED_WORKSPACE_SENTINEL, probes.workspace.as_path()),
             (HOSTED_SKILL_SENTINEL, probes.skill.as_path()),
             (HOSTED_CREDENTIAL_SENTINEL, probes.credential.as_path()),
-            ("ZS_CONFIG_DIR", paths.config_dir.as_path()),
-            ("ZS_DATA_DIR", paths.data_dir.as_path()),
-            ("ZS_LOCAL_DATA_DIR", paths.local_data_dir.as_path()),
-            ("ZS_STATE_DIR", paths.state_dir.as_path()),
-            ("ZS_CACHE_DIR", paths.cache_dir.as_path()),
-            ("ZS_CREDENTIALS_DIR", paths.credentials_dir.as_path()),
+            ("MINI_AGENT_CONFIG_DIR", paths.config_dir.as_path()),
+            ("MINI_AGENT_DATA_DIR", paths.data_dir.as_path()),
+            ("MINI_AGENT_LOCAL_DATA_DIR", paths.local_data_dir.as_path()),
+            ("MINI_AGENT_STATE_DIR", paths.state_dir.as_path()),
+            ("MINI_AGENT_CACHE_DIR", paths.cache_dir.as_path()),
+            (
+                "MINI_AGENT_CREDENTIALS_DIR",
+                paths.credentials_dir.as_path(),
+            ),
         ] {
             assert_eq!(
                 environment
@@ -6091,10 +6094,10 @@ mod tests {
         .canonicalize()
         .unwrap();
         for name in [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ] {
             assert!(
                 std::env::var_os(name).is_some(),

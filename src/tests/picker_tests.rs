@@ -392,7 +392,7 @@ where
     F: FnOnce(&Path),
 {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("zerostack_test_{}_{}", std::process::id(), n));
+    let dir = std::env::temp_dir().join(format!("mini-agent_test_{}_{}", std::process::id(), n));
     fs::create_dir_all(&dir).unwrap();
     let canonical = dir.canonicalize().unwrap();
     f(&canonical);
@@ -804,7 +804,10 @@ mod file_picker_multibyte {
 
 mod slash_picker_contract {
     use super::*;
-    use crate::ui::pickers::handlers::handle_file_key;
+    use crate::ui::pickers::handlers::{
+        CommandPickerCtx, handle_command_key, handle_file_key, handle_models_key,
+        handle_prefixed_key,
+    };
     use crate::ui::pickers::list::{available_commands, match_rank};
     use crate::ui::pickers::{PickerWindow, picker_window};
     use compact_str::CompactString;
@@ -943,12 +946,12 @@ mod slash_picker_contract {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
-            project_dir: Some(root.join(".zerostack")),
+            project_dir: Some(root.join(".mini-agent")),
         };
         crate::paths::prepare_storage_roots(&paths).unwrap();
-        std::fs::create_dir_all(root.join(".zerostack/agents")).unwrap();
+        std::fs::create_dir_all(root.join(".mini-agent/agents")).unwrap();
         std::fs::write(
-            root.join(".zerostack/agents/projectonly.md"),
+            root.join(".mini-agent/agents/projectonly.md"),
             "project persona",
         )
         .unwrap();
@@ -1002,6 +1005,8 @@ mod slash_picker_contract {
             mentions,
             names
                 .iter()
+                // `/agent default` clears the persona; it is no persona to mention.
+                .filter(|name| name.as_str() != "default")
                 .map(|name| format!("@agent:{name}"))
                 .collect::<Vec<_>>()
         );
@@ -1346,6 +1351,120 @@ mod slash_picker_contract {
         assert_eq!(input.buffer, "/");
         assert_eq!(input.cursor, 1);
         assert!(command_picker_open(&input));
+    }
+
+    #[test]
+    fn command_picker_caret_edit_closes_before_plain_text_editing() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/abc");
+        press(&mut input, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Delete, KeyModifiers::NONE);
+        typed(&mut input, "d");
+
+        assert_eq!(input.buffer, "/abd");
+        assert_eq!(input.cursor, input.buffer.len());
+        assert!(!command_picker_open(&input));
+    }
+
+    #[test]
+    fn argument_pickers_delete_keep_query_and_buffer_in_sync() {
+        let prefix = "/permissions ";
+        let mut list = ListPicker::new();
+        list.set_items(vec!["manual".to_string()]);
+        list.activate();
+        let mut buffer: CompactString = prefix.into();
+        let mut cursor = buffer.len();
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('b'),
+            KeyCode::Char('c'),
+            KeyCode::Left,
+            KeyCode::Delete,
+            KeyCode::Char('d'),
+        ] {
+            assert!(handle_prefixed_key(
+                &mut buffer,
+                &mut cursor,
+                &mut list,
+                prefix,
+                KeyEvent::new(code, KeyModifiers::NONE),
+            ));
+        }
+        assert_eq!(buffer, "/permissions abd");
+        assert_eq!(list.query, "abd");
+
+        let prefix = "/model ";
+        let mut models = ModelsPicker::new();
+        models.set_groups(Vec::new(), vec!["abcd".to_string()]);
+        models.activate();
+        let mut buffer: CompactString = prefix.into();
+        let mut cursor = buffer.len();
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('b'),
+            KeyCode::Char('c'),
+            KeyCode::Left,
+            KeyCode::Delete,
+            KeyCode::Char('d'),
+        ] {
+            assert!(handle_models_key(
+                &mut buffer,
+                &mut cursor,
+                &mut models,
+                KeyEvent::new(code, KeyModifiers::NONE),
+            ));
+        }
+        assert_eq!(buffer, "/model abd");
+        assert_eq!(models.query, "abd");
+    }
+
+    #[test]
+    fn editing_before_cjk_tail_keeps_picker_and_buffer_synchronized() {
+        let mut input = InputEditor::new();
+        input.load_text("日本");
+        input.set_cursor(0);
+        typed(&mut input, "/mo");
+        press(&mut input, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Delete, KeyModifiers::NONE);
+
+        assert_eq!(press(&mut input, KeyCode::Tab, KeyModifiers::NONE), None);
+        assert!(input.buffer.starts_with('/'));
+        assert!(input.buffer.ends_with('本'));
+        assert!(input.buffer.is_char_boundary(input.cursor));
+    }
+
+    #[test]
+    fn accepting_stale_query_before_cjk_tail_uses_a_char_boundary() {
+        let mut picker = ListPicker::with_static_commands();
+        picker.activate();
+        picker.char_input('m');
+        picker.char_input('o');
+        let mut buffer: CompactString = "/m日本".into();
+        let mut cursor = 2;
+        let empty: Vec<String> = Vec::new();
+        let ctx = CommandPickerCtx {
+            prompt_names: &empty,
+            agent_names: &empty,
+            theme_names: &empty,
+            quick_model_names: &empty,
+            live_model_names: &empty,
+            provider_names: &empty,
+            current_model: None,
+            security_mode: None,
+            file_workspace: None,
+        };
+
+        let (handled, _) = handle_command_key(
+            &mut buffer,
+            &mut cursor,
+            &ctx,
+            &mut picker,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        );
+
+        assert!(handled);
+        assert_eq!(buffer, "/mode日本");
+        assert!(buffer.is_char_boundary(cursor));
     }
 
     #[test]

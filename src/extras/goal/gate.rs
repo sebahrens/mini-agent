@@ -76,6 +76,10 @@ pub struct RoundSummary {
     /// The setting a tool refusal this round named as changeable only by the
     /// user (`agent::tools::requires_user_configuration`).
     pub user_gate: Option<String>,
+    /// Fingerprint of this round's failures, set only when every mutating call
+    /// the round made failed. Two rounds in a row with the same fingerprint
+    /// are a retry loop, not progress (mini-agent-n4jsr).
+    pub failure_fingerprint: Option<u64>,
 }
 
 impl RoundSummary {
@@ -94,6 +98,7 @@ impl RoundSummary {
             tokens_used: 0,
             active: std::time::Duration::ZERO,
             user_gate: None,
+            failure_fingerprint: None,
         }
     }
 
@@ -107,8 +112,16 @@ impl RoundSummary {
     /// reading a large file or waiting on a build is working, and the model
     /// says so. Only a round that did neither counts as a stall, which is why
     /// a question to the user is a report rather than silence.
-    fn made_progress(&self) -> bool {
-        self.mutating_tool_calls > 0 || self.report.is_some() || self.end == RoundEnd::AwaitingUser
+    ///
+    /// A mutating call does not count when every one of them failed exactly as
+    /// they did the round before: a retry loop with small variations changes
+    /// nothing, and without this it never parked.
+    fn made_progress(&self, progress: &super::GoalProgress) -> bool {
+        let repeated_failure = self.failure_fingerprint.is_some()
+            && self.failure_fingerprint == progress.last_failure_fingerprint;
+        (self.mutating_tool_calls > 0 && !repeated_failure)
+            || self.report.is_some()
+            || self.end == RoundEnd::AwaitingUser
     }
 }
 
@@ -508,7 +521,7 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
     }
 
     // Row 11. Nothing happened, repeatedly.
-    if !round.made_progress() {
+    if !round.made_progress(progress) {
         let streak = progress.consecutive_no_progress.saturating_add(1);
         if streak >= bounds.no_progress_rounds {
             return Step::Decided(GateDecision::paused(
@@ -585,7 +598,7 @@ fn should_drift_check(goal: &Goal, round: &RoundSummary) -> bool {
         return false;
     }
     // Only on rounds that did something; a stalled round has nothing to judge.
-    if !round.made_progress() {
+    if !round.made_progress(&goal.progress) {
         return false;
     }
     let next_round = goal.progress.current_round();
@@ -900,12 +913,14 @@ pub fn apply(
         _ => goal.progress.consecutive_round_failures = 0,
     }
 
-    if round.made_progress() {
+    if round.made_progress(&goal.progress) {
         goal.progress.consecutive_no_progress = 0;
     } else {
         goal.progress.consecutive_no_progress =
             goal.progress.consecutive_no_progress.saturating_add(1);
     }
+
+    goal.progress.last_failure_fingerprint = round.failure_fingerprint;
 
     // Judge failures are counted only on completion claims, because those are
     // the rounds where a missing judge actually changes the outcome: a drift
@@ -1522,6 +1537,63 @@ mod tests {
             }
             other => panic!("expected an impossible stop, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repeated_identical_failing_mutations_count_as_no_progress() {
+        let mut g = goal();
+        let failing = |fp| RoundSummary {
+            tool_calls: 1,
+            mutating_tool_calls: 1,
+            failure_fingerprint: fp,
+            ..RoundSummary::completed()
+        };
+        // The first failure is new information; the same failure again is not.
+        let first = failing(Some(7));
+        let d = decided(&g, &first);
+        apply(&mut g, &first, &d, None, None);
+        assert_eq!(g.progress.consecutive_no_progress, 0);
+        let again = failing(Some(7));
+        let d = decided(&g, &again);
+        apply(&mut g, &again, &d, None, None);
+        assert_eq!(g.progress.consecutive_no_progress, 1);
+        // A different failure is movement and resets the streak.
+        let other = failing(Some(8));
+        let d = decided(&g, &other);
+        apply(&mut g, &other, &d, None, None);
+        assert_eq!(g.progress.consecutive_no_progress, 0);
+        // A round with a succeeding mutation clears the remembered failure.
+        let ok = failing(None);
+        let d = decided(&g, &ok);
+        apply(&mut g, &ok, &d, None, None);
+        assert_eq!(g.progress.last_failure_fingerprint, None);
+    }
+
+    #[test]
+    fn a_retry_loop_of_the_same_failure_parks() {
+        let mut g = goal();
+        let failing = RoundSummary {
+            tool_calls: 1,
+            mutating_tool_calls: 1,
+            failure_fingerprint: Some(7),
+            ..RoundSummary::completed()
+        };
+        let mut parked = false;
+        for _ in 0..=g.bounds.no_progress_rounds {
+            let d = decided(&g, &failing);
+            if matches!(
+                d,
+                GateDecision::Stop {
+                    paused_reason: Some(PauseReason::NoProgress),
+                    ..
+                }
+            ) {
+                parked = true;
+                break;
+            }
+            apply(&mut g, &failing, &d, None, None);
+        }
+        assert!(parked, "an identical failing retry loop must pause");
     }
 
     // Row 11.

@@ -13,7 +13,6 @@ use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchron
 use regex::Regex;
 
 use super::events::sanitize_output;
-#[cfg(test)]
 use super::feed::BlockStyle;
 use super::feed::{Feed, FeedLines, ForegroundPalette, style_from_color};
 use super::statusline::StatusSpan;
@@ -182,6 +181,10 @@ fn paint_text(text: &str) -> String {
 pub struct LineEntry {
     pub text: CompactString,
     pub color: Color,
+    /// Resolve this row through the configured semantic accent instead of
+    /// treating `color` as its final foreground. This keeps branded welcome
+    /// rows distinct from unrelated cyan markdown and link content.
+    pub theme_accent: bool,
     /// Ephemeral foreground spans; text stays plain for widths and copying.
     pub(crate) syntax_spans: Option<std::sync::Arc<[super::highlight::TokenSpan]>>,
 }
@@ -210,6 +213,7 @@ struct ChatSnapshot {
     selection_start: Option<SelectionPoint>,
     selection_end: Option<SelectionPoint>,
     chat_bg: Option<Color>,
+    accent: Option<Color>,
     monochrome: bool,
 }
 
@@ -841,6 +845,7 @@ pub struct Renderer {
     chat_bg: Option<Color>,
     input_bg: Option<Color>,
     status_bg: Option<Color>,
+    accent: Option<Color>,
     pub selection_active: bool,
     pub selection_start: Option<SelectionPoint>,
     pub selection_end: Option<SelectionPoint>,
@@ -1019,6 +1024,7 @@ impl Renderer {
             chat_bg: None,
             input_bg: None,
             status_bg: None,
+            accent: None,
             selection_active: false,
             selection_start: None,
             selection_end: None,
@@ -1400,7 +1406,7 @@ impl Renderer {
             return;
         }
         self.palette = palette;
-        self.feed.set_palette(palette);
+        self.feed.set_palette(self.feed_palette());
         self.statusline_rows.borrow_mut().clear();
         self.last_chat_snapshot = None;
         self.last_bottom_snapshot = None;
@@ -1426,8 +1432,54 @@ impl Renderer {
         (self.chat_bg, self.input_bg, self.status_bg)
     }
 
+    pub fn set_accent_color(&mut self, accent: Option<Color>) {
+        if self.accent == accent {
+            return;
+        }
+        self.accent = accent;
+        self.feed.set_palette(self.feed_palette());
+        self.statusline_rows.borrow_mut().clear();
+        self.chat_dirty = true;
+        self.last_chat_snapshot = None;
+        self.last_bottom_snapshot = None;
+    }
+
+    /// The feed's foreground roles: the theme palette with the configured
+    /// accent, when set, taking the user role (the fork's accent replaces
+    /// the user/green foreground).
+    fn feed_palette(&self) -> ForegroundPalette {
+        let mut palette = self.palette;
+        if let Some(accent) = self.accent {
+            palette.user = accent;
+        }
+        palette
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accent_color(&self) -> Option<Color> {
+        self.accent
+    }
+
     fn color(&self, color: Color) -> Color {
+        let color = if color == Color::Green {
+            self.accent.unwrap_or(color)
+        } else {
+            color
+        };
         resolve_color(color, self.monochrome)
+    }
+
+    fn line_color(&self, entry: &LineEntry) -> Color {
+        if entry.theme_accent {
+            resolve_color(self.accent.unwrap_or(entry.color), self.monochrome)
+        } else {
+            self.color(entry.color)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn line_color_for_test(&self, entry: &LineEntry) -> Color {
+        self.line_color(entry)
     }
 
     /// Geometry owned by a captured App fixture, which never queries the
@@ -1572,6 +1624,7 @@ impl Renderer {
             selection_start: self.selection_start,
             selection_end: self.selection_end,
             chat_bg: self.chat_bg,
+            accent: self.accent,
             monochrome: self.monochrome,
         }
     }
@@ -2178,6 +2231,7 @@ impl Renderer {
                     2u8.hash(&mut state);
                     entry.text.as_str().hash(&mut state);
                     entry.color.hash(&mut state);
+                    entry.theme_accent.hash(&mut state);
                     if let Some(spans) = &entry.syntax_spans {
                         for span in spans.iter() {
                             (span.range.start, span.range.end, span.color).hash(&mut state);
@@ -2200,6 +2254,7 @@ impl Renderer {
             visible,
             self.chat_margin,
             self.chat_bg,
+            self.accent,
             self.monochrome,
         ));
         let mut painted = std::mem::take(&mut self.painted_rows);
@@ -2249,7 +2304,7 @@ impl Renderer {
                 if let Some(line) = row_line(row) {
                     let entry = &buffer[line];
                     self.write_chat_margin(&mut stdout)?;
-                    write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
+                    write!(stdout, "{}", SetForegroundColor(self.line_color(entry)))?;
                     paint_styled_row(&mut stdout, entry, selected_range(line), self.monochrome)?;
                 }
                 write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
@@ -2403,6 +2458,56 @@ impl Renderer {
         self.feed.place_after_anchor(anchor, style, text);
         self.chat_dirty = true;
         self.paint_written_line()
+    }
+
+    /// Place a tool result under its call as a foldable block (see
+    /// [`crate::ui::tool_output`]); a result with only one form is placed as
+    /// a plain block.
+    pub fn write_tool_result(
+        &mut self,
+        anchor: &str,
+        view: &crate::ui::tool_output::ToolResultView,
+    ) -> io::Result<()> {
+        let block = if view.foldable() {
+            crate::ui::feed::Block::foldable(
+                BlockStyle::ToolResult,
+                view.collapsed.as_str(),
+                view.expanded.as_str(),
+                view.start_expanded,
+            )
+        } else {
+            crate::ui::feed::Block::new(BlockStyle::ToolResult, view.initial())
+        };
+        self.feed.place_block_after_anchor(anchor, block);
+        self.chat_dirty = true;
+        self.paint_written_line()
+    }
+
+    /// Unfold, fold or toggle (`None`) the `nth` most recent tool result
+    /// (1 = latest). Returns its new state, or `None` when there is none.
+    pub fn set_tool_output_fold(&mut self, nth: usize, expanded: Option<bool>) -> Option<bool> {
+        let state = self.feed.set_fold(nth, expanded);
+        self.chat_dirty = true;
+        state
+    }
+
+    /// Unfold or fold every tool result. Returns how many changed.
+    pub fn set_all_tool_output_folds(&mut self, expanded: bool) -> usize {
+        let changed = self.feed.set_all_folds(expanded);
+        self.chat_dirty = true;
+        changed
+    }
+
+    /// Toggle the tool result whose summary row is laid-out chat line
+    /// `line` (a click on it). Returns the new state, or `None` when the row
+    /// is not a tool-result summary.
+    pub fn toggle_tool_output_at_line(&mut self, line: usize) -> Option<bool> {
+        let width = self.max_line_width();
+        let state = self.feed.toggle_fold_at_line(width, line);
+        if state.is_some() {
+            self.chat_dirty = true;
+        }
+        state
     }
 
     pub fn clear_content(&mut self) -> io::Result<()> {
@@ -3043,7 +3148,8 @@ impl Renderer {
         // The draw itself settles `input_vscroll_offset` (cursor follow /
         // clamping); record the settled value so the next identical frame is
         // recognized as unchanged. `spinner_frame` deliberately keeps the
-        // pre-draw value so a running spinner still differs next frame.
+        // pre-draw value so real UI events can advance the running indicator
+        // without scheduling spinner-only terminal writes.
         let mut drawn = snapshot;
         drawn.input_vscroll_offset = self.input_vscroll_offset;
         self.record_bottom_drawn(drawn);
@@ -3392,11 +3498,60 @@ pub async fn open_url(url: &str) -> anyhow::Result<()> {
 
     #[cfg(not(windows))]
     {
-        let mut commands = [
-            tokio::process::Command::new("xdg-open"),
-            tokio::process::Command::new("open"),
-        ];
+        let mut commands = Vec::with_capacity(5);
+        for program in url_opener_programs(running_under_wsl()) {
+            let mut command = tokio::process::Command::new(program);
+            command.args(url_opener_prefix_args(program));
+            commands.push(command);
+        }
         open_url_with_commands(url, &mut commands, std::time::Duration::from_secs(2)).await
+    }
+}
+
+#[cfg(not(windows))]
+fn running_under_wsl() -> bool {
+    let os_release = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
+    wsl_markers_present(
+        std::env::var_os("WSL_INTEROP").is_some(),
+        std::env::var_os("WSL_DISTRO_NAME").is_some(),
+        os_release.as_deref(),
+    )
+}
+
+#[cfg(not(windows))]
+pub(crate) fn wsl_markers_present(
+    has_interop: bool,
+    has_distro_name: bool,
+    os_release: Option<&str>,
+) -> bool {
+    has_interop
+        || has_distro_name
+        || os_release.is_some_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn url_opener_programs(running_under_wsl: bool) -> Vec<&'static str> {
+    if running_under_wsl {
+        // Ask Windows to invoke its registered URL handler so the user's
+        // default Windows browser opens. A failed Windows dispatcher must not
+        // fall through to an uncertified Linux browser. Never use cmd.exe here:
+        // OAuth URLs contain metacharacters that must stay one literal argv.
+        return vec![
+            "/mnt/c/Windows/System32/rundll32.exe",
+            "rundll32.exe",
+            "/mnt/c/Windows/explorer.exe",
+            "explorer.exe",
+        ];
+    }
+    vec!["xdg-open", "open"]
+}
+
+#[cfg(not(windows))]
+pub(crate) fn url_opener_prefix_args(program: &str) -> &'static [&'static str] {
+    if program.ends_with("rundll32.exe") {
+        &["url.dll,FileProtocolHandler"]
+    } else {
+        &[]
     }
 }
 
@@ -3434,7 +3589,7 @@ pub(crate) async fn open_url_with_commands(
             }
         }
     }
-    anyhow::bail!("no working opener found (tried xdg-open and open)")
+    anyhow::bail!("no working opener found for desktop URL")
 }
 
 pub(crate) const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
@@ -4123,6 +4278,7 @@ mod statusline_layout_tests {
         crate::context::themes::apply(
             include_str!("../../data/themes/default-light.json"),
             renderer,
+            &mut crate::ui::input::InputEditor::new(),
         )
         .unwrap();
         let mut session = Session::new("p", "model", 1000, "");
@@ -4323,6 +4479,7 @@ mod syntax_paint_tests {
                 ]
                 .into(),
             ),
+            theme_accent: false,
         };
         let mut painted = Vec::new();
         paint_styled_row(&mut painted, &entry, Some((4, 7)), false).unwrap();
@@ -4421,6 +4578,7 @@ mod syntax_paint_tests {
                 }]
                 .into(),
             ),
+            theme_accent: false,
         };
         let mut painted = Vec::new();
         paint_styled_row(&mut painted, &entry, None, false).unwrap();

@@ -37,14 +37,24 @@ def receive(peer: socket.socket) -> dict:
 
 
 def require_reaped(descriptor: int, role: str) -> None:
-    # pidfd POLLIN also includes zombies. POLLHUP proves reaping, while the
-    # retained descriptor prevents a recycled PID from changing the identity.
+    # pidfd POLLIN includes zombies and remains the only poll bit after reaping
+    # on some supported Linux kernels (including WSL2). Probe the retained
+    # identity with signal 0: zombies still accept it, while a reaped identity
+    # returns ESRCH. The pidfd prevents a recycled PID from changing the target.
     poll = select.poll()
     poll.register(descriptor, select.POLLIN)
     events = poll.poll(0)
     flags = events[0][1] if events else 0
     require(not flags & (select.POLLERR | select.POLLNVAL), f"invalid pidfd for {role}")
-    require(bool(flags & select.POLLHUP), f"{role} was not reaped (pidfd events={flags})")
+    require(
+        bool(flags & (select.POLLIN | select.POLLHUP)),
+        f"{role} was not reaped (pidfd events={flags})",
+    )
+    try:
+        signal.pidfd_send_signal(descriptor, 0)
+    except ProcessLookupError:
+        return
+    raise AssertionError(f"{role} was not reaped (pidfd events={flags})")
 
 
 class GymTree:
@@ -139,18 +149,23 @@ class GymTree:
         pending = {self.pidfds[role]: role for role in roles}
         poll = select.poll()
         for descriptor in pending:
-            # HUP is reported even with an empty interest mask. Avoid waking
-            # repeatedly on zombie POLLIN while waiting for actual reaping.
-            poll.register(descriptor, 0 if reaped else select.POLLIN)
+            poll.register(descriptor, select.POLLIN)
         deadline = time.monotonic() + GUARD
         while pending:
             ready = poll.poll(max(0, math.ceil((deadline - time.monotonic()) * 1000)))
             require(bool(ready), f"fixture processes did not {'reap' if reaped else 'exit'}: {list(pending.values())}")
             for descriptor, flags in ready:
                 require(not flags & (select.POLLERR | select.POLLNVAL), "invalid fixture identity during join")
-                require(flags & (select.POLLHUP if reaped else select.POLLIN | select.POLLHUP), "unexpected pidfd join event")
+                require(flags & (select.POLLIN | select.POLLHUP), "unexpected pidfd join event")
+                if reaped:
+                    try:
+                        require_reaped(descriptor, pending[descriptor])
+                    except AssertionError:
+                        continue
                 poll.unregister(descriptor)
                 del pending[descriptor]
+            if reaped and pending:
+                time.sleep(0.01)
 
     def close(self) -> None:
         # Acceptance occurs in run(), before any gate release or rescue here.

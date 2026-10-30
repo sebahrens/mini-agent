@@ -5,8 +5,22 @@ use super::file::FilePicker;
 use super::list::ListPicker;
 use super::models::ModelsPicker;
 
-use crate::ui::input::cursor::prev_char_boundary;
-use crate::ui::input::{Picker, is_modifier_chord};
+use crate::ui::input::Picker;
+use crate::ui::input::cursor::{next_char_boundary, prev_char_boundary};
+use crate::ui::input::is_modifier_chord;
+
+fn floor_char_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+#[cfg(test)]
+fn accepts_text_input(modifiers: KeyModifiers) -> bool {
+    !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
 
 /// Ctrl+W in a picker: delete the typed query (it is one word), or, when the
 /// query is already empty, act like Backspace and drop the trigger.
@@ -21,18 +35,28 @@ const BACKSPACE: KeyEvent = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE
 /// Replace the `@<query>` span that starts at byte offset `at` with
 /// `replacement` and return the byte cursor just after the inserted text.
 ///
-/// Every offset here is a byte offset: `at` comes from [`mention_start`], and
-/// `query_len` is `picker.query.len()` (bytes). Slicing by chars with these
-/// values corrupted any buffer containing multi-byte text before the `@`.
+/// Every offset here is a byte offset: `at` comes from [`completion_start`]
+/// and `marker_len` is 1 for an `@` mention, 0 for an `/add` argument. Slicing
+/// by chars with these values corrupted any buffer containing multi-byte text
+/// before the `@`.
 fn replace_at_span(
     buffer: &mut CompactString,
     at: usize,
-    query_len: usize,
+    query: &str,
     marker_len: usize,
     replacement: &str,
 ) -> usize {
     let before = &buffer[..at];
-    let after = buffer.get(at + marker_len + query_len..).unwrap_or("");
+    // Only the part of `query` the buffer still holds is consumed: a stale
+    // query must never swallow (or split) the text after the mention.
+    let tail = buffer.get(at + marker_len..).unwrap_or("");
+    let matched_bytes = tail
+        .chars()
+        .zip(query.chars())
+        .take_while(|(actual, expected)| actual == expected)
+        .map(|(actual, _)| actual.len_utf8())
+        .sum::<usize>();
+    let after = &tail[matched_bytes..];
     let mut next = String::with_capacity(before.len() + replacement.len() + after.len());
     next.push_str(before);
     next.push_str(replacement);
@@ -100,7 +124,7 @@ pub fn handle_file_key(
                     *cursor = replace_at_span(
                         buffer,
                         at,
-                        0,
+                        "",
                         usize::from(picker.argument_start.is_none()),
                         "",
                     );
@@ -144,7 +168,7 @@ pub fn handle_file_key(
                     *cursor = replace_at_span(
                         buffer,
                         at,
-                        0,
+                        "",
                         usize::from(picker.argument_start.is_none()),
                         "",
                     );
@@ -184,7 +208,7 @@ pub fn handle_file_key(
                     *cursor = replace_at_span(
                         buffer,
                         at,
-                        picker.query.len(),
+                        &picker.query,
                         usize::from(picker.argument_start.is_none()),
                         &path_str,
                     );
@@ -202,7 +226,7 @@ pub fn handle_file_key(
                 *cursor = replace_at_span(
                     buffer,
                     at,
-                    picker.query.len(),
+                    &picker.query,
                     usize::from(picker.argument_start.is_none()),
                     "",
                 );
@@ -248,7 +272,7 @@ fn command_backspace(buffer: &mut CompactString, cursor: &mut usize, picker: &mu
         *cursor = prev_char_boundary(buffer, *cursor);
     } else {
         if buffer.starts_with('/') {
-            let after_offset = (1 + picker.query.len()).min(buffer.len());
+            let after_offset = floor_char_boundary(buffer, 1 + picker.query.len());
             *buffer = buffer[after_offset..].into();
             *cursor = 0;
         }
@@ -266,11 +290,78 @@ fn opens_sub_picker(command: &str, ctx: &CommandPickerCtx) -> bool {
         }
         "/theme" => !ctx.theme_names.is_empty(),
         "/provider" => !ctx.provider_names.is_empty(),
+        "/models-subagent" => !ctx.quick_model_names.is_empty(),
         "/queue" | "/add" => true,
         "/mode" => ctx.security_mode.is_some(),
-        _ => false,
+        _ => argument_picker_spec(command).is_some(),
     }
 }
+
+/// Closed argument sets that can be selected instead of memorized. Commands
+/// taking paths, names, or prose remain free-form.
+pub(crate) fn argument_picker_spec(
+    command: &str,
+) -> Option<(&'static [&'static str], &'static str)> {
+    match command {
+        "/permissions" => Some((&["yolo", "auto", "manual"], "/permissions ")),
+        "/mode" => Some((
+            &[
+                "standard",
+                "restrictive",
+                "readonly",
+                "planwrite",
+                "guarded",
+                "yolo",
+            ],
+            "/mode ",
+        )),
+        "/editsys" => Some((&["similarity", "hashedit"], "/editsys ")),
+        "/toggle" => Some((&["todo on", "todo off"], "/toggle ")),
+        "/memory" => Some((
+            &["status", "search", "read", "write", "editor", "clear"],
+            "/memory ",
+        )),
+        "/init" => Some((&["force"], "/init ")),
+        "/undo" => Some((&["stash"], "/undo ")),
+        "/queue" => Some((&["ls", "clear", "pop"], "/queue ")),
+        "/advisor" => Some((
+            &[
+                "on",
+                "off",
+                "handoff on",
+                "handoff off",
+                "model",
+                "max-uses",
+                "context-limit",
+            ],
+            "/advisor ",
+        )),
+        "/mcp" => Some((&["login", "logout"], "/mcp ")),
+        "/loop" => Some((&["status", "stop"], "/loop ")),
+        "/goal" => Some((
+            &[
+                "status", "pause", "resume", "reopen", "clear", "check", "bounds",
+            ],
+            "/goal ",
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) const FINITE_ARGUMENT_COMMANDS: &[&str] = &[
+    "/permissions",
+    "/mode",
+    "/editsys",
+    "/toggle",
+    "/memory",
+    "/init",
+    "/undo",
+    "/queue",
+    "/advisor",
+    "/mcp",
+    "/loop",
+    "/goal",
+];
 
 /// Replace the typed `/query` with the highlighted command plus a space, and
 /// open the argument picker when the command has one.
@@ -284,14 +375,15 @@ fn accept_command(
         let selected = cmd.to_string();
         let slash_pos = buffer.find('/').unwrap_or(0);
         let before = &buffer[..slash_pos];
-        let after_offset = slash_pos + 1 + picker.query.len();
-        let after = &buffer[after_offset.min(buffer.len())..];
-        let insertion = if after.is_empty() || after.starts_with(' ') {
+        let after_offset = floor_char_boundary(buffer, slash_pos + 1 + picker.query.len());
+        let after = &buffer[after_offset..];
+        let inserts_space = after.is_empty() || after.starts_with(' ');
+        let insertion = if inserts_space {
             format!("{} ", selected)
         } else {
             format!("{}{}", selected, after)
         };
-        let new_cursor = before.len() + selected.len() + 1;
+        let new_cursor = before.len() + selected.len() + usize::from(inserts_space);
         let replacement = format!("{}{}", before, insertion);
         *buffer = replacement.into();
         *cursor = new_cursor;
@@ -321,16 +413,24 @@ fn accept_command(
                 }
                 "/mode" => Picker::Prefixed(mode_picker(ctx.security_mode), "/mode "),
                 other => {
-                    let (items, prefix): (Vec<String>, &'static str) = match other {
-                        "/prompt" => (ctx.prompt_names.to_vec(), "/prompt "),
-                        "/agent" => (ctx.agent_names.to_vec(), "/agent "),
-                        "/theme" => (ctx.theme_names.to_vec(), "/theme "),
-                        "/provider" => (ctx.provider_names.to_vec(), "/provider "),
-                        _ => (
-                            vec!["ls".to_string(), "clear".to_string(), "pop".to_string()],
-                            "/queue ",
-                        ),
-                    };
+                    let (items, prefix): (Vec<String>, &'static str) =
+                        if let Some((items, prefix)) = argument_picker_spec(other) {
+                            (
+                                items.iter().map(|item| (*item).to_string()).collect(),
+                                prefix,
+                            )
+                        } else {
+                            match other {
+                                "/prompt" => (with_default(ctx.prompt_names), "/prompt "),
+                                "/agent" => (with_default(ctx.agent_names), "/agent "),
+                                "/theme" => (with_default(ctx.theme_names), "/theme "),
+                                "/provider" => (ctx.provider_names.to_vec(), "/provider "),
+                                "/models-subagent" => {
+                                    (ctx.quick_model_names.to_vec(), "/models-subagent ")
+                                }
+                                _ => unreachable!("sub-picker command must have a specification"),
+                            }
+                        };
                     let mut lp = ListPicker::new();
                     if other == "/agent" {
                         // `/agent` changes the main agent; `@agent:` starts a
@@ -353,6 +453,17 @@ fn accept_command(
     }
     picker.deactivate();
     (true, None)
+}
+
+fn with_default(names: &[String]) -> Vec<String> {
+    std::iter::once("default".to_string())
+        .chain(
+            names
+                .iter()
+                .filter(|name| name.as_str() != "default")
+                .cloned(),
+        )
+        .collect()
 }
 
 /// The `/mode` argument picker: every security mode with its one-line
@@ -422,20 +533,38 @@ pub fn handle_command_key(
             (false, None)
         }
         KeyCode::Char(c) => {
+            if c == ' '
+                && picker
+                    .selected_name()
+                    .is_some_and(|command| command.strip_prefix('/') == Some(picker.query.as_str()))
+            {
+                return accept_command(buffer, cursor, ctx, picker);
+            }
             picker.char_input(c);
-            let byte_in_query = picker
-                .query
-                .char_indices()
-                .nth(picker.cursor.saturating_sub(1))
-                .map(|(i, _)| i)
-                .unwrap_or(picker.query.len());
-            let pos = 1 + byte_in_query;
+            let pos = floor_char_boundary(buffer, *cursor);
             buffer.insert(pos, c);
-            *cursor += c.len_utf8();
+            *cursor = pos + c.len_utf8();
             (true, None)
         }
         KeyCode::Backspace => {
             command_backspace(buffer, cursor, picker);
+            (true, None)
+        }
+        KeyCode::Delete => {
+            picker.delete();
+            if *cursor < buffer.len() {
+                buffer.remove(*cursor);
+            }
+            (true, None)
+        }
+        KeyCode::Left => {
+            picker.move_left();
+            *cursor = prev_char_boundary(buffer, *cursor);
+            (true, None)
+        }
+        KeyCode::Right => {
+            picker.move_right();
+            *cursor = next_char_boundary(buffer, *cursor);
             (true, None)
         }
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -475,8 +604,8 @@ pub fn handle_command_key(
         KeyCode::Esc => {
             let slash_pos = buffer.find('/').unwrap_or(0);
             let before = &buffer[..slash_pos];
-            let after_offset = slash_pos + 1 + picker.query.len();
-            let after = &buffer[after_offset.min(buffer.len())..];
+            let after_offset = floor_char_boundary(buffer, slash_pos + 1 + picker.query.len());
+            let after = &buffer[after_offset..];
             let replacement = format!("{}/{}", before, after);
             *buffer = replacement.into();
             *cursor = slash_pos + 1;
@@ -518,6 +647,9 @@ trait QueryPicker {
     fn query_cursor(&self) -> usize;
     fn char_input(&mut self, c: char);
     fn backspace(&mut self);
+    fn delete(&mut self);
+    fn move_left(&mut self);
+    fn move_right(&mut self);
     fn select_prev(&mut self);
     fn select_next(&mut self);
     fn toggle_group(&mut self);
@@ -538,6 +670,15 @@ impl QueryPicker for ListPicker {
     }
     fn backspace(&mut self) {
         ListPicker::backspace(self)
+    }
+    fn delete(&mut self) {
+        ListPicker::delete(self)
+    }
+    fn move_left(&mut self) {
+        ListPicker::move_left(self)
+    }
+    fn move_right(&mut self) {
+        ListPicker::move_right(self)
     }
     fn select_prev(&mut self) {
         ListPicker::select_prev(self)
@@ -569,6 +710,15 @@ impl QueryPicker for ModelsPicker {
     }
     fn backspace(&mut self) {
         ModelsPicker::backspace(self)
+    }
+    fn delete(&mut self) {
+        ModelsPicker::delete(self)
+    }
+    fn move_left(&mut self) {
+        ModelsPicker::move_left(self)
+    }
+    fn move_right(&mut self) {
+        ModelsPicker::move_right(self)
     }
     fn select_prev(&mut self) {
         ModelsPicker::select_prev(self)
@@ -643,7 +793,9 @@ fn query_backspace<P: QueryPicker>(
         if remove_pos < buffer.len() {
             buffer.remove(remove_pos);
         }
-        *cursor = prev_char_boundary(buffer, *cursor);
+        // The caret lands where the removed char started; stepping back from
+        // the old byte offset would drift inside a multi-byte tail.
+        *cursor = remove_pos.min(buffer.len());
     } else {
         cancel_query(buffer, cursor, picker, prefix_len);
     }
@@ -690,18 +842,30 @@ fn handle_query_key<P: QueryPicker>(
         KeyCode::Char(_) if is_modifier_chord(key) => true,
         KeyCode::Char(c) => {
             picker.char_input(c);
-            let byte_in_query = picker
-                .query()
-                .char_indices()
-                .nth(picker.query_cursor().saturating_sub(1))
-                .map(|(i, _)| i)
-                .unwrap_or(picker.query().len());
-            buffer.insert(prefix_len + byte_in_query, c);
-            *cursor += c.len_utf8();
+            let insert_pos = floor_char_boundary(buffer, *cursor);
+            buffer.insert(insert_pos, c);
+            *cursor = insert_pos + c.len_utf8();
             true
         }
         KeyCode::Backspace => {
             query_backspace(buffer, cursor, picker, prefix_len);
+            true
+        }
+        KeyCode::Delete => {
+            picker.delete();
+            if *cursor < buffer.len() {
+                buffer.remove(*cursor);
+            }
+            true
+        }
+        KeyCode::Left => {
+            picker.move_left();
+            *cursor = prev_char_boundary(buffer, *cursor).max(prefix_len);
+            true
+        }
+        KeyCode::Right => {
+            picker.move_right();
+            *cursor = next_char_boundary(buffer, *cursor);
             true
         }
         KeyCode::Tab
@@ -726,7 +890,9 @@ fn handle_query_key<P: QueryPicker>(
             picker.select_next();
             true
         }
-        KeyCode::Tab if !picker.has_matches() => true,
+        KeyCode::Enter | KeyCode::Tab if tab == TabBehaviour::Select && !picker.has_matches() => {
+            true
+        }
         KeyCode::Enter | KeyCode::Tab => {
             if let Some(name) = picker.selected_name() {
                 let name = name.to_owned();
@@ -769,6 +935,130 @@ pub fn handle_models_key(
         key,
         TabBehaviour::ToggleGroup,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use compact_str::CompactString;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::ui::pickers::list::ListPicker;
+
+    use super::{
+        CommandPickerCtx, accepts_text_input, argument_picker_spec, handle_command_key,
+        handle_prefixed_key, replace_at_span,
+    };
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn empty_command_context() -> CommandPickerCtx<'static> {
+        CommandPickerCtx {
+            prompt_names: &[],
+            agent_names: &[],
+            theme_names: &[],
+            quick_model_names: &[],
+            live_model_names: &[],
+            provider_names: &[],
+            current_model: None,
+            file_workspace: None,
+            security_mode: None,
+        }
+    }
+
+    #[test]
+    fn finite_argument_commands_open_consistent_sub_pickers() {
+        let (permissions, prefix) = argument_picker_spec("/permissions").unwrap();
+        assert_eq!(permissions, ["yolo", "auto", "manual"]);
+        assert_eq!(prefix, "/permissions ");
+
+        let (modes, prefix) = argument_picker_spec("/mode").unwrap();
+        assert!(modes.contains(&"planwrite"));
+        assert_eq!(prefix, "/mode ");
+
+        for command in super::FINITE_ARGUMENT_COMMANDS {
+            assert!(argument_picker_spec(command).is_some(), "{command}");
+        }
+        assert!(argument_picker_spec("/rename").is_none());
+    }
+
+    #[test]
+    fn space_after_exact_command_deterministically_starts_its_argument_stage() {
+        for (command, expects_picker) in
+            [("/rename", false), ("/add", true), ("/permissions", true)]
+        {
+            let mut buffer = CompactString::from(command);
+            let mut cursor = buffer.len();
+            let mut picker = ListPicker::with_static_commands();
+            picker.activate();
+            for character in command.trim_start_matches('/').chars() {
+                picker.char_input(character);
+            }
+
+            let (handled, replacement) = handle_command_key(
+                &mut buffer,
+                &mut cursor,
+                &empty_command_context(),
+                &mut picker,
+                key(KeyCode::Char(' ')),
+            );
+
+            assert_eq!(handled, expects_picker, "{command}");
+            let expected = if expects_picker {
+                format!("{command} ")
+            } else {
+                command.to_string()
+            };
+            assert_eq!(buffer, expected);
+            assert_eq!(replacement.is_some(), expects_picker, "{command}");
+            assert!(!picker.active, "{command}");
+        }
+    }
+
+    #[test]
+    fn argument_enter_and_tab_select_without_submitting() {
+        for code in [KeyCode::Enter, KeyCode::Tab] {
+            let mut buffer = CompactString::from("/permissions ");
+            let mut cursor = buffer.len();
+            let mut picker = ListPicker::new();
+            picker.set_items(vec!["yolo".to_string(), "auto".to_string()]);
+            picker.activate();
+
+            let handled = handle_prefixed_key(
+                &mut buffer,
+                &mut cursor,
+                &mut picker,
+                "/permissions ",
+                key(code),
+            );
+
+            assert!(handled, "{code:?}");
+            assert_eq!(buffer, "/permissions yolo");
+            assert!(!picker.active);
+        }
+    }
+
+    #[test]
+    fn stale_file_query_replacement_preserves_the_multibyte_buffer_tail() {
+        let mut buffer = CompactString::from("@a日本");
+        let cursor = replace_at_span(&mut buffer, 0, "ab", 1, "src/lib.rs");
+
+        assert_eq!(buffer, "src/lib.rs日本");
+        assert_eq!(cursor, "src/lib.rs".len());
+    }
+
+    #[test]
+    fn picker_text_input_rejects_control_and_alt_chords() {
+        assert!(accepts_text_input(KeyModifiers::NONE));
+        assert!(accepts_text_input(KeyModifiers::SHIFT));
+        assert!(!accepts_text_input(KeyModifiers::CONTROL));
+        assert!(!accepts_text_input(KeyModifiers::ALT));
+        assert!(!accepts_text_input(
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        ));
+    }
 }
 
 #[cfg(test)]

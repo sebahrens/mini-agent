@@ -5,7 +5,7 @@ learned retrieval dependencies. The opt-in `skills` feature additionally enables
 skills. The two types keep their existing authority boundaries:
 
 - Agent Skills are content-addressed instruction packages. Explicit imports take precedence,
-  followed by captured project `.zerostack/skills`, `.mini-agent/skills`, `.claude/skills`, and
+  followed by captured project `.mini-agent/skills`, `.claude/skills`, and
   the captured user's `~/.claude/skills`. Project roots require the existing project-config trust
   fingerprint; original files require current read authority. Ask/Deny sources are omitted without
   prompting. Links, hard links, special files and escaping resources are refused. Only
@@ -285,11 +285,17 @@ Each `grants` entry is a tagged object keyed by `kind`, and every list inside it
 (`methods` 1–2):
 
 ```json
-{ "kind": "read_file",  "workspace_prefixes": ["src/"] }
-{ "kind": "write_file", "workspace_prefixes": ["out/"] }
+{ "kind": "read_file",  "workspace_prefixes": ["src"] }
+{ "kind": "write_file", "workspace_prefixes": ["out"] }
 { "kind": "fetch",      "origins": ["https://example.com"], "methods": ["GET"] }
 { "kind": "spawn",      "programs": ["rg"] }
 ```
+
+`workspace_prefixes` are workspace-relative directory or file paths written without a leading or trailing
+`/` (`"src"`, not `"src/"`) and without `.`, `..`, empty, backslash or `:` components. The importer
+deliberately rejects `"src/"` instead of normalizing it: the prefix spelling is part of the artifact
+identity, and one canonical spelling keeps equal grants hashing to equal ids. A prefix covers its
+descendants by path component, so `"src"` already grants `src/lib/a.rs`.
 
 `methods` accepts only the canonical `GET` and `POST`. A capability tier outside the closed set,
 or a non-canonical method spelling, fails canonicalization before the artifact is enqueued.
@@ -645,17 +651,18 @@ about-to-be-retrievable revision; the feedback is recorded either way.
 ## Reading `--learned-skill-stats`
 
 The command prints a TSV table with this header, one row per identity-v2 revision ordered by
-invocation count, then a `total` row that sums only `invocations`, `gym_tasks`, `user_positive`,
+invocation count, then a `total` row that sums only `invocations`, `gym_invocations`, `gym_tasks`, `user_positive`,
 `user_negative` and `est_round_trips_saved` (every other total cell is `-`):
 
 ```text
-id  status  invocations  success  last_used_unix  tasks_with  passed_with  pass_rate_without  gym_tasks  user_positive  user_negative  declared_effect_methods  est_round_trips_saved
+id  status  invocations  gym_invocations  success  last_used_unix  tasks_with  passed_with  pass_rate_without  gym_tasks  user_positive  user_negative  declared_effect_methods  est_round_trips_saved
 ```
 
 | Column | Meaning |
 | --- | --- |
 | `status` | live lifecycle status of the revision |
-| `invocations` | recorded `invoked` events |
+| `invocations` | recorded `invoked` events, **including** non-production ones (Skill Gym episodes and other `MINI_AGENT_GYM=1` runs). Verification runs (embedded tests, held-out suites, mutation passes) execute in a separate verifier worker and record no `invoked` events |
+| `gym_invocations` | of `invocations`, the `invoked` events recorded outside production (`MINI_AGENT_GYM=1`). Subtract it for real-use counts. Derived from retained events, so it undercounts after event compaction |
 | `success` | **share of terminal calls that returned without a fault** — see below. `n/a` with no terminal calls |
 | `last_used_unix` | timestamp of the most recent `invoked` event, or `never` |
 | `tasks_with` | distinct production turns with a task outcome that used this skill |

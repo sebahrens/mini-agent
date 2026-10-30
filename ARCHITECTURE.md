@@ -110,7 +110,13 @@ chains and Git worktrees; see `src/extras/mod.rs` and `Cargo.toml` for declarati
   changing the process-wide configuration and storage roots.
 - The general process sandbox in `src/sandbox.rs` serves shell and brokered
   subprocess effects. The JavaScript worker uses the distinct fail-closed
-  containment launcher in `src/sandbox/worker.rs`.
+  containment launcher in `src/sandbox/worker.rs`. On Linux, the launcher
+  performs the bubblewrap `Command::spawn()` on the dedicated, process-lifetime
+  thread in `src/sandbox/spawner.rs`, because `PR_SET_PDEATHSIG` (which
+  `--die-with-parent` installs) is tracked against the parent OS thread, not
+  the parent process; a transient launch thread that exits right after
+  spawning could otherwise race bwrap's own startup and get the worker
+  SIGKILLed.
 
 The canonical JS containment checklist is in
 [Phase 6](docs/specs/phase-6-brokered-js-runtime.md#phase-6-security-invariants-canonical).
@@ -141,10 +147,10 @@ console state. Persistent transcripts remain separate from display retention.
 ## Persistence and configuration
 
 `AppPaths` in `src/paths.rs` is the storage authority. `--print-config` shows
-resolved roots. Configuration uses `ZS_CONFIG_DIR`, then the selected global
+resolved roots. Configuration uses `MINI_AGENT_CONFIG_DIR`, then the selected global
 home (`MINI_AGENT_HOME` or `~/.mini-agent`), or an existing platform-specific
 legacy `zerostack` root. File priority is TOML, YAML, YML, then JSON; project
-configuration lives under `.zerostack/config.toml` and has a separate trust gate.
+configuration lives under `.mini-agent/config.toml` and has a separate trust gate.
 See [configuration locations](docs/agent/CONFIG.md) and
 [platform paths](docs/specs/platform-paths.md) for override/migration rules.
 

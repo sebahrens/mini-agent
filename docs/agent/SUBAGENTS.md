@@ -189,12 +189,16 @@ Definitions are markdown resolved by `src/context/agents.rs`, highest priority
 first among eligible layers:
 
 ```
-.zerostack/agents/<name>.md      # trusted legacy project override (highest)
-.mini-agent/agents/<name>.md     # trusted mini-agent project definition
+.mini-agent/agents/<name>.md     # trusted mini-agent project override (highest)
 .claude/agents/<name>.md         # trusted Claude-style project definition
 data_dir/agents/<name>.md        # user global
 data/agents/<name>.md            # compiled-in default
 ```
+
+Set `claude_project_agents = false` to skip the `.claude/agents` layer when a
+repository's Claude Code agents are not meant for mini-agent (for example
+descriptions longer than the 160-character limit, which are otherwise reported
+as invalid on every start).
 
 `src/context/mentions.rs` parses agent mentions in submitted text against the
 same trust-gated resolution. The canonical token is `@agent:<name>`; Claude
@@ -367,7 +371,7 @@ branches; resolve at merge time. Committing needs a git identity (repository
 or global `user.name`/`user.email`); if the commit fails the worktree is kept
 and the report says so.
 
-A trusted project may also provide `.zerostack/agents/.notes.md`. Unlike a
+A trusted project may also provide `.mini-agent/agents/.notes.md`. Unlike a
 same-named definition, this file replaces nothing: the host appends it under a
 `## Project notes` boundary to every resolved persona after overrides have
 been selected. The shared file is limited to 64 KiB and each combined persona
@@ -376,11 +380,11 @@ and result provenance. Invalid, empty, unreadable, or oversized notes are
 ignored with a warning and a visible task-result notice.
 
 Project definitions participate only when the exact current
-`.zerostack/config.toml` is bound in the private project-config trust store.
+`.mini-agent/config.toml` is bound in the private project-config trust store.
 All three project directories use this existing gate, even when the definitions
 live under `.claude` or `.mini-agent`; those directories do not create an
 independent trust grant. Project notes use the same gate and remain supported
-only at `.zerostack/agents/.notes.md`. Persona files themselves are not part of
+only at `.mini-agent/agents/.notes.md`. Persona files themselves are not part of
 the config fingerprint: an approved checkout may change its persona content.
 Resolved persona maps are cached per user agents directory and workspace root.
 Every lookup re-evaluates project trust and re-stamps each layer through the
@@ -428,6 +432,8 @@ An optional YAML frontmatter block may configure the persona:
 name: rust-review
 description: Focused Rust API and test review
 tools: [Read, Grep, Glob]
+mcp_servers:
+  Context7: [search_docs, get_context]
 model: fast-review
 turn_budget: medium
 mode: review
@@ -459,11 +465,19 @@ mode: review
   parent's selection, permissions, workspace binding, or sandbox.
   The legacy code-indexer 0.1.6 persona's explicit `## Tools` CLI-only contract is
   recognized as requiring `shell`; incidental mentions and examples elsewhere
-  are not requirements. Read-only children have no shell, MCP, or nested `Agent`
-  route. Use the parent's authorized indexer tools or a compatible read-only
+  are not requirements. Read-only children have no shell or nested `Agent`
+  route, and MCP only through an explicit `mcp_servers` allowlist. Use the parent's authorized indexer tools or a compatible read-only
   persona instead. New imported personas should declare `required_tools`.
   Task schema descriptions display declared requirements alongside resolved
   definitions; a requirement is not a promise that the tool is installed.
+- `mcp_servers` is an exact map from configured server names to their allowed
+  wire-level tool names (at most 8 servers and 32 tools). It is child-only and
+  opt-in: omission grants no MCP capability, and the child never reuses or
+  falls back to the outer agent's connections. Each child connects only the
+  named server configurations, so credentials for other servers are absent,
+  and installs only tools returned under the exact allowlist. An unknown
+  server or missing tool fails the child instead of widening or silently
+  degrading its capability.
 - `model` is first resolved as a configured quick-model alias, including its
   provider and `extra_body`. Otherwise it is a raw model ID on the current
   subagent provider. A provider switch that cannot authenticate fails the task
@@ -479,8 +493,18 @@ mode: review
   [Worktree-isolated write children](#worktree-isolated-write-children).
 - `mode: write` selects an implementation child only with the global opt-in.
   Other `mode` values remain the prompt default used when the persona is selected for the
-  main loop through `/agent`. Child-only `tools`, `required_tools`, `model`, and `turn_budget`
+  main loop through `/agent`. Child-only `tools`, `required_tools`, `mcp_servers`, `model`, and `turn_budget`
   settings do not alter main-loop authority.
+
+Persona MCP startup uses the normal bounded initialization and catalog limits,
+and calls use `mcp_tool_timeout_secs`. Each child receives a fresh permission
+checker built from the configured rules and current mode; outer-session
+allow-all state, one-shot approvals, and session grants are not copied. The
+permission prompt transport may be shared, but decisions remain child-scoped.
+The child future owns its MCP manager: normal completion performs graceful
+shutdown, while cancellation drops the manager and immediately cancels its
+services/process tree. MCP output still passes through the existing bounded
+tool-result and `[subagent output ...]` report boundaries.
 
 The block is validated and removed before the prompt is installed. Malformed
 metadata, mismatched names, empty prompt bodies, invalid UTF-8, and oversized
@@ -714,8 +738,10 @@ model id in `model:` stays on the parent's provider.
 
 ### Read-only JavaScript (when `js` is enabled and contained)
 
-The child `js` tool supports local computation plus exactly three brokered
-effects: `read_file`, `list_dir`, and `grep`. `write_file`, `fetch`, `spawn`,
+The child `js` tool supports local computation plus exactly four brokered
+effects: `read_file`, `read_lines` (ranged/tail line reads of files larger than
+the 1 MiB `read_file` cap), `list_dir`, and `grep`, and the pure helpers
+`splitLines(text)` and `json_exact(text)`. `write_file`, `fetch`, `spawn`,
 `scratch_put`, `scratch_get`, `result`, `read_files`, `glob`, and
 `propose_skill` are absent from the realm. The parent broker independently
 limits the invocation grant to `read_file`, so a malformed or compromised
@@ -1022,6 +1048,16 @@ The task tool keeps at most `task_max_concurrency` child futures in flight.
 Queued prompts are started only as slots become available. The whole call owns
 all child futures, so dropping or cancelling the call drops every child before
 returning; no detached subagent task is left running.
+
+Before launching concurrent children, the scheduler deterministically reserves
+the aggregate `task_max_cost_units` budget across all requested prompts. Each
+child stops making further provider calls when its reservation is exhausted,
+and both completed and cancelled children are charged at most their reserved
+share. This prevents concurrent children from each spending the full aggregate
+budget before the scheduler observes their usage. A provider response can
+report usage beyond its reservation because usage arrives after that response;
+such an overrun stops the call immediately and is charged only to the reserved
+share in the bounded aggregate report.
 
 The first child failure stops new launches and cancels in-flight siblings.
 Aggregate output exhaustion, aggregate cost exhaustion, and the whole-call

@@ -97,12 +97,12 @@ async fn startup5_first_http_overlaps_probe_and_completed_snapshot_changes_only_
     let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
     let root = crate::tests::OwnedTestDirectory::new("startup5-provider-races");
     let names = [
-        "ZS_CONFIG_DIR",
-        "ZS_DATA_DIR",
-        "ZS_LOCAL_DATA_DIR",
-        "ZS_STATE_DIR",
-        "ZS_CACHE_DIR",
-        "ZS_CREDENTIALS_DIR",
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
         "MINI_AGENT_HOME",
     ];
     let values: Vec<_> = names
@@ -212,12 +212,12 @@ async fn startup5_native_losing_inventory_survives_rebuild_and_reload_without_pr
     let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
     let root = crate::tests::OwnedTestDirectory::new("startup5-native-pin");
     let names = [
-        "ZS_CONFIG_DIR",
-        "ZS_DATA_DIR",
-        "ZS_LOCAL_DATA_DIR",
-        "ZS_STATE_DIR",
-        "ZS_CACHE_DIR",
-        "ZS_CREDENTIALS_DIR",
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
         "MINI_AGENT_HOME",
     ];
     let values: Vec<_> = names

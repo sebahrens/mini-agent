@@ -238,8 +238,11 @@ This is lifecycle management, not a security boundary against hostile commands.
 The caller establishes cleanup ownership before launch and retains it through interrupted
 startup handoffs. Control and acknowledgement use local socket pairs whose objects can be
 closed again safely, even if a descriptor was reused after an interrupted close.
-The caller allows up to five additional seconds to confirm cleanup. Missing acknowledgement,
-an interrupted cleanup wait, or an expired cleanup deadline raises a fatal runner error, stops further episodes/mining,
+The caller allows up to five additional seconds to confirm cleanup. The acknowledgement is one
+JSON object read across partial chunks until it is complete or its endpoint reaches EOF; the
+error names the failure (no acknowledgement, incomplete, malformed, or a supervisor that exited
+non-zero after acknowledging) and includes the supervisor's late stderr. Missing acknowledgement,
+a non-zero supervisor exit, an interrupted cleanup wait, or an expired cleanup deadline raises a fatal runner error, stops further episodes/mining,
 and preserves remaining workspace and AppPaths files. Resource finalization attempts every
 stream and endpoint close; a close failure also remains fatal instead of masking an unconfirmed
 cleanup result with a recoverable I/O error. A surviving supervisor keeps ownership
@@ -254,7 +257,9 @@ descriptors over a private local socket. Forks, execs, new sessions and reparent
 double forks remain in that coalition. On command exit, timeout, overflow or
 caller death, the job signals its remaining members using kernel-checked PID
 versions, reaps the direct child and acknowledges only once no live descendants
-remain. The broker removes the job and private socket after acknowledgement;
+remain. After acknowledgement the broker waits briefly for the job to exit, then removes the
+job and private socket; a `launchctl remove` failure is accepted only once launchd reports the
+label unloaded within a bounded settle period;
 unconfirmed cleanup retains ownership and preserves workspaces. Native macOS
 support requires a functioning per-user launchd domain; it never falls back to
 immediate-child-only cleanup. The API layouts and signalling semantics follow
@@ -293,10 +298,12 @@ checks ownership boundaries, and readiness failures exercise the same fixture cl
 
 ### Isolation
 
-Episodes never read the operator's configuration. `ZS_CONFIG_DIR` and `ZS_CREDENTIALS_DIR` point at
-gym-owned directories seeded with a minimal `config.toml` holding only `--provider`/`--model` when
-given. Quotes, backslashes, control characters, and Unicode in these values are preserved as
-string content. The runner also sets gym-owned `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`,
+Episodes never read the operator's configuration. `MINI_AGENT_CONFIG_DIR` and `MINI_AGENT_CREDENTIALS_DIR` point at
+gym-owned directories seeded with a minimal `config.toml` holding `--provider`/`--model` when
+given plus `js-read-roots = ["."]` and `js-write-roots = ["."]`, so the `js` tool's file effects work
+inside the episode workspace (relative roots resolve from it; without roots they are denied and the
+`library` arm cannot measure js). Nothing outside the disposable workspace worktree is granted. Quotes, backslashes, control characters, and Unicode in these values are preserved as
+string content. The runner also sets gym-owned `MINI_AGENT_DATA_DIR`, `MINI_AGENT_LOCAL_DATA_DIR`, `MINI_AGENT_STATE_DIR`, `MINI_AGENT_CACHE_DIR`,
 `TMPDIR`, and `MINI_AGENT_GYM=1`. The environment is an allowlist, not a copy: `PATH`, `HOME`,
 `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `TZ`, `SSL_CERT_DIR`, `SSL_CERT_FILE`, the
 known provider key variables (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_API_KEY`,

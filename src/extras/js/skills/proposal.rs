@@ -728,6 +728,10 @@ impl AttemptBudget {
             .map(|_| ())
             .map_err(|_| ProposalError::BudgetExhausted)
     }
+
+    fn restore(&self) {
+        self.remaining.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// The settled admission outcome of one proposal, as observed after the queue
@@ -738,8 +742,14 @@ pub(crate) struct SettledProposal {
     pub(crate) skill_id: String,
     pub(crate) status: ProposalStatus,
     pub(crate) reason_code: Option<String>,
+    /// Bounded, path-free explanation of a rejection (which test or rule
+    /// failed), taken from the evaluation report. `None` when there is none.
+    pub(crate) detail: Option<String>,
     pub(crate) report_id: Option<String>,
 }
+
+/// The longest rejection detail shown to the model.
+const MAX_SETTLED_DETAIL_CHARS: usize = 200;
 
 /// The most proposal ids one session tracks for settled-outcome reporting.
 /// A session can spend at most `DEFAULT_SESSION_ATTEMPTS` attempts, so this
@@ -865,10 +875,6 @@ impl ProposalEffectService {
         }
     }
 
-    pub(crate) fn reserve_attempt(&self) -> Result<(), ProposalError> {
-        self.host.budget.consume()
-    }
-
     pub(crate) fn authorize_reserved(
         &self,
         proposal: JsProposal,
@@ -904,10 +910,23 @@ impl ProposalEffectService {
         &self,
         prepared: PreparedProposalEffect,
     ) -> Result<ProposalEffectResult, ProposalError> {
-        let result = self
+        self.host.budget.consume()?;
+        let result = match self
             .host
             .sender
-            .enqueue(prepared.artifact, prepared.predecessor_id)?;
+            .enqueue(prepared.artifact, prepared.predecessor_id)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                // A response timeout is outcome-unknown: the command may have
+                // been durably accepted after the caller stopped waiting. All
+                // other queue failures are definitive and spend no attempt.
+                if !matches!(error, ProposalError::QueueTimeout) {
+                    self.host.budget.restore();
+                }
+                return Err(error);
+            }
+        };
         self.host.observe_enqueued(&result.proposal_id);
         let status = match result.status {
             super::store::EnqueueStatus::Pending => ProposalStatus::Pending,
@@ -1135,7 +1154,19 @@ impl ProposalQueue {
                             let result = store
                                 .get_proposal(&proposal_id)
                                 .map_err(|_| ProposalError::StoreUnavailable)
-                                .map(|record| record.and_then(settled_proposal));
+                                .map(|record| {
+                                    let detail = record
+                                        .as_ref()
+                                        .and_then(|record| record.report_id.as_deref())
+                                        .and_then(|id| {
+                                            store.get_evaluation_report(id).ok().flatten()
+                                        })
+                                        .and_then(|report| report_detail(&report.summary_json));
+                                    record.and_then(settled_proposal).map(|mut settled| {
+                                        settled.detail = detail;
+                                        settled
+                                    })
+                                });
                             let _ = reply.send(result);
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1172,8 +1203,23 @@ fn settled_proposal(record: ProposalRecord) -> Option<SettledProposal> {
         skill_id: record.skill_id,
         status,
         reason_code: record.reason_code,
+        detail: None,
         report_id: record.report_id,
     })
+}
+
+/// Extract the rejection `detail` from a report summary, bounded to
+/// [`MAX_SETTLED_DETAIL_CHARS`] and restricted to printable ASCII so a stored
+/// summary can never inject control characters or long text into a tool result.
+fn report_detail(summary_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(summary_json).ok()?;
+    let detail = value.get("detail")?.as_str()?;
+    let bounded = detail
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(MAX_SETTLED_DETAIL_CHARS)
+        .collect::<String>();
+    (!bounded.is_empty()).then_some(bounded)
 }
 
 /// Map a durable-store failure onto the closed proposal error surface.

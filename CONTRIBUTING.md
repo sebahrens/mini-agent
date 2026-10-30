@@ -22,6 +22,11 @@ cargo test                     # type checking and tests in one pass
 cargo install --path . --debug # the development build/install command
 ```
 
+- `make check` runs `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and
+  `cargo test --locked`, each through `scripts/check_once.py`. It fingerprints the working tree (the CI
+  fingerprint rules: uncommitted edits count, docs and version-only bumps do not) plus `rustc --version`
+  and the command line, and skips a check that already passed for the identical tree (markers in
+  `target/.check-once/`). Use `--force` to rerun; failures are never recorded.
 - The `--debug` install is the contributor build: faster to compile and keeps `debug_assert!`
   checks on. The README's `cargo install --path . --locked` is the end-user source install.
   In the dev profile mini-agent itself stays at opt-level 0 while dependencies build at
@@ -61,16 +66,40 @@ cargo install --path . --debug # the development build/install command
   `macos`/`seatbelt`, or whose file is gated as a whole by `#![cfg(...)]`, also runs that
   platform's rows. `scripts/ci_success.py` accepts the skips only for `tests` scope on push and
   pull request. Tags, the schedule, dispatch, an unresolvable base or any doubt run the full matrix.
+  Two additional fail-safe checks narrow `tests` further: a balanced-paren scan of every
+  `cfg(...)`/`cfg!(...)`/`cfg_attr(...)` call anywhere in the file (not only a leading
+  `#![cfg(...)]`) — naming `windows`/`target_os = "windows"` or `macos`/`target_os = "macos"` keeps
+  just that platform's rows, while `unix`, `target_family`, `target_vendor`, `target_env`,
+  `target_arch`, or a `target_os` naming neither tracked platform cannot be attributed to one
+  platform and keeps both; and, for a `src/`-rooted test path (a top-level `tests/*.rs` integration
+  test is its own Cargo-compiled crate root with no `mod` declaration to check), the path must be
+  reachable only through a `mod`/`#[path]` declaration chain that is itself `cfg(test)`-gated,
+  directly or via a declaring file that is itself a test path — a missing declaration, one carrying
+  a platform cfg, or one that is not `cfg(test)`-gated reports `code`, the full matrix.
 - CI pass fingerprints: `clippy`, `test`, `all-features`, `parallel-test-smoke`, `mcp-stdio` and
   `lsp-lifecycle` start with `.github/actions/ci-fingerprint`. The fingerprint is the SHA-256 of the
   job id, feature row, runner OS/`ImageOS`/arch, `Cargo.lock`, `rust-toolchain.toml`, the workflow
   file and the tracked files of the job's input class (`production` excludes docs nothing reads and
   test-only paths; `production+tests` keeps tests). A successful push to `main` saves the marker
   `ci-pass-<job>-<fingerprint>` through `actions/cache`; later runs restore it lookup-only and skip
-  the remaining steps with a notice naming the fingerprint. Pull requests read main's markers but
-  never write; tags, the schedule and dispatch never read or write. The Phase 6 containment gates
-  and `linux-sandbox-policy` never use markers. Editing the workflow or the action invalidates
-  every marker.
+  the remaining steps with a notice naming the fingerprint. A pull request's own branch is deleted
+  post-merge, so it cannot write that cache entry for main to see; instead it publishes its
+  fingerprint as a build artifact named for the key. A push to main whose cache lookup misses asks
+  `scripts/ci_pr_trust.py` whether the pull request that merged into this commit already proved the
+  key through its own successful `pull_request` run at that PR's exact head SHA and, if so, treats
+  it as a hit and saves the marker itself, so a merge that moved no code never re-runs what the PR
+  already proved (mini-agent-di2xu). Every lookup fails open on any API error. Version-only release
+  bumps hit the markers: `scripts/ci_fingerprint.py` excludes the exact `RELEASE_METADATA` paths
+  (`docs/acp-registry.json`, `editors/vscode/package.json`, `editors/vscode/package-lock.json`,
+  `packaging/aur/.SRCINFO`, `packaging/aur/PKGBUILD`, `packaging/conda/mini-agent/meta.yaml`,
+  `packaging/conda/mini-agent-bin/meta.yaml`, `packaging/homebrew/mini-agent.rb`,
+  `packaging/windows/README.md`, `.github/workflows/release.yml`,
+  `scripts/tests/test_release_artifacts.py`) and hashes `Cargo.toml`/`Cargo.lock` with only the root
+  package's own version replaced by a placeholder; a test fails if Rust sources ever read one of
+  those paths. Tags may read markers but never write them (a marker is only written by a push to
+  main for identical inputs, so it is the same evidence on a tag); the schedule and dispatch neither
+  read nor write. The Phase 6 containment gates and `linux-sandbox-policy` never use markers (they
+  keep running on tags). Editing the workflow or the action invalidates every marker.
 - Dependency changes go only in the root `Cargo.toml` and `Cargo.lock`. Reuse existing dependencies
   instead of adding a second version, and keep optional or platform-specific dependencies behind
   their feature or target.

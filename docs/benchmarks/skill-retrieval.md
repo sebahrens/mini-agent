@@ -15,7 +15,7 @@ cargo test --features js,skills skill_retrieval_benchmark_smoke -- --nocapture
 Run the full debug-profile audit with:
 
 ```bash
-ZS_SKILL_BENCH_FULL=1 cargo test --features js,skills skill_retrieval_benchmark -- --ignored --nocapture
+MINI_AGENT_SKILL_BENCH_FULL=1 cargo test --features js,skills skill_retrieval_benchmark -- --ignored --nocapture
 ```
 
 Each run emits one machine-readable JSON line and a human summary. The same JSON is written to
@@ -93,7 +93,7 @@ The Phase 5 audit retains 100,000 revision rows and measures lifecycle-adjacent 
 separately from retrieval. Run it with:
 
 ```bash
-ZS_SKILL_BENCH_FULL=1 cargo test --features js,skills phase5_operations_benchmark -- --ignored --nocapture
+MINI_AGENT_SKILL_BENCH_FULL=1 cargo test --features js,skills phase5_operations_benchmark -- --ignored --nocapture
 ```
 
 The accepted 2026-08-01 debug-profile run passed every deliberately conservative budget:

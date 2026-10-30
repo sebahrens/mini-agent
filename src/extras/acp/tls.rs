@@ -30,6 +30,7 @@ pub(super) const ACP_TLS_KEY_ENV: &str = "MINI_AGENT_ACP_TLS_KEY";
 const TLS_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Server TLS identity and the certificate digest the handshake binds.
+#[derive(Debug)]
 pub(super) struct AcpTlsConfig {
     acceptor: tokio_native_tls::TlsAcceptor,
     certificate_sha256: String,

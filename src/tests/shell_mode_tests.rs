@@ -21,6 +21,18 @@ const SHORT_LIMITS: CommandLimits = CommandLimits {
     combined_bytes: 6144,
 };
 
+/// Limits for runs whose expected outcome is anything other than a timeout.
+///
+/// [`SHORT_LIMITS`] exists to make the timeout path fire quickly, but its
+/// 300 ms deadline is shorter than process (and especially sandbox backend)
+/// startup on a heavily loaded host. A test that expects completion,
+/// cancellation, a caller drop, or an output limit must not race that
+/// deadline, or the run is reported as timed out instead.
+const COMPLETION_LIMITS: CommandLimits = CommandLimits {
+    timeout: Duration::from_secs(60),
+    ..SHORT_LIMITS
+};
+
 /// For controls that expect the command to finish: they prove output and
 /// status handling, not a 300 ms launch deadline, so hosted-runner shell
 /// startup gets the same bounded slack as the credential-isolation control.
@@ -72,16 +84,12 @@ async fn implicit_unavailable_default_clears_ambient_credentials() {
     let sandbox = Sandbox::new(false, "missing-default").with_unavailable_default_fallback();
 
     // This success control proves credential isolation, not a 300 ms launch
-    // deadline. Keep hosted-runner scheduling bounded independently of the
-    // short limits used by the timeout controls below.
-    let success_limits = CommandLimits {
-        timeout: Duration::from_secs(5),
-        ..SHORT_LIMITS
-    };
+    // deadline: it uses the load-stable completion limits, not the short
+    // limits used by the timeout controls below.
     let output = sandbox
         .output_command_with_limits(
             "test -z \"${MINI_AGENT_FALLBACK_SECRET+x}\" && printf clean",
-            success_limits,
+            COMPLETION_LIMITS,
         )
         .await
         .unwrap();
@@ -139,7 +147,7 @@ async fn explicit_shell_under_no_sandbox_env_policy_matches_spec() {
         let run = sandbox
             .run_explicit_shell(
                 "!test -z \"${MINI_AGENT_EXPLICIT_SHELL_SECRET+x}\" && printf '%s' \"$PATH\"",
-                SHORT_LIMITS,
+                COMPLETION_LIMITS,
                 None,
             )
             .await
@@ -277,7 +285,7 @@ async fn explicit_shell_available_backend_runs_or_fails_closed_before_payload() 
                 "!printf ran > {}; test -z \"${{OPENROUTER_API_KEY+x}}\" && printf sandboxed",
                 marker.display()
             ),
-            SHORT_LIMITS,
+            COMPLETION_LIMITS,
             None,
         )
         .await
@@ -309,22 +317,42 @@ async fn explicit_shell_available_backend_runs_or_fails_closed_before_payload() 
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_timeout_kills_term_ignoring_descendant_and_recovers() {
-    let marker = unique_marker("timeout-descendant");
     let sandbox = Sandbox::new(false, "bwrap");
-    let command = format!(
-        "!trap '' TERM; sh -c 'trap \"\" TERM; sleep 1; printf leaked > {}' & wait",
-        marker.display()
-    );
-    let run = sandbox
-        .run_explicit_shell(&command, SHORT_LIMITS, None)
-        .await
-        .unwrap();
+    // The 300 ms deadline under test is shorter than shell startup on a loaded
+    // host, so the deadline can fire before the descendant publishes its pids.
+    // Such an attempt still exercises the timeout path but cannot prove the
+    // descendant was reaped, so retry until one attempt observes a live
+    // TERM-ignoring descendant at the deadline.
+    let mut observed_descendants = false;
+    for _ in 0..20 {
+        let marker = unique_marker("timeout-descendant");
+        let started = unique_marker("timeout-started");
+        let command = format!(
+            "!trap '' TERM; {} & wait",
+            descendant_tree_script(&started, &marker, true)
+        );
+        let run = sandbox
+            .run_explicit_shell(&command, SHORT_LIMITS, None)
+            .await
+            .unwrap();
 
-    assert_eq!(run.output.status, CommandStatus::TimedOut);
-    assert!(run.rendered_output().contains("timed out"));
-    sleep(Duration::from_millis(1200)).await;
-    assert!(!marker.exists());
-    assert_eq!(sandbox.active_group_count(), 0);
+        assert_eq!(run.output.status, CommandStatus::TimedOut);
+        assert!(run.rendered_output().contains("timed out"));
+        assert_eq!(sandbox.active_group_count(), 0);
+        if started.exists() {
+            let descendants = descendant_pids(&started);
+            assert_descendants_killed_and_reaped(&descendants, &marker).await;
+            let _ = std::fs::remove_file(&started);
+            observed_descendants = true;
+            break;
+        }
+        assert!(!marker.exists(), "descendant payload ran after termination");
+        let _ = std::fs::remove_file(started.with_extension("tmp"));
+    }
+    assert!(
+        observed_descendants,
+        "no attempt started its descendant before the 300 ms deadline"
+    );
 
     let next = sandbox
         .run_explicit_shell("!printf recovered", SUCCESS_LIMITS, None)
@@ -341,31 +369,33 @@ async fn explicit_shell_operation_cancellation_kills_and_reaps_tree() {
     let sandbox = Sandbox::new(false, "bwrap");
     let cancellation = CommandCancellation::new();
     let command = format!(
-        "!sh -c 'printf started > {}; sleep 1; printf leaked > {}' & wait",
-        started.display(),
-        marker.display(),
+        "!{} & wait",
+        descendant_tree_script(&started, &marker, false)
     );
     let handle = tokio::spawn({
         let sandbox = sandbox.clone();
         let cancellation = cancellation.clone();
         async move {
             sandbox
-                .run_explicit_shell(&command, SHORT_LIMITS, Some(&cancellation))
+                .run_explicit_shell(&command, COMPLETION_LIMITS, Some(&cancellation))
                 .await
         }
     });
 
-    wait_until(|| sandbox.active_group_count() == 1 && started.exists()).await;
+    wait_until_named("explicit shell process tree to start", || {
+        sandbox.active_group_count() == 1 && started.exists()
+    })
+    .await;
+    let descendants = descendant_pids(&started);
     cancellation.cancel();
-    let run = timeout(Duration::from_secs(2), handle)
+    let run = timeout(Duration::from_secs(30), handle)
         .await
-        .unwrap()
+        .expect("cancelled explicit shell must settle")
         .unwrap()
         .unwrap();
     assert_eq!(run.output.status, CommandStatus::Cancelled);
-    sleep(Duration::from_millis(1200)).await;
-    assert!(!marker.exists());
     assert_eq!(sandbox.active_group_count(), 0);
+    assert_descendants_killed_and_reaped(&descendants, &marker).await;
     let _ = std::fs::remove_file(started);
 }
 
@@ -384,15 +414,14 @@ fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
         let mut sandbox = Sandbox::new(false, "bwrap");
         let audit_receipts = sandbox.observe_explicit_shell_audits();
         let interaction = format!(
-            "!trap '' TERM; sh -c 'printf started > {}; sleep 1; printf leaked > {}' & wait",
-            started.display(),
-            marker.display()
+            "!trap '' TERM; {} & wait",
+            descendant_tree_script(&started, &marker, false)
         );
         let handle = tokio::spawn({
             let sandbox = sandbox.clone();
             async move {
                 sandbox
-                    .run_explicit_shell(&interaction, SHORT_LIMITS, None)
+                    .run_explicit_shell(&interaction, COMPLETION_LIMITS, None)
                     .await
             }
         });
@@ -401,6 +430,7 @@ fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
             sandbox.active_group_count() == 1 && started.exists()
         })
         .await;
+        let descendants = descendant_pids(&started);
         handle.abort();
         let _ = handle.await;
         wait_until_named("explicit shell process group cleanup", || {
@@ -413,8 +443,7 @@ fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
             || !audit_receipts.lock().unwrap().is_empty(),
         )
         .await;
-        sleep(Duration::from_millis(1200)).await;
-        assert!(!marker.exists());
+        assert_descendants_killed_and_reaped(&descendants, &marker).await;
         let _ = std::fs::remove_file(started);
         (audit_receipts, marker)
     });
@@ -434,12 +463,12 @@ fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
 async fn explicit_shell_bounds_stdout_stderr_and_mixed_floods() {
     let sandbox = Sandbox::new(false, "bwrap");
     let cases = [
-        ("!yes o", SHORT_LIMITS, CommandOutputLimit::Stdout),
-        ("!yes e >&2", SHORT_LIMITS, CommandOutputLimit::Stderr),
+        ("!yes o", COMPLETION_LIMITS, CommandOutputLimit::Stdout),
+        ("!yes e >&2", COMPLETION_LIMITS, CommandOutputLimit::Stderr),
         (
             "!yes o & yes e >&2 & wait",
             CommandLimits {
-                timeout: SHORT_LIMITS.timeout,
+                timeout: COMPLETION_LIMITS.timeout,
                 stdout_bytes: 8192,
                 stderr_bytes: 8192,
                 combined_bytes: SHORT_LIMITS.combined_bytes,
@@ -674,6 +703,57 @@ fn unique_marker(label: &str) -> std::path::PathBuf {
     marker
 }
 
+/// Shell fragment for a backgrounded subshell that publishes its own pid and
+/// its `sleep` child's pid to `started` (atomically, via rename) and writes
+/// `marker` only if it outlives a sleep far longer than any test waits.
+///
+/// The long sleep keeps the fixture independent of scheduling delay: a slow
+/// kill on a loaded host cannot let the payload leak, and only a tree that is
+/// never killed reaches the marker write.
+///
+/// With `ignore_term`, the subshell ignores SIGTERM before forking, and the
+/// ignored disposition survives into `sleep`, so only a SIGKILL of the whole
+/// group ends the tree.
+#[cfg(unix)]
+fn descendant_tree_script(started: &Path, marker: &Path, ignore_term: bool) -> String {
+    let started = started.display();
+    let trap = if ignore_term { "trap \"\" TERM; " } else { "" };
+    format!(
+        "sh -c '{trap}sleep 120 & printf \"%s %s\" $$ $! > {started}.tmp; mv {started}.tmp {started}; wait; printf leaked > {}'",
+        marker.display()
+    )
+}
+
+#[cfg(unix)]
+fn descendant_pids(started: &Path) -> Vec<i32> {
+    let recorded = std::fs::read_to_string(started).unwrap();
+    let pids: Vec<i32> = recorded
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 2, "unexpected descendant record {recorded:?}");
+    pids
+}
+
+/// Waits until every recorded descendant is gone, then asserts the payload
+/// never ran. Signal zero still succeeds for a zombie, so `ESRCH` proves each
+/// process was both killed and reaped. The wait is bounded by a condition
+/// rather than a fixed sleep, and is far shorter than the fixture's own sleep,
+/// so a descendant that survived termination fails here instead of passing.
+#[cfg(unix)]
+async fn assert_descendants_killed_and_reaped(pids: &[i32], marker: &Path) {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    wait_until_named("descendant process tree to be killed and reaped", || {
+        pids.iter()
+            .all(|pid| kill(Pid::from_raw(*pid), None) == Err(Errno::ESRCH))
+    })
+    .await;
+    assert!(!marker.exists(), "descendant payload ran after termination");
+}
+
 fn workspace_marker(label: &str) -> std::path::PathBuf {
     let marker = std::env::current_dir().unwrap().join(format!(
         ".mini-agent-explicit-shell-{label}-{}-{}",
@@ -693,10 +773,6 @@ fn is_backend_setup_denial(rendered: &str) -> bool {
     ]
     .iter()
     .any(|needle| rendered.contains(needle))
-}
-
-async fn wait_until(predicate: impl FnMut() -> bool) {
-    wait_until_for_named(Duration::from_secs(30), "condition", predicate).await;
 }
 
 async fn wait_until_named(label: &str, predicate: impl FnMut() -> bool) {

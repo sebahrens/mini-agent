@@ -563,12 +563,12 @@ async fn oauth47_actual_sdk_plan_tool_followup_and_auxiliary_use_one_selected_re
 fn oauth47_actual_client_login_precedes_keys_but_never_crosses_custom_routes() {
     let roots = crate::tests::OwnedTestDirectory::new("oauth47-precedence");
     let mut vars = [
-        "ZS_CONFIG_DIR",
-        "ZS_DATA_DIR",
-        "ZS_LOCAL_DATA_DIR",
-        "ZS_STATE_DIR",
-        "ZS_CACHE_DIR",
-        "ZS_CREDENTIALS_DIR",
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
     ]
     .map(|name| (name, Some(roots.path().join(name).into_os_string())))
     .to_vec();

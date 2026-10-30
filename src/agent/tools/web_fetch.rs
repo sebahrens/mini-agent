@@ -327,9 +327,9 @@ mod web_fetch_persistence_tests {
         let root = crate::tests::OwnedTestDirectory::new("web-spill");
         let value = root.path().as_os_str().to_owned();
         let _environment = crate::tests::ScopedProcessEnv::set(&[
-            ("ZS_DATA_DIR", Some(value.clone())),
-            ("ZS_CONFIG_DIR", Some(value.clone())),
-            ("ZS_STATE_DIR", Some(value)),
+            ("MINI_AGENT_DATA_DIR", Some(value.clone())),
+            ("MINI_AGENT_CONFIG_DIR", Some(value.clone())),
+            ("MINI_AGENT_STATE_DIR", Some(value)),
         ]);
         let mut session = crate::session::Session::new("fixture", "model", 128_000, "");
         session.add_message(crate::session::MessageRole::User, "retrieve docs");

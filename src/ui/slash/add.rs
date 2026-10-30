@@ -65,6 +65,7 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                 );
             }
         }
+        write_result(ctx.renderer, "usage: /add <path>");
         return Ok(());
     }
 

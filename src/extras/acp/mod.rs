@@ -3,6 +3,7 @@ mod commands;
 pub mod config;
 mod cron;
 mod idle;
+mod persona;
 mod policy;
 mod sessions;
 mod tls;
@@ -13,12 +14,12 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
-#[cfg(test)]
 use std::pin::Pin;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context as TaskContext, Poll};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::*;
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Dispatch, RequestCancellation, Responder,
-    Role, Stdio,
+    Role,
 };
 use rig::completion::Message;
 use tokio::sync::{Mutex, Notify};
@@ -47,8 +48,56 @@ const MAX_PENDING_AUTHENTICATIONS: usize = 16;
 const MAX_ACP_HISTORY_TURNS: usize = 128;
 const MAX_ACP_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACP_SESSIONS: usize = 64;
+const MAX_ACP_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ACP_PROMPT_BYTES: usize = 2 * 1024 * 1024;
+const MIN_ACP_TCP_API_KEY_BYTES: usize = 32;
 #[cfg(feature = "mcp")]
 const MAX_ACP_CLIENT_MCP_SERVERS: usize = 8;
+
+struct BoundedLineReader<R> {
+    inner: R,
+    current_line_bytes: usize,
+    maximum_line_bytes: usize,
+}
+
+impl<R> BoundedLineReader<R> {
+    fn new(inner: R, maximum_line_bytes: usize) -> Self {
+        Self {
+            inner,
+            current_line_bytes: 0,
+            maximum_line_bytes,
+        }
+    }
+}
+
+impl<R: futures::AsyncRead + Unpin> futures::AsyncRead for BoundedLineReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let read = match Pin::new(&mut this.inner).poll_read(cx, buffer) {
+            Poll::Ready(Ok(read)) => read,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        };
+        for byte in &buffer[..read] {
+            if *byte == b'\n' {
+                this.current_line_bytes = 0;
+            } else {
+                this.current_line_bytes = this.current_line_bytes.saturating_add(1);
+                if this.current_line_bytes > this.maximum_line_bytes {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ACP frame exceeds its byte limit",
+                    )));
+                }
+            }
+        }
+        Poll::Ready(Ok(read))
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -420,6 +469,12 @@ struct SessionState {
     spend: crate::spend::run::Run,
     history: Arc<Mutex<SessionHistory>>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
+    /// The session's workspace-bound context before any prompt is activated.
+    /// A persona switch activates its prompt on a fresh copy of this, so the
+    /// selected prompt alone decides the persona.
+    base_context: Arc<ContextFiles>,
+    /// `base_context` with the session's current prompt activated. Each turn
+    /// snapshots it, so a switch takes effect from the next prompt.
     context: Arc<ContextFiles>,
     turns: Arc<StdMutex<SessionTurns>>,
     read_tracker: crate::agent::tools::ReadTracker,
@@ -817,6 +872,9 @@ struct AcpState {
     mcp_fixture: StdMutex<Option<crate::extras::mcp::McpClientManager>>,
     #[cfg(test)]
     prompt_exit_barrier: Option<Arc<PromptExitBarrier>>,
+    /// Every route a turn resolved, in order, for persona routing tests.
+    #[cfg(test)]
+    turn_routes: StdMutex<Vec<persona::TurnRoute>>,
 }
 
 #[cfg(test)]
@@ -847,6 +905,23 @@ type RunnerFixture = Arc<
 >;
 
 // --- TCP Transport ---
+
+struct BoundedStdioTransport;
+
+impl<Counterpart: Role> ConnectTo<Counterpart> for BoundedStdioTransport {
+    async fn connect_to(
+        self,
+        client: impl ConnectTo<Counterpart::Counterpart>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let stdin = blocking::Unblock::new(std::io::stdin());
+        let stdout = blocking::Unblock::new(std::io::stdout());
+        ConnectTo::<Counterpart>::connect_to(
+            ByteStreams::new(stdout, BoundedLineReader::new(stdin, MAX_ACP_FRAME_BYTES)),
+            client,
+        )
+        .await
+    }
+}
 
 struct TcpTransport {
     host: String,
@@ -915,8 +990,14 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         let read_unblock = blocking::Unblock::new(read_half);
         let write_unblock = blocking::Unblock::new(write_half);
 
-        ConnectTo::<Counterpart>::connect_to(ByteStreams::new(write_unblock, read_unblock), client)
-            .await
+        ConnectTo::<Counterpart>::connect_to(
+            ByteStreams::new(
+                write_unblock,
+                BoundedLineReader::new(read_unblock, MAX_ACP_FRAME_BYTES),
+            ),
+            client,
+        )
+        .await
     }
 }
 
@@ -1021,6 +1102,7 @@ async fn accept_authenticated_peer_with_idle<S: accept::AcceptSource>(
     }
 }
 
+#[derive(Debug)]
 struct TcpServerSettings {
     host: String,
     port: u16,
@@ -1084,7 +1166,11 @@ fn resolve_tcp_settings_with_key(
                 "ACP TCP requires authentication; set MINI_AGENT_ACP_API_KEY or configure a matching TCP acp_servers api_key"
             )
         })?;
-
+    if api_key.len() < MIN_ACP_TCP_API_KEY_BYTES {
+        anyhow::bail!(
+            "ACP TCP authentication key must be at least {MIN_ACP_TCP_API_KEY_BYTES} bytes"
+        );
+    }
     if !is_loopback_host(&host) && !tls {
         if !allow_remote {
             anyhow::bail!(
@@ -1286,6 +1372,8 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
         mcp_fixture: StdMutex::new(None),
         #[cfg(test)]
         prompt_exit_barrier: None,
+        #[cfg(test)]
+        turn_routes: StdMutex::new(Vec::new()),
     });
 
     // Choose transport: TCP if an endpoint is configured, otherwise stdio.
@@ -1304,7 +1392,7 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
         .await
         .map_err(|e| anyhow::anyhow!("ACP TCP server error: {}", e))?;
     } else {
-        connect_agent(state, Stdio::new())
+        connect_agent(state, BoundedStdioTransport)
             .await
             .map_err(|e| anyhow::anyhow!("ACP stdio server error: {}", e))?;
     }
@@ -1365,6 +1453,16 @@ async fn connect_agent(
                 move |req: SetSessionModeRequest, responder, cx| {
                     let state = state.clone();
                     async move { handle_set_session_mode(req, responder, cx, &state).await }
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                move |req: SetSessionConfigOptionRequest, responder, cx| {
+                    let state = state.clone();
+                    async move { handle_set_session_config_option(req, responder, cx, &state).await }
                 }
             },
             on_receive_request!(),
@@ -1577,9 +1675,35 @@ async fn handle_new_session(
     )
     .await?;
 
+    // Permission modes are the ACP session modes; the persona (prompt and its
+    // `[prompt_to_model]` route) is the `mode` session config option.
+    let config_options = persona_config_options(state, &session_id).await;
     commands::announce(&session_id, &cx)?;
-    let resp = NewSessionResponse::new(session_id).modes(modes);
+    let resp = NewSessionResponse::new(session_id)
+        .modes(modes)
+        .config_options(config_options);
     responder.respond(resp)
+}
+
+/// The persona config options a client sees for an installed session.
+async fn persona_config_options(
+    state: &AcpState,
+    session_id: &SessionId,
+) -> Vec<SessionConfigOption> {
+    state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|session| {
+            persona::session_config_options(
+                &state.cli,
+                &state.cfg,
+                &session.base_context,
+                &session.context,
+            )
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(feature = "subagents")]
@@ -1650,7 +1774,7 @@ async fn install_session(
     #[cfg(feature = "mcp")] client_mcp_servers: ClientMcpServers,
 ) -> Result<Option<SessionModeState>, agent_client_protocol::Error> {
     let sandbox = acp_session_sandbox(state, workspace.clone())?;
-    let context = state
+    let base_context = state
         .context
         .for_workspace_binding(state.cli.resolve_no_context_files(&state.cfg), &workspace);
     workspace.validate().map_err(|_| {
@@ -1659,6 +1783,13 @@ async fn install_session(
             "ACP workspace changed during context preparation",
         )
     })?;
+    // Resolve the session's prompt exactly as interactive startup does. Its
+    // route is checked on every turn, which refuses a provider that cannot be
+    // initialized instead of falling back to the startup provider.
+    let initial_prompt = persona::initial_prompt(&state.cli, &state.cfg, &base_context)
+        .map_err(|error| agent_client_protocol::Error::new(-32602, error))?;
+    let context = persona::activate(&base_context, initial_prompt.as_deref())
+        .map_err(|error| agent_client_protocol::Error::new(-32602, error))?;
     let (provider, model) = acp_provider_and_model(&state.cli, &state.cfg);
     let initial_spend = crate::spend::run::Run::for_new_session(
         &session_id.to_string(),
@@ -1764,6 +1895,7 @@ async fn install_session(
                 reuse: Default::default(),
             })),
             workspace,
+            base_context: Arc::new(base_context),
             context: Arc::new(context),
             turns: turns.clone(),
             read_tracker,
@@ -1824,6 +1956,81 @@ async fn claim_writer(lease: Arc<SessionLease>) -> Result<(), agent_client_proto
                 "could not claim exclusive session persistence",
             )
         })
+}
+
+/// Switch a session to the prompt `selection` (`None`: no prompt). The new
+/// prompt's route is validated first: a switch to a provider that cannot be
+/// initialized is refused and the session keeps its current persona. Returns
+/// the config options to report; the switch applies from the next prompt.
+async fn switch_session_persona(
+    state: &AcpState,
+    session_id: &SessionId,
+    selection: Option<&str>,
+) -> Result<Vec<SessionConfigOption>, agent_client_protocol::Error> {
+    let unknown_session = || agent_client_protocol::Error::new(-32602, "unknown ACP session");
+    let base = state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|session| session.base_context.clone())
+        .ok_or_else(unknown_session)?;
+    let context = persona::activate(&base, selection)
+        .map_err(|error| agent_client_protocol::Error::new(-32602, error))?;
+    let route = persona::resolve_route(&state.cli, &state.cfg, &context)
+        .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
+    persona::check_route(&state.cli, &state.cfg, &route)
+        .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
+    let options = persona::session_config_options(&state.cli, &state.cfg, &base, &context);
+    tracing::info!(
+        "ACP session {} persona: {} ({}/{})",
+        session_id,
+        persona::current_mode_id(&context),
+        route.provider,
+        route.model
+    );
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(session_id).ok_or_else(unknown_session)?;
+    session.context = Arc::new(context);
+    Ok(options)
+}
+
+async fn handle_set_session_config_option(
+    req: SetSessionConfigOptionRequest,
+    responder: Responder<SetSessionConfigOptionResponse>,
+    _cx: ConnectionTo<Client>,
+    state: &AcpState,
+) -> Result<(), agent_client_protocol::Error> {
+    let _activity = state.idle.admit()?;
+    if req.config_id.0.as_ref() != persona::PERSONA_CONFIG_ID {
+        return responder.respond_with_error(agent_client_protocol::Error::new(
+            -32602,
+            persona::bounded_message(&format!(
+                "unknown ACP session config option '{}'",
+                req.config_id
+            )),
+        ));
+    }
+    let Some(value) = req.value.as_value_id() else {
+        return responder.respond_with_error(agent_client_protocol::Error::new(
+            -32602,
+            "ACP session config option 'mode' takes a mode id",
+        ));
+    };
+    let mode_id = value.0.clone();
+    let options = match switch_session_persona(
+        state,
+        &req.session_id,
+        persona::selection_for(&mode_id),
+    )
+    .await
+    {
+        Ok(options) => options,
+        Err(error) => return responder.respond_with_error(error),
+    };
+    // The ACP session modes are permission modes, so a persona switch reports
+    // only its config option; it never claims a session mode change.
+    responder.respond(SetSessionConfigOptionResponse::new(options))
 }
 
 #[cfg(feature = "mcp")]
@@ -2748,9 +2955,10 @@ mod typed_prompt_tests {
 
 fn render_prompt_blocks(blocks: &[ContentBlock]) -> Result<String, agent_client_protocol::Error> {
     let mut rendered = Vec::with_capacity(blocks.len());
+    let mut rendered_bytes = 0_usize;
     for block in blocks {
-        match block {
-            ContentBlock::Text(text) => rendered.push(text.text.clone()),
+        let piece = match block {
+            ContentBlock::Text(text) => text.text.clone(),
             ContentBlock::ResourceLink(resource) => {
                 let mut link = format!("[resource: {}]({})", resource.name, resource.uri);
                 if let Some(description) = resource.description.as_deref()
@@ -2759,11 +2967,11 @@ fn render_prompt_blocks(blocks: &[ContentBlock]) -> Result<String, agent_client_
                     link.push('\n');
                     link.push_str(description);
                 }
-                rendered.push(link);
+                link
             }
             ContentBlock::Resource(resource) => match &resource.resource {
                 EmbeddedResourceResource::TextResourceContents(text) => {
-                    rendered.push(format!("[embedded resource: {}]\n{}", text.uri, text.text))
+                    format!("[embedded resource: {}]\n{}", text.uri, text.text)
                 }
                 EmbeddedResourceResource::BlobResourceContents(_) => {
                     return Err(agent_client_protocol::Error::new(
@@ -2790,7 +2998,20 @@ fn render_prompt_blocks(blocks: &[ContentBlock]) -> Result<String, agent_client_
                     "unsupported ACP prompt content block",
                 ));
             }
+        };
+        rendered_bytes = rendered_bytes
+            .checked_add(piece.len())
+            .and_then(|bytes| bytes.checked_add(usize::from(!rendered.is_empty())))
+            .ok_or_else(|| {
+                agent_client_protocol::Error::new(-32602, "ACP prompt exceeds its byte limit")
+            })?;
+        if rendered_bytes > MAX_ACP_PROMPT_BYTES {
+            return Err(agent_client_protocol::Error::new(
+                -32602,
+                "ACP prompt exceeds its byte limit",
+            ));
         }
+        rendered.push(piece);
     }
     let rendered = rendered.join("\n");
     if rendered.trim().is_empty() {
@@ -4002,13 +4223,25 @@ async fn execute_prompt(
     {
         return Ok(PromptOutcome::failed(crate::spend::run::BUDGET_STOP.into()));
     }
+    // The session prompt's `[prompt_to_model]` route, or the startup
+    // selection when it is unmapped. A route that cannot be initialized
+    // refuses the turn: no other provider is substituted for it.
+    let route = match persona::resolve_route(&state.cli, &state.cfg, &context) {
+        Ok(route) => route,
+        Err(error) => return Ok(PromptOutcome::failed(error)),
+    };
+    if let Err(error) = persona::check_route(&state.cli, &state.cfg, &route) {
+        return Ok(PromptOutcome::failed(error));
+    }
+    #[cfg(test)]
+    lock_unpoisoned(&state.turn_routes).push(route.clone());
     // The relay reads the same session-local store the actual tool mutates.
     // Tool output and arguments are display data, never a second TODO source.
     let plan_store = todo_store.clone();
     // The provider this turn's usage is reported by, so a goal's token total
     // is normalised the same way as the TUI's and headless rounds'.
     #[cfg(feature = "goal")]
-    let usage_provider = acp_provider_and_model(&state.cli, &state.cfg).0;
+    let usage_provider = route.provider.clone();
     #[cfg(test)]
     if let Some(fixture) = &state.runner_fixture {
         let prior_history = history
@@ -4077,6 +4310,7 @@ async fn execute_prompt(
             }
         }
         .0;
+    let tools_enabled = authority.tools_enabled;
     if let Some(mode) = history.policy.mode() {
         authority.mode = mode;
     }
@@ -4088,6 +4322,11 @@ async fn execute_prompt(
     )
     .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
     history.policy.apply(&permission);
+    // The session prompt's `%%mode=` directive may only narrow this turn's
+    // operator-configured mode.
+    if let Err(error) = persona::apply_permission_mode(&permission, tools_enabled, &context) {
+        return Ok(PromptOutcome::failed(error));
+    }
     if let Some(rx) = ask_rx {
         tokio::spawn(state.idle.admit()?.track(drive_permission_bridge(
             cx.clone(),
@@ -4103,24 +4342,24 @@ async fn execute_prompt(
             blocked_ms,
         )));
     }
-    let (provider_str, model_str) = acp_provider_and_model(&state.cli, &state.cfg);
+    let client =
+        match persona::route_client(&state.cli, &state.cfg, &route, &state.provider_clients) {
+            Ok(client) => client,
+            Err(error) => return Ok(PromptOutcome::failed(error)),
+        };
+    let persona::TurnRoute {
+        provider: provider_str,
+        model: model_str,
+        ..
+    } = route;
 
     tracing::debug!(
-        "ACP run_prompt: provider={}, model={}, prompt_len={}",
+        "ACP run_prompt: provider={}, model={}, prompt={:?}, prompt_len={}",
         provider_str,
         model_str,
+        context.current_prompt_name,
         prompt_text.len(),
     );
-
-    let client = match state
-        .provider_clients
-        .get(&state.cli, &state.cfg, &provider_str)
-    {
-        Ok(client) => client,
-        Err(error) => {
-            return Ok(PromptOutcome::failed(error.to_string()));
-        }
-    };
 
     let native = matches!(&client, crate::provider::AnyClient::Anthropic(_))
         || crate::session::native_publication::is_native_bearing(&history.session);
@@ -5985,6 +6224,41 @@ mod protocol_tests {
         );
         assert!(render_prompt_blocks(&[]).is_err());
         assert!(render_prompt_blocks(&[ContentBlock::Text(TextContent::new("  "))]).is_err());
+        assert!(
+            render_prompt_blocks(&[ContentBlock::Text(TextContent::new(
+                "x".repeat(MAX_ACP_PROMPT_BYTES + 1)
+            ))])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn acp_frame_reader_bounds_each_newline_delimited_message() {
+        use futures::AsyncReadExt;
+
+        let mut oversized = BoundedLineReader::new(
+            futures::io::Cursor::new(vec![b'x'; MAX_ACP_FRAME_BYTES + 1]),
+            MAX_ACP_FRAME_BYTES,
+        );
+        let mut output = Vec::new();
+        let error = futures::executor::block_on(oversized.read_to_end(&mut output)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let input = format!("{}\n{}\n", "a".repeat(32), "b".repeat(32));
+        let mut bounded = BoundedLineReader::new(futures::io::Cursor::new(input.clone()), 32);
+        let mut output = String::new();
+        futures::executor::block_on(bounded.read_to_string(&mut output)).unwrap();
+        assert_eq!(output, input);
+    }
+
+    /// Fixture turns still check their route's provider credential before the
+    /// fixture runs (persona routing refuses an unusable route first), so the
+    /// startup provider needs a key.
+    fn fixture_cli() -> Cli {
+        Cli {
+            api_key: Some("acp-fixture-key".to_string()),
+            ..Cli::default()
+        }
     }
 
     #[tokio::test]
@@ -6180,7 +6454,7 @@ mod protocol_tests {
             idle: idle::Idle::new(None).unwrap(),
             cli: Cli {
                 no_session: true,
-                ..Cli::default()
+                ..fixture_cli()
             },
             cfg: Config::default(),
             context: crate::context::load(true),
@@ -6196,6 +6470,7 @@ mod protocol_tests {
             #[cfg(feature = "mcp")]
             mcp_fixture: StdMutex::new(None),
             prompt_exit_barrier: None,
+            turn_routes: StdMutex::new(Vec::new()),
         })
     }
 
@@ -6204,7 +6479,7 @@ mod protocol_tests {
             idle: idle::Idle::new(None).unwrap(),
             cli: Cli {
                 no_session: true,
-                ..Cli::default()
+                ..fixture_cli()
             },
             cfg: Config::default(),
             context: crate::context::load(true),
@@ -6220,6 +6495,7 @@ mod protocol_tests {
             #[cfg(feature = "mcp")]
             mcp_fixture: StdMutex::new(None),
             prompt_exit_barrier: None,
+            turn_routes: StdMutex::new(Vec::new()),
         })
     }
 
@@ -6231,7 +6507,7 @@ mod protocol_tests {
             idle: idle::Idle::new(None).unwrap(),
             cli: Cli {
                 no_session: true,
-                ..Cli::default()
+                ..fixture_cli()
             },
             cfg: Config::default(),
             context: crate::context::load(true),
@@ -6247,6 +6523,7 @@ mod protocol_tests {
             #[cfg(feature = "mcp")]
             mcp_fixture: StdMutex::new(None),
             prompt_exit_barrier: Some(prompt_exit_barrier),
+            turn_routes: StdMutex::new(Vec::new()),
         })
     }
 
@@ -6287,6 +6564,7 @@ mod protocol_tests {
             #[cfg(feature = "mcp")]
             mcp_fixture: StdMutex::new(None),
             prompt_exit_barrier: None,
+            turn_routes: StdMutex::new(Vec::new()),
         };
 
         let sandbox = acp_session_sandbox(&state, workspace.clone()).unwrap();
@@ -6661,12 +6939,12 @@ mod protocol_tests {
         use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode};
         let root = crate::tests::OwnedTestDirectory::new("background56-acp-permission");
         let bindings = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -9404,7 +9682,11 @@ mod protocol_tests {
                     })
                 })
             };
-            let state = fixture_state(fixture);
+            let mut state = fixture_state(fixture);
+            Arc::get_mut(&mut state)
+                .expect("the private lifecycle fixture must not be shared before setup")
+                .cli
+                .no_sandbox = true;
             *lock_unpoisoned(&state.mcp_fixture) =
                 Some(McpClientManager::from_handles(vec![handle]));
             let workspace = ProtocolTempDir::new();
@@ -10696,6 +10978,538 @@ mod protocol_tests {
             .await
             .unwrap();
     }
+    // --- Persona routing (mini-agent-5u1cu) ---
+
+    /// A signed startup provider `acme` keyed through `config.api_keys`, a
+    /// second provider `remote` whose key is never present, and the routes
+    /// the persona tests select between. Embedded prompts are always loaded:
+    /// `review` carries `%%mode=readonly`, `code` `%%mode=last_user_mode`.
+    const PERSONA_CONFIG: &str = r#"
+provider = "acme"
+model = "acme-signed"
+default_prompt = "review"
+
+[api_keys]
+acme = "sk-acme-secret-value"
+
+[custom_providers.acme]
+provider_type = "openai"
+base_url = "http://127.0.0.1:9/v1"
+
+[custom_providers.remote]
+provider_type = "openai"
+base_url = "http://127.0.0.1:9/v1"
+api_key_env = "MINI_AGENT_ACP_PERSONA_TEST_KEY_THAT_IS_NEVER_SET"
+
+[quick_models.review-fast]
+provider = "acme"
+model = "acme-review"
+
+[quick_models.plan-remote]
+provider = "remote"
+model = "remote-planner"
+
+[quick_models.ask-unsigned]
+provider = "genais"
+model = "unsigned-model"
+
+[prompt_to_model]
+review = "review-fast"
+plan = "plan-remote"
+ask = "ask-unsigned"
+brainstorm = "no-such-quick-model"
+"#;
+
+    fn persona_state(cfg: &str, fixture: PromptFixture) -> Arc<AcpState> {
+        Arc::new(AcpState {
+            idle: idle::Idle::new(None).unwrap(),
+            cli: Cli {
+                no_session: true,
+                ..Cli::default()
+            },
+            cfg: toml::from_str(cfg).expect("persona test config parses"),
+            context: crate::context::load(true),
+            leases: Arc::default(),
+            sessions: Mutex::new(HashMap::new()),
+            cancel_routes: StdMutex::new(HashMap::new()),
+            shell_search_path: std::env::var_os("PATH"),
+            hook_roots: None,
+            client_mcp: ClientMcpPolicy::Sandboxed,
+            prompt_fixture: Some(fixture),
+            runner_fixture: None,
+            #[cfg(feature = "mcp")]
+            mcp_fixture: StdMutex::new(None),
+            prompt_exit_barrier: None,
+            turn_routes: StdMutex::new(Vec::new()),
+            provider_clients: Default::default(),
+        })
+    }
+
+    fn counting_fixture(turns: Arc<AtomicUsize>) -> PromptFixture {
+        Arc::new(move |p, _| {
+            turns.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move { Ok(vec![done(&p, vec![Message::assistant(p.clone())])]) })
+        })
+    }
+
+    fn route(provider: &str, model: &str, mapped: Option<(&str, &str)>) -> persona::TurnRoute {
+        persona::TurnRoute {
+            provider: provider.into(),
+            model: model.into(),
+            mapped: mapped.map(|(prompt, alias)| (prompt.to_string(), alias.to_string())),
+        }
+    }
+
+    fn persona_config_value(options: &[SessionConfigOption]) -> String {
+        let [option] = options else {
+            panic!("exactly one persona option expected: {options:?}");
+        };
+        assert_eq!(option.id.0.as_ref(), persona::PERSONA_CONFIG_ID);
+        match &option.kind {
+            SessionConfigKind::Select(select) => select.current_value.0.to_string(),
+            other => panic!("the persona option must be a select: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_session_applies_default_prompt_and_its_prompt_to_model_route() {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let state = persona_state(PERSONA_CONFIG, counting_fixture(turns.clone()));
+        let probe = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state.clone()), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let created = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                // ACP session modes are the permission modes; personas are
+                // the `mode` session config option, advertised as below.
+                if let Some(permission_modes) = &created.modes {
+                    assert!(
+                        permission_modes
+                            .available_modes
+                            .iter()
+                            .any(|mode| mode.id.0.as_ref() == "readonly"),
+                        "session modes remain the permission modes"
+                    );
+                }
+                let modes = {
+                    let sessions = state.sessions.lock().await;
+                    let session = &sessions[&created.session_id];
+                    persona::session_modes(
+                        &state.cli,
+                        &state.cfg,
+                        &session.base_context,
+                        &session.context,
+                    )
+                };
+                assert_eq!(modes.current_mode_id.0.as_ref(), "review");
+                for id in [persona::NO_PROMPT_MODE_ID, "review", "code", "plan"] {
+                    assert!(
+                        modes
+                            .available_modes
+                            .iter()
+                            .any(|mode| mode.id.0.as_ref() == id),
+                        "mode {id} must be advertised"
+                    );
+                }
+                let review = modes
+                    .available_modes
+                    .iter()
+                    .find(|mode| mode.id.0.as_ref() == "review")
+                    .unwrap();
+                assert_eq!(
+                    review.description.as_deref(),
+                    Some("model: acme/acme-review; permission mode: readonly")
+                );
+                assert_eq!(
+                    persona_config_value(created.config_options.as_deref().unwrap_or(&[])),
+                    "review"
+                );
+                {
+                    let sessions = state.sessions.lock().await;
+                    let context = &sessions[&created.session_id].context;
+                    assert_eq!(context.current_prompt_name.as_deref(), Some("review"));
+                    let prompt = context.current_prompt.as_deref().unwrap();
+                    assert!(
+                        !prompt.contains("%%mode="),
+                        "directives must be stripped: {prompt}"
+                    );
+                }
+
+                let response = cx
+                    .send_request(prompt(created.session_id, "hello"))
+                    .block_task()
+                    .await?;
+                assert_eq!(response.stop_reason, StopReason::EndTurn);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(turns.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *lock_unpoisoned(&probe.turn_routes),
+            vec![route(
+                "acme",
+                "acme-review",
+                Some(("review", "review-fast"))
+            )],
+            "the default prompt's [prompt_to_model] route selects the turn's model"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_option_switches_persona_and_routed_model() {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let state = persona_state(PERSONA_CONFIG, counting_fixture(turns.clone()));
+        let probe = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+
+        Client
+            .builder()
+            .on_receive_notification(
+                {
+                    let updates = updates.clone();
+                    async move |notification: SessionNotification, _cx| {
+                        lock_unpoisoned(&updates).push(notification.update);
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state.clone()), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                // `code` has no route: the turn runs on the startup selection.
+                cx.send_request(SetSessionConfigOptionRequest::new(
+                    session.clone(),
+                    persona::PERSONA_CONFIG_ID,
+                    "code",
+                ))
+                .block_task()
+                .await?;
+                cx.send_request(prompt(session.clone(), "as code"))
+                    .block_task()
+                    .await?;
+
+                // The config option selects the same prompts.
+                let options = cx
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session.clone(),
+                        persona::PERSONA_CONFIG_ID,
+                        "review",
+                    ))
+                    .block_task()
+                    .await?
+                    .config_options;
+                assert_eq!(persona_config_value(&options), "review");
+                cx.send_request(prompt(session.clone(), "as reviewer"))
+                    .block_task()
+                    .await?;
+
+                // No prompt restores pre-persona ACP behaviour.
+                cx.send_request(SetSessionConfigOptionRequest::new(
+                    session.clone(),
+                    persona::PERSONA_CONFIG_ID,
+                    persona::NO_PROMPT_MODE_ID,
+                ))
+                .block_task()
+                .await?;
+                assert!(
+                    state.sessions.lock().await[&session]
+                        .context
+                        .current_prompt_name
+                        .is_none()
+                );
+                cx.send_request(prompt(session.clone(), "no prompt"))
+                    .block_task()
+                    .await?;
+
+                assert!(
+                    cx.send_request(SetSessionConfigOptionRequest::new(
+                        session.clone(),
+                        persona::PERSONA_CONFIG_ID,
+                        "no-such",
+                    ))
+                    .block_task()
+                    .await
+                    .is_err(),
+                    "an unknown mode is refused"
+                );
+                assert!(
+                    cx.send_request(SetSessionConfigOptionRequest::new(
+                        session, "model", "review"
+                    ))
+                    .block_task()
+                    .await
+                    .is_err(),
+                    "an unknown config option is refused"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(turns.load(Ordering::Acquire), 3);
+        assert_eq!(
+            *lock_unpoisoned(&probe.turn_routes),
+            vec![
+                route("acme", "acme-signed", None),
+                route("acme", "acme-review", Some(("review", "review-fast"))),
+                route("acme", "acme-signed", None),
+            ]
+        );
+        let updates = lock_unpoisoned(&updates);
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, SessionUpdate::CurrentModeUpdate(_))),
+            "a persona switch never claims a permission-mode change: {updates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_routed_provider_is_refused_never_substituted() {
+        let turns = Arc::new(AtomicUsize::new(0));
+        // The default prompt `plan` routes to `remote`, whose key is absent.
+        let cfg =
+            PERSONA_CONFIG.replace("default_prompt = \"review\"", "default_prompt = \"plan\"");
+        let state = persona_state(&cfg, counting_fixture(turns.clone()));
+        let probe = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state.clone()), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                let refused = cx
+                    .send_request(prompt(session.clone(), "plan it"))
+                    .block_task()
+                    .await
+                    .expect_err("a turn whose routed provider has no key is refused");
+                let message = refused.message.clone();
+                assert!(
+                    message.contains("'plan'")
+                        && message.contains("'remote'")
+                        && message.contains("refusing to substitute"),
+                    "the refusal names the route: {message}"
+                );
+                assert!(
+                    message.contains("MINI_AGENT_ACP_PERSONA_TEST_KEY_THAT_IS_NEVER_SET")
+                        && !message.contains("sk-acme-secret-value"),
+                    "the refusal names the variable, never a credential: {message}"
+                );
+                assert!(message.len() <= 512 + '…'.len_utf8());
+
+                // A provider the operator did not configure (a signed overlay
+                // that kept only `acme`) is refused at the switch, and the
+                // session keeps its persona.
+                let unsigned = cx
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session.clone(),
+                        persona::PERSONA_CONFIG_ID,
+                        "ask",
+                    ))
+                    .block_task()
+                    .await
+                    .expect_err("a switch to an unconfigured provider is refused");
+                assert!(
+                    unsigned.message.contains("'genais'"),
+                    "{}",
+                    unsigned.message
+                );
+                let dangling = cx
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session.clone(),
+                        persona::PERSONA_CONFIG_ID,
+                        "brainstorm",
+                    ))
+                    .block_task()
+                    .await
+                    .expect_err("a route naming no quick model is refused");
+                assert!(
+                    dangling.message.contains("no-such-quick-model"),
+                    "{}",
+                    dangling.message
+                );
+                assert_eq!(
+                    state.sessions.lock().await[&session]
+                        .context
+                        .current_prompt_name
+                        .as_deref(),
+                    Some("plan"),
+                    "a refused switch leaves the persona unchanged"
+                );
+
+                // An available persona still works in the same session.
+                cx.send_request(SetSessionConfigOptionRequest::new(
+                    session.clone(),
+                    persona::PERSONA_CONFIG_ID,
+                    "review",
+                ))
+                .block_task()
+                .await?;
+                let response = cx
+                    .send_request(prompt(session, "review it"))
+                    .block_task()
+                    .await?;
+                assert_eq!(response.stop_reason, StopReason::EndTurn);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            turns.load(Ordering::Acquire),
+            1,
+            "the refused turn never reached a model"
+        );
+        assert_eq!(
+            *lock_unpoisoned(&probe.turn_routes),
+            vec![route(
+                "acme",
+                "acme-review",
+                Some(("review", "review-fast"))
+            )],
+            "the refused turn ran on no provider at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_load_prompt_refuses_the_session() {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let mut state = persona_state(PERSONA_CONFIG, counting_fixture(turns));
+        Arc::get_mut(&mut state).unwrap().cli.load_prompt = Some("no-such-prompt".to_string());
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let error = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await
+                    .expect_err("an unknown --load-prompt is refused as at startup");
+                assert!(
+                    error.message.contains("no-such-prompt"),
+                    "{}",
+                    error.message
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    fn persona_context(prompts: &[(&str, &str)]) -> ContextFiles {
+        let mut context = crate::context::load(true);
+        context.prompts = prompts
+            .iter()
+            .map(|(name, content)| (name.to_string(), content.to_string()))
+            .collect();
+        context
+    }
+
+    fn persona_permission(default_mode: &str) -> crate::permission::checker::PermCheck {
+        let cli = Cli {
+            no_sandbox: true,
+            ..Cli::default()
+        };
+        let cfg = Config {
+            default_permission_mode: Some(default_mode.to_string()),
+            ..Config::default()
+        };
+        let (authority, _) =
+            crate::permission::resolve_configured_execution_authority(&cli, &cfg).unwrap();
+        crate::permission::build_interactive_permission_at(&cfg, authority, None)
+            .unwrap()
+            .0
+            .expect("tools and permission checks are enabled")
+    }
+
+    #[test]
+    fn a_persona_mode_directive_only_narrows_the_turn_permission() {
+        use crate::permission::SecurityMode;
+
+        let base = persona_context(&[
+            (
+                "reviewer",
+                "%%mode=readonly\n%%agent=rust-maintainer\n\nReview.",
+            ),
+            ("widen", "%%mode=yolo\n\nDo anything."),
+            ("keep", "%%mode=last_user_mode\n\nKeep."),
+        ]);
+        let mode =
+            |permission: &crate::permission::checker::PermCheck| permission.lock().unwrap().mode();
+
+        let reviewer = persona::activate(&base, Some("reviewer")).unwrap();
+        assert_eq!(
+            reviewer.current_agent_name.as_deref(),
+            Some("rust-maintainer"),
+            "the prompt's %%agent= selects the main-agent persona"
+        );
+        let standard = persona_permission("standard");
+        persona::apply_permission_mode(&Some(standard.clone()), true, &reviewer).unwrap();
+        assert_eq!(mode(&standard), SecurityMode::ReadOnly);
+
+        let widen = persona::activate(&base, Some("widen")).unwrap();
+        let readonly = persona_permission("readonly");
+        persona::apply_permission_mode(&Some(readonly.clone()), true, &widen).unwrap();
+        assert_eq!(
+            mode(&readonly),
+            SecurityMode::ReadOnly,
+            "a persona can never raise the operator-selected mode"
+        );
+
+        let keep = persona::activate(&base, Some("keep")).unwrap();
+        let planwrite = persona_permission("planwrite");
+        persona::apply_permission_mode(&Some(planwrite.clone()), true, &keep).unwrap();
+        assert_eq!(mode(&planwrite), SecurityMode::PlanWrite);
+
+        let error = persona::apply_permission_mode(&None, true, &reviewer)
+            .expect_err("a mode that cannot be enforced refuses the turn");
+        assert!(error.contains("readonly"), "{error}");
+        assert!(persona::apply_permission_mode(&None, false, &reviewer).is_ok());
+        assert!(persona::apply_permission_mode(&None, true, &keep).is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -10727,15 +11541,15 @@ mod workspace_tests {
             "SECOND_ARCHITECTURE_SENTINEL",
         )
         .unwrap();
-        std::fs::create_dir_all(first.join(".zerostack/prompts")).unwrap();
-        std::fs::create_dir_all(second.join(".zerostack/prompts")).unwrap();
+        std::fs::create_dir_all(first.join(".mini-agent/prompts")).unwrap();
+        std::fs::create_dir_all(second.join(".mini-agent/prompts")).unwrap();
         std::fs::write(
-            first.join(".zerostack/prompts/acp-root.md"),
+            first.join(".mini-agent/prompts/acp-root.md"),
             "FIRST_PROMPT_SENTINEL",
         )
         .unwrap();
         std::fs::write(
-            second.join(".zerostack/prompts/acp-root.md"),
+            second.join(".mini-agent/prompts/acp-root.md"),
             "SECOND_PROMPT_SENTINEL",
         )
         .unwrap();
@@ -11518,18 +12332,19 @@ mod tcp_authentication_tests {
 
     #[test]
     fn port_only_tcp_configuration_defaults_to_loopback() {
+        const KEY: &str = "0123456789abcdef0123456789abcdef";
         let cli = Cli {
             acp_port: Some(8123),
             ..Default::default()
         };
-        let cfg = tcp_config(DEFAULT_TCP_HOST, 8123, Some("configured-key"));
+        let cfg = tcp_config(DEFAULT_TCP_HOST, 8123, Some(KEY));
 
         let settings = resolve_tcp_settings_with_key(&cli, &cfg, None, false, false)
             .unwrap()
             .unwrap();
         assert_eq!(settings.host, DEFAULT_TCP_HOST);
         assert_eq!(settings.port, 8123);
-        assert_eq!(settings.api_key, "configured-key");
+        assert_eq!(settings.api_key, KEY);
     }
 
     #[test]
@@ -11540,8 +12355,7 @@ mod tcp_authentication_tests {
         };
 
         let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None, false, false)
-            .err()
-            .expect("TCP without authentication must fail");
+            .expect_err("TCP without authentication must fail");
         assert!(error.to_string().contains("requires authentication"));
     }
 
@@ -11551,13 +12365,12 @@ mod tcp_authentication_tests {
             acp_host: Some("0.0.0.0".to_owned()),
             ..Default::default()
         };
-        let key = Some("secret".to_owned());
+        let key = Some("0123456789abcdef0123456789abcdef".to_owned());
         let error =
             resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false, false)
-                .err()
-                .expect("a remote bind must be refused by default");
+                .expect_err("a remote bind must be refused by default");
         assert!(error.to_string().contains(ACP_ALLOW_REMOTE_ENV), "{error}");
-        assert!(!error.to_string().contains("secret"));
+        assert!(!error.to_string().contains(key.as_deref().unwrap()));
 
         let settings =
             resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), true, false)
@@ -11812,6 +12625,25 @@ mod goal_acp_tests {
             )
             .unwrap();
         store
+    }
+
+    #[test]
+    fn prompt_goal_metadata_is_applied_only_after_turn_registration() {
+        let source = include_str!("mod.rs");
+        let prompt = source
+            .split("async fn handle_prompt(")
+            .nth(1)
+            .and_then(|source| source.split("async fn respond_terminal(").next())
+            .expect("ACP prompt handler source");
+        // The goal may change only for an admitted prompt: admission comes
+        // first, and a refused goal drops that admission, settling the turn.
+        let admission = prompt
+            .find("admit_turn(&state, sess)?")
+            .expect("turn admission");
+        let goal = prompt
+            .find("apply_meta_goal(&state, &snapshot.goal_store, meta)")
+            .expect("goal metadata application");
+        assert!(admission < goal);
     }
 
     /// The objective arrives as structured metadata, never as prompt text: a

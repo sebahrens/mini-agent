@@ -36,9 +36,9 @@ fn setup_test_env() -> TestEnv {
     std::fs::create_dir_all(&dir).unwrap();
     let data_dir = dir.to_str().unwrap().to_string();
     let environment = crate::tests::ScopedProcessEnv::set(&[
-        ("ZS_DATA_DIR", Some(data_dir.clone().into())),
-        ("ZS_CONFIG_DIR", Some(data_dir.clone().into())),
-        ("ZS_STATE_DIR", Some(data_dir.clone().into())),
+        ("MINI_AGENT_DATA_DIR", Some(data_dir.clone().into())),
+        ("MINI_AGENT_CONFIG_DIR", Some(data_dir.clone().into())),
+        ("MINI_AGENT_STATE_DIR", Some(data_dir.clone().into())),
     ]);
     // Elevated Windows tokens can give generic CreateDirectory an
     // Administrators owner. Create this missing private fixture through the
@@ -299,6 +299,21 @@ fn load_session_exact_rejects_an_embedded_id_mismatch() {
     let error = load_session_exact(&expected.id).unwrap_err();
     assert!(error.to_string().contains("persisted session ID mismatch"));
     drop(env);
+}
+
+#[test]
+fn load_session_exact_rejects_oversized_session_files_before_decoding() {
+    let env = setup_test_env();
+    let id = uuid::Uuid::new_v4().to_string();
+    let path = env.dir.join("sessions").join(format!("{id}.json"));
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(crate::session::storage::MAX_SESSION_BYTES as u64 + 1)
+        .unwrap();
+    drop(file);
+
+    let error = load_session_exact(&id).unwrap_err().to_string();
+    assert!(error.contains("exceeds the"), "{error}");
+    assert!(error.contains("byte limit"), "{error}");
 }
 
 #[test]
@@ -847,7 +862,7 @@ fn long_tool_result_save_failure_keeps_full_output() {
     let _ = std::fs::remove_file(&path);
     std::fs::write(&path, b"not a directory").unwrap();
     let environment = crate::tests::ScopedProcessEnv::set(&[(
-        "ZS_STATE_DIR",
+        "MINI_AGENT_STATE_DIR",
         Some(path.as_os_str().to_os_string()),
     )]);
 
@@ -992,11 +1007,11 @@ fn suffix_path_is_inside_config_dir() {
 #[cfg(unix)]
 #[test]
 fn session_storage_permissions_ignore_permissive_umask() {
-    const CHILD_STATE_DIR: &str = "ZS_SESSION_PERMISSION_UMASK_CHILD";
+    const CHILD_STATE_DIR: &str = "MINI_AGENT_SESSION_PERMISSION_UMASK_CHILD";
     const SESSION_ID: &str = "session-storage-permission-umask";
 
     if let Some(state_dir) = std::env::var_os(CHILD_STATE_DIR) {
-        unsafe { std::env::set_var("ZS_STATE_DIR", &state_dir) };
+        unsafe { std::env::set_var("MINI_AGENT_STATE_DIR", &state_dir) };
         let mut session = Session::new("openai", "gpt-4", 128000, "");
         session.id = SESSION_ID.into();
         save_session(&session).unwrap();

@@ -13,7 +13,7 @@ pub fn global_dir() -> PathBuf {
 
 /// Where a loaded prompt came from. Only the source decides whether prompt
 /// header directives are honored: embedded and user prompts are the user's own
-/// configuration, while `.zerostack/prompts` is repository content that an
+/// configuration, while `.mini-agent/prompts` is repository content that an
 /// untrusted clone controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptSource {
@@ -372,14 +372,14 @@ fn neutralize_untrusted_directive(name: &str, content: String) -> String {
         tracing::warn!(
             prompt = name,
             mode,
-            "ignoring %%mode= directive from untrusted project prompt; trust the project config (.zerostack/config.toml) to enable it"
+            "ignoring %%mode= directive from untrusted project prompt; trust the project config (.mini-agent/config.toml) to enable it"
         );
     }
     if let Some(agent) = drop_agent {
         tracing::warn!(
             prompt = name,
             agent,
-            "ignoring %%agent= directive from untrusted project prompt; trust the project config (.zerostack/config.toml) to enable it"
+            "ignoring %%agent= directive from untrusted project prompt; trust the project config (.mini-agent/config.toml) to enable it"
         );
     }
     if drop_next.is_some() {
@@ -418,7 +418,7 @@ pub(crate) fn load_for_workspace_binding(
     let paths =
         crate::paths::process_paths_ref().expect("startup must initialize application paths");
     let user = crate::context::load_dir_files(&paths.prompts_dir(), "md");
-    let project_dir = std::path::Path::new(".zerostack/prompts");
+    let project_dir = std::path::Path::new(".mini-agent/prompts");
     let project = workspace.validate().map_err(std::io::Error::other)
         .and_then(|_| workspace.read_relative_definition_layer(project_dir, "md", 256 * 1024, 1024, 128))
         .and_then(|files| { workspace.validate().map_err(std::io::Error::other)?; Ok(files) })
@@ -455,7 +455,7 @@ fn load_with_paths(paths: &crate::paths::AppPaths) -> HashMap<String, String> {
         .and_then(|workspace| {
             workspace
                 .read_relative_definition_layer(
-                    std::path::Path::new(".zerostack/prompts"),
+                    std::path::Path::new(".mini-agent/prompts"),
                     "md",
                     256 * 1024,
                     1024,
@@ -518,7 +518,7 @@ mod tests {
                 state_dir: dir.join("state"),
                 cache_dir: dir.join("cache"),
                 credentials_dir: dir.join("credentials"),
-                project_dir: Some(dir.join(crate::product::LEGACY_PROJECT_DIRECTORY)),
+                project_dir: Some(dir.join(crate::product::PROJECT_DIRECTORY)),
             };
             TestDir { dir, paths }
         }
@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zerostack_prompts_are_loaded() {
+    fn test_mini_agent_prompts_are_loaded() {
         let td = TestDir::new();
         let dir = td.project_dir();
         write_prompt(&dir, "myproject", "# My Project Prompt");
@@ -613,37 +613,37 @@ mod tests {
     }
 
     #[test]
-    fn test_zerostack_overrides_prompts_dir() {
+    fn test_mini_agent_overrides_prompts_dir() {
         let td = TestDir::new();
         let prompts_dir = td.global_dir();
         let zs_dir = td.project_dir();
         write_prompt(&prompts_dir, "code", "from prompts/");
-        write_prompt(&zs_dir, "code", "from .zerostack/prompts/");
+        write_prompt(&zs_dir, "code", "from .mini-agent/prompts/");
 
         let prompts = td.load();
-        assert_eq!(prompts["code"], "from .zerostack/prompts/");
+        assert_eq!(prompts["code"], "from .mini-agent/prompts/");
     }
 
     #[test]
-    fn test_zerostack_overrides_global() {
+    fn test_mini_agent_overrides_global() {
         let td = TestDir::new();
         let global = td.global_dir();
         let zs_dir = td.project_dir();
         write_prompt(&global, "code", "from global/");
-        write_prompt(&zs_dir, "code", "from .zerostack/");
+        write_prompt(&zs_dir, "code", "from .mini-agent/");
 
         let prompts = td.load();
-        assert_eq!(prompts["code"], "from .zerostack/");
+        assert_eq!(prompts["code"], "from .mini-agent/");
     }
 
     #[test]
-    fn test_zerostack_overrides_embedded() {
+    fn test_mini_agent_overrides_embedded() {
         let td = TestDir::new();
         let zs_dir = td.project_dir();
-        write_prompt(&zs_dir, "code", "from .zerostack/");
+        write_prompt(&zs_dir, "code", "from .mini-agent/");
 
         let prompts = td.load();
-        assert_eq!(prompts["code"], "from .zerostack/");
+        assert_eq!(prompts["code"], "from .mini-agent/");
     }
 
     #[test]
@@ -665,12 +665,12 @@ mod tests {
         let zs_dir = td.project_dir();
 
         write_prompt(&global, "code", "from global/");
-        write_prompt(&zs_dir, "custom", "from .zerostack/");
-        write_prompt(&zs_dir, "code", "from .zerostack/code");
+        write_prompt(&zs_dir, "custom", "from .mini-agent/");
+        write_prompt(&zs_dir, "code", "from .mini-agent/code");
 
         let prompts = td.load();
-        assert_eq!(prompts["code"], "from .zerostack/code");
-        assert_eq!(prompts["custom"], "from .zerostack/");
+        assert_eq!(prompts["code"], "from .mini-agent/code");
+        assert_eq!(prompts["custom"], "from .mini-agent/");
         assert!(prompts.contains_key("ask"));
     }
 

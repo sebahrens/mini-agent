@@ -83,7 +83,8 @@ fn notice(version: Option<&str>, current: &str) -> Option<String> {
     }
     let version = normalized_version(version)?;
     Some(format!(
-        "[update] v{version} available. Install with:\n  curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash -s -- --release {version}"
+        "[update] v{version} available. Install with:\n  curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh | bash -s -- --release {version}",
+        crate::product::REPOSITORY_SLUG
     ))
 }
 

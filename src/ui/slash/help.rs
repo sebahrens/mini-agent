@@ -211,9 +211,19 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  /mode <mode>           set mode (standard|restrictive|readonly|planwrite|guarded|yolo)",
     );
+    emit(false, "  /permissions          choose approval mode");
+    emit(false, "  /permissions <mode>   set mode (yolo|auto|manual)");
     emit(
         false,
         "  /sandbox [profile]     inspect or select workspace|host-read|host-full",
+    );
+    emit(
+        false,
+        "  /expand [n|all]        unfold the latest (or nth latest, or every) tool result",
+    );
+    emit(
+        false,
+        "  /collapse [n|all]      fold tool results back to their one-line summary",
     );
     emit(false, "  /toggle                show toggleable features");
     emit(false, "  /toggle todo [on|off]  toggle todo-list tools");
@@ -501,6 +511,10 @@ fn keys_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  Ctrl+R                 cycle reasoning: collapsed/full/off",
     );
+    emit(
+        false,
+        "  Ctrl+T                 fold/unfold the latest tool result (or click its summary)",
+    );
     emit(false, "  Ctrl+G                 edit input in $EDITOR");
     emit(false, "  Ctrl+O                 launch lazygit");
     emit(
@@ -520,7 +534,11 @@ fn keys_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(false, "  Ctrl+Y / Alt+Y         yank/rotate kill ring");
     emit(
         false,
-        "  Ctrl+C / Ctrl+D        interrupt; idle: clear draft/delete, quit when empty",
+        "  Ctrl+C                 interrupt/clear; press again consecutively to exit",
+    );
+    emit(
+        false,
+        "  Ctrl+D                 interrupt; idle: delete, or exit when empty",
     );
     emit(false, "  mouse scroll           scroll chat");
 }
@@ -598,6 +616,25 @@ mod tests {
                 && line.contains("history")),
             "{lines:?}"
         );
+    }
+
+    /// mini-agent-ay2rm: tool-output folding stays discoverable from /help.
+    #[test]
+    fn help_names_the_tool_output_fold_key_and_commands() {
+        let mut lines = Vec::new();
+        help_lines(&mut |_, line| lines.push(line.to_string()));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Ctrl+T") && line.contains("tool result")),
+            "{lines:?}"
+        );
+        for command in ["/expand", "/collapse"] {
+            assert!(
+                lines.iter().any(|line| line.contains(command)),
+                "{command} missing: {lines:?}"
+            );
+        }
     }
 
     /// mini-agent-lqq0c: aliases are hidden from completion, but each one

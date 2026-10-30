@@ -57,8 +57,8 @@ mini-agent loads `ARCHITECTURE.md` files using the same recursive upward search
 as `AGENTS.md`:
 
 1. **Global**: `<config-root>/agent/ARCHITECTURE.md`, e.g.
-   `~/.mini-agent/agent/ARCHITECTURE.md` (legacy Linux install:
-   `~/.config/zerostack/agent/ARCHITECTURE.md`)
+   `~/.mini-agent/agent/ARCHITECTURE.md` (existing Linux install:
+   `~/.config/mini-agent/agent/ARCHITECTURE.md`)
 2. **Project**: `ARCHITECTURE.md` in the current working directory and all
    parent directories up to the filesystem root
 
@@ -72,16 +72,17 @@ with `-p`, `--loop`, `--acp`) never ask, so they cannot stop on the question or
 consume piped input:
 
 ```
-No ARCHITECTURE.md found in /home/you/project. Create one? [y/N]
+No ARCHITECTURE.md found in /home/you/project. Create an empty template? [y/N]
 ```
 
 If you answer yes, a template is written to the project root. The template
 includes sections for directory layout, key types/traits, control flow, data
 flow, design decisions, dependencies, and entry points.
 
-When you accept and the template is created, mini-agent automatically injects
-a system message instructing the agent to explore the codebase and populate
-the file with a thorough architectural overview.
+Accepting this prompt only creates and loads the empty template. It does not
+start an agent turn, contact the model provider, or launch subagents. The
+interactive composer remains idle until you enter an instruction. An explicit
+positional CLI prompt still starts normally.
 
 ### Template Contents
 
@@ -205,6 +206,7 @@ reproducing code; focus on structure, relationships, and rationale.
 ## Entry Points
 - `main.rs` — binary entry, CLI parsing, session init
 - `src/startup.rs` — resolved workspace, session, permission and provider setup
+- `src/session/environment.rs` — `EnvironmentRecord`, the execution environment a session last ran in (effective sandbox `off` or `<backend>/<profile>`, permission mode, workspace root, tool-set label), persisted on the session file as `Session.environment`. At startup `Startup::sync_session_environment` records the current environment; when the session was resumed and the recorded one differs, `Session::sync_environment` appends one system message listing each changed field (`- sandbox: bwrap/workspace -> off`) and telling the model to re-check earlier conclusions about network access, installed tools, credentials and writable files. Sessions saved by older builds carry no record and only record. The tool-set label is `none`, `all`, or the sorted `--tools` allowlist, so flag order is not a change
 - `src/ui/app.rs` — interactive application loop
 - `src/ui/slash/` — slash command handlers
 - `src/context/mentions.rs` — `@agent:<name>` mention parsing against the trust-gated persona names and the non-persisted routing note

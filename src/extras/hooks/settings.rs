@@ -41,12 +41,50 @@ pub(crate) struct HookGroup {
 
 pub(crate) type HooksConfig = HashMap<String, Vec<HookGroup>>;
 
+const SUPPORTED_HOOK_EVENTS: &[&str] = &[
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Stop",
+    "SessionStart",
+    "SessionEnd",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
+    "Notification",
+    "PermissionRequest",
+];
+
 /// Parses the JSON value found at the top-level `hooks` key of settings.json.
 pub(crate) fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfig, String> {
     let mut config: HooksConfig =
         serde_json::from_value(value.clone()).map_err(|e| format!("invalid hooks config: {e}"))?;
 
     for (event, groups) in &mut config {
+        if !SUPPORTED_HOOK_EVENTS.contains(&event.as_str()) {
+            // A spelling that differs from a known event only by case is
+            // almost certainly a typo (e.g. `PreToolUSe`), so it still fails
+            // the whole file with a corrective message. Anything else is a
+            // genuinely unrecognized or future event name (`FutureEvent`,
+            // a newer Claude Code event this build has no dispatcher for,
+            // ...): tolerate it so one unrecognized event does not discard
+            // every hook — including sibling events this build does
+            // understand — in the same settings file.
+            if SUPPORTED_HOOK_EVENTS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(event))
+            {
+                return Err(format!(
+                    "unsupported hook event {event:?}; expected one of {}",
+                    SUPPORTED_HOOK_EVENTS.join(", ")
+                ));
+            }
+            tracing::warn!(
+                "hooks: unsupported hook event {event:?} is not dispatched by this build; expected one of {} (keeping it loaded, inert)",
+                SUPPORTED_HOOK_EVENTS.join(", ")
+            );
+        }
         for group in groups {
             for handler in &mut group.hooks {
                 if handler.kind != "command" {

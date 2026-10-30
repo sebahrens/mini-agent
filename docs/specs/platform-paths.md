@@ -56,7 +56,7 @@ directories and relevant environment variables. Tests construct that abstraction
 do not mutate process-global environment variables in parallel or infer expected paths from the
 host running the test.
 
-`project_dir` is `<workspace-root>/.zerostack`, not an operating-system user directory. The
+`project_dir` is `<workspace-root>/.mini-agent`, not an operating-system user directory. The
 workspace root is the same root used by the session permission system. Merely changing the process
 current directory must not redirect user-global state after startup.
 
@@ -64,23 +64,23 @@ current directory must not redirect user-global state after startup.
 
 | Root | Override | Global home (`<home>`) | Legacy default source |
 |------|----------|------------------------|-----------------------|
-| Configuration | `ZS_CONFIG_DIR` | `<home>` | platform config directory |
-| Portable durable data | `ZS_DATA_DIR` | `<home>` | platform data directory |
-| Machine-local durable data | `ZS_LOCAL_DATA_DIR`, then `ZS_DATA_DIR` for backward compatibility | `<home>` | platform local-data directory |
-| Runtime state | `ZS_STATE_DIR`, then `ZS_LOCAL_DATA_DIR`, then `ZS_DATA_DIR` | `<home>/state` | platform state/local-data directory |
-| Rebuildable cache | `ZS_CACHE_DIR` | `<home>/cache` | platform cache directory |
-| Credentials | `ZS_CREDENTIALS_DIR` | `<local_data_dir>/credentials` (`<home>/credentials`) | `<local_data_dir>/credentials` |
+| Configuration | `MINI_AGENT_CONFIG_DIR` | `<home>` | platform config directory |
+| Portable durable data | `MINI_AGENT_DATA_DIR` | `<home>` | platform data directory |
+| Machine-local durable data | `MINI_AGENT_LOCAL_DATA_DIR`, then `MINI_AGENT_DATA_DIR` for backward compatibility | `<home>` | platform local-data directory |
+| Runtime state | `MINI_AGENT_STATE_DIR`, then `MINI_AGENT_LOCAL_DATA_DIR`, then `MINI_AGENT_DATA_DIR` | `<home>/state` | platform state/local-data directory |
+| Rebuildable cache | `MINI_AGENT_CACHE_DIR` | `<home>/cache` | platform cache directory |
+| Credentials | `MINI_AGENT_CREDENTIALS_DIR` | `<local_data_dir>/credentials` (`<home>/credentials`) | `<local_data_dir>/credentials` |
 
-Each root is resolved independently: a per-root `ZS_*_DIR` override (and its documented cascade)
+Each root is resolved independently: a per-root `MINI_AGENT_*_DIR` override (and its documented cascade)
 always wins. Roots without an override use the **global home** when one is selected, otherwise the
 legacy per-OS platform mapping below. The global home is selected in this order:
 
-1. `MINI_AGENT_HOME`, when set (validated like every `ZS_*` override).
+1. `MINI_AGENT_HOME`, when set (validated like every per-root override).
 2. `~/.mini-agent`, when that path already exists (the user adopted it, or an earlier fresh start
    created it).
-3. `~/.mini-agent`, when no legacy `zerostack` configuration, data, or local-data root exists
+3. `~/.mini-agent`, when no existing platform-native `mini-agent` configuration, data, or local-data root exists
    (fresh install). A legacy cache root alone does not count: it is rebuildable.
-4. Otherwise no global home: an existing legacy install keeps its legacy roots unchanged. Startup
+4. Otherwise no global home: an existing install keeps its platform-native roots unchanged. Startup
    never moves user data because the product identity changed.
 
 Production probes steps 2-3 once in `PathEnvironment::from_process` and records the result as
@@ -93,17 +93,17 @@ home directory needed for `~`, a relative path, or a required base-directory loo
 a typed startup error. Durable or sensitive state never falls back to `.` or another
 current-working-directory-relative path.
 
-`ZS_DATA_DIR` continues to redirect both portable and local data unless the more specific local
-override is present. When `ZS_STATE_DIR` is absent, an explicit `ZS_LOCAL_DATA_DIR` or
-`ZS_DATA_DIR` value is also the state root without an added `state` component, preserving existing
-hermetic/test deployments. `ZS_DATA_DIR` no longer selects the config root: callers that need one
+`MINI_AGENT_DATA_DIR` continues to redirect both portable and local data unless the more specific local
+override is present. When `MINI_AGENT_STATE_DIR` is absent, an explicit `MINI_AGENT_LOCAL_DATA_DIR` or
+`MINI_AGENT_DATA_DIR` value is also the state root without an added `state` component, preserving existing
+hermetic/test deployments. `MINI_AGENT_DATA_DIR` no longer selects the config root: callers that need one
 hermetic root set both variables. A config found under the old data-root behavior is a legacy
 migration candidate. This intentional split prevents a fresh config and an existing config from
 using different storage classes.
 
 ### Project-local configuration trust
 
-`.zerostack/config.toml` is repository-controlled and is not equivalent to the user-global
+`.mini-agent/config.toml` is repository-controlled and is not equivalent to the user-global
 configuration. Before trust, startup may merge only this exhaustive benign top-level allowlist:
 
 `always_show_welcome`, `chain`, `chat_left_margin`, `colors`, `compact_enabled`,
@@ -111,7 +111,7 @@ configuration. Before trust, startup may merge only this exhaustive benign top-l
 `max_bash_output_lines`, `max_find_results`, `max_grep_results`, `max_list_dir_entries`,
 `max_read_lines`, `max_text_file_size`, `max_tokens`, `mid_turn_compact_threshold`, `model`,
 `reserve_tokens`, `retry`, `show_cost_always`, `show_reasoning`, `reasoning_display`, `show_tool_details`, `statusline`,
-the four `subagent_max_*` result/read limits, and `temperature`.
+the four `subagent_max_*` result/read limits, `temperature`, and `tool_output`.
 
 `retry` is admitted only as a tightening of the user's policy: after the benign merge, each project
 `[retry]` field is capped at the effective global (or default) value, so repository content can make
@@ -145,18 +145,18 @@ store and are never authorized by project-config trust.
 ## Platform mapping
 
 With a global home, every platform uses the same layout in the table above (`~/.mini-agent` is
-`%USERPROFILE%\.mini-agent` on Windows). The legacy mapping below applies only when no global home
-is selected. All legacy rows append the application component `zerostack` to the
+`%USERPROFILE%\.mini-agent` on Windows). The platform mapping below applies only when no global home
+is selected. All platform rows append the application component `mini-agent` to the
 operating-system base directory.
 
 | Root | Linux | macOS | Windows |
 |------|-------|-------|---------|
-| `config_dir` | `$XDG_CONFIG_HOME/zerostack`, default `~/.config/zerostack` | `~/Library/Application Support/zerostack` | `%APPDATA%\zerostack` (Roaming) |
-| `data_dir` | `$XDG_DATA_HOME/zerostack`, default `~/.local/share/zerostack` | `~/Library/Application Support/zerostack` | `%APPDATA%\zerostack` (Roaming) |
-| `local_data_dir` | `$XDG_DATA_HOME/zerostack`, default `~/.local/share/zerostack` | `~/Library/Application Support/zerostack` | `%LOCALAPPDATA%\zerostack` |
-| `state_dir` | `$XDG_STATE_HOME/zerostack`, default `~/.local/state/zerostack` | `~/Library/Application Support/zerostack/state` | `%LOCALAPPDATA%\zerostack\state` |
-| `cache_dir` | `$XDG_CACHE_HOME/zerostack`, default `~/.cache/zerostack` | `~/Library/Caches/zerostack` | `%LOCALAPPDATA%\zerostack\cache` |
-| `credentials_dir` | `<local_data_dir>/credentials` | `<local_data_dir>/credentials` | `%LOCALAPPDATA%\zerostack\credentials` |
+| `config_dir` | `$XDG_CONFIG_HOME/mini-agent`, default `~/.config/mini-agent` | `~/Library/Application Support/mini-agent` | `%APPDATA%\mini-agent` (Roaming) |
+| `data_dir` | `$XDG_DATA_HOME/mini-agent`, default `~/.local/share/mini-agent` | `~/Library/Application Support/mini-agent` | `%APPDATA%\mini-agent` (Roaming) |
+| `local_data_dir` | `$XDG_DATA_HOME/mini-agent`, default `~/.local/share/mini-agent` | `~/Library/Application Support/mini-agent` | `%LOCALAPPDATA%\mini-agent` |
+| `state_dir` | `$XDG_STATE_HOME/mini-agent`, default `~/.local/state/mini-agent` | `~/Library/Application Support/mini-agent/state` | `%LOCALAPPDATA%\mini-agent\state` |
+| `cache_dir` | `$XDG_CACHE_HOME/mini-agent`, default `~/.cache/mini-agent` | `~/Library/Caches/mini-agent` | `%LOCALAPPDATA%\mini-agent\cache` |
+| `credentials_dir` | `<local_data_dir>/credentials` | `<local_data_dir>/credentials` | `%LOCALAPPDATA%\mini-agent\credentials` |
 
 Configuration and data base directories intentionally coincide on macOS and for Windows Roaming
 data. Artifact-specific child directories still keep concerns separate. Linux must not place a
@@ -179,11 +179,11 @@ new config file under the data root merely because no config file exists yet.
 | Session ownership locks | `state_dir/sessions/<session-id>.lock` | Empty private advisory-lock files beside each `<session-id>.json`. The process that owns a session holds the lock (`flock` / `LockFileEx`) until it exits or switches sessions; a resume of a locked session forks to a new ID and a save of one is refused. Discovery reads only `*.json`, lock files are never deleted, and a leftover lock file is inert because the OS releases the lock on process exit. |
 | Goal round transcripts | `state_dir/goals/<goal-id>` | Durable operational state owned by the goal feature. Written with the application's private permissions, one bounded JSON record per gate evaluation, suppressed entirely when artifact writing is disabled. Separate from `state_dir/loops` so a goal's record is never confused with a `--loop` iteration's. No migration: the directory is new and absent installations have nothing to move. |
 | Welcome, hook/config trust, architecture, and migration markers | `state_dir/shown_welcome_msg`, `state_dir/hooks`, `state_dir/config`, `state_dir/archmd`, `state_dir/migrations/v1` | Machine-local operational and migration state |
-| Brokered JavaScript effect audit | `state_dir/audit/js-effects` | Private machine-local security evidence with one exclusive writer and hash-linked segments |
+| Brokered JavaScript effect audit | `state_dir/audit/js-effects` (slot 0), `state_dir/audit/js-effects-<n>` (concurrent writers) | Private machine-local security evidence with one exclusive writer and hash-linked segments |
 | Embedding model downloads, query cache, rebuildable dense snapshots, import staging | `cache_dir` | Safe to delete and reconstruct |
 | MCP OAuth refresh/access tokens and future secret material | `credentials_dir` | Requires stronger access controls and must not roam by default |
 | Skill Gym worktrees, reports, and isolated AppPaths | Operator-selected `MINI_AGENT_GYM_ROOT` (the setup script defaults to `<repository>/.gym`) | Evaluation-only tree outside `AppPaths`; every episode overrides data/local-data/state/cache roots and sets `MINI_AGENT_GYM=1` so evidence cannot qualify as production |
-| System-managed hook settings | `/etc/zerostack` (Linux), `/Library/Application Support/zerostack` (macOS), `%ProgramData%\zerostack` (Windows) | Explicit read-only administrator-policy exception; no user override |
+| System-managed hook settings | `/etc/mini-agent` (Linux), `/Library/Application Support/mini-agent` (macOS), `%ProgramData%\mini-agent` (Windows) | Explicit read-only administrator-policy exception; no user override |
 
 An artifact has exactly one owner and one canonical root. A module may receive a fully resolved
 artifact path or an `AppPaths` reference; it may not reinterpret another root. Rebuildable cache
@@ -191,7 +191,12 @@ loss must never delete the authoritative skill database or disable primitive JS 
 
 ### Brokered JavaScript effect audit
 
-`AppPaths::effect_audit()` is the only owner of the effect-audit location. It fixes the directory
+`AppPaths::effect_audit()` is the only owner of the effect-audit location. The audit has one
+exclusive writer per directory, so concurrent mini-agent processes each claim the first free
+slot through `AppPaths::effect_audit_slot(n)`: slot 0 is `<state_dir>/audit/js-effects` and slot
+`n` is `<state_dir>/audit/js-effects-<n>` (at most 64). A slot is only an integer-derived fixed
+child, a freed slot is reused by the next process, and no slot directory is ever deleted. Each
+slot is an independent hash-linked chain with its own key. It fixes the directory
 at `<state_dir>/audit/js-effects`, the writer lock at `writer.lock`, and opaque monotonically
 numbered segment names. Its parent-only target-correlation key is fixed at `target-hmac-v1.key`;
 an initialization marker outside the segment directory makes disappearance of a previously
@@ -339,9 +344,18 @@ content only when the canonical artifact is absent. Known legacy candidates incl
 config-under-data, config-under-XDG-config,
 session/data, hook trust, OAuth, log, and Phase 3 draft skill-database locations.
 
+The pre-rename user-global application component `zerostack` is a migration source only. The old
+`ZEROSTACK_{CONFIG,DATA,LOCAL_DATA,STATE,CACHE,CREDENTIALS}_DIR` overrides remain read-only
+fallbacks when the corresponding `MINI_AGENT_*` override is absent; canonical overrides always
+win. Project-controlled `.zerostack` directories are not loaded or copied automatically because
+moving repository policy would bypass the new path-bound trust decision. Rename reviewed project
+content to `.mini-agent` and approve the canonical project config again.
+
 When the canonical artifact already exists, a missing marker may be repaired by comparing a
 distinct legacy candidate. After no-follow type validation, a candidate whose path equals the
-canonical path is excluded. If no distinct candidate remains, startup accepts the canonical
+canonical path is excluded (for example when a `MINI_AGENT_*` override and its `ZEROSTACK_*`
+fallback resolve to the same directory); the `zerostack` -> `mini-agent` rename migration still
+applies to every candidate that is distinct from the canonical path. If no distinct candidate remains, startup accepts the canonical
 artifact without reading or hashing its tree and without creating a migration marker. This
 allows shared data/state roots to contain active session locks.
 

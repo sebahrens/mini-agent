@@ -14,6 +14,8 @@ use crate::session::{MessageRole, Session, SessionMessage};
 pub const MAX_SESSION_IMPORT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SESSION_IMPORT_MESSAGES: usize = 10_000;
 const MAX_SESSION_IMPORT_LINE_BYTES: usize = 4 * 1024 * 1024;
+const SESSION_EXPORT_FORMAT: &str = "mini-agent-session-jsonl";
+const LEGACY_SESSION_EXPORT_FORMAT: &str = "zerostack-session-jsonl";
 
 /// Export a session as JSONL: one metadata header line, then one message per
 /// line. Refuses output outside the same bounds [`parse_session_file`] accepts.
@@ -28,7 +30,7 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
     let replay = ImportedReplayMetadata::from_session(session);
     let header = serde_json::json!({
         "type": "session",
-        "format": "zerostack-session-jsonl",
+        "format": SESSION_EXPORT_FORMAT,
         "version": 2,
         "id": session.id.as_str(),
         "name": session.name.as_str(),
@@ -388,6 +390,9 @@ pub struct JsonlSessionImport {
     pub messages: Vec<SessionMessage>,
     pub totals: ImportedTotals,
     pub replay: ImportedReplayMetadata,
+    // Parsed regardless of features so a goal record never breaks import;
+    // only goal-enabled builds restore it.
+    #[cfg_attr(not(feature = "goal"), allow(dead_code))]
     pub goal: Option<ImportedGoal>,
 }
 
@@ -492,7 +497,10 @@ fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
         if header.is_none() {
             let parsed: JsonlSessionHeader = serde_json::from_value(value)
                 .with_context(|| format!("line {} is not a JSONL session header", index + 1))?;
-            if parsed.kind != "session" || parsed.format != "zerostack-session-jsonl" {
+            if parsed.kind != "session"
+                || (parsed.format != SESSION_EXPORT_FORMAT
+                    && parsed.format != LEGACY_SESSION_EXPORT_FORMAT)
+            {
                 anyhow::bail!("unsupported JSONL session format on line {}", index + 1);
             }
             if !matches!(parsed.version, 1 | 2) {
@@ -1142,12 +1150,26 @@ mod serialization_shape_tests {
         let lines = jsonl.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 1 + session.messages.len());
         for (line, msg) in lines[1..].iter().zip(&session.messages) {
-            let expected = serde_json::json!({
-                "role": msg.role,
-                "content": msg.content.as_str(),
-                "estimated_tokens": msg.estimated_tokens,
+            // `ExportLine` (not `serde_json::json!`) is the documented wire
+            // contract: "Field order is the emitted key order" above its
+            // definition. A plain struct always serializes in declaration
+            // order regardless of whether serde_json's `preserve_order`
+            // feature happens to be unified in by some optional dependency
+            // in a given feature combination; `serde_json::json!` builds a
+            // `Map` whose key order depends on exactly that feature (sorted
+            // alphabetically when off, insertion order when on). Comparing
+            // against the same struct type pins the real contract instead
+            // of an accidental, feature-dependent `Map` ordering.
+            let expected = serde_json::to_string(&ExportLine {
+                role: &msg.role,
+                content: msg.content.as_str(),
+                estimated_tokens: msg.estimated_tokens,
+                tool_call_id: None,
+                tool: None,
+                recorded_diff: None,
+                user: None,
             })
-            .to_string();
+            .unwrap();
             assert_eq!(*line, expected);
         }
     }

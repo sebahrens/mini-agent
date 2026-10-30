@@ -237,7 +237,7 @@ async fn no_matching_hook_passes_through_to_inner_tool() {
 #[tokio::test]
 async fn post_tool_use_failure_observes_but_cannot_change_the_outcome() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-decorator-failure-{}",
+        "mini-agent-hooks-decorator-failure-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);

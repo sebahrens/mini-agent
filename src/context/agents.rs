@@ -10,9 +10,43 @@ const MAX_AGENT_MODEL_CHARS: usize = 256;
 const MAX_PROJECT_NOTES_BYTES: usize = 64 * 1024;
 const MAX_PROJECT_AGENT_ENTRIES: usize = 1_024;
 const MAX_PROJECT_AGENT_FILES: usize = 128;
-// Low to high priority: retain the legacy directory's override precedence.
-const PROJECT_AGENT_LAYERS: [&str; 3] =
-    [".claude/agents", ".mini-agent/agents", ".zerostack/agents"];
+// Low to high priority: compatibility layers first, then the product's own
+// project directory (which alone carries `.notes` and trusted-override rules).
+const PROJECT_AGENT_LAYERS: [&str; 2] = [".claude/agents", ".mini-agent/agents"];
+const CLAUDE_PROJECT_AGENT_LAYER: &str = ".claude/agents";
+
+/// Whether project `.claude/agents` definitions are read (`claude_project_agents`).
+/// Set once at startup from the resolved config; defaults to on for Claude Code
+/// compatibility.
+static CLAUDE_PROJECT_AGENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_PROJECT_AGENTS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub fn set_claude_project_agents(enabled: bool) {
+    CLAUDE_PROJECT_AGENTS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn claude_project_agents_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = CLAUDE_PROJECT_AGENTS_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    CLAUDE_PROJECT_AGENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Project definition layers in ascending priority, without `.claude/agents`
+/// when `claude_project_agents = false`.
+fn project_agent_layers() -> impl DoubleEndedIterator<Item = &'static str> {
+    let include_claude = claude_project_agents_enabled();
+    PROJECT_AGENT_LAYERS
+        .into_iter()
+        .filter(move |layer| include_claude || *layer != CLAUDE_PROJECT_AGENT_LAYER)
+}
 const MAX_DECLARED_TOOLS: usize = 128;
 const MAX_TOOL_NAME_CHARS: usize = 64;
 const MAX_NOTICE_NAMES: usize = 8;
@@ -104,6 +138,8 @@ struct AgentMetadata {
     isolation_worktree: bool,
     /// The turn budget came from the deprecated `effort` alias.
     deprecated_effort_alias: bool,
+    #[cfg(feature = "mcp")]
+    mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
     unknown_keys: Vec<String>,
 }
 
@@ -265,6 +301,25 @@ fn normalize_agent_definition(
             None => return Err("frontmatter isolation must be a string"),
         },
     };
+    #[cfg(feature = "mcp")]
+    let mcp_servers = mapping
+        .get(serde_yaml_ng::Value::String("mcp_servers".into()))
+        .map(parse_agent_mcp_servers)
+        .transpose()?;
+    #[cfg(feature = "mcp")]
+    let known_keys = [
+        "name",
+        "mode",
+        "isolation",
+        "description",
+        "tools",
+        "required_tools",
+        "model",
+        "turn_budget",
+        "effort",
+        "mcp_servers",
+    ];
+    #[cfg(not(feature = "mcp"))]
     let known_keys = [
         "name",
         "mode",
@@ -302,11 +357,71 @@ fn normalize_agent_definition(
                     turn_budget,
                     isolation_worktree,
                     deprecated_effort_alias,
+                    #[cfg(feature = "mcp")]
+                    mcp_servers,
                     unknown_keys,
                 },
             )
         })
         .ok_or("prompt body is empty")
+}
+
+#[cfg(feature = "mcp")]
+fn parse_agent_mcp_servers(
+    value: &serde_yaml_ng::Value,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, &'static str> {
+    const MAX_SERVERS: usize = 8;
+    const MAX_TOOLS: usize = 32;
+    const MAX_NAME_CHARS: usize = 256;
+
+    let mapping = value
+        .as_mapping()
+        .ok_or("frontmatter mcp_servers must map server names to tool-name lists")?;
+    if mapping.len() > MAX_SERVERS {
+        return Err("frontmatter mcp_servers exceeds the 8-server limit");
+    }
+
+    let mut result = std::collections::BTreeMap::new();
+    let mut total_tools = 0usize;
+    for (server, tools) in mapping {
+        let server = server
+            .as_str()
+            .map(str::trim)
+            .filter(|name| {
+                !name.is_empty()
+                    && name.chars().count() <= MAX_NAME_CHARS
+                    && !name.chars().any(char::is_control)
+            })
+            .ok_or("frontmatter mcp_servers contains an invalid server name")?;
+        let tools = tools
+            .as_sequence()
+            .ok_or("frontmatter mcp_servers entries must be non-empty tool-name lists")?;
+        if tools.is_empty() {
+            return Err("frontmatter mcp_servers entries must be non-empty tool-name lists");
+        }
+        let mut selected = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let tool = tool
+                .as_str()
+                .map(str::trim)
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.chars().count() <= MAX_NAME_CHARS
+                        && !name.chars().any(char::is_control)
+                })
+                .ok_or("frontmatter mcp_servers contains an invalid tool name")?;
+            if selected.iter().any(|existing| existing == tool) {
+                return Err("frontmatter mcp_servers contains a duplicate tool name");
+            }
+            selected.push(tool.to_string());
+            total_tools += 1;
+            if total_tools > MAX_TOOLS {
+                return Err("frontmatter mcp_servers exceeds the 32-tool limit");
+            }
+        }
+        result.insert(server.to_string(), selected);
+    }
+    Ok(result)
 }
 
 fn parse_required_agent_tools(value: &serde_yaml_ng::Value) -> Result<Vec<String>, &'static str> {
@@ -485,6 +600,10 @@ pub struct AgentDefinition {
     /// Optional `turn_budget` tier (formerly `effort`) that narrows the global
     /// child turn cap. Unrelated to the model's `[reasoning] effort`.
     pub(crate) turn_budget: Option<AgentTurnBudget>,
+    /// Exact MCP server/tool capabilities for specialist children. Absence means
+    /// no MCP authority and never inherits the outer agent's MCP connections.
+    #[cfg(feature = "mcp")]
+    pub(crate) mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// `isolation: worktree`: a write-mode persona runs each child in its own
     /// git worktree and branch instead of the parent workspace. Meaningless
     /// (and ignored) without `mode: write`.
@@ -512,6 +631,8 @@ fn merge_definitions(
                 required_tools: metadata.required_tools,
                 model: metadata.model,
                 turn_budget: metadata.turn_budget,
+                #[cfg(feature = "mcp")]
+                mcp_servers: metadata.mcp_servers,
                 isolation_worktree: metadata.isolation_worktree,
                 source: source.clone(),
                 project_notes_path: None,
@@ -552,6 +673,8 @@ impl AgentDefinition {
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
             isolation_worktree: false,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
@@ -735,7 +858,7 @@ pub(crate) fn project_persona_set(
 ) -> Option<PersonaSet> {
     use sha2::{Digest, Sha256};
     let mut entries = Vec::new();
-    for layer in PROJECT_AGENT_LAYERS {
+    for layer in project_agent_layers() {
         match workspace.read_relative_definition_layer(
             Path::new(layer),
             "md",
@@ -923,6 +1046,8 @@ fn merge_external_definitions(
                         required_tools: metadata.required_tools,
                         model: metadata.model,
                         turn_budget: metadata.turn_budget,
+                        #[cfg(feature = "mcp")]
+                        mcp_servers: metadata.mcp_servers,
                         isolation_worktree: metadata.isolation_worktree,
                         source: source.clone(),
                         project_notes_path: None,
@@ -972,7 +1097,7 @@ fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition>
 }
 
 /// Load all agent type definitions. Priority (highest wins):
-///   project override (.zerostack/agents → .mini-agent/agents → .claude/agents)
+///   project override (.mini-agent/agents → .claude/agents)
 ///   → user global (data_dir/agents/<name>.md)
 ///   → compiled-in default (data/agents/<name>.md)
 #[cfg(any(test, feature = "subagents"))]
@@ -1186,8 +1311,7 @@ fn persona_fingerprint(
 ) -> Option<PersonaFingerprint> {
     let user = user_layer_stamp(&paths.agents_dir())?;
     let project = if trusted {
-        PROJECT_AGENT_LAYERS
-            .into_iter()
+        project_agent_layers()
             .map(|layer| project_layer_stamp(workspace, layer))
             .collect::<Option<Vec<_>>>()?
     } else {
@@ -1258,7 +1382,7 @@ fn load_uncached(
     UNCACHED_LOADS.with(|loads| loads.set(loads.get() + 1));
     let mut agents = load_base(paths);
     if trusted {
-        for layer in PROJECT_AGENT_LAYERS {
+        for layer in project_agent_layers() {
             let definitions = workspace.read_relative_definition_layer(
                 Path::new(layer),
                 "md",
@@ -1267,7 +1391,7 @@ fn load_uncached(
                 MAX_PROJECT_AGENT_FILES,
             );
             match definitions {
-                Ok(definitions) if layer == ".zerostack/agents" => {
+                Ok(definitions) if layer == ".mini-agent/agents" => {
                     merge_project_definitions(
                         &mut agents,
                         definitions,
@@ -1303,7 +1427,7 @@ pub(crate) fn ignored_project_personas_notice(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> Option<String> {
     let mut names = Vec::new();
-    for layer in PROJECT_AGENT_LAYERS {
+    for layer in project_agent_layers() {
         let Ok(directory) = workspace.open_dir_relative(Path::new(layer)) else {
             continue;
         };
@@ -1489,7 +1613,7 @@ pub(crate) fn untrusted_project_persona_exists(
         .map(|paths| project_definitions_trusted(&paths, workspace))
         .unwrap_or(false);
     !trusted
-        && PROJECT_AGENT_LAYERS.into_iter().any(|layer| {
+        && project_agent_layers().any(|layer| {
             workspace.has_relative_regular_file(&Path::new(layer).join(format!("{name}.md")))
         })
 }
@@ -1514,7 +1638,7 @@ pub(crate) fn source_hint_for_workspace(
             .map(|paths| project_definitions_trusted(&paths, workspace))
             .unwrap_or(false);
         if trusted {
-            for layer in PROJECT_AGENT_LAYERS.into_iter().rev() {
+            for layer in project_agent_layers().rev() {
                 let relative = Path::new(layer).join(format!("{name}.md"));
                 if workspace.has_relative_regular_file(&relative) {
                     return format!(
@@ -1559,7 +1683,7 @@ pub(crate) mod tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
-            project_dir: Some(root.join(".zerostack")),
+            project_dir: Some(root.join(".mini-agent")),
         }
     }
 
@@ -1645,7 +1769,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(paths.agents_dir()).unwrap();
         let user = paths.agents_dir().join("helper.md");
         std::fs::write(&user, "user helper alpha").unwrap();
-        let project = root.join(".zerostack/agents/editor.md");
+        let project = root.join(".mini-agent/agents/editor.md");
         std::fs::create_dir_all(project.parent().unwrap()).unwrap();
         std::fs::write(&project, "---\nmode: write\n---\nproject editor").unwrap();
         let config = paths.project_config_file().unwrap();
@@ -1681,7 +1805,7 @@ pub(crate) mod tests {
         assert_eq!(user_edited["helper"].prompt, "user helper omega");
 
         // Adding a persona file invalidates.
-        std::fs::write(root.join(".zerostack/agents/added.md"), "added").unwrap();
+        std::fs::write(root.join(".mini-agent/agents/added.md"), "added").unwrap();
         assert!(load_for_paths_and_workspace(&paths, &workspace).contains_key("added"));
         assert_eq!(uncached_loads(), start + 4);
 
@@ -1704,7 +1828,7 @@ pub(crate) mod tests {
         crate::paths::prepare_storage_roots(&paths).unwrap();
         std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
         std::fs::write(root.join(".claude/agents/linked.md"), "linked persona").unwrap();
-        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
+        std::fs::create_dir_all(root.join(".mini-agent")).unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
         crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
@@ -1716,6 +1840,75 @@ pub(crate) mod tests {
         std::fs::rename(root.join(".claude"), root.join("moved")).unwrap();
         std::os::unix::fs::symlink(root.join("moved"), root.join(".claude")).unwrap();
         assert!(!load_for_paths_and_workspace(&paths, &workspace).contains_key("linked"));
+    }
+
+    #[test]
+    fn claude_project_agents_false_skips_only_the_claude_layer() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                CLAUDE_PROJECT_AGENTS_OVERRIDE.with(|cell| cell.set(None));
+            }
+        }
+        let _reset = Reset;
+        let fixture = crate::tests::OwnedTestDirectory::new("claude-agents-off");
+        let root = fixture.path();
+        let paths = isolated_paths(root);
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        std::fs::create_dir_all(paths.agents_dir()).unwrap();
+        std::fs::write(paths.agents_dir().join("review.md"), "user-global fallback").unwrap();
+        for layer in PROJECT_AGENT_LAYERS {
+            std::fs::create_dir_all(root.join(layer)).unwrap();
+            std::fs::write(
+                root.join(layer).join("review.md"),
+                format!("persona {layer}"),
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join(".claude/agents/claude-only.md"), "Claude persona").unwrap();
+        std::fs::write(root.join(".mini-agent/agents/mini-only.md"), "mini persona").unwrap();
+        // A Claude Code definition mini-agent would reject (description > 160).
+        std::fs::write(
+            root.join(".claude/agents/long.md"),
+            format!(
+                "---\nname: long\ndescription: {}\n---\nbody",
+                "x".repeat(400)
+            ),
+        )
+        .unwrap();
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
+        crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
+            .unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
+
+        CLAUDE_PROJECT_AGENTS_OVERRIDE.with(|cell| cell.set(Some(true)));
+        let with_claude = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(with_claude.contains_key("claude-only"));
+        assert!(
+            !with_claude.contains_key("long"),
+            "over-long description is rejected"
+        );
+
+        CLAUDE_PROJECT_AGENTS_OVERRIDE.with(|cell| cell.set(Some(false)));
+        let without = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(!without.contains_key("claude-only"));
+        assert!(without.contains_key("mini-only"));
+        assert!(
+            without["review"]
+                .prompt
+                .starts_with("persona .mini-agent/agents")
+        );
+        assert_eq!(
+            project_agent_layers().collect::<Vec<_>>(),
+            [".mini-agent/agents"]
+        );
+        std::fs::remove_file(root.join(".mini-agent/agents/review.md")).unwrap();
+        let fallback = load_for_paths_and_workspace(&paths, &workspace);
+        assert_eq!(
+            fallback["review"].prompt, "user-global fallback",
+            "the Claude layer must not be the fallback when it is disabled"
+        );
     }
 
     #[test]
@@ -1737,7 +1930,7 @@ pub(crate) mod tests {
         std::fs::write(root.join(".claude/agents/claude-only.md"), "Claude persona").unwrap();
         std::fs::write(root.join(".mini-agent/agents/mini-only.md"), "mini persona").unwrap();
         std::fs::write(
-            root.join(".zerostack/agents/.notes.md"),
+            root.join(".mini-agent/agents/.notes.md"),
             "legacy shared notes",
         )
         .unwrap();
@@ -1746,7 +1939,7 @@ pub(crate) mod tests {
         assert_eq!(untrusted["review"].prompt, "user-global fallback");
         assert!(!untrusted.contains_key("claude-only"));
         assert!(!untrusted.contains_key("mini-only"));
-        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
+        std::fs::create_dir_all(root.join(".mini-agent")).unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
         crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
@@ -1755,22 +1948,18 @@ pub(crate) mod tests {
         assert!(
             trusted["review"]
                 .prompt
-                .starts_with("persona .zerostack/agents")
+                .starts_with("persona .mini-agent/agents")
         );
         assert_eq!(
             trusted["review"].project_override_path("review"),
-            Some(root.join(".zerostack/agents/review.md"))
+            Some(root.join(".mini-agent/agents/review.md"))
         );
         for name in ["claude-only", "mini-only", "review"] {
             assert!(trusted[name].prompt.ends_with("legacy shared notes"));
         }
-        std::fs::remove_file(root.join(".zerostack/agents/review.md")).unwrap();
+        std::fs::remove_file(root.join(".mini-agent/agents/review.md")).unwrap();
         let next = load_for_paths_and_workspace(&paths, &workspace);
-        assert!(
-            next["review"]
-                .prompt
-                .starts_with("persona .mini-agent/agents")
-        );
+        assert!(next["review"].prompt.starts_with("persona .claude/agents"));
         std::fs::write(
             root.join(".mini-agent/agents/review.md"),
             "---\nname: wrong\n---\ninvalid",
@@ -1871,7 +2060,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
-        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
+        std::fs::create_dir_all(root.join(".mini-agent")).unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
         crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
@@ -1907,8 +2096,14 @@ pub(crate) mod tests {
             root.join(".claude/agents/review.md"),
         )
         .unwrap();
-        symlink(root.join("private-personas"), root.join(".mini-agent")).unwrap();
-        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
+        // The fork keeps project config and agents under one `.mini-agent`
+        // directory, so link only the agents layer to a private directory.
+        std::fs::create_dir_all(root.join(".mini-agent")).unwrap();
+        symlink(
+            root.join("private-personas"),
+            root.join(".mini-agent/agents"),
+        )
+        .unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
         crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
@@ -1945,10 +2140,10 @@ pub(crate) mod tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
-            project_dir: Some(root.join(crate::product::LEGACY_PROJECT_DIRECTORY)),
+            project_dir: Some(root.join(crate::product::PROJECT_DIRECTORY)),
         };
         crate::paths::prepare_storage_roots(&paths).unwrap();
-        let agent_dir = root.join(".zerostack/agents");
+        let agent_dir = root.join(".mini-agent/agents");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(
             agent_dir.join("rust-security-review.md"),
@@ -1963,7 +2158,7 @@ pub(crate) mod tests {
             "trusted project persona"
         );
 
-        std::fs::create_dir_all(root.join(".zerostack")).unwrap();
+        std::fs::create_dir_all(root.join(".mini-agent")).unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
         crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
@@ -2107,6 +2302,41 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn persona_mcp_frontmatter_is_exact_and_bounded() {
+        let configured = normalize_agent_definition(
+            "review".into(),
+            "---\nname: review\nmcp_servers:\n  docs: [search, fetch]\n  source:\n    - grep\n---\nbody".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            configured.2.mcp_servers,
+            Some(std::collections::BTreeMap::from([
+                (
+                    "docs".to_string(),
+                    vec!["search".to_string(), "fetch".to_string()]
+                ),
+                ("source".to_string(), vec!["grep".to_string()]),
+            ]))
+        );
+        assert!(configured.2.unknown_keys.is_empty());
+        for invalid in [
+            "mcp_servers: [docs]",
+            "mcp_servers:\n  docs: []",
+            "mcp_servers:\n  docs: [search, search]",
+        ] {
+            assert!(
+                normalize_agent_definition(
+                    "review".into(),
+                    format!("---\nname: review\n{invalid}\n---\nbody"),
+                )
+                .is_err(),
+                "accepted invalid MCP metadata: {invalid}"
+            );
+        }
+    }
+
     #[test]
     fn persona_isolation_is_an_explicit_worktree_opt_in() {
         let parse = |frontmatter: &str| {
@@ -2182,7 +2412,7 @@ pub(crate) mod tests {
         merge_project_definitions(
             &mut agents,
             [("review".to_string(), Ok("project".to_string()))],
-            PathBuf::from("/workspace/.zerostack/agents"),
+            PathBuf::from("/workspace/.mini-agent/agents"),
             false,
         );
 
@@ -2193,7 +2423,7 @@ pub(crate) mod tests {
         merge_project_definitions(
             &mut agents,
             [("review".to_string(), Ok("project".to_string()))],
-            PathBuf::from("/workspace/.zerostack/agents"),
+            PathBuf::from("/workspace/.mini-agent/agents"),
             true,
         );
 
@@ -2202,16 +2432,16 @@ pub(crate) mod tests {
         assert_eq!(
             resolved.source,
             AgentDefinitionSource::ProjectOverride {
-                directory: PathBuf::from("/workspace/.zerostack/agents")
+                directory: PathBuf::from("/workspace/.mini-agent/agents")
             }
         );
         assert_eq!(
             resolved.project_override_path("review"),
-            Some(PathBuf::from("/workspace/.zerostack/agents/review.md"))
+            Some(PathBuf::from("/workspace/.mini-agent/agents/review.md"))
         );
         assert_eq!(
             resolved.source_description("review"),
-            "trusted project override /workspace/.zerostack/agents/review.md"
+            "trusted project override /workspace/.mini-agent/agents/review.md"
         );
     }
 
@@ -2227,7 +2457,7 @@ pub(crate) mod tests {
             )],
             AgentDefinitionSource::Embedded,
         );
-        let directory = PathBuf::from("/workspace/.zerostack/agents");
+        let directory = PathBuf::from("/workspace/.mini-agent/agents");
 
         merge_project_definitions(
             &mut agents,
@@ -2250,7 +2480,7 @@ pub(crate) mod tests {
         assert_eq!(definition.source, AgentDefinitionSource::Embedded);
         assert_eq!(
             definition.source_description("review"),
-            "compiled-in default with trusted project notes /workspace/.zerostack/agents/.notes.md"
+            "compiled-in default with trusted project notes /workspace/.mini-agent/agents/.notes.md"
         );
         assert!(
             definition
@@ -2290,7 +2520,7 @@ pub(crate) mod tests {
                 ".notes".to_string(),
                 Ok("x".repeat(MAX_PROJECT_NOTES_BYTES + 1)),
             )],
-            PathBuf::from("/workspace/.zerostack/agents"),
+            PathBuf::from("/workspace/.mini-agent/agents"),
             true,
         );
 
@@ -2315,6 +2545,8 @@ pub(crate) mod tests {
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
             isolation_worktree: false,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
@@ -2328,6 +2560,8 @@ pub(crate) mod tests {
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
             isolation_worktree: false,
             source: AgentDefinitionSource::UserGlobal,
             project_notes_path: None,
@@ -2347,6 +2581,8 @@ pub(crate) mod tests {
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
             isolation_worktree: false,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
@@ -2393,7 +2629,7 @@ pub(crate) mod tests {
         merge_project_definitions(
             &mut agents,
             [("review".to_string(), Ok("valid project".into()))],
-            PathBuf::from("/workspace/.zerostack/agents"),
+            PathBuf::from("/workspace/.mini-agent/agents"),
             true,
         );
         let project = agents.get("review").unwrap();
@@ -2442,7 +2678,7 @@ pub(crate) mod tests {
         merge_project_definitions(
             &mut agents,
             [("review".to_string(), Err("exceeds the 8-byte limit".into()))],
-            PathBuf::from("/workspace/.zerostack/agents"),
+            PathBuf::from("/workspace/.mini-agent/agents"),
             true,
         );
 
@@ -2450,7 +2686,7 @@ pub(crate) mod tests {
         assert_eq!(resolved.prompt, "embedded");
         let notice = resolved.result_notice("review").unwrap();
         assert!(notice.starts_with("[specialist source: project definition ignored:"));
-        assert!(notice.contains("/workspace/.zerostack/agents/review.md"));
+        assert!(notice.contains("/workspace/.mini-agent/agents/review.md"));
         assert!(notice.contains("exceeds the 8-byte limit"));
         assert!(notice.contains("using compiled-in default"));
     }
@@ -2586,8 +2822,8 @@ pub(crate) mod tests {
         let first = container.join("first");
         let second = container.join("second");
         for (workspace, prompt) in [(&first, "FIRST_WORKSPACE"), (&second, "SECOND_WORKSPACE")] {
-            std::fs::create_dir_all(workspace.join(".zerostack/agents")).unwrap();
-            std::fs::write(workspace.join(".zerostack/agents/review.md"), prompt).unwrap();
+            std::fs::create_dir_all(workspace.join(".mini-agent/agents")).unwrap();
+            std::fs::write(workspace.join(".mini-agent/agents/review.md"), prompt).unwrap();
         }
 
         let first_binding = crate::paths::WorkspaceBinding::capture(&first).unwrap();
@@ -2611,7 +2847,7 @@ pub(crate) mod tests {
             assert!(prompt.contains("read-only"), "{name} must stay read-only");
             for repository_marker in [
                 "mini-agent",
-                "zerostack",
+                "mini-agent",
                 "Phase 6",
                 "src/extras/",
                 "editors/vscode",

@@ -47,6 +47,7 @@ planning context only; it cannot override the cited section.
 |-------|----------------|-----------------|------|
 | Foundation | [platform-paths.md](platform-paths.md) | Delivered | Typed Linux/macOS/Windows roots, artifact ownership, secure migration |
 | Cross-cutting | [subprocess-trust.md](subprocess-trust.md) | Contract delivered | Subprocess principals, trust classes, launch fields, fail-closed backend selection, checked launch inventory |
+| Cross-cutting | [structured-git-mutations.md](structured-git-mutations.md) | Contract delivered | Structured Git operation atomicity, repository identity, rollback, stash/ref safety, and mutation authorization |
 | 1 | [phase-1-js-engine.md](phase-1-js-engine.md) | Delivered | Core QuickJS integration, `JsTool`, primitive host globals |
 | 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS general-process isolation |
 | 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Delivered | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
@@ -383,6 +384,13 @@ The monorepo was flattened: production source and the workspace `Cargo.toml` are
 root. Paths under `zerostack/` in a superseded artifact are historical, not aliases that new
 tracker issues may cite.
 
+The active product namespace is `mini-agent`: new platform roots use the `mini-agent` application
+component, project policy uses `.mini-agent`, public environment variables use `MINI_AGENT_*`, and
+new session exports use `mini-agent-session-jsonl`. The only runtime `zerostack` identifiers are
+explicit compatibility inputs owned by `platform-paths.md`: legacy user-global roots and path
+overrides may be discovered when their canonical counterpart is absent, and the old session JSONL
+format remains importable. Legacy project policy is not loaded or migrated automatically.
+
 Phase 1–5 behavior remains implemented under `src/extras/js/`, with the portable Agent Skills
 catalog in `src/extras/skills/`. Phase 6 moved production and verification QuickJS ownership into
 the contained same-executable worker in `worker.rs`/`realm.rs`. The historical in-process engine
@@ -428,3 +436,14 @@ cargo install --path . --debug    # install development binary
 (`js/read_file: denied (no js-read-roots configured)`). See "Delivered corrections (2026-10-19
 denial reasons)" in [`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md). The
 canonical invariant checklist is unchanged.
+
+## Delivered corrections (2026-10-22 launch-thread fix)
+
+`mini-agent-hdl3i`: the Linux production JS worker launch's bubblewrap `Command::spawn()` now runs
+on a dedicated, process-lifetime thread (`src/sandbox/spawner.rs`) instead of a transient thread
+that exits right after handing off the `WorkerProcess`, removing a `PR_SET_PDEATHSIG`-vs-thread race
+that could get a freshly launched worker SIGKILLed (the intermittent
+`linux-sandbox-policy:js_worker_resource_benchmark` `JS_TEST_WORKER_EXIT class=signal_kill` flake).
+See "Delivered corrections (2026-10-22 launch-thread fix)" in
+[`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md). The canonical invariant
+checklist is unchanged; this is an implementation detail of invariant 1.

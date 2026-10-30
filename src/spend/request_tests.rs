@@ -929,12 +929,12 @@ async fn usd_budget_native_actual_task_batch_held_children_keep_independent_prof
     use rig::tool::Tool;
     let root = crate::tests::OwnedTestDirectory::new("cost-actual-task-batch");
     let bindings = [
-        "ZS_CONFIG_DIR",
-        "ZS_DATA_DIR",
-        "ZS_LOCAL_DATA_DIR",
-        "ZS_STATE_DIR",
-        "ZS_CACHE_DIR",
-        "ZS_CREDENTIALS_DIR",
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
     ]
     .map(|name| (name, Some(root.path().join(name).into_os_string())));
     let _env = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -1086,12 +1086,12 @@ async fn usd_budget_actual_saved_session_fork_preserves_uncertainty_without_impo
         let root = crate::tests::OwnedTestDirectory::new("cost-session-fork");
         let (ledger, fork, run, original_id) = {
             let bindings = [
-                "ZS_CONFIG_DIR",
-                "ZS_DATA_DIR",
-                "ZS_LOCAL_DATA_DIR",
-                "ZS_STATE_DIR",
-                "ZS_CACHE_DIR",
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CONFIG_DIR",
+                "MINI_AGENT_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
+                "MINI_AGENT_STATE_DIR",
+                "MINI_AGENT_CACHE_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
             ]
             .map(|name| (name, Some(root.path().join(name).into_os_string())));
             let _env = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -1179,12 +1179,12 @@ async fn usd_budget_actual_saved_session_fork_preserves_uncertainty_without_impo
 fn held_ledger_flush_child(root: &std::path::Path) -> ! {
     use clap::Parser;
     let bindings = [
-        "ZS_CONFIG_DIR",
-        "ZS_DATA_DIR",
-        "ZS_LOCAL_DATA_DIR",
-        "ZS_STATE_DIR",
-        "ZS_CACHE_DIR",
-        "ZS_CREDENTIALS_DIR",
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
     ]
     .map(|key| (key, Some(root.join(key).into_os_string())));
     let _env = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -1331,11 +1331,12 @@ fn usd_budget_actual_held_regular_ledger_flush_preserves_sigint_grace_and_writer
             .unwrap_or_else(|| panic!("{mode}: missing production result: {output}"));
         assert_eq!(result["usage"]["input_tokens"], 50, "{result}");
         assert_eq!(result["usage"]["output_tokens"], 10, "{result}");
-        let ledger = Ledger::new(&root.path().join("ZS_STATE_DIR"));
+        let ledger = Ledger::new(&root.path().join("MINI_AGENT_STATE_DIR"));
         let total = ledger.summary().unwrap().all_time;
         assert_eq!(total.records, 1, "{mode}: exact receipt persisted once");
         assert!((total.known_cost - 0.00007).abs() < 1e-12);
-        let sessions = std::fs::read_dir(root.path().join("ZS_STATE_DIR/sessions")).unwrap();
+        let sessions =
+            std::fs::read_dir(root.path().join("MINI_AGENT_STATE_DIR/sessions")).unwrap();
         let saved = sessions
             .filter_map(Result::ok)
             .find(|entry| {
@@ -1347,7 +1348,12 @@ fn usd_budget_actual_held_regular_ledger_flush_preserves_sigint_grace_and_writer
             .unwrap();
         let saved: crate::session::Session =
             serde_json::from_slice(&std::fs::read(saved.path()).unwrap()).unwrap();
-        assert_eq!(saved.total_input_tokens, 50);
+        assert_eq!(
+            saved.total_input_tokens,
+            50,
+            "{mode}: {}",
+            std::fs::read_to_string(root.path().join("stderr")).unwrap()
+        );
         assert_eq!(saved.total_output_tokens, 10);
         assert!((saved.recorded_total_cost() - 0.00007).abs() < 1e-12);
         assert_eq!(saved.spend_account.snapshot().tracking_error, forced);
@@ -1728,12 +1734,12 @@ async fn usd_budget_readonly_report_rechecks_paid_and_free_observation_after_ear
 async fn background56_actual_task_and_signed_native_next_prompt_overlap_and_notify_once() {
     let root = crate::tests::OwnedTestDirectory::new("background56-native-overlap");
     let bindings = [
-        "ZS_CONFIG_DIR",
-        "ZS_DATA_DIR",
-        "ZS_LOCAL_DATA_DIR",
-        "ZS_STATE_DIR",
-        "ZS_CACHE_DIR",
-        "ZS_CREDENTIALS_DIR",
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
     ]
     .map(|name| (name, Some(root.path().join(name).into_os_string())));
     let _environment = crate::tests::ScopedProcessEnv::set(&bindings);

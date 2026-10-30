@@ -66,6 +66,7 @@ pub(super) const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "subagent_max_list_dir_entries",
     "subagent_max_read_lines",
     "temperature",
+    "tool_output",
     // Masks only hide more of HOME from contained commands, and project
     // layers can only add to the list (see `merge_config_value_layer`).
     "sandbox-home-masks",
@@ -587,6 +588,7 @@ pub(super) fn rich_default_config() -> Config {
         default_permission_mode: Some("standard".to_string()),
         default_prompt: Some(CompactString::new("code")),
         show_tool_details: None,
+        tool_output: None,
         chain: Some(crate::config::types::ChainConfig::default()),
         #[cfg(feature = "subagents")]
         subagent_max_read_lines: Some(2000),
@@ -956,7 +958,7 @@ mod doctor_config_tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
-            project_dir: Some(root.join("workspace/.zerostack")),
+            project_dir: Some(root.join("workspace/.mini-agent")),
         }
     }
 
@@ -968,16 +970,16 @@ mod doctor_config_tests {
         let child = repo.join("sub/deep");
         std::fs::create_dir_all(&child).unwrap();
         std::fs::create_dir(repo.join(".git")).unwrap();
-        std::fs::create_dir(repo.join(".zerostack")).unwrap();
-        paths.project_dir = Some(child.join(".zerostack"));
+        std::fs::create_dir(repo.join(".mini-agent")).unwrap();
+        paths.project_dir = Some(child.join(".mini-agent"));
         let global = paths.config_dir.join("config.toml");
         atomic_config_write(
             &global,
             "model='global'\nprovider='ollama'\nchat_left_margin=1\nmax_budget_usd=0.5\n",
         )
         .unwrap();
-        let project = repo.join(".zerostack/config.toml");
-        let local = repo.join(".zerostack/config.local.toml");
+        let project = repo.join(".mini-agent/config.toml");
+        let local = repo.join(".mini-agent/config.local.toml");
         std::fs::write(
             &project,
             "model='project'\nprovider='anthropic'\nchat_left_margin=2\nmax_budget_usd=0.01\n",
@@ -1199,16 +1201,16 @@ mod doctor_config_tests {
         let child = repo.join("sub");
         std::fs::create_dir_all(&child).unwrap();
         std::fs::create_dir(repo.join(".git")).unwrap();
-        std::fs::create_dir(repo.join(".zerostack")).unwrap();
-        paths.project_dir = Some(child.join(".zerostack"));
+        std::fs::create_dir(repo.join(".mini-agent")).unwrap();
+        paths.project_dir = Some(child.join(".mini-agent"));
         let global = paths.config_dir.join("config.toml");
         atomic_config_write(
             &global,
             "provider='ollama'\n[mcp_servers.local]\ncommand='host-command'\nargs=['global']\n",
         )
         .unwrap();
-        let project = repo.join(".zerostack/config.toml");
-        let local = repo.join(".zerostack/config.local.toml");
+        let project = repo.join(".mini-agent/config.toml");
+        let local = repo.join(".mini-agent/config.local.toml");
         std::fs::write(&project, "[mcp_servers.local]\nargs=['project']\n").unwrap();
         std::fs::write(&local, "[mcp_servers.local]\nargs=['local']\n").unwrap();
         // An ancestor .mcp.json is not part of config discovery, even with
@@ -2127,6 +2129,13 @@ fn statusline_value_needs_git_status(value: &toml::Value) -> bool {
 pub(super) fn split_project_override(
     local_toml: &str,
 ) -> Result<(toml::Value, toml::Value, BTreeSet<String>), String> {
+    split_project_override_with_sensitive_fields(local_toml, SENSITIVE_FIELDS_IN_BENIGN_TABLES)
+}
+
+fn split_project_override_with_sensitive_fields(
+    local_toml: &str,
+    sensitive_fields: &[(&str, &str)],
+) -> Result<(toml::Value, toml::Value, BTreeSet<String>), String> {
     let local = parse_project_toml(local_toml)?;
     let table = local
         .as_table()
@@ -2137,6 +2146,16 @@ pub(super) fn split_project_override(
     for (key, value) in table {
         if key == "permission_mode_cycle" {
             tracing::warn!("project config: permission_mode_cycle is global-only and was ignored");
+            continue;
+        }
+        if matches!(
+            key.as_str(),
+            "sandbox-required"
+                | "sandbox_required"
+                | "permission-checks-required"
+                | "permission_checks_required"
+        ) {
+            tracing::warn!("project config: {key} is global-only and was ignored");
             continue;
         }
         if !BENIGN_PROJECT_CONFIG_KEYS.contains(&key.as_str())
@@ -2151,17 +2170,21 @@ pub(super) fn split_project_override(
         // out rather than classifying the whole table as sensitive: the bounds
         // beside them are exactly what a project should be able to set.
         let mut value = value.clone();
-        for (table_key, field) in SENSITIVE_FIELDS_IN_BENIGN_TABLES {
+        for (table_key, field) in sensitive_fields {
             if key != table_key {
                 continue;
             }
             let Some(held) = value.as_table_mut().and_then(|table| table.remove(*field)) else {
                 continue;
             };
-            let mut carved = toml::map::Map::new();
-            carved.insert((*field).to_string(), held);
             sensitive_keys.insert(format!("{key}.{field}"));
-            sensitive.insert(key.clone(), toml::Value::Table(carved));
+            let carved = sensitive
+                .entry(key.clone())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            carved
+                .as_table_mut()
+                .expect("sensitive table carve-out retains its table shape")
+                .insert((*field).to_string(), held);
         }
         benign.insert(key.clone(), value);
     }
@@ -2220,6 +2243,19 @@ pub(super) fn merge_config_value_layer(
             }
         }
         merged.sandbox_home_masks = masks;
+    }
+    #[cfg(feature = "js")]
+    if matches!(layer, ConfigLayer::Project | ConfigLayer::Local)
+        && merged.js_fetch_origins == Some(super::JsFetchOrigins::All)
+        && base
+            .js_fetch_origins
+            .as_ref()
+            .is_some_and(|inherited| *inherited != super::JsFetchOrigins::All)
+    {
+        // A project layer may narrow the inherited fetch origins, never lift
+        // them: `"all"` over an inherited list or `"none"` is ignored.
+        tracing::warn!("project config: js-fetch-origins = \"all\" cannot widen inherited origins");
+        merged.js_fetch_origins = base.js_fetch_origins.clone();
     }
     #[cfg(feature = "mcp")]
     {
@@ -2652,8 +2688,8 @@ pub(crate) fn project_config_relative_is_trusted_at_readonly(
     workspace: &crate::paths::WorkspaceBinding,
     relative: &Path,
 ) -> bool {
-    if relative != Path::new(".zerostack/config.toml")
-        && relative != Path::new(".zerostack/config.local.toml")
+    if relative != Path::new(".mini-agent/config.toml")
+        && relative != Path::new(".mini-agent/config.local.toml")
     {
         return false;
     }
@@ -2719,8 +2755,8 @@ fn project_config_is_trusted_in_workspace_mode(
     let take_stamp = || {
         // An absent store is a valid (empty) trust state; fingerprint it as such.
         Some(vec![
-            stat_fingerprint(&root.join(".zerostack"))?,
-            stat_fingerprint(&root.join(".zerostack/config.toml"))?,
+            stat_fingerprint(&root.join(".mini-agent"))?,
+            stat_fingerprint(&root.join(".mini-agent/config.toml"))?,
             stat_fingerprint(store.parent()?)?,
             stat_fingerprint(&store).unwrap_or([0; 9]),
         ])
@@ -2763,7 +2799,7 @@ fn project_config_is_trusted_in_workspace_uncached(
     #[cfg(test)]
     TRUST_FULL_EVALUATIONS.with(|n| n.set(n.get() + 1));
     let Ok((_, binding)) =
-        read_project_config_in_workspace(workspace, Path::new(".zerostack/config.toml"))
+        read_project_config_in_workspace(workspace, Path::new(".mini-agent/config.toml"))
     else {
         return false;
     };
@@ -2863,7 +2899,7 @@ pub(crate) fn trust_project_config(
     save_project_config_trust(trust_store, &store).map_err(|error| error.to_string())
 }
 
-/// Merge benign `.zerostack/config.toml` keys immediately and keep all other
+/// Merge benign `.mini-agent/config.toml` keys immediately and keep all other
 /// keys inert until trust is bound to the canonical project/config paths and
 /// exact config bytes.
 fn apply_local_override(
@@ -3053,7 +3089,7 @@ pub fn verify_project_config_trust() -> std::io::Result<()> {
         "mini-agent-project-config-trust-{}",
         uuid::Uuid::new_v4()
     ));
-    let project_config = root.join("project/.zerostack/config.toml");
+    let project_config = root.join("project/.mini-agent/config.toml");
     let trust_store = root.join("state/config/trusted-project-configs.json");
     let result = (|| {
         std::fs::create_dir_all(project_config.parent().expect("config has a parent"))?;
@@ -3144,7 +3180,7 @@ pub fn verify_project_config_trust() -> std::io::Result<()> {
             ));
         }
 
-        let copied_config = root.join("copied-project/.zerostack/config.toml");
+        let copied_config = root.join("copied-project/.mini-agent/config.toml");
         std::fs::create_dir_all(copied_config.parent().expect("config has a parent"))?;
         std::fs::write(&copied_config, exact_project_config)?;
         let mut copied = Config {
@@ -3524,6 +3560,7 @@ mod project_config_trust_tests {
     use super::{
         PROJECT_CONFIG_TRUST_SCHEMA, ProjectConfigTrustOutcome, ProjectConfigTrustStore,
         apply_local_override_with_confirmation, save_project_config_trust, split_project_override,
+        split_project_override_with_sensitive_fields,
     };
     use crate::config::Config;
 
@@ -3532,7 +3569,7 @@ mod project_config_trust_tests {
             "mini-agent-project-config-trust-{name}-{}",
             uuid::Uuid::new_v4()
         ));
-        let config = root.join("project/.zerostack/config.toml");
+        let config = root.join("project/.mini-agent/config.toml");
         let trust = root.join("state/config/trusted-project-configs.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         (root, config, trust)
@@ -3556,7 +3593,7 @@ mod project_config_trust_tests {
     #[test]
     fn usd_budget_project_layers_cannot_raise_lower_or_set_global_cap_even_when_trusted() {
         let root = crate::tests::OwnedTestDirectory::new("project-budget-global-only");
-        let path = root.path().join("project/.zerostack/config.toml");
+        let path = root.path().join("project/.mini-agent/config.toml");
         let trust = root
             .path()
             .join("state/config/trusted-project-configs.json");
@@ -3606,7 +3643,7 @@ mod project_config_trust_tests {
         }
         assert_eq!(super::keys::lookup("cache_ttl").unwrap().name, "cache_ttl");
         let root = crate::tests::OwnedTestDirectory::new("cache71-project-policy");
-        let path = root.path().join("project/.zerostack/config.toml");
+        let path = root.path().join("project/.mini-agent/config.toml");
         let trust = root
             .path()
             .join("state/config/trusted-project-configs.json");
@@ -3646,7 +3683,7 @@ mod project_config_trust_tests {
     #[test]
     fn permission_mode_cycle_is_global_only_even_for_approved_project_config() {
         let root = crate::tests::OwnedTestDirectory::new("project-mode-cycle-global-only");
-        let path = root.path().join("project/.zerostack/config.toml");
+        let path = root.path().join("project/.mini-agent/config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "permission_mode_cycle = [\"yolo\"]\nyolo = true\n").unwrap();
         let trust = root
@@ -3672,9 +3709,41 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    fn required_guards_are_global_only_even_for_approved_project_config() {
+        let root = crate::tests::OwnedTestDirectory::new("project-required-guards-global-only");
+        let path = root.path().join("project/.mini-agent/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "sandbox-required = false\npermission_checks_required = false\nyolo = true\n",
+        )
+        .unwrap();
+        let trust = root
+            .path()
+            .join("state/config/trusted-project-configs.json");
+        let mut cfg = Config {
+            sandbox_required: Some(true),
+            permission_checks_required: Some(true),
+            ..Default::default()
+        };
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
+        assert_eq!(cfg.yolo, Some(true));
+        assert_eq!(cfg.sandbox_required, Some(true));
+        assert_eq!(cfg.permission_checks_required, Some(true));
+        let (benign, sensitive, keys) =
+            split_project_override("sandbox_required = true\npermission-checks-required = true\n")
+                .unwrap();
+        assert!(
+            benign.as_table().unwrap().is_empty()
+                && sensitive.as_table().unwrap().is_empty()
+                && keys.is_empty()
+        );
+    }
+
+    #[test]
     fn profile100_project_filesystem_grants_require_current_project_approval() {
         let root = crate::tests::OwnedTestDirectory::new("profile100-project-trust");
-        let path = root.path().join("project/.zerostack/config.toml");
+        let path = root.path().join("project/.mini-agent/config.toml");
         let trust = root.path().join("state/trusted-project-configs.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "sandbox-profile = 'host-full'\nsandbox-read-roots = ['/read']\nsandbox-write-roots = ['/write']\nchat_left_margin = 7\n").unwrap();
@@ -3738,7 +3807,7 @@ mod project_config_trust_tests {
     #[test]
     fn project_update_check_cannot_opt_in_to_network_without_trust() {
         let root = crate::tests::OwnedTestDirectory::new("project-update-check-trust");
-        let path = root.path().join("project/.zerostack/config.toml");
+        let path = root.path().join("project/.mini-agent/config.toml");
         let trust = root
             .path()
             .join("state/config/trusted-project-configs.json");
@@ -3763,7 +3832,7 @@ mod project_config_trust_tests {
     #[test]
     fn config69_trusted_merge_preserves_json_values_and_toml_datetime() {
         let root = crate::tests::OwnedTestDirectory::new("config69-json-trusted");
-        let path = root.path().join("project/.zerostack/config.toml");
+        let path = root.path().join("project/.mini-agent/config.toml");
         let trust = root
             .path()
             .join("state/config/trusted-project-configs.json");
@@ -3800,7 +3869,7 @@ mod project_config_trust_tests {
     #[test]
     fn project_shell_deadline_requires_content_bound_trust() {
         let root = crate::tests::OwnedTestDirectory::new("project-shell-deadline-trust");
-        let config_path = root.path().join("project/.zerostack/config.toml");
+        let config_path = root.path().join("project/.mini-agent/config.toml");
         let trust_path = root
             .path()
             .join("state/config/trusted-project-configs.json");
@@ -3935,7 +4004,7 @@ mod project_config_trust_tests {
         for key in ["permission-allow-prefix", "permission_allow_prefix"] {
             let fixture = crate::tests::OwnedTestDirectory::new("project-shell-prefix-trust");
             let root = fixture.path().to_path_buf();
-            let config_path = root.join("project/.zerostack/config.toml");
+            let config_path = root.join("project/.mini-agent/config.toml");
             let trust_path = root.join("state/config/trusted-project-configs.json");
             std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
             let global = root.join("global/config.toml");
@@ -4274,7 +4343,7 @@ mod project_config_trust_tests {
         )
         .unwrap();
 
-        let second_config = root.join("copied-project/.zerostack/config.toml");
+        let second_config = root.join("copied-project/.mini-agent/config.toml");
         std::fs::create_dir_all(second_config.parent().unwrap()).unwrap();
         std::fs::copy(&first_config, &second_config).unwrap();
         let mut copied = Config {
@@ -4365,6 +4434,35 @@ future_security_switch = true
         }
     }
 
+    #[test]
+    fn project_config_carves_every_sensitive_field_from_one_benign_table() {
+        let (benign, sensitive, keys) = split_project_override_with_sensitive_fields(
+            "[goal]\njudge = 'off'\nmax_tokens = 42\nmax_elapsed_secs = 7\n",
+            &[("goal", "judge"), ("goal", "max_tokens")],
+        )
+        .unwrap();
+
+        let benign_goal = benign.get("goal").and_then(toml::Value::as_table).unwrap();
+        assert_eq!(benign_goal.len(), 1);
+        assert_eq!(
+            benign_goal
+                .get("max_elapsed_secs")
+                .and_then(toml::Value::as_integer),
+            Some(7)
+        );
+        let sensitive_goal = sensitive
+            .get("goal")
+            .and_then(toml::Value::as_table)
+            .unwrap();
+        assert_eq!(sensitive_goal.len(), 2);
+        assert!(sensitive_goal.contains_key("judge"));
+        assert!(sensitive_goal.contains_key("max_tokens"));
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["goal.judge".into(), "goal.max_tokens".into(),])
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn project_config_trust_symlink_target_change_invalidates_binding() {
@@ -4373,13 +4471,13 @@ future_security_switch = true
         let (root, _, trust_path) = fixture("symlink");
         let first = root.join("first");
         let second = root.join("second");
-        std::fs::create_dir_all(first.join(crate::product::LEGACY_PROJECT_DIRECTORY)).unwrap();
-        std::fs::create_dir_all(second.join(crate::product::LEGACY_PROJECT_DIRECTORY)).unwrap();
-        std::fs::write(first.join(".zerostack/config.toml"), "yolo = true\n").unwrap();
-        std::fs::write(second.join(".zerostack/config.toml"), "yolo = true\n").unwrap();
+        std::fs::create_dir_all(first.join(crate::product::PROJECT_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(second.join(crate::product::PROJECT_DIRECTORY)).unwrap();
+        std::fs::write(first.join(".mini-agent/config.toml"), "yolo = true\n").unwrap();
+        std::fs::write(second.join(".mini-agent/config.toml"), "yolo = true\n").unwrap();
         let linked_project = root.join("linked-project");
         symlink(&first, &linked_project).unwrap();
-        let linked_config = linked_project.join(".zerostack/config.toml");
+        let linked_config = linked_project.join(".mini-agent/config.toml");
 
         let mut approved = Config::default();
         apply_local_override_with_confirmation(
@@ -4543,6 +4641,39 @@ mod config_key_tests {
         serde_json::to_value(cfg).unwrap()
     }
 
+    #[test]
+    fn sandbox_toolchain_roots_parse_in_both_spellings_and_require_project_trust() {
+        use std::path::PathBuf;
+        let cfg = parse_toml("sandbox-toolchain-roots = [\"/opt/tools\", \"~/.rustup\"]");
+        assert_eq!(
+            cfg.sandbox_toolchain_roots,
+            Some(vec![
+                PathBuf::from("/opt/tools"),
+                PathBuf::from("~/.rustup")
+            ])
+        );
+        let alias = parse_toml("sandbox_toolchain_roots = [\"/opt/tools\", \"~/.rustup\"]");
+        assert!(alias.preserved.keys().next().is_none());
+        assert_eq!(normalized(&alias), normalized(&cfg));
+        assert_eq!(
+            parse_toml("sandbox-toolchain-roots = []").sandbox_toolchain_roots,
+            Some(Vec::new()),
+            "an explicit empty list replaces the default"
+        );
+        assert_eq!(parse_toml("max_tokens = 1").sandbox_toolchain_roots, None);
+
+        for spelling in ["sandbox-toolchain-roots", "sandbox_toolchain_roots"] {
+            let (benign, _, keys) =
+                split_project_override(&format!("{spelling} = [\"/opt\"]\nmax_tokens = 1\n"))
+                    .unwrap();
+            assert!(
+                keys.iter().any(|key| key.starts_with("sandbox")),
+                "{spelling} must need project-config trust: {keys:?}"
+            );
+            assert!(benign.get(spelling).is_none(), "{spelling}");
+        }
+    }
+
     /// The snake_case spelling of each kebab-case key (and the kebab spelling
     /// of the snake-case permission keys next to them) configures exactly
     /// what the canonical spelling does, in TOML and YAML alike.
@@ -4594,7 +4725,9 @@ mod config_key_tests {
         #[cfg(feature = "js")]
         assert_eq!(
             parse_toml(js_pair.1).js_fetch_origins,
-            Some(vec!["https://docs.rs".to_string()])
+            Some(crate::config::JsFetchOrigins::List(vec![
+                "https://docs.rs".to_string()
+            ]))
         );
         // A build without `js` keeps either spelling without owning it and
         // without calling it unknown.
@@ -4673,6 +4806,47 @@ permission-allow-prefix = { shell = ["git status"] }
         );
     }
 
+    #[cfg(feature = "js")]
+    #[test]
+    fn project_layer_cannot_widen_js_fetch_origins() {
+        use crate::config::JsFetchOrigins;
+        let project = |base: Option<JsFetchOrigins>, line: &str| {
+            let base = Config {
+                js_fetch_origins: base,
+                ..Config::default()
+            };
+            let local: toml::Value = toml::from_str(line).unwrap();
+            super::merge_config_value(&base, local)
+                .unwrap()
+                .js_fetch_origins
+        };
+        let docs = JsFetchOrigins::List(vec!["https://docs.rs".into()]);
+        // "all" over an inherited list or "none" is ignored.
+        assert_eq!(
+            project(Some(docs.clone()), "js-fetch-origins = \"all\""),
+            Some(docs.clone())
+        );
+        assert_eq!(
+            project(Some(JsFetchOrigins::None), "js-fetch-origins = \"all\""),
+            Some(JsFetchOrigins::None)
+        );
+        // Narrowing, and "all" over an absent/"all" base (no change), still work.
+        assert_eq!(
+            project(Some(docs), "js-fetch-origins = \"none\""),
+            Some(JsFetchOrigins::None)
+        );
+        assert_eq!(
+            project(None, "js-fetch-origins = \"all\""),
+            Some(JsFetchOrigins::All)
+        );
+        // The key is sensitive, so an untrusted project file never reaches the merge.
+        let (benign, sensitive, keys) =
+            split_project_override("js-fetch-origins = \"all\"\nmodel = \"m\"\n").unwrap();
+        assert!(keys.contains("js-fetch-origins"));
+        assert!(benign.get("js-fetch-origins").is_none());
+        assert!(sensitive.get("js-fetch-origins").is_some());
+    }
+
     #[test]
     fn load_warns_about_unknown_keys_only() {
         let root = scratch("unknown");
@@ -4689,7 +4863,7 @@ permission-allow-prefix = { shell = ["git status"] }
              command = \"printf\"\n",
         )
         .unwrap();
-        let project = root.join("project/.zerostack/config.toml");
+        let project = root.join("project/.mini-agent/config.toml");
         std::fs::create_dir_all(project.parent().unwrap()).unwrap();
         std::fs::write(
             &project,
@@ -4794,7 +4968,7 @@ pub(crate) mod bounded_project_trust_tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
-            project_dir: Some(root.join(".zerostack")),
+            project_dir: Some(root.join(".mini-agent")),
         }
     }
 
@@ -4804,7 +4978,7 @@ pub(crate) mod bounded_project_trust_tests {
         let root = crate::tests::OwnedTestDirectory::new("trust-memo");
         let paths = paths(root.path());
         crate::paths::prepare_storage_roots(&paths).unwrap();
-        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        std::fs::create_dir_all(root.path().join(".mini-agent")).unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, "model='project-model'\n").unwrap();
         trust_project_config(&config, &paths.project_config_trust_file()).unwrap();
@@ -4834,7 +5008,7 @@ pub(crate) mod bounded_project_trust_tests {
         let root = crate::tests::OwnedTestDirectory::new("bounded-trust-positive");
         let paths = paths(root.path());
         crate::paths::prepare_storage_roots(&paths).unwrap();
-        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        std::fs::create_dir_all(root.path().join(".mini-agent")).unwrap();
         let config = paths.project_config_file().unwrap();
         let content = "model='project-model'\nshell_timeout_secs=9\n";
         std::fs::write(&config, content).unwrap();
@@ -4872,7 +5046,7 @@ pub(crate) mod bounded_project_trust_tests {
         let root = crate::tests::OwnedTestDirectory::new("bounded-trust-limits");
         let paths = paths(root.path());
         crate::paths::prepare_storage_roots(&paths).unwrap();
-        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        std::fs::create_dir_all(root.path().join(".mini-agent")).unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, vec![b'x'; MAX_PROJECT_CONFIG_BYTES + 1]).unwrap();
         let mut cfg = Config::default();
@@ -4942,32 +5116,32 @@ pub(crate) mod bounded_project_trust_tests {
         let workspace_root = root.path().join("workspace");
         std::fs::create_dir(&workspace_root).unwrap();
         let environment = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&environment);
         let process = crate::paths::process_paths_ref().unwrap();
         crate::paths::prepare_storage_roots(process).unwrap();
         let paths = process.with_workspace_root(&workspace_root).unwrap();
-        std::fs::create_dir_all(workspace_root.join(".zerostack/prompts")).unwrap();
-        std::fs::create_dir_all(workspace_root.join(".zerostack/agents")).unwrap();
+        std::fs::create_dir_all(workspace_root.join(".mini-agent/prompts")).unwrap();
+        std::fs::create_dir_all(workspace_root.join(".mini-agent/agents")).unwrap();
         std::fs::write(
             paths.project_config_file().unwrap(),
             "default_prompt='code'\n",
         )
         .unwrap();
         std::fs::write(
-            workspace_root.join(".zerostack/prompts/owned.md"),
+            workspace_root.join(".mini-agent/prompts/owned.md"),
             "%%mode=yolo\nOWNED_PROMPT",
         )
         .unwrap();
         std::fs::write(
-            workspace_root.join(".zerostack/agents/owned.md"),
+            workspace_root.join(".mini-agent/agents/owned.md"),
             "---\ndescription: Owned specialist\n---\nOWNED_AGENT",
         )
         .unwrap();
@@ -4986,20 +5160,20 @@ pub(crate) mod bounded_project_trust_tests {
             crate::context::agents::load_for_workspace_binding(&workspace).contains_key("owned")
         );
         std::fs::rename(&workspace_root, root.path().join("retained")).unwrap();
-        std::fs::create_dir_all(workspace_root.join(".zerostack/prompts")).unwrap();
-        std::fs::create_dir_all(workspace_root.join(".zerostack/agents")).unwrap();
+        std::fs::create_dir_all(workspace_root.join(".mini-agent/prompts")).unwrap();
+        std::fs::create_dir_all(workspace_root.join(".mini-agent/agents")).unwrap();
         std::fs::write(
             paths.project_config_file().unwrap(),
             "default_prompt='code'\n",
         )
         .unwrap();
         std::fs::write(
-            workspace_root.join(".zerostack/prompts/owned.md"),
+            workspace_root.join(".mini-agent/prompts/owned.md"),
             "%%mode=yolo\nREPLACEMENT_PROMPT",
         )
         .unwrap();
         std::fs::write(
-            workspace_root.join(".zerostack/agents/owned.md"),
+            workspace_root.join(".mini-agent/agents/owned.md"),
             "REPLACEMENT_AGENT",
         )
         .unwrap();
@@ -5025,8 +5199,8 @@ pub(crate) mod bounded_project_trust_tests {
         let project = root
             .path()
             .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
-        std::fs::create_dir_all(project.join(".zerostack")).unwrap();
-        let config = project.join(".zerostack/config.toml");
+        std::fs::create_dir_all(project.join(".mini-agent")).unwrap();
+        let config = project.join(".mini-agent/config.toml");
         std::fs::write(&config, "model='benign'\nshell_timeout_secs=9\n").unwrap();
         let mut cfg = Config::default();
         assert_eq!(
@@ -5130,17 +5304,17 @@ pub(crate) mod bounded_project_trust_tests {
             assert!(result.is_err(), "{stage} FIFO must reject without blocking");
         }
         let environment = [
-            ("ZS_CONFIG_DIR", &paths.config_dir),
-            ("ZS_DATA_DIR", &paths.data_dir),
-            ("ZS_LOCAL_DATA_DIR", &paths.local_data_dir),
-            ("ZS_STATE_DIR", &paths.state_dir),
-            ("ZS_CACHE_DIR", &paths.cache_dir),
-            ("ZS_CREDENTIALS_DIR", &paths.credentials_dir),
+            ("MINI_AGENT_CONFIG_DIR", &paths.config_dir),
+            ("MINI_AGENT_DATA_DIR", &paths.data_dir),
+            ("MINI_AGENT_LOCAL_DATA_DIR", &paths.local_data_dir),
+            ("MINI_AGENT_STATE_DIR", &paths.state_dir),
+            ("MINI_AGENT_CACHE_DIR", &paths.cache_dir),
+            ("MINI_AGENT_CREDENTIALS_DIR", &paths.credentials_dir),
         ]
         .map(|(name, path)| (name, Some(path.clone().into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&environment);
-        std::fs::create_dir_all(root.join(".zerostack/prompts")).unwrap();
-        let prompt = root.join(".zerostack/prompts/fifo.md");
+        std::fs::create_dir_all(root.join(".mini-agent/prompts")).unwrap();
+        let prompt = root.join(".mini-agent/prompts/fifo.md");
         drop(crate::tests::process_gate::ProcessGate::new(&prompt).unwrap());
         assert!(
             !crate::context::prompts::load_for_workspace_binding(workspace).contains_key("fifo")

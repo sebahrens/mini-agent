@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
+use crossterm::style::Color;
+
 /// Paths per batch sent from the background walk to the picker. Small
 /// batches keep the first matches visible quickly on large trees.
 const WALK_BATCH_SIZE: usize = 25;
@@ -100,6 +102,85 @@ impl Drop for InFlight {
         if let Some(at) = running.iter().position(|root| *root == self.0) {
             running.remove(at);
         }
+    }
+}
+
+/// A closed/open flag plus the condition variable that wakes a waiter when
+/// it changes.
+#[cfg(test)]
+type WalkGateState = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+/// Test-only gates keyed by root, so a test can hold a specific root's
+/// background walk closed without affecting any other root's walk, even one
+/// racing concurrently in another test in the same binary.
+#[cfg(test)]
+static WALK_GATES: std::sync::Mutex<Vec<(PathBuf, WalkGateState)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Test-only: blocks the next background walk(s) started for `root`
+/// immediately after they start — before they touch the filesystem or
+/// publish into [`WALK_SNAPSHOT_CACHE`] — until this guard drops. Lets a
+/// test observe the shared cache and `WALKS_IN_FLIGHT` deterministically in
+/// the window between a walk starting and it publishing a new snapshot,
+/// instead of racing the real walk thread's completion (which, on a real OS
+/// thread, can finish before the test's own synchronous code runs its next
+/// assertion).
+#[cfg(test)]
+struct WalkGate(PathBuf);
+
+#[cfg(test)]
+impl WalkGate {
+    fn close(root: &Path) -> Self {
+        let state = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        WALK_GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((root.to_path_buf(), state));
+        WalkGate(root.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+impl Drop for WalkGate {
+    fn drop(&mut self) {
+        let mut gates = WALK_GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates.retain(|(root, state)| {
+            if *root != self.0 {
+                return true;
+            }
+            let (open, signal) = &**state;
+            *open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            signal.notify_all();
+            false
+        });
+    }
+}
+
+/// Blocks while a [`WalkGate`] for `root` is held; a no-op when none is.
+/// Called by the background walk thread itself, right after it starts.
+#[cfg(test)]
+fn wait_for_test_gate(root: &Path) {
+    let state = WALK_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(gate_root, _)| gate_root == root)
+        .map(|(_, state)| state.clone());
+    let Some(state) = state else {
+        return;
+    };
+    let (open, signal) = &*state;
+    let mut open = open
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while !*open {
+        open = signal
+            .wait(open)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 
@@ -237,53 +318,6 @@ pub(crate) fn take_walks_started() -> usize {
     WALKS_STARTED.with(|walks| walks.replace(0))
 }
 
-/// Test-only: roots whose background walks wait until released, so a test
-/// can observe a walk that is deterministically still in flight.
-#[cfg(test)]
-static HELD_WALKS: (std::sync::Mutex<Vec<PathBuf>>, std::sync::Condvar) =
-    (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
-
-#[cfg(test)]
-struct WalkHold(PathBuf);
-
-#[cfg(test)]
-impl WalkHold {
-    fn new(root: &Path) -> Self {
-        HELD_WALKS
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(root.to_path_buf());
-        WalkHold(root.to_path_buf())
-    }
-}
-
-#[cfg(test)]
-impl Drop for WalkHold {
-    fn drop(&mut self) {
-        let mut held = HELD_WALKS
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        held.retain(|root| *root != self.0);
-        HELD_WALKS.1.notify_all();
-    }
-}
-
-#[cfg(test)]
-fn wait_while_walk_held(root: &Path) {
-    let held = HELD_WALKS
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    drop(
-        HELD_WALKS
-            .1
-            .wait_while(held, |held| held.iter().any(|held| held == root))
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
-}
-
 #[cfg(test)]
 fn count_filter(scanned: usize, rescan: bool) {
     FILTER_COUNTS.with(|counts| {
@@ -312,6 +346,7 @@ pub struct FilePicker {
     /// Lowercase query the current `matches` were computed for.
     query_lower: String,
     monochrome: bool,
+    accent: Option<Color>,
     loading: bool,
     walk_rx: Option<mpsc::Receiver<Vec<CacheEntry>>>,
     walk_cancel: Arc<AtomicBool>,
@@ -342,6 +377,7 @@ impl FilePicker {
             virtual_len: 0,
             query_lower: String::new(),
             monochrome: false,
+            accent: None,
             loading: false,
             walk_rx: None,
             walk_cancel: Arc::new(AtomicBool::new(false)),
@@ -361,6 +397,10 @@ impl FilePicker {
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
         self.monochrome = monochrome;
+    }
+
+    pub fn set_accent_color(&mut self, accent: Option<Color>) {
+        self.accent = accent;
     }
 
     /// Opaque MCP operands are completion strings, never filesystem walk roots.
@@ -485,11 +525,11 @@ impl FilePicker {
             self.walk_rx = Some(rx);
             let running = InFlight::begin(&root);
             #[cfg(test)]
-            let held_root = root.clone();
+            let gated_root = root.clone();
             handle.spawn_blocking(move || {
                 let _running = running;
                 #[cfg(test)]
-                wait_while_walk_held(&held_root);
+                wait_for_test_gate(&gated_root);
                 let mut all = Vec::new();
                 let finished = if let Some(workspace) = workspace {
                     let mut batches = 0usize;
@@ -810,6 +850,7 @@ impl FilePicker {
             },
             self.selected,
             self.monochrome,
+            self.accent,
             None,
             floor_row,
             0,
@@ -1014,8 +1055,12 @@ mod cache_tests {
         assert_eq!(take_walks_started(), 0, "young snapshot starts no walk");
         assert!(!young.is_loading());
         backdate_snapshot(binding.root(), WALK_REVALIDATE_MIN * 2);
-        // Keep the revalidating walk in flight until both presses observed it.
-        let hold = WalkHold::new(binding.root());
+        // `second`'s background walk is real OS-thread concurrency: on a
+        // loaded machine it could publish its snapshot before the
+        // "still shows the stale cache" assertions below. Close the gate for
+        // this root so that walk blocks right after it starts, keeping it in
+        // flight until both presses observed it.
+        let gate = WalkGate::close(binding.root());
         // The next press shows the cached list at once and starts exactly
         // one background walk.
         let mut second = FilePicker::new();
@@ -1032,7 +1077,7 @@ mod cache_tests {
         assert!(third.is_loading());
         third.set_add_argument(5, ".txt");
         assert_eq!(third.matches, vec![PathBuf::from("first.txt")]);
-        drop(hold);
+        drop(gate);
         // When the walk finishes, both open pickers pick up the new file.
         finish_walk(&mut second).await;
         finish_walk(&mut third).await;

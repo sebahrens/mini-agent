@@ -229,6 +229,24 @@ fn propose_skill_backpressure_and_timeout_are_bounded() {
 }
 
 #[test]
+fn definitive_proposal_queue_failure_restores_the_session_attempt() {
+    let (sender, receiver) = ProposalQueue::bounded(1, Duration::from_millis(5));
+    drop(receiver);
+    let budget = AttemptBudget::new(1);
+    let service = ProposalEffectService::new(ProposalHost::new(sender, budget.clone()));
+    let prepared = service.authorize_reserved(proposal("")).unwrap();
+
+    assert!(matches!(
+        service.execute_prepared(prepared),
+        Err(ProposalError::QueueClosed)
+    ));
+    assert!(
+        budget.consume().is_ok(),
+        "a definitive infrastructure failure must not spend the proposal attempt"
+    );
+}
+
+#[test]
 fn propose_skill_host_worker_durably_enqueues_idempotently() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("store");
@@ -926,12 +944,12 @@ fn settled_proposal_outcomes_are_observed_once_and_queued_ones_stay_tracked() {
             skill_id: "settling-skill".to_string(),
             status: ProposalStatus::Rejected,
             reason_code: Some("duplicate_skill".to_string()),
+            detail: None,
             report_id: Some("report-1".to_string()),
         })));
     });
 
     let prepared = service.authorize_reserved(proposal("")).unwrap();
-    service.reserve_attempt().unwrap();
     service.execute_prepared(prepared).expect("enqueue");
     assert!(
         service.settled_outcomes().is_empty(),
@@ -967,12 +985,12 @@ fn settled_proposal_outcomes_are_appended_to_the_tool_result() {
             skill_id: "reported-skill".to_string(),
             status: ProposalStatus::Deferred,
             reason_code: Some("evaluation_infrastructure_deferred".to_string()),
+            detail: Some("embedded test 0 did not return exactly true".to_string()),
             report_id: None,
         })));
     });
 
     let prepared = service.authorize_reserved(proposal("")).unwrap();
-    service.reserve_attempt().unwrap();
     service.execute_prepared(prepared).expect("enqueue");
     let rendered = crate::extras::js::tool::with_settled_proposal_outcomes(
         "step result".to_string(),
@@ -982,6 +1000,7 @@ fn settled_proposal_outcomes_are_appended_to_the_tool_result() {
     assert!(rendered.contains("reported-proposal"));
     assert!(rendered.contains("settled as deferred"));
     assert!(rendered.contains("evaluation_infrastructure_deferred"));
+    assert!(rendered.contains("Detail: embedded test 0 did not return exactly true"));
     assert_eq!(
         crate::extras::js::tool::with_settled_proposal_outcomes("next step".to_string(), &service),
         "next step",

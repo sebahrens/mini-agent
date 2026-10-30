@@ -30,14 +30,15 @@ export class SessionUpdateRouter {
     loading.updates.push(notification);
   }
 
-  finish(client: acp.ClientContext, sessionId: string): PublicProtocolSession {
+  finish(client: acp.ClientContext, sessionId: string,
+    configOptions: readonly acp.SessionConfigOption[] = []): PublicProtocolSession {
     const loading = this.loading;
     this.loading = undefined;
     if (!loading || loading.overflow || (loading.expectedId && loading.expectedId !== sessionId)) {
       throw new Error('The saved ACP conversation exceeded its bounded replay or identity contract.');
     }
     const session = new PublicProtocolSession(client, sessionId, this,
-      loading.updates.filter(update => update.sessionId === sessionId).map(update => update.update));
+      loading.updates.filter(update => update.sessionId === sessionId).map(update => update.update), configOptions);
     this.current = session;
     return session;
   }
@@ -59,11 +60,24 @@ export class PublicProtocolSession implements ConversationSession {
   private disposed = false;
 
   constructor(private readonly client: acp.ClientContext, readonly sessionId: string,
-    private readonly router: SessionUpdateRouter, private replay: acp.SessionUpdate[]) {}
+    private readonly router: SessionUpdateRouter, private replay: acp.SessionUpdate[],
+    private options: readonly acp.SessionConfigOption[] = []) {}
 
   receive(update: acp.SessionUpdate): void {
     // Routing is exact-ID scoped. Late updates cannot be adopted by a new owner.
-    if (!this.disposed) { this.subscriber?.(update); }
+    if (this.disposed) { return; }
+    if (update.sessionUpdate === 'config_option_update') { this.options = update.configOptions; }
+    this.subscriber?.(update);
+  }
+
+  configOptions(): readonly acp.SessionConfigOption[] { return this.options; }
+
+  /** Select a config option value; the agent applies it from the next prompt. */
+  async setConfigOption(configId: string, value: string): Promise<void> {
+    if (this.disposed || this.activePrompt) { throw new Error('ACP conversation is unavailable or busy.'); }
+    const response = await this.client.request(acp.methods.agent.session.setConfigOption,
+      { sessionId: this.sessionId, configId, value }, { cancellationSignal: AbortSignal.timeout(10_000) });
+    if (!this.disposed) { this.options = response.configOptions; }
   }
 
   async prompt(text: string, onUpdate: (update: acp.SessionUpdate) => void,

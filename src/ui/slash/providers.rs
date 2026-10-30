@@ -439,6 +439,13 @@ fn resolve_model_pricing_with_source_from_listing(
     if let Some(prices) = live {
         return (Some(prices), "cached live listing");
     }
+    if let Some(prices) = cfg
+        .custom_providers_map()
+        .get(provider)
+        .and_then(|custom| custom.resolved_prices_for(model_id))
+    {
+        return (Some(prices), "custom provider price table");
+    }
     if let Some(prices) = Config::catalog_input_output_cost(provider, model_id) {
         return (Some(prices), "embedded catalogue");
     }
@@ -626,6 +633,10 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
                 write_result(ctx.renderer, line);
             }
         }
+        write_result(
+            ctx.renderer,
+            "usage: /provider <name>  (press Tab to list providers)",
+        );
         return Ok(());
     }
     let new_provider = parts[1].trim();
@@ -726,6 +737,10 @@ async fn handle_model(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         write_result(
             ctx.renderer,
             "  /model <alias|id> switches (Tab in the picker toggles quick aliases and provider models); /models lists them",
+        );
+        write_result(
+            ctx.renderer,
+            "usage: /model <name>  (press Tab to list provider models)",
         );
         return Ok(());
     }
@@ -954,7 +969,8 @@ fn parse_models_add<'a>(parts: &'a [&'a str]) -> Result<ModelAddArgs<'a>, ()> {
 #[cfg(any(test, feature = "subagents"))]
 const SUBAGENT_MODEL_USAGE: &str = "usage: /subagent-model <model-id>";
 #[cfg(any(test, feature = "subagents"))]
-const SUBAGENT_MODELS_USAGE: &str = "usage: /subagent-models <quick-model>";
+const SUBAGENT_MODELS_USAGE: &str =
+    "usage: /subagent-models <quick-model>  (press Tab to list options)";
 
 #[cfg(feature = "subagents")]
 async fn handle_model_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
@@ -1098,6 +1114,8 @@ async fn model_for_subagent(
         None,
         None,
         crate::extras::subagents::builder::PersonaExecution::default(),
+        #[cfg(feature = "mcp")]
+        Vec::new(),
         #[cfg(feature = "skills")]
         None,
     )
@@ -1383,6 +1401,10 @@ mod model_pricing_tests {
             rig::providers::anthropic::Client::builder()
                 .http_client(crate::provider_http::ProviderHttpClient::default())
                 .api_key("unused-test-key")
+                // The /model warm-up spawns a listing fetch; keep it on a closed
+                // local port so it never reaches the network or shares a
+                // process-wide listing-cache key with other tests.
+                .base_url("http://127.0.0.1:1")
                 .build()
                 .unwrap(),
         );
@@ -1582,6 +1604,66 @@ mod model_pricing_tests {
         );
         assert_eq!(
             resolve_model_pricing("other-provider", "live", &cfg, None),
+            None
+        );
+    }
+
+    /// mini-agent-9osxv: a `custom_providers` entry alone (no `quick_models`
+    /// alias) can price its own models, so a gateway reports `/cost`
+    /// instead of `cost:?`. It ranks between a live listing and the embedded
+    /// catalog -- more specific than the catalog, but a cached live price
+    /// still wins.
+    #[test]
+    fn custom_provider_model_prices_rank_between_live_listing_and_catalog() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "custom_providers": { "litellm-gw": {
+                "provider_type": "openai",
+                "base_url": "http://127.0.0.1:1/v1",
+                "model_prices": {
+                    "bedrock.anthropic.claude-sonnet-5-5": {
+                        "input_token_cost": 3.0,
+                        "output_token_cost": 15.0
+                    }
+                }
+            } }
+        }))
+        .unwrap();
+
+        let (pricing, provenance) = diagnostic_model_pricing(
+            "litellm-gw",
+            "bedrock.anthropic.claude-sonnet-5-5",
+            &cfg,
+            None,
+        );
+        assert_eq!(pricing, Some((3.0, 15.0)));
+        assert_eq!(provenance, "custom provider price table");
+
+        // A cached live listing for the same route still wins over the
+        // configured table.
+        let listing = [ModelEntry {
+            id: "bedrock.anthropic.claude-sonnet-5-5".into(),
+            display: "claude".into(),
+            context_length: None,
+            kind: None,
+            input_price: Some(1.0),
+            output_price: Some(2.0),
+            cache_read_price: None,
+            cache_write_price: None,
+        }];
+        assert_eq!(
+            resolve_model_pricing_from_listing(
+                "litellm-gw",
+                "bedrock.anthropic.claude-sonnet-5-5",
+                &cfg,
+                Some(&listing),
+            ),
+            Some((1.0, 2.0))
+        );
+
+        // A model absent from the table falls through to the embedded
+        // catalog (or `None` when the catalog does not know it either).
+        assert_eq!(
+            resolve_model_pricing("litellm-gw", "glm-5.3", &cfg, None),
             None
         );
     }

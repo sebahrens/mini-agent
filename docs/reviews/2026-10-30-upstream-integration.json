@@ -1,0 +1,53 @@
+{
+  "source": "../mini-agent-upstream-changes/upstream-changes.patch",
+  "base": "f202cb3d943a8ba47eb1dd983d32a225494856f9",
+  "scope": {
+    "files": 321,
+    "insertions": 31879,
+    "deletions": 3397,
+    "snapshot_check": "Every patch path matched the supplied snapshot after initial application; deleted.txt is empty. The snapshot adds no other differing payload files."
+  },
+  "integration_decisions": [
+    "Retain main release version 1.10.4, packaging recipes and CI workflow; integrate supplied runtime, helper pack, persona, configuration, provider, UI, Windows and companion-server changes.",
+    "Replace supplied free-form model exception diagnostics with closed JsDiagnosticHint values. Retain collection, top-level-return and unavailable-global guidance; reject forged message fields and keep runtime secret-disclosure controls intact.",
+    "Remove stale RUSTSEC-2026-0381 waiver: Cargo.lock already has webpki-roots 1.0.10, not affected 0.26.11. Retain original strict unused-advisory policy.",
+    "Reconcile package-policy checks with canonical project names, WEBSITE_URL and actual default features. Keep existing recipe paths and document legacy migration boundaries.",
+    "Preserve silent Windows direct probes: discard stderr instead of inheriting it. Reconcile policy tests with supplied bounded 30s run/5s reap/15s recovery windows, retaining negative controls.",
+    "Add explicit discovery and execution for supplied native Linux loader-alias and transient-launch-thread probes. Add companion-server tests to CI.",
+    "Use debug installation in the supplied Makefile to comply with repository build rules.",
+    "Preserve ZS_*_DIR path overrides from main behind MINI_AGENT_*_DIR and ahead of ZEROSTACK_*_DIR; test all three precedence cases. Update retained CI hooks to canonical names, including platform-path negative controls. Keep legacy .zerostack user files ignored.",
+    "Mark supplied Windows signing instructions as a reference policy: main retains its release workflow, which does not implement the fork signing steps or tag waivers."
+  ],
+  "review": {
+    "personas": [
+      "adversarial",
+      "reliability",
+      "testing"
+    ],
+    "focus": [
+      "worker/parent diagnostic disclosure",
+      "broker authority and terminal retirement",
+      "read_lines authorization and bounds",
+      "Linux runtime closure and spawner ownership",
+      "Windows ACL/preflight recovery",
+      "configuration narrowing and migration",
+      "companion GitHub credential isolation and pinned pushes"
+    ],
+    "limitations": "Review is an integration review, not a formal security audit. Native Linux and Windows evidence must come from hosted CI."
+  },
+  "validation_strategy": "Shared startup, protocol, dependency and feature boundaries justify the existing hosted matrix. Locally run affected Rust modules once with skills enabled, focused diagnostics and changed callers, strict Clippy and debug install. Reuse passing results and rerun only failed or subsequently changed scope. Run affected Python and VS Code suites. Hosted native probes supply platform evidence.",
+  "validation_results": {
+    "python_affected": "127 pass, 8 platform skips (native process/socket access required)",
+    "vscode": "typecheck, lint, 96 unit tests and node key tests pass",
+    "policy": "197 pass; metadata, dependency policy, workspace boundaries and feature graph pass",
+    "rust_diagnostics": "119 pass, 1 ignored",
+    "rust_affected_modules": "712 pass, 3 fixtures subsequently corrected to catch parser errors explicitly, 5 ignored",
+    "rust_affected_callers": "320 pass including corrected fixtures",
+    "remaining": "Exact pushed-head hosted CI pending.",
+    "rust_legacy_override": "1 pass covering all three prefix precedence cases",
+    "rust_protocol_integration": "6 ACP parity and 53 headless JSON tests pass",
+    "clippy": "strict all-targets skills row passed",
+    "debug_install": "passed with final embedded docs",
+    "native_macos": "Installed skills-enabled debug binary --js-runtime-check: PASS (2), on macOS 26.4.1 with canonical per-user temporary application home. Shared /private/tmp publication storage correctly refused."
+  }
+}

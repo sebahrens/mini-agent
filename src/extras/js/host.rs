@@ -21,7 +21,7 @@ use rquickjs::prelude::Opt;
 use rquickjs::{Context, prelude::Func};
 #[cfg(test)]
 use rquickjs::{Ctx, IntoJs, Object, Value};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::time::timeout;
 use unicode_normalization::UnicodeNormalization;
 
@@ -60,8 +60,10 @@ use crate::extras::js::types::PermCancellation;
 use crate::extras::js::types::STEP_TIMEOUT;
 use crate::extras::js::types::{
     DISCOVERY_MAX_RESULT_BYTES, DISCOVERY_MAX_RESULTS, DISCOVERY_MAX_VISITED_FILES,
-    DISCOVERY_PATTERN_MAX_BYTES, EffectServiceError, GREP_FILE_MAX_BYTES, READ_FILE_MAX_BYTES,
-    READ_FILES_MAX_PATH_BYTES, READ_FILES_MAX_PATHS, READ_FILES_MAX_RESULT_BYTES, SpawnResult,
+    DISCOVERY_PATTERN_MAX_BYTES, EFFECT_PATH_MAX_BYTES, EffectServiceError, FETCH_URL_MAX_BYTES,
+    GREP_FILE_MAX_BYTES, READ_FILE_MAX_BYTES, READ_FILES_MAX_PATH_BYTES, READ_FILES_MAX_PATHS,
+    READ_FILES_MAX_RESULT_BYTES, READ_LINES_MAX_COUNT, READ_LINES_MAX_LINE_BYTES,
+    READ_LINES_MAX_SCAN_BYTES, SPAWN_ARGUMENT_MAX_COUNT, SPAWN_ARGUMENTS_MAX_BYTES, SpawnResult,
     WRITE_FILE_MAX_BYTES, canonical_spawn_permission_subject, spawn_policy_input,
 };
 #[cfg(target_os = "linux")]
@@ -253,6 +255,38 @@ impl AllowConfig {
     #[cfg(test)]
     pub(crate) fn unrestricted(base: &Path) -> Self {
         Self::from_settings(base, None, None, None, true, true)
+    }
+
+    /// Normalises a failed read/discovery resolution to the policy denial when the target is
+    /// outside the configured roots (mini-agent-pyzjc): a missing path, a `/proc` file that
+    /// cannot be statted, or a symlink leaving the roots all answer `denied` with the same
+    /// reason, so the error never reveals whether an out-of-root path exists.
+    fn mask_outside_roots(
+        &self,
+        base: &Path,
+        path: &str,
+        error: EffectServiceError,
+    ) -> EffectServiceError {
+        if !matches!(
+            error,
+            EffectServiceError::NotFound
+                | EffectServiceError::BackendFailure
+                | EffectServiceError::InvalidTarget
+        ) {
+            return error;
+        }
+        let PathPolicy::Roots(roots) = &self.read else {
+            return error;
+        };
+        let inside = |candidate: &Path| roots.iter().any(|root| candidate.starts_with(root));
+        let lexical = absolute_lexical(base, Path::new(&crate::fs::expand_tilde(path)));
+        let outside = !inside(&lexical)
+            || std::fs::canonicalize(&lexical).is_ok_and(|canonical| !inside(&canonical));
+        if outside {
+            EffectServiceError::FileOutsideConfiguredRoots
+        } else {
+            error
+        }
     }
 
     /// Resolving reference decision, kept as the oracle for [`Self::authorize_read_canonical`].
@@ -1365,6 +1399,84 @@ async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, Effect
     String::from_utf8(bytes).map_err(|_| EffectServiceError::InvalidBody)
 }
 
+/// Streams `count` lines starting at 1-based `from` (or the last `-from` lines when negative).
+///
+/// Bounded three ways: at most `READ_LINES_MAX_SCAN_BYTES` are scanned, each line is truncated
+/// to `READ_LINES_MAX_LINE_BYTES`, and the returned text stops near `READ_FILE_MAX_BYTES`
+/// (`eof` is then false so the caller can continue). A trailing `\r` is stripped and no phantom
+/// empty line follows a final newline. Invalid UTF-8 is replaced rather than rejected.
+async fn read_lines_range<R: tokio::io::AsyncBufRead + Unpin>(
+    mut reader: R,
+    from: i64,
+    count: u32,
+) -> Result<(Vec<String>, bool), EffectServiceError> {
+    let count = count.min(READ_LINES_MAX_COUNT) as usize;
+    let tail = from < 0;
+    let keep = if tail {
+        from.unsigned_abs() as usize
+    } else {
+        count
+    }
+    .min(count);
+    let skip = if tail { 0 } else { (from - 1) as u64 };
+    let mut out: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut out_bytes = 0usize;
+    let mut line_no = 0u64;
+    let mut scanned = 0u64;
+    let mut current: Vec<u8> = Vec::new();
+    let mut eof = false;
+    let mut stopped = false;
+    while !stopped {
+        let chunk = reader.fill_buf().await.map_err(file_path_error)?;
+        if chunk.is_empty() {
+            eof = true;
+            if current.is_empty() {
+                break;
+            }
+        }
+        let (take, complete) = match chunk.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (index + 1, true),
+            None => (chunk.len(), false),
+        };
+        let room = READ_LINES_MAX_LINE_BYTES.saturating_sub(current.len());
+        let end = if complete { take - 1 } else { take };
+        current.extend_from_slice(&chunk[..end.min(room)]);
+        reader.consume(take);
+        scanned += take as u64;
+        if scanned > READ_LINES_MAX_SCAN_BYTES {
+            return Err(EffectServiceError::OutputLimit);
+        }
+        if !complete && !eof {
+            continue;
+        }
+        line_no += 1;
+        if current.last() == Some(&b'\r') {
+            current.pop();
+        }
+        if line_no > skip {
+            let text = String::from_utf8_lossy(&current).into_owned();
+            out_bytes += text.len();
+            out.push_back(text);
+            if tail {
+                while out.len() > keep || out_bytes > READ_FILE_MAX_BYTES {
+                    out_bytes -= out.pop_front().map_or(0, |line| line.len());
+                }
+            } else if out.len() >= keep || out_bytes >= READ_FILE_MAX_BYTES {
+                stopped = true;
+            }
+        }
+        current.clear();
+        if eof {
+            break;
+        }
+    }
+    if stopped && !eof {
+        // Probe whether anything follows so `eof` is accurate when the range ends exactly there.
+        eof = reader.fill_buf().await.map_err(file_path_error)?.is_empty();
+    }
+    Ok((out.into(), eof))
+}
+
 async fn resolve_write_target(
     base: &Path,
     path: &str,
@@ -1570,7 +1682,12 @@ impl FileEffectService {
                 EffectTargetPath::Ambient(path) => path,
             };
             let effect_base = self.allow_config.effect_base();
-            let target = resolve_read_target(&effect_base, &path).await?;
+            let target = resolve_read_target(&effect_base, &path)
+                .await
+                .map_err(|error| {
+                    self.allow_config
+                        .mask_outside_roots(&effect_base, &path, error)
+                })?;
             if let AuthorizationDecision::Denied(reason) =
                 self.allow_config.authorize_read(&target.path)
             {
@@ -1599,6 +1716,56 @@ impl FileEffectService {
                 PreparedReadEffect::Path(target) => read_approved_file(target).await,
                 PreparedReadEffect::Bound { file, .. } => read_capability_file(file).await,
             }
+        };
+        tokio::select! {
+            result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
+            _ = bridge.cancelled() => Err(EffectServiceError::Cancelled),
+        }
+    }
+
+    async fn execute_read_lines(
+        &self,
+        prepared: PreparedReadEffect,
+        from: i64,
+        count: u32,
+        bridge: PermissionBridge,
+    ) -> Result<(Vec<String>, bool), EffectServiceError> {
+        let call = async {
+            let file = match prepared {
+                PreparedReadEffect::Path(target) => {
+                    if !target.identity.is_file() {
+                        return Err(if target.identity.is_dir() {
+                            EffectServiceError::IsDirectory
+                        } else {
+                            EffectServiceError::InvalidTarget
+                        });
+                    }
+                    let file = crate::fs::open_stable_file(&target.path)
+                        .await
+                        .map_err(file_path_error)?;
+                    let opened = crate::fs::checked_tokio_file_metadata(&file)
+                        .await
+                        .map_err(file_path_error)?;
+                    crate::fs::ensure_same_file(&target.path, &target.identity, &opened)
+                        .map_err(file_path_error)?;
+                    if !opened.is_file() {
+                        return Err(EffectServiceError::InvalidTarget);
+                    }
+                    file
+                }
+                PreparedReadEffect::Bound { file, .. } => {
+                    let metadata = file.metadata().map_err(file_path_error)?;
+                    if !metadata.is_file() {
+                        return Err(if metadata.is_dir() {
+                            EffectServiceError::IsDirectory
+                        } else {
+                            EffectServiceError::InvalidTarget
+                        });
+                    }
+                    tokio::fs::File::from_std(file)
+                }
+            };
+            read_lines_range(tokio::io::BufReader::new(file), from, count).await
         };
         tokio::select! {
             result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
@@ -2160,7 +2327,6 @@ pub(crate) fn make_propose_skill(
         let prepared = service
             .authorize_reserved(proposal)
             .map_err(proposal_host_error)?;
-        service.reserve_attempt().map_err(proposal_host_error)?;
         let result = service
             .execute_prepared(prepared)
             .map_err(proposal_host_error)?;
@@ -2898,6 +3064,21 @@ fn compile_discovery_grep(
     Ok(DiscoveryAction::Grep { matcher, include })
 }
 
+/// Hide everything except the regular file `name` directly under the walk root
+/// (directories are all hidden, so nothing below the root is visited).
+fn only_file_filter(
+    inner: Option<crate::agent::tools::find_files::PathFilter>,
+    name: std::ffi::OsString,
+) -> crate::agent::tools::find_files::PathFilter {
+    std::sync::Arc::new(move |path: &Path, is_directory: bool| {
+        is_directory
+            || path.file_name() != Some(name.as_os_str())
+            || inner
+                .as_ref()
+                .is_some_and(|hidden| hidden(path, is_directory))
+    })
+}
+
 async fn prepare_discovery_root(
     file: &FileEffectService,
     path: &str,
@@ -2916,17 +3097,40 @@ async fn prepare_discovery_root(
                 .logical_relative_path(&relative)
                 .map_err(file_path_error)?;
             let workspace_relative = workspace_relative_path(workspace.root(), &logical)?;
-            let root = workspace
-                .open_relative_directory_file(&relative)
-                .map_err(file_path_error)?;
+            let hidden = file
+                .permission_bridge
+                .walk_deny_filter(tool, Some(workspace.root()));
+            let (root, walk_root, hidden) = match workspace.open_relative_directory_file(&relative)
+            {
+                Ok(root) => (root, logical.clone(), hidden),
+                Err(error) => {
+                    // mini-agent-6v01f: a grep `path` naming one regular file searches
+                    // just that file. The same capability open `read_file` uses proves
+                    // it is a regular file inside the workspace; the walk then runs over
+                    // its capability-bound parent with every other entry hidden.
+                    let name = match (&action, relative.file_name()) {
+                        (DiscoveryAction::Grep { .. }, Some(name))
+                            if workspace.open_regular_relative(&relative).is_ok() =>
+                        {
+                            name.to_owned()
+                        }
+                        _ => return Err(HostEffectError::from(file_path_error(error))),
+                    };
+                    let parent = relative.parent().unwrap_or(Path::new(""));
+                    let root = workspace
+                        .open_relative_directory_file(parent)
+                        .map_err(file_path_error)?;
+                    let parent_logical = workspace
+                        .logical_relative_path(parent)
+                        .map_err(file_path_error)?;
+                    (root, parent_logical, Some(only_file_filter(hidden, name)))
+                }
+            };
             // mini-agent-c1o7m: entries the tool's (and `read`'s) path deny
             // rules hide are skipped, and denied directories are pruned.
-            let directory = BoundDirectory::from_file(&logical, root)
+            let directory = BoundDirectory::from_file(&walk_root, root)
                 .map_err(file_path_error)?
-                .with_hidden_filter(
-                    file.permission_bridge
-                        .walk_deny_filter(tool, Some(workspace.root())),
-                );
+                .with_hidden_filter(hidden);
             return Ok((
                 PreparedDiscoveryEffect {
                     directory,
@@ -2942,20 +3146,45 @@ async fn prepare_discovery_root(
     };
 
     let absolute = absolute_lexical(&output_base, Path::new(&expanded));
+    let mask = |error| {
+        file.allow_config
+            .mask_outside_roots(&output_base, &expanded, error)
+    };
     let canonical = tokio::select! {
-        result = tokio::fs::canonicalize(absolute) => result.map_err(file_path_error)?,
+        result = tokio::fs::canonicalize(absolute) => {
+            result.map_err(|error| mask(file_path_error(error)))?
+        }
         _ = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
     };
     let identity = tokio::select! {
-        result = crate::fs::stable_path_metadata(&canonical) => result.map_err(file_path_error)?,
+        result = crate::fs::stable_path_metadata(&canonical) => {
+            result.map_err(|error| mask(file_path_error(error)))?
+        }
         _ = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
     };
-    if !identity.is_dir() {
+    let hidden = file.permission_bridge.walk_deny_filter(tool, None);
+    let (directory, hidden) = if identity.is_dir() {
+        (
+            BoundDirectory::open(&canonical, &identity).map_err(file_path_error)?,
+            hidden,
+        )
+    } else if matches!(action, DiscoveryAction::Grep { .. }) && identity.is_file() {
+        // mini-agent-6v01f: a single-file grep path; see the workspace-bound branch.
+        let (Some(parent), Some(name)) = (canonical.parent(), canonical.file_name()) else {
+            return Err(HostEffectError::InvalidTarget);
+        };
+        let parent_identity = tokio::select! {
+            result = crate::fs::stable_path_metadata(parent) => result.map_err(file_path_error)?,
+            _ = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
+        };
+        (
+            BoundDirectory::open(parent, &parent_identity).map_err(file_path_error)?,
+            Some(only_file_filter(hidden, name.to_owned())),
+        )
+    } else {
         return Err(HostEffectError::InvalidTarget);
-    }
-    let directory = BoundDirectory::open(&canonical, &identity)
-        .map_err(file_path_error)?
-        .with_hidden_filter(file.permission_bridge.walk_deny_filter(tool, None));
+    };
+    let directory = directory.with_hidden_filter(hidden);
     let workspace_relative = workspace_relative_path(&output_base, &canonical)?;
     Ok((
         PreparedDiscoveryEffect {
@@ -3283,6 +3512,7 @@ async fn prepare_parent_read(
     let target = tokio::select! {
         result = timeout(file.timeout, resolve_read_target(&effect_base, &path)) => {
             result.map_err(|_| HostEffectError::EffectTimedOut)?
+                .map_err(|error| file.allow_config.mask_outside_roots(&effect_base, &path, error))
                 .map_err(HostEffectError::from)?
         }
         _ = cancellation.cancelled() => {
@@ -3375,6 +3605,36 @@ async fn authorize_parent_read(
 
 /// Concrete implementation of the A11 parent effect seam. Authorization
 /// stores a prepared, exact target; execution can only consume that target.
+fn validate_effect_request_bounds(operation: &EffectOperation) -> Result<(), HostEffectError> {
+    let path = match operation {
+        EffectOperation::ReadFile { path }
+        | EffectOperation::ReadLines { path, .. }
+        | EffectOperation::ListDir { path }
+        | EffectOperation::Glob { path, .. }
+        | EffectOperation::Grep { path, .. }
+        | EffectOperation::WriteFile { path, .. } => Some(path),
+        _ => None,
+    };
+    if path.is_some_and(|path| path.len() > EFFECT_PATH_MAX_BYTES) {
+        return Err(HostEffectError::OutputLimit);
+    }
+    match operation {
+        EffectOperation::Spawn { program, arguments }
+            if arguments.len() > SPAWN_ARGUMENT_MAX_COUNT
+                || std::iter::once(program.len())
+                    .chain(arguments.iter().map(String::len))
+                    .try_fold(0_usize, usize::checked_add)
+                    .is_none_or(|bytes| bytes > SPAWN_ARGUMENTS_MAX_BYTES) =>
+        {
+            Err(HostEffectError::OutputLimit)
+        }
+        EffectOperation::Fetch { url, .. } if url.len() > FETCH_URL_MAX_BYTES => {
+            Err(HostEffectError::OutputLimit)
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(crate) struct ParentHostEffectService {
     file: FileEffectService,
     spawn: SpawnEffectService,
@@ -3435,8 +3695,20 @@ impl ParentEffectService for ParentHostEffectService {
     ) -> Result<(), HostEffectError> {
         self.validated = None;
         self.authorized = None;
+        validate_effect_request_bounds(operation)?;
         match operation {
-            EffectOperation::ReadFile { path } if path.is_empty() || path.contains('\0') => {
+            EffectOperation::ReadFile { path }
+                if path.is_empty() || path.contains('\0') || path.len() > EFFECT_PATH_MAX_BYTES =>
+            {
+                Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::ReadLines { path, from, count }
+                if path.is_empty()
+                    || path.contains('\0')
+                    || *from == 0
+                    || *count == 0
+                    || *count > READ_LINES_MAX_COUNT =>
+            {
                 Err(HostEffectError::InvalidTarget)
             }
             EffectOperation::ReadFiles { paths }
@@ -3456,12 +3728,15 @@ impl ParentEffectService for ParentHostEffectService {
             {
                 Err(HostEffectError::OutputLimit)
             }
-            EffectOperation::ListDir { path } if path.is_empty() || path.contains('\0') => {
+            EffectOperation::ListDir { path }
+                if path.is_empty() || path.contains('\0') || path.len() > EFFECT_PATH_MAX_BYTES =>
+            {
                 Err(HostEffectError::InvalidTarget)
             }
             EffectOperation::Glob { path, pattern }
                 if path.is_empty()
                     || path.contains('\0')
+                    || path.len() > EFFECT_PATH_MAX_BYTES
                     || pattern.is_empty()
                     || pattern.contains('\0')
                     || pattern.len() > DISCOVERY_PATTERN_MAX_BYTES =>
@@ -3474,6 +3749,7 @@ impl ParentEffectService for ParentHostEffectService {
                 options,
             } if path.is_empty()
                 || path.contains('\0')
+                || path.len() > EFFECT_PATH_MAX_BYTES
                 || pattern.is_empty()
                 || pattern.contains('\0')
                 || pattern.len() > DISCOVERY_PATTERN_MAX_BYTES
@@ -3487,6 +3763,9 @@ impl ParentEffectService for ParentHostEffectService {
             }
             EffectOperation::WriteFile { path, .. } if path.is_empty() || path.contains('\0') => {
                 Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::WriteFile { path, .. } if path.len() > EFFECT_PATH_MAX_BYTES => {
+                Err(HostEffectError::OutputLimit)
             }
             EffectOperation::WriteFile { content, .. } if content.len() > WRITE_FILE_MAX_BYTES => {
                 Err(HostEffectError::OutputLimit)
@@ -3519,8 +3798,20 @@ impl ParentEffectService for ParentHostEffectService {
             {
                 Err(HostEffectError::InvalidTarget)
             }
+            EffectOperation::Spawn { program, arguments }
+                if arguments.len() > SPAWN_ARGUMENT_MAX_COUNT
+                    || std::iter::once(program.len())
+                        .chain(arguments.iter().map(String::len))
+                        .try_fold(0_usize, usize::checked_add)
+                        .is_none_or(|bytes| bytes > SPAWN_ARGUMENTS_MAX_BYTES) =>
+            {
+                Err(HostEffectError::OutputLimit)
+            }
             EffectOperation::Fetch { url, .. } if url.is_empty() || url.contains('\0') => {
                 Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::Fetch { url, .. } if url.len() > FETCH_URL_MAX_BYTES => {
+                Err(HostEffectError::OutputLimit)
             }
             #[cfg(feature = "skills")]
             EffectOperation::ProposeSkill { draft } => {
@@ -3538,9 +3829,6 @@ impl ParentEffectService for ParentHostEffectService {
                             |error| HostEffectError::from(proposal_service_error(error)),
                         )?)
                         .map_err(|error| HostEffectError::from(proposal_service_error(error)))?;
-                proposal
-                    .reserve_attempt()
-                    .map_err(|error| HostEffectError::from(proposal_service_error(error)))?;
                 self.validated = Some(PreparedParentEffect::Proposal(prepared));
                 Ok(())
             }
@@ -3647,7 +3935,7 @@ impl ParentEffectService for ParentHostEffectService {
                 self.validated = None;
             }
             match operation {
-                EffectOperation::ReadFile { path } => {
+                EffectOperation::ReadFile { path } | EffectOperation::ReadLines { path, .. } => {
                     validate_effect_workspace(&self.file, &cancellation).await?;
                     let (target, workspace_relative) =
                         prepare_parent_read(&self.file, path, cancellation).await?;
@@ -4100,7 +4388,7 @@ impl ParentEffectService for ParentHostEffectService {
     fn execute<'a>(
         &'a mut self,
         _authorized: &'a AuthorizedEffect,
-        _operation: &'a EffectOperation,
+        operation: &'a EffectOperation,
         cancellation: PermCancellation,
     ) -> ParentEffectFuture<'a, Result<EffectResult, HostEffectError>> {
         Box::pin(async move {
@@ -4111,6 +4399,14 @@ impl ParentEffectService for ParentHostEffectService {
             match prepared {
                 PreparedParentEffect::Read(target) => {
                     let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    if let EffectOperation::ReadLines { from, count, .. } = operation {
+                        let (lines, eof) = self
+                            .file
+                            .execute_read_lines(target, *from, *count, bridge)
+                            .await
+                            .map_err(HostEffectError::from)?;
+                        return Ok(EffectResult::ReadLines { lines, eof });
+                    }
                     let content = self
                         .file
                         .execute_read(target, bridge)
@@ -4364,20 +4660,67 @@ mod tests {
         assert_eq!(decode_spawn_stream(b"ok \xf0\x9f", false), "ok �");
     }
 
+    #[test]
+    fn parent_rejects_oversized_effect_targets_before_permission_or_audit() {
+        assert_eq!(
+            validate_effect_request_bounds(&EffectOperation::ReadFile {
+                path: "p".repeat(EFFECT_PATH_MAX_BYTES + 1),
+            }),
+            Err(HostEffectError::OutputLimit)
+        );
+        assert_eq!(
+            validate_effect_request_bounds(&EffectOperation::Spawn {
+                program: "tool".into(),
+                arguments: vec!["x".into(); SPAWN_ARGUMENT_MAX_COUNT + 1],
+            }),
+            Err(HostEffectError::OutputLimit)
+        );
+        assert_eq!(
+            validate_effect_request_bounds(&EffectOperation::Fetch {
+                url: "u".repeat(FETCH_URL_MAX_BYTES + 1),
+                method: crate::extras::js::protocol::HttpMethod::Get,
+                headers: Vec::new(),
+                body: None,
+            }),
+            Err(HostEffectError::OutputLimit)
+        );
+    }
+
     use crate::tests::support::temp::TempDir;
 
+    /// Small size limits with timeouts that are incidental to the test.
+    ///
+    /// Size, encoding, redirect and cancellation tests must not depend on the
+    /// local test server being scheduled within a few milliseconds, so the
+    /// timeouts here are generous enough to survive heavy CPU contention.
+    /// Tests that exercise a deadline use [`timeout_fetch_limits`] instead.
     #[cfg(feature = "sandbox")]
     fn test_fetch_limits() -> FetchLimits {
         FetchLimits {
-            connect_timeout: Duration::from_millis(100),
-            read_timeout: Duration::from_millis(50),
-            total_timeout: Duration::from_millis(150),
+            connect_timeout: Duration::from_secs(30),
+            read_timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(60),
             request_header_max_bytes: 128,
             request_header_max_count: 8,
             request_body_max_bytes: 1024,
             response_header_max_bytes: 128,
             response_header_max_count: 8,
             response_body_max_bytes: 1024,
+        }
+    }
+
+    /// Small size limits with deadlines that are the property under test.
+    ///
+    /// Stalled servers are synchronized so they provably do not respond
+    /// before these deadlines fire, while the deadlines are long enough that
+    /// a promptly answering server still completes under CPU contention.
+    #[cfg(feature = "sandbox")]
+    fn timeout_fetch_limits() -> FetchLimits {
+        FetchLimits {
+            connect_timeout: Duration::from_secs(30),
+            read_timeout: Duration::from_secs(1),
+            total_timeout: Duration::from_secs(3),
+            ..test_fetch_limits()
         }
     }
 
@@ -4402,7 +4745,7 @@ mod tests {
         use std::io::Read as _;
 
         stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         let mut request = Vec::new();
         let mut buffer = [0_u8; 512];
@@ -4578,11 +4921,11 @@ mod tests {
     fn js_fetch_transport_bounds_slow_headers_and_body_then_recovers() {
         use std::io::Write as _;
 
-        let transport = FetchTransport::with_limits(test_fetch_limits(), None).unwrap();
+        let transport = FetchTransport::with_limits(timeout_fetch_limits(), None).unwrap();
         let (release_headers_tx, release_headers_rx) = std::sync::mpsc::channel();
         let (slow_headers_url, slow_headers_server) = serve_fetch_once(move |mut stream| {
             read_fetch_request(&mut stream);
-            let _ = release_headers_rx.recv_timeout(Duration::from_secs(1));
+            let _ = release_headers_rx.recv_timeout(Duration::from_secs(60));
             let _ = stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         });
@@ -4598,7 +4941,7 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
                 .unwrap();
             stream.flush().unwrap();
-            let _ = release_body_rx.recv_timeout(Duration::from_secs(1));
+            let _ = release_body_rx.recv_timeout(Duration::from_secs(60));
             let _ = stream.write_all(b"hello");
         });
         let slow_body = transport.execute(slow_body_url, &FetchRequest::get(), || false);
@@ -4613,11 +4956,15 @@ mod tests {
                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
                 )
                 .unwrap();
-            for _ in 0..100 {
-                if stream.write_all(b"1\r\nx\r\n").is_err() {
+            // Trickle one byte every 10 ms until the client hangs up: each
+            // read succeeds well inside the read timeout and the 1 KiB body
+            // limit is not reached before the 3 s total deadline, so only the
+            // total wall-clock bound can end the exchange.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                if stream.write_all(b"1\r\nx\r\n").is_err() || stream.flush().is_err() {
                     break;
                 }
-                stream.flush().unwrap();
                 std::thread::sleep(Duration::from_millis(10));
             }
         });
@@ -4829,9 +5176,22 @@ mod tests {
         }
     }
 
+    /// Upper bound for wall-clock "eventually" waits in the DNS budget tests. It only bounds
+    /// how long a broken invariant takes to fail; a passing run returns as soon as the
+    /// observed state is reached, so it is generous enough for a loaded parallel test run.
+    #[cfg(feature = "sandbox")]
+    const DNS_TEST_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Resolver timeout for the recovery lookup in the DNS budget tests. Recovery must prove
+    /// that capacity came back, not race a short wall-clock deadline: under a loaded parallel
+    /// run, acquiring the permit, scheduling the lookup task and starting its blocking worker
+    /// can exceed the 50 ms timeout the tests use to provoke `TimedOut`.
+    #[cfg(feature = "sandbox")]
+    const DNS_TEST_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
     #[cfg(feature = "sandbox")]
     async fn wait_for_dns_activity(lookup: &BlockingDnsLookup, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(DNS_TEST_SETTLE_TIMEOUT, async {
             while lookup.active() != expected {
                 tokio::task::yield_now().await;
             }
@@ -4842,7 +5202,7 @@ mod tests {
 
     #[cfg(all(feature = "sandbox", feature = "multithread"))]
     fn wait_for_dns_activity_blocking(lookup: &BlockingDnsLookup, expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + DNS_TEST_SETTLE_TIMEOUT;
         while lookup.active() != expected && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -4892,7 +5252,7 @@ mod tests {
 
         lookup.release();
         wait_for_dns_activity(&lookup, 0).await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(DNS_TEST_SETTLE_TIMEOUT, async {
             while budget.available_permits() != 2 {
                 tokio::task::yield_now().await;
             }
@@ -4901,11 +5261,21 @@ mod tests {
         .expect("DNS permits were not released after lookup completion");
         assert_eq!(budget.available_permits(), 2);
 
+        // Recovery shares the same budget and lookup; only the caller's timeout is widened so a
+        // slow scheduler cannot turn recovered capacity into `TimedOut`.
+        drop(resolver);
+        let recovery_resolver = RuntimeFetchResolver::with_lookup_for_test(
+            tokio::runtime::Handle::current(),
+            budget.clone(),
+            lookup.clone(),
+            DNS_TEST_RECOVERY_TIMEOUT,
+        );
         let bridge = owner.bridge();
-        let recovered =
-            tokio::task::spawn_blocking(move || resolver.resolve("example.com", 443, &bridge))
-                .await
-                .expect("recovery resolve task panicked");
+        let recovered = tokio::task::spawn_blocking(move || {
+            recovery_resolver.resolve("example.com", 443, &bridge)
+        })
+        .await
+        .expect("recovery resolve task panicked");
         assert_eq!(recovered, Ok(vec![public_address()]));
     }
 
@@ -4963,15 +5333,24 @@ mod tests {
         lookup.release();
         wait_for_dns_activity_blocking(&lookup, 0);
         let _ = first.join();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + DNS_TEST_SETTLE_TIMEOUT;
         while budget.available_permits() != 1 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(budget.available_permits(), 1);
 
+        // Recovery shares the replacement runtime, budget and lookup; only the caller's timeout
+        // is widened so a slow scheduler cannot turn recovered capacity into `TimedOut`.
+        drop(replacement_resolver);
+        let recovery_resolver = RuntimeFetchResolver::with_lookup_for_test(
+            replacement.handle().clone(),
+            budget.clone(),
+            lookup.clone(),
+            DNS_TEST_RECOVERY_TIMEOUT,
+        );
         let bridge = owner.bridge();
         let recovered =
-            std::thread::spawn(move || replacement_resolver.resolve("third.example", 443, &bridge))
+            std::thread::spawn(move || recovery_resolver.resolve("third.example", 443, &bridge))
                 .join()
                 .unwrap();
         assert_eq!(recovered, Ok(vec![public_address()]));
@@ -5872,6 +6251,96 @@ mod tests {
         }
     }
 
+    // mini-agent-6v01f: a single-file grep `path` reuses the read capability and deny
+    // rules; directories, siblings, symlinks and denied files keep their old behavior.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn brokered_grep_accepts_a_single_file_path_under_read_rules() {
+        let directory = TempDir::new("js-grep-file");
+        let base = directory.path().canonicalize().unwrap();
+        let workspace_root = base.join("workspace");
+        std::fs::create_dir_all(workspace_root.join("config")).unwrap();
+        std::fs::write(workspace_root.join("config/app.txt"), "x\nneedle app\n").unwrap();
+        std::fs::write(
+            workspace_root.join("config/sibling.txt"),
+            "needle sibling\n",
+        )
+        .unwrap();
+        std::fs::write(workspace_root.join("config/token.txt"), "needle token\n").unwrap();
+        std::fs::write(base.join("outside.txt"), "needle outside\n").unwrap();
+        std::os::unix::fs::symlink(
+            base.join("outside.txt"),
+            workspace_root.join("config/link.txt"),
+        )
+        .unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [("config/token.txt".to_string(), Action::Deny)].into(),
+            )),
+            doom_loop: Some(Action::Allow),
+            ..PermissionConfig::default()
+        };
+        let permission = Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(workspace_root.clone()),
+                Some(vec!["standard".to_string()]),
+            )
+            .unwrap(),
+        ));
+        let (mut broker, grant, _owner) =
+            bound_file_broker(&base, &workspace_root, Some(permission), "gfile");
+        let absolute = workspace_root.join("config/app.txt");
+        let mut ordinal = 0;
+        let mut grep = async |path: String| {
+            let result = broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        ordinal,
+                        EffectOperation::Grep {
+                            path,
+                            pattern: "needle".into(),
+                            options: GrepOptions::default(),
+                        },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await;
+            ordinal += 1;
+            result
+        };
+        for path in [
+            "config/app.txt".to_string(),
+            absolute.to_string_lossy().into_owned(),
+        ] {
+            let Ok(EffectResult::Grep { matches, truncated }) = grep(path.clone()).await else {
+                panic!("{path}: single-file grep must succeed");
+            };
+            assert!(!truncated);
+            assert_eq!(matches.len(), 1, "{path}");
+            assert_eq!(matches[0].path, "config/app.txt", "{path}");
+            assert_eq!(matches[0].line, 2);
+        }
+        // A read-denied file is refused or hidden, never searched; a symlink is never followed.
+        for path in ["config/token.txt", "config/link.txt"] {
+            match grep(path.into()).await {
+                Err(_) => {}
+                Ok(EffectResult::Grep { matches, .. }) => assert!(matches.is_empty(), "{path}"),
+                Ok(other) => panic!("{path}: {other:?}"),
+            }
+        }
+        assert!(grep("config/missing.txt".into()).await.is_err(), "missing");
+        let Ok(EffectResult::Grep { matches, .. }) = grep("config".into()).await else {
+            panic!("directory grep must still work");
+        };
+        assert_eq!(
+            matches.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
+            vec!["config/app.txt", "config/sibling.txt"]
+        );
+    }
+
     #[cfg(feature = "skills")]
     fn scoped_host_broker(
         directory: &TempDir,
@@ -5907,6 +6376,7 @@ mod tests {
         let capability = match &request.operation {
             EffectOperation::ReadFile { .. }
             | EffectOperation::ReadFiles { .. }
+            | EffectOperation::ReadLines { .. }
             | EffectOperation::ListDir { .. }
             | EffectOperation::Glob { .. }
             | EffectOperation::Grep { .. } => HostCapability::ReadFile,
@@ -7222,18 +7692,44 @@ mod tests {
             outer_timeout,
         );
 
-        let host_call = tokio::task::spawn_blocking(move || {
+        // Both the 25 ms outer timeout and the 250 ms cancellation drain run on this runtime's
+        // clock. On wall-clock time a loaded parallel run could expire the outer timeout before
+        // the executor thread even reached the permission prompt, or expire the drain before
+        // the cancelled executor unwound. Pause virtual time before the host call starts: the
+        // running blocking tasks inhibit auto-advance, so no timer fires until the test
+        // advances it, and the executor is provably parked on the permission prompt first.
+        tokio::time::pause();
+        let mut host_call = tokio::task::spawn_blocking(move || {
             fetch("https://example.com/".to_string(), Opt(None))
                 .expect_err("permission wait must exceed the outer timeout")
                 .to_string()
         });
-        let permission = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
+        let permission = ask_rx
+            .recv()
             .await
             .expect("fetch must reach permission before its outer timeout")
-            .expect("permission channel closed")
             .into_permission();
-        let error = tokio::time::timeout(Duration::from_secs(1), host_call)
-            .await
+        // The host-call thread arms the outer timer on its first poll, which can race with the
+        // prompt above, so step virtual time one outer timeout at a time until the host call
+        // settles. The total advance stays below the cancellation drain timeout, so the drain
+        // can only end by the executor actually unwinding, never by its own timer.
+        let max_steps =
+            FETCH_CANCELLATION_DRAIN_TIMEOUT.as_millis() / outer_timeout.as_millis() - 1;
+        let mut settled = None;
+        for _ in 0..max_steps {
+            tokio::time::advance(outer_timeout).await;
+            let real_wait =
+                tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(200)));
+            tokio::select! {
+                result = &mut host_call => {
+                    settled = Some(result);
+                    break;
+                }
+                _ = real_wait => {}
+            }
+        }
+        tokio::time::resume();
+        let error = settled
             .expect("outer timeout must return")
             .expect("fetch host-call task panicked");
         let retained_executor_after_timeout = Arc::strong_count(&executor);
@@ -7885,6 +8381,45 @@ mod tests {
         expect_denied(
             policy.authorize_read(&safe.join("..").join("safe-evil").join("secret.txt")),
             AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+    }
+
+    #[test]
+    fn unresolvable_out_of_root_reads_are_masked_as_denied_but_in_root_misses_stay_not_found() {
+        // mini-agent-pyzjc
+        let temp = TempDir::new("js-mask-outside");
+        let safe = temp.path().join("safe");
+        std::fs::create_dir_all(&safe).unwrap();
+        let safe = safe.canonicalize().unwrap();
+        let roots = vec![safe.to_string_lossy().into_owned()];
+        let policy =
+            AllowConfig::from_settings(&safe, None, Some(&roots), Some(&roots), false, false);
+        let mask = |path: &str, error| policy.mask_outside_roots(&safe, path, error);
+        for path in [
+            "/etc/passwd",
+            "/proc/self/environ",
+            "/definitely/missing/file",
+            "../outside-missing.txt",
+            "sub/../../escape",
+        ] {
+            for error in [
+                EffectServiceError::NotFound,
+                EffectServiceError::BackendFailure,
+            ] {
+                assert_eq!(
+                    mask(path, error),
+                    EffectServiceError::FileOutsideConfiguredRoots,
+                    "{path}"
+                );
+            }
+        }
+        assert_eq!(
+            mask("missing.txt", EffectServiceError::NotFound),
+            EffectServiceError::NotFound
+        );
+        assert_eq!(
+            mask("/etc/passwd", EffectServiceError::OutputLimit),
+            EffectServiceError::OutputLimit
         );
     }
 
@@ -9321,15 +9856,23 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
         let bridge = owner.bridge();
+        // The effect timeout is also the absolute wall-clock deadline for executable
+        // preparation (PATH resolution, identity checks and the sealed snapshot copy on a
+        // bounded, process-wide pool of preparation slots shared with concurrently running
+        // spawn tests). A 25 ms budget let a loaded parallel run expire that deadline before
+        // the process ever started, which correctly reports `effect timed out` instead of the
+        // execution timeout this test proves. Keep a budget preparation always meets while the
+        // child still outlives it by an order of magnitude, so only the process deadline fires.
+        let spawn_timeout = Duration::from_secs(2);
         let result = tokio::task::spawn_blocking(move || {
             let _owner = owner;
             let spawn = make_spawn_with_timeout(
                 Sandbox::new(false, "bwrap"),
                 bridge,
                 runtime,
-                Duration::from_millis(25),
+                spawn_timeout,
             );
-            spawn("sleep".to_string(), vec!["5".to_string()])
+            spawn("sleep".to_string(), vec!["60".to_string()])
                 .expect("spawn should return Ok with timed_out=true, not Err")
         })
         .await
@@ -9340,5 +9883,42 @@ mod tests {
             "timed_out must be true when deadline expires"
         );
         assert_eq!(result.code, -1, "timed-out process has no exit code");
+    }
+
+    #[tokio::test]
+    async fn read_lines_range_streams_head_tail_and_bounds_long_lines() {
+        let data: &[u8] = b"one\r\ntwo\nthree\n";
+        let run = |from: i64, count: u32| async move {
+            super::read_lines_range(tokio::io::BufReader::new(data), from, count)
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            run(1, 10).await,
+            (vec!["one".into(), "two".into(), "three".into()], true)
+        );
+        assert_eq!(run(2, 1).await, (vec!["two".into()], false));
+        assert_eq!(
+            run(-2, 10).await,
+            (vec!["two".into(), "three".into()], true)
+        );
+        assert_eq!(run(9, 1).await, (Vec::<String>::new(), true));
+        // A final line without a newline is still a line; empty input has none.
+        let (lines, eof) = super::read_lines_range(tokio::io::BufReader::new(&b"a\nb"[..]), 1, 5)
+            .await
+            .unwrap();
+        assert_eq!((lines, eof), (vec!["a".into(), "b".into()], true));
+        let (lines, _) = super::read_lines_range(tokio::io::BufReader::new(&b""[..]), 1, 5)
+            .await
+            .unwrap();
+        assert!(lines.is_empty());
+        // Over-long lines are truncated but still counted as one line.
+        let mut long = vec![b'z'; READ_LINES_MAX_LINE_BYTES * 3];
+        long.extend_from_slice(b"\nnext\n");
+        let (lines, _) = super::read_lines_range(tokio::io::BufReader::new(&long[..]), 1, 5)
+            .await
+            .unwrap();
+        assert_eq!(lines[0].len(), READ_LINES_MAX_LINE_BYTES);
+        assert_eq!(lines[1], "next");
     }
 }

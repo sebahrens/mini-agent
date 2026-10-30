@@ -130,23 +130,22 @@ or changes HOME. It must run under **MSYS POSIX `/usr/bin/python3`**, with
 `MSYSTEM=UCRT64`; native Windows/MinGW Python is deliberately rejected. Compiler
 identity must be `x86_64-w64-mingw32` from the exact `/ucrt64/bin` prefix.
 
-Provision these signed MSYS2 packages in CI before invoking the helper:
+Provision these signed MSYS2 packages in CI before invoking the helper. The
+organization's Actions policy admits no third-party provisioning action, so CI
+(`.github/actions/prepare-git-runtime`) uses the runner image's own MSYS2 at
+`C:\msys64` with `MSYSTEM=UCRT64`, `MSYS2_PATH_TYPE=minimal` and
+`CHERE_INVOKING=1`, updates it twice with `pacman --noconfirm -Syuu`, and never
+clears pacman's cache, so source collection keeps the signed installed archives:
 
 ```yaml
-- uses: msys2/setup-msys2@v2 # Pin this action to the publisher's reviewed commit in CI.
-  with:
-    msystem: UCRT64
-    update: true
-    install: >-
-      make patch python diffutils
-      mingw-w64-ucrt-x86_64-gcc
-      mingw-w64-ucrt-x86_64-curl-winssl
-      mingw-w64-ucrt-x86_64-pcre2
-      mingw-w64-ucrt-x86_64-zlib
-      mingw-w64-ucrt-x86_64-expat
-      mingw-w64-ucrt-x86_64-libiconv
+- name: Provision explicit UCRT64 build dependencies
+  shell: pwsh
+  env: { MSYSTEM: UCRT64, MSYS2_PATH_TYPE: minimal, CHERE_INVOKING: "1" }
+  run: |
+    & C:\msys64\usr\bin\bash.exe -lc 'pacman --noconfirm --needed -S make patch python diffutils mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-curl-winssl mingw-w64-ucrt-x86_64-pcre2 mingw-w64-ucrt-x86_64-zlib mingw-w64-ucrt-x86_64-expat mingw-w64-ucrt-x86_64-libiconv'
 - name: Build pinned guarded Windows Git
-  shell: msys2 {0}
+  shell: C:\msys64\usr\bin\bash.exe -leo pipefail '{0}'
+  env: { MSYSTEM: UCRT64, MSYS2_PATH_TYPE: minimal, CHERE_INVOKING: "1" }
   run: |
     set -euo pipefail
     /usr/bin/python3 scripts/build-git-runtime-windows.py \

@@ -71,8 +71,8 @@ pub(crate) fn token_path(
 fn normalize_http_url(value: &str) -> anyhow::Result<String> {
     let mut url = reqwest::Url::parse(value)
         .map_err(|error| anyhow::anyhow!("invalid MCP OAuth endpoint: {error}"))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        anyhow::bail!("MCP OAuth endpoint must be an absolute HTTP(S) URL");
+    if url.scheme() != "https" || url.host_str().is_none() {
+        anyhow::bail!("MCP OAuth endpoint must be an absolute HTTPS URL");
     }
     if !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!("MCP OAuth endpoint must not contain user information");
@@ -816,10 +816,15 @@ mod windows_private {
     struct SecurityDescriptor(*mut c_void);
 
     impl SecurityDescriptor {
-        fn private() -> std::io::Result<Self> {
+        /// Owner-only protected descriptor. A directory's ACEs are inheritable
+        /// so the propagating directory DACL write never leaves an existing
+        /// child with an empty DACL its owner can no longer open; see the
+        /// descriptor in `crate::fs::private` for the full rationale.
+        fn private(directory: bool) -> std::io::Result<Self> {
             let current_user = current_user_sid_string()?;
+            let inheritance = if directory { "OICI" } else { "" };
             let sddl = wide(OsStr::new(&format!(
-                "O:{current_user}D:P(A;;FA;;;SY)(A;;FA;;;{current_user})"
+                "O:{current_user}D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;{current_user})"
             )));
             let mut descriptor = null_mut();
             let result = unsafe {
@@ -935,7 +940,7 @@ mod windows_private {
     fn mcp_oauth_storage_security_creation_descriptor_sets_current_owner() {
         // A token's default owner can be Administrators. Creation must name
         // the same current user that apply_private_dacl later validates.
-        let descriptor = SecurityDescriptor::private().unwrap();
+        let descriptor = SecurityDescriptor::private(false).unwrap();
         let mut owner = null_mut();
         let mut defaulted = 0;
         assert_ne!(
@@ -1055,7 +1060,7 @@ mod windows_private {
             ));
         }
         ensure_current_owner(handle)?;
-        let descriptor = SecurityDescriptor::private()?;
+        let descriptor = SecurityDescriptor::private(expect_directory)?;
         let status = unsafe {
             SetSecurityInfo(
                 handle,
@@ -1109,7 +1114,7 @@ mod windows_private {
                 "credential root is a reparse point or has the wrong type",
             )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let descriptor = SecurityDescriptor::private()?;
+                let descriptor = SecurityDescriptor::private(true)?;
                 let attributes = descriptor.attributes();
                 let path_wide = wide(path.as_os_str());
                 if unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } == 0 {
@@ -1125,7 +1130,7 @@ mod windows_private {
     }
 
     fn create_private_file(path: &Path, disposition: Dword) -> std::io::Result<std::fs::File> {
-        let descriptor = SecurityDescriptor::private()?;
+        let descriptor = SecurityDescriptor::private(false)?;
         let attributes = descriptor.attributes();
         let handle = open_handle(
             path,
@@ -1396,7 +1401,7 @@ async fn authorization_manager_bound(
 pub struct LoginSession {
     pub auth_url: String,
     session: AuthorizationSession,
-    redirect_port: u16,
+    callback_listener: std::net::TcpListener,
     expected_state: String,
 }
 
@@ -1443,10 +1448,13 @@ pub(crate) async fn begin_login_bound(
                 .map(|(_, value)| value.into_owned())
         })
         .ok_or_else(|| anyhow::anyhow!("OAuth authorization URL is missing state"))?;
+    // Bind before returning the URL so an automatically opened browser cannot
+    // race a fast authorization redirect ahead of listener startup.
+    let callback_listener = bind_callback_listener(settings.redirect_port())?;
     Ok(LoginSession {
         auth_url,
         session,
-        redirect_port: settings.redirect_port(),
+        callback_listener,
         expected_state,
     })
 }
@@ -1460,7 +1468,10 @@ impl LoginSession {
         validate: impl Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         validate()?;
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.redirect_port)).await?;
+        // The listener was bound in `begin_login_bound`, before the URL was
+        // handed out, so an automatically opened browser cannot race a fast
+        // authorization redirect ahead of listener startup.
+        let listener = tokio::net::TcpListener::from_std(self.callback_listener)?;
         let captured = capture_callback_owned(listener, timeout, &self.expected_state).await?;
         validate()?;
         tokio::select! {
@@ -1679,6 +1690,18 @@ fn authorization_complete_body() -> String {
         "<html><body><h3>{}: authorization complete.</h3>You can close this tab and return to the terminal.</body></html>",
         crate::product::PUBLIC_NAME
     )
+}
+
+/// Bind the loopback listener for the OAuth redirect.
+fn bind_callback_listener(port: u16) -> anyhow::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| anyhow::anyhow!("cannot bind 127.0.0.1:{port} for OAuth redirect: {e}"))?;
+    // Converted into a tokio listener by `wait_for_callback_owned`, which
+    // requires a non-blocking socket.
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| anyhow::anyhow!("OAuth redirect listener config failed: {e}"))?;
+    Ok(listener)
 }
 
 /// Blocking single-request loopback HTTP listener for the OAuth redirect.

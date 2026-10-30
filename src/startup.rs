@@ -495,6 +495,13 @@ pub(crate) fn verify_resume_provider_safety() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether an explicit `--model`/`--provider`/`--quick-model` (or its
+/// environment form) pins the startup model. A pinned model is never replaced
+/// by the `[prompt_to_model]` mapping of the startup persona.
+fn cli_pins_startup_model(cli: &Cli) -> bool {
+    cli.model.is_some() || cli.provider.is_some() || cli.quick_model.is_some()
+}
+
 /// Apply the `[prompt_to_model]` mapping at startup before the TUI is
 /// available. Updates `provider`, `model`, and `session` fields so the
 /// initial agent is built with the correct model.
@@ -505,14 +512,14 @@ fn apply_startup_prompt_model(
     model: &mut CompactString,
     session: &mut Session,
 ) {
-    let qm_name = match cfg.resolve_prompt_model(prompt_name) {
-        Some(name) => name,
-        None => return,
-    };
-    let qm = config::quick_models_map(cfg);
-    let Some(qmc) = qm.get(qm_name) else {
+    let config::PromptRoute::Mapped {
+        alias: qm_name,
+        quick_model: qmc,
+    } = cfg.resolve_prompt_route(prompt_name)
+    else {
         return;
     };
+    let qm = config::quick_models_map(cfg);
     *provider = qmc.provider.clone();
     *model = qmc.model.clone();
     session.model = qmc.model.clone();
@@ -562,7 +569,7 @@ pub(crate) fn report_headless_mcp_notices(
 ) {
     if let Some(manager) = manager {
         for notice in manager.take_notices() {
-            report(&crate::ui::events::sanitize_output(&notice));
+            report(&crate::ui::events::sanitize_output(notice.message()));
         }
     }
 }
@@ -627,7 +634,6 @@ pub(crate) struct Startup {
     #[cfg(feature = "advisor")]
     pub handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
     // Set by resolve_prompts:
-    pub arch_msg: Option<String>,
     pub session_resumed: bool,
     pub resume_override_pending: bool,
     #[cfg(feature = "hooks")]
@@ -1084,7 +1090,12 @@ impl Startup {
         #[cfg(feature = "acp")]
         let read_stdin = read_stdin && !cli.acp_enabled;
         if read_stdin {
-            let stdin = match crate::print::read_headless_stdin(cli.quiet).await {
+            let stdin = match crate::print::read_headless_stdin(
+                cli.quiet,
+                !cli.message.join(" ").trim().is_empty(),
+            )
+            .await
+            {
                 Ok(stdin) => stdin,
                 Err(error) => {
                     crate::print::emit_headless_preflight_failure(
@@ -1487,7 +1498,6 @@ impl Startup {
             worker_probe,
             #[cfg(feature = "advisor")]
             handoff_rx: None,
-            arch_msg: None,
             session_resumed,
             resume_override_pending,
             #[cfg(feature = "hooks")]
@@ -1517,8 +1527,20 @@ impl Startup {
         self.validate_sandbox_availability()
     }
 
-    /// Phase 2: subagents, sandbox, tools config,
-    /// permission checker, advisor.
+    /// Publish the process-wide provider/model configuration required by the
+    /// task tool. ACP calls this before accepting connections; each task tool
+    /// still owns its session workspace, permission checker, and event route.
+    #[cfg(all(feature = "subagents", feature = "acp"))]
+    pub(crate) fn init_subagents(&self) {
+        crate::extras::subagents::install(crate::extras::subagents::resolve_config(
+            &self.cfg,
+            self.cli.api_key.as_deref(),
+            &self.provider,
+            &self.model,
+            &self.client,
+        ));
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_native_final_before_replace(&mut self) {
         self.native_startup
@@ -1527,6 +1549,8 @@ impl Startup {
             .fail_final_before_replace();
     }
 
+    /// Phase 2: subagents, sandbox, tools config,
+    /// permission checker, advisor.
     pub(crate) async fn init_features(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "subagents")]
         crate::extras::subagents::install(crate::extras::subagents::resolve_config(
@@ -1845,63 +1869,25 @@ impl Startup {
 
         // Default prompt resolution (after prompts may have been regenerated)
         {
-            let default_prompt = self
-                .cfg
-                .default_prompt
-                .as_deref()
-                .unwrap_or("code")
-                .to_string();
-            if self.context.activate_prompt(&default_prompt).is_some() {
-                let mut prompt_text = self.context.current_prompt.take().unwrap_or_default();
-
-                let caps: &[&str] = &[
-                    #[cfg(feature = "memory")]
-                    "- **Memory**: persistent memory across sessions (memory_read, memory_write, memory_search)",
-                    #[cfg(feature = "subagents")]
-                    "- **Subagents**: delegate specific multi-step investigations to parallel subagents via the `task` tool",
-                ];
-
-                if !caps.is_empty() {
-                    prompt_text.push_str("\n\n## Available Capabilities\n\n");
-                    prompt_text.push_str(&caps.join("\n"));
-                    prompt_text.push('\n');
-                }
-
-                self.context.current_prompt = Some(prompt_text);
-
-                if !self.session_resumed {
-                    apply_startup_prompt_model(
-                        &default_prompt,
-                        &self.cfg,
-                        &mut self.provider,
-                        &mut self.model,
-                        &mut self.session,
-                    );
-                }
+            let default_prompt = self.cfg.resolve_default_prompt().to_string();
+            if self.context.activate_main_prompt(&default_prompt).is_some()
+                && !self.session_resumed
+                && !cli_pins_startup_model(&self.cli)
+            {
+                apply_startup_prompt_model(
+                    &default_prompt,
+                    &self.cfg,
+                    &mut self.provider,
+                    &mut self.model,
+                    &mut self.session,
+                );
             }
         }
 
         // --load-prompt overrides the default prompt
         if let Some(ref name) = self.cli.load_prompt {
-            if self.context.activate_prompt(name).is_some() {
-                let mut prompt_text = self.context.current_prompt.take().unwrap_or_default();
-
-                let caps: &[&str] = &[
-                    #[cfg(feature = "memory")]
-                    "- **Memory**: persistent memory across sessions (memory_read, memory_write, memory_search)",
-                    #[cfg(feature = "subagents")]
-                    "- **Subagents**: delegate specific multi-step investigations to parallel subagents via the `task` tool",
-                ];
-
-                if !caps.is_empty() {
-                    prompt_text.push_str("\n\n## Available Capabilities\n\n");
-                    prompt_text.push_str(&caps.join("\n"));
-                    prompt_text.push('\n');
-                }
-
-                self.context.current_prompt = Some(prompt_text);
-
-                if !self.session_resumed {
+            if self.context.activate_main_prompt(name).is_some() {
+                if !self.session_resumed && !cli_pins_startup_model(&self.cli) {
                     apply_startup_prompt_model(
                         name,
                         &self.cfg,
@@ -1976,29 +1962,6 @@ impl Startup {
             }
         }
 
-        // Build the auto-trigger message for ARCHITECTURE.md creation
-        #[cfg(feature = "archmd")]
-        {
-            self.arch_msg = if arch_created {
-                Some(
-                    "I've just created an empty ARCHITECTURE.md template at the project root. \
-                    Explore the codebase thoroughly using the `task` tool (delegating parallel exploration to subagents) \
-                    and fill ARCHITECTURE.md with a high-level architecture document covering:\n\
-                    - Directory layout and module responsibilities\n\
-                    - Key types, traits, and their relationships\n\
-                    - Control flow (how requests/events flow through the system)\n\
-                    - Data flow (how data is transformed from input to output)\n\
-                    - Design decisions and rationale\n\
-                    - External dependencies and how they are used\n\
-                    - Entry points for different execution modes\n\n\
-                    Keep the document under ~300 lines of code total. Keep entries concise and reference specific source files."
-                        .to_string(),
-                )
-            } else {
-                None
-            };
-        }
-
         Ok(())
     }
 
@@ -2038,10 +2001,31 @@ impl Startup {
         self.worker_probe.take()
     }
 
+    /// Record the effective environment on the session and, on resume, tell
+    /// the model once when it differs from the recorded one (mini-agent-1pi7h).
+    fn sync_session_environment(&mut self) {
+        let permission_mode = self
+            .permission
+            .as_ref()
+            .map(|p| {
+                format!("{:?}", p.lock().unwrap_or_else(|e| e.into_inner()).mode()).to_lowercase()
+            })
+            .unwrap_or_else(|| "unspecified".into());
+        let tools = tool_set_label(self.cli.resolve_no_tools(&self.cfg), &self.cli.tools);
+        let now = session::environment::EnvironmentRecord {
+            sandbox: self.sandbox.environment_label(),
+            permission_mode,
+            workspace: self.workspace.root().display().to_string(),
+            tools,
+        };
+        self.session.sync_environment(now, self.session_resumed);
+    }
+
     async fn dispatch_inner(mut self: Box<Self>) -> anyhow::Result<()> {
         session::storage::report_pending_save_notices(&mut self.session, |notice| {
             eprintln!("warning: {notice}")
         });
+        self.sync_session_environment();
         if self.resume_override_pending {
             // All fallible startup validation has completed. Persist the
             // identity/audit update atomically before any agent can receive
@@ -2848,7 +2832,6 @@ impl Startup {
             ask_rx,
             sandbox,
             status_signals,
-            arch_msg,
             paths,
             is_interactive,
             #[cfg(feature = "advisor")]
@@ -2861,7 +2844,10 @@ impl Startup {
         } = self;
 
         crate::update::spawn_startup_notice(&cli, &cfg, is_interactive, &paths.state_dir);
-        let auto_trigger_msg = select_interactive_auto_trigger(&cli, arch_msg);
+        // Creating a context-file template is a filesystem setup action, not
+        // permission to start an agent turn. Only an explicit CLI message may
+        // auto-trigger interactive execution.
+        let auto_trigger_msg = interactive_initial_message(&cli);
 
         crate::ui::run_interactive(
             crate::ui::state::UiContext::new(
@@ -2897,10 +2883,6 @@ fn interactive_initial_message(cli: &Cli) -> Option<String> {
     }
     let message = cli.message.join(" ");
     (!message.trim().is_empty()).then_some(message)
-}
-
-fn select_interactive_auto_trigger(cli: &Cli, fallback: Option<String>) -> Option<String> {
-    interactive_initial_message(cli).or(fallback)
 }
 
 /// Startup-banner lines for a JavaScript runtime or learned-skill subsystem the
@@ -4016,18 +3998,86 @@ pub(crate) struct HeadlessRounds {
     pub persisted: bool,
 }
 
+/// Comparable label for the tool set recorded in the session environment:
+/// `none`, `all`, or the sorted allowlist (so flag order never reads as a change).
+fn tool_set_label(no_tools: bool, allowlist: &[String]) -> String {
+    if no_tools {
+        "none".to_string()
+    } else if allowlist.is_empty() {
+        "all".to_string()
+    } else {
+        let mut names: Vec<_> = allowlist.iter().map(|t| t.to_string()).collect();
+        names.sort();
+        names.join(",")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_model_flags_pin_startup_model_against_prompt_to_model() {
+        use super::*;
+        assert!(!cli_pins_startup_model(&Cli::default()));
+        for cli in [
+            Cli {
+                model: Some("m".into()),
+                ..Cli::default()
+            },
+            Cli {
+                provider: Some("openai".into()),
+                ..Cli::default()
+            },
+            Cli {
+                quick_model: Some("q".into()),
+                ..Cli::default()
+            },
+        ] {
+            assert!(cli_pins_startup_model(&cli));
+        }
+    }
+
     use super::ACTIVE_OPENROUTER_PRICING_REAPERS;
     use super::{
         OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
         apply_resume_provider_decision, compact_headless_session_with, headless_compaction_plan,
         interactive_initial_message, js_runtime_banner_lines, needs_openrouter_context_refresh,
         require_recent_session, resolve_resume_provider_decision, run_startup_probes_concurrently,
-        select_interactive_auto_trigger, unavailable_sandbox_must_fail,
-        validate_startup_permission_policy,
+        unavailable_sandbox_must_fail, validate_startup_permission_policy,
     };
     use crate::cli::Cli;
+
+    /// The startup wiring feeds `tool_set_label` into the recorded environment
+    /// that `Session::sync_environment` compares on resume: an unchanged tool
+    /// set must not look like a change, and a changed one must produce the
+    /// resume notice (mini-agent-jn5e7).
+    #[test]
+    fn tool_set_label_is_order_insensitive_and_drives_the_resume_notice() {
+        use crate::session::environment::EnvironmentRecord;
+        use crate::session::{MessageRole, Session};
+
+        assert_eq!(super::tool_set_label(true, &["read".into()]), "none");
+        assert_eq!(super::tool_set_label(false, &[]), "all");
+        assert_eq!(
+            super::tool_set_label(false, &["write".into(), "read".into()]),
+            super::tool_set_label(false, &["read".into(), "write".into()]),
+        );
+
+        let record = |tools: String| EnvironmentRecord {
+            sandbox: "off".into(),
+            permission_mode: "standard".into(),
+            workspace: "/w".into(),
+            tools,
+        };
+        let mut session = Session::new("p", "m", 1000, "s");
+        session.sync_environment(record(super::tool_set_label(false, &[])), false);
+        assert!(!session.sync_environment(record(super::tool_set_label(false, &[])), true));
+        assert!(
+            session.sync_environment(record(super::tool_set_label(false, &["read".into()])), true)
+        );
+        let notice = session.messages.last().unwrap();
+        assert_eq!(notice.role, MessageRole::System);
+        assert!(notice.content.to_string().contains("- tools: all -> read"));
+    }
 
     /// A refused containment preflight must reach the startup banner with its
     /// reason intact, and a healthy (or not-compiled) runtime must add nothing.
@@ -4078,6 +4128,10 @@ mod tests {
         );
 
         for report in [
+            JsRuntimeReport {
+                javascript: RuntimeAvailability::Pending,
+                learned_skills: RuntimeAvailability::Pending,
+            },
             JsRuntimeReport {
                 javascript: RuntimeAvailability::Available,
                 learned_skills: RuntimeAvailability::Available,
@@ -4824,6 +4878,8 @@ mod tests {
             connect_timeout_secs: None,
             stream_idle_timeout_secs: None,
             model: None,
+            prompt_caching: false,
+            model_prices: std::collections::HashMap::new(),
         }
     }
 
@@ -5178,6 +5234,25 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "acp", feature = "subagents"))]
+    #[test]
+    fn acp_initializes_subagents_before_serving_connections() {
+        let main = include_str!("main.rs");
+        let acp_branch = main
+            .find("if startup.cli.acp_enabled {")
+            .expect("ACP startup branch missing");
+        let initialize = main[acp_branch..]
+            .find("startup.init_subagents();")
+            .map(|offset| acp_branch + offset)
+            .expect("ACP subagent initialization missing");
+        let serve = main[acp_branch..]
+            .find("extras::acp::serve")
+            .map(|offset| acp_branch + offset)
+            .expect("ACP server startup missing");
+
+        assert!(acp_branch < initialize && initialize < serve);
+    }
+
     #[test]
     fn startup_probe_captures_policy_without_sharing_runtime_owners() {
         // Like Startup's publication/cleanup owner, this carrier is !Sync.
@@ -5471,27 +5546,6 @@ mod tests {
     }
 
     #[test]
-    fn positional_input_precedes_the_existing_interactive_fallback() {
-        let cli = Cli {
-            message: vec!["user prompt".into()],
-            ..Cli::default()
-        };
-
-        assert_eq!(
-            select_interactive_auto_trigger(&cli, Some("fallback".into())),
-            Some("user prompt".into())
-        );
-    }
-
-    #[test]
-    fn empty_interactive_startup_preserves_the_existing_fallback() {
-        assert_eq!(
-            select_interactive_auto_trigger(&Cli::default(), Some("fallback".into())),
-            Some("fallback".into())
-        );
-    }
-
-    #[test]
     fn every_execution_mode_rejects_invalid_permissions_before_startup() {
         let invalid = Config {
             permission_regex: Some(serde_json::json!({
@@ -5599,19 +5653,19 @@ mod tests {
         let root = crate::tests::OwnedTestDirectory::new("fork75-startup");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -5732,19 +5786,19 @@ mod tests {
         let root = crate::tests::OwnedTestDirectory::new("startup-session-name");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -5927,19 +5981,19 @@ mod native_publication_startup_tests {
                 let root = crate::tests::OwnedTestDirectory::new("native-startup-actual");
                 let _environment = crate::tests::ScopedProcessEnv::set(&[
                     (
-                        "ZS_CONFIG_DIR",
+                        "MINI_AGENT_CONFIG_DIR",
                         Some(root.path().join("config").into_os_string()),
                     ),
                     (
-                        "ZS_DATA_DIR",
+                        "MINI_AGENT_DATA_DIR",
                         Some(root.path().join("data").into_os_string()),
                     ),
                     (
-                        "ZS_STATE_DIR",
+                        "MINI_AGENT_STATE_DIR",
                         Some(root.path().join("state").into_os_string()),
                     ),
                     (
-                        "ZS_CACHE_DIR",
+                        "MINI_AGENT_CACHE_DIR",
                         Some(root.path().join("cache").into_os_string()),
                     ),
                 ]);

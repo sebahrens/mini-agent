@@ -190,6 +190,10 @@ struct SkillUsageStats {
     skill_id: String,
     status: String,
     invocations: u64,
+    /// Of `invocations`, how many `invoked` events were recorded outside
+    /// production (`MINI_AGENT_GYM`). Derived from retained events, so it
+    /// undercounts after event compaction.
+    gym_invocations: u64,
     direct_successes: u64,
     direct_failures: u64,
     last_used: Option<i64>,
@@ -215,7 +219,7 @@ struct SkillUsageStats {
 /// one records `no_verify_command` rows, and a turn that never touched the
 /// workspace records `gate_skipped`. Neither carries a pass/fail signal, so
 /// both are excluded and those three columns stay empty for that operator.
-const SKILL_STATS_HEADER: &str = "id\tstatus\tinvocations\tsuccess\tlast_used_unix\t\
+const SKILL_STATS_HEADER: &str = "id\tstatus\tinvocations\tgym_invocations\tsuccess\tlast_used_unix\t\
      tasks_with\tpassed_with\tpass_rate_without\tgym_tasks\tuser_positive\tuser_negative\t\
      declared_effect_methods\test_round_trips_saved";
 
@@ -236,10 +240,11 @@ impl SkillUsageStats {
 
     fn to_line(&self) -> String {
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.skill_id,
             self.status,
             self.invocations,
+            self.gym_invocations,
             render_percent(self.success_percent()),
             self.last_used
                 .map_or_else(|| "never".to_string(), |value| value.to_string()),
@@ -342,6 +347,12 @@ const SKILL_STATS_SQL: &str = "WITH lost_turns AS (
                 AND baselines.source_id IS scopes.source_id
               GROUP BY scopes.skill_id
          ),
+         gym_invoked AS (
+             SELECT skill_id, COUNT(*) AS gym_invocations
+               FROM skill_events
+              WHERE event_kind = 'invoked' AND production = 0
+              GROUP BY skill_id
+         ),
          last_invoked AS (
              SELECT skill_id, MAX(created_at) AS last_used
                FROM skill_events
@@ -360,12 +371,14 @@ const SKILL_STATS_SQL: &str = "WITH lost_turns AS (
                 COALESCE(observed.gym_tasks, 0),
                 COALESCE(stats.user_positive_count, 0),
                 COALESCE(stats.user_negative_count, 0),
-                revision.capability_json
+                revision.capability_json,
+                COALESCE(gym_invoked.gym_invocations, 0)
            FROM skill_revisions AS revision
            LEFT JOIN skill_stats AS stats ON stats.skill_id = revision.id
            LEFT JOIN observed ON observed.skill_id = revision.id
            LEFT JOIN baseline_counts ON baseline_counts.skill_id = revision.id
            LEFT JOIN last_invoked ON last_invoked.skill_id = revision.id
+           LEFT JOIN gym_invoked ON gym_invoked.skill_id = revision.id
           WHERE revision.identity_version = 2
           ORDER BY COALESCE(stats.invoked_count, 0) DESC, revision.id";
 
@@ -387,6 +400,7 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             row.get::<_, i64>(11)?,
             row.get::<_, i64>(12)?,
             row.get::<_, String>(13)?,
+            row.get::<_, i64>(14)?,
         ))
     })?;
     rows.map(|row| {
@@ -405,6 +419,7 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             user_positive,
             user_negative,
             capability_json,
+            gym_invocations,
         ) = row?;
         let declared_effect_methods = serde_json::from_str::<serde_json::Value>(&capability_json)
             .ok()
@@ -415,6 +430,7 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             skill_id,
             status,
             invocations: u64::try_from(invocations).unwrap_or(0),
+            gym_invocations: u64::try_from(gym_invocations).unwrap_or(0),
             direct_successes,
             direct_failures: u64::try_from(failures).unwrap_or(0),
             last_used,
@@ -443,6 +459,7 @@ pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
         println!("{}", row.to_line());
     }
     let invocations = rows.iter().map(|row| row.invocations).sum::<u64>();
+    let gym_invocations = rows.iter().map(|row| row.gym_invocations).sum::<u64>();
     let saved = rows
         .iter()
         .map(|row| row.estimated_round_trips_saved)
@@ -450,7 +467,9 @@ pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
     let gym = rows.iter().map(|row| row.gym_tasks).sum::<u64>();
     let positive = rows.iter().map(|row| row.user_positive).sum::<u64>();
     let negative = rows.iter().map(|row| row.user_negative).sum::<u64>();
-    println!("total\t-\t{invocations}\t-\t-\t-\t-\t-\t{gym}\t{positive}\t{negative}\t-\t{saved}");
+    println!(
+        "total\t-\t{invocations}\t{gym_invocations}\t-\t-\t-\t-\t-\t{gym}\t{positive}\t{negative}\t-\t{saved}"
+    );
     Ok(())
 }
 
@@ -2061,6 +2080,20 @@ mod tests {
                 rusqlite::params!["a".repeat(64), artifact.id],
             )
             .unwrap();
+        // Non-production invocations are part of `invocations` (the aggregate
+        // counter) but are broken out so they are not read as real usage.
+        for invocation in ["b", "c"] {
+            store
+                .conn_mut()
+                .execute(
+                    "INSERT INTO skill_events (
+                        invocation_id, skill_id, turn_id, event_kind, index_generation,
+                        evidence_complete, production, created_at
+                     ) VALUES (?, ?, 'turn-gym-stats', 'invoked', 0, 1, 0, 42)",
+                    rusqlite::params![invocation.repeat(64), artifact.id],
+                )
+                .unwrap();
+        }
         // Gym rows share the verify command with the production rows, so a
         // missing `production` predicate would fold them into the utility
         // columns instead of the gym column.
@@ -2099,6 +2132,13 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].invocations, 8);
         assert_eq!(rows[0].last_used, Some(42));
+        assert_eq!(rows[0].gym_invocations, 2);
+        let line = rows[0].to_line();
+        assert_eq!(
+            line.split('\t').count(),
+            SKILL_STATS_HEADER.split('\t').count()
+        );
+        assert!(SKILL_STATS_HEADER.contains("invocations\tgym_invocations\tsuccess"));
         assert_eq!(rows[0].success_percent(), Some(75.0));
         assert_eq!(rows[0].tasks_with, 2, "gym tasks must not count as utility");
         assert_eq!(rows[0].passed_with, 1);

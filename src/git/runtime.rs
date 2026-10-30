@@ -1061,7 +1061,7 @@ mod tests {
     fn profile100_custom_write_root_refuses_late_and_preapproved_helpers() {
         let fixture = crate::tests::OwnedTestDirectory::new("profile100-custom-authority");
         let _env = crate::tests::ScopedProcessEnv::set(&[(
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             Some(fixture.path().join("cache").into_os_string()),
         )]);
         let workspace = fixture.path().join("workspace");

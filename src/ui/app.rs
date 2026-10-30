@@ -20,7 +20,7 @@ use crate::config;
 use crate::config::keybindings::{KeyAction, KeyBindings};
 use crate::event::{AgentEvent, BtwEvent, UserEvent};
 #[cfg(feature = "mcp")]
-use crate::extras::mcp::McpClientManager;
+use crate::extras::mcp::{McpClientManager, McpNoticeLevel};
 use crate::provider::AnyAgent;
 use crate::sandbox::CommandCancellation;
 use crate::sandbox::{
@@ -58,6 +58,43 @@ use super::{
 
 const TURN_TRACE_MAX: usize = 64;
 const BTW_MAX_INFLIGHT: usize = 4;
+
+#[cfg(feature = "mcp")]
+fn mcp_notice_color(level: McpNoticeLevel) -> Color {
+    match level {
+        McpNoticeLevel::Info => C_RESULT,
+        McpNoticeLevel::Error => C_ERROR,
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_notice_tests {
+    use super::*;
+
+    #[test]
+    fn informational_notices_use_system_style_and_failures_use_error_style() {
+        assert_eq!(mcp_notice_color(McpNoticeLevel::Info), C_RESULT);
+        assert_eq!(mcp_notice_color(McpNoticeLevel::Error), C_ERROR);
+    }
+}
+
+// Each value only carries one received event from the channel to its handler;
+// boxing it would add an allocation per event.
+#[allow(clippy::large_enum_variant)]
+enum AgentStreamItem {
+    Event(AgentEvent),
+    Closed,
+}
+
+async fn recv_agent_stream_item(
+    receiver: &mut Option<mpsc::Receiver<AgentEvent>>,
+) -> Option<AgentStreamItem> {
+    let receiver = receiver.as_mut()?;
+    Some(match receiver.recv().await {
+        Some(event) => AgentStreamItem::Event(event),
+        None => AgentStreamItem::Closed,
+    })
+}
 
 /// Echo a submitted prompt as `> line` rows plus a blank separator, painted
 /// as one frame instead of one chat repaint per line. The frame closes before
@@ -186,7 +223,6 @@ pub(super) mod test_support {
             btw_total_out: 0,
             user_tx,
             user_rx,
-            tui_log_rx: None,
             deferred_user_events: Default::default(),
             #[cfg(feature = "subagents")]
             background_requests: Default::default(),
@@ -197,6 +233,7 @@ pub(super) mod test_support {
             #[cfg(feature = "mcp")]
             mcp_admin: None,
             model_cache_generation: 0,
+            ctrl_c_exit_armed: false,
             session_start_task: None,
             skill_commands: None,
             update_notice: None,
@@ -221,19 +258,19 @@ mod dot_command_tests {
         let root = crate::tests::OwnedTestDirectory::new("dot-command-handler");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -359,9 +396,18 @@ mod btw_pricing_tests {
     async fn quick_model_price_presence_actual_app_usage_charges_paid_alias() {
         let root = crate::tests::OwnedTestDirectory::new("quick-model-price-presence-app");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
-            ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
-            ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
-            ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
         ]);
         let cli = crate::cli::Cli::default();
         let cfg: crate::config::Config =
@@ -422,9 +468,18 @@ mod btw_pricing_tests {
     fn actual_btw_event_handler_charges_snapshot_and_ignores_duplicate_or_cancelled_ids() {
         let root = crate::tests::OwnedTestDirectory::new("btw-pricing-handler");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
-            ("ZS_CONFIG_DIR", Some(root.path().as_os_str().to_owned())),
-            ("ZS_DATA_DIR", Some(root.path().as_os_str().to_owned())),
-            ("ZS_STATE_DIR", Some(root.path().as_os_str().to_owned())),
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
         ]);
         let cli = crate::cli::Cli::default();
         let cfg = crate::config::Config::default();
@@ -848,6 +903,14 @@ fn is_lazygit_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// Ctrl+T folds or unfolds the latest tool result. Ctrl+O is taken by
+/// lazygit; Ctrl+T is unbound in the editor and pickers.
+fn is_tool_output_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('t' | 'T'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TranscriptScroll {
     Top,
@@ -917,6 +980,35 @@ mod home_end_tests {
 }
 
 #[cfg(test)]
+mod tool_output_key_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_t_folds_tool_output_and_plain_t_types() {
+        assert!(is_tool_output_key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL
+        )));
+        for key in [
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+            KeyEvent::new(
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        ] {
+            assert!(!is_tool_output_key(key), "{key:?}");
+        }
+        // Ctrl+T must not collide with the lazygit key.
+        assert!(!is_lazygit_key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL
+        )));
+    }
+}
+
+#[cfg(test)]
 mod lazygit_key_tests {
     use super::*;
 
@@ -934,11 +1026,35 @@ mod lazygit_key_tests {
         ] {
             assert!(!is_lazygit_key(key), "{key:?}");
         }
-        // Idle Ctrl+C clears a draft first; Ctrl+D forward-deletes in it.
+        // The shared idle helper preserves Ctrl+D shell-style behavior.
         assert_eq!(idle_interrupt(false, false), IdleInterrupt::ClearDraft);
         assert_eq!(idle_interrupt(true, false), IdleInterrupt::EditorKey);
         assert_eq!(idle_interrupt(false, true), IdleInterrupt::Exit);
         assert_eq!(idle_interrupt(true, true), IdleInterrupt::Exit);
+        assert_eq!(
+            ctrl_c_action(false, InterruptTarget::MainRun, true),
+            CtrlCAction::Interrupt(InterruptTarget::MainRun)
+        );
+        assert_eq!(
+            ctrl_c_action(false, InterruptTarget::Exit, false),
+            CtrlCAction::ClearDraft
+        );
+        assert_eq!(
+            ctrl_c_action(false, InterruptTarget::Exit, true),
+            CtrlCAction::ArmExit
+        );
+        assert_eq!(
+            ctrl_c_action(true, InterruptTarget::Exit, true),
+            CtrlCAction::Exit
+        );
+        assert_eq!(
+            ctrl_c_feedback(CtrlCAction::Interrupt(InterruptTarget::MainRun)),
+            "interrupt requested; press Ctrl-C again to exit"
+        );
+        assert_eq!(
+            ctrl_c_feedback(CtrlCAction::Exit),
+            "exit requested; shutting down..."
+        );
         let mut input = InputEditor::new();
         input.load_text("draft");
         input.discard_draft();
@@ -963,6 +1079,50 @@ mod lazygit_key_tests {
             None
         );
         assert_eq!(input.buffer, "a");
+    }
+}
+
+#[cfg(test)]
+mod agent_stream_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delayed_terminal_event_is_delivered_before_stream_closure() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut receiver = Some(rx);
+        let sender = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            tx.send(AgentEvent::Done {
+                response: "done".into(),
+                interactions: Vec::new(),
+            })
+            .await
+            .unwrap();
+        });
+
+        let item = tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_agent_stream_item(&mut receiver),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            item,
+            Some(AgentStreamItem::Event(AgentEvent::Done { .. }))
+        ));
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_terminal_event_is_reported_as_stream_closure() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut receiver = Some(rx);
+        drop(tx);
+
+        assert!(matches!(
+            recv_agent_stream_item(&mut receiver).await,
+            Some(AgentStreamItem::Closed)
+        ));
     }
 }
 
@@ -1200,11 +1360,10 @@ mod git_status_refresh_tests {
     }
 }
 
-/// What an idle Ctrl+C / Ctrl+D (nothing to interrupt) does to the draft.
+/// What Ctrl+D (and legacy callers) do when nothing is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdleInterrupt {
-    /// Ctrl+C with a draft: clear it (recoverable with Ctrl+Y); a second
-    /// press on the now empty input quits.
+    /// Clear a draft (recoverable with Ctrl+Y).
     ClearDraft,
     /// Ctrl+D with a draft: forward-delete in the editor, as in a shell.
     EditorKey,
@@ -1251,6 +1410,35 @@ pub(crate) fn interrupt_target(
         InterruptTarget::MainRun
     } else {
         InterruptTarget::Exit
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlCAction {
+    Interrupt(InterruptTarget),
+    ClearDraft,
+    ArmExit,
+    Exit,
+}
+
+fn ctrl_c_action(exit_armed: bool, target: InterruptTarget, draft_empty: bool) -> CtrlCAction {
+    if target != InterruptTarget::Exit {
+        CtrlCAction::Interrupt(target)
+    } else if exit_armed {
+        CtrlCAction::Exit
+    } else if draft_empty {
+        CtrlCAction::ArmExit
+    } else {
+        CtrlCAction::ClearDraft
+    }
+}
+
+fn ctrl_c_feedback(action: CtrlCAction) -> &'static str {
+    match action {
+        CtrlCAction::Interrupt(_) => "interrupt requested; press Ctrl-C again to exit",
+        CtrlCAction::ClearDraft => "draft cleared; press Ctrl-C again to exit",
+        CtrlCAction::ArmExit => "press Ctrl-C again to exit",
+        CtrlCAction::Exit => "exit requested; shutting down...",
     }
 }
 
@@ -1336,7 +1524,6 @@ pub(crate) struct App<'a> {
 
     user_tx: mpsc::Sender<UserEvent>,
     user_rx: mpsc::Receiver<UserEvent>,
-    tui_log_rx: Option<mpsc::Receiver<String>>,
     deferred_user_events: std::collections::VecDeque<UserEvent>,
     /// Custom slash templates for completion, re-read only when a template
     /// layer directory changed.
@@ -1350,6 +1537,9 @@ pub(crate) struct App<'a> {
     #[cfg(feature = "mcp")]
     mcp_admin: Option<Box<crate::ui::mcp_admin::State>>,
     model_cache_generation: u64,
+    /// One Ctrl-C cancels or clears and arms exit; only the next consecutive
+    /// Ctrl-C exits the interactive process.
+    ctrl_c_exit_armed: bool,
     /// SessionStart hook work deferred past the first frame (see
     /// [`App::finish_startup_work`]).
     session_start_task: Option<SessionStartTask>,
@@ -1524,19 +1714,19 @@ mod reasoning_display_tests {
         let root = crate::tests::OwnedTestDirectory::new("reasoning-app-controls");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -1720,6 +1910,7 @@ impl<'a> App<'a> {
         input.set_vim_enabled(ui.cfg.vim_mode.unwrap_or(false));
         input.set_file_workspace(ui.workspace.clone());
         input.set_monochrome(ui.cli.no_color);
+
         input.set_prompt_names(ui.context.prompts.keys().cloned().collect());
         input.set_custom_commands(
             crate::context::commands::load_for_workspace(&ui.workspace)
@@ -1784,6 +1975,7 @@ impl<'a> App<'a> {
             ui.context,
             ui.cfg.colors.as_ref(),
             &mut renderer,
+            &mut input,
         );
 
         let mut run = AgentRunState {
@@ -2223,7 +2415,6 @@ impl<'a> App<'a> {
             btw_total_out: 0,
             user_tx,
             user_rx,
-            tui_log_rx: crate::logging::take_tui_diagnostics(),
             deferred_user_events: std::collections::VecDeque::new(),
             #[cfg(feature = "subagents")]
             background_requests: Default::default(),
@@ -2234,6 +2425,7 @@ impl<'a> App<'a> {
             #[cfg(feature = "mcp")]
             mcp_admin: None,
             model_cache_generation: crate::ui::slash::model_cache_generation(),
+            ctrl_c_exit_armed: false,
             session_start_task,
             skill_commands,
             update_notice: crate::update::take_startup_notice(),
@@ -2442,7 +2634,6 @@ impl<'a> App<'a> {
                 self.begin_user_request(request)?;
                 self.refresh()?;
             }
-            self.drain_tui_diagnostics()?;
             #[cfg(feature = "git-worktree")]
             self.drain_git_observations()?;
             // Every adoption/rebuild path returns here, including a prompt that
@@ -2453,7 +2644,10 @@ impl<'a> App<'a> {
                 if !notices.is_empty() {
                     self.renderer.frame(|renderer| {
                         for notice in &notices {
-                            renderer.write_line(&sanitize_output(notice), C_ERROR)?;
+                            renderer.write_line(
+                                &sanitize_output(notice.message()),
+                                mcp_notice_color(notice.level()),
+                            )?;
                         }
                         Ok(())
                     })?;
@@ -2495,17 +2689,6 @@ impl<'a> App<'a> {
                     if let Some(pool) = background_pool { pool.wait_changed().await; return; }
                     std::future::pending::<()>().await;
                 } => { self.refresh()?; }
-                Some(message) = async { self.tui_log_rx.as_mut()?.recv().await } => {
-                    // The record and the burst drained after it: one paint.
-                    self.renderer.begin_frame();
-                    let written = message
-                        .lines()
-                        .try_for_each(|line| self.renderer.write_line(&sanitize_output(line), C_ERROR))
-                        .and_then(|()| self.drain_tui_diagnostics());
-                    let flushed = self.renderer.end_frame();
-                    written?;
-                    flushed?;
-                }
                 Some(result) = async { Some(self.update_notice.as_mut()?.await) } => {
                     self.update_notice = None;
                     if let Ok(notice) = result {
@@ -2565,27 +2748,32 @@ impl<'a> App<'a> {
                     self.take_prebuild(prebuilt).await;
                     self.refresh()?;
                 }
-                Some(event) = async { self.run.agent_rx.as_mut()?.recv().await } => {
-                    // Only results of tools that may change the workspace
-                    // force a refresh; unknown names (MCP, js) count as mutating.
-                    if match &event {
-                        AgentEvent::ToolResult { name, .. } => {
-                            crate::agent::runner::tool_may_mutate_workspace(name)
+                Some(event) = recv_agent_stream_item(&mut self.run.agent_rx), if self.run.agent_rx.is_some() => {
+                    match event {
+                        AgentStreamItem::Event(event) => {
+                            if match &event {
+                                AgentEvent::ToolResult { name, .. } => {
+                                    crate::agent::runner::tool_may_mutate_workspace(name)
+                                }
+                                AgentEvent::FileMutation { .. }
+                                | AgentEvent::Done { .. }
+                                | AgentEvent::Error { .. } => true,
+                                _ => false,
+                            } {
+                                self.loop_state.git_poll.mark_changed(std::time::Instant::now());
+                            }
+                            // This measured large child is unrelated to input, but
+                            // its inline storage inflated every event-loop poll.
+                            crate::startup::heap_future(|| self.handle_agent_event(event)).await?;
+                            // Streaming paints the chat directly and would leave an
+                            // open picker erased until the next key; repaint it.
+                            if self.input.picker.as_ref().is_some_and(|picker| picker.active()) {
+                                self.refresh()?;
+                            }
                         }
-                        AgentEvent::FileMutation { .. }
-                        | AgentEvent::Done { .. }
-                        | AgentEvent::Error { .. } => true,
-                        _ => false,
-                    } {
-                        self.loop_state.git_poll.mark_changed(std::time::Instant::now());
-                    }
-                    // This measured large child is unrelated to input, but
-                    // its inline storage inflated every event-loop poll.
-                    crate::startup::heap_future(|| self.handle_agent_event(event)).await?;
-                    // Streaming paints the chat directly and would leave an
-                    // open picker erased until the next key; repaint it.
-                    if self.input.picker.as_ref().is_some_and(|picker| picker.active()) {
-                        self.refresh()?;
+                        AgentStreamItem::Closed => {
+                            crate::startup::heap_future(|| self.handle_agent_stream_closed()).await?;
+                        }
                     }
                 }
                 Some(ask_req) = async { self.ask_rx.as_mut()?.recv().await }, if (self.permission_prompt.is_none() && self.question_prompt.is_none()) => {
@@ -2694,39 +2882,6 @@ impl<'a> App<'a> {
 
         self.handle_worktree_auto_merge().await?;
         Ok(())
-    }
-
-    fn drain_tui_diagnostics(&mut self) -> io::Result<()> {
-        // The common idle case opens no frame at all.
-        if self.tui_log_rx.as_ref().is_none_or(|rx| rx.is_empty())
-            && !crate::logging::has_dropped_tui_diagnostics()
-        {
-            return Ok(());
-        }
-        let receiver = self.tui_log_rx.as_mut();
-        // Every drained line is painted in one frame.
-        self.renderer.frame(|renderer| {
-            // A trace burst cannot monopolize input or agent progress. The
-            // next event-loop iteration drains the remaining records.
-            if let Some(receiver) = receiver {
-                for _ in 0..16 {
-                    let Ok(message) = receiver.try_recv() else {
-                        break;
-                    };
-                    for line in message.lines() {
-                        renderer.write_line(&sanitize_output(line), C_ERROR)?;
-                    }
-                }
-            }
-            let dropped = crate::logging::take_dropped_tui_diagnostics();
-            if dropped > 0 {
-                renderer.write_line(
-                    &format!("warning: {dropped} additional diagnostic records omitted"),
-                    C_ERROR,
-                )?;
-            }
-            Ok(())
-        })
     }
 
     #[cfg(test)]
@@ -3603,8 +3758,14 @@ impl<'a> App<'a> {
                     ) {
                         self.copy_selection_to_clipboard().await?;
                     } else {
-                        // A plain click: drop the one-line highlight silently.
+                        // A plain click: drop the one-line highlight silently,
+                        // and unfold or fold a tool result clicked on its
+                        // summary row.
+                        let clicked = self.renderer.selection_start.map(|point| point.line);
                         self.renderer.clear_selection();
+                        if let Some(line) = clicked {
+                            self.renderer.toggle_tool_output_at_line(line);
+                        }
                     }
                 }
             }
@@ -3626,6 +3787,7 @@ impl<'a> App<'a> {
                     .write_line(&format!("cannot open link: {error}"), C_ERROR)?;
             }
             UserEvent::Paste(data) => {
+                self.ctrl_c_exit_armed = false;
                 #[cfg(feature = "multimodal")]
                 if data.is_empty() && self.clipboard_image_allowed() {
                     crate::startup::heap_future(|| {
@@ -3655,11 +3817,13 @@ impl<'a> App<'a> {
                         return Ok(ControlFlow::Continue(()));
                     }
                     Some(KeyAction::CopySelection) => {
+                        self.ctrl_c_exit_armed = false;
                         self.copy_selection_to_clipboard().await?;
                         self.refresh()?;
                         return Ok(ControlFlow::Continue(()));
                     }
                     Some(KeyAction::PasteClipboard) => {
+                        self.ctrl_c_exit_armed = false;
                         #[cfg(feature = "multimodal")]
                         if self.clipboard_image_allowed()
                             && crate::startup::heap_future(|| {
@@ -3684,11 +3848,54 @@ impl<'a> App<'a> {
                 }
                 let is_ctrl_c = action == Some(KeyAction::Interrupt);
                 let is_ctrl_d = action == Some(KeyAction::Eof);
-                if is_ctrl_c || is_ctrl_d {
+                if is_ctrl_c {
                     let validation_active = self.run.validation_active();
+                    let target =
+                        interrupt_target(self.btw_inflight, validation_active, self.run.is_running);
+                    let ctrl_c =
+                        ctrl_c_action(self.ctrl_c_exit_armed, target, self.input.buffer.is_empty());
+                    if ctrl_c == CtrlCAction::ClearDraft {
+                        self.input.discard_draft();
+                    }
+                    if ctrl_c != CtrlCAction::Exit {
+                        self.ctrl_c_exit_armed = true;
+                    }
+                    self.renderer.write_line(ctrl_c_feedback(ctrl_c), C_ERROR)?;
+                    // Acknowledgment must reach the terminal before any
+                    // potentially slow cancellation and cleanup wait.
+                    self.refresh()?;
+                    match ctrl_c {
+                        CtrlCAction::Interrupt(InterruptTarget::Btw) => {
+                            self.btw_pricing.cancel_all();
+                            for (_, _, task, scope) in self.btw_abort.drain(..) {
+                                retire_scoped_task(
+                                    task,
+                                    scope,
+                                    "side-question",
+                                    std::time::Duration::from_secs(5),
+                                )
+                                .await?;
+                            }
+                            self.btw_inflight = 0;
+                            self.renderer.write_line("btw cancelled", C_ERROR)?;
+                        }
+                        CtrlCAction::Interrupt(
+                            InterruptTarget::Validation | InterruptTarget::MainRun,
+                        ) => {
+                            self.abort_main_run().await?;
+                        }
+                        CtrlCAction::ClearDraft | CtrlCAction::ArmExit => {}
+                        CtrlCAction::Exit => return Ok(ControlFlow::Break(())),
+                        CtrlCAction::Interrupt(InterruptTarget::Exit) => unreachable!(),
+                    }
+                    self.refresh()?;
+                    return Ok(ControlFlow::Continue(()));
+                }
+                self.ctrl_c_exit_armed = false;
+                if is_ctrl_d {
                     match interrupt_target(
                         self.btw_inflight,
-                        validation_active,
+                        self.run.validation_active(),
                         self.run.is_running,
                     ) {
                         InterruptTarget::Btw => {
@@ -3709,9 +3916,8 @@ impl<'a> App<'a> {
                             self.abort_main_run().await?;
                         }
                         InterruptTarget::Exit => {
-                            match idle_interrupt(is_ctrl_d, self.input.buffer.is_empty()) {
+                            match idle_interrupt(true, self.input.buffer.is_empty()) {
                                 IdleInterrupt::Exit => return Ok(ControlFlow::Break(())),
-                                IdleInterrupt::ClearDraft => self.input.discard_draft(),
                                 IdleInterrupt::EditorKey => {
                                     let editor_key = KeyBindings::canonical(KeyAction::Eof)
                                         .expect("default EOF key");
@@ -3720,6 +3926,7 @@ impl<'a> App<'a> {
                                     })
                                     .await?;
                                 }
+                                IdleInterrupt::ClearDraft => unreachable!(),
                             }
                         }
                     }
@@ -3957,6 +4164,15 @@ impl<'a> App<'a> {
                     &format!("cannot save reasoning preference: {error}"),
                     C_ERROR,
                 )?,
+            }
+            return Ok(());
+        }
+
+        // Ctrl+T is unbound by default; a user binding for it wins.
+        if action.is_none() && is_tool_output_key(key) {
+            if self.renderer.set_tool_output_fold(1, None).is_none() {
+                self.renderer
+                    .show_notice("no tool output to expand yet", Color::DarkGrey);
             }
             return Ok(());
         }
@@ -4255,6 +4471,10 @@ impl<'a> App<'a> {
                     self.run_queue_command(arg)?;
                     return Ok(());
                 }
+            }
+            if let Some((expand, arg)) = crate::ui::tool_output::fold_command(&text) {
+                self.run_fold_command(expand, arg);
+                return Ok(());
             }
             {
                 let t = text.trim_start();
@@ -4635,6 +4855,33 @@ impl<'a> App<'a> {
         if todo_progress_changed {
             self.refresh()?;
         }
+        Ok(())
+    }
+
+    async fn handle_agent_stream_closed(&mut self) -> anyhow::Result<()> {
+        self.run.agent_rx = None;
+        if !self.run.is_running {
+            self.run.main_abort = None;
+            return Ok(());
+        }
+
+        tracing::error!(
+            response_bytes = self.run.response_buf.len(),
+            turn_trace_events = self.run.turn_trace.len(),
+            pending_turn = self.run.pending_turn.is_some(),
+            main_task_finished = self
+                .run
+                .main_abort
+                .as_ref()
+                .is_some_and(tokio::task::AbortHandle::is_finished),
+            "agent event stream closed before a terminal completion event"
+        );
+        self.renderer.write_line(
+            "error: agent event delivery ended before terminal completion",
+            C_ERROR,
+        )?;
+        self.fail_pending_main_turn().await;
+        self.refresh()?;
         Ok(())
     }
 
@@ -5981,6 +6228,38 @@ impl<'a> App<'a> {
             Ok(true)
         } else {
             unreachable!("literal, picker and one-shot dot input already returned")
+        }
+    }
+
+    /// `/expand [n|all]` and `/collapse [n|all]`: unfold or fold tool
+    /// results in place. Feedback is a transient notice so the command never
+    /// grows the transcript it is reshaping.
+    fn run_fold_command(&mut self, expand: bool, arg: &str) {
+        use crate::ui::tool_output::{FoldTarget, parse_fold_target};
+        let verb = if expand { "expand" } else { "collapse" };
+        match parse_fold_target(arg) {
+            Err(error) => self
+                .renderer
+                .show_notice(&format!("/{verb}: {error}"), C_ERROR),
+            Ok(FoldTarget::All) => {
+                let changed = self.renderer.set_all_tool_output_folds(expand);
+                let done = if expand { "expanded" } else { "collapsed" };
+                self.renderer
+                    .show_notice(&format!("{done} {changed} tool result(s)"), Color::DarkGrey);
+            }
+            Ok(FoldTarget::Nth(n)) => {
+                if self
+                    .renderer
+                    .set_tool_output_fold(n, Some(expand))
+                    .is_none()
+                {
+                    let total = self.renderer.feed().fold_count();
+                    self.renderer.show_notice(
+                        &format!("/{verb}: no tool result #{n} ({total} expandable)"),
+                        C_ERROR,
+                    );
+                }
+            }
         }
     }
 
@@ -7646,7 +7925,7 @@ impl<'a> App<'a> {
         match &probe_result {
             Ok(_) if available => {
                 tracing::info!(
-                    target: "zerostack::audit::support_utility",
+                    target: "mini_agent::audit::support_utility",
                     trust_class = "TC-SUPPORT-UTILITY",
                     utility = "lazygit-version-probe",
                     cwd = %cwd.display(),
@@ -7657,7 +7936,7 @@ impl<'a> App<'a> {
             }
             Ok(output) => {
                 tracing::warn!(
-                    target: "zerostack::audit::support_utility",
+                    target: "mini_agent::audit::support_utility",
                     trust_class = "TC-SUPPORT-UTILITY",
                     utility = "lazygit-version-probe",
                     cwd = %cwd.display(),
@@ -7668,7 +7947,7 @@ impl<'a> App<'a> {
             }
             Err(error) => {
                 tracing::warn!(
-                    target: "zerostack::audit::support_utility",
+                    target: "mini_agent::audit::support_utility",
                     trust_class = "TC-SUPPORT-UTILITY",
                     utility = "lazygit-version-probe",
                     cwd = %cwd.display(),
@@ -7715,7 +7994,7 @@ impl<'a> App<'a> {
             }
             Err(error) => {
                 tracing::warn!(
-                    target: "zerostack::audit::support_utility",
+                    target: "mini_agent::audit::support_utility",
                     trust_class = "TC-SUPPORT-UTILITY",
                     utility = "lazygit",
                     cwd = %cwd.display(),
@@ -8622,19 +8901,19 @@ mod interrupt_rewind_tests {
         let root = crate::tests::OwnedTestDirectory::new("app-shell-rewind");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -8872,19 +9151,19 @@ mod interrupt_rewind_tests {
         let root = crate::tests::OwnedTestDirectory::new("app-provider-error-draft");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -9002,27 +9281,27 @@ mod interrupt_rewind_tests {
         let root = crate::tests::OwnedTestDirectory::new("app-context-stop-draft");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_LOCAL_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
                 Some(root.path().join("local-data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
             (
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
                 Some(root.path().join("credentials").into_os_string()),
             ),
         ]);
@@ -9200,19 +9479,19 @@ mod interrupt_rewind_tests {
         let root = crate::tests::OwnedTestDirectory::new("app-interrupt-drafts");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
@@ -9374,27 +9653,27 @@ mod explicit_shell_persistence_tests {
         let root = crate::tests::OwnedTestDirectory::new("explicit-shell-persistence");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_LOCAL_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
                 Some(root.path().join("local-data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
             (
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
                 Some(root.path().join("credentials").into_os_string()),
             ),
         ]);
@@ -9456,27 +9735,27 @@ mod explicit_shell_persistence_tests {
         let root = crate::tests::OwnedTestDirectory::new("explicit-shell-live-tail");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_LOCAL_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
                 Some(root.path().join("local-data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
             (
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
                 Some(root.path().join("credentials").into_os_string()),
             ),
         ]);
@@ -9523,27 +9802,27 @@ mod explicit_shell_persistence_tests {
         let root = crate::tests::OwnedTestDirectory::new("explicit-shell-save-failure");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_LOCAL_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
                 Some(root.path().join("local-data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
             (
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
                 Some(root.path().join("credentials").into_os_string()),
             ),
         ]);
@@ -9631,27 +9910,27 @@ mod permission_loop_tests {
     fn environment(root: &crate::tests::OwnedTestDirectory) -> crate::tests::ScopedProcessEnv {
         crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_LOCAL_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
                 Some(root.path().join("local-data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
             (
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
                 Some(root.path().join("credentials").into_os_string()),
             ),
         ])
@@ -9844,9 +10123,6 @@ mod permission_loop_tests {
             },
         )
         .await;
-        let (logs, log_receiver) = mpsc::channel(2);
-        app.tui_log_rx = Some(log_receiver);
-        sent(&logs, "BACKGROUND_LOG_BEFORE_ANSWER".into()).await;
         sent(
             &agent_events,
             AgentEvent::Token("BACKGROUND_AGENT_BEFORE_ANSWER".into()),
@@ -9859,7 +10135,6 @@ mod permission_loop_tests {
         for marker in [
             "BACKGROUND_BTW_BEFORE_ANSWER",
             "BACKGROUND_AGENT_BEFORE_ANSWER",
-            "BACKGROUND_LOG_BEFORE_ANSWER",
         ] {
             assert!(transcript.contains(marker), "{marker}: {transcript}");
             assert!(
@@ -11633,12 +11908,12 @@ mod mutation_consumer_tests {
     async fn actual_app_channel_renders_only_matching_committed_diff_and_replays_same_preview() {
         let root = crate::tests::OwnedTestDirectory::new("mutation-app");
         let bindings = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _env = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -11793,12 +12068,12 @@ mod compaction_visibility_tests {
     async fn actual_compact_show_is_read_only_and_sanitizes_the_active_saved_summary() {
         let root = crate::tests::OwnedTestDirectory::new("compact-show-app");
         let bindings = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _env = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -11918,12 +12193,12 @@ mod custom_command_tests {
     async fn actual_custom_slash_submits_one_literal_user_turn_and_restores_one_shot_context() {
         let root = crate::tests::OwnedTestDirectory::new("custom-slash-app");
         let bindings = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -12114,19 +12389,19 @@ mod workspace_session_picker_tests {
     fn environment(root: &crate::tests::OwnedTestDirectory) -> crate::tests::ScopedProcessEnv {
         crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ])
@@ -12410,7 +12685,7 @@ mod workspace_session_picker_tests {
                         #[cfg(feature = "hooks")]
                         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
                         let root = crate::tests::OwnedTestDirectory::new("worktree116");
-                        let bindings = ["ZS_CONFIG_DIR", "ZS_DATA_DIR", "ZS_LOCAL_DATA_DIR", "ZS_STATE_DIR", "ZS_CACHE_DIR", "ZS_CREDENTIALS_DIR"]
+                        let bindings = ["MINI_AGENT_CONFIG_DIR", "MINI_AGENT_DATA_DIR", "MINI_AGENT_LOCAL_DATA_DIR", "MINI_AGENT_STATE_DIR", "MINI_AGENT_CACHE_DIR", "MINI_AGENT_CREDENTIALS_DIR"]
                             .map(|name| (name, Some(root.path().join(name).into_os_string())));
                         let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
                         let repository = root.path().join("repository");
@@ -12695,12 +12970,12 @@ mod usd_budget_app_tests {
         for case in ["zero", "ledger-only", "corrupt"] {
             let root = crate::tests::OwnedTestDirectory::new("cost-git-proposal-app");
             let bindings = [
-                "ZS_CONFIG_DIR",
-                "ZS_DATA_DIR",
-                "ZS_LOCAL_DATA_DIR",
-                "ZS_STATE_DIR",
-                "ZS_CACHE_DIR",
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CONFIG_DIR",
+                "MINI_AGENT_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
+                "MINI_AGENT_STATE_DIR",
+                "MINI_AGENT_CACHE_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
             ]
             .map(|name| (name, Some(root.path().join(name).into_os_string())));
             let _env = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -12829,12 +13104,12 @@ mod usd_budget_app_tests {
     async fn usd_budget_actual_app_cost_query_is_readonly_and_queue_stays_visible() {
         let root = crate::tests::OwnedTestDirectory::new("cost-query-app");
         let bindings = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _env = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -13623,27 +13898,27 @@ mod git_feature_off_consumer_tests {
         let root = crate::tests::OwnedTestDirectory::new("git32-feature-off");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_LOCAL_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
                 Some(root.path().join("local-data").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
             (
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
                 Some(root.path().join("credentials").into_os_string()),
             ),
         ]);
@@ -13718,12 +13993,12 @@ mod context_diagnostic_tests {
     async fn actual_context_and_doctor_are_pure_cold_busy_and_built_without_provider_requests() {
         let root = crate::tests::OwnedTestDirectory::new("context-diagnostic-app");
         let environment = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&environment);
@@ -13864,14 +14139,19 @@ mod context_diagnostic_tests {
         assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
         assert_eq!(saved_files(&paths.sessions_dir()), stored_before);
         app.run.is_running = false;
-        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        std::fs::create_dir_all(root.path().join(crate::product::PROJECT_DIRECTORY)).unwrap();
         std::fs::write(
-            root.path().join(".zerostack/config.toml"),
+            root.path()
+                .join(crate::product::PROJECT_DIRECTORY)
+                .join("config.toml"),
             "model='test-model'\n",
         )
         .unwrap();
         crate::config::load::trust_project_config(
-            &root.path().join(".zerostack/config.toml"),
+            &root
+                .path()
+                .join(crate::product::PROJECT_DIRECTORY)
+                .join("config.toml"),
             &paths.project_config_trust_file(),
         )
         .unwrap();
@@ -14051,12 +14331,12 @@ mod git_confirmation_stack_tests {
                         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
                         let root = crate::tests::OwnedTestDirectory::new("combined-git-one-mib");
                         let bindings = [
-                            "ZS_CONFIG_DIR",
-                            "ZS_DATA_DIR",
-                            "ZS_LOCAL_DATA_DIR",
-                            "ZS_STATE_DIR",
-                            "ZS_CACHE_DIR",
-                            "ZS_CREDENTIALS_DIR",
+                            "MINI_AGENT_CONFIG_DIR",
+                            "MINI_AGENT_DATA_DIR",
+                            "MINI_AGENT_LOCAL_DATA_DIR",
+                            "MINI_AGENT_STATE_DIR",
+                            "MINI_AGENT_CACHE_DIR",
+                            "MINI_AGENT_CREDENTIALS_DIR",
                         ]
                         .map(|name| (name, Some(root.path().join(name).into_os_string())));
                         let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -14446,12 +14726,12 @@ mod plan_approval_tests {
         fn new() -> Self {
             let directory = crate::tests::OwnedTestDirectory::new("actual-plan-approval");
             let bindings = [
-                "ZS_CONFIG_DIR",
-                "ZS_DATA_DIR",
-                "ZS_LOCAL_DATA_DIR",
-                "ZS_STATE_DIR",
-                "ZS_CACHE_DIR",
-                "ZS_CREDENTIALS_DIR",
+                "MINI_AGENT_CONFIG_DIR",
+                "MINI_AGENT_DATA_DIR",
+                "MINI_AGENT_LOCAL_DATA_DIR",
+                "MINI_AGENT_STATE_DIR",
+                "MINI_AGENT_CACHE_DIR",
+                "MINI_AGENT_CREDENTIALS_DIR",
             ]
             .map(|name| (name, Some(directory.path().join(name).into_os_string())));
             let environment = crate::tests::ScopedProcessEnv::set(&bindings);
@@ -15760,7 +16040,7 @@ mod plan_approval_tests {
                 let cli = crate::cli::Cli { no_session: true, no_tools: true, no_context_files: true, api_key: Some("unused-local-key".into()), ..Default::default() };
                 let workspace = roots.workspace();
                 let paths = crate::paths::process_paths_ref().unwrap();
-                let config = workspace.root().join(".zerostack/config.toml");
+                let config = workspace.root().join(crate::product::PROJECT_DIRECTORY).join("config.toml");
                 std::fs::create_dir_all(config.parent().unwrap()).unwrap();
                 std::fs::write(&config, "model='fixture'\n").unwrap();
                 crate::config::load::trust_project_config(&config, &paths.project_config_trust_file()).unwrap();
@@ -16936,7 +17216,8 @@ mod plan_approval_tests {
         ));
         begin(&mut app).await;
         assert!(finish_turn(&mut app).await);
-        let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+        let ledger =
+            crate::spend::Ledger::new(&roots.directory.path().join("MINI_AGENT_STATE_DIR"));
         let first = ledger.summary_for_session(&app.ui.session.id).unwrap();
         assert_eq!(
             first.session.records, 1,
@@ -17048,7 +17329,8 @@ mod plan_approval_tests {
                 );
             }
             assert_eq!(provider.calls().len(), if capped { 1 } else { 2 });
-            let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+            let ledger =
+                crate::spend::Ledger::new(&roots.directory.path().join("MINI_AGENT_STATE_DIR"));
             let totals = ledger
                 .summary_for_session(&app.ui.session.id)
                 .unwrap()
@@ -17156,7 +17438,8 @@ mod plan_approval_tests {
             )
             .await;
             key(&mut app, KeyCode::Enter).await;
-            let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+            let ledger =
+                crate::spend::Ledger::new(&roots.directory.path().join("MINI_AGENT_STATE_DIR"));
             let mut boundaries = 0;
             let mut read_succeeded = false;
             let succeeded = tokio::time::timeout(Duration::from_secs(10), async {
@@ -17241,10 +17524,14 @@ mod plan_approval_tests {
             assert_eq!(app.ui.session.total_input_tokens, totals.input_tokens);
             assert!(!app.ui.session.spend_account.has_pending());
             assert!(!app.ui.session.spend_account.snapshot().tracking_error);
-            for line in
-                std::fs::read_to_string(roots.directory.path().join("ZS_STATE_DIR/usage.jsonl"))
-                    .unwrap()
-                    .lines()
+            for line in std::fs::read_to_string(
+                roots
+                    .directory
+                    .path()
+                    .join("MINI_AGENT_STATE_DIR/usage.jsonl"),
+            )
+            .unwrap()
+            .lines()
             {
                 let row: serde_json::Value = serde_json::from_str(line).unwrap();
                 assert_eq!(row["session_id"], id.as_str());
@@ -17299,7 +17586,8 @@ mod plan_approval_tests {
         .await;
         key(&mut app, KeyCode::Enter).await;
         assert!(!finish_turn(&mut app).await);
-        let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+        let ledger =
+            crate::spend::Ledger::new(&roots.directory.path().join("MINI_AGENT_STATE_DIR"));
         assert_eq!(
             ledger
                 .summary_for_session(&app.ui.session.id)
@@ -17414,7 +17702,8 @@ mod plan_approval_tests {
             assert!(app.ui.session.spend_account.snapshot().tracking_error);
             assert!(!app.ui.session.spend_account.has_pending());
             assert_eq!(app.ui.session.total_cost, 0.0);
-            let ledger = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"));
+            let ledger =
+                crate::spend::Ledger::new(&roots.directory.path().join("MINI_AGENT_STATE_DIR"));
             assert_eq!(
                 ledger
                     .summary_for_session(&app.ui.session.id)
@@ -18397,7 +18686,7 @@ mod plan_approval_tests {
         let observed = usage.clone();
         crate::question::scope(Some(turn.clone()), async {
             let result = crate::startup::heap_future(|| {
-                candidate.run_subagent("Child intent", 3, None, &cfg.retry, usage)
+                candidate.run_subagent("Child intent", 3, None, &cfg.retry, usage, None)
             })
             .await;
             assert_eq!(result.response.unwrap(), "CHILD_DONE");
@@ -18535,10 +18824,11 @@ mod plan_approval_tests {
         assert_eq!(boundaries, 1);
         assert!(rejected_again);
         assert_eq!(provider.calls().len(), 3);
-        let persisted = crate::spend::Ledger::new(&roots.directory.path().join("ZS_STATE_DIR"))
-            .summary_for_session(&id)
-            .unwrap()
-            .session;
+        let persisted =
+            crate::spend::Ledger::new(&roots.directory.path().join("MINI_AGENT_STATE_DIR"))
+                .summary_for_session(&id)
+                .unwrap()
+                .session;
         assert_eq!(persisted.records, 3);
         assert_eq!(
             (persisted.input_tokens, persisted.output_tokens),
@@ -18689,7 +18979,7 @@ mod config_editor68_tests {
         std::thread::Builder::new().name("config68-app".into()).stack_size(1024*1024).spawn(||{
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(crate::startup::heap_future(||async {
                 let root=crate::tests::OwnedTestDirectory::new("config68-app");
-                let environment=["ZS_CONFIG_DIR","ZS_DATA_DIR","ZS_LOCAL_DATA_DIR","ZS_STATE_DIR","ZS_CACHE_DIR","ZS_CREDENTIALS_DIR"].map(|name|(name,Some(root.path().join(name).into_os_string())));
+                let environment=["MINI_AGENT_CONFIG_DIR","MINI_AGENT_DATA_DIR","MINI_AGENT_LOCAL_DATA_DIR","MINI_AGENT_STATE_DIR","MINI_AGENT_CACHE_DIR","MINI_AGENT_CREDENTIALS_DIR"].map(|name|(name,Some(root.path().join(name).into_os_string())));
                 let _environment=crate::tests::ScopedProcessEnv::set(&environment);
                 let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
                 let mut cfg:crate::config::Config=serde_json::from_value(serde_json::json!({"max_tokens":51,"custom_providers":{"editor68":{"provider_type":"openai","base_url":format!("http://{address}/v1"),"api_style":"completions"}}})).unwrap();

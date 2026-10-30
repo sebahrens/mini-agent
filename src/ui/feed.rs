@@ -171,6 +171,16 @@ pub struct Block {
     /// inserted for one anchor in insertion order.
     attached_to: Option<CompactString>,
     reasoning: Option<ReasoningBlock>,
+    /// A foldable block (a tool result) keeps the form it is not showing;
+    /// toggling swaps it with `text`.
+    fold: Option<Box<Fold>>,
+}
+
+/// The hidden form of a foldable block.
+#[derive(Clone, Debug)]
+struct Fold {
+    alternate: String,
+    expanded: bool,
 }
 
 /// Per-block state only agent (markdown) layouts use.
@@ -349,7 +359,56 @@ impl Block {
             anchor: None,
             attached_to: None,
             reasoning,
+            fold: None,
         }
+    }
+
+    /// A foldable block showing `collapsed` or `expanded` first.
+    pub fn foldable(
+        style: BlockStyle,
+        collapsed: impl Into<String>,
+        expanded: impl Into<String>,
+        start_expanded: bool,
+    ) -> Self {
+        let mut collapsed = terminal_safe(collapsed.into());
+        compact_oversized_block(&mut collapsed);
+        let mut expanded = terminal_safe(expanded.into());
+        compact_oversized_block(&mut expanded);
+        let (text, alternate) = if start_expanded {
+            (expanded, collapsed)
+        } else {
+            (collapsed, expanded)
+        };
+        let mut block = Self::new(style, text);
+        block.fold = Some(Box::new(Fold {
+            alternate,
+            expanded: start_expanded,
+        }));
+        block
+    }
+
+    /// Bytes retained by the block, both forms of a foldable block included.
+    fn retained_bytes(&self) -> usize {
+        self.text.len() + self.fold.as_ref().map_or(0, |fold| fold.alternate.len())
+    }
+
+    /// Swap a foldable block to `expanded`. Returns whether it changed.
+    fn set_expanded(&mut self, expanded: bool) -> bool {
+        let Some(fold) = self.fold.as_mut() else {
+            return false;
+        };
+        if fold.expanded == expanded {
+            return false;
+        }
+        std::mem::swap(&mut self.text, &mut fold.alternate);
+        fold.expanded = expanded;
+        self.revision = self.revision.wrapping_add(1);
+        self.clear_highlight_budget();
+        *self.plain_cache.borrow_mut() = None;
+        self.clear_md_cache();
+        self.clear_syntax_cache();
+        *self.render_cache.borrow_mut() = None;
+        true
     }
 }
 
@@ -602,15 +661,7 @@ impl Feed {
             return false;
         }
         let mut start = if self.pruned_blocks > 0 {
-            plain_block_lines(
-                &Block::new(
-                    BlockStyle::System,
-                    format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
-                ),
-                width,
-                self.palette,
-            )
-            .len()
+            self.omitted_header_lines(width).len()
         } else {
             0
         };
@@ -780,18 +831,119 @@ impl Feed {
         style: BlockStyle,
         text: impl Into<String>,
     ) -> bool {
-        let Some(position) = self.anchor_insert_position(anchor) else {
-            self.push_block(style, text);
-            return false;
+        self.place_block_after_anchor(anchor, Block::new(style, text))
+    }
+
+    /// [`Feed::place_after_anchor`] for an already-built block (a foldable
+    /// tool result).
+    pub fn place_block_after_anchor(&mut self, anchor: &str, mut block: Block) -> bool {
+        self.total_bytes = self.total_bytes.saturating_add(block.retained_bytes());
+        let placed = match self.anchor_insert_position(anchor) {
+            Some(position) => {
+                block.attached_to = Some(CompactString::from(anchor));
+                self.touch(position);
+                self.blocks.insert(position, block);
+                self.note_inserted_at(position);
+                true
+            }
+            None => {
+                self.touch(self.blocks.len());
+                self.blocks.push_back(block);
+                false
+            }
         };
-        let mut block = Block::new(style, text);
-        block.attached_to = Some(CompactString::from(anchor));
-        self.touch(position);
-        self.total_bytes = self.total_bytes.saturating_add(block.text.len());
-        self.blocks.insert(position, block);
-        self.note_inserted_at(position);
         self.prune_completed_prefix();
-        true
+        placed
+    }
+
+    /// Number of foldable blocks (tool results) retained in the feed.
+    pub fn fold_count(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter(|block| block.fold.is_some())
+            .count()
+    }
+
+    /// Index of the `nth` most recent foldable block (1 = latest).
+    fn nth_fold_index(&self, nth: usize) -> Option<usize> {
+        if nth == 0 {
+            return None;
+        }
+        self.blocks
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, block)| block.fold.is_some())
+            .nth(nth - 1)
+            .map(|(index, _)| index)
+    }
+
+    /// Whether the `nth` most recent foldable block is unfolded.
+    #[cfg(test)]
+    pub fn fold_expanded(&self, nth: usize) -> Option<bool> {
+        let index = self.nth_fold_index(nth)?;
+        self.blocks[index].fold.as_ref().map(|fold| fold.expanded)
+    }
+
+    /// Unfold (`Some(true)`), fold (`Some(false)`) or toggle (`None`) the
+    /// `nth` most recent foldable block (1 = latest). Returns its new state,
+    /// or `None` when there is no such block.
+    pub fn set_fold(&mut self, nth: usize, expanded: Option<bool>) -> Option<bool> {
+        let index = self.nth_fold_index(nth)?;
+        self.set_fold_at(index, expanded)
+    }
+
+    /// [`Feed::set_fold`] by block index.
+    fn set_fold_at(&mut self, index: usize, expanded: Option<bool>) -> Option<bool> {
+        let block = self.blocks.get_mut(index)?;
+        let current = block.fold.as_ref()?.expanded;
+        let target = expanded.unwrap_or(!current);
+        if block.set_expanded(target) {
+            self.touch(index);
+        }
+        Some(target)
+    }
+
+    /// Unfold or fold every foldable block. Returns how many changed.
+    pub fn set_all_folds(&mut self, expanded: bool) -> usize {
+        let mut changed = 0;
+        let mut first_changed = None;
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            if block.set_expanded(expanded) {
+                changed += 1;
+                first_changed.get_or_insert(index);
+            }
+        }
+        if let Some(index) = first_changed {
+            self.touch(index);
+        }
+        changed
+    }
+
+    /// Toggle the foldable block whose first laid-out row (its summary) is
+    /// row `line` at `width`. Returns the new state, or `None` when that row
+    /// is not a foldable block's summary.
+    pub fn toggle_fold_at_line(&mut self, width: usize, line: usize) -> Option<bool> {
+        let mut row = if self.pruned_blocks > 0 {
+            self.omitted_header_lines(width).len()
+        } else {
+            0
+        };
+        let mut target = None;
+        for (index, block) in self.blocks.iter().enumerate() {
+            if row > line {
+                break;
+            }
+            if row == line && block.fold.is_some() {
+                target = Some(index);
+                break;
+            }
+            row += block_segments(self, block, width)
+                .iter()
+                .map(|segment| segment.len())
+                .sum::<usize>();
+        }
+        self.set_fold_at(target?, None)
     }
 
     /// Place a run of single-line rows under `anchor` like repeated
@@ -1098,7 +1250,8 @@ impl Feed {
         let last_index = self.blocks.len().saturating_sub(1);
         self.touch(last_index);
         if let Some(last) = self.blocks.back_mut() {
-            self.total_bytes = self.total_bytes.saturating_sub(last.text.len());
+            self.total_bytes = self.total_bytes.saturating_sub(last.retained_bytes());
+            last.fold = None;
             last.style = style;
             last.text = terminal_safe(text.into());
             last.reasoning = (style == BlockStyle::Reasoning).then(|| ReasoningBlock {
@@ -1136,7 +1289,7 @@ impl Feed {
             .blocks
             .iter()
             .take(len)
-            .map(|block| block.text.len())
+            .map(Block::retained_bytes)
             .sum();
         self.blocks.truncate(len);
         if self.running_reasoning.is_some_and(|index| index >= len) {
@@ -1374,14 +1527,7 @@ impl Feed {
         let mut lines = FeedLines::default();
         let mut notice_segments = 0;
         if first == 0 && self.pruned_blocks > 0 {
-            lines.push(Arc::new(plain_block_lines(
-                &Block::new(
-                    BlockStyle::System,
-                    format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
-                ),
-                width,
-                self.palette,
-            )));
+            lines.push(Arc::new(self.omitted_header_lines(width)));
             notice_segments = 1;
         }
         let mut block_segments =
@@ -1407,6 +1553,18 @@ impl Feed {
             first_block: first,
             block_segments,
         }
+    }
+
+    /// The row noting blocks shed by retention.
+    fn omitted_header_lines(&self, width: usize) -> Vec<LineEntry> {
+        plain_block_lines(
+            &Block::new(
+                BlockStyle::System,
+                format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
+            ),
+            width,
+            self.palette,
+        )
     }
 
     /// Blocks visited by layout rebuilds so far (test-only).
@@ -1548,7 +1706,7 @@ impl Feed {
             };
             if let Some((index, block)) = block {
                 self.note_removed_at(index);
-                self.total_bytes = self.total_bytes.saturating_sub(block.text.len());
+                self.total_bytes = self.total_bytes.saturating_sub(block.retained_bytes());
                 self.pruned_blocks = self.pruned_blocks.saturating_add(1);
                 removed = true;
             } else {
@@ -1697,6 +1855,7 @@ fn reasoning_block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc
         syntax_spans: None,
         text: CompactString::from(clipped),
         color: feed.palette.reasoning,
+        theme_accent: false,
     }])];
     if expanded {
         segments.extend(plain_body_segments(feed, block, width));
@@ -1750,6 +1909,13 @@ fn plain_block_lines(block: &Block, width: usize, palette: ForegroundPalette) ->
         palette.block_color(block.style),
         &mut result,
     );
+    if block.style == BlockStyle::Welcome {
+        // Branded welcome rows resolve through the theme accent at paint
+        // time, distinct from unrelated link-colored content.
+        for entry in &mut result {
+            entry.theme_accent = true;
+        }
+    }
     result
 }
 
@@ -1762,6 +1928,7 @@ fn push_plain_rows(text: &str, width: usize, color: Color, result: &mut Vec<Line
                 syntax_spans: None,
                 text: CompactString::new(""),
                 color,
+                theme_accent: false,
             });
         } else {
             for chunk in word_wrap(trimmed, width) {
@@ -1769,6 +1936,7 @@ fn push_plain_rows(text: &str, width: usize, color: Color, result: &mut Vec<Line
                     syntax_spans: None,
                     text: chunk,
                     color,
+                    theme_accent: false,
                 });
             }
         }
@@ -2375,6 +2543,7 @@ fn agent_tail_lines(
             syntax_spans: None,
             text,
             color,
+            theme_accent: false,
         })
         .collect::<Vec<_>>();
     if needs_prefix {

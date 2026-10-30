@@ -25,7 +25,7 @@ inherited project TOML entry. Removal refuses a different selected owning
 source. Built-in servers retain their dedicated enable settings.
 
 Project JSON uses the `mcpServers` object. Precedence is global config, trusted
-`.mcp.json`, trusted `.zerostack/config.toml`, then built-in injection. A project
+`.mcp.json`, trusted `.mini-agent/config.toml`, then built-in injection. A project
 file is bounded to 1 MiB and 128 server entries, read without following symbolic
 links or accepting hardlinks, directories, or FIFOs. Malformed or untrusted
 definitions remain inactive and visible. Feature-off builds preserve config
@@ -183,7 +183,13 @@ automatic mode and retain their sealed connection identity.
 
 On generic providers, the first model request receives `mcp_search` and a bounded
 JSON names index, rather than every deferred schema. `mcp_search {"query":"tool name or words"}`
-uses deterministic name/description matching over the captured catalogue. It
+uses deterministic name/description matching over the captured catalogue. Each
+query word matches independently, so one query may list several exact tool names.
+Ranking is: the whole query equals a name; a query word equals a name; every word
+is in the name; every word is in the name or description; then partial matches,
+ordered by how many words matched, with names breaking ties. A result with no
+matches carries a `hint` that names this rule, so an unmatched query is not read
+as an unavailable server. It
 returns at most eight names, descriptions and schemas, limited to 128 KiB total,
 and publishes those exact schemas for subsequent model requests. Queries are
 limited to 2 KiB and 32 words; invalid or oversized input fails explicitly. The
@@ -245,3 +251,10 @@ client admission checked after acquiring it, immediately before the atomic
 batch. A cancelled lock wait or revoked candidate publishes neither schemas
 nor activation names. No separate invocation registry, paid embeddings or
 semantic retrieval service is introduced.
+
+## Optional GitHub companion
+
+The stdlib-only `tools/ghagent-mcp` companion runs outside the sandbox and exposes
+allowlisted branch pushes, CI polling, and opt-in draft release creation. It is not
+registered automatically. See [installation, permissions, and trust boundaries](../../tools/ghagent-mcp/README.md)
+before configuring its token and repository allowlist.

@@ -2555,19 +2555,19 @@ async fn native_refused_checkpoint_controls(interactive: bool) {
     let roots = crate::tests::OwnedTestDirectory::new("native-refused-checkpoint");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(roots.path().join("config").into_os_string()),
         ),
         (
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             Some(roots.path().join("data").into_os_string()),
         ),
         (
-            "ZS_STATE_DIR",
+            "MINI_AGENT_STATE_DIR",
             Some(roots.path().join("state").into_os_string()),
         ),
         (
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             Some(roots.path().join("cache").into_os_string()),
         ),
     ]);
@@ -2760,19 +2760,19 @@ async fn effort46_restored_inflight_after_opened_unobserved_http_keeps_account_i
     let roots = crate::tests::OwnedTestDirectory::new("native-restored-http-uncertainty");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(roots.path().join("config").into_os_string()),
         ),
         (
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             Some(roots.path().join("data").into_os_string()),
         ),
         (
-            "ZS_STATE_DIR",
+            "MINI_AGENT_STATE_DIR",
             Some(roots.path().join("state").into_os_string()),
         ),
         (
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             Some(roots.path().join("cache").into_os_string()),
         ),
     ]);
@@ -2917,19 +2917,19 @@ async fn native_headless_frontend_control(
     let roots = crate::tests::OwnedTestDirectory::new("native-headless-frontend");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(roots.path().join("config").into_os_string()),
         ),
         (
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             Some(roots.path().join("data").into_os_string()),
         ),
         (
-            "ZS_STATE_DIR",
+            "MINI_AGENT_STATE_DIR",
             Some(roots.path().join("state").into_os_string()),
         ),
         (
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             Some(roots.path().join("cache").into_os_string()),
         ),
     ]);
@@ -3509,19 +3509,19 @@ async fn native_tui_frontend_control(
     let roots = crate::tests::OwnedTestDirectory::new("native-tui-frontend");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(roots.path().join("config").into_os_string()),
         ),
         (
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             Some(roots.path().join("data").into_os_string()),
         ),
         (
-            "ZS_STATE_DIR",
+            "MINI_AGENT_STATE_DIR",
             Some(roots.path().join("state").into_os_string()),
         ),
         (
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             Some(roots.path().join("cache").into_os_string()),
         ),
     ]);
@@ -3615,7 +3615,7 @@ async fn native_tui_frontend_control(
         crate::extras::skills::session::ImmutableFixtureCleanup(roots.path().to_path_buf());
     let package = roots.path().join(".claude/skills/reviewer");
     if authored {
-        let config = roots.path().join(".zerostack/config.toml");
+        let config = roots.path().join(".mini-agent/config.toml");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(&config, "model='native-test'\n").unwrap();
         crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
@@ -3910,19 +3910,19 @@ async fn effort46_actual_session_start_context_resumes_saved_native_prefix() {
     let roots = crate::tests::OwnedTestDirectory::new("native-startup-context-resume");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(roots.path().join("config").into_os_string()),
         ),
         (
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             Some(roots.path().join("data").into_os_string()),
         ),
         (
-            "ZS_STATE_DIR",
+            "MINI_AGENT_STATE_DIR",
             Some(roots.path().join("state").into_os_string()),
         ),
         (
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             Some(roots.path().join("cache").into_os_string()),
         ),
     ]);
@@ -4092,12 +4092,12 @@ async fn native_steering79_case(stop_at_boundary: bool) {
     let roots = crate::tests::OwnedTestDirectory::new("native-steering79");
     let _environment = crate::tests::ScopedProcessEnv::set(
         &[
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(roots.path().join(name).into_os_string()))),
     );
@@ -4244,19 +4244,19 @@ async fn effort46_live_headless_resume_uses_persisted_main_override() {
     let roots = crate::tests::OwnedTestDirectory::new("effort-live-headless");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(roots.path().join("config").into_os_string()),
         ),
         (
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             Some(roots.path().join("data").into_os_string()),
         ),
         (
-            "ZS_STATE_DIR",
+            "MINI_AGENT_STATE_DIR",
             Some(roots.path().join("state").into_os_string()),
         ),
         (
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             Some(roots.path().join("cache").into_os_string()),
         ),
     ]);
@@ -4496,19 +4496,19 @@ async fn cache71_memory_native_roundtrip(legacy: bool) {
     let roots = crate::tests::OwnedTestDirectory::new("cache71-memory-native");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
         (
-            "ZS_CONFIG_DIR",
+            "MINI_AGENT_CONFIG_DIR",
             Some(roots.path().join("config").into_os_string()),
         ),
         (
-            "ZS_DATA_DIR",
+            "MINI_AGENT_DATA_DIR",
             Some(roots.path().join("data").into_os_string()),
         ),
         (
-            "ZS_STATE_DIR",
+            "MINI_AGENT_STATE_DIR",
             Some(roots.path().join("state").into_os_string()),
         ),
         (
-            "ZS_CACHE_DIR",
+            "MINI_AGENT_CACHE_DIR",
             Some(roots.path().join("cache").into_os_string()),
         ),
     ]);

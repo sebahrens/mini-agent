@@ -49,10 +49,15 @@ effective. Runtime diagnostics continue to report the actual backend state.
 
 ### reqwest note
 
-The repository has one `reqwest` dependency. Enable its blocking client feature on that existing
-entry; do not add another version. Historically, `fetch()` ran from the Phase 1 JS thread; Phase 6
+Production networking uses the workspace's direct `reqwest` 0.13 dependency. Enable its blocking
+client feature on that existing entry; do not add another direct version. Historically, `fetch()` ran from the Phase 1 JS thread; Phase 6
 supersedes that placement with parent-broker execution. All waits retain finite deadlines and
 cancellation.
+
+The optional `skills-embed` graph also contains transitive `reqwest` 0.12 through
+`fastembed` 5.17.4 → `hf-hub` 0.5.0. `deny.toml` records an exact-version duplicate
+exception with that rationale; it is not part of Phase 2 fetch and should be removed when the
+upstream graph converges on 0.13.
 
 ## Target files
 
@@ -71,7 +76,7 @@ cancellation.
 1. parses and normalizes one absolute URL with the same parser used by the transport;
 2. rejects credentials, fragments, ambiguous hosts, and schemes other than HTTPS (or HTTP when
    `js-fetch-allow-http = true`);
-3. checks `js-fetch-origins` as an exact-origin narrowing policy when configured;
+3. checks `js-fetch-origins` as an exact-origin narrowing policy (`"all"`, `"none"` or a list);
 4. resolves the host under a three-second deadline and rejects the whole answer set if any IPv4,
    IPv6, or mapped address is loopback, private, link-local, multicast, unspecified, reserved,
    documentation-only, transition-only, or metadata-capable;
@@ -79,13 +84,22 @@ cancellation.
 6. binds the connection to that authorized resolution result; and
 7. returns `{status, text}` or a typed JS error.
 
-`js-fetch-origins` entries contain only a scheme, host, and optional non-default port, for example
-`["https://docs.rs", "https://api.example.com:8443"]`. An empty or malformed configured list denies
-all fetches. When the setting is absent, the origin narrowing layer is unrestricted but the
-mandatory permission check remains. An unmatched `js/fetch` permission is `Ask` in interactive
-standard/guarded modes and fails closed without an approval channel. Read-only and plan-write
-modes deny it by default. Explicit `permission`, `permission-allow`, `permission-ask`, and
-`permission-deny` rules can target `js/fetch`.
+`js-fetch-origins` accepts three forms:
+
+- `"all"` applies no origin narrowing.
+- `"none"` denies every fetch.
+- An array lists exact origins. Entries contain only a scheme, host, and optional non-default port,
+  for example `["https://docs.rs", "https://api.example.com:8443"]`. An empty or malformed array
+  denies all fetches, so `[]` is equivalent to `"none"` and is also valid for older builds.
+
+Any other string is a startup error. When the setting is absent it behaves like `"all"` and logs a
+one-time notice; the mandatory `js/fetch` permission check applies in every form. A project config layer cannot widen inherited origins to
+`"all"` (the widening is ignored with a warning), and the key is treated as sensitive in a project
+layer. In `yolo` mode an absent key lets `fetch()` reach any public HTTPS origin (loopback and
+private targets are always refused), so deployments should set `"none"` or a list. An unmatched `js/fetch` permission is `Ask`
+in interactive standard/guarded modes and fails closed without an approval channel. Read-only and
+plan-write modes deny it by default. Explicit `permission`, `permission-allow`, `permission-ask`,
+and `permission-deny` rules can target `js/fetch`.
 
 Options support `method` (`GET` or `POST`), a string-to-string `headers` object, and a UTF-8
 `body` for POST. Host, framing, proxy, credential, forwarding, and content-encoding headers are
@@ -241,17 +255,44 @@ default `bwrap` backend, the following matrix is normative:
 
 | Capability | Enforced policy |
 |------------|-----------------|
-| Filesystem reads | The canonical current workspace, mini-agent's canonical application cache, explicit read-only runtime roots (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/nix` when present), `/etc/localtime`, `/etc/ld.so.cache`, and kernel/system metadata exposed by the new `/proc` |
+| Filesystem reads | The canonical current workspace, mini-agent's canonical application cache, explicit read-only runtime roots (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/nix` when present), the validated read-only `sandbox-toolchain-roots` (see below), any explicit profile `sandbox-read-roots`, `/etc/localtime`, `/etc/ld.so.cache`, and kernel/system metadata exposed by the new `/proc` |
 | Filesystem writes | The workspace and application cache bind mounts plus a private ephemeral `/tmp`, except the workspace Git metadata below, which stays read-only; the remaining sandbox root and runtime mounts are read-only |
 | Process namespace | Separate user, PID, IPC, UTS, and cgroup namespaces |
 | Devices | A synthetic minimal `/dev`; host device trees are not mounted |
 | Environment | `--clearenv`, followed only by `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `COLORTERM`, and `NO_COLOR`; `TMPDIR` is fixed to `/tmp` |
 | Network | A separate IP network namespace; host interfaces, host loopback listeners, and external IP networks are unreachable. Filesystem Unix-domain sockets inside the workspace or application-cache bind remain reachable |
 
+#### Configurable read-only toolchain roots (`sandbox-toolchain-roots`)
+
+User-installed CLIs outside the runtime roots (Homebrew on Linux, `~/.cargo/bin`, `~/.local/bin`,
+the rustup home behind Cargo's proxies) would otherwise be unreachable even though `PATH` still
+names them. `sandbox-toolchain-roots` (CLI `--sandbox-toolchain-root`) lists additional binds for the
+general-process and sandboxed-hook `bwrap` profiles; its default when unset is
+`["/home/linuxbrew", "~/.cargo/bin", "~/.local/bin", "~/.rustup"]`, and a configured list replaces
+it. This key is distinct from the profile-level `sandbox-read-roots`/`sandbox-write-roots` grants.
+The resolver in `src/sandbox/read_roots.rs` enforces, per launch:
+
+- every bind is `--ro-bind` (or `--ro-bind-try` for an entry absent at resolution) and precedes the
+  writable workspace bind; no entry ever adds or widens a writable mount;
+- entries are absolute or `~/`-relative to the real home directory, with no `..` component;
+- an entry, or its canonical target, that is `/`, the home directory or an ancestor of it, that
+  contains the workspace or application cache, or that overlaps the private configuration,
+  credential, or state directory fails the launch closed; an entry inside the workspace is
+  skipped so it cannot shadow writable files or the read-only Git metadata binds;
+- `~/.cargo` is not a default because it holds `credentials.toml`;
+- mounted `bin`/`sbin` entries are appended to the sandbox `PATH` when the host `PATH` lacks them;
+  the rest of the environment allow-list is unchanged.
+
+These roots are readable runtime mounts and therefore not confidentiality boundaries for their
+contents. A project-local value is security-sensitive and applies only after content-bound
+project-config trust. Workspace-service profiles and the broker-only JS worker do not use these
+roots.
+
 The working directory is the workspace boundary. The wrapper refuses filesystem root as a
 workspace or application-cache root, but a user who starts mini-agent in another broad directory
-has intentionally selected that directory as visible and writable. Runtime mounts remain readable
-and therefore are not confidentiality boundaries for their contents.
+has intentionally selected that directory as visible and writable, except that a workspace which
+would contain mini-agent's own configuration, credential, or state directory is rejected. Runtime
+mounts remain readable and therefore are not confidentiality boundaries for their contents.
 
 The wrapper does not claim seccomp syscall filtering, CPU/memory quotas, Unix-domain socket
 filtering inside writable binds, confidentiality for kernel/system metadata exposed through
@@ -383,7 +424,7 @@ multi-link, read/write-overlapping, or otherwise unsafe roots fail closed.
 
 Root conflicts are classified only after canonicalization and diagnostics expose fixed role names
 and containment direction, never user paths. A workspace that contains the read-only application
-cache is rejected with guidance to use a project subdirectory or move `ZS_CACHE_DIR` outside the
+cache is rejected with guidance to use a project subdirectory or move `MINI_AGENT_CACHE_DIR` outside the
 workspace; the converse cache-contains-workspace case advises moving the project or cache so
 neither contains the other. Configured read/write conflicts likewise name both roles. The private
 AppContainer control sibling is derived with ancestor reparse rejection and checked against every
@@ -442,7 +483,7 @@ name/payload tests and cross-compilation alone do not establish native recovery 
 | Filesystem reads | The sandbox adds access only for the canonical workspace and application cache, exact selected executable, and bounded explicit `windows-appcontainer-read-roots`; ambient `PATH`, home, Cargo, and Rustup roots are not inferred. Standard Windows system resources and any pre-existing host object readable to `ALL APPLICATION PACKAGES` remain readable, so read confidentiality is not claimed. |
 | Filesystem writes | The sandbox adds package-SID write access only for the canonical workspace plus bounded explicit `windows-appcontainer-write-roots`. A pre-existing host object that already grants write access to `ALL APPLICATION PACKAGES` remains writable; the hosted outside-write canary proves the reference runner boundary but is not a universal write-confidentiality claim. The unique profile's OS-managed storage is private ephemeral sandbox storage. |
 | Executable | The parent supplies stable identity plus SHA-256. The helper reopens and hashes the executable, denies write/delete sharing, verifies the proof, and retains that handle through `CreateProcessAsUserW`. |
-| Process lifetime | The target enters a kill-on-close Job at creation time. The Job limits active processes and UI operations; the caller's wall-clock command timeout is the duration bound. General build and test commands have no fixed per-process memory, aggregate memory, or CPU-time Job ceiling. The separately constrained JS worker retains its strict resource limits. Descendants retain the AppContainer SID and exact Job without breakaway. Helper cancellation first signals cooperative Job termination and waits for `ActiveProcesses == 0` before ACL/profile cleanup, with forced helper termination as a bounded fallback. |
+| Process lifetime | The target enters a kill-on-close Job at creation time. The Job limits active processes and UI operations; the caller's wall-clock command timeout is the duration bound. General build and test commands have no fixed per-process memory, aggregate memory, or CPU-time Job ceiling. The separately constrained JS worker retains its strict resource limits. Descendants retain the AppContainer SID and exact Job without breakaway. Helper cancellation first signals cooperative Job termination and waits for `ActiveProcesses == 0` before ACL/profile cleanup, with forced helper termination as a bounded fallback. Non-helper Windows children never enter that cooperative wait: cancellation uses a native process snapshot to terminate the owned tree, and async callers run Windows termination off the runtime thread. |
 | Environment | The helper request travels only through inherited stdin. The target environment is cleared and rebuilt from `PATH`, `PATHEXT`, Windows system/shell variables, and non-credential locale/terminal variables. API keys, agent sockets, and credential variables are not forwarded. |
 | Network | No capability is supplied. Hosted proof requires zero `TokenCapabilities`, no current-SID loopback exemption, and failed IPv4/IPv6 TCP connection attempts against loopback and an external address. The capability and exemption checks cover both TCP and UDP; a connectionless UDP `send` completion is not accepted as evidence of delivery or authority because Winsock may only have queued the datagram locally. |
 | Registry | AppContainer-visible common registry/COM resources are inherited through `ALL APPLICATION PACKAGES`. No registry confidentiality or isolation is claimed. |
@@ -510,8 +551,8 @@ by the existing reaper. Each elapsed/deadline-slack integer is capped at 60,000 
 saturation record are retained per call. No argv, path, SID, environment,
 request/response payload, command output or credential is captured.
 
-The existing five-second run deadline, five-second reap budget and fresh
-five-second profile recovery ceiling remain unchanged. The setup/build work is
+The general-process preflight uses a thirty-second run deadline, five-second
+reap budget and fresh fifteen-second profile recovery ceiling. The setup/build work is
 inside the run budget; synchronous OS process creation is checked before entry
 but is not made interruptible by these diagnostics. A timeout remains closed.
 The two source-free native diagnostic controls, existing real timeout/tree-reap
@@ -557,3 +598,9 @@ including custom roots and host-full outside retained readonly exceptions.
 Native acceptance must exercise actual ordinary reads/writes, private read
 refusal, ancestor rename refusal, and host-full outside-workspace writes; unit
 argv/render tests alone do not attest OS enforcement.
+
+The Windows general-process preflight and direct executable probes share a bounded
+30-second run window and 5-second reap window. Preserved ACL/profile recovery gets
+a fresh 15-second window after reaping. Direct probes discard command stdout and
+stderr; only closed parent-owned failure metadata may be reported. These general
+process limits do not change the separate Phase 6 JavaScript worker limits.

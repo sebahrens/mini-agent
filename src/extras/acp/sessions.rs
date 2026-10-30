@@ -265,8 +265,13 @@ pub(super) async fn handle_load(
             return Err(error);
         }
     }
+    let config_options = super::persona_config_options(state, &req.session_id).await;
     super::commands::announce(&req.session_id, &cx)?;
-    responder.respond(LoadSessionResponse::new().modes(modes))
+    responder.respond(
+        LoadSessionResponse::new()
+            .modes(modes)
+            .config_options(config_options),
+    )
 }
 
 fn replay_updates(

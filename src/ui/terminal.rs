@@ -15,6 +15,17 @@ const DROP_RESTORE_ATTEMPTS: usize = 3;
 const DROP_RESTORE_BACKOFF: Duration = Duration::from_millis(10);
 static SYSTEM_TERMINAL_ATTACHED: AtomicBool = AtomicBool::new(false);
 
+/// Set for the whole lifetime of the interactive TUI's terminal guard,
+/// including editor/pager suspensions; cleared only when the guard drops.
+static SYSTEM_TERMINAL_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// Whether the interactive TUI currently owns the terminal (attached, or
+/// suspended for an external editor or pager it will resume over). Tracing
+/// output must not be written to stdout/stderr while this holds.
+pub(crate) fn tui_owns_terminal() -> bool {
+    SYSTEM_TERMINAL_SESSION.load(Ordering::Acquire)
+}
+
 // Counts successful terminal resumptions. Attaching clears the screen, so the
 // renderer repaints everything when it sees a new value. Test builds keep it
 // per thread so parallel fixtures never invalidate each other's renderers.
@@ -1123,6 +1134,7 @@ impl TerminalGuard {
             session: TerminalSession::with_options(SystemTerminal, options)
                 .map_err(|error| TerminalLifecycleError::new("attachment", error))?,
         };
+        SYSTEM_TERMINAL_SESSION.store(true, Ordering::Release);
         SYSTEM_TERMINAL_ATTACHED.store(true, Ordering::Release);
         Ok(guard)
     }
@@ -1154,6 +1166,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         SYSTEM_TERMINAL_ATTACHED.store(false, Ordering::Release);
+        SYSTEM_TERMINAL_SESSION.store(false, Ordering::Release);
     }
 }
 

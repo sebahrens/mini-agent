@@ -55,6 +55,45 @@ fn create_error(path: &str, error: std::io::Error) -> ToolError {
     }
 }
 
+fn read_bounded_overwrite(
+    reader: &mut impl Read,
+    recorded: u64,
+    limit: u64,
+    path: &str,
+) -> Result<Vec<u8>, ToolError> {
+    if recorded > limit {
+        return Err(overwrite_not_authorized(path));
+    }
+    let mut bytes = Vec::with_capacity(recorded.min(limit) as usize);
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(overwrite_not_authorized(path));
+    }
+    Ok(bytes)
+}
+
+async fn read_bounded_overwrite_async(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    recorded: u64,
+    limit: u64,
+    path: &str,
+) -> Result<Vec<u8>, ToolError> {
+    if recorded > limit {
+        return Err(overwrite_not_authorized(path));
+    }
+    let mut bytes = Vec::with_capacity(recorded.min(limit) as usize);
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > limit {
+        return Err(overwrite_not_authorized(path));
+    }
+    Ok(bytes)
+}
+
 pub struct WriteTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -232,7 +271,7 @@ impl WriteTool {
         );
         let bytes = args.content.len();
         if bytes as u64 > self.max_text_file_size {
-            tracing::warn!(
+            tracing::debug!(
                 "tool write file too large: path={}, size={}, max={}",
                 expanded,
                 bytes,
@@ -286,8 +325,19 @@ impl WriteTool {
                         return Ok(Probe::TooLarge);
                     }
                     let expected = crate::fs::checked_file_metadata(&existing)?;
-                    let mut current = Vec::with_capacity(metadata.len() as usize);
-                    existing.read_to_end(&mut current)?;
+                    // Bind the read itself, not only the earlier metadata
+                    // length: the file may grow while its descriptor remains
+                    // open. A regrown file is reported the same way a file
+                    // already too large at the metadata check is.
+                    let current = match read_bounded_overwrite(
+                        &mut existing,
+                        metadata.len(),
+                        limit,
+                        &relative.to_string_lossy(),
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return Ok(Probe::TooLarge),
+                    };
                     Ok::<_, std::io::Error>(Probe::Read(Box::new((metadata, expected, current))))
                 })
                 .await
@@ -518,7 +568,7 @@ impl WriteTool {
         }
         let mut preview_before = None;
         let existing = if path.exists() {
-            tracing::warn!("tool write file exists: path={}", expanded);
+            tracing::debug!("tool write file exists: path={}", expanded);
             if !args.overwrite {
                 return Err(create_error(
                     &expanded,
@@ -530,8 +580,13 @@ impl WriteTool {
             if metadata.len() > self.max_text_file_size {
                 return Err(overwrite_not_authorized(&expanded));
             }
-            let mut current = Vec::with_capacity(metadata.len() as usize);
-            file.read_to_end(&mut current).await?;
+            let current = read_bounded_overwrite_async(
+                &mut file,
+                metadata.len(),
+                self.max_text_file_size,
+                &expanded,
+            )
+            .await?;
             let (crc, lines) = full_text_fingerprint(&current)?;
             if !self.read_tracker.permits_full_overwrite(
                 &path.to_string_lossy(),
@@ -695,6 +750,23 @@ mod tests {
         .expect("valid PlanWrite permission fixture");
         WriteTool::new(Some(Arc::new(Mutex::new(checker))), None, None)
             .with_workspace(workspace.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn overwrite_reads_recheck_the_limit_after_the_recorded_size() {
+        let payload = b"0123456789";
+        let mut sync_reader = std::io::Cursor::new(payload);
+        let sync_error = read_bounded_overwrite(&mut sync_reader, 4, 5, "growing.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(sync_error.contains("complete current read"));
+
+        let mut async_reader = std::io::Cursor::new(payload);
+        let async_error = read_bounded_overwrite_async(&mut async_reader, 4, 5, "growing.txt")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(async_error.contains("complete current read"));
     }
 
     #[tokio::test]

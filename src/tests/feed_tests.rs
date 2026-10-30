@@ -157,6 +157,18 @@ fn lines_wrap_plain_block() {
 }
 
 #[test]
+fn welcome_rows_request_the_theme_accent_without_relabeling_cyan_content() {
+    let mut feed = Feed::new();
+    feed.push_line(BlockStyle::Welcome, "welcome");
+    feed.push_line(BlockStyle::Plain, "plain");
+    let lines = feed.lines(80);
+
+    assert!(lines[0].theme_accent);
+    assert_eq!(lines[0].color, Color::Cyan);
+    assert!(!lines[1].theme_accent);
+}
+
+#[test]
 fn lines_wrap_narrow_width() {
     let mut feed = Feed::new();
     feed.push_line(BlockStyle::Plain, "hello world");

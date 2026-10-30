@@ -1,5 +1,5 @@
 //! Built-in language-server defaults and resolution against user
-//! `[lsp.servers]` config. Servers are PATH binaries only — zerostack never
+//! `[lsp.servers]` config. Servers are PATH binaries only — mini-agent never
 //! auto-installs anything; a missing binary is skipped at spawn time.
 
 use std::collections::HashMap;

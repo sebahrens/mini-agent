@@ -13,10 +13,10 @@ impl Drop for LoopTestDataDir {
 }
 
 fn loop_test_data_dir() -> LoopTestDataDir {
-    let dir = std::env::temp_dir().join(format!("zerostack-loop-tests-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("mini-agent-loop-tests-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let environment = crate::tests::ScopedProcessEnv::set(&[(
-        "ZS_DATA_DIR",
+        "MINI_AGENT_DATA_DIR",
         Some(dir.as_os_str().to_os_string()),
     )]);
     LoopTestDataDir {
@@ -26,7 +26,7 @@ fn loop_test_data_dir() -> LoopTestDataDir {
 }
 
 fn unique_plan_path(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("zerostack-{label}-{}", uuid::Uuid::new_v4()))
+    std::env::temp_dir().join(format!("mini-agent-{label}-{}", uuid::Uuid::new_v4()))
 }
 
 // --- LoopState tests ---
@@ -610,4 +610,121 @@ async fn goal_pause_cancels_the_running_verification() {
     assert!(
         !crate::ui::event_handler::retire_goal_verification_after_control(&mut run, ui.session)
     );
+}
+
+/// A run that fails (an exhausted turn budget, a provider error) is still a
+/// goal round in the TUI: it is settled through the gate rather than left
+/// unsettled, so the goal is retried or, past its failure limit, parked with a
+/// reason, and no stale collector is left for the next ordinary turn.
+#[cfg(all(unix, feature = "goal"))]
+#[tokio::test]
+async fn a_failed_tui_run_is_settled_as_a_goal_round() {
+    use crate::event::AgentEvent;
+    use crate::extras::goal::{GoalStatus, PauseReason};
+    use crate::sandbox::Sandbox;
+    use crate::ui::event_handler::handle_agent_event;
+    use crate::ui::state::{AgentRunState, ChainState, SlashState, UiContext};
+    use clap::Parser;
+
+    let root = loop_test_data_dir();
+    let workspace =
+        std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&root.path).unwrap());
+    let mut context = crate::context::load(true);
+    context.workspace_root = workspace.root().to_path_buf();
+    let cli = crate::cli::Cli::parse_from([
+        "mini-agent",
+        "--no-session",
+        "--no-sandbox",
+        "--shell",
+        "/bin/sh",
+    ]);
+    let cfg = crate::config::Config::default();
+    let mut session = crate::session::Session::new("openrouter", "test", 128_000, "");
+    let mut goal = crate::extras::goal::Goal::new("ship the release", Vec::new()).unwrap();
+    goal.judge = crate::extras::goal::JudgePolicy::Off;
+    // Two failed rounds already: this third one reaches the limit, so the
+    // gate parks the goal instead of relaunching a provider-backed round.
+    goal.progress.consecutive_round_failures =
+        crate::extras::goal::gate::MAX_CONSECUTIVE_ROUND_FAILURES;
+    session.goal_store.set(goal, false).unwrap();
+
+    let client = crate::provider::AnyClient::OpenRouter(
+        rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .http_client(crate::provider_http::ProviderHttpClient::default())
+            .build()
+            .unwrap(),
+    );
+    let authority = crate::permission::resolve_configured_execution_authority(&cli, &cfg)
+        .unwrap()
+        .0;
+    let sandbox = crate::permission::bind_configured_shell(
+        &cli,
+        &cfg,
+        authority,
+        &workspace,
+        None,
+        Sandbox::new(false, "__missing_goal_test_backend__"),
+    )
+    .with_workspace_binding(workspace.clone());
+    let mut ui = UiContext::new(
+        &cli,
+        &cfg,
+        &mut session,
+        &mut context,
+        workspace,
+        client,
+        None,
+        None,
+        sandbox,
+        None,
+    );
+    let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+    let slash = SlashState {
+        custom_commands: Default::default(),
+        show_reasoning: false,
+        reasoning_enabled: false,
+        todo_tools_enabled: false,
+    };
+    let mut chain = ChainState::default();
+    let mut run = AgentRunState {
+        goal_round: Some(crate::extras::goal::driver::RoundCollector::new()),
+        ..AgentRunState::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+    handle_agent_event(
+        AgentEvent::Error {
+            message: "PromptError: MaxTurnsError: reached max turns limit: 200".into(),
+            interactions: Vec::new(),
+        },
+        &mut renderer,
+        &mut run,
+        &mut ui,
+        &slash,
+        &mut chain,
+        &tx,
+    )
+    .await
+    .unwrap();
+
+    let goal = ui.session.goal_store.snapshot().unwrap();
+    assert_eq!(
+        goal.status,
+        GoalStatus::Paused,
+        "the failed round was judged"
+    );
+    assert_eq!(goal.paused_reason, Some(PauseReason::RoundFailure));
+    assert!(
+        goal.history
+            .back()
+            .is_some_and(|entry| entry.summary.contains("MaxTurnsError")),
+        "the failure is recorded in the goal history: {:?}",
+        goal.history
+    );
+    assert!(
+        run.goal_round.is_none(),
+        "no stale collector is left behind"
+    );
+    assert!(!run.is_running);
 }

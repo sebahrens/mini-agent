@@ -124,6 +124,7 @@ fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>
                 syntax_spans: None,
                 text: CompactString::new(""),
                 color,
+                theme_accent: false,
             });
         } else {
             for chunk in word_wrap(trimmed, max_width) {
@@ -131,6 +132,7 @@ fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>
                     syntax_spans: None,
                     text: chunk,
                     color,
+                    theme_accent: false,
                 });
             }
         }
@@ -304,6 +306,7 @@ pub(crate) fn markdown_with_code_state(
                         syntax_spans: None,
                         text: CompactString::new(""),
                         color: Color::White,
+                        theme_accent: false,
                     });
                 }
                 TagEnd::CodeBlock => {
@@ -323,6 +326,7 @@ pub(crate) fn markdown_with_code_state(
                             text: CompactString::from(trimmed),
                             color: Color::DarkYellow,
                             syntax_spans,
+                            theme_accent: false,
                         });
                     }
                     if acc.is_empty() || acc.ends_with('\n') {
@@ -330,6 +334,7 @@ pub(crate) fn markdown_with_code_state(
                             text: CompactString::new(""),
                             color: Color::DarkYellow,
                             syntax_spans: None,
+                            theme_accent: false,
                         });
                     }
                     last_code_state = code_state.take();
@@ -339,6 +344,7 @@ pub(crate) fn markdown_with_code_state(
                         text: CompactString::new(""),
                         color: Color::White,
                         syntax_spans: None,
+                        theme_accent: false,
                     });
                 }
                 TagEnd::BlockQuote(_) => {
@@ -350,6 +356,7 @@ pub(crate) fn markdown_with_code_state(
                                 syntax_spans: None,
                                 text: CompactString::new(""),
                                 color: Color::DarkGrey,
+                                theme_accent: false,
                             });
                         } else {
                             prefixed.clear();
@@ -360,6 +367,7 @@ pub(crate) fn markdown_with_code_state(
                                     syntax_spans: None,
                                     text: chunk,
                                     color: Color::DarkGrey,
+                                    theme_accent: false,
                                 });
                             }
                         }
@@ -371,6 +379,7 @@ pub(crate) fn markdown_with_code_state(
                         syntax_spans: None,
                         text: CompactString::new(""),
                         color: Color::White,
+                        theme_accent: false,
                     });
                 }
                 TagEnd::Item => {
@@ -396,6 +405,7 @@ pub(crate) fn markdown_with_code_state(
                                 syntax_spans: None,
                                 text: CompactString::new(""),
                                 color,
+                                theme_accent: false,
                             });
                         } else if first {
                             prefixed.truncate(bullet_len);
@@ -405,6 +415,7 @@ pub(crate) fn markdown_with_code_state(
                                     syntax_spans: None,
                                     text: chunk,
                                     color,
+                                    theme_accent: false,
                                 });
                             }
                             first = false;
@@ -414,6 +425,7 @@ pub(crate) fn markdown_with_code_state(
                                     syntax_spans: None,
                                     text: chunk,
                                     color,
+                                    theme_accent: false,
                                 });
                             }
                         }
@@ -428,6 +440,7 @@ pub(crate) fn markdown_with_code_state(
                         syntax_spans: None,
                         text: CompactString::new(""),
                         color: Color::White,
+                        theme_accent: false,
                     });
                 }
                 TagEnd::Link => {
@@ -446,6 +459,7 @@ pub(crate) fn markdown_with_code_state(
                                     syntax_spans: None,
                                     text: chunk,
                                     color: Color::DarkGrey,
+                                    theme_accent: false,
                                 });
                             }
                             acc.clear();
@@ -461,6 +475,7 @@ pub(crate) fn markdown_with_code_state(
                         syntax_spans: None,
                         text: CompactString::new(""),
                         color: Color::White,
+                        theme_accent: false,
                     });
                 }
                 TagEnd::TableHead => {
@@ -516,11 +531,13 @@ pub(crate) fn markdown_with_code_state(
                     syntax_spans: None,
                     text: CompactString::from(rule),
                     color: Color::DarkGrey,
+                    theme_accent: false,
                 });
                 result.push(LineEntry {
                     syntax_spans: None,
                     text: CompactString::new(""),
                     color: Color::White,
+                    theme_accent: false,
                 });
             }
             Event::Html(t) => {
@@ -667,6 +684,7 @@ fn push_table_line(text: &str, color: Color, out: &mut Vec<LineEntry>) {
         syntax_spans: None,
         text: CompactString::from(text),
         color,
+        theme_accent: false,
     });
 }
 

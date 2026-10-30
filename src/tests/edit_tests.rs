@@ -11,6 +11,15 @@ fn select_edit_system(es: EditSystem) {
 }
 
 #[test]
+fn selecting_the_active_edit_system_reports_no_change() {
+    select_edit_system(EditSystem::Similarity);
+    assert!(!set_edit_system(EditSystem::Similarity));
+    assert!(set_edit_system(EditSystem::Hashedit));
+    assert!(!set_edit_system(EditSystem::Hashedit));
+    assert!(set_edit_system(EditSystem::Similarity));
+}
+
+#[test]
 fn rebuilt_edit_and_read_definitions_follow_the_selected_edit_system() {
     select_edit_system(EditSystem::Similarity);
     let similarity_edit = edit::EditTool::new(None, None);
@@ -49,7 +58,7 @@ struct TempFile(String);
 impl TempFile {
     fn new(name: &str) -> Self {
         let path = std::env::temp_dir()
-            .join(format!("zerostack-test-{}-{name}", uuid::Uuid::new_v4()))
+            .join(format!("mini-agent-test-{}-{name}", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .to_string();
         TempFile(path)

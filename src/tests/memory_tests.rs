@@ -1555,12 +1555,12 @@ fn memory62_environment(
 ) -> crate::tests::ScopedProcessEnv {
     crate::tests::ScopedProcessEnv::set(&[
         ("MINI_AGENT_HOME", Some(owner.path().as_os_str().to_owned())),
-        ("ZS_CONFIG_DIR", None),
-        ("ZS_DATA_DIR", None),
-        ("ZS_LOCAL_DATA_DIR", None),
-        ("ZS_STATE_DIR", None),
-        ("ZS_CACHE_DIR", None),
-        ("ZS_CREDENTIALS_DIR", None),
+        ("MINI_AGENT_CONFIG_DIR", None),
+        ("MINI_AGENT_DATA_DIR", None),
+        ("MINI_AGENT_LOCAL_DATA_DIR", None),
+        ("MINI_AGENT_STATE_DIR", None),
+        ("MINI_AGENT_CACHE_DIR", None),
+        ("MINI_AGENT_CREDENTIALS_DIR", None),
     ])
 }
 

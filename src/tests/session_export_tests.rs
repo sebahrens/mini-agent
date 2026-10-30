@@ -489,7 +489,7 @@ fn session_file_detection_rejects_ambiguous_and_unsupported_schemas() {
     object.insert("type".into(), serde_json::json!("session"));
     object.insert(
         "format".into(),
-        serde_json::json!("zerostack-session-jsonl"),
+        serde_json::json!("mini-agent-session-jsonl"),
     );
     object.insert("version".into(), serde_json::json!(1));
     let error = parse_session_file(&ambiguous.to_string())
@@ -508,6 +508,21 @@ fn session_file_detection_rejects_ambiguous_and_unsupported_schemas() {
             .to_string()
             .contains("unsupported JSONL session version 3")
     );
+}
+
+#[test]
+fn session_import_accepts_the_pre_rename_jsonl_format() {
+    let session = sample_session();
+    let legacy = session_to_jsonl(&session).unwrap().replacen(
+        "mini-agent-session-jsonl",
+        "zerostack-session-jsonl",
+        1,
+    );
+    let ParsedSessionFile::Jsonl(imported) = parse_session_file(&legacy).unwrap() else {
+        panic!("the pre-rename JSONL schema must remain importable");
+    };
+    assert_eq!(imported.id, session.id);
+    assert_eq!(imported.messages.len(), session.messages.len());
 }
 
 #[test]

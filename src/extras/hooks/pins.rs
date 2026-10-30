@@ -15,7 +15,7 @@
 //!
 //! Operands are the resolved executable, each argument, and every
 //! whitespace/shell-punctuation-separated token of the arguments and the `if`
-//! condition, plus `$ZEROSTACK_PROJECT_DIR`-prefixed tokens expanded to the
+//! condition, plus `$MINI_AGENT_PROJECT_DIR`-prefixed tokens expanded to the
 //! workspace. Only operands that resolve (lexically or after following links)
 //! into the workspace and name an existing regular file are bound. Other
 //! variable expansion, files a script sources or reads on its own, and the
@@ -377,8 +377,8 @@ pub(crate) fn resolve_hook_program(
 
 /// Every argument plus its whitespace/shell-punctuation separated tokens, so
 /// `sh -c "./check.sh --fast"` and `--config=hook.toml` bind their files.
-/// A token that starts with `$ZEROSTACK_PROJECT_DIR` or
-/// `${ZEROSTACK_PROJECT_DIR}` is also bound with that prefix replaced by
+/// A token that starts with `$MINI_AGENT_PROJECT_DIR` or
+/// `${MINI_AGENT_PROJECT_DIR}` is also bound with that prefix replaced by
 /// `root`, because the hook child receives exactly that value and a shell
 /// condition or script argument expands it. Other variables are not expanded.
 fn operand_tokens<'a>(args: impl Iterator<Item = &'a str>, root: &Path) -> Vec<String> {
@@ -408,14 +408,14 @@ fn operand_tokens<'a>(args: impl Iterator<Item = &'a str>, root: &Path) -> Vec<S
 }
 
 /// The hook environment variable naming the selected workspace.
-const PROJECT_DIR_VARIABLE: &str = "ZEROSTACK_PROJECT_DIR";
+const PROJECT_DIR_VARIABLE: &str = crate::product::HOOK_PROJECT_DIR_ENV;
 
 fn expand_project_dir(token: &str, root: &Path) -> Option<String> {
     let rest = token.strip_prefix('$')?;
     let braced = format!("{{{PROJECT_DIR_VARIABLE}}}");
     let rest = match rest.strip_prefix(braced.as_str()) {
         Some(rest) => rest,
-        // `$ZEROSTACK_PROJECT_DIRX` names a different variable.
+        // `$MINI_AGENT_PROJECT_DIRX` names a different variable.
         None => rest
             .strip_prefix(PROJECT_DIR_VARIABLE)
             .filter(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))?,

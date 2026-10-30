@@ -76,7 +76,7 @@ impl EditorTemp {
             return Err(editor_draft_too_large());
         }
         let directory =
-            std::env::temp_dir().join(format!("zerostack-editor-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("mini-agent-editor-{}", uuid::Uuid::new_v4()));
         crate::fs::ensure_private_directory(&directory)?;
         let path = directory.join("message.md");
         let mut options = std::fs::OpenOptions::new();
@@ -330,6 +330,7 @@ pub struct InputEditor {
     draft: Option<CompactString>,
     pub picker: Option<Picker>,
     monochrome: bool,
+    accent: Option<crossterm::style::Color>,
     prompt_names: Vec<String>,
     agent_names: Vec<String>,
     theme_names: Vec<String>,
@@ -390,6 +391,7 @@ impl InputEditor {
             draft: None,
             picker: None,
             monochrome: false,
+            accent: None,
             prompt_names: Vec::new(),
             agent_names: Vec::new(),
             theme_names: Vec::new(),
@@ -576,6 +578,7 @@ impl InputEditor {
         #[cfg(feature = "agent-skills")]
         picker.append_described_items(self.skill_commands.clone());
         picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
         picker.activate();
         self.picker = Some(Picker::Command(picker));
     }
@@ -646,6 +649,18 @@ impl InputEditor {
         }
     }
 
+    pub fn set_accent_color(&mut self, accent: Option<crossterm::style::Color>) {
+        self.accent = accent;
+        if let Some(ref mut picker) = self.picker {
+            picker.set_accent_color(accent);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accent_color(&self) -> Option<crossterm::style::Color> {
+        self.accent
+    }
+
     pub fn set_prompt_names(&mut self, names: Vec<String>) {
         self.prompt_names = names;
     }
@@ -671,6 +686,7 @@ impl InputEditor {
     pub fn start_file_picker(&mut self) {
         let mut picker = FilePicker::new();
         picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
         picker.activate();
         // Persona mentions come first so an empty or short query shows them
         // in the first window, ahead of MCP operands and walked files.
@@ -734,6 +750,7 @@ impl InputEditor {
         }
         let mut picker = FilePicker::new();
         picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
         picker.activate_for_add(self.file_workspace.clone());
         picker.set_add_argument(start, query);
         self.picker = Some(Picker::File(picker));
@@ -749,6 +766,7 @@ impl InputEditor {
         }
         let mut picker = ListPicker::new();
         picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
         picker.set_items(commands);
         picker.activate();
         self.picker = Some(Picker::Bang(picker));
@@ -760,6 +778,7 @@ impl InputEditor {
         #[cfg(feature = "agent-skills")]
         picker.append_described_items(self.skill_commands.clone());
         picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
         picker.activate();
         self.picker = Some(Picker::Command(picker));
     }
@@ -769,8 +788,13 @@ impl InputEditor {
     pub fn start_models_picker(&mut self, prefix: &'static str) {
         let mut picker = ModelsPicker::for_command(prefix, self.current_model.clone());
         picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
         picker.set_groups(
-            self.quick_model_names.clone(),
+            if prefix == "/models " {
+                self.quick_model_names.clone()
+            } else {
+                Vec::new()
+            },
             self.live_model_names.clone(),
         );
         picker.activate();
@@ -780,11 +804,98 @@ impl InputEditor {
     pub fn start_provider_picker(&mut self) {
         let mut picker = ListPicker::new();
         picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
         if !self.provider_names.is_empty() {
             picker.set_items(self.provider_names.clone());
         }
         picker.activate();
         self.picker = Some(Picker::Prefixed(picker, "/provider "));
+    }
+
+    pub fn start_argument_picker<I, S>(&mut self, prefix: &'static str, items: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut picker = ListPicker::new();
+        picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
+        picker.set_items(items.into_iter().map(Into::into).collect());
+        picker.activate();
+        self.load_text(prefix);
+        self.picker = Some(Picker::Prefixed(picker, prefix));
+    }
+
+    fn start_argument_picker_with_query<I, S>(
+        &mut self,
+        prefix: &'static str,
+        items: I,
+        query: &str,
+    ) where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.start_argument_picker(prefix, items);
+        if let Some(Picker::Prefixed(picker, _)) = self.picker.as_mut() {
+            for character in query.chars() {
+                picker.char_input(character);
+            }
+        }
+        self.load_text(&format!("{prefix}{query}"));
+    }
+
+    /// Open argument completion for an exact or partially completed slash
+    /// command even when the command picker is no longer active (for example,
+    /// after paste or history recall). Returns false when Tab should keep its
+    /// normal indentation behavior.
+    fn try_start_argument_completion(&mut self) -> bool {
+        if self.cursor != self.buffer.len() || self.buffer.contains('\n') {
+            return false;
+        }
+        let line = self.buffer.to_string();
+
+        for (command, prefix, items) in [
+            ("/prompt", "/prompt ", with_default(&self.prompt_names)),
+            ("/agent", "/agent ", with_default(&self.agent_names)),
+            ("/theme", "/theme ", with_default(&self.theme_names)),
+            ("/provider", "/provider ", self.provider_names.clone()),
+            (
+                "/models-subagent",
+                "/models-subagent ",
+                self.quick_model_names.clone(),
+            ),
+        ] {
+            if let Some(query) = command_argument_query(&line, command) {
+                self.start_argument_picker_with_query(prefix, items, query);
+                return true;
+            }
+        }
+
+        for (command, prefix) in [("/models", "/models "), ("/model", "/model ")] {
+            if let Some(query) = command_argument_query(&line, command) {
+                self.start_models_picker(prefix);
+                if let Some(Picker::Models(picker)) = self.picker.as_mut() {
+                    for character in query.chars() {
+                        picker.char_input(character);
+                    }
+                }
+                self.load_text(&format!("{prefix}{query}"));
+                return true;
+            }
+        }
+
+        for command in crate::ui::pickers::handlers::FINITE_ARGUMENT_COMMANDS {
+            if let Some(query) = command_argument_query(&line, command) {
+                let Some((items, prefix)) =
+                    crate::ui::pickers::handlers::argument_picker_spec(command)
+                else {
+                    continue;
+                };
+                self.start_argument_picker_with_query(prefix, items.iter().copied(), query);
+                return true;
+            }
+        }
+        false
     }
 
     /// Open the `/rewind` picker over the given `(message_index,
@@ -799,6 +910,7 @@ impl InputEditor {
         }
         let mut picker = RewindPicker::new(targets, binding);
         picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
         picker.activate();
         self.picker = Some(Picker::Rewind(picker));
         self.history_pos = None;
@@ -821,9 +933,8 @@ impl InputEditor {
     pub fn start_prompt_picker(&mut self) {
         let mut picker = ListPicker::new();
         picker.set_monochrome(self.monochrome);
-        if !self.prompt_names.is_empty() {
-            picker.set_items(self.prompt_names.clone());
-        }
+        picker.set_accent_color(self.accent);
+        picker.set_items(with_default(&self.prompt_names));
         picker.activate();
         self.picker = Some(Picker::Prefixed(picker, "/prompt "));
     }
@@ -831,6 +942,7 @@ impl InputEditor {
     pub fn start_dot_picker(&mut self) {
         let mut picker = ListPicker::new();
         picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
         if !self.prompt_names.is_empty() {
             picker.set_items(self.prompt_names.clone());
         }
@@ -874,9 +986,8 @@ impl InputEditor {
     pub fn start_theme_picker(&mut self) {
         let mut picker = ListPicker::new();
         picker.set_monochrome(self.monochrome);
-        if !self.theme_names.is_empty() {
-            picker.set_items(self.theme_names.clone());
-        }
+        picker.set_accent_color(self.accent);
+        picker.set_items(with_default(&self.theme_names));
         picker.activate();
         self.picker = Some(Picker::Prefixed(picker, "/theme "));
     }
@@ -1507,6 +1618,17 @@ impl InputEditor {
                     }
                 }
                 if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
+                    && self.buffer.starts_with("/model ")
+                {
+                    let after_prefix: String = self.buffer.chars().skip("/model ".len()).collect();
+                    if !after_prefix.is_empty() && c != ' ' && after_prefix.len() == 1 {
+                        self.start_models_picker("/model ");
+                        if let Some(Picker::Models(ref mut mp)) = self.picker {
+                            mp.char_input(c);
+                        }
+                    }
+                }
+                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
                     && self.buffer.starts_with("/theme ")
                 {
                     let after_prefix: String = self.buffer.chars().skip("/theme ".len()).collect();
@@ -1586,7 +1708,7 @@ impl InputEditor {
                 None
             }
             KeyCode::Tab => {
-                if self.start_add_file_picker() {
+                if self.start_add_file_picker() || self.try_start_argument_completion() {
                     return None;
                 }
                 self.buffer.insert_str(self.cursor, "  ");
@@ -1803,6 +1925,24 @@ impl InputEditor {
         self.buffer = CompactString::new(&new_buf);
         deleted
     }
+}
+
+fn with_default(names: &[String]) -> Vec<String> {
+    std::iter::once("default".to_string())
+        .chain(
+            names
+                .iter()
+                .filter(|name| name.as_str() != "default")
+                .cloned(),
+        )
+        .collect()
+}
+
+fn command_argument_query<'a>(line: &'a str, command: &str) -> Option<&'a str> {
+    if line == command {
+        return Some("");
+    }
+    line.strip_prefix(command)?.strip_prefix(' ')
 }
 
 #[cfg(all(test, unix))]

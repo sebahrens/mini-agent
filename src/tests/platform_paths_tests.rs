@@ -55,12 +55,12 @@ fn windows_environment() -> PathEnvironment {
 
 fn set_override(overrides: &mut PathOverrides, variable: &str, value: OsString) {
     match variable {
-        "ZS_CONFIG_DIR" => overrides.config_dir = Some(value),
-        "ZS_DATA_DIR" => overrides.data_dir = Some(value),
-        "ZS_LOCAL_DATA_DIR" => overrides.local_data_dir = Some(value),
-        "ZS_STATE_DIR" => overrides.state_dir = Some(value),
-        "ZS_CACHE_DIR" => overrides.cache_dir = Some(value),
-        "ZS_CREDENTIALS_DIR" => overrides.credentials_dir = Some(value),
+        "MINI_AGENT_CONFIG_DIR" => overrides.config_dir = Some(value),
+        "MINI_AGENT_DATA_DIR" => overrides.data_dir = Some(value),
+        "MINI_AGENT_LOCAL_DATA_DIR" => overrides.local_data_dir = Some(value),
+        "MINI_AGENT_STATE_DIR" => overrides.state_dir = Some(value),
+        "MINI_AGENT_CACHE_DIR" => overrides.cache_dir = Some(value),
+        "MINI_AGENT_CREDENTIALS_DIR" => overrides.credentials_dir = Some(value),
         _ => panic!("unknown override {variable}"),
     }
 }
@@ -108,26 +108,26 @@ fn app_paths_matrix_acceptance_defaults_on_all_platforms() {
     assert_eq!(
         linux,
         AppPaths {
-            config_dir: PathBuf::from("/home/alice/.config/zerostack"),
-            data_dir: PathBuf::from("/home/alice/.local/share/zerostack"),
-            local_data_dir: PathBuf::from("/home/alice/.local/share/zerostack"),
-            state_dir: PathBuf::from("/home/alice/.local/state/zerostack"),
-            cache_dir: PathBuf::from("/home/alice/.cache/zerostack"),
-            credentials_dir: PathBuf::from("/home/alice/.local/share/zerostack/credentials"),
-            project_dir: Some(PathBuf::from("/work/project/.zerostack")),
+            config_dir: PathBuf::from("/home/alice/.config/mini-agent"),
+            data_dir: PathBuf::from("/home/alice/.local/share/mini-agent"),
+            local_data_dir: PathBuf::from("/home/alice/.local/share/mini-agent"),
+            state_dir: PathBuf::from("/home/alice/.local/state/mini-agent"),
+            cache_dir: PathBuf::from("/home/alice/.cache/mini-agent"),
+            credentials_dir: PathBuf::from("/home/alice/.local/share/mini-agent/credentials"),
+            project_dir: Some(PathBuf::from("/work/project/.mini-agent")),
         }
     );
     assert_default_root_contract(PathPlatform::Linux, &linux).unwrap();
 
     let macos = AppPaths::resolve(&macos_environment()).unwrap();
-    let application_support = PathBuf::from("/Users/alice/Library/Application Support/zerostack");
+    let application_support = PathBuf::from("/Users/alice/Library/Application Support/mini-agent");
     assert_eq!(macos.config_dir, application_support);
     assert_eq!(macos.data_dir, application_support);
     assert_eq!(macos.local_data_dir, application_support);
     assert_eq!(macos.state_dir, application_support.join("state"));
     assert_eq!(
         macos.cache_dir,
-        PathBuf::from("/Users/alice/Library/Caches/zerostack")
+        PathBuf::from("/Users/alice/Library/Caches/mini-agent")
     );
     assert_eq!(
         macos.credentials_dir,
@@ -138,24 +138,24 @@ fn app_paths_matrix_acceptance_defaults_on_all_platforms() {
     let windows = AppPaths::resolve(&windows_environment()).unwrap();
     assert_eq!(
         windows.config_dir,
-        PathBuf::from(r"C:\Users\Alice\AppData\Roaming\zerostack")
+        PathBuf::from(r"C:\Users\Alice\AppData\Roaming\mini-agent")
     );
     assert_eq!(windows.data_dir, windows.config_dir);
     assert_eq!(
         windows.local_data_dir,
-        PathBuf::from(r"C:\Users\Alice\AppData\Local\zerostack")
+        PathBuf::from(r"C:\Users\Alice\AppData\Local\mini-agent")
     );
     assert_eq!(
         windows.state_dir,
-        PathBuf::from(r"C:\Users\Alice\AppData\Local\zerostack\state")
+        PathBuf::from(r"C:\Users\Alice\AppData\Local\mini-agent\state")
     );
     assert_eq!(
         windows.cache_dir,
-        PathBuf::from(r"C:\Users\Alice\AppData\Local\zerostack\cache")
+        PathBuf::from(r"C:\Users\Alice\AppData\Local\mini-agent\cache")
     );
     assert_eq!(
         windows.credentials_dir,
-        PathBuf::from(r"C:\Users\Alice\AppData\Local\zerostack\credentials")
+        PathBuf::from(r"C:\Users\Alice\AppData\Local\mini-agent\credentials")
     );
     assert_default_root_contract(PathPlatform::Windows, &windows).unwrap();
 }
@@ -182,7 +182,7 @@ fn app_paths_matrix_fresh_install_uses_global_home_on_all_platforms() {
     assert_home_layout(&linux, "/home/alice/.mini-agent", '/');
     assert_eq!(
         linux.project_dir,
-        Some(PathBuf::from("/work/project/.zerostack")),
+        Some(PathBuf::from("/work/project/.mini-agent")),
         "the global home never relocates workspace storage"
     );
 
@@ -279,7 +279,7 @@ fn app_paths_matrix_zs_overrides_take_precedence_over_the_global_home() {
         assert_eq!(
             paths.state_dir,
             PathBuf::from("/zs/data"),
-            "ZS_DATA_DIR keeps its documented local/state cascade"
+            "MINI_AGENT_DATA_DIR keeps its documented local/state cascade"
         );
 
         environment.overrides.local_data_dir = Some(OsString::from("/zs/local"));
@@ -407,12 +407,12 @@ fn app_paths_matrix_acceptance_all_overrides_and_precedence() {
     }
 
     const OVERRIDES: [&str; 6] = [
-        "ZS_CONFIG_DIR",
-        "ZS_DATA_DIR",
-        "ZS_LOCAL_DATA_DIR",
-        "ZS_STATE_DIR",
-        "ZS_CACHE_DIR",
-        "ZS_CREDENTIALS_DIR",
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
     ];
     for base_environment in [
         linux_environment(),
@@ -505,7 +505,7 @@ fn acceptance_paths(root: &Path) -> AppPaths {
         state_dir: root.join("state"),
         cache_dir: root.join("cache"),
         credentials_dir: root.join("credentials"),
-        project_dir: Some(root.join("workspace").join(".zerostack")),
+        project_dir: Some(root.join("workspace").join(".mini-agent")),
     }
 }
 
@@ -920,7 +920,7 @@ fn platform_paths_acceptance_intentional_negative_controls() {
         );
     }
 
-    if let Ok(control) = std::env::var("ZS_PLATFORM_PATH_NEGATIVE_CONTROL") {
+    if let Ok(control) = std::env::var("MINI_AGENT_PLATFORM_PATH_NEGATIVE_CONTROL") {
         rejected_negative_control(&control)
             .expect("intentional negative control must make the acceptance test fail");
     }

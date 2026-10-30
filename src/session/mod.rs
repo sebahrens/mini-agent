@@ -3,6 +3,7 @@ pub(crate) mod background_observation;
 pub(crate) mod catalogue;
 pub mod chat_history;
 pub(crate) mod compaction;
+pub(crate) mod environment;
 pub(crate) mod file_checkpoints;
 pub mod lock;
 pub(crate) mod native_publication;
@@ -918,6 +919,10 @@ pub struct Session {
     pub provider_override_audit: Vec<ProviderOverrideAudit>,
     #[serde(default)]
     pub permission_allowlist: Vec<PermissionAllowEntry>,
+    /// Sandbox/permission/workspace/tool environment the session last ran in,
+    /// compared on resume to tell the model when it changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<environment::EnvironmentRecord>,
     /// Structured task state shared by the active agent tools and persisted
     /// with this logical session. Cloning a live session intentionally keeps
     /// the same store so rebuilt agents observe updates immediately.
@@ -1402,6 +1407,7 @@ impl Session {
             overhead_tokens: 0,
             overhead_parts: Vec::new(),
             rewind_undo: None,
+            environment: None,
             history_conversion_cache: HistoryConversionCache::default(),
             save_notice_state: storage::SaveNoticeState::default(),
             history_revision: 0,

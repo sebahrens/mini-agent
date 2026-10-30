@@ -24,10 +24,22 @@ fn fixture_root(label: &str) -> FixtureRoot {
         .unwrap()
         .join(format!("mini-agent-{label}-{}", uuid::Uuid::new_v4()));
     let environment = crate::tests::ScopedProcessEnv::set(&[
-        ("ZS_CONFIG_DIR", Some(path.join("config").into_os_string())),
-        ("ZS_DATA_DIR", Some(path.join("data").into_os_string())),
-        ("ZS_STATE_DIR", Some(path.join("state").into_os_string())),
-        ("ZS_CACHE_DIR", Some(path.join("cache").into_os_string())),
+        (
+            "MINI_AGENT_CONFIG_DIR",
+            Some(path.join("config").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(path.join("data").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(path.join("state").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_CACHE_DIR",
+            Some(path.join("cache").into_os_string()),
+        ),
     ]);
     std::fs::create_dir_all(&path).unwrap();
     FixtureRoot {

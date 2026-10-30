@@ -675,14 +675,14 @@ fn checked_retrieval_results_separate_fidelity_from_semantic_relevance() {
 }
 
 #[tokio::test]
-#[ignore = "set ZS_SKILL_BENCH_FULL=1 to run the 100,000-revision audit"]
+#[ignore = "set MINI_AGENT_SKILL_BENCH_FULL=1 to run the 100,000-revision audit"]
 async fn skill_retrieval_benchmark() {
     assert_eq!(
-        std::env::var("ZS_SKILL_BENCH_FULL").as_deref(),
+        std::env::var("MINI_AGENT_SKILL_BENCH_FULL").as_deref(),
         Ok("1"),
-        "the ignored full benchmark requires ZS_SKILL_BENCH_FULL=1"
+        "the ignored full benchmark requires MINI_AGENT_SKILL_BENCH_FULL=1"
     );
-    let corpus_size = std::env::var("ZS_SKILL_BENCH_SIZE")
+    let corpus_size = std::env::var("MINI_AGENT_SKILL_BENCH_SIZE")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(100_000);

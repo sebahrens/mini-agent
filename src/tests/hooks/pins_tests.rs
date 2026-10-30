@@ -273,7 +273,7 @@ fn project_trust_hash_binds_workspace_file_content_but_keeps_plain_bindings_stab
 fn rewritten_project_hook_script_requires_confirmation_again() {
     let project = Project::new("reconfirm");
     project.write_script("guard.sh", DENY_SCRIPT);
-    let settings = project.root.join(".zerostack/settings.json");
+    let settings = project.root.join(".mini-agent/settings.json");
     std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
     std::fs::write(
         &settings,
@@ -423,15 +423,15 @@ async fn rewritten_workspace_file_of_a_global_hook_is_denied_in_a_later_session(
     }
 }
 
-/// `$ZEROSTACK_PROJECT_DIR`-relative paths name the workspace the hook child
+/// `$MINI_AGENT_PROJECT_DIR`-relative paths name the workspace the hook child
 /// receives, so they are bound like `./` paths (mini-agent-ryobw).
 #[test]
 fn project_dir_variable_paths_are_content_bound() {
     let project = Project::new("project-dir-var");
     project.write_script("hooks/check.sh", "#!/bin/sh\nexit 0\n");
     project.write_script("hooks/guard.sh", DENY_SCRIPT);
-    let mut configured = handler("sh", &["${ZEROSTACK_PROJECT_DIR}/hooks/guard.sh"]);
-    configured.condition = Some("sh \"$ZEROSTACK_PROJECT_DIR/hooks/check.sh\"".into());
+    let mut configured = handler("sh", &["${MINI_AGENT_PROJECT_DIR}/hooks/guard.sh"]);
+    configured.condition = Some("sh \"$MINI_AGENT_PROJECT_DIR/hooks/check.sh\"".into());
     let pins = HookContentPins::capture(&project.root, &configured);
     let locations: Vec<String> = pins.entries().into_iter().map(|(path, _)| path).collect();
     assert_eq!(
@@ -440,7 +440,7 @@ fn project_dir_variable_paths_are_content_bound() {
     );
 
     // A different variable that merely shares the prefix is not expanded.
-    let other = handler("sh", &["$ZEROSTACK_PROJECT_DIRX/hooks/guard.sh"]);
+    let other = handler("sh", &["$MINI_AGENT_PROJECT_DIRX/hooks/guard.sh"]);
     assert!(HookContentPins::capture(&project.root, &other).is_empty());
 }
 
@@ -452,7 +452,7 @@ async fn rewritten_project_dir_variable_condition_script_is_denied() {
     project.write_script("allow.sh", ALLOW_SCRIPT);
     project.write_script("check.sh", "#!/bin/sh\nexit 0\n");
     let mut configured = handler("./allow.sh", &[]);
-    configured.condition = Some("sh \"$ZEROSTACK_PROJECT_DIR/check.sh\"".into());
+    configured.condition = Some("sh \"$MINI_AGENT_PROJECT_DIR/check.sh\"".into());
     let dispatcher = HookDispatcher::from_config_with_backend_and_root(
         &pre_tool_config(configured),
         "unused",
@@ -470,7 +470,7 @@ async fn rewritten_project_dir_variable_condition_script_is_denied() {
     let _ = pre_tool(&dispatcher, &project).await;
     assert!(
         !marker.exists(),
-        "a rewritten $ZEROSTACK_PROJECT_DIR condition script must not run"
+        "a rewritten $MINI_AGENT_PROJECT_DIR condition script must not run"
     );
 }
 

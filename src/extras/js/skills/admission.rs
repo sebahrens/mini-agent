@@ -22,7 +22,7 @@ use super::store::{
     ApprovalAuthorization, ApprovalAuthorizationRequest, ApprovalTransition,
     approval_manifest_digest,
 };
-use super::verify::VerificationError;
+use super::verify::{TestResult, VerificationError};
 use super::{CapabilityManifest, CapabilityScope, SkillArtifact, SkillExport};
 
 const LEASE_SECONDS: i64 = 30;
@@ -200,7 +200,7 @@ impl AdmissionEvaluator {
         match self.evaluate_lease(&lease, now) {
             Ok(report) => Ok(Some(report)),
             Err(EvaluationFailure::Deterministic { code, detail }) => {
-                let report = rejection_report(&lease, code, detail, now);
+                let report = rejection_report(&lease, code, &detail, now);
                 self.store.reject_proposal(
                     &lease.proposal_id,
                     &self.worker_id,
@@ -933,7 +933,7 @@ fn success_report(
 fn rejection_report(
     lease: &ProposalLease,
     reason_code: &str,
-    detail: &'static str,
+    detail: &str,
     now: i64,
 ) -> EvaluationReportRecord {
     build_report(
@@ -995,8 +995,11 @@ fn build_report(
     report
 }
 
-fn deterministic(code: &'static str, detail: &'static str) -> EvaluationFailure {
-    EvaluationFailure::Deterministic { code, detail }
+fn deterministic(code: &'static str, detail: impl Into<String>) -> EvaluationFailure {
+    EvaluationFailure::Deterministic {
+        code,
+        detail: detail.into(),
+    }
 }
 
 fn classify_store(error: StoreError) -> EvaluationFailure {
@@ -1063,19 +1066,45 @@ fn classify_verification(
             "verification resource limit exceeded",
         )
     } else {
-        deterministic(fallback_code, fallback_detail)
+        deterministic(fallback_code, verification_detail(error, fallback_detail))
+    }
+}
+
+/// Name the failing test or rule without echoing source, messages, or paths.
+///
+/// Only the test index, the closed outcome name, a declared export name
+/// (bounded here), and the closed worker diagnostic (`Class/Stage/Role`) are
+/// used, so the text is bounded and path-free.
+fn verification_detail(error: &VerificationError, fallback: &str) -> String {
+    match error {
+        VerificationError::TestFailed { index, outcome } => match outcome {
+            TestResult::ReturnedFalse => format!(
+                "embedded test {index} did not return exactly true (a test must evaluate to the boolean true; call exports without the hidden _cap parameter)"
+            ),
+            TestResult::Threw(diagnostic) => {
+                format!("embedded test {index} threw ({diagnostic})")
+            }
+            TestResult::ResourceLimit | TestResult::JobLimitExceeded => {
+                format!("embedded test {index} exceeded a resource limit")
+            }
+        },
+        VerificationError::SourceEvaluationFailed(failure) => {
+            format!("skill source failed to evaluate ({failure})")
+        }
+        VerificationError::MutationPassFailed { export, .. } => {
+            let export = export.chars().take(64).collect::<String>();
+            format!("export '{export}' failed the mutation pass")
+        }
+        VerificationError::NoTests => "skill has no embedded tests".to_string(),
+        VerificationError::NoExports => "skill declares no exports".to_string(),
+        _ => fallback.to_string(),
     }
 }
 
 enum EvaluationFailure {
-    Deterministic {
-        code: &'static str,
-        detail: &'static str,
-    },
+    Deterministic { code: &'static str, detail: String },
     SuiteRequired,
-    Infrastructure {
-        error: String,
-    },
+    Infrastructure { error: String },
 }
 
 /// Synchronous authenticated approval boundary. Called only after an explicit
@@ -1233,6 +1262,7 @@ mod scheduler_tests {
             exception_class: None,
             line: None,
             column: None,
+            hint: None,
         };
         let error = test_result(Some(&internal))
             .expect_err("a worker internal failure is not a candidate test outcome");
@@ -1251,6 +1281,7 @@ mod scheduler_tests {
             exception_class: None,
             line: None,
             column: None,
+            hint: None,
         };
         assert!(matches!(
             test_result(Some(&thrown)).expect("a thrown exception is a test outcome"),
@@ -1280,6 +1311,7 @@ mod scheduler_tests {
                 exception_class: None,
                 line: None,
                 column: None,
+                hint: None,
             }))
         }
 
@@ -1299,6 +1331,7 @@ mod scheduler_tests {
                     exception_class: None,
                     line: None,
                     column: None,
+                    hint: None,
                 }),
             },
             VerificationError::TestFailed {
@@ -1344,6 +1377,37 @@ mod scheduler_tests {
             "embedded verification failed",
         );
         assert!(matches!(failure, EvaluationFailure::Infrastructure { .. }));
+    }
+
+    #[test]
+    fn rejection_detail_names_the_failing_test_and_stays_bounded() {
+        let failure = classify_verification(
+            &VerificationError::TestFailed {
+                index: 2,
+                outcome: TestResult::ReturnedFalse,
+            },
+            "embedded_test_failed",
+            "embedded verification failed",
+        );
+        let EvaluationFailure::Deterministic { code, detail } = failure else {
+            panic!("a failed embedded test is a deterministic rejection");
+        };
+        assert_eq!(code, "embedded_test_failed");
+        assert!(detail.contains("embedded test 2"), "{detail}");
+        assert!(detail.contains("_cap"), "{detail}");
+        assert!(!detail.contains('/'), "detail must be path-free: {detail}");
+
+        let long_export = "x".repeat(500);
+        let mutation = verification_detail(
+            &VerificationError::MutationPassFailed {
+                export: long_export,
+                reason: "/home/user/secret".to_string(),
+                diagnostic: None,
+            },
+            "fallback",
+        );
+        assert!(mutation.len() < 128, "{mutation}");
+        assert!(!mutation.contains("secret"), "{mutation}");
     }
 
     #[test]

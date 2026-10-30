@@ -17,11 +17,11 @@ with tempfile.TemporaryDirectory(prefix='mini-agent-118-owned-',dir='/private/tm
  root=Path(temp);work=root/'workspace';work.mkdir();env=os.environ.copy()
  for key in tuple(env):
   if key.startswith(('ZS_','OPENAI_','ANTHROPIC_','OPENROUTER_')) or key.endswith(('_API_KEY','_AUTH_TOKEN')):env.pop(key,None)
- for key in ('ZS_CONFIG_DIR','ZS_DATA_DIR','ZS_LOCAL_DATA_DIR','ZS_STATE_DIR','ZS_CACHE_DIR','ZS_CREDENTIALS_DIR'):
+ for key in ('MINI_AGENT_CONFIG_DIR','MINI_AGENT_DATA_DIR','MINI_AGENT_LOCAL_DATA_DIR','MINI_AGENT_STATE_DIR','MINI_AGENT_CACHE_DIR','MINI_AGENT_CREDENTIALS_DIR'):
   p=root/key;p.mkdir(mode=0o700);env[key]=str(p)
  env.update(TERM='xterm-256color',RUST_LOG='off',OPENAI_API_KEY='owned-local118-only')
  listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen();port=listener.getsockname()[1]
- config=Path(env['ZS_CONFIG_DIR'])/'config.toml';config.write_text('provider="terminal118"\nmodel="fixture"\nsession_title_model="off"\nauto_update_prompts=false\nauto_update_themes=false\n[lsp]\nenabled=false\n[custom_providers.terminal118]\nprovider_type="openai"\napi_style="completions"\napi_key_env="OPENAI_API_KEY"\nbase_url="http://127.0.0.1:'+str(port)+'/v1"\n');config.chmod(0o600)
+ config=Path(env['MINI_AGENT_CONFIG_DIR'])/'config.toml';config.write_text('provider="terminal118"\nmodel="fixture"\nsession_title_model="off"\nauto_update_prompts=false\nauto_update_themes=false\n[lsp]\nenabled=false\n[custom_providers.terminal118]\nprovider_type="openai"\napi_style="completions"\napi_key_env="OPENAI_API_KEY"\nbase_url="http://127.0.0.1:'+str(port)+'/v1"\n');config.chmod(0o600)
  answered=False
  def setup():
   os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0);resource.setrlimit(resource.RLIMIT_STACK,(1048576,resource.getrlimit(resource.RLIMIT_STACK)[1]))

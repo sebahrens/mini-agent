@@ -88,7 +88,7 @@ impl AnyClient {
         let result: anyhow::Result<_> = (|| {
             Ok(match self {
                 Self::OpenAI(OpenAiClient::Responses(c)) => build!(c),
-                Self::OpenAI(OpenAiClient::Completions(c)) => build!(c),
+                Self::OpenAI(OpenAiClient::Completions(c, _)) => build!(c),
                 Self::Anthropic(c) => build!(c),
                 Self::Gemini(c) => build!(c),
                 Self::OpenRouter(c) => build!(c),

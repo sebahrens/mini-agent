@@ -169,7 +169,7 @@ mod bounded_directory_file_tests {
             "mini-agent-bounded-directory-files-{}",
             uuid::Uuid::new_v4()
         ));
-        let agents = root.join(".zerostack/agents");
+        let agents = root.join(".mini-agent/agents");
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(agents.join("exact.md"), b"12345678").unwrap();
         std::fs::write(agents.join("oversized.md"), b"123456789").unwrap();
@@ -188,7 +188,7 @@ mod bounded_directory_file_tests {
 
         let workspace = crate::paths::WorkspaceBinding::capture(&root).unwrap();
         let capability_status = workspace
-            .read_relative_dir_files_bounded_status(Path::new(".zerostack/agents"), "md", 8)
+            .read_relative_dir_files_bounded_status(Path::new(".mini-agent/agents"), "md", 8)
             .unwrap();
         assert_eq!(capability_status.len(), 3);
         assert!(capability_status.contains(&("exact".to_string(), Ok("12345678".to_string()))));
@@ -352,6 +352,29 @@ impl ContextFiles {
             }
         }
         Some(directives.mode.map(str::to_string))
+    }
+
+    /// Activate `name` as the main loop's startup prompt: [`Self::activate_prompt`]
+    /// followed by the capability list the main agent is told about. Startup
+    /// (`default_prompt` and `--load-prompt`) and every ACP session select their
+    /// prompt through this one entry point, so both surfaces give the model the
+    /// same system prompt for the same prompt name.
+    pub(crate) fn activate_main_prompt(&mut self, name: &str) -> Option<Option<String>> {
+        let mode = self.activate_prompt(name)?;
+        let mut prompt_text = self.current_prompt.take().unwrap_or_default();
+        let caps: &[&str] = &[
+            #[cfg(feature = "memory")]
+            "- **Memory**: persistent memory across sessions (memory_read, memory_write, memory_search)",
+            #[cfg(feature = "subagents")]
+            "- **Subagents**: delegate specific multi-step investigations to parallel subagents via the `task` tool",
+        ];
+        if !caps.is_empty() {
+            prompt_text.push_str("\n\n## Available Capabilities\n\n");
+            prompt_text.push_str(&caps.join("\n"));
+            prompt_text.push('\n');
+        }
+        self.current_prompt = Some(prompt_text);
+        Some(mode)
     }
 
     /// Select a persona for the main loop and return its optional default
@@ -942,25 +965,25 @@ mod file_read_diagnostic_tests {
         let root = crate::tests::OwnedTestDirectory::new("prompt-theme-read-diagnostics");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(root.path().join("state").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(root.path().join("cache").into_os_string()),
             ),
         ]);
         let paths = crate::paths::process_paths_ref().unwrap();
         let workspace_dir = root.path().join("workspace");
-        let project_prompts = workspace_dir.join(".zerostack/prompts");
+        let project_prompts = workspace_dir.join(".mini-agent/prompts");
         for directory in [
             paths.prompts_dir(),
             paths.themes_dir(),
@@ -1064,13 +1087,16 @@ mod startup_binding_load_tests {
         let root = crate::tests::OwnedTestDirectory::new("startup-binding-load");
         let workspace_root = root.path().join("workspace");
         std::fs::create_dir(&workspace_root).unwrap();
+        // Canonical `MINI_AGENT_*_DIR` override names (see
+        // `paths::process_override`); the stale `ZS_*` prefix matched no
+        // override, so this test silently resolved real default path roots.
         let environment = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(root.path().join(name).into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&environment);

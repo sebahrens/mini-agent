@@ -229,13 +229,7 @@ impl SlashCtx<'_> {
     /// agent was rebuilt). When `false`, the caller should call
     /// `rebuild_agent()` to pick up other prompt changes (mode directive, etc.).
     pub async fn switch_to_prompt_model(&mut self, prompt_name: &str) -> bool {
-        let qm_name = match self.cfg.resolve_prompt_model(prompt_name) {
-            Some(name) => name,
-            None => return false,
-        };
-
-        let qm = crate::config::quick_models_map(self.cfg);
-        let Some(qmc) = qm.get(qm_name) else {
+        let Some((qm_name, qmc)) = mapped_prompt_route(self.cfg, prompt_name) else {
             return false;
         };
 
@@ -275,7 +269,7 @@ impl SlashCtx<'_> {
                 &qmc.provider,
                 &qmc.model,
                 self.cfg,
-                Some(qm_name),
+                Some(qm_name.as_str()),
                 input_price,
             ));
         self.session
@@ -296,6 +290,21 @@ impl SlashCtx<'_> {
     }
 }
 
+/// The quick model `[prompt_to_model]` maps `prompt_name` to, if it exists.
+/// An unmapped prompt and an alias naming no quick model both leave the
+/// TUI's current model in place.
+fn mapped_prompt_route(
+    cfg: &crate::config::Config,
+    prompt_name: &str,
+) -> Option<(String, crate::config::QuickModelConfig)> {
+    match cfg.resolve_prompt_route(prompt_name) {
+        crate::config::PromptRoute::Mapped { alias, quick_model } => {
+            Some((alias.to_string(), quick_model.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// Free-function variant of [`SlashCtx::switch_to_prompt_model`] for call
 /// sites that don't have a `SlashCtx` (dot commands, chain transitions,
 /// startup). Returns `true` if a model switch occurred.
@@ -306,15 +315,10 @@ pub(crate) async fn apply_prompt_model(
     reasoning_enabled: bool,
     renderer: &mut Renderer,
 ) -> bool {
-    let qm_name = match ui.cfg.resolve_prompt_model(prompt_name) {
-        Some(name) => name,
-        None => return false,
-    };
-
-    let qm = crate::config::quick_models_map(ui.cfg);
-    let Some(qmc) = qm.get(qm_name) else {
+    let Some((qm_name, qmc)) = mapped_prompt_route(ui.cfg, prompt_name) else {
         return false;
     };
+    let qm = crate::config::quick_models_map(ui.cfg);
 
     let new_model = compact_str::CompactString::from(&*qmc.model);
     let provider_changed = qmc.provider != ui.session.provider;
@@ -364,7 +368,7 @@ pub(crate) async fn apply_prompt_model(
             &qmc.provider,
             &qmc.model,
             ui.cfg,
-            Some(qm_name),
+            Some(qm_name.as_str()),
             input_price,
         ));
     ui.session
@@ -954,8 +958,8 @@ pub(crate) async fn handle_slash(
         "/prompt" | "/agent" | "/theme" | "/regen-prompts" | "/regen-themes" => {
             content::handle(&parts, &mut ctx).await
         }
-        "/cost" | "/reasoning" | "/thinking" | "/mode" | "/sandbox" | "/toggle" | "/mcp"
-        | "/editsys" | "/advisor" | "/keys" | "/vim" | "/top" | "/bottom" => {
+        "/cost" | "/reasoning" | "/thinking" | "/mode" | "/permissions" | "/sandbox"
+        | "/toggle" | "/mcp" | "/editsys" | "/advisor" | "/keys" | "/vim" | "/top" | "/bottom" => {
             settings::handle(&parts, &mut ctx).await
         }
         "/sessions" | "/fork" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind"

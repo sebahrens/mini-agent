@@ -262,7 +262,11 @@ const MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
             resolveEncoded = encoded => {
                 try { resolve(parse(encoded)); } catch (_) { reject(0); }
             };
-            rejectEncoded = () => reject(0);
+            rejectEncoded = (message, code) => {
+                if (typeof message !== "string") { reject(0); return; }
+                try { const error = new Error(message); error.code = code; reject(error); }
+                catch (_) { reject(0); }
+            };
         });
         settlementId = prepareSettlement(resolveEncoded, rejectEncoded);
         const encoded = invoke(token, encode(values), settlementId);
@@ -450,7 +454,13 @@ impl ModelSettlementRegistry {
         }
     }
 
-    fn settle(&self, ctx: &Ctx<'_>, id: u64, encoded: Option<String>) -> rquickjs::Result<()> {
+    fn settle(
+        &self,
+        ctx: &Ctx<'_>,
+        id: u64,
+        encoded: Option<String>,
+        failure: Option<(String, &'static str)>,
+    ) -> rquickjs::Result<()> {
         let settlement = self
             .state
             .lock()
@@ -460,7 +470,10 @@ impl ModelSettlementRegistry {
             .ok_or(rquickjs::Error::Unknown)?;
         match encoded {
             Some(encoded) => settlement.resolve.restore(ctx)?.call((encoded,)),
-            None => settlement.reject.restore(ctx)?.call(()),
+            None => match failure {
+                Some((message, code)) => settlement.reject.restore(ctx)?.call((message, code)),
+                None => settlement.reject.restore(ctx)?.call(()),
+            },
         }
     }
 }
@@ -1011,13 +1024,19 @@ fn load_artifact_internal(
                         let settle_success = Function::new(
                             ctx.clone(),
                             move |ctx: Ctx<'_>, settlement_id: u64, encoded: String| {
-                                success_settlements.settle(&ctx, settlement_id, Some(encoded))
+                                success_settlements.settle(&ctx, settlement_id, Some(encoded), None)
                             },
                         )?;
                         let failure_settlements = settlements.clone();
+                        let failure_capabilities = capabilities.clone();
                         let settle_failure =
                             Function::new(ctx.clone(), move |ctx: Ctx<'_>, settlement_id: u64| {
-                                failure_settlements.settle(&ctx, settlement_id, None)
+                                // mini-agent-dv0m7: a failed brokered effect rejects the call
+                                // with the text a direct call would throw, not a bare 0.
+                                let failure = failure_capabilities.take_last_failure().map(
+                                    |(tool, error)| super::worker::effect_error_text(tool, &error),
+                                );
+                                failure_settlements.settle(&ctx, settlement_id, None, failure)
                             })?;
                         let methods = artifact
                             .capability
@@ -1277,6 +1296,7 @@ fn build_bound_dispatcher<'js>(
                 .clone()
                 .ok_or(rquickjs::Error::Unknown)?;
             let wrapper = resources.wrapper.restore(&ctx)?;
+            let _ = capabilities.take_last_failure();
             let result: Value = match call_function_with_capability_args(
                 &wrapper,
                 &capabilities,
@@ -1287,6 +1307,15 @@ fn build_bound_dispatcher<'js>(
                 Err(error) => {
                     if !super::memory::allocation_failed(&ctx) {
                         let _ = terminal(invocation_id, false);
+                        // mini-agent-dv0m7: the boundary hides skill-thrown values behind a
+                        // bare 0. When the last brokered effect failed, surface its
+                        // host-generated text instead, exactly as a direct call throws it.
+                        if matches!(error, rquickjs::Error::Exception)
+                            && let Some((tool, failure)) = capabilities.take_last_failure()
+                        {
+                            let _ = ctx.catch();
+                            return Err(super::worker::effect_error_from(&ctx, tool, &failure));
+                        }
                     }
                     return Err(error);
                 }
@@ -1372,7 +1401,7 @@ pub(super) fn skill_effect_exception(
     error: &CapabilityError,
 ) -> rquickjs::Error {
     let code = match error {
-        CapabilityError::EffectFailed(code) => effect_error_code_token(*code),
+        CapabilityError::EffectFailed(code, _) => effect_error_code_token(*code),
         CapabilityError::InvalidArguments => "invalid_target",
         CapabilityError::DispatchDenied => "denied",
         CapabilityError::Revoked
@@ -1402,23 +1431,23 @@ mod tests {
         context.with(|ctx| {
             for (error, expected) in [
                 (
-                    CapabilityError::EffectFailed(EffectErrorCode::NotFound),
+                    CapabilityError::EffectFailed(EffectErrorCode::NotFound, None),
                     "not_found",
                 ),
                 (
-                    CapabilityError::EffectFailed(EffectErrorCode::TooLarge),
+                    CapabilityError::EffectFailed(EffectErrorCode::TooLarge, None),
                     "too_large",
                 ),
                 (
-                    CapabilityError::EffectFailed(EffectErrorCode::TimedOut),
+                    CapabilityError::EffectFailed(EffectErrorCode::TimedOut, None),
                     "timed_out",
                 ),
                 (
-                    CapabilityError::EffectFailed(EffectErrorCode::BackendFailure),
+                    CapabilityError::EffectFailed(EffectErrorCode::BackendFailure, None),
                     "backend_failure",
                 ),
                 (
-                    CapabilityError::EffectFailed(EffectErrorCode::Denied),
+                    CapabilityError::EffectFailed(EffectErrorCode::Denied, None),
                     "denied",
                 ),
                 (CapabilityError::DispatchDenied, "denied"),

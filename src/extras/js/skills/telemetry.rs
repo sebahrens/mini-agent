@@ -289,6 +289,12 @@ impl EventBatch {
         Ok(Self { events })
     }
 
+    pub(crate) fn mark_evidence_incomplete(&mut self) {
+        for event in &mut self.events {
+            event.evidence_complete = false;
+        }
+    }
+
     pub fn events(&self) -> &[SkillEvent] {
         &self.events
     }

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::config::load::read_config_content;
 use crate::config::load::{atomic_config_write, parse_config_content};
 
@@ -28,7 +28,7 @@ fn mode(path: &Path) -> u32 {
 #[cfg(unix)]
 #[test]
 fn config_persistence_permissions_ignore_permissive_umask() {
-    const CHILD_PATH: &str = "ZS_CONFIG_PERMISSION_UMASK_CHILD";
+    const CHILD_PATH: &str = "MINI_AGENT_CONFIG_PERMISSION_UMASK_CHILD";
     if let Some(config) = std::env::var_os(CHILD_PATH) {
         atomic_config_write(Path::new(&config), "api_keys = { openai = \"secret\" }\n").unwrap();
         return;
@@ -68,7 +68,7 @@ fn config_persistence_permissions_ignore_permissive_umask() {
 #[cfg(unix)]
 #[test]
 fn config_persistence_permissions_restore_owner_read_after_restrictive_umask() {
-    const CHILD_PATH: &str = "ZS_CONFIG_RESTRICTIVE_UMASK_CHILD";
+    const CHILD_PATH: &str = "MINI_AGENT_CONFIG_RESTRICTIVE_UMASK_CHILD";
     if let Some(config) = std::env::var_os(CHILD_PATH) {
         atomic_config_write(Path::new(&config), "api_keys = { openai = \"secret\" }\n").unwrap();
         return;
@@ -227,6 +227,82 @@ fn config_persistence_permissions_windows_dacls_exclude_broad_principals() {
             "ordinary Users can access config content: {dacl}"
         );
     }
+}
+
+/// The release VS Code smoke provisions `config.toml` with Node before the
+/// agent starts, and users hand-write it with an editor. Such a file and its
+/// directory carry only ACEs inherited from `%TEMP%` or the profile. Making the
+/// directory private re-propagates inheritance to that child; with a
+/// non-inheritable private DACL the child was left with an empty DACL, so the
+/// following read failed with `Access is denied. (os error 5)`.
+#[cfg(windows)]
+#[test]
+fn config_persistence_permissions_windows_reads_config_created_by_another_writer() {
+    let root = TempDir::new("windows-foreign-writer");
+    let config_dir = root.path().join("config");
+    let config = config_dir.join("config.toml");
+    let sibling = config_dir.join("notes.txt");
+    let nested = config_dir.join("nested");
+    std::fs::create_dir(&config_dir).unwrap();
+    std::fs::write(&config, "model = \"from-another-writer\"\n").unwrap();
+    std::fs::write(&sibling, "sibling").unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("child.txt"), "nested").unwrap();
+
+    // The first read repairs the directory and the file; a later startup
+    // reads the already-private file again.
+    for _ in 0..2 {
+        assert_eq!(
+            read_config_content(&config).unwrap(),
+            "model = \"from-another-writer\"\n"
+        );
+    }
+
+    for (path, directory) in [(config_dir.clone(), true), (config.clone(), false)] {
+        let dacl = crate::fs::private_dacl_sddl(&path, directory).unwrap();
+        assert!(dacl.starts_with("D:P"), "DACL is not protected: {dacl}");
+        assert!(
+            !dacl.contains(";;;WD)") && !dacl.contains("S-1-1-0"),
+            "Everyone can access config content: {dacl}"
+        );
+        assert!(
+            !dacl.contains(";;;BU)") && !dacl.contains("S-1-5-32-545"),
+            "ordinary Users can access config content: {dacl}"
+        );
+        assert!(
+            !dacl.contains(";;;BA)") && !dacl.contains("S-1-5-32-544"),
+            "the private DACL still grants Administrators: {dacl}"
+        );
+    }
+
+    // Children the repair did not open themselves keep an owner-usable,
+    // owner-only DACL rather than an empty one.
+    assert_eq!(std::fs::read_to_string(&sibling).unwrap(), "sibling");
+    assert_eq!(
+        std::fs::read_to_string(nested.join("child.txt")).unwrap(),
+        "nested"
+    );
+    for (path, directory) in [
+        (sibling, false),
+        (nested.join("child.txt"), false),
+        (nested, true),
+    ] {
+        let dacl = crate::fs::private_dacl_sddl(&path, directory).unwrap();
+        assert!(
+            !dacl.contains(";;;WD)")
+                && !dacl.contains(";;;BU)")
+                && !dacl.contains(";;;BA)")
+                && !dacl.contains(";;;AU)"),
+            "an existing child inherited a broad grant: {dacl}"
+        );
+    }
+
+    // Replacing the repaired file still works.
+    atomic_config_write(&config, "model = \"replacement\"\n").unwrap();
+    assert_eq!(
+        read_config_content(&config).unwrap(),
+        "model = \"replacement\"\n"
+    );
 }
 
 #[cfg(windows)]

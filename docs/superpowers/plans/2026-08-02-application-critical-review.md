@@ -512,8 +512,8 @@ outside this task absent a source-proven production defect.
 
 ### REL-03 — Establish canonical repository/product coordinates without breaking data compatibility (P1)
 
-**Defect:** the actual repository is `sebahrens/mini-agent`, but installer, package URLs, docs,
-OpenRouter identity, and welcome links target `sebahrens/mini-agent`. The public binary is
+**Defect:** the pre-migration repository and the installer, package URLs, docs,
+OpenRouter identity, and welcome links used inconsistent coordinates. The public binary is
 `mini-agent`, while `zerostack` is also used as a persisted compatibility namespace and package brand.
 Unclassified global replacement would be destructive; leaving wrong network coordinates is broken.
 
@@ -532,8 +532,8 @@ Unclassified global replacement would be destructive; leaving wrong network coor
 
 **TDD sequence:**
 
-1. Write and test an identity matrix: public crate/binary `mini-agent`; repository
-   `sebahrens/mini-agent`; release assets `mini-agent-*`; legacy persisted `.zerostack`, app-data, and
+1. Write and test an identity matrix: public crate/binary `mini-agent`; canonical repository;
+   release assets `mini-agent-*`; legacy persisted `.zerostack`, app-data, and
    `ZEROSTACK_*` names remain compatibility API until a separate migration is approved.
 2. Change every network/download/homepage coordinate to the canonical repository.
 3. Make model/provider/protocol client identity report the chosen public product identity consistently;

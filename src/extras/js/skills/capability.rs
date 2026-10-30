@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::extras::js::protocol::{
-    AdvisoryAttribution, EffectErrorCode, EffectOperation, EffectRequest, EffectResult, GrantId,
-    HttpHeader, HttpMethod, InvocationId, MAX_EFFECTS_PER_STEP,
+    AdvisoryAttribution, DenialReason, EffectError, EffectErrorCode, EffectOperation,
+    EffectRequest, EffectResult, GrantId, HttpHeader, HttpMethod, InvocationId,
+    MAX_EFFECTS_PER_STEP,
 };
 
 use super::{CapabilityManifest, HostCapability, IdentityError};
@@ -37,8 +38,11 @@ pub enum CapabilityError {
     /// code-bearing exception model-authored globals already receive. Without
     /// it a missing file, an oversized read, a timeout and a real denial all
     /// reach skill code as one opaque exception.
+    ///
+    /// The closed, non-sensitive denial refinement travels with it so the model-facing
+    /// boundary can report the same text a direct call would.
     #[error("effect failed: {0:?}")]
-    EffectFailed(EffectErrorCode),
+    EffectFailed(EffectErrorCode, Option<DenialReason>),
 }
 
 /// Stable JS-visible token for one closed effect error code.
@@ -145,6 +149,8 @@ struct InvocationCapabilityState {
     active: HashMap<u64, ActiveInvocation>,
     bound_handle: Option<PreparedInvocationHandle>,
     seen_grants: HashSet<GrantId>,
+    /// Outcome of the most recent brokered effect when it failed; see `take_last_failure`.
+    last_failure: Option<(&'static str, EffectError)>,
 }
 
 struct PreparedInvocation {
@@ -379,7 +385,26 @@ impl InvocationCapabilityRuntime {
                 },
             }
         };
-        encode_effect_result((self.dispatcher)(effect)?)
+        let outcome = (self.dispatcher)(effect).and_then(encode_effect_result);
+        if let Ok(mut state) = self.state.lock() {
+            state.last_failure = match &outcome {
+                Err(CapabilityError::EffectFailed(code, reason)) => Some((
+                    operation.as_token(),
+                    EffectError {
+                        code: *code,
+                        reason: *reason,
+                    },
+                )),
+                _ => None,
+            };
+        }
+        outcome
+    }
+
+    /// Take the failure of the most recent brokered effect, if it failed. Only host-generated
+    /// closed data (tool token, code, denial reason) is kept; nothing the skill controls.
+    pub(crate) fn take_last_failure(&self) -> Option<(&'static str, EffectError)> {
+        self.state.lock().ok()?.last_failure.take()
     }
 
     pub(crate) fn finish(&self, token: u64) {
@@ -395,6 +420,7 @@ impl InvocationCapabilityRuntime {
             state.bound_handle = None;
             state.next_effect_ordinal = 0;
             state.seen_grants.clear();
+            state.last_failure = None;
         }
     }
 
@@ -542,7 +568,8 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
         }),
-        EffectResult::ResultAccepted { .. }
+        EffectResult::ReadLines { .. }
+        | EffectResult::ResultAccepted { .. }
         | EffectResult::ScratchPut
         | EffectResult::ScratchGet { .. }
         | EffectResult::ProposalAccepted { .. } => {
@@ -551,7 +578,9 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
         // The closed code is carried to the ABI boundary instead of being
         // collapsed into one opaque denial, so a skill can distinguish a
         // missing file from a revoked capability.
-        EffectResult::Error(error) => return Err(CapabilityError::EffectFailed(error.code)),
+        EffectResult::Error(error) => {
+            return Err(CapabilityError::EffectFailed(error.code, error.reason));
+        }
     };
     serde_json::to_string(&value).map_err(|_| CapabilityError::DispatchDenied)
 }
@@ -593,7 +622,7 @@ mod effect_error_code_tests {
             let error = encode_effect_result(EffectResult::Error(EffectError::new(code)))
                 .expect_err("a failed effect must not encode as a value");
             match error {
-                CapabilityError::EffectFailed(observed) => assert_eq!(observed, code),
+                CapabilityError::EffectFailed(observed, _) => assert_eq!(observed, code),
                 other => panic!("effect code {code:?} was discarded as {other:?}"),
             }
         }

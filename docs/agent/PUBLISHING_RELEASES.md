@@ -4,6 +4,10 @@ description: "How mini-agent releases are published: GitHub, Homebrew, AUR, Cond
 
 # Publishing Releases
 
+The [reference Authenticode custody, verification, and rotation procedure](WINDOWS_SIGNING.md)
+describes the policy for a future signing integration. The retained release workflow does not
+implement those signing steps; verify the exact published artifact's signature status.
+
 This guide covers the full release workflow: bumping the version, tagging, publishing GPL-compliant
 GitHub assets, and updating downstream package managers.
 
@@ -126,14 +130,14 @@ sandbox tests.
 
 | Category | Canonical value | Compatibility policy |
 |---|---|---|
-| Cargo package, CLI/UI, provider identity, ACP agent, MCP OAuth, LSP client | `mini-agent` | Public identity; do not report `zerostack` to new integrations. |
+| Cargo package, CLI/UI, provider identity, ACP agent, MCP OAuth, LSP client | `mini-agent` | Public identity for every new integration. |
 | Source repository and release origin | `sebahrens/mini-agent` | All active download, homepage, source, and checksum URLs use this repository. |
 | Release assets | binary archives plus `mini-agent-vX.Y.Z-source.tar.gz` | Binary archives carry the executable, GPL text, modification notice, and source directions; the same release carries vendored Corresponding Source. |
-| AUR, Conda, and Homebrew recipe names | `zerostack-bin`, `zerostack`, and `zerostack.rb` | Retained only as package-channel compatibility names; each installs `mini-agent`. |
-| Persisted data, project policy, and hook environment | `zerostack`, `.zerostack`, and `ZEROSTACK_*` | Stable user-data compatibility contract; release-coordinate changes must not migrate or rename it. |
-| CLI environment, logs, and audit targets | `ZS_*`, `zerostack-*.log`, `zerostack::audit::*` | Retained compatibility identifiers; prose and executable examples use `mini-agent`. |
+| AUR, Conda, and Homebrew recipe names | `zerostack-bin`, `zerostack`, and `zerostack.rb` | Retained package-channel compatibility names; each installs `mini-agent`. |
+| Persisted data, project policy, and hook environment | `mini-agent`, `.mini-agent`, and `MINI_AGENT_*` | New writes use canonical names. Startup imports unambiguous pre-rename user-global artifacts through the versioned legacy migration and retains their source for recovery. Legacy `.zerostack` project policy is not implicitly adopted; legacy `ZS_*` and `ZEROSTACK_*` path overrides remain fallback inputs. |
+| CLI environment, logs, and audit targets | `MINI_AGENT_*`, `mini-agent-*.log`, `mini_agent::audit::*` | Canonical identifiers; prose and executable examples use `mini-agent`. |
 | New HTML export and share file names | `mini-agent-session-<id>.html` | Public product name. HTML is a viewing format; session import uses JSONL or native JSON and does not restrict file names. |
-| JSONL session schema | `zerostack-session-jsonl` | Version 1 remains accepted alongside version 2. Existing exports require no rename or data migration. |
+| JSONL session schema | `mini-agent-session-jsonl` | The legacy `zerostack-session-jsonl` format name remains accepted on import. Existing exports require no rename or data migration. |
 
 ## Supported distribution surfaces
 
@@ -148,6 +152,23 @@ deliberately explicit:
 | Native VS Code VSIX | Supported local-install candidates for five release targets; Marketplace/Open VSX publication remains a separate deferred step. |
 | AUR and Conda | Repository-maintained recipes; publication remains the manual downstream step described below. |
 | Homebrew | Compatibility formula retained, but no end-user install command is supported until a canonical tap exists and its archive smoke passes. |
+
+### Node `url.parse` deprecation warning
+
+The `DEP0169` warning sometimes printed by VSIX packaging or side-load tooling is
+not emitted by mini-agent extension code. The project-owned TypeScript and
+JavaScript trees contain no legacy `url.parse` call, and CI enforces that
+boundary. The locked packaging toolchain currently reaches those calls through
+`@vscode/vsce` 4.0.0 → `typed-rest-client` 1.8.11; the latter calls Node's legacy
+API in `HttpClient.js` and `Util.js`. The extension bundle does not include that
+development-only packaging dependency.
+
+Do not suppress Node deprecation warnings or weaken installation checks. The
+supported remediation is to update the pinned `@vscode/vsce` toolchain when its
+upstream dependency removes the legacy calls, then regenerate and review
+`package-lock.json`. A warning originating from the downloaded VS Code CLI must
+likewise be resolved by updating the tested VS Code version, not by changing the
+extension runtime.
 
 The CI `package` gate extracts `git archive HEAD` and tests, installs and probes that exact
 repository source candidate in isolation, including the real streaming Retry-After regression.

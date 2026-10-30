@@ -312,3 +312,38 @@ rather than disappearing from accounting; the blocking converter rejects the
 same inconsistencies. OpenAI's shared decoder and Responses conversion remain
 unchanged. Local actual-SDK controls cover both streaming tool routes, blocking
 and streaming malformed usage, redirects, listing and auth destination isolation.
+
+## Claude prompt caching on the shared OpenAI-compatible Chat Completions path (mini-agent-u9jj3)
+
+`openai::completion::{CompletionModelOptions, GenericCompletionModel}` gain a
+`prompt_caching_ttl_1h` flag alongside the existing `prompt_caching` one, and
+`GenericCompletionModel<OpenAICompletionsExt, H>` gains `with_prompt_caching`/
+`with_prompt_caching_1h` builder methods mirroring OpenRouter's own (see the
+OpenRouter prompt-caching backport above). `OpenAICompatibleProvider for
+OpenAICompletionsExt` now overrides `finalize_request_body_with_options` to
+call the new `apply_claude_prompt_caching`, which marks the already-serialized
+request body with Anthropic-style `cache_control` breakpoints — the last tool
+definition, the system message, and the second-to-last message (the
+conversation tail, left to advance one position per call so a growing
+conversation keeps its already-sent prefix cached and only the newest
+increment is uncached) — when the model opted in. This targets
+OpenAI-compatible gateways (e.g. a LiteLLM/Bedrock proxy) that forward such
+markers through to a native Anthropic backend; every other `OpenAICompatibleProvider`
+implementation (real OpenAI, DeepSeek, Mistral, HuggingFace, ...) keeps its
+existing `prompt_caching` behavior (none, for the ones that do not opt a model
+into it) since the flag defaults to `false` and is set only by the application's
+own Claude-family gating in `src/provider.rs`. Byte-stable: every change here
+either adds a `cache_control` key or restructures a string `content` into a
+single-element array carrying the exact same text.
+
+Local SDK tests in this file (`claude_prompt_caching_*`, `apply_claude_prompt_caching_*`)
+cover system/tools/tail marking, the 1h TTL variant, and the off-by-default
+no-op, using the same `RecordingHttpClient` pattern as the file's existing
+non-success-status tests; like every other `#[cfg(test)]` block in this
+vendored tree, they do not run under the application's own `cargo test`
+(`rig-core` is excluded from the workspace, so its dev-dependency graph never
+builds) and exist for documentation/Corresponding-Source parity with upstream's
+own test suite. The verified, CI-exercised coverage for this change is the
+application's "production consumer tests" in `src/provider_prompt_caching_tests.rs`,
+which drive a real loopback HTTP server through `create_client` and
+`completion_model_with_cache_ttl` and assert on the captured wire JSON body.

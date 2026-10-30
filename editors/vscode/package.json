@@ -64,6 +64,10 @@
       {
         "command": "mini-agent.resume",
         "title": "Mini Agent: Resume Saved Session"
+      },
+      {
+        "command": "mini-agent.selectPersona",
+        "title": "Mini Agent: Select Persona"
       }
     ],
     "configuration": {

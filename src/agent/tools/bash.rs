@@ -388,7 +388,7 @@ impl ShellTool {
         };
 
         if output.status != CommandStatus::Completed {
-            tracing::warn!("tool shell stopped before completion: {:?}", output.status);
+            tracing::debug!("tool shell stopped before completion: {:?}", output.status);
             return Err(resource_limit_error(output, limits, self.max_output_lines));
         }
 
@@ -406,7 +406,7 @@ impl ShellTool {
         let metadata = None;
         let termination = render_termination(output.exit_status);
         if let Some(termination) = termination.as_deref() {
-            tracing::warn!("tool shell: {termination}");
+            tracing::debug!("tool shell: {termination}");
         }
 
         let output_len = output.stdout.len() + output.stderr.len();

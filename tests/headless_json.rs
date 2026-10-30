@@ -1,5 +1,10 @@
 use std::process::Command;
 
+fn tested_binary() -> std::ffi::OsString {
+    std::env::var_os("MINI_AGENT_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_mini-agent").into())
+}
+
 #[path = "../src/tests/support/temp.rs"]
 mod temp;
 
@@ -36,6 +41,9 @@ fn doctor_lsp_executable_metadata_does_not_launch_or_disclose_arguments_environm
 #[test]
 fn doctor_cli_is_read_only_with_missing_invalid_and_configured_credentials_and_no_requests() {
     let root = TempRoot::new();
+    // This case is about an absent config: retire the fixture's published
+    // empty one. Legacy discovery stays confined to this root.
+    std::fs::remove_file(root.0.join("config.toml")).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut missing = root.command();
@@ -47,8 +55,11 @@ fn doctor_cli_is_read_only_with_missing_invalid_and_configured_credentials_and_n
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("missing; compiled defaults shown"));
-    assert!(text.contains("fingerprint:") && text.contains("credential source:"));
+    assert!(text.contains("missing; compiled defaults shown"), "{text}");
+    assert!(
+        text.contains("fingerprint:") && text.contains("credential source:"),
+        "{text}"
+    );
     assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
 
     // Seed through the ordinary private writer, including the native Windows
@@ -315,11 +326,16 @@ impl TempRoot {
             std::fs::set_permissions(path.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("make app root private");
         }
+        // Every subprocess points its canonical config root here. Publish an
+        // empty canonical config up front so production legacy discovery never
+        // consults the developer or CI account's real pre-migration files.
+        // Individual fixtures remain free to replace it with their own config.
+        std::fs::write(path.join("config.toml"), "").expect("create canonical test config");
         Self(path)
     }
 
     fn command(&self) -> Command {
-        self.command_for(env!("CARGO_BIN_EXE_mini-agent"))
+        self.command_for(tested_binary())
     }
 
     fn command_for(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -327,13 +343,30 @@ impl TempRoot {
         command
             .current_dir(&self.0)
             .stdin(std::process::Stdio::null());
+        // Legacy discovery deliberately consults the platform's former
+        // default roots in addition to the canonical MINI_AGENT_* overrides. Point
+        // those defaults at this fixture too, so a developer's real legacy
+        // sessions/configuration cannot leak into subprocess assertions.
+        #[cfg(target_os = "linux")]
+        command
+            .env("XDG_CONFIG_HOME", self.0.path())
+            .env("XDG_DATA_HOME", self.0.path())
+            .env("XDG_STATE_HOME", self.0.path())
+            .env("XDG_CACHE_HOME", self.0.path());
+        #[cfg(target_os = "macos")]
+        command.env("HOME", self.0.path());
+        #[cfg(target_os = "windows")]
+        command
+            .env("APPDATA", self.0.path())
+            .env("LOCALAPPDATA", self.0.path())
+            .env("USERPROFILE", self.0.path());
         for name in [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ] {
             command.env(name, self.0.path());
         }
@@ -400,6 +433,7 @@ impl TempRoot {
                 "partial_failure"
                     | "partial_wait"
                     | "active_command"
+                    | "tool_turn"
                     | "second_wait"
                     | "verification"
                     | "verification_without_shell"
@@ -600,6 +634,7 @@ impl TempRoot {
                             ))
                             && index == 0)
                         || (outcome == "schema_unknown_tool" && index == 1)
+                        || (outcome == "tool_turn" && index == 0)
                         || matches!(
                             outcome,
                             "partial_failure" | "partial_wait" | "active_command"
@@ -771,7 +806,7 @@ impl TempRoot {
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
             .collect();
-        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions.len(), 1, "unexpected session files: {sessions:?}");
         serde_json::from_slice(&std::fs::read(&sessions[0]).unwrap()).unwrap()
     }
 }
@@ -908,8 +943,8 @@ fn loop_resumes_existing_plan_without_reading_piped_stdin() {
 
 #[test]
 fn startup_commands_run_with_the_windows_default_stack_budget() {
-    for (args, expected) in [
-        (&["--print-config"][..], "config"),
+    for (args, expected, provider_outcome) in [
+        (&["--print-config"][..], "config", None),
         (
             &[
                 "--no-sandbox",
@@ -919,6 +954,7 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
                 "!echo stack-budget",
             ][..],
             "stack-budget",
+            None,
         ),
         (
             &[
@@ -934,6 +970,23 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
                 "hello",
             ][..],
             "finished",
+            Some("completed"),
+        ),
+        (
+            &[
+                "--no-sandbox",
+                "--no-context-files",
+                "--no-session",
+                "--yolo",
+                "--provider",
+                "local-test",
+                "--model",
+                "test",
+                "-p",
+                "write the requested file",
+            ][..],
+            "finished",
+            Some("tool_turn"),
         ),
         // JSON dispatch also retains the startup owner while streaming and
         // rendering its terminal result on the physical main-thread stack.
@@ -953,6 +1006,7 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
                 "hello",
             ][..],
             "finished",
+            Some("completed"),
         ),
         // `--loop` assembles a goal, an agent and a round driver on the same
         // startup frame, and is dispatched down a different path from `-p`.
@@ -974,10 +1028,11 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
                 "1",
             ][..],
             "finished",
+            Some("completed"),
         ),
     ] {
         let root = TempRoot::new();
-        let server = (expected == "finished").then(|| root.local_provider("completed"));
+        let server = provider_outcome.map(|outcome| root.local_provider(outcome));
         #[cfg(not(unix))]
         let mut command = root.command();
         #[cfg(unix)]
@@ -992,7 +1047,7 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
                     "ulimit -s 1024 || exit 125\nexec \"$@\"",
                     "stack-probe",
                 ])
-                .arg(env!("CARGO_BIN_EXE_mini-agent"));
+                .arg(tested_binary());
             command
         };
         command
@@ -1027,7 +1082,7 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
                 "missing isolated root: {stdout}"
             );
         }
-        assert!(!root.0.join(".zerostack").exists());
+        assert!(!root.0.join(".mini-agent").exists());
     }
 }
 
@@ -2735,8 +2790,11 @@ fn stalled_piped_stdin_can_be_interrupted_and_empty_prompts_never_wait_for_eof()
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // Retain the pipe's write end without sending EOF: the child is genuinely
-    // blocked inside its bounded stdin reader, before provider initialization.
+    // Retain the pipe's write end without sending EOF, after sending some data
+    // (a wholly silent pipe is skipped with an explicit prompt): the child is
+    // genuinely blocked inside its bounded stdin reader, before provider
+    // initialization.
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"data").unwrap();
     let stdout_pipe = child.stdout.take().unwrap();
     let stderr_pipe = child.stderr.take().unwrap();
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -2802,6 +2860,31 @@ fn stalled_piped_stdin_can_be_interrupted_and_empty_prompts_never_wait_for_eof()
     assert_eq!(value["result"], "no prompt given");
     assert_eq!(value["session_id"], serde_json::Value::Null);
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Reading piped stdin"));
+}
+
+/// mini-agent-jfpmq: an explicit prompt must not wait on an open stdin pipe that
+/// never carries data or EOF.
+#[cfg(unix)]
+#[test]
+fn explicit_prompt_does_not_block_on_a_silent_open_stdin_pipe() {
+    use std::process::Stdio;
+    let root = TempRoot::new();
+    let mut command = root.command();
+    command
+        .args([
+            "-p",
+            "--output",
+            "stream-json",
+            "--provider",
+            "missing-local-provider",
+            "summarize",
+        ])
+        .stdin(Stdio::piped());
+    // `bounded_output` keeps the write end open and has its own deadline.
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("Reading piped stdin"), "{stderr}");
+    assert!(output.status.code().is_some());
 }
 
 #[cfg(unix)]
@@ -4177,7 +4260,7 @@ fn output_schema_local_provider_positive_repair_and_exhaustion_keep_accounting_a
                     "ulimit -s 1024 || exit 125\nexec \"$@\"",
                     "schema-stack-probe",
                 ])
-                .arg(env!("CARGO_BIN_EXE_mini-agent"))
+                .arg(tested_binary())
                 .args(args);
             for (key, value) in envs {
                 match value {
@@ -4666,7 +4749,7 @@ fn usd_budget_actual_provider_stops_effects_and_repair_but_keeps_valid_answer_an
                     "ulimit -s 1024 || exit 125\nexec \"$@\"",
                     "cost-stack-probe",
                 ])
-                .arg(env!("CARGO_BIN_EXE_mini-agent"))
+                .arg(tested_binary())
                 .args(args);
             for (key, value) in envs {
                 match value {
@@ -5085,7 +5168,7 @@ fn native_web_headless_actual_schema_denials_and_missing_key_preserve_json_usage
                 "ulimit -s 1024 || exit 125\nexec \"$@\"",
                 "native-web-stack-probe",
             ])
-            .arg(env!("CARGO_BIN_EXE_mini-agent"));
+            .arg(tested_binary());
         command
     };
     command

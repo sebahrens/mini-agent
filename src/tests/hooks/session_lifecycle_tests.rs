@@ -43,7 +43,7 @@ fn ctx() -> HookCtx {
 #[tokio::test]
 async fn session_start_runs_the_matching_hook_with_source() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-session-start-{}",
+        "mini-agent-hooks-session-start-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
@@ -67,7 +67,7 @@ async fn session_start_runs_the_matching_hook_with_source() {
 #[tokio::test]
 async fn session_end_runs_the_matching_hook_with_reason() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-session-end-{}",
+        "mini-agent-hooks-session-end-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);

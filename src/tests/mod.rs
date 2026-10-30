@@ -254,7 +254,7 @@ impl Drop for ScopedProcessEnv {
 
 #[test]
 fn scoped_process_environment_restores_after_panic() {
-    const NAME: &str = "ZS_SCOPED_ENV_UNWIND_TEST";
+    const NAME: &str = "MINI_AGENT_SCOPED_ENV_UNWIND_TEST";
     let before = std::env::var_os(NAME);
     let result = std::panic::catch_unwind(|| {
         let _environment = ScopedProcessEnv::set(&[(NAME, Some(OsString::from("temporary")))]);

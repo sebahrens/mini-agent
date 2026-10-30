@@ -146,6 +146,54 @@ struct RawTaskBrief {
     run_in_background: Option<serde::de::IgnoredAny>,
 }
 
+/// The brief list as sent on the wire. Non-strict gateways sometimes encode
+/// the array as a JSON string (`"[{\"objective\": …}]"`); that string is
+/// decoded as the same list. Any other type keeps serde's usual rejection.
+struct RawBriefList(Vec<RawTaskBrief>);
+
+impl<'de> Deserialize<'de> for RawBriefList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RawBriefList;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence of brief objects (or a JSON string encoding one)")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                serde_json::from_str::<Vec<RawTaskBrief>>(value)
+                    .map(RawBriefList)
+                    .map_err(|error| {
+                        E::custom(format!(
+                            "task: briefs must be a list of brief objects; the string value is not a JSON-encoded list of briefs: {error}"
+                        ))
+                    })
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1024));
+                while let Some(item) = seq.next_element::<RawTaskBrief>()? {
+                    items.push(item);
+                }
+                Ok(RawBriefList(items))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 struct RawTaskArgsParsed {
     prompts: Option<Vec<String>>,
     briefs: Option<Vec<TaskBrief>>,
@@ -162,7 +210,7 @@ impl<'de> Deserialize<'de> for TaskArgs {
         #[serde(deny_unknown_fields)]
         struct RawTaskArgs {
             prompts: Option<StringList>,
-            briefs: Option<Vec<RawTaskBrief>>,
+            briefs: Option<RawBriefList>,
             #[serde(default)]
             agent_type: Option<String>,
             #[serde(default)]
@@ -170,7 +218,7 @@ impl<'de> Deserialize<'de> for TaskArgs {
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
-        let mut raw_briefs = raw.briefs;
+        let mut raw_briefs = raw.briefs.map(|briefs| briefs.0);
         let mut agent_type = raw.agent_type;
         if let Some(briefs) = raw_briefs.as_mut() {
             if briefs.iter().any(|brief| brief.run_in_background.is_some()) {
@@ -456,6 +504,8 @@ struct ResolvedSpecialization {
     required_tools: Vec<String>,
     model: Option<String>,
     turn_budget: Option<crate::context::agents::AgentTurnBudget>,
+    #[cfg(feature = "mcp")]
+    mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 impl ResolvedSpecialization {
@@ -587,6 +637,8 @@ fn resolve_persona_runtime_with(
             // would send for this model; persona params are merged on top.
             provider_extra_body: crate::config::resolve_extra_body(config, &model_name),
             additional_params,
+            #[cfg(feature = "mcp")]
+            mcp_servers: specialization.mcp_servers.clone(),
         },
         model_name,
     })
@@ -642,6 +694,8 @@ fn resolve_specialization(
         required_tools,
         model: definition.model,
         turn_budget: definition.turn_budget,
+        #[cfg(feature = "mcp")]
+        mcp_servers: definition.mcp_servers,
     }))
 }
 
@@ -891,6 +945,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             .join("\n");
         serde_json::json!({
             "type": "object",
+            "description": "Provide exactly one of prompts or briefs. mini-agent validates this constraint when the tool call is decoded.",
             "properties": {
                 "prompts": {
                     "type": "array",
@@ -1355,6 +1410,20 @@ editing in a known location, grepping for a literal you will act on immediately.
                     model_name,
                     config.cache_ttl.unwrap_or_default(),
                 );
+                // Persona-scoped MCP: connect only the servers and exact tools
+                // the trusted persona names, with an independent permission
+                // checker; outer-agent MCP connections are never inherited.
+                #[cfg(feature = "mcp")]
+                let (mcp_manager, mcp_tools) =
+                    match builder::build_persona_mcp(&persona, &config, &authorization).await {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            return ChildExecution {
+                                output: Err(error),
+                                cost_units: 0,
+                            };
+                        }
+                    };
                 let agent = builder::build_explore_agent_with_suffix(
                     model,
                     max_turns,
@@ -1365,6 +1434,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                     specialization,
                     suffix.as_deref(),
                     persona,
+                    #[cfg(feature = "mcp")]
+                    mcp_tools,
                     #[cfg(feature = "skills")]
                     skill_services,
                 )
@@ -1381,6 +1452,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                 } else {
                     agent
                 };
+                // Live task/repair admission bounds every provider call, so
+                // no separate per-run token reservation is passed.
                 let result = agent
                     .run_subagent(
                         &execution_prompt,
@@ -1388,6 +1461,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         event_tx.as_ref(),
                         &config.retry,
                         initial_usage.clone(),
+                        None,
                     )
                     .await;
                 #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
@@ -1412,6 +1486,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                             event_tx.as_ref(),
                             &config.retry,
                             retry_usage.clone(),
+                            None,
                         )
                         .await;
                     run = merge_forced_continuation_run(run, retried);
@@ -1445,6 +1520,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                                     events.as_ref(),
                                     &retry,
                                     ledger,
+                                    None,
                                 )
                                 .await
                         }
@@ -1472,6 +1548,10 @@ editing in a known location, grepping for a literal you will act on immediately.
                     None => output,
                 };
                 let cost_units = child_budget.used.load(std::sync::atomic::Ordering::Acquire);
+                #[cfg(feature = "mcp")]
+                if let Some(manager) = mcp_manager {
+                    manager.shutdown().await;
+                }
                 ChildExecution { output, cost_units }
             });
             let future: ChildFuture = Box::pin(crate::permission::ask::scope_subagent(
@@ -2655,6 +2735,107 @@ fn report_contract_violations(response: &str) -> Vec<&'static str> {
     violations
 }
 
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = value.get(..prefix.len())?;
+    candidate
+        .eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
+}
+
+fn normalize_report_label(line: &str, section: &str) -> String {
+    let Some(content) = line.trim().strip_prefix("- ") else {
+        return line.trim().to_string();
+    };
+    let labels: &[(&str, &str)] = match section {
+        "findings" => &[
+            ("[confidence: high]", "[confidence: high]"),
+            ("**[confidence: high]**", "[confidence: high]"),
+            ("**confidence: high**", "[confidence: high]"),
+            ("[confidence: medium]", "[confidence: medium]"),
+            ("**[confidence: medium]**", "[confidence: medium]"),
+            ("**confidence: medium**", "[confidence: medium]"),
+            ("[confidence: low]", "[confidence: low]"),
+            ("**[confidence: low]**", "[confidence: low]"),
+            ("**confidence: low**", "[confidence: low]"),
+        ],
+        "coverage" => &[
+            ("covered:", "Covered:"),
+            ("**covered:**", "Covered:"),
+            ("**covered**:", "Covered:"),
+            ("skipped:", "Skipped:"),
+            ("**skipped:**", "Skipped:"),
+            ("**skipped**:", "Skipped:"),
+        ],
+        _ => return line.trim().to_string(),
+    };
+    for (accepted, canonical) in labels {
+        if let Some(rest) = strip_ascii_case_prefix(content, accepted) {
+            let rest = rest.trim_start_matches([' ', ':', '-']);
+            return if rest.is_empty() {
+                format!("- {canonical}")
+            } else {
+                format!("- {canonical} {rest}")
+            };
+        }
+    }
+    if section == "findings"
+        && let Some(moved) = leading_confidence_label(content)
+    {
+        return moved;
+    }
+    line.trim().to_string()
+}
+
+/// Bytes of a finding bullet searched for a confidence label placed after a
+/// short title, as in `- **F1: Title** [confidence: high] detail`.
+const CONFIDENCE_LABEL_WINDOW: usize = 160;
+
+/// Moves an exact bracketed confidence label found near the start of a finding
+/// to the front; the bullet's remaining text is kept unchanged.
+fn leading_confidence_label(content: &str) -> Option<String> {
+    let mut window = content.len().min(CONFIDENCE_LABEL_WINDOW);
+    while !content.is_char_boundary(window) {
+        window -= 1;
+    }
+    // ASCII lowercasing keeps byte offsets aligned with `content`.
+    let lowered = content[..window].to_ascii_lowercase();
+    for level in ["high", "medium", "low"] {
+        let label = format!("[confidence: {level}]");
+        if let Some(start) = lowered.find(&label) {
+            let before = content[..start].trim_end();
+            let after = content[start + label.len()..].trim_start();
+            let rest = match (before.is_empty(), after.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => format!(" {after}"),
+                (false, true) => format!(" {before}"),
+                (false, false) => format!(" {before} {after}"),
+            };
+            return Some(format!("- {label}{rest}"));
+        }
+    }
+    None
+}
+
+fn normalize_report_contract(response: &str) -> Option<String> {
+    let lines = response.lines().map(str::trim).collect::<Vec<_>>();
+    let start = lines.iter().position(|line| *line == "## Findings")?;
+    let mut section = "before";
+    let mut normalized = Vec::new();
+    for line in &lines[start..] {
+        section = match *line {
+            "## Findings" => "findings",
+            "## Unverified" => "unverified",
+            "## Coverage" => "coverage",
+            _ => section,
+        };
+        normalized.push(normalize_report_label(line, section));
+    }
+    let normalized = normalized.join("\n");
+    report_contract_violations(&normalized)
+        .is_empty()
+        .then_some(normalized)
+}
+
 /// Model turns allowed for the report-contract repair: one reply, no new
 /// tool work.
 const REPORT_REPAIR_MAX_TURNS: usize = 1;
@@ -2714,24 +2895,33 @@ fn select_repaired_report_with_violations(
     }
 }
 
+#[cfg(test)]
 fn enforce_report_contract(response: &str) -> String {
     let violations = report_contract_violations(response);
     if violations.is_empty() {
         return response.to_string();
     }
-    host_repaired_report(&violations)
+    host_repaired_report(response, &violations)
 }
 
 /// The host-repaired contract for a response with known `violations`.
-fn host_repaired_report(violations: &[&'static str]) -> String {
-    // The raw child text is never forwarded to the parent model; the user
-    // reads it, marked unverified, with `/tasks result <id>`.
+/// Harmless Markdown variations are normalized into the contract; the
+/// normalized text is never "raw" or unstructured, since this only returns
+/// it once it independently satisfies the full contract. Anything that does
+/// not normalize is replaced by a fixed-size repair that withholds the raw
+/// child text, so the repair never grows with (or relays) a malformed or
+/// unverifiable response; the user can still read the withheld text, marked
+/// unverified, with `/tasks result <id>`.
+fn host_repaired_report(response: &str, violations: &[&'static str]) -> String {
+    if let Some(normalized) = normalize_report_contract(response) {
+        return normalized;
+    }
     format!(
         "[partial: subagent response contract repaired by host]\n\n\
          ## Findings\n\
          - [confidence: low] The child returned an unstructured response; its raw text was withheld from this report.\n\n\
          ## Unverified\n\
-         - Original findings and confidence could not be machine-verified.\n\n\
+         - Original findings and confidence could not be machine-verified; raw child text was omitted.\n\n\
          ## Coverage\n\
          - Covered: Not reported in the required structure.\n\
          - Skipped: {}.\n\n\
@@ -2785,13 +2975,11 @@ fn partial_report(response: &str, max_bytes: usize, reason: &str) -> String {
 fn enforce_bounded_report_contract(response: &str, max_report_bytes: usize) -> String {
     // Validate before cutting: truncating a valid fenced extract must not
     // manufacture missing headings, nor conceal that evidence was omitted.
-    if response.len() <= max_report_bytes {
-        let enforced = enforce_report_contract(response);
-        if enforced.len() <= max_report_bytes {
-            return enforced;
-        }
-    }
-    partial_report(response, max_report_bytes, "report byte limit")
+    enforce_validated_report_contract(
+        response.to_string(),
+        report_contract_violations(response),
+        max_report_bytes,
+    )
 }
 
 /// [`enforce_bounded_report_contract`] for a response whose contract
@@ -2801,16 +2989,19 @@ fn enforce_validated_report_contract(
     violations: Vec<&'static str>,
     max_report_bytes: usize,
 ) -> String {
-    if response.len() <= max_report_bytes {
-        if violations.is_empty() {
+    if violations.is_empty() {
+        if response.len() <= max_report_bytes {
             return response;
         }
-        let enforced = host_repaired_report(&violations);
-        if enforced.len() <= max_report_bytes {
-            return enforced;
-        }
+        return partial_report(&response, max_report_bytes, "report byte limit");
     }
-    partial_report(&response, max_report_bytes, "report byte limit")
+    // A malformed response is never quoted: its repair is either the
+    // normalized contract or a fixed-size notice, independent of its size.
+    let repaired = host_repaired_report(&response, &violations);
+    if repaired.len() <= max_report_bytes {
+        return repaired;
+    }
+    partial_report(&repaired, max_report_bytes, "report byte limit")
 }
 
 /// Tokens charged against the subagent budget for one completion.
@@ -3129,10 +3320,77 @@ mod tests {
         assert!(repaired.contains("[partial: subagent response contract repaired by host]"));
         assert!(!repaired.contains("important but unstructured finding"));
         assert!(!repaired.contains("forged heading"));
+        assert!(repaired.contains("raw child text was omitted"));
         assert!(repaired.contains("/tasks result"));
         assert!(repaired.contains("- [confidence: low]"));
         assert!(repaired.contains("- Covered:"));
         assert!(repaired.contains("- Skipped:"));
+    }
+
+    #[test]
+    fn report_contract_normalizes_harmless_markdown_without_raw_inflation() {
+        let response = "Here is the requested report.\n\n\
+                        ## Findings\n\
+                        - **Confidence: High**: Verified issue.\n\n\
+                        ## Unverified\n\
+                        - None.\n\n\
+                        ## Coverage\n\
+                        - **Covered:** src/lib.rs.\n\
+                        - **Skipped:** None.";
+        let normalized = enforce_report_contract(response);
+
+        assert!(report_contract_violations(&normalized).is_empty());
+        assert!(normalized.starts_with("## Findings\n"));
+        assert!(normalized.contains("- [confidence: high] Verified issue."));
+        assert!(normalized.contains("- Covered: src/lib.rs."));
+        assert!(normalized.contains("- Skipped: None."));
+        assert!(!normalized.contains("Here is the requested report"));
+        assert!(!normalized.contains("Raw child response"));
+        assert!(normalized.len() < response.len());
+    }
+
+    #[test]
+    fn report_contract_normalizes_titled_findings_and_bold_coverage_labels() {
+        let response = "## Findings\n\
+                        - **F1: Stale lock** [Confidence: Medium] Drop is the only release.\n\
+                        - **F2: Clean** — [confidence: low]\n\n\
+                        ## Unverified\n\
+                        - None.\n\n\
+                        ## Coverage\n\
+                        - **Covered**: src/workspace.rs.\n\
+                        - **Skipped**: tests.";
+        assert!(!report_contract_violations(response).is_empty());
+        let normalized = enforce_report_contract(response);
+
+        assert!(report_contract_violations(&normalized).is_empty());
+        assert!(
+            normalized
+                .contains("- [confidence: medium] **F1: Stale lock** Drop is the only release.")
+        );
+        assert!(normalized.contains("- [confidence: low] **F2: Clean** —"));
+        assert!(normalized.contains("- Covered: src/workspace.rs."));
+        assert!(normalized.contains("- Skipped: tests."));
+        assert!(!normalized.contains("repaired by host"));
+
+        // A label far past the title window is not hoisted from the body.
+        let distant = format!(
+            "- {} [confidence: high]",
+            "x".repeat(CONFIDENCE_LABEL_WINDOW)
+        );
+        assert_eq!(normalize_report_label(&distant, "findings"), distant);
+    }
+
+    #[test]
+    fn malformed_report_repair_size_is_independent_of_raw_response_size() {
+        let small = enforce_bounded_report_contract("malformed", MAX_SUBAGENT_RESPONSE_BYTES);
+        let large = enforce_bounded_report_contract(
+            &"malformed".repeat(20_000),
+            MAX_SUBAGENT_RESPONSE_BYTES,
+        );
+
+        assert_eq!(small, large);
+        assert!(large.len() < 1_024);
+        assert!(report_contract_violations(&large).is_empty());
     }
 
     #[test]
@@ -3190,7 +3448,9 @@ mod tests {
         let repaired = enforce_bounded_report_contract(fake, 4096);
         assert!(report_contract_violations(&repaired).is_empty());
         assert!(repaired.starts_with("[partial:"));
+        // The fenced lookalike is never relayed as report text.
         assert!(!repaired.contains("Not a report"));
+        assert!(repaired.contains("raw child text was omitted"));
 
         let unclosed = "## Findings\n- [confidence: high] Extract:\n````\n```\n\
                         ## Unverified\n- None.\n## Coverage\n- Covered: fake\n- Skipped: fake";
@@ -3344,11 +3604,11 @@ mod tests {
         let fixture = crate::tests::OwnedTestDirectory::new("report-contract-wire");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(fixture.path().join("data").into_os_string()),
             ),
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(fixture.path().join("config").into_os_string()),
             ),
         ]);
@@ -3490,9 +3750,22 @@ mod tests {
     }
 
     #[test]
-    fn task_schema_enumerates_and_describes_resolved_specialists() {
+    fn task_schema_is_gateway_compatible_and_describes_resolved_specialists() {
         let tool = TaskTool::new(None, None, true);
         let schema = tool.parameters();
+        assert_eq!(schema["type"], "object");
+        for unsupported in ["oneOf", "anyOf", "allOf"] {
+            assert!(
+                schema.get(unsupported).is_none(),
+                "task schema must not expose top-level {unsupported}: {schema}"
+            );
+        }
+        assert!(
+            schema["description"]
+                .as_str()
+                .unwrap()
+                .contains("exactly one of prompts or briefs")
+        );
         let agent_type = &schema["properties"]["agent_type"];
         let names = agent_type["enum"].as_array().unwrap();
         assert!(names.iter().any(|name| name == "rust-security-review"));
@@ -3507,6 +3780,40 @@ mod tests {
             schema["properties"]["briefs"]["items"]["required"][0],
             "objective"
         );
+    }
+
+    #[test]
+    fn task_schema_runtime_enforces_prompt_or_brief_exclusivity_at_decode_time() {
+        let prompts = serde_json::from_value::<TaskArgs>(serde_json::json!({
+            "prompts": ["inspect auth"]
+        }))
+        .unwrap();
+        assert_eq!(prompts.prompts, ["inspect auth"]);
+        assert!(prompts.briefs.is_none());
+
+        let briefs = serde_json::from_value::<TaskArgs>(serde_json::json!({
+            "briefs": [{ "objective": "inspect auth" }]
+        }))
+        .unwrap();
+        assert!(briefs.prompts.is_empty());
+        assert_eq!(briefs.briefs.unwrap()[0].objective, "inspect auth");
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "prompts": ["inspect auth"],
+                "briefs": [{ "objective": "inspect auth" }]
+            }),
+        ] {
+            let error = match serde_json::from_value::<TaskArgs>(invalid) {
+                Ok(_) => panic!("invalid task arguments were accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("one of prompts"),
+                "unexpected decode error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3648,7 +3955,7 @@ mod tests {
             prompts(1),
             limits(),
             fake_executor(vec![step], counters),
-            Some("[specialist source: project override .zerostack/agents/review.md]".into()),
+            Some("[specialist source: project override .mini-agent/agents/review.md]".into()),
         )
         .await;
 
@@ -3669,8 +3976,8 @@ mod tests {
         let first = container.join("first");
         let second = container.join("second");
         for (workspace, prompt) in [(&first, "FIRST_TASK"), (&second, "SECOND_TASK")] {
-            std::fs::create_dir_all(workspace.join(".zerostack/agents")).unwrap();
-            std::fs::write(workspace.join(".zerostack/agents/review.md"), prompt).unwrap();
+            std::fs::create_dir_all(workspace.join(".mini-agent/agents")).unwrap();
+            std::fs::write(workspace.join(".mini-agent/agents/review.md"), prompt).unwrap();
         }
         let first_binding = crate::paths::WorkspaceBinding::capture(&first).unwrap();
         let second_binding = crate::paths::WorkspaceBinding::capture(&second).unwrap();
@@ -3723,18 +4030,20 @@ mod tests {
             isolation_worktree: false,
             prompt: "review carefully".into(),
             result_notice: None,
-            source: "trusted project override /workspace/.zerostack/agents/review.md".into(),
+            source: "trusted project override /workspace/.mini-agent/agents/review.md".into(),
             tools: None,
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
         };
 
         assert_eq!(
             hook_identity(Some("review"), Some(&specialization)),
             (
                 "review".to_string(),
-                "trusted project override /workspace/.zerostack/agents/review.md".to_string(),
+                "trusted project override /workspace/.mini-agent/agents/review.md".to_string(),
             )
         );
         assert_eq!(
@@ -3762,6 +4071,8 @@ mod tests {
             required_tools: Vec::new(),
             model: Some("fast-review".into()),
             turn_budget: Some(crate::context::agents::AgentTurnBudget::Medium),
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
         }
     }
 
@@ -3770,11 +4081,11 @@ mod tests {
         let root = crate::tests::OwnedTestDirectory::new("required-persona-preflight");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
         ]);
@@ -3794,6 +4105,8 @@ mod tests {
             connect_timeout_secs: Some(1),
             stream_idle_timeout_secs: Some(1),
             model: None,
+            prompt_caching: false,
+            model_prices: std::collections::HashMap::new(),
         };
         let client = crate::provider::create_client(
             "preflight-test",
@@ -3868,11 +4181,11 @@ mod tests {
         let root = crate::tests::OwnedTestDirectory::new("write-persona-opt-in");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(root.path().join("data").into_os_string()),
             ),
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(root.path().join("config").into_os_string()),
             ),
         ]);
@@ -4087,7 +4400,7 @@ mod tests {
 
     #[test]
     fn compact_partial_reserves_complete_host_status_after_project_notice() {
-        let notice = "[specialist source: project override .zerostack/agents/review.md]";
+        let notice = "[specialist source: project override .mini-agent/agents/review.md]";
         let (partial, cut) = fit_success("UNTRUSTED BODY\n".repeat(100), 26);
         assert!(cut);
         let report = TaskReport {
@@ -4168,7 +4481,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn project_override_notice_and_near_limit_results_share_one_output_bound() {
         let counters = Arc::new(FakeCounters::default());
-        let notice = "[specialist source: project override .zerostack/agents/review.md]";
+        let notice = "[specialist source: project override .mini-agent/agents/review.md]";
         let max_output_bytes = notice.len() + 48;
         let step = FakeStep {
             delay: Duration::ZERO,
@@ -5668,6 +5981,7 @@ mod child_continuation_tests {
                     None,
                     &crate::retry::RetryConfig::default(),
                     SharedUsageLedger::default(),
+                    None,
                 )
                 .await
             })
@@ -5686,6 +6000,7 @@ mod child_continuation_tests {
             None,
             &crate::retry::RetryConfig::default(),
             SharedUsageLedger::default(),
+            None,
         )
         .await
     }
@@ -5820,7 +6135,7 @@ mod child_continuation_tests {
         // with the raw text withheld; the details never enter it.
         let parent_text =
             enforce_validated_report_contract(finished.response.unwrap(), violations.clone(), 4096);
-        assert_eq!(parent_text, host_repaired_report(&violations));
+        assert_eq!(parent_text, host_repaired_report(raw, &violations));
         assert!(parent_text.starts_with("[partial: subagent response contract repaired by host]"));
         assert!(
             !parent_text.contains("RAW_CHILD_TEXT"),
@@ -5892,6 +6207,23 @@ mod response_limit_tests {
 
     fn parse_args(value: serde_json::Value) -> Result<TaskArgs, String> {
         serde_json::from_value::<TaskArgs>(value).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn json_encoded_brief_list_string_is_decoded_as_the_list() {
+        let args = parse_args(serde_json::json!({
+            "briefs": "[{\"objective\": \"Fix a panic\", \"files\": [\"src/lib.rs\"]}]",
+            "agent_type": "implementer"
+        }))
+        .unwrap();
+        let briefs = args.briefs.unwrap();
+        assert_eq!(briefs.len(), 1);
+        assert_eq!(briefs[0].objective, "Fix a panic");
+        assert_eq!(briefs[0].files, ["src/lib.rs"]);
+        assert_eq!(args.agent_type.as_deref(), Some("implementer"));
+
+        let error = parse_args(serde_json::json!({"briefs": "fix the panic"})).unwrap_err();
+        assert!(error.contains("JSON-encoded list of briefs"), "{error}");
     }
 
     #[test]

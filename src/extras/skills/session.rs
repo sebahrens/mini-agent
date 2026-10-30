@@ -180,12 +180,6 @@ impl InstructionServices {
                 let mut roots = vec![
                     SourceRoot {
                         binding: Arc::clone(&self.workspace),
-                        directory: ".zerostack/skills".into(),
-                        origin: "project .zerostack",
-                        project: true,
-                    },
-                    SourceRoot {
-                        binding: Arc::clone(&self.workspace),
                         directory: ".mini-agent/skills".into(),
                         origin: "project .mini-agent",
                         project: true,
@@ -1106,10 +1100,10 @@ mod discovery_tests {
                 state_dir: root.path().join("state"),
                 cache_dir: root.path().join("cache"),
                 credentials_dir: root.path().join("credentials"),
-                project_dir: Some(root.path().join(".zerostack")),
+                project_dir: Some(root.path().join(".mini-agent")),
             };
             crate::paths::prepare_storage_roots(&paths).unwrap();
-            std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+            std::fs::create_dir_all(root.path().join(".mini-agent")).unwrap();
             let config = paths.project_config_file().unwrap();
             std::fs::write(&config, "model='fixture'\n").unwrap();
             crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
@@ -1232,7 +1226,7 @@ mod discovery_tests {
             "compat body",
         );
         let path = fixture.skill(
-            ".zerostack/skills",
+            ".mini-agent/skills",
             "reviewer",
             "code review",
             "highest body; consult `notes.txt`",
@@ -1243,7 +1237,7 @@ mod discovery_tests {
         )
         .unwrap();
         let pin = fixture.services.pin("reviewer").await.unwrap();
-        assert_eq!(pin.origin, "project .zerostack");
+        assert_eq!(pin.origin, "project .mini-agent");
         let turn = InstructionTurn::new(fixture.services.clone(), Some(pin));
         let selection = turn
             .prepare("unrelated words without overlap")

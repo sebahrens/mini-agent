@@ -539,6 +539,12 @@ pub(crate) enum EffectOperation {
     ReadFiles {
         paths: Vec<String>,
     },
+    /// Ranged line read. `from` is 1-based; a negative `from` selects the last `-from` lines.
+    ReadLines {
+        path: String,
+        from: i64,
+        count: u32,
+    },
     ListDir {
         path: String,
     },
@@ -701,6 +707,10 @@ pub(crate) enum EffectResult {
     },
     ReadFiles {
         contents: Vec<String>,
+    },
+    ReadLines {
+        lines: Vec<String>,
+        eof: bool,
     },
     ListDir {
         entries: Vec<DirectoryEntry>,
@@ -881,6 +891,65 @@ pub(crate) struct Diagnostic {
     pub(crate) exception_class: Option<JsExceptionClass>,
     pub(crate) line: Option<u32>,
     pub(crate) column: Option<u32>,
+    /// Closed guidance only: arbitrary worker exception text never crosses the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hint: Option<JsDiagnosticHint>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum JsDiagnosticHint {
+    CollectionProperty,
+    TopLevelReturn,
+    UnavailableGlobal,
+}
+
+impl JsDiagnosticHint {
+    pub(crate) fn from_exception(class: JsExceptionClass, message: &str) -> Option<Self> {
+        match class {
+            JsExceptionClass::TypeError
+                if (message.contains("into type") && message.contains("array"))
+                    || message.contains("is not iterable") =>
+            {
+                Some(Self::CollectionProperty)
+            }
+            JsExceptionClass::SyntaxError if message.starts_with("return not in a function") => {
+                Some(Self::TopLevelReturn)
+            }
+            JsExceptionClass::ReferenceError => {
+                let name = message
+                    .strip_suffix(" is not defined")?
+                    .trim_matches(['\'', '"']);
+                [
+                    "require",
+                    "process",
+                    "module",
+                    "exports",
+                    "fs",
+                    "Buffer",
+                    "__dirname",
+                    "__filename",
+                ]
+                .contains(&name)
+                .then_some(Self::UnavailableGlobal)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            Self::CollectionProperty => {
+                "glob() returns {paths}, list_dir() returns {entries}, grep() returns {matches}: use the array property"
+            }
+            Self::TopLevelReturn => {
+                "scripts are not functions: use result(value) or end with the value"
+            }
+            Self::UnavailableGlobal => {
+                "not available: only the listed globals exist; use read_file/list_dir/grep/glob/read_lines instead"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1392,7 +1461,7 @@ impl ParentProtocol {
                 WorkerFrame::EffectRequest(request),
             ) => {
                 validate_invocation(frame, invocation)?;
-                if *next_effect >= MAX_EFFECTS_PER_STEP {
+                if *next_effect >= effect_quota(&request.operation) {
                     return Err(ProtocolError::TooManyEffects {
                         maximum: MAX_EFFECTS_PER_STEP,
                     });
@@ -1632,7 +1701,7 @@ impl WorkerProtocol {
                 WorkerFrame::EffectRequest(request),
             ) => {
                 validate_invocation(frame, invocation)?;
-                if *next_effect >= MAX_EFFECTS_PER_STEP {
+                if *next_effect >= effect_quota(&request.operation) {
                     return Err(ProtocolError::TooManyEffects {
                         maximum: MAX_EFFECTS_PER_STEP,
                     });
@@ -1793,6 +1862,12 @@ fn validate_invocation<M>(
         });
     }
     Ok(())
+}
+
+/// Effects allowed before the next one is refused. A terminal `result()` owns one extra slot so
+/// a script that exhausted the quota can still return what it gathered.
+fn effect_quota(operation: &EffectOperation) -> u32 {
+    MAX_EFFECTS_PER_STEP + u32::from(matches!(operation, EffectOperation::Result { .. }))
 }
 
 fn validate_effect(expected: u32, actual: u32) -> Result<(), ProtocolError> {

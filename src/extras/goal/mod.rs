@@ -507,6 +507,9 @@ pub struct GoalProgress {
     pub wrap_up_issued: bool,
     /// Consecutive judge failures, for the fail-open ladder.
     pub judge_failures: u32,
+    /// Fingerprint of the previous round's all-failing mutating calls, so an
+    /// identical failure repeated next round is not counted as progress.
+    pub last_failure_fingerprint: Option<u64>,
 }
 
 impl GoalProgress {

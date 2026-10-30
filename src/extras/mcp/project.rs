@@ -168,8 +168,8 @@ impl SourceCapture {
         }
         match kind {
             SourceKind::ProjectConfig
-                if relative != Path::new(".zerostack/config.toml")
-                    && relative != Path::new(".zerostack/config.local.toml") =>
+                if relative != Path::new(".mini-agent/config.toml")
+                    && relative != Path::new(".mini-agent/config.local.toml") =>
             {
                 return Err("invalid MCP project config source");
             }
@@ -1420,8 +1420,8 @@ mod trust_tests {
         assert!(!crate::config::project_mcp_is_trusted_at(
             &trust, &workspace, &changed
         ));
-        std::fs::create_dir(root.path().join(".zerostack")).unwrap();
-        let toml = root.path().join(".zerostack/config.toml");
+        std::fs::create_dir(root.path().join(".mini-agent")).unwrap();
+        let toml = root.path().join(".mini-agent/config.toml");
         std::fs::write(&toml, "[mcp_servers.different]\ncommand='toml-only'\n").unwrap();
         crate::config::trust_project_config(&toml, &trust).unwrap();
         assert!(!crate::config::project_mcp_is_trusted_at(

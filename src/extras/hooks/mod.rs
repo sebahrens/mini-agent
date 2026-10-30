@@ -166,7 +166,7 @@ pub(crate) fn set_active_session(session_id: &str) {
 }
 
 /// Best-effort session identity for `HookCtx` until the session-lifecycle
-/// seam supplies zerostack's real session id/path.
+/// seam supplies mini-agent's real session id/path.
 pub(crate) fn session_context() -> (String, String) {
     if let Some(context) = ACTIVE_SESSION_CONTEXT
         .lock()
@@ -834,7 +834,10 @@ mod event60_tests {
                 matcher: None,
                 hooks: vec![settings::HookHandler {
                     kind: "command".into(), command: Some("/bin/sh".into()),
-                    args: Some(vec!["-c".into(), "cat > \"$1\"; printf '%s' '{\"decision\":\"block\",\"permissionDecision\":\"allow\"}'".into(), "event60".into(), root.path().join(event).display().to_string()]),
+                    // Append one line per event: concurrent tests may dispatch
+                    // through this process-global dispatcher, so the
+                    // assertions select this test's own events.
+                    args: Some(vec!["-c".into(), "{ cat; printf '\\n'; } >> \"$1\"; printf '%s' '{\"decision\":\"block\",\"permissionDecision\":\"allow\"}'".into(), "event60".into(), root.path().join(event).display().to_string()]),
                     timeout: Some(3), is_async: false, condition: None, once: false,
                     trust: settings::HookTrust::Trusted, env: Default::default(),
                 }],
@@ -892,22 +895,30 @@ mod event60_tests {
             })
             .await;
         cleanup.settle().await;
-        let read = |name: &str| -> serde_json::Value {
-            serde_json::from_slice(&std::fs::read(root.path().join(name)).unwrap()).unwrap()
+        // Every complete envelope line the hook for `name` recorded; a line
+        // still being appended by a concurrent dispatch is skipped.
+        let events = |name: &str| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(root.path().join(name))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
         };
-        let permission = read("PermissionRequest");
-        assert_eq!(permission["tool_name"], "shell");
-        assert_eq!(permission["tool_input"], "literal request");
-        assert_eq!(
-            read("Notification")["notification_type"],
+        let observed = |name: &str, field: &str, value: &str| {
+            events(name).iter().any(|event| event[field] == value)
+        };
+        assert!(events("PermissionRequest").iter().any(|event| {
+            event["tool_name"] == "shell" && event["tool_input"] == "literal request"
+        }));
+        assert!(observed(
+            "Notification",
+            "notification_type",
             "permission_prompt"
-        );
-        assert_eq!(read("PreCompact")["trigger"], "manual");
-        assert_eq!(
-            read("PreCompact")["custom_instructions"],
-            "retain decisions"
-        );
-        assert_eq!(read("SessionStart")["source"], "compact");
+        ));
+        assert!(events("PreCompact").iter().any(|event| {
+            event["trigger"] == "manual" && event["custom_instructions"] == "retain decisions"
+        }));
+        assert!(observed("SessionStart", "source", "compact"));
 
         #[cfg(feature = "js")]
         {
@@ -959,8 +970,9 @@ mod event60_tests {
                 .await;
             drop(owner);
             cleanup.settle().await;
-            assert_eq!(read("PermissionRequest")["tool_name"], "read");
-            assert_eq!(read("PermissionRequest")["tool_input"], "pending.txt");
+            assert!(events("PermissionRequest").iter().any(|event| {
+                event["tool_name"] == "read" && event["tool_input"] == "pending.txt"
+            }));
         }
     }
 }

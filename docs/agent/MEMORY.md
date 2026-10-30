@@ -8,7 +8,7 @@ description: "Persistent markdown memory in mini-agent: global notes, project sc
 
 The Memory system provides persistent, file-based storage that lets the agent recall information across sessions. It lives behind the `memory` Cargo feature flag, which is included in the default build. A custom minimal build can omit it with `--no-default-features`.
 
-Memory is plain Markdown on disk — no database, no indexing service. All storage lives under the platform data root (`<data_dir>/memory/`), controlled by `ZS_DATA_DIR`.
+Memory is plain Markdown on disk — no database, no indexing service. All storage lives under the platform data root (`<data_dir>/memory/`), controlled by `MINI_AGENT_DATA_DIR`.
 
 ---
 

@@ -415,6 +415,20 @@ fn assert_closed_exception(
     assert_eq!(diagnostic.line.is_some(), diagnostic.column.is_some());
 }
 
+#[test]
+fn worker_runtime_reports_the_real_syntax_error_column() {
+    // mini-agent-4yrjs: the engine says column 1; the real column is recovered from the token.
+    let results = run_steps(&["let x = ;", "40 + 2"], 10_000, 10_000);
+    assert_closed_exception(
+        &results[0],
+        JsErrorCode::Syntax,
+        DiagnosticClass::Syntax,
+        JsExceptionClass::SyntaxError,
+        Some((1, 9)),
+    );
+    assert_eq!(results[1].outcome, StepOutcome::Value("42".into()));
+}
+
 #[tokio::test]
 async fn worker_runtime_allows_exactly_the_effect_limit() {
     let supervisor =
@@ -439,6 +453,42 @@ async fn worker_runtime_allows_exactly_the_effect_limit() {
         *witness.ordinals.lock().unwrap(),
         (0..crate::extras::js::protocol::MAX_EFFECTS_PER_STEP).collect::<Vec<_>>()
     );
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_runtime_keeps_result_set_after_the_effect_limit() {
+    // mini-agent-nsjvk: result() owns one slot past the quota, so a catch block can return the
+    // partial data; the step keeps the value and adds a warning instead of an effect-limit error.
+    let supervisor =
+        JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
+    let effects = RecordingEffects::default();
+    let witness = effects.clone();
+    let grant_id = GrantId::new(uuid::Uuid::from_u128(1)).unwrap();
+    let result = supervisor
+        .execute(
+            RunStep::new(
+                "let n = 0; try { for (let i = 0; i < 300; i += 1) { read_file('fixture'); n += 1; } } catch (e) { result({reads: n}); }".into(),
+            )
+            .with_model_grant(grant_id),
+            effects,
+            PermCancellation::new(),
+        )
+        .await
+        .expect("a result() after the effect limit must be accepted");
+
+    assert_eq!(
+        result.outcome,
+        StepOutcome::Structured(serde_json::json!({"reads": 256}))
+    );
+    assert!(
+        result.console.iter().any(
+            |record| record.level == ConsoleLevel::Warn && record.text.contains("effect limit")
+        ),
+        "{:?}",
+        result.console
+    );
+    assert_eq!(witness.ordinals.lock().unwrap().len(), 257);
     supervisor.shutdown_for_test().await.unwrap();
 }
 
@@ -912,8 +962,7 @@ fn worker_runtime_classifies_and_redacts_exceptions_then_recovers() {
     for index in [1, 3, 5, 7, 9, 11, 13, 15, 17, 19] {
         assert_eq!(results[index].outcome, StepOutcome::Value("42".into()));
     }
-    let encoded = serde_json::to_string(&results).unwrap();
-    assert!(!encoded.contains(SECRET));
+    assert!(!serde_json::to_string(&results).unwrap().contains(SECRET));
 }
 
 #[test]
@@ -1024,6 +1073,20 @@ fn worker_runtime_timeout_and_pending_job_limits_reset_before_next_request() {
         DiagnosticStage::JobDrain,
     );
     assert_eq!(jobs[1].outcome, StepOutcome::Value("42".into()));
+}
+
+#[test]
+fn worker_runtime_bounds_resolved_promise_cycles_during_result_conversion() {
+    let cycle = "let ra, rb; const a = new Promise(r => { ra = r; }); const b = new Promise(r => { rb = r; }); a.then = undefined; b.then = undefined; ra(b); rb(a); a";
+    let results = run_steps(&[cycle, "40 + 2"], 10_000, 10_000);
+
+    assert_closed_error(
+        &results[0],
+        JsErrorCode::JobLimit,
+        DiagnosticClass::ResourceLimit,
+        DiagnosticStage::ResultConversion,
+    );
+    assert_eq!(results[1].outcome, StepOutcome::Value("42".into()));
 }
 
 #[tokio::test]
@@ -1840,6 +1903,7 @@ impl InvocationEffectHandler for RecordingEffects {
                         .map(|path| format!("content:{path}"))
                         .collect(),
                 },
+                EffectOperation::Result { json } => EffectResult::ResultAccepted { json },
                 _ => EffectResult::ReadFile {
                     content: format!("effect-{}", request.effect_ordinal),
                 },
@@ -2835,13 +2899,27 @@ async fn wait_for_process_exit(pid: u32) {
     .expect("stale protocol-pipe descendant survived bounded tree teardown");
 }
 
+/// Whole-call watchdog for the stale-descendant case. It must exceed the descendant-detection
+/// bound below by a wide margin: the supervisor reports root exit (`Transport`) only after its
+/// `try_wait` poll observes the exit, and that same deadline also covers re-executing the test
+/// binary and the libtest startup of a fresh worker, which can take seconds on a loaded CI runner.
+/// A deadline close to the detection bound turns scheduling noise into `Err(TimedOut)`.
+#[cfg(unix)]
+const STALE_DESCENDANT_WATCHDOG: Duration = Duration::from_secs(60);
+
+/// Bound on reporting root exit while a descendant still holds the protocol pipe. The descendant
+/// (`/bin/sleep 30`) keeps the pipe open for 30 s and the watchdog is longer still, so an
+/// implementation that waited for pipe EOF or the deadline cannot finish inside this bound.
+#[cfg(unix)]
+const STALE_DESCENDANT_DETECTION_BOUND: Duration = Duration::from_secs(15);
+
 #[cfg(unix)]
 #[tokio::test]
 async fn worker_supervisor_reaps_root_exited_descendant_holding_protocol_pipe() {
     let (supervisor, launcher) =
-        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_secs(2));
+        recovery_supervisor(TestSupervisorStartup::Healthy, STALE_DESCENDANT_WATCHDOG);
     let stale = tokio::time::timeout(
-        Duration::from_secs(2),
+        STALE_DESCENDANT_DETECTION_BOUND,
         supervisor.execute(
             RunStep::new("stale-response".into()),
             RecordingEffects::default(),
@@ -4094,6 +4172,8 @@ fn run_scripted_supervisor_worker() -> ! {
                     StepOutcome::Timeout
                 } else if step.code == "oom-step" {
                     StepOutcome::OutOfMemory
+                } else if step.code == "structured-success" {
+                    StepOutcome::Structured(serde_json::json!({"status": "ok"}))
                 } else {
                     StepOutcome::Value(
                         if step.code == "two-effects" {
@@ -4153,6 +4233,7 @@ fn run_scripted_supervisor_worker() -> ! {
                         exception_class: positions.then_some(JsExceptionClass::TypeError),
                         line: positions.then_some(1),
                         column: positions.then_some(1),
+                        hint: None,
                     }),
                     #[cfg(feature = "skills")]
                     transcript: Default::default(),
@@ -4206,6 +4287,7 @@ fn run_scripted_supervisor_worker() -> ! {
                                     exception_class: None,
                                     line: None,
                                     column: None,
+                                    hint: None,
                                 });
                             result.passed = fault == "true-summary";
                         }

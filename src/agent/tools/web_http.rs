@@ -488,31 +488,71 @@ impl<C: Clone> PinnedClientCache<C> {
         }
     }
 
+    /// Synchronous build-or-reuse for callers with no runtime to offload the
+    /// build onto (`BLOCKING_CLIENTS`, `js` + `sandbox` only); an async
+    /// caller with a runtime should instead use `lookup` and run its build
+    /// through `tokio::task::spawn_blocking` before calling `insert`, the
+    /// way `send_async` does for `ASYNC_CLIENTS`.
+    #[cfg_attr(not(all(feature = "js", feature = "sandbox")), allow(dead_code))]
     pub(crate) fn get_or_build<E>(
         &self,
         key: &str,
         addresses: &[SocketAddr],
         build: impl FnOnce() -> Result<C, E>,
     ) -> Result<C, E> {
-        let mut pinned = addresses.to_vec();
-        pinned.sort_unstable();
-        pinned.dedup();
+        if let Some(client) = self.lookup(key, addresses) {
+            return Ok(client);
+        }
+        // Build the client (TLS/CA setup, possibly hundreds of milliseconds)
+        // without holding `entries`: a lock held across that work would
+        // serialize every other cache lookup and insert behind it, including
+        // unrelated pins and concurrent callers checking only this host.
+        let client = build()?;
+        Ok(self.insert(key, addresses, client))
+    }
+
+    /// Cache lookup only, normalizing `addresses` the same way `insert` does.
+    /// A hit moves the entry to most-recently-used.
+    pub(crate) fn lookup(&self, key: &str, addresses: &[SocketAddr]) -> Option<C> {
+        let pinned = Self::normalize(addresses);
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let index = entries.iter().position(|(entry_key, entry_addresses, _)| {
+            entry_key == key && *entry_addresses == pinned
+        })?;
+        // Most recently used last.
+        let entry = entries.remove(index);
+        let client = entry.2.clone();
+        entries.push(entry);
+        Some(client)
+    }
+
+    /// Inserts an already-built `client`, reusing a matching entry another
+    /// caller raced in and inserted first instead of evicting over it. Call
+    /// after building a client a prior `lookup` missed; the build itself
+    /// must not run while holding `entries` (see `get_or_build`).
+    pub(crate) fn insert(&self, key: &str, addresses: &[SocketAddr], client: C) -> C {
+        let pinned = Self::normalize(addresses);
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(index) = entries.iter().position(|(entry_key, entry_addresses, _)| {
             entry_key == key && *entry_addresses == pinned
         }) {
-            // Most recently used last.
             let entry = entries.remove(index);
-            let client = entry.2.clone();
+            let existing = entry.2.clone();
             entries.push(entry);
-            return Ok(client);
+            return existing;
         }
-        let client = build()?;
         if entries.len() >= self.capacity {
             entries.remove(0);
         }
         entries.push((key.to_owned(), pinned, client.clone()));
-        Ok(client)
+        client
+    }
+
+    fn normalize(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+        let mut pinned = addresses.to_vec();
+        pinned.sort_unstable();
+        pinned.dedup();
+        pinned
     }
 }
 
@@ -797,24 +837,39 @@ pub(crate) async fn send_async(
     let host = url.host_str().ok_or(FetchError::MissingHost)?;
     // Limits are the compile-time defaults, so the client depends only on the
     // pinned host and destination set.
-    let client = ASYNC_CLIENTS.get_or_build(host, addresses, || {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .no_gzip()
-            .no_brotli()
-            .no_zstd()
-            .no_deflate()
-            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            .connect_timeout(limits.connect_timeout)
-            .read_timeout(limits.read_timeout)
-            .timeout(limits.total_timeout)
-            .user_agent(concat!("mini-agent-web/", env!("CARGO_PKG_VERSION")))
-            .resolve_to_addrs(host, addresses)
-            .build()
-            .map_err(|e| FetchError::ClientBuild(e.to_string()))
-    })?;
+    let client = if let Some(client) = ASYNC_CLIENTS.lookup(host, addresses) {
+        client
+    } else {
+        // A cache miss builds a fresh client, which synchronously parses the
+        // host's TLS/CA store (hundreds of milliseconds, more under CPU
+        // contention). Run that on the blocking pool instead of this task's
+        // own async worker thread: a worker thread tied up by it cannot poll
+        // anything else on that runtime, including this same exchange's
+        // cancellation check or a sibling exchange's timers.
+        let host_owned = host.to_string();
+        let addresses_owned = addresses.to_vec();
+        let built = tokio::task::spawn_blocking(move || {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .no_gzip()
+                .no_brotli()
+                .no_zstd()
+                .no_deflate()
+                .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .connect_timeout(limits.connect_timeout)
+                .read_timeout(limits.read_timeout)
+                .timeout(limits.total_timeout)
+                .user_agent(concat!("mini-agent-web/", env!("CARGO_PKG_VERSION")))
+                .resolve_to_addrs(&host_owned, &addresses_owned)
+                .build()
+                .map_err(|e| FetchError::ClientBuild(e.to_string()))
+        })
+        .await
+        .map_err(|_| FetchError::ClientBuild("client build task panicked".to_string()))??;
+        ASYNC_CLIENTS.insert(host, addresses, built)
+    };
     let mut builder = client
         .request(request.method.clone(), url.clone())
         .headers(request.headers.clone());
@@ -1617,6 +1672,18 @@ mod web_permission_cancel_tests {
     }
     #[tokio::test]
     async fn web_http_cancelled_stalled_socket_returns_without_unowned_network_work() {
+        // `execute` builds a fresh TLS client for this never-seen-before
+        // host, synchronously parsing the host CA store (hundreds of
+        // milliseconds, more under CPU contention) before it can even
+        // connect. Size the "peer has seen the connection" wait relative to
+        // a standalone measurement of that cost instead of a fixed budget
+        // contention can exceed, the same way the absolute-deadline test
+        // does.
+        let setup = std::time::Instant::now();
+        drop(reqwest::Client::builder().no_proxy().build().unwrap());
+        let setup = setup.elapsed();
+        let peer_wait = setup * 4 + Duration::from_secs(2);
+
         let peer = Peer::new(vec![String::new()]);
         let client = fixture_client(&peer);
         let scope = crate::agent::runner::AgentWorkScope::new();
@@ -1631,13 +1698,15 @@ mod web_permission_cancel_tests {
                 ))
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(peer_wait, async {
             while peer.count() == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| {
+            panic!("peer never saw the connection within {peer_wait:?} (TLS setup {setup:?})")
+        });
         scope.cancellation_handle().cancel();
         let message = tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -1831,12 +1900,16 @@ mod web_deadline_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         client.ask_tx = Some(tx);
         client.permission = Some(checker.clone());
-        client.test_total_timeout = Duration::from_millis(75);
+        client.test_total_timeout = Duration::from_millis(750);
         let request = FetchRequest::get();
         let fetch = client.execute("http://fixture.invalid/docs", &request, "web_fetch", true);
         let late = async {
-            let ask = rx.recv().await.unwrap().into_permission();
-            tokio::time::sleep(Duration::from_millis(125)).await;
+            let mut ask = rx.recv().await.unwrap().into_permission();
+            // Wait for the deadline to drop the receiver instead of sleeping a
+            // fixed margin that a loaded runner can miss (mini-agent-h3o6r).
+            tokio::time::timeout(Duration::from_secs(30), ask.reply.closed())
+                .await
+                .expect("deadline must close the pending approval");
             assert!(ask.reply.is_closed());
             assert!(
                 ask.reply
@@ -1859,9 +1932,16 @@ mod web_deadline_tests {
     }
     #[tokio::test]
     async fn web_http_absolute_deadline_bounds_a_live_stalled_exchange() {
+        // Each exchange synchronously builds a TLS client that parses the host
+        // CA store before connecting. Corporate stores make that setup alone
+        // take hundreds of milliseconds, so size the deadline to reach the
+        // stalled peer and bound only the exchange beyond the measured setup.
+        let setup = std::time::Instant::now();
+        drop(reqwest::Client::builder().no_proxy().build().unwrap());
+        let setup = setup.elapsed();
         let peer = Peer::new(vec![String::new()]);
         let mut client = fixture_client(&peer);
-        client.test_total_timeout = Duration::from_millis(75);
+        client.test_total_timeout = setup * 3 + Duration::from_millis(75);
         let before = std::time::Instant::now();
         let error = client
             .execute(
@@ -1874,7 +1954,11 @@ mod web_deadline_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed out"));
-        assert!(before.elapsed() < Duration::from_secs(1));
+        let elapsed = before.elapsed();
+        assert!(
+            elapsed < client.test_total_timeout + setup + Duration::from_secs(1),
+            "elapsed {elapsed:?} with TLS setup {setup:?}"
+        );
         assert_eq!(peer.count(), 1);
     }
 }

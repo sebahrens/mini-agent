@@ -6,6 +6,24 @@ const host = vi.hoisted(() => ({ download: vi.fn(), command: vi.fn(), tests: vi.
 vi.mock('@vscode/test-electron', () => ({
   downloadAndUnzipVSCode: host.download, runVSCodeCommand: host.command, runTests: host.tests,
 }));
+// The win32-x64 target runs the installed binary's containment check on a
+// Windows host; this offline test installs nothing, so stub that lookup.
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:child_process')>()),
+  execFileSync: vi.fn(() => 'JS runtime check: PASS (2)\n'),
+}));
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs')>();
+  const { version } = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  return {
+    ...fs,
+    readdirSync: ((path: string, ...rest: unknown[]) => (
+      String(path).endsWith('extensions')
+        ? [`mini-agent.mini-agent-${version}-win32-x64`]
+        : (fs.readdirSync as (...args: unknown[]) => unknown)(path, ...rest)
+    )) as typeof fs.readdirSync,
+  };
+});
 vi.mock('node:http', async () => {
   const { EventEmitter } = await import('node:events');
   class OfflineServer extends EventEmitter {
@@ -16,6 +34,10 @@ vi.mock('node:http', async () => {
   }
   return { createServer: () => new OfflineServer() };
 });
+// Every test cold-imports the runner (vi.resetModules) and touches the real
+// filesystem; hosted Windows runners took ~7 s against vitest's 5 s default
+// (mini-agent-zugls).
+vi.setConfig({ testTimeout: 30_000 });
 const originalArguments = process.argv;
 let errors: ReturnType<typeof vi.spyOn>;
 const runner: string = '../scripts/run-integration-tests.mjs';
@@ -62,10 +84,10 @@ it('passes distinct data/state roots to the actual host runner and leaves privat
   const stopped = new Error('offline host boundary reached');
   host.tests.mockImplementation(async (options: { extensionTestsEnv: Record<string, string> }) => {
     const environment = options.extensionTestsEnv;
-    expect(environment.ZS_STATE_DIR).toBe(environment.ZS_CONFIG_DIR);
-    expect(environment.ZS_DATA_DIR).toBe(join(dirname(environment.ZS_CONFIG_DIR), 'data'));
-    expect(environment.ZS_DATA_DIR).not.toBe(environment.ZS_STATE_DIR);
-    expect(existsSync(environment.ZS_DATA_DIR)).toBe(false);
+    expect(environment.MINI_AGENT_STATE_DIR).toBe(environment.MINI_AGENT_CONFIG_DIR);
+    expect(environment.MINI_AGENT_DATA_DIR).toBe(join(dirname(environment.MINI_AGENT_CONFIG_DIR), 'data'));
+    expect(environment.MINI_AGENT_DATA_DIR).not.toBe(environment.MINI_AGENT_STATE_DIR);
+    expect(existsSync(environment.MINI_AGENT_DATA_DIR)).toBe(false);
     throw stopped;
   });
   await expect(import(runner)).rejects.toBe(stopped);

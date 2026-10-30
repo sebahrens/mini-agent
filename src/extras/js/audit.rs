@@ -514,11 +514,8 @@ impl EffectAudit {
 
         let indices =
             segment_indices(&owner).map_err(|error| report_open_stage("segment_indices", error))?;
-        let initialized = initialization_marker_exists(&owner)
+        let _initialized = initialization_marker_exists(&owner)
             .map_err(|error| report_open_stage("initialization_marker_exists", error))?;
-        if initialized && indices.is_empty() {
-            return Err(AuditError::MissingSegment);
-        }
         if indices.len() as u64 > options.max_segments {
             return Err(AuditError::RetentionLimit);
         }
@@ -946,7 +943,7 @@ impl EffectAudit {
         let result = self.append_effect_unpoisoned(body, sync);
         if matches!(
             result,
-            Err(AuditError::PathUnavailable | AuditError::SyncFailed | AuditError::RetentionLimit)
+            Err(AuditError::PathUnavailable | AuditError::SyncFailed)
         ) {
             self.poisoned = true;
         }
@@ -1075,22 +1072,29 @@ impl EffectAudit {
     }
 }
 
+/// Records which open stage failed. A held writer lock is the expected outcome while a process
+/// probes for a free audit slot, so it stays at debug; everything else is a warning. The stage
+/// and error variant are static labels: no path or secret reaches the log.
 fn report_open_stage(stage: &'static str, error: AuditError) -> AuditError {
     #[cfg(test)]
     eprintln!("EFFECT_AUDIT_OPEN_FAILED={stage}");
-    #[cfg(not(test))]
-    let _ = stage;
+    if error == AuditError::WriterLocked {
+        tracing::debug!(stage, %error, "JS effect audit open stage failed");
+    } else {
+        tracing::warn!(stage, %error, "JS effect audit open stage failed");
+    }
     error
 }
 
 fn report_open_io_stage(stage: &'static str, error: &std::io::Error) {
+    let errno = error.raw_os_error().unwrap_or(-1);
     #[cfg(test)]
-    eprintln!(
-        "EFFECT_AUDIT_OPEN_IO_FAILED={stage}:errno_{}",
-        error.raw_os_error().unwrap_or(-1)
-    );
-    #[cfg(not(test))]
-    let _ = (stage, error);
+    eprintln!("EFFECT_AUDIT_OPEN_IO_FAILED={stage}:errno_{errno}");
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        tracing::debug!(stage, errno, "JS effect audit open I/O stage failed");
+    } else {
+        tracing::warn!(stage, errno, "JS effect audit open I/O stage failed");
+    }
 }
 
 fn body_from_record(

@@ -270,6 +270,7 @@ impl ReadTool {
         let target = crate::agent::tools::resolve_tool_target(self.workspace.as_ref(), &args.path);
         let requested = target.requested;
         let path = requested.to_string_lossy().into_owned();
+        crate::agent::tools::precheck_perm_path_deny(&self.permission, "read", &path)?;
         let relative = target.bound_relative.as_deref().unwrap_or(Path::new(""));
         let bound_workspace = target.bound_relative.as_ref().and(self.workspace.as_ref());
         let capability_file = bound_workspace
@@ -448,7 +449,7 @@ impl ReadTool {
         let file_size = metadata.len();
         let explicitly_bounded = args.offset.is_some() || args.limit.is_some();
         if file_size > self.max_text_file_size && !explicitly_bounded {
-            tracing::warn!(
+            tracing::debug!(
                 "tool read requires a bounded window: path={}, size={}, max={}",
                 path,
                 file_size,
@@ -915,7 +916,7 @@ mod tests {
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let temp = std::env::temp_dir().join(format!(
-            "zerostack_read_toctou_test_{}_{}",
+            "mini-agent_read_toctou_test_{}_{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -964,6 +965,74 @@ mod tests {
         assert!(error.to_string().contains("Path changed"));
 
         std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    // mini-agent-33lax: the refusal is returned to the model, so it must not
+    // also be logged at warn (which reached the terminal under the TUI).
+    #[tokio::test]
+    async fn oversized_unbounded_read_refusal_logs_below_warn() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Levels(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Message(String);
+                impl tracing::field::Visit for Message {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), message.0));
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-read-large-log-level-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "zero\none\ntwo\nthree\n").unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Levels(Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = ReadTool::new(None, None, Some(4), 100)
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+                raw_notebook: false,
+            })
+            .await
+            .unwrap_err();
+        std::fs::remove_file(path).unwrap();
+
+        assert!(error.to_string().contains("unbounded read"), "{error}");
+        let events = events.lock().unwrap();
+        // Only the negative assertion is made: tracing caches callsite
+        // interest process-wide, so parallel tests installing their own
+        // thread-local subscribers can make the debug record itself racy.
+        assert!(
+            events
+                .iter()
+                .all(|(level, _)| *level > tracing::Level::WARN),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Launcher for ghagent-mcp. `make install` copies this next to ghagent_mcp.py
+# and the installed copy resolves the server relative to itself.
+exec python3 -I "$(dirname "$(readlink -f "$0")")/../share/ghagent-mcp/ghagent_mcp.py" "$@"

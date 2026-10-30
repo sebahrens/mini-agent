@@ -123,6 +123,10 @@ impl RewindPicker {
         self.list.set_monochrome(monochrome);
     }
 
+    pub fn set_accent_color(&mut self, accent: Option<crossterm::style::Color>) {
+        self.list.set_accent_color(accent);
+    }
+
     pub fn activate(&mut self) {
         self.active = true;
         self.stage = Stage::PickMessage;

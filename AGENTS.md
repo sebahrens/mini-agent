@@ -149,6 +149,7 @@ bd close <id>         # Complete work
 3. **Update issue status** - Close finished work, update in-progress items
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
+   bd export --output .beads/issues.jsonl
    git pull --rebase
    bd dolt push
    git push

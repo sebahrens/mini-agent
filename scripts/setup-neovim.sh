@@ -13,7 +13,7 @@ set -euo pipefail
 SKIP_MINI_AGENT=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-mini-agent|--skip-zerostack)
+        --skip-mini-agent)
             SKIP_MINI_AGENT=true
             shift
             ;;
@@ -157,10 +157,10 @@ return {
                     opts = {
                         show_presets = false,
                     },
-                    zerostack = function()
+                    ["mini-agent"] = function()
                         return {
-                            name = "zerostack",
-                            formatted_name = "Zerostack",
+                            name = "mini-agent",
+                            formatted_name = "mini-agent",
                             type = "acp",
                             roles = {
                                 llm = "assistant",
@@ -208,7 +208,7 @@ return {
             },
             interactions = {
                 chat = {
-                    adapter = "zerostack",
+                    adapter = "mini-agent",
                 },
             },
             display = {
@@ -232,7 +232,7 @@ echo ""
 echo "Next steps:"
 echo "  1. Launch neovim and let lazy.nvim install plugins"
 echo "  2. Open a chat with: <leader>cc (default: \\cc)"
-echo "  3. Select the 'zerostack' adapter in the chat buffer"
+echo "  3. Select the 'mini-agent' adapter in the chat buffer"
 echo ""
 echo "Ensure mini-agent is built with ACP support:"
 echo "  cargo install --path . --debug"

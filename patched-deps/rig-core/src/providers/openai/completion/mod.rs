@@ -1387,6 +1387,11 @@ pub struct CompletionModelOptions {
     pub tool_result_array_content: bool,
     /// Whether the model requested provider-specific prompt caching markers.
     pub prompt_caching: bool,
+    /// Whether a requested one-hour cache TTL should be stamped onto
+    /// `prompt_caching`'s markers instead of the provider's default (five
+    /// minutes for Anthropic-style `cache_control`). Ignored when
+    /// `prompt_caching` is false.
+    pub prompt_caching_ttl_1h: bool,
 }
 
 /// Contract for provider extensions that speak the OpenAI Chat Completions wire
@@ -1526,6 +1531,24 @@ impl OpenAICompatibleProvider for super::OpenAICompletionsExt {
 
     type StreamingUsage = Usage;
     type Response = CompletionResponse;
+
+    /// Applies Anthropic-style `cache_control` breakpoints (system prompt,
+    /// last tool definition, conversation tail) when the model opted in via
+    /// [`GenericCompletionModel::with_prompt_caching`]. Intended for
+    /// OpenAI-compatible gateways that front a Claude model (e.g. a
+    /// LiteLLM/Bedrock proxy) and pass such markers through to the native
+    /// Anthropic request; a gateway that does not recognize the field simply
+    /// ignores it.
+    fn finalize_request_body_with_options(
+        &self,
+        body: &mut serde_json::Value,
+        options: CompletionModelOptions,
+    ) -> Result<(), CompletionError> {
+        if options.prompt_caching {
+            apply_claude_prompt_caching(body, options.prompt_caching_ttl_1h);
+        }
+        Ok(())
+    }
 }
 
 /// A chat-completions model over any [`OpenAICompatibleProvider`] extension.
@@ -1538,6 +1561,7 @@ pub struct GenericCompletionModel<Ext = super::OpenAICompletionsExt, H = reqwest
     pub(crate) strict_tools: bool,
     pub(crate) tool_result_array_content: bool,
     pub(crate) prompt_caching: bool,
+    pub(crate) prompt_caching_ttl_1h: bool,
 }
 
 /// The completion model struct for OpenAI's Chat Completions API.
@@ -1559,6 +1583,7 @@ where
             strict_tools: false,
             tool_result_array_content: false,
             prompt_caching: false,
+            prompt_caching_ttl_1h: false,
         }
     }
 
@@ -1578,6 +1603,123 @@ where
     pub fn with_tool_result_array_content(mut self) -> Self {
         self.tool_result_array_content = true;
         self
+    }
+}
+
+impl<H> GenericCompletionModel<super::OpenAICompletionsExt, H>
+where
+    crate::client::Client<super::OpenAICompletionsExt, H>: std::fmt::Debug + Clone + 'static,
+{
+    /// Enable Anthropic-style `cache_control` prompt-caching markers on the
+    /// system prompt, the last tool definition, and the conversation tail
+    /// (the second-to-last message, advancing one position per call so the
+    /// previously-sent prefix of a growing conversation stays a cache hit).
+    /// Intended for OpenAI-compatible gateways that front a Claude model.
+    /// Uses the provider's default cache TTL (five minutes); see
+    /// [`with_prompt_caching_1h`](Self::with_prompt_caching_1h) for a
+    /// one-hour TTL.
+    pub fn with_prompt_caching(mut self) -> Self {
+        self.prompt_caching = true;
+        self
+    }
+
+    /// Identical to [`with_prompt_caching`](Self::with_prompt_caching) but
+    /// requests a one-hour cache TTL (`{"type": "ephemeral", "ttl": "1h"}`)
+    /// instead of the default five minutes.
+    pub fn with_prompt_caching_1h(mut self) -> Self {
+        self.prompt_caching = true;
+        self.prompt_caching_ttl_1h = true;
+        self
+    }
+}
+
+/// Builds the Anthropic-style `cache_control` value for a breakpoint: the
+/// default ephemeral marker, or one carrying an explicit one-hour TTL.
+fn claude_cache_control(ttl_1h: bool) -> serde_json::Value {
+    if ttl_1h {
+        serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        serde_json::json!({ "type": "ephemeral" })
+    }
+}
+
+/// Marks the last content block of a chat message with a `cache_control`
+/// breakpoint, converting a bare string `content` into a single-element text
+/// block first so the breakpoint has somewhere to attach. A no-op when
+/// `content` is absent, not a string/array, or an array whose last element is
+/// not a JSON object.
+fn mark_message_cache_boundary(message: &mut serde_json::Value, cache_control: &serde_json::Value) {
+    let Some(obj) = message.as_object_mut() else {
+        return;
+    };
+    match obj.get("content").cloned() {
+        Some(serde_json::Value::String(s)) => {
+            obj.insert(
+                "content".to_string(),
+                serde_json::json!([{
+                    "type": "text",
+                    "text": s,
+                    "cache_control": cache_control
+                }]),
+            );
+        }
+        Some(serde_json::Value::Array(mut arr)) => {
+            if let Some(last) = arr.last_mut()
+                && let Some(last_obj) = last.as_object_mut()
+            {
+                last_obj.insert("cache_control".to_string(), cache_control.clone());
+            }
+            obj.insert("content".to_string(), serde_json::Value::Array(arr));
+        }
+        _ => {}
+    }
+}
+
+/// Applies Anthropic-style `cache_control` breakpoints to an already
+/// serialized OpenAI-compatible chat-completions request body: the last tool
+/// definition (if any tools are present), the system message, and the
+/// conversation tail.
+///
+/// The tail breakpoint marks the second-to-last message in `messages` (not
+/// the last, which is this turn's new content and would otherwise be billed
+/// as a cache write with no future reuse). Anthropic's prefix-based cache
+/// matching means this breakpoint's position simply advances by one message
+/// each call, so everything sent on a prior call stays a cache hit and only
+/// the newest increment is uncached — the same amortized effect as
+/// Anthropic's native "automatic caching" mode, without relying on a
+/// gateway-specific beta header this OpenAI-compatible wire format has no
+/// room for.
+///
+/// Byte-stable: every change here adds a `cache_control` key or restructures
+/// `content` from a string into a single-element array carrying the exact
+/// same text; no existing text is altered.
+fn apply_claude_prompt_caching(body: &mut serde_json::Value, ttl_1h: bool) {
+    let cache_control = claude_cache_control(ttl_1h);
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+
+    if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_array_mut())
+        && let Some(last_tool) = tools.last_mut()
+        && let Some(tool_obj) = last_tool.as_object_mut()
+    {
+        tool_obj.insert("cache_control".to_string(), cache_control.clone());
+    }
+
+    let Some(messages) = obj.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    if let Some(system_msg) = messages
+        .iter_mut()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
+    {
+        mark_message_cache_boundary(system_msg, &cache_control);
+    }
+
+    let len = messages.len();
+    if len >= 2 {
+        mark_message_cache_boundary(&mut messages[len - 2], &cache_control);
     }
 }
 
@@ -1963,6 +2105,7 @@ where
             strict_tools: self.strict_tools,
             tool_result_array_content: self.tool_result_array_content,
             prompt_caching: self.prompt_caching,
+            prompt_caching_ttl_1h: self.prompt_caching_ttl_1h,
         };
         let mut request = self.client.ext().build_completion_request(
             self.model.to_owned(),
@@ -2064,8 +2207,9 @@ where
 mod tests {
     use super::*;
     use crate::completion::CompletionRequestBuilder;
+    use crate::providers::openai::CompletionsClient;
     use crate::telemetry::ProviderResponseExt;
-    use crate::test_utils::MockCompletionModel;
+    use crate::test_utils::{MockCompletionModel, RecordingHttpClient};
     use std::collections::HashMap;
 
     fn test_document(id: &str, text: &str) -> crate::completion::Document {
@@ -2108,7 +2252,14 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(
-                response.usage.as_ref().unwrap().prompt_tokens_details.as_ref().unwrap().cache_write_tokens as u64,
+                response
+                    .usage
+                    .as_ref()
+                    .unwrap()
+                    .prompt_tokens_details
+                    .as_ref()
+                    .unwrap()
+                    .cache_write_tokens as u64,
                 expected_write,
             );
             let converted: completion::CompletionResponse<CompletionResponse> =
@@ -3177,5 +3328,231 @@ mod tests {
             .expect("raw body should be valid JSON")
             .expect("parsed JSON should be present");
         assert_eq!(json["error"]["type"], "rate_limit_error");
+    }
+
+    fn minimal_chat_completion_response() -> String {
+        serde_json::json!({
+            "id": "fixture",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "fixture",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop",
+                "logprobs": null
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string()
+    }
+
+    fn claude_cache_test_request(
+        model: &super::CompletionModel<RecordingHttpClient>,
+    ) -> CompletionRequest {
+        model
+            .completion_request("new turn")
+            .preamble("You are a careful agent.".to_string())
+            .message(message::Message::user("earlier turn"))
+            .message(message::Message::assistant("earlier reply"))
+            .tool(completion::ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            })
+            .build()
+    }
+
+    #[tokio::test]
+    async fn claude_prompt_caching_marks_system_tools_and_tail() {
+        let http_client = RecordingHttpClient::new(minimal_chat_completion_response());
+        let client = CompletionsClient::builder()
+            .api_key("test-key")
+            .base_url("https://gateway.example/v1")
+            .http_client(http_client.clone())
+            .build()
+            .expect("build client");
+        let model = client
+            .completion_model("bedrock.anthropic.claude-sonnet-5-5")
+            .with_prompt_caching();
+        let request = claude_cache_test_request(&model);
+
+        model
+            .completion(request)
+            .await
+            .expect("completion should succeed");
+
+        let requests = http_client.requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body should be JSON");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        let system = messages
+            .iter()
+            .find(|m| m["role"] == "system")
+            .expect("system message present");
+        let system_blocks = system["content"].as_array().expect("array content");
+        assert_eq!(
+            system_blocks.last().unwrap()["cache_control"],
+            serde_json::json!({ "type": "ephemeral" })
+        );
+
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(
+            tools.last().unwrap()["cache_control"],
+            serde_json::json!({ "type": "ephemeral" })
+        );
+
+        // Tail breakpoint: the second-to-last message (the end of the prior
+        // turn), not the brand-new last message, which must stay unmarked.
+        let len = messages.len();
+        assert!(len >= 2);
+        let tail_blocks = messages[len - 2]["content"]
+            .as_array()
+            .expect("array content");
+        assert_eq!(
+            tail_blocks.last().unwrap()["cache_control"],
+            serde_json::json!({ "type": "ephemeral" })
+        );
+        assert!(
+            !serde_json::to_string(&messages[len - 1])
+                .unwrap()
+                .contains("cache_control"),
+            "the newest message must not carry a cache breakpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_prompt_caching_1h_sets_ttl_marker() {
+        let http_client = RecordingHttpClient::new(minimal_chat_completion_response());
+        let client = CompletionsClient::builder()
+            .api_key("test-key")
+            .base_url("https://gateway.example/v1")
+            .http_client(http_client.clone())
+            .build()
+            .expect("build client");
+        let model = client
+            .completion_model("bedrock.anthropic.claude-sonnet-5-5")
+            .with_prompt_caching_1h();
+        let request = claude_cache_test_request(&model);
+
+        model
+            .completion(request)
+            .await
+            .expect("completion should succeed");
+
+        let requests = http_client.requests();
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body should be JSON");
+        let messages = body["messages"].as_array().expect("messages array");
+        let system = messages
+            .iter()
+            .find(|m| m["role"] == "system")
+            .expect("system message present");
+        assert_eq!(
+            system["content"].as_array().unwrap().last().unwrap()["cache_control"],
+            serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_prompt_caching_off_by_default_leaves_body_unmarked() {
+        let http_client = RecordingHttpClient::new(minimal_chat_completion_response());
+        let client = CompletionsClient::builder()
+            .api_key("test-key")
+            .base_url("https://gateway.example/v1")
+            .http_client(http_client.clone())
+            .build()
+            .expect("build client");
+        // No `.with_prompt_caching()` call: this mirrors a plain OpenAI-
+        // compatible model, which must see no behavioral change.
+        let model = client.completion_model("bedrock.anthropic.claude-sonnet-5-5");
+        let request = claude_cache_test_request(&model);
+
+        model
+            .completion(request)
+            .await
+            .expect("completion should succeed");
+
+        let requests = http_client.requests();
+        let body_text = String::from_utf8_lossy(&requests[0].body);
+        assert!(!body_text.contains("cache_control"));
+    }
+
+    #[test]
+    fn apply_claude_prompt_caching_string_system_message_converts_to_block() {
+        let mut body = serde_json::json!({
+            "model": "claude-test",
+            "messages": [
+                {"role": "system", "content": "be helpful"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        apply_claude_prompt_caching(&mut body, false);
+        assert_eq!(
+            body["messages"][0]["content"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "be helpful",
+                "cache_control": { "type": "ephemeral" }
+            }])
+        );
+    }
+
+    #[test]
+    fn apply_claude_prompt_caching_preserves_non_text_blocks() {
+        let mut body = serde_json::json!({
+            "model": "claude-test",
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"}
+                ]},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        apply_claude_prompt_caching(&mut body, false);
+        assert_eq!(body["messages"][0]["content"][0]["text"], "part one");
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["cache_control"],
+            serde_json::json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn apply_claude_prompt_caching_no_system_message_is_noop_for_system_breakpoint() {
+        let mut body = serde_json::json!({
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let before = body.clone();
+        apply_claude_prompt_caching(&mut body, false);
+        // A single-message conversation has no distinct tail message either
+        // (len < 2), so the body is left byte-identical.
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn apply_claude_prompt_caching_marks_last_tool_only() {
+        let mut body = serde_json::json!({
+            "model": "claude-test",
+            "tools": [
+                {"type": "function", "function": {"name": "a"}},
+                {"type": "function", "function": {"name": "b"}}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        apply_claude_prompt_caching(&mut body, false);
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            serde_json::json!({ "type": "ephemeral" })
+        );
     }
 }

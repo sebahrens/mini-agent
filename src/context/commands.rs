@@ -513,7 +513,7 @@ mod tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
-            project_dir: Some(root.join(".zerostack")),
+            project_dir: Some(root.join(".mini-agent")),
         }
     }
 
@@ -694,7 +694,7 @@ mod tests {
             paths.config_dir.join("commands"),
             root.path().join(".claude/commands"),
             root.path().join(".mini-agent/commands"),
-            root.path().join(".zerostack"),
+            root.path().join(".mini-agent"),
         ] {
             std::fs::create_dir_all(directory).unwrap();
         }
@@ -770,7 +770,7 @@ mod tests {
         let root = crate::tests::OwnedTestDirectory::new("command-trust-file-authority");
         let paths = paths(root.path());
         crate::paths::prepare_storage_roots(&paths).unwrap();
-        std::fs::create_dir_all(root.path().join(".zerostack")).unwrap();
+        std::fs::create_dir_all(root.path().join(".mini-agent")).unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, "default_prompt = 'code'\n").unwrap();
         crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
@@ -854,7 +854,7 @@ mod tests {
             .unwrap(),
         );
         assert!(load_for_paths(&paths, &workspace).is_empty());
-        std::fs::create_dir_all(workspace_dir.join(".zerostack")).unwrap();
+        std::fs::create_dir_all(workspace_dir.join(".mini-agent")).unwrap();
         let config = paths.project_config_file().unwrap();
         std::fs::write(&config, "default_prompt = 'code'\n").unwrap();
         crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())

@@ -94,11 +94,30 @@ fn wildcard_matcher_matches_every_tool() {
 
 #[test]
 fn name_list_matcher_matches_after_normalization() {
-    // "Edit|Write" is CC-style names; the model calls zerostack's "write" tool.
+    // "Edit|Write" is CC-style names; the model calls mini-agent's "write" tool.
     let config = config_with("PreToolUse", Some("Edit|Write"), vec![handler("true")]);
     let dispatcher = HookDispatcher::from_config(&config).unwrap();
     assert!(!dispatcher.handlers_for("PreToolUse", "write").is_empty());
     assert!(dispatcher.handlers_for("PreToolUse", "bash").is_empty());
+}
+
+#[test]
+fn anchored_regex_matcher_canonicalizes_claude_tool_names() {
+    let config = config_with(
+        "PreToolUse",
+        Some("^(Bash|Write|Glob)$"),
+        vec![handler("true")],
+    );
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+
+    for name in ["bash", "write", "find_files"] {
+        assert_eq!(
+            dispatcher.handlers_for("PreToolUse", name).len(),
+            1,
+            "{name}"
+        );
+    }
+    assert!(dispatcher.handlers_for("PreToolUse", "read").is_empty());
 }
 
 #[test]
@@ -169,7 +188,7 @@ fn same_executable_with_distinct_arguments_is_not_deduplicated() {
 #[tokio::test]
 async fn dispatch_returns_continue_without_running_anything_when_no_handler_matches() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-dispatch-nomatch-{}",
+        "mini-agent-hooks-dispatch-nomatch-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
@@ -386,7 +405,7 @@ async fn dispatch_generic_blocks_on_decision_block_json() {
 #[tokio::test]
 async fn dispatch_starts_async_handlers_without_waiting_and_ignores_their_decisions() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-async-complete-{}",
+        "mini-agent-hooks-async-complete-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
@@ -702,7 +721,7 @@ async fn async_hook_cancellation_fixture_settles_readiness_failures() {
 #[tokio::test]
 async fn dispatch_post_tool_use_failure_runs_but_cannot_change_outcome() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-posttooluse-failure-{}",
+        "mini-agent-hooks-posttooluse-failure-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
@@ -777,8 +796,8 @@ async fn if_condition_broken_command_fails_closed_and_runs_anyway() {
 #[tokio::test]
 async fn condition_and_handler_share_explicit_environment_and_project_cwd() {
     let mut configured = handler_with_condition(
-        r#"test "$HOOK_POLICY" = expected && test "$PWD" = "$ZEROSTACK_PROJECT_DIR" && echo '{"permissionDecision":"deny"}'"#,
-        r#"test "$HOOK_POLICY" = expected && test "$PWD" = "$ZEROSTACK_PROJECT_DIR""#,
+        r#"test "$HOOK_POLICY" = expected && test "$PWD" = "$MINI_AGENT_PROJECT_DIR" && echo '{"permissionDecision":"deny"}'"#,
+        r#"test "$HOOK_POLICY" = expected && test "$PWD" = "$MINI_AGENT_PROJECT_DIR""#,
     );
     configured
         .env
@@ -796,7 +815,7 @@ async fn condition_and_handler_share_explicit_environment_and_project_cwd() {
 #[tokio::test]
 async fn unavailable_required_sandbox_denies_condition_and_handler_before_launch() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-policy-denied-{}",
+        "mini-agent-hooks-policy-denied-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
@@ -821,7 +840,7 @@ async fn unavailable_required_sandbox_denies_condition_and_handler_before_launch
 #[tokio::test]
 async fn once_policy_denial_is_retried_instead_of_consumed() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-once-policy-denied-{}",
+        "mini-agent-hooks-once-policy-denied-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
@@ -844,11 +863,11 @@ async fn once_policy_denial_is_retried_instead_of_consumed() {
 #[tokio::test]
 async fn false_condition_does_not_consume_once_binding() {
     let condition_marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-once-condition-{}",
+        "mini-agent-hooks-once-condition-{}",
         std::process::id()
     ));
     let output_marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-once-condition-output-{}",
+        "mini-agent-hooks-once-condition-output-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&condition_marker);
@@ -879,15 +898,17 @@ async fn false_condition_does_not_consume_once_binding() {
 
 #[tokio::test]
 async fn immutable_policy_root_prevents_cwd_retargeting() {
-    let base =
-        std::env::temp_dir().join(format!("zerostack-hooks-bound-root-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "mini-agent-hooks-bound-root-{}",
+        std::process::id()
+    ));
     let project_a = base.join("a");
     let project_b = base.join("b");
     std::fs::create_dir_all(&project_a).unwrap();
     std::fs::create_dir_all(&project_b).unwrap();
     let marker_a = project_a.join("ran");
     let marker_b = project_b.join("ran");
-    let command = r#"test "$PWD" = "$ZEROSTACK_PROJECT_DIR" && touch ran"#;
+    let command = r#"test "$PWD" = "$MINI_AGENT_PROJECT_DIR" && touch ran"#;
     let config = config_with("PreToolUse", None, vec![handler(command)]);
     let dispatcher =
         HookDispatcher::from_config_with_backend_and_root(&config, "unused", &project_a).unwrap();
@@ -906,7 +927,7 @@ async fn immutable_policy_root_prevents_cwd_retargeting() {
 #[tokio::test]
 async fn failed_execution_root_rebind_is_sticky_until_an_explicit_valid_rebind() {
     let base = std::env::temp_dir().join(format!(
-        "zerostack-hooks-sticky-invalid-root-{}",
+        "mini-agent-hooks-sticky-invalid-root-{}",
         uuid::Uuid::new_v4()
     ));
     let initial = base.join("initial");
@@ -939,7 +960,7 @@ async fn failed_execution_root_rebind_is_sticky_until_an_explicit_valid_rebind()
 #[tokio::test]
 async fn rebind_during_condition_invalidates_handler_launch_lease() {
     let base = std::env::temp_dir().join(format!(
-        "zerostack-hooks-concurrent-rebind-{}",
+        "mini-agent-hooks-concurrent-rebind-{}",
         uuid::Uuid::new_v4()
     ));
     let initial = base.join("initial");
@@ -995,7 +1016,7 @@ async fn rebind_during_condition_invalidates_handler_launch_lease() {
 #[tokio::test]
 async fn directory_identity_replacement_after_condition_denies_handler_launch() {
     let base = std::env::temp_dir().join(format!(
-        "zerostack-hooks-root-replacement-{}",
+        "mini-agent-hooks-root-replacement-{}",
         uuid::Uuid::new_v4()
     ));
     let selected = base.join("selected");
@@ -1050,7 +1071,7 @@ async fn directory_identity_replacement_after_condition_denies_handler_launch() 
 #[tokio::test]
 async fn once_identity_keeps_distinct_argv_and_environment_bindings_independent() {
     let marker = std::env::temp_dir().join(format!(
-        "zerostack-hooks-once-policy-{}",
+        "mini-agent-hooks-once-policy-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
@@ -1090,7 +1111,7 @@ async fn once_identity_keeps_distinct_argv_and_environment_bindings_independent(
 
 #[tokio::test]
 async fn once_handler_runs_on_first_dispatch_and_is_skipped_on_second() {
-    let marker = std::env::temp_dir().join(format!("zerostack-hooks-once-{}", std::process::id()));
+    let marker = std::env::temp_dir().join(format!("mini-agent-hooks-once-{}", std::process::id()));
     let _ = std::fs::remove_file(&marker);
     let cmd = format!("printf x >> {}", marker.display());
     let config = config_with("PreToolUse", None, vec![handler_once(&cmd)]);
@@ -1120,7 +1141,7 @@ async fn turn_scoped_hook_root_overrides_the_shared_execution_root() {
     let project_b = base.join("b");
     std::fs::create_dir_all(&project_a).unwrap();
     std::fs::create_dir_all(&project_b).unwrap();
-    let command = r#"test "$PWD" = "$ZEROSTACK_PROJECT_DIR" && touch ran"#;
+    let command = r#"test "$PWD" = "$MINI_AGENT_PROJECT_DIR" && touch ran"#;
     let config = config_with("PreToolUse", None, vec![handler(command)]);
     let dispatcher =
         HookDispatcher::from_config_with_backend_and_root(&config, "unused", &project_a).unwrap();
@@ -1163,4 +1184,37 @@ async fn turn_scoped_hook_root_overrides_the_shared_execution_root() {
     assert_eq!(in_a.verdict, Verdict::Defer);
     assert!(project_a.join("ran").exists());
     let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn regex_matchers_canonicalize_builtin_names_but_keep_mcp_names_literal() {
+    let config = HashMap::from([(
+        "PreToolUse".to_string(),
+        vec![
+            HookGroup {
+                matcher: Some("^(Glob|ReadFile)$".into()),
+                hooks: vec![handler("true")],
+            },
+            HookGroup {
+                matcher: Some("^mcp__Alpha[.]Space__SearchValue$|^Glob$".into()),
+                hooks: vec![handler("false")],
+            },
+        ],
+    )]);
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    // Built-in aliases still reach their canonical tool names.
+    assert_eq!(dispatcher.handlers_for("PreToolUse", "find_files").len(), 2);
+    assert_eq!(dispatcher.handlers_for("PreToolUse", "read_file").len(), 1);
+    // MCP provenance is matched exactly, without snake-casing its segments.
+    assert_eq!(
+        dispatcher
+            .handlers_for("PreToolUse", "mcp__Alpha.Space__SearchValue")
+            .len(),
+        1
+    );
+    assert!(
+        dispatcher
+            .handlers_for("PreToolUse", "mcp__alpha.space__search_value")
+            .is_empty()
+    );
 }

@@ -58,7 +58,7 @@ impl<'de> Deserialize<'de> for McpDefer {
     }
 }
 
-/// Immutable identity for an MCP server registered by zerostack itself.
+/// Immutable identity for an MCP server registered by mini-agent itself.
 ///
 /// Its value is opaque outside this module, its constructors are crate-private,
 /// and the corresponding config variant is skipped by serde, so user
@@ -217,6 +217,18 @@ pub struct OAuthSettings {
     /// Loopback port for the redirect URI. Defaults to [`DEFAULT_REDIRECT_PORT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect_port: Option<u16>,
+    /// Host spelling used in the registered redirect URI. The listener still
+    /// binds only to IPv4 loopback. Defaults to `127.0.0.1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_host: Option<OAuthRedirectHost>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum OAuthRedirectHost {
+    #[serde(rename = "127.0.0.1")]
+    Ipv4Loopback,
+    #[serde(rename = "localhost")]
+    Localhost,
 }
 
 pub const DEFAULT_REDIRECT_PORT: u16 = 8970;
@@ -238,7 +250,14 @@ impl OAuthSettings {
     }
 
     pub fn redirect_uri(&self) -> String {
-        format!("http://127.0.0.1:{}/callback", self.redirect_port())
+        let host = match self
+            .redirect_host
+            .unwrap_or(OAuthRedirectHost::Ipv4Loopback)
+        {
+            OAuthRedirectHost::Ipv4Loopback => "127.0.0.1",
+            OAuthRedirectHost::Localhost => "localhost",
+        };
+        format!("http://{host}:{}/callback", self.redirect_port())
     }
 }
 

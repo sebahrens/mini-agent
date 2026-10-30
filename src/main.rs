@@ -42,6 +42,9 @@ use anyhow::Context;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
+#[cfg(feature = "multithread")]
+const ASYNC_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 fn main() -> anyhow::Result<ExitCode> {
     #[cfg(target_os = "windows")]
     if let Some(exit_code) = sandbox::windows::maybe_run_from_args() {
@@ -153,7 +156,14 @@ fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     #[cfg(feature = "multithread")]
     let mut builder = {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder.worker_threads(4);
+        // Debug all-features builds retain substantially larger provider and
+        // tool futures than optimized builds. Tokio's implicit worker-stack
+        // default is too small for those futures on WSL, so make the same
+        // cross-platform budget used by the test matrix part of the runtime
+        // contract instead of relying on an ambient RUST_MIN_STACK.
+        builder
+            .worker_threads(4)
+            .thread_stack_size(ASYNC_WORKER_STACK_SIZE);
         builder
     };
     #[cfg(not(feature = "multithread"))]
@@ -253,6 +263,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         git::global_snapshot::wait_initialized().await;
         let mut cfg = config::load_for_diagnostics_in_workspace(&app_paths, &workspace);
         config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
+        context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
         let mut report =
             diagnostics::DoctorReport::capture(&cli, &cfg, &app_paths, None, None, true);
         report.section("Terminal");
@@ -355,6 +366,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
 
     let (mut cfg, is_first_startup) =
         config::load_in_workspace(&app_paths, &workspace, is_interactive);
+    context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
 
     // Headless and ACP runs never prompt: personas stay inert, so say so once.
     if !is_interactive && let Some(notice) = context::agents::untrusted_personas_notice(&workspace)
@@ -364,8 +376,34 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
 
     let loaded_warning_count = cfg.load_warnings.len();
     config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
+    context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
     for warning in &cfg.load_warnings[loaded_warning_count..] {
         eprintln!("warning: {warning}");
+    }
+
+    #[cfg(feature = "git-worktree")]
+    if cli.git_runtime_check {
+        // The Git tool reads the startup-frozen global Git snapshot.
+        git::global_snapshot::wait_initialized().await;
+        let backend = cli.resolve_sandbox_backend(&cfg);
+        let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg), &backend)
+            .with_general_profile(
+                cli.resolve_sandbox_profile(&cfg),
+                cfg.sandbox_read_roots.clone(),
+                cfg.sandbox_write_roots.clone(),
+            )
+            .with_windows_appcontainer_roots(
+                cli.resolve_windows_appcontainer_read_roots(&cfg),
+                cli.resolve_windows_appcontainer_write_roots(&cfg),
+            )
+            .with_bwrap_read_roots(cli.resolve_sandbox_toolchain_roots(&cfg))
+            .with_workspace_binding(workspace.clone());
+        let verification =
+            startup::heap_future(|| git::tool::GitTool::verify_runtime(workspace, sandbox))
+                .await
+                .map_err(anyhow::Error::msg)?;
+        println!("Git runtime check: PASS ({})", verification["operation"]);
+        return Ok(());
     }
 
     // Learned-skill operator commands may launch contained workers.
@@ -606,13 +644,17 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         .await?,
     );
 
-    // ACP mode skips feature initialization, so validate the shared process
-    // sandbox contract before entering either execution surface.
+    // ACP mode skips the remaining feature initialization, so validate the
+    // shared process sandbox contract before entering either execution surface.
     startup.preflight_startup_capabilities()?;
 
     // ACP mode: serve and exit before feature init
     #[cfg(feature = "acp")]
     if startup.cli.acp_enabled {
+        // ACP builds agents lazily per session, but the task tool's immutable
+        // provider/model runtime must exist before ACP advertises or serves it.
+        #[cfg(feature = "subagents")]
+        startup.init_subagents();
         #[cfg(feature = "js")]
         let probe = startup.take_worker_probe();
         let result =

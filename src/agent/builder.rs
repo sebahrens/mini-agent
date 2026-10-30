@@ -34,6 +34,21 @@ fn registered_shell_capability<'a>(
     sandbox.shell_capability()
 }
 
+#[cfg(all(test, feature = "subagents"))]
+mod subagent_registration_tests {
+    use super::should_register_task_tool;
+
+    #[test]
+    fn task_registration_requires_enablement_and_initialized_runtime() {
+        assert!(should_register_task_tool(None, true));
+        assert!(should_register_task_tool(Some(true), true));
+        assert!(!should_register_task_tool(Some(false), true));
+        assert!(!should_register_task_tool(None, false));
+        assert!(!should_register_task_tool(Some(true), false));
+        assert!(!should_register_task_tool(Some(false), false));
+    }
+}
+
 #[cfg(any(feature = "mcp", all(test, feature = "goal", feature = "js")))]
 fn is_reserved_builtin_tool_name(name: &str) -> bool {
     matches!(
@@ -630,7 +645,7 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
     #[cfg(feature = "agent-skills")]
     names.push("skills_search");
     #[cfg(feature = "subagents")]
-    if cfg.task_enabled.unwrap_or(true) {
+    if task_tool_available(cfg) {
         names.push("task");
     }
     #[cfg(feature = "memory")]
@@ -652,6 +667,16 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         }
     });
     names
+}
+
+#[cfg(feature = "subagents")]
+fn task_tool_available(cfg: &Config) -> bool {
+    should_register_task_tool(cfg.task_enabled, crate::extras::subagents::is_initialized())
+}
+
+#[cfg(feature = "subagents")]
+fn should_register_task_tool(task_enabled: Option<bool>, runtime_initialized: bool) -> bool {
+    task_enabled.unwrap_or(true) && runtime_initialized
 }
 
 /// Capture the exact current composition alongside its cold token estimate.
@@ -788,6 +813,17 @@ fn register_js_tool_with_status(
         return;
     }
 
+    if cfg.js_fetch_origins.is_none() {
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            tracing::warn!(
+                "JavaScript fetch() is not narrowed by origin because js-fetch-origins is unset; \
+                 set js-fetch-origins to \"none\" or a list of exact origins such as \
+                 [\"https://docs.rs\"] to restrict it (\"all\" keeps this behaviour silently)"
+            );
+        });
+    }
+
     let startup_base = workspace_root.to_path_buf();
     let allow_config = AllowConfig::from_settings(
         &startup_base,
@@ -799,7 +835,9 @@ fn register_js_tool_with_status(
     )
     .with_workspace_binding(workspace.clone())
     .with_fetch_settings(
-        cfg.js_fetch_origins.as_deref(),
+        cfg.js_fetch_origins
+            .as_ref()
+            .and_then(crate::config::JsFetchOrigins::as_policy_origins),
         cfg.js_fetch_allow_http.unwrap_or(false),
     );
     #[cfg(feature = "skills")]
@@ -1151,7 +1189,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let mut catalogue_fingerprint = sha2::Sha256::new();
 
         #[cfg(feature = "subagents")]
-        if cfg.task_enabled.unwrap_or(true) {
+        if task_tool_available(cfg) {
             use crate::extras::subagents::task_tool::TaskTool;
             let task_tool = TaskTool::new(
                 permission.clone(),
@@ -1219,6 +1257,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     workspace.clone(),
                 ),
             ));
+        }
+        #[cfg(feature = "subagents")]
+        if cfg.task_enabled.unwrap_or(true) && !crate::extras::subagents::is_initialized() {
+            tracing::warn!("task tool unavailable because the subagent runtime is not initialized");
         }
 
         #[cfg(feature = "memory")]
@@ -1444,6 +1486,11 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                         native_declarations = view.definitions();
                     }
                     eager.extend(view.initially_active());
+                    context
+                        .mcp_discovery
+                        .register_view(tool_output_session_id, &view);
+                    search_binding
+                        .follow_session(context.mcp_discovery.clone(), tool_output_session_id);
                     search_binding
                         .set_view(view)
                         .expect("new per-build MCP search binding");
@@ -1842,19 +1889,19 @@ mod extra_file_tests {
     ) -> crate::tests::ScopedProcessEnv {
         crate::tests::ScopedProcessEnv::set(&[
             (
-                "ZS_CONFIG_DIR",
+                "MINI_AGENT_CONFIG_DIR",
                 Some(owned.path().join("config").into_os_string()),
             ),
             (
-                "ZS_STATE_DIR",
+                "MINI_AGENT_STATE_DIR",
                 Some(owned.path().join("state").into_os_string()),
             ),
             (
-                "ZS_DATA_DIR",
+                "MINI_AGENT_DATA_DIR",
                 Some(owned.path().join("data").into_os_string()),
             ),
             (
-                "ZS_CACHE_DIR",
+                "MINI_AGENT_CACHE_DIR",
                 Some(owned.path().join("cache").into_os_string()),
             ),
         ])
@@ -2276,6 +2323,9 @@ mod extra_file_tests {
 
     #[test]
     fn headless_preamble_replaces_the_interactive_response_contract() {
+        // Isolate the config dir: a user's real SUFFIX.md may legitimately say "ask the user".
+        let owned = crate::tests::OwnedTestDirectory::new("headless-preamble-contract");
+        let _environment = workspace_preamble_environment(&owned);
         let context = empty_ctx();
         let interactive = super::build_preamble_for_workspace(
             &context,
@@ -2760,12 +2810,12 @@ mod js_tests {
     fn cache71_memory_changes_leave_static_preamble_and_ranges_unchanged() {
         let roots = crate::tests::OwnedTestDirectory::new("cache71-memory-prefix");
         let bindings = [
-            "ZS_CONFIG_DIR",
-            "ZS_DATA_DIR",
-            "ZS_LOCAL_DATA_DIR",
-            "ZS_STATE_DIR",
-            "ZS_CACHE_DIR",
-            "ZS_CREDENTIALS_DIR",
+            "MINI_AGENT_CONFIG_DIR",
+            "MINI_AGENT_DATA_DIR",
+            "MINI_AGENT_LOCAL_DATA_DIR",
+            "MINI_AGENT_STATE_DIR",
+            "MINI_AGENT_CACHE_DIR",
+            "MINI_AGENT_CREDENTIALS_DIR",
         ]
         .map(|name| (name, Some(roots.path().join(name).into_os_string())));
         let _environment = crate::tests::ScopedProcessEnv::set(&bindings);
