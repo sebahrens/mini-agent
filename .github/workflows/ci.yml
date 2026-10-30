@@ -1883,6 +1883,12 @@ jobs:
           }
           $required = @(
             'general_preflight_cache_retains_success_and_failure_without_reprobing',
+            'noninheriting_directory_ace_skips_propagation_and_inheritable_ace_keeps_it',
+            'parent_death_watchdog_terminates_a_blocked_helper',
+            'preflight_diagnostic_is_sanitized_and_bounded',
+            'preflight_recovery_accepts_exact_legacy_owner_only_root',
+            'preflight_root_authority_attests_exact_noninheriting_package_traversal',
+            'vanished_stale_journal_is_skipped_not_fatal',
             'preflight_diagnostics_bound_closed_timing_and_late_exit_categories',
             'preflight_diagnostics_cached_result_never_reprobes_or_emits_private_error_data',
             'control_root_authority_denies_ancestor_swap_after_attestation',
@@ -1908,8 +1914,8 @@ jobs:
           if ($nativeExit -ne 0) {
             throw "Native general-sandbox regressions failed with exit code $nativeExit"
           }
-          if (-not ($native -match '^test result: ok\. 40 passed; 0 failed; 0 ignored;')) {
-            throw 'Native general-sandbox regressions did not execute all forty tests'
+          if (-not ($native -match '^test result: ok\. 46 passed; 0 failed; 0 ignored;')) {
+            throw 'Native general-sandbox regressions did not execute all forty-six tests'
           }
           cargo test --locked atomic_write_tests -- --test-threads=1
           if ($LASTEXITCODE -ne 0) {

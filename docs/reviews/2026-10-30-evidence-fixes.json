@@ -37,12 +37,12 @@
     "minimal_affected_rust": "22 passed; strict minimal all-targets Clippy passed before final pressure refinement",
     "terminal_receipts": "1 passed after adding canonical receipt assertion",
     "pressure_refinement": "12 focused tests passed, including all new pressure/omission controls",
-    "ci_policy": "72 passed",
+    "ci_policy": "72 passed, including exact native Windows46-regression requirement and all six supplied regression names",
     "headless_acp": "6 ACP parity +53 headless tests passed",
     "strict_rich_clippy": "skills-enabled all-targets strict Clippy passed",
     "debug_install_native": "final skills-enabled debug install passed; installed binary native macOS JS runtime check PASS (2) with canonical per-user temporary home",
     "hosted_ci": "consolidated commit pending push/run",
     "strict_minimal_clippy": "final minimal all-targets strict Clippy passed after pressure refinement"
   },
-  "predecessor_ci": "41023420121 was superseded and cancelled. Linux/macOS parallel and all-features failures shared six raw-message expectations now corrected and locally passing. Linux native gate failed exact probe discovery (module name corrected); dependency, VSCode and Windows default compilation passed."
+  "predecessor_ci": "41023420121 was superseded and cancelled. Linux/macOS parallel and all-features failures shared six raw-message expectations now corrected and locally passing. Linux native gate failed exact probe discovery (module name corrected); dependency, VSCode and Windows default compilation passed. The first consolidated runs were superseded while queued after detecting the native Windows suite count had grown40->46; exact discovery/count guards were updated without disabling any test."
 }

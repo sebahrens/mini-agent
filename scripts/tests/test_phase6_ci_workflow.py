@@ -1835,10 +1835,16 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
         native = job.split("name: Test native general-sandbox policy and recovery", 1)[1].split("- name:", 1)[0]
         for item in [
             "preflight_diagnostics_bound_closed_timing_and_late_exit_categories",
+            "noninheriting_directory_ace_skips_propagation_and_inheritable_ace_keeps_it",
+            "parent_death_watchdog_terminates_a_blocked_helper",
+            "preflight_diagnostic_is_sanitized_and_bounded",
+            "preflight_recovery_accepts_exact_legacy_owner_only_root",
+            "preflight_root_authority_attests_exact_noninheriting_package_traversal",
+            "vanished_stale_journal_is_skipped_not_fatal",
             "preflight_diagnostics_cached_result_never_reprobes_or_emits_private_error_data",
             "timed_out_general_preflight_reaps_tree_and_removes_recovery_state",
             ".Count -ne 1", "$nativeExit = $LASTEXITCODE", "if ($nativeExit -ne 0)",
-            r"'^test result: ok\. 40 passed; 0 failed; 0 ignored;'",
+            r"'^test result: ok\. 46 passed; 0 failed; 0 ignored;'",
         ]:
             if item not in native:
                 raise AssertionError("missing native diagnostic execution guard: " + item)
@@ -1895,7 +1901,7 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
         for before, after in [
             ("preflight_diagnostics_bound_closed_timing_and_late_exit_categories", "missing_bound_test"),
             ("preflight_diagnostics_cached_result_never_reprobes_or_emits_private_error_data", "missing_cache_test"),
-            ("40 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 40 ignored;"),
+            ("46 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 46 ignored;"),
             ("$observerExit = $LASTEXITCODE", "$observerExit = 0"),
             ("2 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 2 ignored;"),
             ("--exact --nocapture --test-threads=1", "--ignored --nocapture --test-threads=1"),
