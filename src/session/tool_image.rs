@@ -2,8 +2,8 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-const MAX_TOOL_IMAGES: usize = 8;
-const MAX_TOOL_IMAGE_ENCODED_BYTES: usize = 7 * 1024 * 1024;
+pub(crate) const MAX_TOOL_IMAGES: usize = 8;
+pub(crate) const MAX_TOOL_IMAGE_ENCODED_BYTES: usize = 7 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedImage")]
@@ -102,21 +102,7 @@ impl PersistedToolImage {
         Ok(value)
     }
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
-        let cap = crate::agent::tools::read_image::MAX_IMAGE_BYTES;
-        if self.data.is_empty() || self.data.len() > cap.div_ceil(3) * 4 {
-            return Err("Tool image exceeds the 5 MiB byte limit");
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(self.data.as_bytes())
-            .map_err(|_| "Invalid tool image base64")?;
-        if bytes.len() > cap {
-            return Err("Tool image exceeds the 5 MiB byte limit");
-        }
-        let info = crate::agent::tools::read_image::inspect(&bytes)?
-            .ok_or("Unsupported tool image format")?;
-        if info.format.mime() != self.mime_type.as_str() {
-            return Err("Tool image MIME type does not match its bytes");
-        }
+        let info = inspect_literal_image(&self.data, &self.mime_type)?;
         let tiles = u64::from(info.width.div_ceil(512)) * u64::from(info.height.div_ceil(512));
         let _ = self.context_tokens.set(256 + tiles * 256);
         Ok(())
@@ -129,6 +115,29 @@ impl PersistedToolImage {
             additional_params: None,
         }
     }
+}
+/// Admit the same literal payload at MCP delivery and history retention, so a
+/// malformed image cannot make the rest of a result disappear during replay.
+pub(crate) fn inspect_literal_image(
+    data: &str,
+    mime_type: &super::user::ImageMime,
+) -> Result<crate::agent::tools::read_image::ImageMetadata, &'static str> {
+    let cap = crate::agent::tools::read_image::MAX_IMAGE_BYTES;
+    if data.is_empty() || data.len() > cap.div_ceil(3) * 4 {
+        return Err("Tool image exceeds the 5 MiB byte limit");
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|_| "Invalid tool image base64")?;
+    if bytes.len() > cap {
+        return Err("Tool image exceeds the 5 MiB byte limit");
+    }
+    let info =
+        crate::agent::tools::read_image::inspect(&bytes)?.ok_or("Unsupported tool image format")?;
+    if info.format.mime() != mime_type.as_str() {
+        return Err("Tool image MIME type does not match its bytes");
+    }
+    Ok(info)
 }
 pub(crate) fn validate_images(images: &[PersistedToolImage]) -> Result<(), &'static str> {
     if images.len() > MAX_TOOL_IMAGES

@@ -45,6 +45,28 @@ not rewritten or reread. Runtime attachment selections are not imported or
 restored from saved sessions. Resource text is server-supplied data, not verified
 host-file content.
 
+## Tool-result images
+
+Successful `tools/call` results deliver PNG, JPEG, GIF and WebP image blocks and
+image blob resources as native model images, in their original image order.
+Accompanying text and structured content remain in the delimited MCP response.
+The adapter bounds and spills that text before serializing the image envelope;
+base64 image payloads stay intact and are never included in a text spill.
+Text-only results and errors retain their existing rendering.
+
+Each result admits at most eight images and 7 MiB of encoded image data. The
+same literal-image validation used by history also enforces the existing 5 MiB
+decoded per-image limit, supported format headers, dimensions and matching MIME
+types. Unsupported, malformed or over-limit images become descriptive
+placeholders with omission notes; an omitted image does not consume the budget
+for later valid images. Non-image blob resources retain their placeholders.
+Image blob resource URIs are identifiers, not host paths or URLs to fetch.
+
+Accepted images survive the generic spill hook, session persistence, replay and
+compaction through the existing native image pipeline. This applies to tool
+results; the bounded text-only resource attachments described above keep their
+existing contract.
+
 ## Server form requests
 
 The client advertises form elicitation. An `elicitation/create` callback must

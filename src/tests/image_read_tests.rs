@@ -357,6 +357,160 @@ async fn image_read64_repeated_successes_preserve_native_images_without_steering
     );
 }
 
+#[tokio::test]
+async fn tool_image_envelopes_keep_pixels_through_generic_spill_and_replay() {
+    use futures::StreamExt;
+    use rig::agent::{AgentBuilder, MultiTurnStreamItem};
+    use rig::streaming::StreamingChat;
+    use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+    use rig::tool::Tool;
+
+    struct ImageEnvelopeTool(String);
+    impl Tool for ImageEnvelopeTool {
+        const NAME: &'static str = "mcp_image_envelope";
+        type Error = crate::agent::tools::ToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+        fn description(&self) -> String {
+            "Return an image envelope".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(&self, _: Self::Args) -> Result<String, Self::Error> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let root = super::OwnedTestDirectory::new("image-envelope-spill");
+    let mut pixels = PNG.to_vec();
+    pixels.resize(32 * 1024, 0);
+    let data = base64::engine::general_purpose::STANDARD.encode(pixels);
+    for long_text in [false, true] {
+        let data_root = root.path().join(format!("data-{long_text}"));
+        let _environment = super::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(data_root.clone().into_os_string()),
+            ),
+            ("MINI_AGENT_CONFIG_DIR", Some(root.path().into())),
+            ("MINI_AGENT_STATE_DIR", Some(root.path().into())),
+        ]);
+        let text = if long_text {
+            // A 12,000-character MCP body stays within its producer's cap,
+            // but fencing adds prefixes and makes the response longer.
+            format!(
+                "[mcp output begins]\n{}[mcp output ends]",
+                "> x\n".repeat(6_000)
+            )
+        } else {
+            "caption".into()
+        };
+        let output = serde_json::json!({
+            "response": text,
+            "parts": [{"type": "image", "mimeType": "image/png", "data": data}]
+        })
+        .to_string();
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "image-id",
+                    ImageEnvelopeTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("seen"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let mut session = crate::session::Session::new("test", "mock", 128_000, "");
+        let agent = AgentBuilder::new(model.clone())
+            .tool(ImageEnvelopeTool(output))
+            .add_hook(crate::agent::runner::ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("inspect", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        let mut streamed = None;
+        while let Some(item) = stream.next().await {
+            if let MultiTurnStreamItem::StreamUserItem(
+                rig::streaming::StreamedUserContent::ToolResult { tool_result, .. },
+            ) = item.unwrap()
+            {
+                streamed = Some(tool_result);
+            }
+        }
+        let result = streamed.expect("streamed image result");
+        let images = crate::session::tool_image::from_result(&result).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(serde_json::to_value(&images[0]).unwrap()["data"], data);
+        let response = result
+            .content
+            .iter()
+            .find_map(|part| match part {
+                ToolResultContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(response, text);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let live = requests[1]
+            .chat_history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|part| match part {
+                    UserContent::ToolResult(result) => Some(result),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(live, &result);
+        session.add_tool_call_with_id(&result.id, ImageEnvelopeTool::NAME, &serde_json::json!({}));
+        let (_, artifact) = session.add_tool_result_with_images(
+            &result.id,
+            ImageEnvelopeTool::NAME,
+            response,
+            images.clone(),
+        );
+        if long_text {
+            assert_eq!(std::fs::read_to_string(artifact.unwrap()).unwrap(), text);
+        } else {
+            assert!(artifact.is_none());
+        }
+        let restored: crate::session::Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        let Some(crate::session::PersistedToolMessage::Result { images: stored, .. }) =
+            &restored.messages[1].tool
+        else {
+            panic!("persisted image result")
+        };
+        assert_eq!(stored, &images);
+        let history = crate::agent::runner::convert_history(&restored);
+        let replayed = history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|part| match part {
+                    UserContent::ToolResult(result) => Some(result),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("replayed image result");
+        assert_eq!(
+            crate::session::tool_image::from_result(replayed).unwrap(),
+            images
+        );
+    }
+}
+
 #[cfg(feature = "multimodal")]
 #[tokio::test]
 async fn image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlation() {

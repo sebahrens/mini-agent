@@ -15,6 +15,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- MCP tool results now deliver supported image blocks and image blob resources to the model,
+  preserving image envelopes while bounding and spilling only their text. Excess images retain
+  placeholders with an omission note (8 images / 7 MiB encoded per result).
 - Skill Gym episodes now set `js-read-roots` and `js-write-roots` to the episode workspace, so the
   `js` tool's file effects work in gym runs instead of being denied.
 - `propose_skill` guidance now documents the hidden `_cap` first parameter of stored exports, and a

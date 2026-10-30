@@ -110,6 +110,25 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
         {
             return Flow::cont();
         }
+        // Image-producing tools bound their response text before assembling
+        // this envelope. Rig parses it only after hooks, and hook rewrites are
+        // deliberately literal text: spilling even a reserialized envelope
+        // here would discard its image parts.
+        let has_images = serde_json::from_str::<serde_json::Value>(result)
+            .ok()
+            .is_some_and(|value| {
+                value["response"].is_string()
+                    && value["parts"].as_array().is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part["type"] == "image"
+                                && part["data"].is_string()
+                                && part["mimeType"].is_string()
+                        })
+                    })
+            });
+        if has_images {
+            return Flow::cont();
+        }
         let output_chars = result.chars().count();
         if output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
             return Flow::cont();

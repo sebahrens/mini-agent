@@ -357,8 +357,6 @@ impl ToolDyn for McpTool {
                 ))));
             }
 
-            let content =
-                render_success_content(result.content, result.structured_content.as_ref());
             // Host coaching is trusted host text: it stays outside the fence
             // that marks untrusted server output, and is written first so the
             // fenced result is rendered once.
@@ -366,11 +364,17 @@ impl ToolDyn for McpTool {
                 msg.push_str("\n\n");
                 msg
             });
-            Ok(bounded_mcp_output_after(
-                head,
-                &content,
-                &spill_scope,
-                &format!("mcp:{server_name}:{tool_name}"),
+            Ok(render_success_content(
+                result.content,
+                result.structured_content.as_ref(),
+                |response| {
+                    bounded_mcp_output_after(
+                        head,
+                        response,
+                        &spill_scope,
+                        &format!("mcp:{server_name}:{tool_name}"),
+                    )
+                },
             ))
         })
     }
@@ -420,23 +424,36 @@ fn ensure_source_current(
 /// Render a successful result's content blocks for the model.
 ///
 /// Blocks are separated by newlines so adjacent text blocks never run
-/// together. Binary payloads (images, blob resources) are described by a
-/// placeholder instead of being inlined as base64, which the model cannot use
-/// and which would otherwise dominate the bounded output.
+/// together. Supported images use the same envelope as the native read tool.
+/// Bound and fence only the text before serializing that envelope: spilling or
+/// truncating its base64 would make Rig fall back to text and lose the images.
 fn render_success_content(
     blocks: Vec<ContentBlock>,
     structured: Option<&serde_json::Value>,
+    bound_response: impl FnOnce(&str) -> String,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
+    let mut images = Vec::new();
+    let mut encoded_bytes = 0usize;
     let mut unsupported = 0_usize;
     for item in blocks {
         match item {
             ContentBlock::Text(t) => parts.push(t.text),
-            ContentBlock::Image(img) => parts.push(format!(
-                "[image: {}, {} bytes]",
-                img.mime_type,
-                base64_decoded_len(&img.data)
-            )),
+            ContentBlock::Image(img) => {
+                let placeholder = format!(
+                    "[image: {}, {} bytes]",
+                    img.mime_type,
+                    base64_decoded_len(&img.data)
+                );
+                collect_image(
+                    &mut images,
+                    &mut encoded_bytes,
+                    &mut parts,
+                    &img.mime_type,
+                    img.data,
+                    placeholder,
+                );
+            }
             ContentBlock::Resource(r) => match r.resource {
                 rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
                     parts.push(text);
@@ -446,11 +463,21 @@ fn render_success_content(
                     mime_type,
                     blob,
                     ..
-                } => parts.push(format!(
-                    "[resource: {uri}, {}, {} bytes]",
-                    mime_type.as_deref().unwrap_or("application/octet-stream"),
-                    base64_decoded_len(&blob)
-                )),
+                } => {
+                    let mime = mime_type.as_deref().unwrap_or("application/octet-stream");
+                    let placeholder = format!(
+                        "[resource: {uri}, {mime}, {} bytes]",
+                        base64_decoded_len(&blob)
+                    );
+                    collect_image(
+                        &mut images,
+                        &mut encoded_bytes,
+                        &mut parts,
+                        mime,
+                        blob,
+                        placeholder,
+                    );
+                }
                 _ => unsupported += 1,
             },
             _ => unsupported += 1,
@@ -485,7 +512,45 @@ fn render_success_content(
             "[{unsupported} content block(s) of a kind this client cannot render were omitted]"
         ));
     }
-    content
+    let response = bound_response(&content);
+    if images.is_empty() {
+        response
+    } else {
+        serde_json::json!({"response": response, "parts": images}).to_string()
+    }
+}
+
+fn collect_image(
+    images: &mut Vec<serde_json::Value>,
+    encoded_bytes: &mut usize,
+    text: &mut Vec<String>,
+    mime: &str,
+    data: String,
+    placeholder: String,
+) {
+    use crate::session::tool_image::{MAX_TOOL_IMAGE_ENCODED_BYTES, MAX_TOOL_IMAGES};
+
+    let Some(mime_type) = crate::session::user::ImageMime::parse(mime) else {
+        text.push(if mime.starts_with("image/") {
+            format!("{placeholder} [image omitted: unsupported image format]")
+        } else {
+            placeholder
+        });
+        return;
+    };
+    if images.len() >= MAX_TOOL_IMAGES
+        || data.len() > MAX_TOOL_IMAGE_ENCODED_BYTES.saturating_sub(*encoded_bytes)
+    {
+        text.push(format!(
+            "{placeholder} [image omitted: tool image limit (8 images, 7 MiB encoded) exceeded]"
+        ));
+    } else if let Err(reason) = crate::session::tool_image::inspect_literal_image(&data, &mime_type)
+    {
+        text.push(format!("{placeholder} [image omitted: {reason}]"));
+    } else {
+        *encoded_bytes += data.len();
+        images.push(serde_json::json!({"type": "image", "mimeType": mime, "data": data}));
+    }
 }
 
 /// Decoded size of a base64 payload, without decoding it.
@@ -598,28 +663,330 @@ mod tests {
         );
     }
 
+    fn png_data() -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+            "../../agent/tools/fixtures/read-image64/3x2.png"
+        ))
+    }
+
+    fn image_block(data: &str) -> ContentBlock {
+        serde_json::from_value(serde_json::json!({
+            "type": "image", "mimeType": "image/png", "data": data
+        }))
+        .unwrap()
+    }
+
+    fn text_block(text: &str) -> ContentBlock {
+        serde_json::from_value(serde_json::json!({"type": "text", "text": text})).unwrap()
+    }
+
+    fn render_small(blocks: Vec<ContentBlock>, structured: Option<&serde_json::Value>) -> String {
+        render_success_content(blocks, structured, |response| {
+            bounded_mcp_output_with(response, |_| panic!("small text must not spill"))
+        })
+    }
+
+    fn retained_images(output: &str) -> Vec<crate::session::tool_image::PersistedToolImage> {
+        let result = rig::message::ToolResult {
+            id: "mcp-image".into(),
+            call_id: None,
+            content: rig::message::ToolResultContent::from_tool_output(output),
+        };
+        crate::session::tool_image::from_result(&result).unwrap()
+    }
+
     #[test]
-    fn success_content_separates_blocks_and_describes_binary_payloads() {
-        let blocks: Vec<ContentBlock> = serde_json::from_value(serde_json::json!([
+    fn success_image_envelope_preserves_text_and_reaches_tool_image_conversion() {
+        let data = png_data();
+        let output = render_small(vec![text_block("first"), image_block(&data)], None);
+        let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({
+                "response": "[mcp output begins]\n> first\n[mcp output ends]",
+                "parts": [{"type": "image", "mimeType": "image/png", "data": data}]
+            })
+        );
+        let images = retained_images(&output);
+        assert_eq!(images.len(), 1);
+        assert_eq!(serde_json::to_value(&images[0]).unwrap()["data"], data);
+    }
+
+    #[test]
+    fn success_mixed_blocks_keep_text_and_image_resource_order() {
+        use base64::Engine;
+        let png = png_data();
+        let gif = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+            "../../agent/tools/fixtures/read-image64/3x2.gif"
+        ));
+        let resource = serde_json::from_value(serde_json::json!({
+            "type": "resource", "resource": {
+                "uri": "urn:image:second", "mimeType": "image/gif", "blob": gif
+            }
+        }))
+        .unwrap();
+        let structured = serde_json::json!({"answer": 42});
+        let output = render_small(
+            vec![
+                text_block("first"),
+                image_block(&png),
+                text_block("middle"),
+                resource,
+                text_block("last"),
+            ],
+            Some(&structured),
+        );
+        let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            envelope["response"],
+            "[mcp output begins]\n> first\n> middle\n> last\n> {\n>   \"answer\": 42\n> }\n[mcp output ends]"
+        );
+        assert_eq!(
+            envelope["parts"],
+            serde_json::json!([
+                {"type": "image", "mimeType": "image/png", "data": png},
+                {"type": "image", "mimeType": "image/gif", "data": gif}
+            ])
+        );
+        let images = retained_images(&output);
+        assert_eq!(images.len(), 2);
+        assert_eq!(serde_json::to_value(&images[0]).unwrap()["data"], png);
+        assert_eq!(serde_json::to_value(&images[1]).unwrap()["data"], gif);
+    }
+
+    #[test]
+    fn success_images_over_count_limit_keep_excess_placeholders() {
+        use crate::session::tool_image::MAX_TOOL_IMAGES;
+        let data = png_data();
+        let blocks = (0..MAX_TOOL_IMAGES + 1)
+            .map(|_| image_block(&data))
+            .collect();
+        let output = render_small(blocks, None);
+        let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(retained_images(&output).len(), MAX_TOOL_IMAGES);
+        let response = envelope["response"].as_str().unwrap();
+        assert_eq!(response.matches("[image: image/png,").count(), 1);
+        assert_eq!(response.matches("image omitted:").count(), 1);
+        assert!(response.contains("8 images, 7 MiB encoded"));
+    }
+
+    // The persistence validator inspects headers without decompressing pixels.
+    fn padded_png(encoded_len: usize) -> String {
+        use base64::Engine;
+        let mut bytes = include_bytes!("../../agent/tools/fixtures/read-image64/3x2.png").to_vec();
+        bytes.resize(encoded_len / 4 * 3, 0);
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        assert_eq!(data.len(), encoded_len);
+        data
+    }
+
+    #[test]
+    fn success_images_at_byte_limit_survive_and_excess_resource_is_omitted() {
+        use crate::session::tool_image::MAX_TOOL_IMAGE_ENCODED_BYTES;
+        let first = padded_png(4 * 1024 * 1024);
+        let second = padded_png(MAX_TOOL_IMAGE_ENCODED_BYTES - first.len());
+        let resource = serde_json::from_value(serde_json::json!({
+            "type": "resource", "resource": {
+                "uri": "urn:image:excess", "mimeType": "image/png", "blob": png_data()
+            }
+        }))
+        .unwrap();
+        let output = render_small(
+            vec![image_block(&first), image_block(&second), resource],
+            None,
+        );
+        let images = retained_images(&output);
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.encoded_len())
+                .sum::<usize>(),
+            MAX_TOOL_IMAGE_ENCODED_BYTES
+        );
+        let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let response = envelope["response"].as_str().unwrap();
+        assert!(response.contains("[resource: urn:image:excess, image/png,"));
+        assert!(response.contains("image omitted:"));
+        assert!(!response.contains(&first));
+    }
+
+    #[test]
+    fn success_oversized_image_does_not_consume_budget_for_later_images() {
+        use crate::session::tool_image::MAX_TOOL_IMAGE_ENCODED_BYTES;
+        let output = render_small(
+            vec![
+                image_block(&"A".repeat(MAX_TOOL_IMAGE_ENCODED_BYTES + 1)),
+                image_block(&png_data()),
+            ],
+            None,
+        );
+        assert_eq!(retained_images(&output).len(), 1);
+        let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(
+            envelope["response"]
+                .as_str()
+                .unwrap()
+                .contains("image omitted:")
+        );
+    }
+
+    #[test]
+    fn success_all_supported_image_formats_preserve_source_order_and_replay() {
+        use base64::Engine;
+        let formats = [
+            (
+                "image/png",
+                include_bytes!("../../agent/tools/fixtures/read-image64/3x2.png").as_slice(),
+            ),
+            (
+                "image/jpeg",
+                include_bytes!("../../agent/tools/fixtures/read-image64/3x2.jpg").as_slice(),
+            ),
+            (
+                "image/gif",
+                include_bytes!("../../agent/tools/fixtures/read-image64/3x2.gif").as_slice(),
+            ),
+            (
+                "image/webp",
+                include_bytes!("../../agent/tools/fixtures/read-image64/3x2-lossless.webp")
+                    .as_slice(),
+            ),
+        ];
+        let blocks = formats
+            .iter()
+            .map(|(mime, bytes)| {
+                serde_json::from_value(serde_json::json!({
+                    "type": "image", "mimeType": mime,
+                    "data": base64::engine::general_purpose::STANDARD.encode(bytes)
+                }))
+                .unwrap()
+            })
+            .collect();
+        let images = retained_images(&render_small(blocks, None));
+        assert_eq!(images.len(), formats.len());
+        for (image, (mime, bytes)) in images.iter().zip(formats) {
+            let value = serde_json::to_value(image).unwrap();
+            assert_eq!(value["mime_type"], mime);
+            assert_eq!(
+                value["data"],
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn success_invalid_images_never_discard_valid_neighbors_or_consume_budget() {
+        use base64::Engine;
+        let wrong_mime = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+            "../../agent/tools/fixtures/read-image64/3x2.gif"
+        ));
+        let over_single_image_limit = padded_png(7 * 1024 * 1024);
+        let output = render_small(
+            vec![
+                image_block("not-base64!"),
+                image_block("https://never.invalid/remote.png"),
+                image_block(&wrong_mime),
+                image_block(&over_single_image_limit),
+                image_block(&png_data()),
+            ],
+            None,
+        );
+        let images = retained_images(&output);
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&images[0]).unwrap()["data"],
+            png_data()
+        );
+        let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let response = envelope["response"].as_str().unwrap();
+        assert_eq!(response.matches("[image omitted:").count(), 4);
+        assert!(response.contains("Invalid tool image base64"));
+        assert!(response.contains("MIME type does not match"));
+        assert!(response.contains("5 MiB"));
+        assert!(!response.contains("not-base64!"));
+        assert!(!response.contains("never.invalid"));
+        assert!(!response.contains(&over_single_image_limit));
+    }
+
+    #[test]
+    fn unsupported_image_mime_and_non_image_blobs_stay_plain_placeholders() {
+        let blocks = serde_json::from_value(serde_json::json!([
             {"type": "text", "text": "first"},
-            {"type": "text", "text": "second"},
-            {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            {"type": "image", "data": "aGVsbG8=", "mimeType": "image/svg+xml"},
             {"type": "resource", "resource": {
-                "uri": "file:///report.pdf",
-                "mimeType": "application/pdf",
-                "blob": "AAECAwQF"
-            }}
+                "uri": "file:///report.pdf", "mimeType": "application/pdf", "blob": "AAECAwQF"
+            }},
+            {"type": "resource", "resource": {"uri": "urn:binary", "blob": "aA=="}}
         ]))
         .unwrap();
-
-        let rendered = render_success_content(blocks, None);
-
         assert_eq!(
-            rendered,
-            "first\nsecond\n[image: image/png, 5 bytes]\n[resource: file:///report.pdf, application/pdf, 6 bytes]"
+            render_small(blocks, None),
+            "[mcp output begins]\n> first\n> [image: image/svg+xml, 5 bytes] [image omitted: unsupported image format]\n> [resource: file:///report.pdf, application/pdf, 6 bytes]\n> [resource: urn:binary, application/octet-stream, 1 bytes]\n[mcp output ends]"
         );
-        assert!(!rendered.contains("base64"));
-        assert!(!rendered.contains("aGVsbG8"));
+    }
+
+    #[test]
+    fn no_image_results_are_unchanged_byte_for_byte() {
+        for (blocks, structured, expected) in [
+            (vec![], None, "[mcp output begins]\n> \n[mcp output ends]"),
+            (
+                vec![text_block("first"), text_block("second\n雪")],
+                None,
+                "[mcp output begins]\n> first\n> second\n> 雪\n[mcp output ends]",
+            ),
+            (
+                vec![text_block("42")],
+                Some(serde_json::json!(42)),
+                "[mcp output begins]\n> 42\n[mcp output ends]",
+            ),
+            (
+                vec![],
+                Some(serde_json::json!({"answer": 42})),
+                "[mcp output begins]\n> {\n>   \"answer\": 42\n> }\n[mcp output ends]",
+            ),
+        ] {
+            assert_eq!(render_small(blocks, structured.as_ref()), expected);
+        }
+    }
+
+    #[test]
+    fn image_envelope_bypasses_bounds_while_response_spills_or_truncates() {
+        let data = padded_png(32 * 1024);
+        // Large base64 alone must never trigger a text spill.
+        assert_eq!(
+            retained_images(&render_small(vec![image_block(&data)], None)).len(),
+            1
+        );
+        let text = "雪".repeat(crate::session::TOOL_RESULT_SAVE_THRESHOLD + 1);
+        for fail_save in [false, true] {
+            let output = render_success_content(
+                vec![text_block(&text), image_block(&data)],
+                None,
+                |response| {
+                    bounded_mcp_output_with_after("host coaching\n\n".into(), response, |saved| {
+                        assert_eq!(saved, text);
+                        if fail_save {
+                            anyhow::bail!("disk full");
+                        }
+                        Ok(PathBuf::from("/private/mcp-output.txt"))
+                    })
+                },
+            );
+            let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+            let response = envelope["response"].as_str().unwrap();
+            assert!(response.starts_with("host coaching\n\n[mcp output begins]\n> "));
+            assert!(response.contains("[mcp output ends]\n[mcp host:"));
+            assert!(response.contains(if fail_save {
+                "output could not be saved"
+            } else {
+                "full output saved to:"
+            }));
+            assert!(response.chars().count() < crate::session::TOOL_RESULT_SAVE_THRESHOLD);
+            assert_eq!(envelope["parts"][0]["data"], data);
+            assert_eq!(retained_images(&output).len(), 1);
+        }
     }
 
     #[test]

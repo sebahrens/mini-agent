@@ -272,6 +272,10 @@ fn main() {
             }
             let payload = escape(&tool_payload(&line));
             let result = match mode.as_str() {
+                "image-result" | "image-error" => format!(
+                    "{{\"content\":[{{\"type\":\"text\",\"text\":\"image caption\"}},{{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAFElEQVR4nGPkSjnBAAZMEIqBgQEAFUoBOkiAy7EAAAAASUVORK5CYII=\"}}],\"isError\":{}}}",
+                    mode == "image-error"
+                ),
                 "structured-only" => {
                     "{\"content\":[],\"structuredContent\":{\"answer\":42},\"isError\":false}"
                         .to_string()
@@ -1993,6 +1997,39 @@ async fn structured_fixture_output(mode: &str) -> Result<String, rig::tool::Tool
     assert_process_reaped(pid).await;
     fixture.cleanup();
     result
+}
+
+#[tokio::test]
+async fn mcp_image_result_survives_call_bounds_and_rig_conversion() {
+    use base64::Engine;
+    let output = structured_fixture_output("image-result").await.unwrap();
+    let result = rig::message::ToolResult {
+        id: "mcp-image".into(),
+        call_id: None,
+        content: rig::message::ToolResultContent::from_tool_output(output),
+    };
+    assert!(
+        matches!(result.content.first(), rig::message::ToolResultContent::Text(text)
+        if text.text == "[mcp output begins]\n> image caption\n[mcp output ends]")
+    );
+    let images = crate::session::tool_image::from_result(&result).unwrap();
+    assert_eq!(images.len(), 1);
+    let value = serde_json::to_value(&images[0]).unwrap();
+    assert_eq!(
+        value["data"],
+        base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+            "../agent/tools/fixtures/read-image64/3x2.png"
+        ))
+    );
+}
+
+#[tokio::test]
+async fn mcp_image_error_remains_a_text_error() {
+    let error = structured_fixture_output("image-error").await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "ToolCallError: [mcp output begins]\n> image caption\n[mcp output ends]"
+    );
 }
 
 #[tokio::test]
