@@ -721,7 +721,7 @@ Accepted top-level keys:
 | `max_session_input_tokens` | integer | Optional global ceiling on input tokens (cached input included) observed across the logical session, its subagents and `/cron` fires. Needs no model prices, so it bounds unpriced providers. Once reached, further model requests and model-dispatched effects are refused like an exhausted USD budget (`stop_reason: "budget"` headless). Resumed sessions count their ledger history. An admitted request can overshoot. Project layers cannot set it. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `max_session_total_tokens` | integer | As `max_session_input_tokens`, over input plus output tokens. |
 | `max_budget_usd`          | number | Optional finite nonnegative USD ceiling for recorded logical-session spend, including auxiliary models. CLI `--max-budget-usd` overrides this global-only setting; project layers cannot change it. Unknown prices or incomplete tracking block capped continuation. Already admitted work can exceed it; this is not a vendor billing limit. See [COST_TRACKING.md](COST_TRACKING.md). |
-| `max_agent_turns`         | integer | Maximum agent turns per response. Default: `200`.                                                                                                                           |
+| `max_agent_turns`         | integer | Maximum model round trips (agent turns) per user prompt. Default: `1000` (was 200); spend caps (`turn_token_budget`, `max_budget_usd`, session token ceilings) are the primary safety net. When reached, the turn fails with an "exhausted its maximum turn budget" error, but completed tool work and messages stay in the session: ask the agent to continue (or rerun with `--continue`) or raise the limit. `--max-agent-turns` overrides it.                                                                                                                           |
 | `verify_command`          | string  | Optional trusted command that must pass before a turn which invoked a potentially mutating tool may complete. Unset or blank disables the gate. Project-local values are sensitive and require content-bound trust. |
 | `goal_checks`             | array   | Commands that must exit zero before a goal may be reported complete. Sensitive: an untrusted project config cannot supply one, exactly as for `verify_command`. Additive with `--goal-check` and `/goal check`. |
 | `goal_judge_model`        | string  | A `quick_models` entry name used to judge goal completion claims. Sensitive: the judge receives a bounded transcript tail, so naming its endpoint decides where that text is sent. |
@@ -750,6 +750,18 @@ Accepted top-level keys:
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
 | `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, and other command classes, including brokered JS `spawn`, retain their existing limits. Sensitive in project-local configuration: changing it requires project trust. |
 | `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Headless, loop, and ACP modes skip it. Requires project trust when set locally. No automatic download or installation. |
+| `session_retention_days` | integer | Delete saved session snapshots (`<uuid>.json` in the sessions directory) whose modification time is older than this many days, once per interactive startup in a background thread. Default: unset/`0` (keep forever). A session open in this or another live process (its lock is held) is never removed; tool-output spill directories are left in place. Requires project trust when set locally. |
+| `persist_project_approvals` | boolean | Offer `(p) always allow in this project` on TUI approval prompts and load those rules at interactive startup. Default: `false`. Rules are stored privately per workspace in the state directory, never in the repository; headless runs ignore them. See [Interactive approvals](#interactive-approvals). |
+| `hooks_http_enabled` | boolean | Allow `type: "http"` hook handlers to POST event JSON to their configured URL. Default: `false` (http hooks load but are never contacted). Requires `hooks`. See [HTTP handlers](#http-handlers). |
+| `hooks_permission_decisions` | boolean | Let `PermissionRequest` hooks answer a pending approval with allow (once) or deny, including in headless runs. Default: `false` (observe only). Requires `hooks`. See [Hook event parity](#hook-event-parity). |
+| `skills_max_selected` | integer | Agent Skills injected per turn by prompt relevance. Default: `3` (at most 16). Requires `agent-skills`. See [SKILLS.md](SKILLS.md#selection-limits-and-the-always-visible-catalog). |
+| `skills_score_floor` | number | Minimum relevance score for automatic Agent Skill selection, 0.0–1.0. Default: `0.20`. |
+| `skills_catalog_bytes` | integer | Bytes of an always-visible name/description catalog of every authorized skill in the skill context. Default: `0` (off); at most 65,536. |
+| `skills_max_packages` | integer | Agent Skill packages discovered across all roots. Default: `64` (1–1,024). |
+| `acp_history_max_turns` | integer | ACP only: summarize live history after this many user turns. Default: unset/`0` (no turn cap; compaction follows token pressure under `compact_enabled` and the byte guard). |
+| `acp_history_max_bytes` | integer | ACP only: serialized live-history memory guard. Default: max(2 MiB, 4 bytes per context-window token); minimum 64 KiB. |
+| `acp_max_sessions` | integer | ACP only: concurrently loaded sessions per process. Default: `64`. |
+| `acp_max_client_mcp_servers` | integer | ACP only: client-supplied MCP servers accepted per `session/new`. Default: `8`. |
 | `max_grep_results`        | integer | Maximum grep matches returned to the main agent. Default: `150`. |
 | `max_find_results`        | integer | Maximum file matches returned to the main agent. Default: `150`. |
 | `max_list_dir_entries`    | integer | Maximum directory entries returned to the main agent per call. Default: `150`. `list_dir` pages past it with `offset` (named in the truncation notice) and may lower it with `limit`. |
@@ -810,7 +822,7 @@ Accepted top-level keys:
 | `show_tool_details`       | boolean or integer | Legacy tool-result setting. With `tool_output = "preview"` an integer sets the preview length. Without `tool_output` it keeps its old meaning as an opt-in: an integer previews that many lines, `true` shows everything, `false` (or `0`) collapses. Unset means collapsed. Task-list updates remain visible independently of this setting. |
 | `diff_context_lines`      | integer | Unchanged context rows around a successful native edit/write preview. Default: `3`; clamped to `20`. |
 | `max_diff_lines`          | integer | Maximum retained mutation-preview rows, including headers and notices. Default: `200`; clamped to `1000`. `0` disables preview capture/display. `show_tool_details=false` hides previews during live rendering and replay; integer tool-detail limits apply to ordinary result text separately. |
-| `reasoning_display`       | `"off"`, `"collapsed"`, `"full"` | TUI presentation of reasoning. Default: `"collapsed"` with one live character-count and elapsed-time header. `Ctrl+R` cycles the modes and saves the preference to global config; clicking a header expands or collapses that block. This setting does not change model requests. Resume shows available recorded human-readable reasoning; elapsed time is live-only, and signatures/encrypted/redacted payloads stay opaque. |
+| `reasoning_display`       | `"off"`, `"collapsed"`, `"full"` | TUI presentation of reasoning. Default: `"collapsed"` with one live character-count and elapsed-time header. `Alt+R` (`cycle_reasoning`, formerly `Ctrl+R`) cycles the modes and saves the preference to global config; clicking a header expands or collapses that block. This setting does not change model requests. Resume shows available recorded human-readable reasoning; elapsed time is live-only, and signatures/encrypted/redacted payloads stay opaque. |
 | `show_reasoning`          | boolean | Legacy presentation preference: `false` means off and `true` means full when `reasoning_display` is absent. Explicit legacy values keep their meaning. `/reasoning` controls model reasoning separately. |
 | `statusline`              | table   | Configurable status bar (up to 3 lines of colored segments). When absent, a built-in default layout is used. See Status bar below. |
 | `chat_left_margin`        | integer | Left padding (columns) for the chat area only; input and status rows are unaffected. Default: `0`. |
@@ -1099,10 +1111,10 @@ mini-agent sets `$MINI_AGENT_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `type` | string | Only `"command"` is supported. |
+| `type` | string | `"command"` or `"http"` (see HTTP handlers). Other Claude Code types (`prompt`, `agent`, `mcp_tool`) are skipped per handler with a warning; the rest of the file stays loaded. |
 | `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical selected workspace; bare names resolve through absolute `PATH` entries only. Workspace-resident files are content-bound (see Trust model). Receives the stdin envelope as JSON; `$MINI_AGENT_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
 | `args` | array of strings | Required, but may be empty. Passed directly as the executable's argv with no shell metacharacter expansion. |
-| `timeout` | integer (seconds) | Per-hook timeout; the whole process group is killed on expiry. Default: 60. |
+| `timeout` | integer (seconds) | Per-hook timeout (also bounds its `if` condition); the whole process group is killed on expiry. Default: 60 for the gating events `UserPromptSubmit`, `PreToolUse` and `PermissionRequest` (a stuck gate fails fast; a timed-out `PreToolUse` denies the tool), 600 for every other event (as in Claude Code, so long test/lint hooks on `Stop` or `PostToolUse` are not killed). |
 | `async` | boolean | When `true`, the hook's `if` condition and handler run in the background and its decision is ignored. Agent-turn work owns the background task, so turn cancellation still terminates and reaps it before the turn settles. Default: `false`. |
 | `if` | string | A shell command evaluated (with the same stdin envelope) before the handler runs; the handler only runs if it exits `0`. Fails closed: a broken/unparseable/timed-out condition still runs the handler, with a warning. |
 | `once` | boolean | Runs the handler at most once per event per session. A false `if` condition or a policy/preflight/spawn denial does not consume the binding; a successfully started child does. |
@@ -1173,11 +1185,49 @@ is not a reversible identity when components contain `__`; use the structured
 fields to distinguish those tuples. Identity is captured by the parent at tool
 registration, never inferred from an alias or rewritten input.
 
+### HTTP handlers
+
+```json
+{ "type": "http", "url": "https://hooks.example.com/pre", "headers": { "Authorization": "Bearer literal-token" }, "timeout": 30 }
+```
+
+An `http` handler POSTs the same JSON stdin envelope to `url` (absolute
+`http`/`https` only) with `Content-Type: application/json` and the literal
+`headers` (at most 32, no environment interpolation). A 2xx response body is
+interpreted exactly like a command hook's stdout after exit 0 (decision JSON);
+any other status behaves like a non-zero exit (the event's failure policy, so a
+failing `PreToolUse` http hook denies). Redirects are not followed, the
+response body is capped at 1 MiB, and `timeout` covers the whole exchange.
+`command`, `args`, `env` and `if` are rejected for http handlers; `async` and
+`once` work as for commands. The URL and headers are part of the hook's trust
+identity and are shown in the project-hook approval prompt.
+
+**HTTP hooks are off by default.** Set `hooks_http_enabled = true` in
+`config.toml` (a sensitive key; project-local values need trust) to let them
+send requests; otherwise they load but are never contacted, and `/hooks`
+reports them as disabled.
+
 ### Events
 
 `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`,
-`Stop`, `SessionStart`, `SessionEnd`, `SubagentStart`, `SubagentStop`,
-`PreCompact`, `Notification`, `PermissionRequest`.
+`Stop`, `StopFailure`, `SessionStart`, `SessionEnd`, `SubagentStart`,
+`SubagentStop`, `PreCompact`, `PostCompact`, `Notification`,
+`PermissionRequest`, `InstructionsLoaded`, `FileChanged`, `CwdChanged`.
+
+The last five are observation-only (their output cannot block or grant):
+
+| Event | When | Envelope fields | Matcher |
+|-------|------|-----------------|---------|
+| `PostCompact` | after a compaction committed (TUI, headless, ACP) | `trigger`, `compact_summary` (≤ 32 KiB) | `auto` / `manual` |
+| `StopFailure` | a turn ended in an error instead of a response (TUI, headless) | `error` (≤ 8 KiB, sanitized) | — |
+| `InstructionsLoaded` | instruction sources captured at startup, and nested `AGENTS.md`/`CLAUDE.md` delivered by a file tool | `file_path`, `load_reason` | `session_start` / `nested_traversal` |
+| `FileChanged` | after a successful native `edit`, `write` or `notebook_edit` | `file_path`, `event: "change"`, `tool_name` | file base name |
+| `CwdChanged` | the hook workspace was rebound (e.g. worktree switch) | `old_cwd`, `new_cwd` | — |
+
+Other Claude Code event names (for example `PermissionDenied`, `ConfigChange`,
+`TaskCreated`, `WorktreeCreate`, `Elicitation`, `PostToolBatch`) are accepted
+with a load warning and stay inert; `/hooks` lists supported events, the
+undispatched ones, and the handler types.
 
 Interactive startup begins `SessionStart` as soon as resume state is known,
 starts the independent agent/MCP prebuild, and joins the hook before accepting
@@ -1209,7 +1259,15 @@ a concurrent MCP invocation cannot borrow the approval token.
 `PostToolUse` may set `"redactions"` to an array of exact, non-empty strings.
 Every occurrence is replaced with the fixed marker `[REDACTED]`. Hook-authored
 `"result"` replacements are ignored so a hook cannot substitute arbitrary
-model-visible output.
+model-visible output. A `PostToolUse` hook can feed back to the model (the
+"run the linter after an edit and tell the model" pattern): `"decision":
+"block"` with a `"reason"`, exit code 2 with stderr, and
+`"additionalContext"` (flat or under `hookSpecificOutput` with
+`hookEventName: "PostToolUse"`) are collected, sanitized, capped at 32 KiB in
+total (with a visible truncation marker), framed as a non-authoritative notice
+that grants no permissions, and prepended to the tool result. The tool has
+already run, so `block` cannot undo it; the original (redacted) result
+follows intact. This applies in TUI, headless and ACP runs alike.
 
 `SubagentStart` can set `"additionalContext"` to prepend text to the child
 prompt. Both subagent lifecycle envelopes include the resolved `agent_type`
@@ -2415,6 +2473,16 @@ When a rule resolves to `ask`, the TUI shows the request and these keys:
   literally so `*` or `?` inside it never widens the grant) for
   the rest of this session. It is recorded with the session for `--resume`
   but never written to the config.
+- `p` (only with `persist_project_approvals = true`; default off, the key is
+  inert otherwise) allows the same scope as `a` and also remembers it for this
+  project: the rule is stored in a private per-user file keyed by the canonical
+  workspace root (`<state_dir>/project-approvals/<sha256>.json`), never in the
+  repository or the trusted project config, so a checkout cannot ship
+  pre-approved rules. Saved rules load as session allow entries at the next
+  interactive start (at most 256 per project); headless (`-p`, `--loop`) and
+  ACP runs never load them, and `deny` rules always win. `/permissions rules`
+  lists them and `/permissions forget <n|all>` removes them (effective at the
+  next interactive start).
 - `f` (only for `read`, `edit`, and `list_dir` requests) allows `read`,
   `edit`, and `list_dir` on the request's folder and everything beneath it
   for this session in one approval: the directory itself for `list_dir`,
@@ -3010,14 +3078,23 @@ Each ACP session owns one canonical `Session` history. Accepted user content,
 correlated structured tool call/results, observed usage and terminal assistant
 content are retained together, including accepted progress before cancellation.
 The next prompt receives that committed history before its current user message.
-Live history is bounded to 128 user-started intervals and 2 MiB of serialized
-canonical messages;
-before an over-bound history is reused, the ordinary provider-backed rolling
+Live history is compacted on the same triggers as the TUI: with
+`compact_enabled = true`, when the estimated context exceeds the routed model's
+`context_window` minus `reserve_tokens` (keeping `keep_recent_tokens` of recent
+turns); independently, a memory guard of `acp_history_max_bytes` serialized
+bytes (default max(2 MiB, 4 bytes per context-window token), minimum 64 KiB)
+always applies. There is no turn-count trigger unless `acp_history_max_turns`
+is set (previously a fixed 128). Native (provider-owned) history is never
+auto-compacted on token pressure, as in the TUI.
+Before an over-bound history is reused, the ordinary provider-backed rolling
 summarizer replaces the oldest complete intervals with a bounded recap and
 records actual compaction metadata. Failure or zero progress uses an explicitly
 labelled emergency recap; original durable rows remain archived. The process
-retains at most 64 ACP sessions, counting pending loads and retiring owners.
-Creating a 65th session is rejected rather than silently invalidating a live session. Each
+retains at most `acp_max_sessions` (default 64) ACP sessions, counting pending
+loads and retiring owners, and each session accepts at most
+`acp_max_client_mcp_servers` (default 8) client-supplied MCP servers. A prompt
+is limited to 2 MiB of rendered text (it must fit the 4 MiB frame).
+Creating a session beyond the cap is rejected rather than silently invalidating a live session. Each
 session accepts one active prompt; a concurrent prompt for the same session is
 rejected instead of queued. Protocol dispatch and work in other sessions remain
 independent. Unless `--no-session` is set, checkpoints save through the shared
@@ -3111,6 +3188,24 @@ being rejected; invalid UTF-8 is still rejected. New sources share at most
 128 KiB and the remainder of the old 512 KiB context budget after JSON escaping;
 earlier root content retains priority. Physical file aliases and include cycles
 are deduplicated while preserving the first authored scope/order.
+
+#### Nested instruction limits
+
+These bounds never fail the triggering `read`, `edit`, `write` or `notebook_edit`
+call and never end the run; exceeding one degrades visibly:
+
+| Limit | Value | Behaviour when exceeded |
+|-------|-------|-------------------------|
+| Bytes per source | 16 KiB | Source truncated at a UTF-8 boundary with an `[mini-agent: instruction source truncated …]` marker; read the file directly for the rest. |
+| Directories with instruction files | 64 | Further directories' sources are skipped; the read result names them in a "sources not shown" notice. |
+| Retained sources / bytes | 64 / 128 KiB (and the remainder of the 512 KiB context budget) | Same as above: skipped directory named in a notice. |
+| Directories without instruction files | 4,096 cached | Past the cap they are re-probed on each touch (no failure). |
+| Path depth considered | 64 components | Deeper targets fail the instruction lookup with a bounded error. |
+| One notice result | 32 KiB | Sources that do not fit are deferred and named; they are offered again once the delivered ones are reviewed. A deferred or skipped source never blocks a mutation. |
+| Delivery receipts per run | 128 | The oldest receipt is evicted; its sources become eligible for re-delivery. |
+
+Invalid UTF-8, linked (symlink/hard-link) sources, include escapes and the
+four-level / 32-node include limits still fail closed with a bounded error.
 
 A first mutation can return "Mutation not executed" with a private instruction
 notice. It changes no file and grants no permission: only a subsequent accepted
@@ -4064,7 +4159,7 @@ for the bounded format and output limits.
 
 Instruction-only Agent Skills are available with the default `agent-skills` Cargo feature. Their
 captured project sources share the existing `.mini-agent/config.toml` trust approval; no new trust
-file or `allowed-tools` permission authority exists. Imported selections and all compatibility skill roots share a 64-package ceiling. Directory roots share a scan
+file or `allowed-tools` permission authority exists. Imported selections and all compatibility skill roots share a `skills_max_packages` ceiling (default 64). Directory roots share a scan
 budget of 1,024 entries, depth 8, 48 KiB per `SKILL.md`, 1 MiB per resource and 8 MiB of
 content. Selected instruction bodies share a 48 KiB budget, referenced resources 32 KiB, and the
 post-escape instruction/learned manifest block 64 KiB. Discovered packages are copied into isolated
@@ -4193,8 +4288,21 @@ compaction emits `SessionStart` with `source: "compact"`; a budget no-op does no
 `PermissionRequest` observes the exact tool name and input before its approval is
 sent to the frontend, followed by a `Notification` with
 `notification_type: "permission_prompt"`. These events run in the caller's
-existing cancellable work scope. Their output cannot approve a request, change
-permission policy, or replace a tool result; the frontend still owns the reply.
+existing cancellable work scope. By default their output cannot approve a
+request, change permission policy, or replace a tool result; the frontend
+still owns the reply.
+
+With `hooks_permission_decisions = true` (default `false`; a sensitive key that
+needs trust when set locally) a `PermissionRequest` hook may answer the pending
+approval: `{"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+"decision": {"behavior": "allow" | "deny", "message": "..."}}}` (or flat
+`permissionDecision`), or exit 2 to deny. Deny wins over allow; `allow` answers
+*once* and never records an allow-always grant; hook failures, timeouts and
+silence fall through to the normal prompt. Deny rules are applied before an
+approval is ever requested, so a hook cannot override them. Headless runs
+(`-p`, `--loop`), which otherwise deny every approval request, also consult the
+hook when this is enabled. A hook answer skips the `permission_prompt`
+notification.
 
 Project `.claude/settings.json` hook groups load alongside native project hook
 settings. Each project binding still requires the existing exact trust approval;

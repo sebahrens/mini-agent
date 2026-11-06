@@ -1972,6 +1972,22 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for MutationD
         _context: &rig::agent::HookContext,
         event: rig::agent::StepEvent<'_, M>,
     ) -> rig::agent::Flow {
+        #[cfg(feature = "hooks")]
+        if let rig::agent::StepEvent::ToolResult {
+            tool_name,
+            outcome: rig::tool::ToolOutcome::Success,
+            extensions,
+            ..
+        } = &event
+            && matches!(*tool_name, "edit" | "write" | "notebook_edit")
+            && let Some(diff) = extensions.get::<MutationDiff>()
+        {
+            let (path, tool) = (diff.path.clone(), tool_name.to_string());
+            crate::startup::heap_future(|| {
+                crate::extras::hooks::dispatch_file_changed(&path, &tool)
+            })
+            .await;
+        }
         if let rig::agent::StepEvent::ToolResult {
             tool_name,
             internal_call_id,

@@ -25,7 +25,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/rewind" => handle_rewind(ctx).await,
         "/retry" => handle_retry(ctx).await,
         "/quit" | "/exit" => handle_quit(ctx).await,
-        "/history" => handle_history(ctx).await,
+        "/history" => handle_history(parts, ctx).await,
         #[cfg(feature = "export")]
         "/export" => handle_export(parts, ctx).await,
         #[cfg(feature = "export")]
@@ -1011,7 +1011,58 @@ async fn handle_quit(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "quit").into())
 }
 
-async fn handle_history(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+/// `/history [n|query]`: the last `n` entries (default 10, at most 1,000),
+/// or the newest 50 entries containing `query` (case-insensitive).
+pub(crate) fn history_lines(
+    entries: &[crate::session::chat_history::ChatHistoryEntry],
+    argument: &str,
+) -> Vec<String> {
+    const DEFAULT_SHOWN: usize = 10;
+    const MAX_SHOWN: usize = 1_000;
+    const MAX_MATCHES: usize = 50;
+    let argument = argument.trim();
+    let (selected, label): (Vec<&crate::session::chat_history::ChatHistoryEntry>, String) =
+        match argument.parse::<usize>() {
+            Ok(count) if !argument.is_empty() => {
+                let count = count.clamp(1, MAX_SHOWN);
+                let start = entries.len().saturating_sub(count);
+                (
+                    entries[start..].iter().collect(),
+                    format!("showing last {}", entries.len() - start),
+                )
+            }
+            _ if argument.is_empty() => {
+                let start = entries.len().saturating_sub(DEFAULT_SHOWN);
+                (
+                    entries[start..].iter().collect(),
+                    format!(
+                        "showing last {}; /history <n> or /history <text>",
+                        entries.len() - start
+                    ),
+                )
+            }
+            _ => {
+                let needle = argument.to_lowercase();
+                let mut matches: Vec<_> = entries
+                    .iter()
+                    .rev()
+                    .filter(|entry| entry.content.to_lowercase().contains(&needle))
+                    .take(MAX_MATCHES)
+                    .collect();
+                matches.reverse();
+                let label = format!("{} newest matches for {argument:?}", matches.len());
+                (matches, label)
+            }
+        };
+    let mut lines: Vec<String> = selected
+        .iter()
+        .map(|entry| format!("  {}", crate::ui::pickers::history::preview(&entry.content)))
+        .collect();
+    lines.push(format!("  ... ({label}; Ctrl+R searches interactively)"));
+    lines
+}
+
+async fn handle_history(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match crate::session::chat_history::load_history() {
         Ok(entries) => {
             if entries.is_empty() {
@@ -1021,12 +1072,9 @@ async fn handle_history(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
                     ctx.renderer,
                     format!("global chat history ({} entries):", entries.len()),
                 );
-                for entry in entries.iter().rev().take(10).rev() {
-                    let preview: String = entry.content.chars().take(80).collect();
-                    write_result(ctx.renderer, format!("  {}", preview));
-                }
-                if entries.len() > 10 {
-                    write_ok(ctx.renderer, "  ... (showing last 10)");
+                let argument = parts[1..].join(" ");
+                for line in history_lines(&entries, &argument) {
+                    write_result(ctx.renderer, crate::ui::events::sanitize_output(&line));
                 }
             }
         }
@@ -1035,6 +1083,24 @@ async fn handle_history(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod imih0_history_tests {
+    #[test]
+    fn history_shows_n_entries_or_query_matches() {
+        let entries: Vec<_> = (0..30)
+            .map(|i| crate::session::chat_history::ChatHistoryEntry {
+                content: format!("prompt number {i}"),
+                timestamp: Default::default(),
+            })
+            .collect();
+        assert_eq!(super::history_lines(&entries, "").len(), 11);
+        assert_eq!(super::history_lines(&entries, "25").len(), 26);
+        let matches = super::history_lines(&entries, "number 2");
+        assert!(matches.iter().any(|line| line.contains("prompt number 21")));
+        assert!(!matches.iter().any(|line| line.contains("prompt number 3")));
+    }
 }
 
 #[cfg(all(test, feature = "export"))]

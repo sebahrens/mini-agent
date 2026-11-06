@@ -559,6 +559,15 @@ pub fn release_all() {
 }
 
 /// The error a save reports when another process owns the session.
+/// Whether this process already owns `session_id`'s lock.
+pub(crate) fn held_by_this_process(session_id: &str) -> bool {
+    lock_path(session_id).is_ok_and(|path| {
+        HELD.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&path)
+    })
+}
+
 pub(crate) fn held_elsewhere_error(session_id: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "session {session_id} is open in another mini-agent process; \

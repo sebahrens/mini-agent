@@ -1827,6 +1827,35 @@ mod bang_history_picker {
         }
     }
 
+    // mini-agent-imih0: the editor's reverse history search end to end.
+    #[test]
+    fn imih0_reverse_search_filters_history_and_restores_the_draft() {
+        let mut input = editor_with_history(&["deploy staging", "cargo test --lib", "cargo fmt"]);
+        typed(&mut input, "draft");
+        input.start_history_search();
+        assert!(input.history_search_active());
+        assert_eq!(input.buffer, "");
+        typed(&mut input, "test");
+        match input.picker.as_ref() {
+            Some(Picker::History(p, _)) => {
+                assert_eq!(p.matches().collect::<Vec<_>>(), vec!["cargo test --lib"]);
+            }
+            _ => panic!("history search must stay open"),
+        }
+        assert_eq!(
+            press(&mut input, KeyCode::Enter),
+            None,
+            "Enter inserts, never submits"
+        );
+        assert_eq!(input.buffer, "cargo test --lib");
+        assert!(!input.history_search_active());
+        input.load_text("second draft");
+        input.start_history_search();
+        input.history_search_next();
+        assert_eq!(press(&mut input, KeyCode::Esc), None);
+        assert_eq!(input.buffer, "second draft");
+    }
+
     #[test]
     fn bang_history_is_newest_first_deduplicated_and_shell_only() {
         let history = [

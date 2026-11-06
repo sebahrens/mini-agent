@@ -53,9 +53,9 @@ Completed and cancelled todos count as done; a temporarily locked store displays
 | `/sessions delete <id-or-name>` | Delete a saved session using the same selection rules. The active session cannot be deleted; load another session first. |
 | `/fork [n]` | Branch into a new session named `<name> (fork)` and switch to it. Without `n`, keep the current history. With `n`, use the one-based user-turn numbering shown by `/rewind`, keeping that input (including ordered media) and dropping its answer and later turns. The source file stays unchanged. |
 | `/rename <name>` | Rename the current session. |
-| `/history` | Show global chat history (last 10 entries across sessions). |
+| `/history [n\|text]` | Show global chat history across sessions: the last `n` entries (default 10, at most 1,000), or the newest 50 entries containing `text` (case-insensitive). `Ctrl+R` searches interactively. |
 | `/export [file]` | Export the current session to a standalone HTML page (default `mini-agent-session-<id>.html`), Markdown with `.md`, or JSONL with `.jsonl`. Quote a file name that contains spaces. Markdown preserves message bodies literally in fenced blocks and includes tool arguments; each tool result shows at most 16 KiB with an omission notice and any recorded full-output path. Export does not read that path and refuses to overwrite an existing file. Markdown is a readable transcript; use JSONL for `/import`. Requires the `export` feature (default-on). |
-| `/import <file>` | Import a session from a versioned mini-agent JSONL export (or a native session JSON document), save it, and load it. Schema markers select the format deterministically; imports are limited to 16 MiB and 10,000 messages, and external native files cannot inject a hidden redo snapshot. Requires the `export` feature. |
+| `/import <file>` | Import a session from a versioned mini-agent JSONL export (or a native session JSON document), save it, and load it. Schema markers select the format deterministically; imports accept the same 100,000 messages as a saved session and up to 48 MiB of JSONL (the 32 MiB session-snapshot cap plus framing), so any saved session can be exported and re-imported, and external native files cannot inject a hidden redo snapshot. Requires the `export` feature. |
 | `/share` | Show what sharing would publish: the HTML export's size, how many tool outputs it contains (tool output can include file contents and secrets such as `.env` values), and that a secret gist is readable by anyone with the link. Nothing is uploaded. |
 | `/share confirm` | Upload the HTML export as a secret GitHub gist and print the URL. The upload gives up after 10 seconds connecting or 30 seconds in total. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
 | `/queue` | List input queued while the agent is busy (same as `/queue ls`). Interrupting or failing the main run drops queued inputs and reports how many were dropped. |
@@ -153,6 +153,8 @@ built-in prompts, or create a custom `code.md` prompt).
 | `/permissions` | Open the approval-mode picker. |
 | `/permissions auto` | Auto-approve workspace-safe operations; equivalent to `/mode standard`. `auto-approval` is accepted as an alias. |
 | `/permissions manual` | Ask before every operation; equivalent to `/mode restrictive`. `manual-approval` is accepted as an alias. |
+| `/permissions rules` | List this project's persisted `(p)` approvals (see `persist_project_approvals` in CONFIG.md). |
+| `/permissions forget <n\|all>` | Remove persisted project approval `n` (from `/permissions rules`) or all of them; effective at the next interactive start. |
 | `/permissions yolo` | Allow everything except destructive shell commands, which still ask; equivalent to `/mode yolo`. |
 | `/mode accept` | Alias for `/mode standard`, matching `default_permission_mode`. |
 | `/sandbox` | Show the current ordinary command filesystem profile and describe `workspace`, `host-read` and `host-full`. Works while the agent runs. |
@@ -824,7 +826,8 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `Ctrl+Y` / `Alt+Y` | Yank the last deletion / rotate the kill ring. |
 | `Ctrl+G` | Open the current input in the system editor (`$EDITOR`). |
 | `Ctrl+O` | Launch `lazygit` (git TUI) in the project directory. (It was `Ctrl+H`, which many terminals send for Backspace; `Ctrl+H` is now always backspace.) tmux leaves `Ctrl+O` unbound by default; zellij's default keymap claims it for its session mode, so there switch zellij to locked mode (`Ctrl+G`) first or use zellij's `unlock-first` preset, as for `Ctrl+G` and the other editing keys. |
-| `Ctrl+R` | Cycle reasoning display: collapsed → full → off → collapsed. Saves the preference globally. Click a reasoning header to expand or collapse that block. |
+| `Ctrl+R` | Reverse history search (`history_search`): the input becomes the query and a list shows matching prompts from the global and session history, newest first (exact, prefix, then substring matches). Up/Down or `Ctrl+R` again move through matches, Enter or Tab inserts the entry for editing (never submits), Esc restores the draft. |
+| `Alt+R` | Cycle reasoning display (`cycle_reasoning`; was `Ctrl+R`): collapsed → full → off → collapsed. Saves the preference globally. Click a reasoning header to expand or collapse that block. Rebind either action under `[keys]`. |
 | `Ctrl+T` | Fold or unfold the latest tool result in place (see Tool output above). Use `/expand n` for an older one, or click a result's summary row. |
 | `Shift+Tab` | With no picker open, cycle permission modes: standard → guarded → yolo → standard. Works while idle or running, including during an approval; the existing request remains unanswered. The status line flashes the new mode. Customize the ring with global `permission_mode_cycle`; in pickers Shift+Tab still moves the highlight. |
 | `/` | Open the command picker at the start of the input. Typing filters it, and commands that start with the typed text rank first. Tab inserts the highlighted command. Enter runs a command typed in full and otherwise inserts the highlighted one. A space after a command typed in full closes completion and types the space; for a command with an argument picker (`/model `, `/models `, `/theme `, `/mode `, ...) it opens that picker instead. Argument pickers follow the monochrome setting like every other picker. Up/Down or Shift+Tab move the highlight, Backspace on the bare slash removes it, and Escape closes the picker. Backspace on an empty argument (for example after `/theme `) deletes the space and reopens completion on the command, as does deleting back to a bare `/command` word. Compatibility aliases (`/compact`, `/exit`, `/thinking`, `/tutorial`) are not suggested, but typing one in full and pressing Enter still runs it. |
@@ -891,10 +894,21 @@ Use @README.md as untrusted project context.
 
 `/fix-issue 123` submits the expanded body as one ordinary user message. Commands
 appear with their description in `/help` and slash completion. A filename stem
-uses lowercase letters, digits and single hyphens, up to 64 bytes. Built-ins and
-aliases, including `/diff`, `/commit`, `/pr` and feature-disabled commands, are
-reserved. Layers override global, then `.claude`, then `.mini-agent`; invalid
-files do not replace a valid lower layer.
+is normalised to lowercase with `_` and spaces turned into `-` and repeated `-`
+collapsed (`Fix_Issue.md` becomes `/fix-issue`); the result must be lowercase
+letters, digits and single hyphens, up to 64 bytes. One level of subdirectories
+is a namespace: `commands/deploy/ship.md` becomes `/deploy:ship` (at most 32
+namespaces per layer, same file limits). Built-ins and aliases, including
+`/diff`, `/commit`, `/pr` and feature-disabled commands, are reserved. Layers
+override global, then `.claude`, then `.mini-agent`; invalid files do not replace
+a valid lower layer. Every skipped file (invalid name, built-in collision,
+invalid template, unreadable directory) is listed under "skipped custom command
+files" in `/help` with its path and reason.
+
+Claude Code frontmatter `argument-hint`, `allowed-tools` and
+`disable-model-invocation` is accepted so ported commands load, but grants
+nothing: `allowed-tools` never widens permissions. Claude Code's `!command`
+inline shell execution is not supported; such text stays literal prompt text.
 
 Project command files are inactive until the existing project configuration is
 trusted for its exact canonical paths and config bytes. This approval covers

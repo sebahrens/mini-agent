@@ -11,8 +11,12 @@ use serde::Deserialize;
 
 use crate::session::{MessageRole, Session, SessionMessage};
 
-pub const MAX_SESSION_IMPORT_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_SESSION_IMPORT_MESSAGES: usize = 10_000;
+/// Import bounds match the persisted-session bounds, so every session that
+/// can be saved can be exported and re-imported. JSONL framing adds a few
+/// bytes per message over the 32 MiB snapshot cap, hence the headroom.
+pub const MAX_SESSION_IMPORT_BYTES: usize =
+    crate::session::storage::MAX_SESSION_BYTES + 16 * 1024 * 1024;
+pub const MAX_SESSION_IMPORT_MESSAGES: usize = crate::session::storage::MAX_SESSION_MESSAGES;
 const MAX_SESSION_IMPORT_LINE_BYTES: usize = 4 * 1024 * 1024;
 const SESSION_EXPORT_FORMAT: &str = "mini-agent-session-jsonl";
 const LEGACY_SESSION_EXPORT_FORMAT: &str = "zerostack-session-jsonl";

@@ -12,6 +12,12 @@ use crate::extras::truncate::truncate_cjk;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 
+/// Directory entries scanned for the project-notes index.
+const NOTES_INDEX_MAX_ENTRIES: usize = 4096;
+/// Newest notes whose first line is read for the index.
+const NOTES_INDEX_MAX_PREVIEWS: usize = 64;
+/// Rows shown (newest first), further bounded by the index byte budget.
+const NOTES_INDEX_MAX_ROWS: usize = 16;
 /// Hard cap on injected/returned memory, protecting the context window. This is
 /// a token-budget guard, not a memory-usage one — files are expected to be small.
 pub const MAX_INJECT_BYTES: usize = 32 * 1024;
@@ -1135,7 +1141,6 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
     /// links beneath the captured parent directory; no directory is created.
     fn notes_index(&self, budget: usize) -> Option<String> {
         const HEADER: &str = "\n\n## Project notes (name — first line; reference only)\n";
-        const OMITTED: &str = "…[additional project notes omitted]\n";
         if budget < HEADER.len() + 64 || crate::paths::artifact_disabled("memory") {
             return None;
         }
@@ -1145,17 +1150,22 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
             .join("projects")
             .join(&self.project)
             .join("notes");
-        let previews = match workspace.read_relative_first_lines(&relative, 256, 64, 1024) {
+        // Newest notes first; a large directory yields a partial index with
+        // an explicit "N more" count instead of disappearing.
+        let (previews, total, capped) = match workspace.read_relative_recent_first_lines(
+            &relative,
+            NOTES_INDEX_MAX_ENTRIES,
+            NOTES_INDEX_MAX_PREVIEWS,
+            1024,
+        ) {
             Ok(previews) => previews,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
             Err(_) => return Some(format!("{HEADER}…[project notes index unavailable]\n")),
         };
         let mut out = HEADER.to_string();
         let mut shown = 0;
-        let mut omitted = false;
         for (name, line, truncated) in previews {
             if name.len() > 128 || self.note_path(&name).is_none() {
-                omitted = true;
                 continue;
             }
             let name = escape_note_index_field(&name, 1024);
@@ -1168,17 +1178,21 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
                     ""
                 }
             );
-            if shown >= 16 || out.len() + row.len() + OMITTED.len() > budget {
-                omitted = true;
-                continue;
+            // Reserve room for the "more" line.
+            if shown >= NOTES_INDEX_MAX_ROWS || out.len() + row.len() + 96 > budget {
+                break;
             }
             out.push_str(&row);
             shown += 1;
         }
-        if omitted {
-            out.push_str(OMITTED);
+        let more = total.saturating_sub(shown);
+        if more > 0 || capped {
+            out.push_str(&format!(
+                "…[{}{more} more project notes, older first omitted; use memory search or read notes/<name>.md]\n",
+                if capped { "at least " } else { "" }
+            ));
         }
-        (shown > 0 || omitted).then_some(out)
+        (shown > 0 || more > 0 || capped).then_some(out)
     }
 
     /// Case-insensitive, multi-term keyword search over the global MEMORY.md +

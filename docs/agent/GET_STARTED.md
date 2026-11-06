@@ -308,7 +308,8 @@ Here is some keybindings to speed up your coding experience:
 
 | Keys | Action |
 | ---- | ------ |
-| `Ctrl+R` | Cycle collapsed / full / off reasoning display; click a header to expand one block |
+| `Ctrl+R` | Reverse search the prompt history; Enter inserts the match, Esc restores the draft |
+| `Alt+R` | Cycle collapsed / full / off reasoning display; click a header to expand one block |
 | `Ctrl+G` | Open input in `$EDITOR` |
 | `Ctrl+O` | Launch `lazygit` |
 | `Ctrl+P` / `Ctrl+N` | Move up/down in input; at its boundaries, navigate command history |
@@ -335,6 +336,9 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--max-budget-usd AMOUNT` | Finite nonnegative recorded-spend ceiling for the logical session, including auxiliary requests. Refused required continuation reports `budget` and exits nonzero; admitted work can exceed the estimate. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `--output-schema FILE` | With plain `-p`, validate an answer against a bounded offline JSON schema; default JSON envelope, at most two tool-free repairs. |
 | `--output text\|json\|stream-json` | With `-p`, select the final answer (default), one JSON result, or streamed NDJSON events. Machine output conflicts with `--pure-stdout`. |
+| `--input-format text\|stream-json` | With `-p`, `stream-json` reads newline-delimited JSON user messages from stdin and runs each as a turn in one session (requires `--output stream-json`; see below). |
+| `--stream-json-preview-bytes N` | With `-p`, cap stream-json text, tool-argument, tool-result and diff previews at `N` bytes (256–1,048,576; default 8,192). |
+| `--max-stdin-bytes N` | With `-p`, piped-stdin limit (per input line with `--input-format stream-json`; 1,024–67,108,864; default 1,048,576). |
 | `--quiet` | With `-p`, silence reasoning, stdin notices, and tool progress on stderr. Errors and operational warnings remain visible. Conflicts with `--pure-stdout`. |
 | `-c`, `--continue` | Continue the most recent session saved for the current workspace. Use `--session` to select one from another workspace. If another running mini-agent process owns that session, continue in a forked copy under a new ID (with a notice) instead of overwriting its turns. |
 | `-r`, `--resume` | Open a workspace-scoped session picker in a terminal. Tab explicitly toggles All workspaces, Enter resumes, and Esc cancels. Without a terminal, list bounded current-workspace rows and exit without provider work. |
@@ -388,7 +392,7 @@ reader uses the same interrupt and 10-second forced-stop grace as an active head
 provider/model, and `ephemeral`), `assistant_text`, `tool_call`, `tool_result`, `usage`, optional
 `goal` updates, optional `file_mutation` records, and a final `result`. Calls and results share `id`; `provider_call_id` records
 the provider identifier separately (its preview is capped at 512 bytes). Tool result events include `is_error`; text/arguments and
-tool previews are limited to 8 KiB and mark truncation. JSON escapes terminal control and deceptive
+tool previews are limited to 8 KiB (`--stream-json-preview-bytes`) and mark truncation. JSON escapes terminal control and deceptive
 Unicode characters while preserving decoded argument data. These events reflect observed SDK
 ordering, including intermediate assistant text. Usage events contain observed per-request
 `usage` deltas and per-round `cumulative` totals; the final result is authoritative for normalized
@@ -402,6 +406,21 @@ reports `omitted_events` explicitly if a larger atomic batch overflows it. Text 
 retain their existing schemas. Diagnostics stay on stderr. A terminal failure still
 emits a final result and retains the existing nonzero exit status. Closing stdout stops output
 while allowing owned work cleanup and session persistence to finish.
+
+#### Multi-turn stream-json input
+
+`mini-agent -p --input-format stream-json --output stream-json` keeps one session open for
+programmatic multi-turn control. Each stdin line is one user message, in Claude Code's shape
+`{"type":"user","message":{"role":"user","content":"..."}}` (content may also be an array of
+`{"type":"text","text":"..."}` blocks) or the flat `{"type":"user","content":"..."}`. An argument
+prompt, if given, runs first. Every turn emits its normal records (`system`, `assistant_text`,
+`tool_call`, `tool_result`, `usage`, …) and its own final `result`; the next line is read only
+after that `result`. Malformed, non-`user`, non-text or oversized lines produce an
+`{"type":"input_error","message":...}` record and are skipped. The run ends at stdin EOF and exits
+nonzero if any turn failed. Approvals behave as in any headless run (no prompts; `Ask` denies
+unless an opted-in `PermissionRequest` hook answers). Provider-native (Anthropic) session history
+is not supported in this mode yet; use `--acp` for multi-turn native sessions. Partial-message
+(token-delta) events are not emitted.
 
 Runtime stdout and stderr writes preserve backpressure and event order. Consumers should drain
 both pipes. If a consumer holds either sink open but stops reading, the pending write remains

@@ -1627,7 +1627,7 @@ fn memory62_notes_index_post_escape_caps_preserve_original_priority_bytes() {
     assert_eq!(after.matches("</memory>").count(), 1);
     assert!(memory62_body(&after).len() <= MAX_INJECT_BYTES);
     assert!(index.lines().filter(|line| line.starts_with("- ")).count() <= 16);
-    assert!(index.contains("additional project notes omitted"));
+    assert!(index.contains("more project notes"));
     m.write(
         WriteTarget::LongTerm,
         &"X</memory>雪".repeat(9000),
@@ -1696,9 +1696,11 @@ fn memory62_note_scan_limits_fail_closed_without_partial_selection() {
             )
             .is_err()
     );
+    // The context index degrades to the newest notes plus a count
+    // (mini-agent-esuz5) instead of disappearing.
     let block = m.context_block().unwrap();
-    assert!(block.contains("project notes index unavailable"));
-    assert!(!block.contains("secret"));
+    assert!(!block.contains("project notes index unavailable"));
+    assert!(block.contains("49 more project notes"), "{block}");
     for i in 0..65 {
         fs::remove_file(pdir(&m).join(format!("notes/n{i:02}.md"))).unwrap();
     }
@@ -2143,4 +2145,29 @@ fn plain_append_refuses_symlink_hardlink_and_directory_targets() {
     }
     assert_eq!(fs::read_to_string(&outside).unwrap(), "outside\n");
     cleanup(&m);
+}
+
+// mini-agent-esuz5: newest-first, partial index with a count, 500 notes.
+#[test]
+fn esuz5_notes_index_lists_newest_first_and_survives_500_notes() {
+    let (_owner, m) = memory62_fixture();
+    let base = std::time::SystemTime::now() - std::time::Duration::from_secs(100_000);
+    for i in 0..500 {
+        let path = pdir(&m).join(format!("notes/note{i:03}.md"));
+        fs::write(&path, format!("first line {i}")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(base + std::time::Duration::from_secs(i as u64))
+            .unwrap();
+    }
+    let block = m.context_block().unwrap();
+    assert!(block.contains("\"note499\""), "newest note is listed");
+    assert!(!block.contains("\"note000\""), "oldest note is omitted");
+    let first = block.find("\"note499\"").unwrap();
+    let second = block.find("\"note498\"").unwrap();
+    assert!(first < second, "newest first");
+    assert!(block.contains("more project notes"));
+    assert!(!block.contains("index unavailable"));
 }

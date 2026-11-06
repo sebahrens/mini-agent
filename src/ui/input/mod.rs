@@ -772,6 +772,41 @@ impl InputEditor {
         self.picker = Some(Picker::Bang(picker));
     }
 
+    /// Open the Ctrl+R reverse history search. The current draft is kept and
+    /// restored on Esc; the buffer holds the query meanwhile.
+    pub fn start_history_search(&mut self) {
+        let (items, full) = crate::ui::pickers::history::history_items(&self.history);
+        if items.is_empty() {
+            return;
+        }
+        let mut picker = ListPicker::new();
+        picker.set_monochrome(self.monochrome);
+        picker.set_accent_color(self.accent);
+        picker.set_items(items);
+        picker.activate();
+        let draft = std::mem::take(&mut self.buffer);
+        let search = crate::ui::pickers::history::HistorySearch {
+            draft,
+            cursor: self.cursor,
+            full,
+        };
+        self.cursor = 0;
+        self.history_pos = None;
+        self.picker = Some(Picker::History(picker, Box::new(search)));
+    }
+
+    /// Whether the reverse history search is open.
+    pub fn history_search_active(&self) -> bool {
+        matches!(&self.picker, Some(Picker::History(p, _)) if p.active)
+    }
+
+    /// The search key pressed again: move to the next (older) match.
+    pub fn history_search_next(&mut self) {
+        if let Some(Picker::History(picker, _)) = &mut self.picker {
+            picker.select_next();
+        }
+    }
+
     pub fn start_command_picker(&mut self) {
         let mut picker = ListPicker::with_static_commands();
         picker.append_described_items(self.custom_commands.clone());

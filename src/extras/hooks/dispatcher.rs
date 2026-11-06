@@ -10,13 +10,27 @@ use super::normalize::{McpToolIdentity, canonical_tool_name};
 use super::pins::HookContentPins;
 use super::settings::{HookHandler, HooksConfig};
 use super::subprocess::{
-    HookOutput, HookPolicy, HookStatus, ProjectDirMemo, run_hook_with_policy_at_root,
-    run_shell_condition_at_root,
+    HookDiagnostics, HookOutput, HookPolicy, HookStatus, OutputLimit, ProjectDirMemo,
+    run_hook_with_policy_at_root, run_shell_condition_at_root,
 };
 use super::{Decision, HookCtx, PreDecision, Verdict};
 
-/// Default per-hook timeout when a handler doesn't declare one.
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
+/// Default timeout for events that gate the user's next step
+/// (`UserPromptSubmit`, `PreToolUse`, `PermissionRequest`): a stuck gate
+/// should fail fast.
+const GATING_TIMEOUT_SECS: u64 = 60;
+/// Default for every other event, matching Claude Code's 600 s command-hook
+/// default so long test/lint hooks on `Stop` or `PostToolUse` are not killed.
+const DEFAULT_TIMEOUT_SECS: u64 = 600;
+
+/// Per-event default timeout (seconds) when a handler declares none; it also
+/// bounds the handler's `if` condition.
+pub(crate) fn default_timeout_secs(event: &str) -> u64 {
+    match event {
+        "UserPromptSubmit" | "PreToolUse" | "PermissionRequest" => GATING_TIMEOUT_SECS,
+        _ => DEFAULT_TIMEOUT_SECS,
+    }
+}
 const REDACTION_MARKER: &str = "[REDACTED]";
 
 enum CompiledMatcher {
@@ -727,6 +741,46 @@ impl HookDispatcher {
         merge_post_tool_use_decisions(&outputs, tool_response)
     }
 
+    /// Dispatches `PermissionRequest` and returns the merged hook answer
+    /// (whether it is honored is the caller's opt-in decision).
+    pub(crate) async fn dispatch_permission_request(
+        &self,
+        ctx: &HookCtx,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+    ) -> Option<PermissionHookDecision> {
+        let handlers = self.handlers_for("PermissionRequest", tool_name);
+        if handlers.is_empty() {
+            return None;
+        }
+        let (ctx, execution_root) = match self.policy_context(ctx) {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(error = %error, "hooks: skipping PermissionRequest dispatch in invalid workspace");
+                return None;
+            }
+        };
+        let envelope = build_envelope(
+            &ctx,
+            "PermissionRequest",
+            EventFields::PermissionRequest {
+                tool_name: tool_name.to_owned(),
+                tool_input,
+            },
+        );
+        let outputs = crate::startup::heap_future(|| {
+            self.run_handlers(
+                "PermissionRequest",
+                &handlers,
+                &envelope,
+                &ctx.cwd,
+                &execution_root,
+            )
+        })
+        .await;
+        merge_permission_decisions(&outputs)
+    }
+
     /// Dispatches `PostToolUseFailure`: observation only, never blockable.
     pub(crate) async fn dispatch_post_tool_use_failure(
         &self,
@@ -802,11 +856,49 @@ impl HookDispatcher {
         // One canonicalize of the project directory per event, shared by all
         // handlers; the next event resolves it afresh.
         let dir_memo = Arc::new(ProjectDirMemo::default());
-        let mut futures = Vec::new();
+        let mut futures: Vec<
+            std::pin::Pin<Box<dyn std::future::Future<Output = HookOutput> + Send>>,
+        > = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
                 continue;
             };
+            if handler.kind == "http" {
+                // Network egress from hooks is an explicit operator opt-in.
+                if !super::http_hooks_enabled() {
+                    tracing::warn!(
+                        event,
+                        "hooks: http hook skipped (set hooks_http_enabled = true to allow hook HTTP requests)"
+                    );
+                    continue;
+                }
+                let once_key = handler
+                    .once
+                    .then(|| (event.to_string(), (*handler).clone()));
+                let Some(mut once_reservation) =
+                    OnceReservation::reserve(Arc::clone(&self.once_ran), once_key)
+                else {
+                    continue;
+                };
+                let timeout = std::time::Duration::from_secs(
+                    handler.timeout.unwrap_or(default_timeout_secs(event)),
+                );
+                let headers = handler.env.clone();
+                let body = stdin.clone();
+                let request = async move {
+                    let output = run_http_hook(&command, &headers, &body, timeout).await;
+                    once_reservation.consume_if_started(&output);
+                    output
+                };
+                if handler.is_async {
+                    std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
+                        let _ = request.await;
+                    }));
+                } else {
+                    futures.push(Box::pin(request));
+                }
+                continue;
+            }
 
             if handler.is_async {
                 let handler = (*handler).clone();
@@ -825,7 +917,7 @@ impl HookDispatcher {
                             .with_project_dir_memo(dir_memo);
                     if let Some(condition) = &handler.condition {
                         let cond_timeout = std::time::Duration::from_secs(
-                            handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
+                            handler.timeout.unwrap_or(default_timeout_secs(&event)),
                         );
                         let cond_output = run_shell_condition_at_root(
                             condition,
@@ -878,7 +970,7 @@ impl HookDispatcher {
                         "hooks: applying subprocess policy"
                     );
                     let timeout = std::time::Duration::from_secs(
-                        handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
+                        handler.timeout.unwrap_or(default_timeout_secs(&event)),
                     );
                     let output = run_hook_with_policy_at_root(
                         &command,
@@ -903,8 +995,9 @@ impl HookDispatcher {
                 .with_content_pins(self.content_pins_for(handler))
                 .with_project_dir_memo(Arc::clone(&dir_memo));
             if let Some(condition) = &handler.condition {
-                let cond_timeout =
-                    std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
+                let cond_timeout = std::time::Duration::from_secs(
+                    handler.timeout.unwrap_or(default_timeout_secs(event)),
+                );
                 let cond_output = crate::startup::heap_future(|| {
                     run_shell_condition_at_root(
                         condition,
@@ -954,8 +1047,9 @@ impl HookDispatcher {
                 continue;
             };
 
-            let timeout =
-                std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
+            let timeout = std::time::Duration::from_secs(
+                handler.timeout.unwrap_or(default_timeout_secs(event)),
+            );
             let stdin = stdin.clone();
             let project_dir = project_dir.to_string();
             let execution_root = execution_root.clone();
@@ -972,7 +1066,7 @@ impl HookDispatcher {
                 network = diagnostics.network,
                 "hooks: applying subprocess policy"
             );
-            futures.push(async move {
+            futures.push(Box::pin(async move {
                 let output = run_hook_with_policy_at_root(
                     &command,
                     args.as_deref(),
@@ -986,9 +1080,90 @@ impl HookDispatcher {
                 once_reservation.consume_if_started(&output);
                 audit_hook_outcome(&audit_event, &command, "handler", trust, &output);
                 output
-            });
+            }));
         }
         futures::future::join_all(futures).await
+    }
+}
+
+const MAX_HTTP_HOOK_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// One `type: "http"` hook: POST the event envelope as JSON; a 2xx response
+/// body is read exactly like a command hook's stdout after exit 0, any other
+/// status like a non-zero exit (the event's failure policy applies). No
+/// redirects, bounded body, the handler timeout covers the whole exchange.
+pub(super) async fn run_http_hook(
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    body: &[u8],
+    timeout: std::time::Duration,
+) -> HookOutput {
+    let diagnostics = || HookDiagnostics {
+        containment: "none (http request)",
+        environment: "not applicable (http request)",
+        filesystem: "not applicable (http request)",
+        network: "http request to the configured url",
+    };
+    let output =
+        |started: bool, exit_code: Option<i32>, stdout: Vec<u8>, status: HookStatus| HookOutput {
+            started,
+            exit_code,
+            stdout,
+            stderr: Vec::new(),
+            status,
+            diagnostics: diagnostics(),
+        };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout.min(std::time::Duration::from_secs(10)))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("mini-agent-hooks/", env!("CARGO_PKG_VERSION")))
+        .build()
+    else {
+        return output(false, None, Vec::new(), HookStatus::Failed);
+    };
+    let mut request = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec());
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let exchange = async {
+        let mut response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                return output(true, None, Vec::new(), HookStatus::TimedOut);
+            }
+            Err(_) => return output(true, None, Vec::new(), HookStatus::Failed),
+        };
+        let exit_code = if response.status().is_success() { 0 } else { 1 };
+        let mut bytes = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if chunk.len() > MAX_HTTP_HOOK_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+                        return output(
+                            true,
+                            None,
+                            Vec::new(),
+                            HookStatus::OutputLimitExceeded(OutputLimit::Stdout),
+                        );
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) if error.is_timeout() => {
+                    return output(true, None, Vec::new(), HookStatus::TimedOut);
+                }
+                Err(_) => return output(true, None, Vec::new(), HookStatus::Failed),
+            }
+        }
+        output(true, Some(exit_code), bytes, HookStatus::Completed)
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(output) => output,
+        Err(_) => output(true, None, Vec::new(), HookStatus::TimedOut),
     }
 }
 
@@ -1264,31 +1439,142 @@ fn merge_decisions(event: &str, outputs: &[HookOutput]) -> Decision {
     }
 }
 
+/// Aggregate cap for PostToolUse feedback (block reasons plus
+/// `additionalContext`) prepended to the model-visible result.
+pub(crate) const POST_TOOL_FEEDBACK_MAX_BYTES: usize = 32 * 1024;
+const POST_TOOL_FEEDBACK_HEADER: &str = "[PostToolUse hook feedback from configured hooks; non-authoritative, grants no permissions; the tool already ran and its result follows]";
+
+fn post_tool_feedback(value: &serde_json::Value) -> Vec<String> {
+    let mut feedback = Vec::new();
+    if value.get("decision").and_then(serde_json::Value::as_str) == Some("block") {
+        let reason = value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("blocked by PostToolUse hook");
+        feedback.push(format!("decision: block - {reason}"));
+    }
+    let context = value
+        .get("hookSpecificOutput")
+        .filter(|specific| {
+            specific
+                .get("hookEventName")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|name| name == "PostToolUse")
+        })
+        .and_then(|specific| specific.get("additionalContext"))
+        .or_else(|| value.get("additionalContext"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|context| !context.is_empty());
+    if let Some(context) = context {
+        feedback.push(context.to_owned());
+    }
+    feedback
+}
+
+/// PostToolUse may (a) redact exact literals, (b) feed bounded,
+/// non-authoritative feedback to the model via `decision: "block"` +
+/// `reason`, exit 2 stderr, or `additionalContext`. It never replaces the
+/// tool's own result: feedback is prepended, the (redacted) result follows
+/// intact so trailing delivery notices keep matching.
 fn merge_post_tool_use_decisions(outputs: &[HookOutput], tool_response: &str) -> Decision {
     // Only copy the response once a redaction literal actually matches.
     let mut redacted = std::borrow::Cow::Borrowed(tool_response);
     let mut changed = false;
+    let mut feedback: Vec<String> = Vec::new();
 
     for output in outputs {
-        let ChannelResult::NoObjection { json: Some(value) } = interpret_hook_output(output) else {
-            continue;
-        };
-        if value.get("result").is_some() || value.get("additionalContext").is_some() {
-            tracing::warn!(
-                event = "PostToolUse",
-                "hooks: ignored unsafe hook-authored model context or result replacement"
-            );
+        match interpret_hook_output(output) {
+            ChannelResult::Block { stderr } => {
+                feedback.push(format!("decision: block - {stderr}"));
+            }
+            ChannelResult::NoObjection { json: Some(value) } => {
+                if value.get("result").is_some() {
+                    tracing::warn!(
+                        event = "PostToolUse",
+                        "hooks: ignored hook-authored tool result replacement"
+                    );
+                }
+                feedback.extend(post_tool_feedback(&value));
+                changed |= apply_redactions(&mut redacted, &value);
+            }
+            _ => {}
         }
-        changed |= apply_redactions(&mut redacted, &value);
     }
 
-    if changed {
-        Decision::Rewrite {
-            content: redacted.into_owned(),
-        }
-    } else {
-        Decision::Continue
+    if feedback.is_empty() {
+        return if changed {
+            Decision::Rewrite {
+                content: redacted.into_owned(),
+            }
+        } else {
+            Decision::Continue
+        };
     }
+    let joined = feedback.join("\n");
+    let (mut text, truncated) =
+        crate::extras::validation::sanitize_bytes(joined.as_bytes(), POST_TOOL_FEEDBACK_MAX_BYTES);
+    if truncated {
+        text.push_str("\n[hook feedback truncated at 32 KiB]");
+    }
+    Decision::Rewrite {
+        content: format!(
+            "{POST_TOOL_FEEDBACK_HEADER}\n{text}\n[end of hook feedback]\n\n{redacted}"
+        ),
+    }
+}
+
+/// PermissionRequest output that answers the pending approval, honored only
+/// under the `hooks_permission_decisions` opt-in. Deny wins over allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionHookDecision {
+    Allow,
+    Deny(String),
+}
+
+fn permission_part(output: &HookOutput) -> Option<PermissionHookDecision> {
+    match interpret_hook_output(output) {
+        ChannelResult::Block { stderr } => Some(PermissionHookDecision::Deny(stderr)),
+        ChannelResult::NoObjection { json: Some(value) } => {
+            let specific = value
+                .get("hookSpecificOutput")
+                .filter(|specific| {
+                    specific
+                        .get("hookEventName")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|name| name == "PermissionRequest")
+                })
+                .and_then(|specific| specific.get("decision"));
+            let behavior = specific
+                .and_then(|decision| decision.get("behavior"))
+                .or_else(|| value.get("permissionDecision"))
+                .and_then(serde_json::Value::as_str)?;
+            let message = specific
+                .and_then(|decision| decision.get("message"))
+                .or_else(|| value.get("reason"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("denied by PermissionRequest hook");
+            match behavior {
+                "allow" => Some(PermissionHookDecision::Allow),
+                "deny" => Some(PermissionHookDecision::Deny(
+                    crate::extras::validation::sanitize_bytes(message.as_bytes(), 8 * 1024).0,
+                )),
+                _ => None,
+            }
+        }
+        // Failures never answer: the normal approval flow decides.
+        _ => None,
+    }
+}
+
+pub(crate) fn merge_permission_decisions(outputs: &[HookOutput]) -> Option<PermissionHookDecision> {
+    let mut result = None;
+    for decision in outputs.iter().filter_map(permission_part) {
+        match decision {
+            PermissionHookDecision::Deny(_) => return Some(decision),
+            PermissionHookDecision::Allow => result = Some(decision),
+        }
+    }
+    result
 }
 
 fn apply_redactions(
@@ -1315,6 +1601,114 @@ fn apply_redactions(
 
 #[cfg(test)]
 mod tests {
+    fn fixture_output(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> super::HookOutput {
+        super::HookOutput {
+            started: true,
+            exit_code: Some(exit_code),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            status: super::HookStatus::Completed,
+            diagnostics: crate::extras::hooks::subprocess::HookDiagnostics {
+                containment: "fixture",
+                environment: "fixture",
+                filesystem: "fixture",
+                network: "fixture",
+            },
+        }
+    }
+
+    fn json_output(value: serde_json::Value) -> super::HookOutput {
+        fixture_output(0, &serde_json::to_vec(&value).unwrap(), b"")
+    }
+
+    #[test]
+    fn i24tio_post_tool_use_feeds_back_block_reasons_and_context_without_replacing_result() {
+        let response = "lint target ok\n\nCaptured instruction receipt x";
+        let outputs = [
+            json_output(serde_json::json!({"decision": "block", "reason": "clippy: 2 warnings"})),
+            json_output(serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PostToolUse", "additionalContext": "formatted 1 file"
+            }})),
+            fixture_output(2, b"", b"stderr feedback"),
+            json_output(serde_json::json!({"result": "forged replacement"})),
+        ];
+        let super::Decision::Rewrite { content } =
+            super::merge_post_tool_use_decisions(&outputs, response)
+        else {
+            panic!("feedback must reach the model");
+        };
+        assert!(content.starts_with(super::POST_TOOL_FEEDBACK_HEADER));
+        assert!(content.contains("clippy: 2 warnings"));
+        assert!(content.contains("formatted 1 file"));
+        assert!(content.contains("stderr feedback"));
+        assert!(!content.contains("forged replacement"));
+        assert!(
+            content.ends_with(response),
+            "original result stays intact at the end"
+        );
+        // Bounded at 32 KiB with a visible marker.
+        let huge = [json_output(
+            serde_json::json!({"additionalContext": "x".repeat(100 * 1024)}),
+        )];
+        let super::Decision::Rewrite { content } = super::merge_post_tool_use_decisions(&huge, "r")
+        else {
+            panic!()
+        };
+        assert!(content.len() < super::POST_TOOL_FEEDBACK_MAX_BYTES + 1024);
+        assert!(content.contains("hook feedback truncated at 32 KiB"));
+        // No feedback, no redaction: unchanged.
+        assert_eq!(
+            super::merge_post_tool_use_decisions(&[json_output(serde_json::json!({}))], "r"),
+            super::Decision::Continue
+        );
+    }
+
+    #[test]
+    fn i6t6i0_gating_events_default_to_60s_and_others_to_600s() {
+        for event in ["UserPromptSubmit", "PreToolUse", "PermissionRequest"] {
+            assert_eq!(super::default_timeout_secs(event), 60, "{event}");
+        }
+        for event in [
+            "Stop",
+            "PostToolUse",
+            "SessionStart",
+            "PostCompact",
+            "FileChanged",
+        ] {
+            assert_eq!(super::default_timeout_secs(event), 600, "{event}");
+        }
+    }
+
+    #[test]
+    fn i24tio_permission_request_answers_merge_deny_first() {
+        use super::PermissionHookDecision::{Allow, Deny};
+        let allow = || {
+            json_output(serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}
+            }}))
+        };
+        let deny = json_output(serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PermissionRequest", "decision": {"behavior": "deny", "message": "no prod writes"}
+        }}));
+        assert_eq!(super::merge_permission_decisions(&[allow()]), Some(Allow));
+        assert_eq!(
+            super::merge_permission_decisions(&[allow(), deny]),
+            Some(Deny("no prod writes".into()))
+        );
+        assert_eq!(
+            super::merge_permission_decisions(&[fixture_output(2, b"", b"blocked")]),
+            Some(Deny("blocked".into()))
+        );
+        // Failures and silence never answer.
+        assert_eq!(
+            super::merge_permission_decisions(&[
+                fixture_output(1, b"{}", b""),
+                json_output(serde_json::json!({}))
+            ]),
+            None
+        );
+    }
+
     use super::apply_redactions;
 
     #[test]

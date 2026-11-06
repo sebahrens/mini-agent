@@ -73,6 +73,17 @@ pub enum OutputFormat {
     StreamJson,
 }
 
+/// `--input-format`: how `-p` reads its prompt(s).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InputFormat {
+    /// One prompt from the arguments (plus optional piped stdin).
+    #[default]
+    Text,
+    /// Newline-delimited JSON user messages on stdin, one turn each, in one
+    /// session (requires `--output stream-json`).
+    StreamJson,
+}
+
 #[derive(Parser, Debug, Default, Clone)]
 #[command(name = "mini-agent", version,
     long_version = concat!(env!("CARGO_PKG_VERSION"), "\nbuild: ", env!("MINI_AGENT_BUILD_FINGERPRINT"), "\ntarget: ", env!("MINI_AGENT_BUILD_TARGET")),
@@ -154,6 +165,33 @@ pub struct Cli {
         help = "With -p: output format (text, json, or stream-json)"
     )]
     pub output: Option<OutputFormat>,
+
+    #[arg(
+        long = "input-format",
+        value_name = "FORMAT",
+        value_enum,
+        requires = "print",
+        help = "With -p: input format; stream-json reads one JSON user message per stdin line and runs each as a turn (requires --output stream-json)"
+    )]
+    pub input_format: Option<InputFormat>,
+
+    #[arg(
+        long = "stream-json-preview-bytes",
+        value_name = "BYTES",
+        requires = "print",
+        value_parser = clap::value_parser!(u32).range(256..=1_048_576),
+        help = "With -p: cap for stream-json text, tool argument, tool result and diff previews (default 8192)"
+    )]
+    pub stream_json_preview_bytes: Option<u32>,
+
+    #[arg(
+        long = "max-stdin-bytes",
+        value_name = "BYTES",
+        requires = "print",
+        value_parser = clap::value_parser!(u32).range(1024..=67_108_864),
+        help = "With -p: piped stdin limit, per line with --input-format stream-json (default 1048576)"
+    )]
+    pub max_stdin_bytes: Option<u32>,
 
     #[arg(
         long,
@@ -759,7 +797,10 @@ pub struct Cli {
         help = "Stop new model requests/effects once recorded session spend reaches this USD estimate")]
     pub max_budget_usd: Option<f64>,
 
-    #[arg(long = "max-agent-turns", help = "Maximum agent turns")]
+    #[arg(
+        long = "max-agent-turns",
+        help = "Maximum model round trips per prompt (default 1000)"
+    )]
     pub max_agent_turns: Option<usize>,
 
     #[arg(long = "temperature", help = "Model temperature (0.0 to 2.0)")]
@@ -1152,6 +1193,10 @@ impl Cli {
         Self::from_arg_matches(&command.try_get_matches_from(args)?)
     }
 
+    pub fn input_format(&self) -> InputFormat {
+        self.input_format.unwrap_or_default()
+    }
+
     pub fn output_format(&self) -> OutputFormat {
         self.output.unwrap_or_else(|| {
             if self.output_schema.is_some() {
@@ -1308,7 +1353,9 @@ impl Cli {
     }
 
     pub fn resolve_max_agent_turns(&self, cfg: &config::Config) -> usize {
-        self.max_agent_turns.or(cfg.max_agent_turns).unwrap_or(200)
+        self.max_agent_turns
+            .or(cfg.max_agent_turns)
+            .unwrap_or(DEFAULT_MAX_AGENT_TURNS)
     }
 
     pub fn resolve_no_context_files(&self, cfg: &config::Config) -> bool {
@@ -2866,5 +2913,30 @@ pub fn resolve_response_max_tokens(explicit: Option<u64>, provider: &str, model:
         (Some(explicit), None) => explicit,
         (None, Some(model_max)) => model_max.min(DEFAULT_MAX_TOKENS_CEILING),
         (None, None) => FALLBACK_MAX_TOKENS,
+    }
+}
+
+/// Model round trips per user prompt when neither `--max-agent-turns` nor
+/// `max_agent_turns` is set. Spend (`turn_token_budget`, `max_budget_usd`,
+/// session token ceilings) is the primary safety net; this only stops a
+/// runaway loop. Hitting it keeps completed work (mini-agent-d01h4).
+pub(crate) const DEFAULT_MAX_AGENT_TURNS: usize = 1000;
+
+/// Suffix of the turn-budget exhaustion error: what was kept and how to go on.
+pub(crate) const MAX_AGENT_TURNS_HINT: &str = " Completed tool work and messages are kept in the session; ask the agent to continue (or rerun with --continue), or raise max_agent_turns / --max-agent-turns.";
+
+#[cfg(test)]
+mod d01h4_tests {
+    #[test]
+    fn max_agent_turns_defaults_to_a_thousand_and_explicit_values_win() {
+        let cli = super::Cli::default();
+        let cfg = crate::config::Config::default();
+        assert_eq!(cli.resolve_max_agent_turns(&cfg), 1000);
+        let cfg = crate::config::Config {
+            max_agent_turns: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(cli.resolve_max_agent_turns(&cfg), 7);
+        assert!(super::MAX_AGENT_TURNS_HINT.contains("continue"));
     }
 }

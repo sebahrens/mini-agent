@@ -125,6 +125,34 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `pulldown-cmark` is updated to 0.13.5 for RUSTSEC-2026-0414 (exponential event growth with
   `ENABLE_WIKILINKS`).
 
+### Added
+
+- Hooks: new observation events `PostCompact`, `StopFailure`, `InstructionsLoaded`,
+  `FileChanged` and `CwdChanged`; an opt-in `type: "http"` handler (`hooks_http_enabled`, default
+  off); unsupported handler types are skipped per hook with a warning instead of rejecting the
+  whole settings file; `/hooks` lists supported and undispatched events and handler types.
+- `PostToolUse` hooks can feed back to the model (`decision: "block"` + `reason`, exit 2 stderr,
+  `additionalContext`; 32 KiB, framed as a non-authoritative notice prepended to the result), and
+  with the new opt-in `hooks_permission_decisions` a `PermissionRequest` hook can answer an
+  approval with allow-once or deny, including in headless runs.
+- Custom slash commands: file stems are normalised (`Fix_Issue.md` → `/fix-issue`), one level of
+  subdirectories becomes a namespace (`/deploy:ship`), Claude Code `argument-hint`/`allowed-tools`
+  frontmatter is accepted (granting nothing), and `/help` lists every skipped command file with its
+  reason.
+- Headless `--input-format stream-json` (with `--output stream-json`) runs one turn per JSON user
+  line on stdin in one session; `--stream-json-preview-bytes` and `--max-stdin-bytes` make the
+  8 KiB preview and 1 MiB stdin limits configurable.
+- Opt-in `persist_project_approvals`: TUI approval prompts offer `(p) always allow in this
+  project`, stored privately per workspace in the state directory (never in the repository) and
+  loaded at interactive startup; `/permissions rules` and `/permissions forget <n|all>` manage
+  them. Headless runs are unaffected and deny rules still win.
+- `Ctrl+R` opens an incremental reverse search over the prompt history (rebindable as
+  `history_search`); reasoning-display cycling moves to `Alt+R` (`cycle_reasoning`).
+  `/history [n|text]` shows the last `n` entries or matching ones instead of only the last 10.
+- Agent Skills: optional always-visible name/description catalog (`skills_catalog_bytes`, default
+  off) and configurable `skills_max_selected` (3), `skills_score_floor` (0.20) and
+  `skills_max_packages` (64).
+
 ### Fixed
 
 - Self-bounded tools (`read`, `shell`, `js`, `web_fetch`, ...) now meet a final per-result
@@ -160,6 +188,32 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `grep` and `find_files` search budgets are configurable (`[tool_limits] search_max_entries`,
   `search_max_depth`, `search_max_bytes`), stated in the tool descriptions, and a partial result
   names the first unsearched path.
+- Hook handlers without a `timeout` now default to 600 s except on the gating events
+  `UserPromptSubmit`, `PreToolUse` and `PermissionRequest`, which keep 60 s (was 60 s everywhere).
+- The project-notes memory index lists the newest notes first (by mtime) with an "N more" count and
+  keeps working with hundreds of notes, instead of 16 alphabetical rows that disappeared above 64
+  `.md` files or 256 entries.
+- `max_agent_turns` now defaults to 1000 model round trips per prompt (was 200), with spend caps as
+  the safety net, and the exhaustion error says that completed work is kept and how to continue.
+- `/import` accepts the persisted-session bounds (100,000 messages; 48 MiB JSONL for the 32 MiB
+  snapshot cap plus framing) instead of 10,000 messages / 16 MiB, so every saved session that
+  `/export` writes as JSONL can be re-imported.
+- ACP (IDE) sessions no longer force a paid summarization after 128 user turns or 2 MiB regardless
+  of the model: compaction follows token pressure against the routed model's context window under
+  `compact_enabled` (as in the TUI), the byte guard scales with the window, and the turn cap,
+  byte guard, session cap and client MCP server cap are configurable (`acp_history_max_turns`,
+  `acp_history_max_bytes`, `acp_max_sessions`, `acp_max_client_mcp_servers`).
+- `/sessions` and the `--resume` picker sort the whole sessions directory by mtime before applying
+  the 2,048-entry cap, and a workspace listing skips other workspaces' sessions via a 4 KiB head
+  peek instead of charging them to the 256 MiB budget, so the newest current-workspace sessions are
+  always listed. New `session_retention_days` (default 0: keep forever) prunes stale, unlocked
+  session snapshots at interactive startup.
+- Nested `AGENTS.md`/`CLAUDE.md` loading no longer makes `read`/`edit`/`write` fail after 64
+  distinct directories, 64 sources or 128 KiB: directories without instruction files no longer
+  count, budget overflow skips the directory with a visible "sources not shown" notice, a source
+  over 16 KiB is truncated with a marker, an oversized notice defers sources instead of failing, and
+  more than 128 delivery receipts evict the oldest instead of terminating the run (CONFIG.md
+  "Nested instruction limits").
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

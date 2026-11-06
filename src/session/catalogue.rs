@@ -9,7 +9,11 @@ use serde::{Deserialize, Deserializer};
 
 use super::{SESSION_TITLE_CHARS, Session};
 
+/// Full header reads per listing, applied after the newest-first mtime sort
+/// (and, for workspace listings, after the cheap working-directory peek).
 pub(crate) const MAX_ENTRIES: usize = 2_048;
+/// Directory entries stat'ed and sorted per listing. Only metadata is kept.
+const MAX_SCAN_ENTRIES: usize = 50_000;
 pub(crate) const MAX_ROWS: usize = 100;
 pub(crate) const MAX_FILE_BYTES: u64 = super::storage::MAX_SESSION_BYTES as u64;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -18,11 +22,15 @@ const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 struct ScanLimits {
     file_bytes: u64,
     total_bytes: u64,
+    scan_entries: usize,
+    header_reads: usize,
 }
 
 const SCAN_LIMITS: ScanLimits = ScanLimits {
     file_bytes: MAX_FILE_BYTES,
     total_bytes: MAX_TOTAL_BYTES,
+    scan_entries: MAX_SCAN_ENTRIES,
+    header_reads: MAX_ENTRIES,
 };
 const MAX_MESSAGES: usize = 100_000;
 
@@ -416,7 +424,7 @@ fn list_with_limits(
     }
     let mut entries = Vec::new();
     for (index, entry) in std::fs::read_dir(&directory)?.enumerate() {
-        if index >= MAX_ENTRIES {
+        if index >= limits.scan_entries {
             catalogue.truncated = true;
             break;
         }
@@ -438,6 +446,7 @@ fn list_with_limits(
     }
     entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let mut total = 0_u64;
+    let mut header_reads = 0_usize;
     for (_, path) in entries {
         retained.validate().map_err(anyhow::Error::msg)?;
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -448,7 +457,11 @@ fn list_with_limits(
             catalogue.skipped += 1;
             continue;
         }
-        let candidate = (|| -> anyhow::Result<Header> {
+        if header_reads >= limits.header_reads {
+            catalogue.truncated = true;
+            break;
+        }
+        let candidate = (|| -> anyhow::Result<Option<Header>> {
             let relative = std::path::PathBuf::from(format!("{stem}.json"));
             let mut file = if readonly {
                 let file = retained.open_regular_relative(&relative)?;
@@ -461,6 +474,17 @@ fn list_with_limits(
                 .then(|| crate::fs::checked_file_metadata(&file))
                 .transpose()?;
             retained.validate().map_err(anyhow::Error::msg)?;
+            if !all {
+                // Another workspace's session must not spend this listing's
+                // byte or header budget: peek its working directory first.
+                use std::io::{Seek, SeekFrom};
+                let peeked = super::storage::peek_session_string_from(&mut file, "working_dir");
+                if peeked.is_some_and(|saved| !same_workspace(&saved, workspace)) {
+                    return Ok(None);
+                }
+                file.seek(SeekFrom::Start(0))?;
+            }
+            header_reads += 1;
             let length = file.metadata()?.len();
             anyhow::ensure!(
                 length <= limits.file_bytes,
@@ -500,10 +524,11 @@ fn list_with_limits(
             );
             let header = header?;
             anyhow::ensure!(header.id == stem, "session filename/id mismatch");
-            Ok(header)
+            Ok(Some(header))
         })();
         let header = match candidate {
-            Ok(header) => header,
+            Ok(Some(header)) => header,
+            Ok(None) => continue,
             Err(_) => {
                 catalogue.skipped += 1;
                 if catalogue.truncated {
@@ -905,6 +930,7 @@ mod tests {
             ScanLimits {
                 file_bytes: 1_024,
                 total_bytes: 8_192,
+                ..SCAN_LIMITS
             },
         )
         .unwrap();
@@ -999,6 +1025,7 @@ mod tests {
             ScanLimits {
                 file_bytes: 1_024,
                 total_bytes: 8_192,
+                ..SCAN_LIMITS
             },
         )
         .unwrap();
@@ -1007,12 +1034,82 @@ mod tests {
         for entry in std::fs::read_dir(&directory).unwrap() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
-        for index in 0..MAX_ENTRIES + 1 {
+        for index in 0..33 {
             std::fs::write(directory.join(format!("ignored-{index}.not-json")), []).unwrap();
         }
-        let result = list(&binding, true).unwrap();
+        let result = list_with_limits(
+            &binding,
+            true,
+            false,
+            ScanLimits {
+                scan_entries: 32,
+                ..SCAN_LIMITS
+            },
+        )
+        .unwrap();
         assert!(result.rows.is_empty());
         assert!(result.truncated);
+    }
+
+    #[test]
+    fn p5o61_newest_current_workspace_sessions_survive_a_large_foreign_directory() {
+        let root = crate::tests::OwnedTestDirectory::new("session-catalogue-order");
+        let _env = environment(&root);
+        let workspace = root.path().join("current");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(&workspace).unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&workspace).unwrap();
+        let directory = super::super::storage::session_path(&uuid::Uuid::new_v4().to_string())
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        crate::paths::ensure_private_directory(&directory).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        // 3,000 sessions from another workspace, all older than ours.
+        for _ in 0..3_000 {
+            let id = uuid::Uuid::new_v4().to_string();
+            let body =
+                serde_json::json!({"id":id,"working_dir":"/elsewhere","messages":[]}).to_string();
+            let path = directory.join(format!("{id}.json"));
+            super::super::storage::atomic_write(&path, &body).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let mine: std::collections::BTreeSet<String> = (0..5)
+            .map(|_| stored(&workspace, "mine").id.to_string())
+            .collect();
+        // A tiny header/byte budget still lists all five: foreign sessions
+        // are peeked, not charged, and the cap applies after the mtime sort.
+        let catalogue = list_with_limits(
+            &binding,
+            false,
+            false,
+            ScanLimits {
+                header_reads: 5,
+                total_bytes: 64 * 1024,
+                ..SCAN_LIMITS
+            },
+        )
+        .unwrap();
+        let listed: std::collections::BTreeSet<String> = catalogue
+            .rows
+            .iter()
+            .map(|row| row.id.to_string())
+            .collect();
+        assert_eq!(listed, mine);
+        // The default listing agrees.
+        let listed: std::collections::BTreeSet<String> = list(&binding, false)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.id.to_string())
+            .collect();
+        assert_eq!(listed, mine);
     }
     #[cfg(unix)]
     #[test]

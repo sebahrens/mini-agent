@@ -32,6 +32,20 @@ It does not reveal stored source or tests and cannot install, approve, activate,
 Queries are non-empty and limited to 8 KiB. Instruction selection is adopted only from the intact final
 successful host tool result; a redacted or spilled result cannot silently install an instruction candidate.
 
+### Selection limits and the always-visible catalog
+
+Each turn injects at most `skills_max_selected` (default 3, at most 16) Agent Skills whose
+relevance to the prompt reaches `skills_score_floor` (default 0.20). Discovery accepts at most
+`skills_max_packages` (default 64, at most 1,024) packages across all roots. Skills that do not
+match the prompt text are otherwise visible only through `skills_search`.
+
+Set `skills_catalog_bytes` (default 0: off; at most 65,536) to add a catalog-style listing of
+every authorized skill's name and one-line description (200 characters each, sorted by name) to
+the trusted skill context on every turn, so the model can pick a skill by name and load it with
+`skills_search`. Bodies are still loaded only on selection. Entries beyond the byte budget are
+counted in a final "N more skills omitted" line. The listing grants no permissions. All four keys
+are read at startup.
+
 `/skills` lists names, origins and bounded one-line descriptions and opens the command picker.
 `/<skill-name> [arguments]` pins the exact captured skill for the next ordinary turn and its automatic
 continuations. Arguments remain literal user text. Builtins and custom command templates take precedence;

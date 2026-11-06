@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::session::Session;
 
 pub(crate) const MAX_SESSION_BYTES: usize = 32 * 1024 * 1024;
-const MAX_SESSION_MESSAGES: usize = 100_000;
+pub(crate) const MAX_SESSION_MESSAGES: usize = 100_000;
 
 /// The persisted-storage error remains static and never includes session data.
 /// Frontends can use the attached counts for an actionable, deduplicated notice.
@@ -962,6 +962,67 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Delete saved session snapshots whose mtime is older than `days` days
+/// (`session_retention_days`). `0` disables retention. Only UUID-named regular
+/// `.json` snapshots are considered; a session owned by this process or locked
+/// by another live process is never removed. Returns the number deleted.
+pub(crate) fn prune_sessions_older_than(
+    days: u32,
+    now: std::time::SystemTime,
+) -> anyhow::Result<usize> {
+    if days == 0 || disabled("sessions") {
+        return Ok(0);
+    }
+    let Some(dir) = existing_session_dir()? else {
+        return Ok(0);
+    };
+    let Some(cutoff) = now.checked_sub(std::time::Duration::from_secs(u64::from(days) * 86_400))
+    else {
+        return Ok(0);
+    };
+    let mut deleted = 0;
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if uuid::Uuid::try_parse(id).is_err() {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.modified().map_or(true, |mtime| mtime >= cutoff) {
+            continue;
+        }
+        if super::lock::held_by_this_process(id) {
+            continue;
+        }
+        match super::lock::claim_session(id) {
+            Ok(super::lock::SessionClaim::Owned) => {}
+            _ => continue,
+        }
+        let result = delete_session(id);
+        super::lock::release_session(id);
+        match result {
+            Ok(()) => {
+                deleted += 1;
+                if let Ok(lock) = super::lock::lock_path(id) {
+                    let _ = std::fs::remove_file(lock);
+                }
+            }
+            Err(error) => tracing::warn!("session retention could not delete {id}: {error:#}"),
+        }
+    }
+    if deleted > 0 {
+        tracing::info!("session retention removed {deleted} saved sessions older than {days} days");
+    }
+    Ok(deleted)
+}
+
 /// At most this many per-entry diagnostics are emitted for one discovery call;
 /// the rest are summarized so a corrupted directory cannot flood the log.
 const MAX_DISCOVERY_DIAGNOSTICS: usize = 5;
@@ -1030,6 +1091,13 @@ const NAME_PEEK_BYTES: usize = 4 * 1024;
 /// "undetermined" (unsafe or unreadable file, key absent or not a string before
 /// the cut), and the caller then decodes the full file.
 fn peek_session_string(path: &Path, key: &str) -> Option<String> {
+    let file = crate::fs::open_private_file(path).ok()?;
+    peek_session_string_from(file, key)
+}
+
+/// [`peek_session_string`] over an already-opened, validated reader (the
+/// catalogue keeps its own descriptor-bound open path).
+pub(super) fn peek_session_string_from(reader: impl std::io::Read, key: &str) -> Option<String> {
     use serde::de::{Deserializer as _, Error as _, IgnoredAny, MapAccess, Visitor};
     struct Head<'a>(&'a str, &'a mut Option<String>);
     impl<'de> Visitor<'de> for Head<'_> {
@@ -1041,7 +1109,6 @@ fn peek_session_string(path: &Path, key: &str) -> Option<String> {
             while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
                 if key == self.0 {
                     *self.1 = Some(map.next_value::<String>()?);
-                    // Found; stop before reaching the truncated tail.
                     return Err(A::Error::custom("key found"));
                 }
                 map.next_value::<IgnoredAny>()?;
@@ -1049,8 +1116,7 @@ fn peek_session_string(path: &Path, key: &str) -> Option<String> {
             Ok(())
         }
     }
-    let file = crate::fs::open_private_file(path).ok()?;
-    let (head, _) = crate::paths::read_utf8_prefix(file, NAME_PEEK_BYTES).ok()??;
+    let (head, _) = crate::paths::read_utf8_prefix(reader, NAME_PEEK_BYTES).ok()??;
     let mut value = None;
     let _ = serde_json::Deserializer::from_str(&head).deserialize_map(Head(key, &mut value));
     value

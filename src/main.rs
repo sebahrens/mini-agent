@@ -133,7 +133,7 @@ fn main() -> anyhow::Result<ExitCode> {
 }
 
 fn report_runtime_headless_error(runtime: &tokio::runtime::Runtime, message: String) {
-    let (message, _) = print::bounded_progress(&message, print::HEADLESS_PROGRESS_BYTES);
+    let (message, _) = print::bounded_progress(&message, print::progress_bytes());
     let _ = runtime.block_on(Box::pin(print::headless_stderr_async(message)));
 }
 
@@ -602,12 +602,18 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         sandbox::begin_backend_probe(&cli.resolve_sandbox_backend(&cfg));
     }
     let version_changed = docs::ensure_global()?;
+    #[cfg(feature = "agent-skills")]
+    extras::skills::index::AgentSkillSearchPolicy::configure(&cfg);
     // ── Hooks: load settings.json config, apply trust, install dispatcher ──
     // Done this early (before provider/API-key resolution) so `--hooks-test`
     // is a pure config/dispatch dry run that needs no API key and makes no
     // model call.
     #[cfg(feature = "hooks")]
     {
+        crate::extras::hooks::set_http_hooks_enabled(cfg.hooks_http_enabled.unwrap_or(false));
+        crate::extras::hooks::set_permission_decisions_enabled(
+            cfg.hooks_permission_decisions.unwrap_or(false),
+        );
         crate::extras::hooks::init_dispatcher(crate::extras::hooks::trust::load_dispatcher(
             &app_paths,
             cli.no_hooks,

@@ -803,6 +803,49 @@ pub struct Config {
     /// Output and traversal bounds for built-in tools (`[tool_limits]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_limits: Option<types::ToolLimitsConfig>,
+    /// Delete saved session snapshots not modified for this many days at
+    /// interactive startup. `None`/`0` (default) keeps sessions forever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_retention_days: Option<u32>,
+    /// ACP: summarize live history after this many user turns. `None`/`0`
+    /// (default) disables the turn trigger; token pressure applies instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_history_max_turns: Option<usize>,
+    /// ACP: serialized live-history memory guard in bytes. Default
+    /// max(2 MiB, 4 bytes per context-window token); minimum 64 KiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_history_max_bytes: Option<usize>,
+    /// ACP: concurrently loaded sessions (default 64).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_max_sessions: Option<usize>,
+    /// ACP: client-supplied MCP servers per session (default 8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_max_client_mcp_servers: Option<usize>,
+    /// Allow `type: "http"` hook handlers to send requests. Default false:
+    /// http handlers load but are never contacted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_http_enabled: Option<bool>,
+    /// Let PermissionRequest hooks answer approvals (allow once / deny).
+    /// Default false: they only observe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_permission_decisions: Option<bool>,
+    /// Agent Skills injected per turn by relevance (default 3, at most 16).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_max_selected: Option<usize>,
+    /// Minimum relevance score for automatic skill selection (default 0.20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_score_floor: Option<f64>,
+    /// Bytes of the always-visible skill name/description catalog (default
+    /// 0 = off, at most 65536).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_catalog_bytes: Option<usize>,
+    /// Skill packages discovered across all roots (default 64, at most 1024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_max_packages: Option<usize>,
+    /// Offer `(p) always allow in this project` on TUI approval prompts and
+    /// load those rules at interactive startup. Default false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_project_approvals: Option<bool>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///

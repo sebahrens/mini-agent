@@ -20,7 +20,10 @@ use crate::session::{self, Session};
 pub(crate) struct HeadlessUsageError;
 
 async fn validate_headless_prompt(cli: &Cli, workspace: &std::path::Path) -> anyhow::Result<()> {
-    if !cli.print || cli.message.iter().any(|part| !part.trim().is_empty()) {
+    if !cli.print
+        || cli.message.iter().any(|part| !part.trim().is_empty())
+        || cli.input_format() == crate::cli::InputFormat::StreamJson
+    {
         return Ok(());
     }
     crate::print::emit_headless_preflight_failure(cli, workspace, "no prompt given").await?;
@@ -889,7 +892,11 @@ async fn compact_headless_session(
     };
 
     #[cfg(feature = "hooks")]
-    if compacted.is_some() {
+    if let Some(compacted) = &compacted {
+        crate::startup::heap_future(|| {
+            crate::extras::hooks::dispatch_post_compact(true, Some(&compacted.summary))
+        })
+        .await;
         let notices =
             crate::startup::heap_future(|| crate::extras::hooks::dispatch_session_start("compact"))
                 .await;
@@ -1167,8 +1174,15 @@ impl Startup {
         #[cfg(feature = "subagents")]
         let headless_agent_directive =
             heap_future(|| route_headless_agent_mentions(&mut cli, &cfg, &workspace)).await?;
+        crate::print::configure_headless_limits(&cli);
+        if cli.input_format() == crate::cli::InputFormat::StreamJson
+            && cli.output_format() != OutputFormat::StreamJson
+        {
+            anyhow::bail!("--input-format stream-json requires --output stream-json");
+        }
         use std::io::IsTerminal as _;
         let read_stdin = cli.print
+            && cli.input_format() == crate::cli::InputFormat::Text
             && !cli.is_loop_mode()
             && !cli.message.join(" ").trim_start().starts_with('!')
             && !std::io::stdin().is_terminal();
@@ -2057,6 +2071,26 @@ impl Startup {
                 .collect();
             let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
             guard.load_session_allowlist(&allowlist);
+            // Opt-in persisted project approvals: interactive TUI only, never
+            // headless; deny rules keep precedence over these allow entries.
+            if self.is_interactive
+                && !self.cli.print
+                && self.cfg.persist_project_approvals.unwrap_or(false)
+            {
+                match crate::permission::project_approvals::load(
+                    &self.paths.state_dir,
+                    self.workspace.root(),
+                ) {
+                    Ok(rules) => {
+                        let rules: Vec<(String, String)> = rules
+                            .into_iter()
+                            .map(|rule| (rule.tool, rule.pattern))
+                            .collect();
+                        guard.load_session_allowlist(&rules);
+                    }
+                    Err(error) => tracing::warn!("project approvals not loaded: {error:#}"),
+                }
+            }
             // Project-sourced prompts only carry a directive when the project
             // config is trusted (context::prompts), and the checker refuses
             // any directive that would raise the mode above the user's
@@ -2179,7 +2213,11 @@ impl Startup {
                 }
             }
             self.join_native_startup().await?;
-            let result = heap_future(|| self.dispatch_print()).await;
+            let result = if self.cli.input_format() == crate::cli::InputFormat::StreamJson {
+                heap_future(|| self.dispatch_print_stream_input()).await
+            } else {
+                heap_future(|| self.dispatch_print()).await
+            };
             #[cfg(feature = "subagents")]
             self.session.close_background_tasks().await;
             // Every headless exit ends the session: a failed turn, a
@@ -2218,6 +2256,64 @@ impl Startup {
             }
 
             heap_future(|| self.dispatch_interactive()).await
+        }
+    }
+
+    /// `--input-format stream-json`: the argument prompt (if any), then one
+    /// turn per JSON user line on stdin, in one session, until EOF. Each turn
+    /// emits its usual stream-json records and its own `result`; malformed
+    /// lines emit an `input_error` record and are skipped. Returns the last
+    /// turn failure so the exit status stays nonzero when one failed.
+    async fn dispatch_print_stream_input(&mut self) -> anyhow::Result<()> {
+        if self.native_ticket.is_some() || self.native_headless.is_some() {
+            anyhow::bail!(
+                "--input-format stream-json does not support provider-native session history yet; use --acp for multi-turn native sessions"
+            );
+        }
+        let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
+        let mut pending =
+            Some(self.cli.message.join(" ").trim().to_string()).filter(|prompt| !prompt.is_empty());
+        let mut last_failure = None;
+        loop {
+            let prompt = match pending.take() {
+                Some(prompt) => prompt,
+                None => match crate::print::read_stream_input_line().await? {
+                    None => break,
+                    Some(Ok(line)) if line.trim().is_empty() => continue,
+                    Some(Ok(line)) => match crate::print::parse_stream_input_line(line.trim()) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            output
+                                .emit_event(
+                                    serde_json::json!({"type":"input_error","message":error}),
+                                )
+                                .await?;
+                            continue;
+                        }
+                    },
+                    Some(Err(error)) => {
+                        output
+                            .emit_event(serde_json::json!({"type":"input_error","message":error}))
+                            .await?;
+                        continue;
+                    }
+                },
+            };
+            if crate::print::headless_force_stopped() {
+                break;
+            }
+            self.cli.message = vec![prompt];
+            crate::print::reset_headless_result_emitted();
+            if let Err(error) = heap_future(|| self.dispatch_print()).await {
+                if crate::print::headless_force_stopped() {
+                    return Err(error);
+                }
+                last_failure = Some(error);
+            }
+        }
+        match last_failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -2964,6 +3060,17 @@ impl Startup {
         } = self;
 
         crate::update::spawn_startup_notice(&cli, &cfg, is_interactive, &paths.state_dir);
+        if let Some(days) = cfg.session_retention_days.filter(|days| *days > 0) {
+            // The current session is already claimed, so it is never pruned.
+            std::thread::spawn(move || {
+                if let Err(error) = crate::session::storage::prune_sessions_older_than(
+                    days,
+                    std::time::SystemTime::now(),
+                ) {
+                    tracing::warn!("session retention skipped: {error:#}");
+                }
+            });
+        }
         // Creating a context-file template is a filesystem setup action, not
         // permission to start an agent turn. Only an explicit CLI message may
         // auto-trigger interactive execution.

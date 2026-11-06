@@ -4789,7 +4789,8 @@ where
                 let _ = event_tx
                     .send(AgentEvent::error_with(
                         CompactString::from(format!(
-                            "Agent exhausted its maximum turn budget ({max_turns}) before completing."
+                            "Agent exhausted its maximum turn budget ({max_turns}) before completing.{}",
+                            crate::cli::MAX_AGENT_TURNS_HINT
                         )),
                         completed_so_far!(),
                     ))
@@ -5640,7 +5641,8 @@ where
             let remaining_turns = max_turns.saturating_sub(turns_used);
             if remaining_turns == 0 {
                 fail_turn!(
-                    "Agent exhausted its maximum turn budget ({max_turns}) before completing."
+                    "Agent exhausted its maximum turn budget ({max_turns}) before completing.{}",
+                    crate::cli::MAX_AGENT_TURNS_HINT
                 );
             }
             if let Some((used, budget)) =

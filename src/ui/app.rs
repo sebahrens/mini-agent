@@ -1793,7 +1793,7 @@ mod reasoning_display_tests {
                 .contains("REASONING_PRIVATE")
         );
         assert!(!app.renderer.selection_active);
-        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
         for expected in [
             ReasoningDisplay::Full,
             ReasoningDisplay::Off,
@@ -4140,6 +4140,16 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
+        if action == Some(KeyAction::HistorySearch) {
+            if self.input.history_search_active() {
+                self.input.history_search_next();
+            } else {
+                self.input.start_history_search();
+            }
+            self.refresh()?;
+            return Ok(());
+        }
+
         if action == Some(KeyAction::CycleReasoning) {
             let current = self.renderer.feed().reasoning_display();
             let display = current.next();
@@ -5653,18 +5663,17 @@ impl<'a> App<'a> {
             return Ok(true);
         }
         // Display-only controls remain available while approval owns input.
-        if (key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL))
-            || matches!(
-                self.keyboard_action(key),
-                Some(
-                    KeyAction::PageUp
-                        | KeyAction::PageDown
-                        | KeyAction::TranscriptTop
-                        | KeyAction::TranscriptBottom
-                )
+        if matches!(
+            self.keyboard_action(key),
+            Some(
+                KeyAction::CycleReasoning
+                    | KeyAction::PageUp
+                    | KeyAction::PageDown
+                    | KeyAction::TranscriptTop
+                    | KeyAction::TranscriptBottom
             )
-            || (self.renderer.selection_active
-                && matches!(key.code, KeyCode::Char('y') | KeyCode::Esc))
+        ) || (self.renderer.selection_active
+            && matches!(key.code, KeyCode::Char('y') | KeyCode::Esc))
         {
             return Ok(false);
         }
@@ -10385,6 +10394,93 @@ mod permission_loop_tests {
             .unwrap();
         task.joined().await;
         assert!(retired.load(Ordering::SeqCst));
+    }
+
+    // mini-agent-7aog4: `(p)` persists a project rule only under the
+    // persist_project_approvals opt-in; by default the key is inert.
+    #[tokio::test]
+    async fn actual_project_approval_key_is_inert_by_default_and_persists_when_enabled() {
+        let root = crate::tests::OwnedTestDirectory::new("permission-project-approval");
+        let _environment = environment(&root);
+        let workspace_path = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        for enabled in [false, true] {
+            let mut cfg = fixture_config();
+            cfg.persist_project_approvals = enabled.then_some(true);
+            let workspace =
+                Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_path).unwrap());
+            let root_path = workspace.root().to_path_buf();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+            let mut app = fixture_app(fixture_ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace,
+            ));
+            let pending = PendingMainTurn::capture(app.ui.session, "project approval");
+            crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+            app.run.is_running = true;
+            let (asks, receiver) = mpsc::channel(4);
+            app.ask_rx = Some(receiver);
+            let (ask, mut decision) = request("cargo test --lib");
+            sent(&asks, ask.into()).await;
+            drain(&mut app).await;
+            assert_eq!(
+                app.renderer
+                    .captured_output()
+                    .contains("(p) always allow in this project"),
+                enabled
+            );
+            sent(
+                &app.user_tx,
+                UserEvent::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            )
+            .await;
+            drain(&mut app).await;
+            let state = &crate::paths::process_paths_ref().unwrap().state_dir;
+            if enabled {
+                assert!(matches!(
+                    replied(decision).await,
+                    UserDecision::AllowAlways(_)
+                ));
+                let rules = crate::permission::project_approvals::load(state, &root_path).unwrap();
+                assert_eq!(rules.len(), 1);
+                assert_eq!(rules[0].tool, "shell");
+            } else {
+                assert!(matches!(
+                    decision.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                assert!(
+                    app.permission_prompt.is_some(),
+                    "default: (p) is not an answer"
+                );
+                assert!(
+                    crate::permission::project_approvals::load(state, &root_path)
+                        .unwrap()
+                        .is_empty()
+                );
+                sent(
+                    &app.user_tx,
+                    UserEvent::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+                )
+                .await;
+                drain(&mut app).await;
+            }
+            sent(&app.user_tx, UserEvent::Quit).await;
+            tokio::time::timeout(Duration::from_secs(2), app.run_inner())
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -17784,7 +17880,7 @@ mod plan_approval_tests {
         let display = app.renderer.feed().reasoning_display();
         user(
             &mut app,
-            UserEvent::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         )
         .await;
         assert_eq!(app.renderer.feed().reasoning_display(), display.next());

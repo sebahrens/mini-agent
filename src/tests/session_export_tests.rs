@@ -585,7 +585,11 @@ fn strict_jsonl_detection_enforces_message_bound() {
     let error = parse_session_file(&jsonl)
         .err()
         .expect("too many messages must fail");
-    assert!(error.to_string().contains("more than 10000 messages"));
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("more than {MAX_SESSION_IMPORT_MESSAGES} messages"))
+    );
 }
 
 #[test]
@@ -619,7 +623,7 @@ fn bounded_jsonl_export_refuses_outputs_its_importer_cannot_accept() {
         session_to_jsonl(&too_many)
             .unwrap_err()
             .to_string()
-            .contains("more than 10000 messages")
+            .contains(&format!("more than {MAX_SESSION_IMPORT_MESSAGES} messages"))
     );
 
     let mut line_too_large = Session::new("provider", "model", 128_000, "line too large");
@@ -955,4 +959,11 @@ fn mutation_previews_roundtrip_redo_html_and_never_change_model_history() {
             .iter()
             .all(|message| message.recorded_diff.is_none())
     );
+}
+
+// mini-agent-vskuz: import limits are the persisted-session limits.
+#[test]
+fn import_limits_cover_every_persistable_session() {
+    assert_eq!(MAX_SESSION_IMPORT_MESSAGES, 100_000);
+    const { assert!(MAX_SESSION_IMPORT_BYTES >= crate::session::storage::MAX_SESSION_BYTES) };
 }

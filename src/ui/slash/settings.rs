@@ -411,10 +411,21 @@ async fn handle_mode(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
 async fn handle_permissions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
         ctx.input
-            .start_argument_picker("/permissions ", ["yolo", "auto", "manual"]);
+            .start_argument_picker("/permissions ", ["yolo", "auto", "manual", "rules"]);
         return Ok(());
     }
 
+    if matches!(parts[1], "rules" | "forget") {
+        let Ok(paths) = crate::paths::process_paths_ref() else {
+            write_error(ctx.renderer, "application paths unavailable");
+            return Ok(());
+        };
+        let root = ctx.workspace.root();
+        for line in project_approval_lines(&paths.state_dir, root, &parts[1..]) {
+            write_result(ctx.renderer, crate::ui::events::sanitize_output(&line));
+        }
+        return Ok(());
+    }
     match parse_permission_mode(parts[1]) {
         Some((mode, label)) => set_permission_mode(ctx, mode, label),
         None => write_error(
@@ -426,6 +437,53 @@ async fn handle_permissions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::R
         ),
     }
     Ok(())
+}
+
+/// `/permissions rules` lists this project's persisted `(p)` approvals;
+/// `/permissions forget <n|all>` removes them (effective from the next
+/// interactive start; this session keeps its already-granted entries).
+pub(crate) fn project_approval_lines(
+    state_dir: &std::path::Path,
+    root: &std::path::Path,
+    arguments: &[&str],
+) -> Vec<String> {
+    use crate::permission::project_approvals;
+    match arguments {
+        ["rules"] => match project_approvals::load(state_dir, root) {
+            Ok(rules) if rules.is_empty() => vec![
+                "  no persisted project approvals (enable persist_project_approvals, then answer (p))".into(),
+            ],
+            Ok(rules) => {
+                let mut lines = vec![format!("  project approvals for {}:", root.display())];
+                lines.extend(
+                    rules
+                        .iter()
+                        .enumerate()
+                        .map(|(index, rule)| format!("  {}. {}: {}", index + 1, rule.tool, rule.pattern)),
+                );
+                lines.push("  remove with /permissions forget <n|all>".into());
+                lines
+            }
+            Err(error) => vec![format!("  error: {error}")],
+        },
+        ["forget", which] => {
+            let index = match *which {
+                "all" => None,
+                other => match other.parse::<usize>() {
+                    Ok(index) => Some(index),
+                    Err(_) => return vec!["  usage: /permissions forget <n|all>".into()],
+                },
+            };
+            match project_approvals::remove(state_dir, root, index) {
+                Ok(removed) => vec![format!(
+                    "  removed {} project approval(s); takes effect at the next interactive start",
+                    removed.len()
+                )],
+                Err(error) => vec![format!("  error: {error}")],
+            }
+        }
+        _ => vec!["  usage: /permissions rules | /permissions forget <n|all>".into()],
+    }
 }
 
 fn parse_permission_mode(value: &str) -> Option<(SecurityMode, &'static str)> {
@@ -1234,5 +1292,39 @@ mod profile100_tests {
         assert!(ctx.permission.is_none());
         assert!(cfg.sandbox_profile.is_none(), "no config persistence");
         assert!(crate::ui::pickers::list::reserved_command("sandbox"));
+    }
+}
+
+#[cfg(test)]
+mod i7aog4_tests {
+    #[test]
+    fn permissions_rules_and_forget_manage_persisted_project_approvals() {
+        let root = crate::tests::OwnedTestDirectory::new("permissions-rules");
+        let state = root.path().join("state");
+        let project = root.path().join("project");
+        let lines = super::project_approval_lines(&state, &project, &["rules"]);
+        assert!(lines[0].contains("no persisted project approvals"));
+        crate::permission::project_approvals::add(
+            &state,
+            &project,
+            crate::permission::project_approvals::ProjectApproval {
+                tool: "shell".into(),
+                pattern: "cargo test".into(),
+            },
+        )
+        .unwrap();
+        let lines = super::project_approval_lines(&state, &project, &["rules"]);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("1. shell: cargo test"))
+        );
+        let lines = super::project_approval_lines(&state, &project, &["forget", "1"]);
+        assert!(lines[0].contains("removed 1"));
+        assert!(
+            crate::permission::project_approvals::load(&state, &project)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

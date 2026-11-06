@@ -41,20 +41,98 @@ pub(crate) struct HookGroup {
 
 pub(crate) type HooksConfig = HashMap<String, Vec<HookGroup>>;
 
-const SUPPORTED_HOOK_EVENTS: &[&str] = &[
+pub(crate) const SUPPORTED_HOOK_EVENTS: &[&str] = &[
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
     "Stop",
+    "StopFailure",
     "SessionStart",
     "SessionEnd",
     "SubagentStart",
     "SubagentStop",
     "PreCompact",
+    "PostCompact",
     "Notification",
     "PermissionRequest",
+    "InstructionsLoaded",
+    "FileChanged",
+    "CwdChanged",
 ];
+
+/// Claude Code hook events this build accepts in settings but never
+/// dispatches (listed by `/hooks` so ported configurations are not silently
+/// assumed to fire).
+pub(crate) const KNOWN_UNDISPATCHED_HOOK_EVENTS: &[&str] = &[
+    "PermissionDenied",
+    "ConfigChange",
+    "TaskCreated",
+    "TaskCompleted",
+    "WorktreeCreate",
+    "WorktreeRemove",
+    "Elicitation",
+    "ElicitationResult",
+    "PostToolBatch",
+];
+
+/// Handler `type` values this build runs. `http` additionally requires the
+/// `hooks_http_enabled` opt-in; other Claude Code types (`prompt`, `agent`,
+/// `mcp_tool`) are skipped per handler with a warning.
+pub(crate) const SUPPORTED_HOOK_TYPES: &[&str] = &["command", "http"];
+
+const MAX_HTTP_HOOK_HEADERS: usize = 32;
+const MAX_HTTP_HOOK_HEADER_BYTES: usize = 8 * 1024;
+const MAX_HTTP_HOOK_URL_BYTES: usize = 8 * 1024;
+
+/// Validates an `http` handler's raw JSON. The URL is stored in `command` and
+/// the literal request headers in `env`, so the existing trust identity,
+/// approval description and dedupe keys cover both without a schema change.
+fn http_binding(
+    raw: Option<&serde_json::Value>,
+) -> Result<(String, BTreeMap<String, String>), String> {
+    let raw = raw
+        .and_then(serde_json::Value::as_object)
+        .ok_or("http hook must be an object")?;
+    for field in ["command", "args", "env", "if"] {
+        if raw.get(field).is_some_and(|value| !value.is_null()) {
+            return Err(format!("http hook does not accept `{field}`"));
+        }
+    }
+    let url = raw
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("http hook requires a string `url`")?;
+    if url.len() > MAX_HTTP_HOOK_URL_BYTES {
+        return Err("http hook url is too long".into());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| "http hook url is invalid")?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("http hook url must be an absolute http(s) URL".into());
+    }
+    let mut headers = BTreeMap::new();
+    if let Some(raw_headers) = raw.get("headers") {
+        let map = raw_headers
+            .as_object()
+            .ok_or("http hook `headers` must be an object of strings")?;
+        if map.len() > MAX_HTTP_HOOK_HEADERS {
+            return Err("http hook has too many headers".into());
+        }
+        for (name, value) in map {
+            let value = value
+                .as_str()
+                .ok_or("http hook header values must be strings")?;
+            if value.len() > MAX_HTTP_HOOK_HEADER_BYTES
+                || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+                || reqwest::header::HeaderValue::from_str(value).is_err()
+            {
+                return Err("http hook header is invalid".into());
+            }
+            headers.insert(name.clone(), value.to_owned());
+        }
+    }
+    Ok((url.to_owned(), headers))
+}
 
 /// Parses the JSON value found at the top-level `hooks` key of settings.json.
 pub(crate) fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfig, String> {
@@ -85,31 +163,54 @@ pub(crate) fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfi
                 SUPPORTED_HOOK_EVENTS.join(", ")
             );
         }
-        for group in groups {
-            for handler in &mut group.hooks {
-                if handler.kind != "command" {
-                    return Err(format!(
-                        "unsupported hook type {:?} for event {event:?} (only \"command\" is supported in v1)",
-                        handler.kind
-                    ));
-                }
-                if handler.args.is_none()
-                    && let Some(command) = handler.command.as_deref()
-                {
-                    let mut argv = split_command_string(command)?;
-                    // Preserve existing single-program bindings (including
-                    // Windows backslashes) and their persisted trust identity.
-                    if argv.len() == 1
-                        && !command
-                            .chars()
-                            .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"'))
-                    {
-                        continue;
+        let raw_groups = value
+            .get(event.as_str())
+            .and_then(serde_json::Value::as_array);
+        for (group_index, group) in groups.iter_mut().enumerate() {
+            let raw_hooks = raw_groups
+                .and_then(|groups| groups.get(group_index))
+                .and_then(|group| group.get("hooks"))
+                .and_then(serde_json::Value::as_array);
+            let mut kept = Vec::with_capacity(group.hooks.len());
+            for (index, mut handler) in std::mem::take(&mut group.hooks).into_iter().enumerate() {
+                match handler.kind.as_str() {
+                    "command" => {
+                        if handler.args.is_none()
+                            && let Some(command) = handler.command.as_deref()
+                        {
+                            let mut argv = split_command_string(command)?;
+                            // Preserve existing single-program bindings
+                            // (including Windows backslashes) and their
+                            // persisted trust identity.
+                            if argv.len() != 1
+                                || command
+                                    .chars()
+                                    .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"'))
+                            {
+                                handler.command = Some(argv.remove(0));
+                                handler.args = (!argv.is_empty()).then_some(argv);
+                            }
+                        }
+                        kept.push(handler);
                     }
-                    handler.command = Some(argv.remove(0));
-                    handler.args = (!argv.is_empty()).then_some(argv);
+                    "http" => match http_binding(raw_hooks.and_then(|hooks| hooks.get(index))) {
+                        Ok((url, headers)) => {
+                            handler.command = Some(url);
+                            handler.args = None;
+                            handler.env = headers;
+                            kept.push(handler);
+                        }
+                        Err(error) => tracing::warn!(
+                            "hooks: skipping one http hook for event {event:?}: {error}"
+                        ),
+                    },
+                    other => tracing::warn!(
+                        "hooks: skipping one hook of unsupported type {other:?} for event {event:?}; this build runs {} (other hooks in the file stay loaded)",
+                        SUPPORTED_HOOK_TYPES.join(", ")
+                    ),
                 }
             }
+            group.hooks = kept;
         }
     }
 

@@ -220,6 +220,10 @@ fn hook_confirmation_description(
         "event={event}; matcher={matcher}; subprocess trust={trust:?}; explicit env keys={env_keys}; env binding sha256={env_binding_sha256:?}{content}"
     );
 
+    if handler.kind == "http" {
+        // The URL lives in `command`, literal request headers in `env`.
+        return format!("http POST url={argv} (headers are the env binding); {policy}");
+    }
     match handler.condition.as_deref() {
         Some(condition) => {
             let condition = serde_json::to_string(condition)
