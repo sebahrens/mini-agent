@@ -100,8 +100,16 @@ combining with an unobserved concurrent change elsewhere in the file.
 
 ## Newlines and file types
 
-HashEdit accepts UTF-8 text only. Invalid UTF-8 is rejected rather than decoded
-lossily. Replacement text uses the original file's dominant line ending: CRLF
+HashEdit accepts UTF-8 text and UTF-16 text that starts with a byte-order mark
+(UTF-16LE `FF FE` or UTF-16BE `FE FF`, common for Windows, .NET and PowerShell
+files). `read` decodes such a file strictly and says so in its output; tags and
+the CRC describe the decoded text, and `edit` (both modes) writes the result back
+in the same UTF-16 byte order with its BOM. The checkpoint keeps the original raw
+bytes, so `/rewind` restores them exactly. Post-edit formatters and language
+servers are skipped for re-encoded files. Any other invalid UTF-8 (including
+BOM-less UTF-16 and legacy code pages) is rejected rather than decoded lossily,
+and `write` with `overwrite: true` still requires UTF-8 so it can never silently
+convert a UTF-16 file. Replacement text uses the original file's dominant line ending: CRLF
 when CRLF pairs outnumber bare LF endings, otherwise LF (including ties).
 CRLF pairs in the replacement are first normalized to LF, then converted to
 the chosen ending. Untouched byte ranges keep their original endings, so a

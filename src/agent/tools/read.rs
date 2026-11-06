@@ -458,6 +458,44 @@ impl ReadTool {
                 None => summary,
             });
         }
+        // A BOM-marked UTF-16 file is decoded whole (bounded) and served as
+        // UTF-8 text; the edit tool writes it back in its own encoding.
+        let utf16_bom = metadata.is_file()
+            && matches!(
+                reader.fill_buf().await?,
+                [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..]
+            );
+        let (mut reader, text_len, decoded_from): (
+            std::pin::Pin<Box<dyn tokio::io::AsyncBufRead + Send>>,
+            u64,
+            Option<&'static str>,
+        ) = if utf16_bom {
+            let cap = self.max_text_file_size.saturating_mul(2).saturating_add(2);
+            if metadata.len() > cap {
+                return Err(ToolError::Msg(format!(
+                    "'{path}' is UTF-16 text of {} bytes, above the {cap}-byte cap for decoding it in one read.",
+                    metadata.len()
+                )));
+            }
+            let mut raw = Vec::with_capacity(metadata.len() as usize);
+            (&mut reader)
+                .take(cap.saturating_add(1))
+                .read_to_end(&mut raw)
+                .await?;
+            match super::text_encoding::decode_utf16_bom(&raw) {
+                Some(Ok((text, encoding))) => {
+                    let len = text.len() as u64;
+                    (
+                        Box::pin(std::io::Cursor::new(text.into_bytes())),
+                        len,
+                        Some(encoding.label()),
+                    )
+                }
+                _ => return Err(not_utf8(&path)),
+            }
+        } else {
+            (Box::pin(reader), metadata.len(), None)
+        };
         if character_window {
             if !metadata.is_file() {
                 return Err(ToolError::Msg(
@@ -467,7 +505,7 @@ impl ReadTool {
             let start = args.character_offset.unwrap_or(1).saturating_sub(1);
             let count = args.character_limit.unwrap_or(16_000);
             let window = read_character_window(
-                reader.take(metadata.len()),
+                (&mut reader).take(text_len),
                 start,
                 count,
                 self.max_text_file_size,
@@ -519,7 +557,7 @@ impl ReadTool {
                 None => text,
             });
         }
-        let file_size = metadata.len();
+        let file_size = text_len;
         let explicitly_bounded = args.offset.is_some() || args.limit.is_some();
         if file_size > self.max_text_file_size && !explicitly_bounded {
             tracing::debug!(
@@ -773,6 +811,12 @@ impl ReadTool {
             info
         };
 
+        let info = match decoded_from {
+            Some(encoding) => format!(
+                "{info}\n\n[decoded from {encoding}; edit writes changes back in this encoding]"
+            ),
+            None => info,
+        };
         let info = match coaching {
             Some(msg) => format!("{}\n\n{}", msg, info),
             None => info,

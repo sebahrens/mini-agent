@@ -1282,6 +1282,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rewind_restores_exact_utf16_preimage_after_edit() {
+        use crate::agent::tools::text_encoding::{TextEncoding, encode};
+        let root = crate::tests::OwnedTestDirectory::new("rewind-utf16");
+        let original = encode("alpha\r\nbeta\r\n", TextEncoding::Utf16Le);
+        std::fs::write(root.path().join("script.ps1"), &original).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let store = FileCheckpoints::default();
+        scope(Some(store.recorder("session", 0, true)), async {
+            crate::agent::tools::edit::EditTool::new(None, None)
+                .with_workspace(root.path())
+                .call(
+                    serde_json::from_value::<EditArgs>(serde_json::json!({
+                        "path": "script.ps1",
+                        "block": "<<<<<<< SEARCH\nbeta\n=======\ngamma\n>>>>>>> REPLACE"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            std::fs::read(root.path().join("script.ps1")).unwrap(),
+            encode("alpha\r\ngamma\r\n", TextEncoding::Utf16Le)
+        );
+        assert_eq!(store.restore("session", 0, &workspace).unwrap(), 1);
+        assert_eq!(
+            std::fs::read(root.path().join("script.ps1")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
     async fn rewind_restores_exact_notebook_preimage_after_notebook_edit() {
         let root = crate::tests::OwnedTestDirectory::new("rewind-notebook");
         // Jupyter-style bytes (indent 1, trailing newline) must come back exactly.

@@ -1514,14 +1514,30 @@ impl EditTool {
         // Fail closed on invalid UTF-8: the whole file is rewritten, so a lossy
         // decode would replace every invalid byte (even in untouched regions)
         // with U+FFFD and silently corrupt e.g. Latin-1 files.
-        let content = match String::from_utf8(bytes) {
-            Ok(text) => text,
+        // A UTF-16 file announced by its BOM is decoded strictly and written
+        // back in the same encoding; its raw bytes are the checkpoint preimage.
+        use super::text_encoding::{TextEncoding, decode_utf16_bom};
+        let (content, encoding, raw_preimage) = match String::from_utf8(bytes) {
+            Ok(text) => (text, TextEncoding::Utf8, None),
             Err(e) => {
-                return Err(ToolError::Msg(format!(
-                    "Cannot edit '{}': file is not valid UTF-8 (invalid byte at offset {}). The edit tool only handles UTF-8 text; convert the file first or use bash for binary/legacy encodings.",
-                    expanded,
-                    e.utf8_error().valid_up_to(),
-                )));
+                let offset = e.utf8_error().valid_up_to();
+                let bytes = e.into_bytes();
+                match decode_utf16_bom(&bytes) {
+                    Some(Ok((text, encoding))) => {
+                        (text, encoding, Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    }
+                    Some(Err(problem)) => {
+                        return Err(ToolError::Msg(format!(
+                            "Cannot edit '{expanded}': it starts with a UTF-16 byte-order mark but {problem}. No edits were applied."
+                        )));
+                    }
+                    None => {
+                        return Err(ToolError::Msg(format!(
+                            "Cannot edit '{}': file is not valid UTF-8 (invalid byte at offset {}). The edit tool handles UTF-8 and BOM-marked UTF-16 text; convert the file first or use bash for binary/legacy encodings.",
+                            expanded, offset,
+                        )));
+                    }
+                }
             }
         };
 
@@ -1605,12 +1621,12 @@ impl EditTool {
                 crate::session::file_checkpoints::prepare(
                     workspace,
                     relative,
-                    shared_preimage.map(|preimage| {
-                        crate::session::file_checkpoints::Preimage::new(
-                            std::sync::Arc::<[u8]>::from(preimage),
-                            &base,
-                        )
-                    }),
+                    raw_preimage
+                        .clone()
+                        .or_else(|| shared_preimage.map(std::sync::Arc::<[u8]>::from))
+                        .map(|preimage| {
+                            crate::session::file_checkpoints::Preimage::new(preimage, &base)
+                        }),
                     disclose_source,
                 )
                 .await
@@ -1633,7 +1649,10 @@ impl EditTool {
         }
 
         let output = modified;
-        let output_bytes = output.len() as u64;
+        // Bytes actually published: re-encoded for UTF-16 sources.
+        let encoded = (encoding != TextEncoding::Utf8)
+            .then(|| super::text_encoding::encode(&output, encoding));
+        let output_bytes = encoded.as_ref().map_or(output.len(), Vec::len) as u64;
         if output_bytes > limit {
             return Err(ToolError::Msg(format!(
                 "Edit rejected: the result would be {output_bytes} bytes, above the {limit}-byte limit for '{expanded}'. Split the change or raise max_edit_file_size."
@@ -1654,10 +1673,11 @@ impl EditTool {
                 let expected = expected.clone();
                 // Move the output through the blocking publication and take it
                 // back instead of copying the whole file.
+                let encoded = encoded.clone();
                 let (published, output) = crate::agent::runner::spawn_blocking_scoped(move || {
                     let published = workspace.replace_relative_atomic_expecting(
                         &owned_relative,
-                        output.as_bytes(),
+                        encoded.as_deref().unwrap_or(output.as_bytes()),
                         &expected,
                         &base,
                     );
@@ -1678,7 +1698,7 @@ impl EditTool {
                 }
                 crate::fs::atomic_write_resolved_expecting(
                     &resolved,
-                    &output,
+                    encoded.as_deref().unwrap_or(output.as_bytes()),
                     approved_parent.expect("external edit must capture its parent"),
                     base,
                 )
@@ -1686,15 +1706,19 @@ impl EditTool {
                 output
             };
         crate::session::file_checkpoints::published();
-        let after_digest = crate::fs::ContentDigest::of(output.as_bytes());
+        let written = encoded.as_deref().unwrap_or(output.as_bytes());
+        let after_digest = crate::fs::ContentDigest::of(written);
+        let written_len = written.len();
+        drop(encoded);
         if let Some(checkpoint) = &mut checkpoint {
-            checkpoint.committed(&after_digest, output.len());
+            checkpoint.committed(&after_digest, written_len);
         }
         // Publication succeeded against the exact source identity and bytes.
         // Invalidate overwrite proof before optional formatter approval/effects.
         self.read_tracker.untrack_read_path(&path);
+        // Formatters observe UTF-8 text; a re-encoded file is left as written.
         let formatted = match &self.formatter {
-            Some(formatter) => {
+            Some(formatter) if encoding == TextEncoding::Utf8 => {
                 crate::startup::heap_future(|| {
                     formatter.run(
                         &formatting_path,
@@ -1707,7 +1731,7 @@ impl EditTool {
                 })
                 .await
             }
-            None => None,
+            _ => None,
         };
         // Without formatter content the committed postimage digest already stands.
         if let Some(checkpoint) = &checkpoint
@@ -1752,6 +1776,12 @@ impl EditTool {
             notes.len(),
         );
         let mut result = format!("Applied {} edit(s) to {}", edit_count, expanded);
+        if encoding != TextEncoding::Utf8 {
+            result.push_str(&format!(
+                "\n  Note: preserved the file's {} encoding",
+                encoding.label()
+            ));
+        }
         for note in &notes {
             result.push_str(&format!("\n  Note: {}", note));
         }

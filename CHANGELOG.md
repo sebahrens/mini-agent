@@ -167,6 +167,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   `workspace_symbols`). It follows `read` permission rules, only queries workspace files, maps
   result URIs back to workspace paths (outside locations are counted, not named) and caps results
   at 100 entries and hover text at 8 KiB (mini-agent-8v84r).
+- `read` and `edit` handle BOM-marked UTF-16 files (UTF-16LE/BE, common in Windows, .NET and
+  PowerShell repositories): `read` decodes them strictly and labels the encoding, and `edit` writes
+  the result back in the same byte order with its BOM, checkpointing the original raw bytes for
+  `/rewind`. Other non-UTF-8 files are still rejected (mini-agent-w6euw).
 
 ### Changed
 

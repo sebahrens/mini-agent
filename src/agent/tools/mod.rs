@@ -20,6 +20,7 @@ pub(crate) mod read_image;
 pub(crate) mod schedule_wakeup;
 #[cfg(all(test, unix))]
 mod symlink_hint_tests;
+pub(crate) mod text_encoding;
 pub(crate) mod todo;
 pub(crate) mod web_fetch;
 pub(crate) mod web_http;
