@@ -1841,9 +1841,17 @@ decompression bomb is truncated (`web_fetch`) or rejected (`web_search`) without
 being materialized; other codings (`br`, `zstd`, stacked lists) are refused.
 Text is decoded with the `Content-Type` charset (or, for HTML without one, a
 `<meta charset>` sniff over the first KiB; UTF-8 otherwise). `web_fetch` decodes
-malformed text with replacement characters and refuses binary media types (PDF,
-images, archives, `application/octet-stream`) by name without downloading the
-body; HTML and XHTML are converted, other text types (plain, JSON, XML, source)
+malformed text with replacement characters and refuses binary media types (images,
+archives, `application/octet-stream`) by name without downloading the body.
+`application/pdf` responses within the body cap are text-extracted by the same
+extractor as `read` (page markers, at most 500 pages / 1,000,000 characters, no
+OCR) and then quoted and spilled like any page; a PDF over the cap is refused with
+guidance. `web_fetch` retries a GET once after HTTP 429/502/503/504 (honoring a
+`Retry-After` of at most 10 s) or a connection failure, only while the wait fits
+inside the total deadline, and reuses a converted page for 15 minutes (16 pages,
+2 MiB each; a hit still requires the permission policy to allow the URL outright and
+is labelled in the output). A near-empty HTML conversion adds a JavaScript-rendering
+hint. HTML and XHTML are converted, other text types (plain, JSON, XML, source)
 are quoted literally. Search and the JS broker reject non-UTF-8 bodies. A native HTTP operation has one deadline spanning DNS,
 approval, redirects and body consumption: ten seconds for `web_search` and the JS
 broker, `web-fetch-timeout-secs` (default 30, clamped 1..=300) for `web_fetch`,
