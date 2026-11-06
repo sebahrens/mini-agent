@@ -281,6 +281,7 @@ pub(crate) struct ConfiguredSandboxKey {
     appcontainer_write_roots: Vec<std::path::PathBuf>,
     toolchain_roots: Vec<std::path::PathBuf>,
     network: crate::sandbox::SandboxNetwork,
+    network_hosts: Vec<String>,
     shell_env: crate::sandbox::ShellEnvPolicy,
     max_background_jobs: usize,
 }
@@ -309,6 +310,7 @@ impl ConfiguredSandboxKey {
             appcontainer_write_roots: cli.resolve_windows_appcontainer_write_roots(cfg),
             toolchain_roots: cli.resolve_sandbox_toolchain_roots(cfg),
             network: cfg.sandbox_network.unwrap_or_default(),
+            network_hosts: cfg.sandbox_network_hosts.clone(),
             shell_env: cfg.shell_env_policy(),
             max_background_jobs: cfg
                 .shell_max_background_jobs
@@ -336,6 +338,7 @@ impl ConfiguredSandboxKey {
             )
             .with_bwrap_read_roots(self.toolchain_roots.clone())
             .with_network(self.network)
+            .with_network_hosts(self.network_hosts.clone())
             .with_shell_env(self.shell_env.clone())
             .with_max_background_jobs(self.max_background_jobs)
     }

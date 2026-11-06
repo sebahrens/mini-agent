@@ -20,6 +20,7 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod general_profile;
+pub(crate) mod net_proxy;
 pub(crate) mod shell_env;
 pub use shell_env::ShellEnvPolicy;
 #[cfg(test)]
@@ -56,6 +57,7 @@ pub(crate) type SandboxCommand = Command;
 const WORKSPACE_AUTHORITY_FD: i32 = 197;
 
 type EssentialEnvironment = Arc<[(&'static str, String)]>;
+type NetworkProxyCell = Arc<OnceLock<Result<Arc<net_proxy::NetworkProxy>, String>>>;
 type EssentialEnvironmentCache = Arc<OnceLock<EssentialEnvironment>>;
 /// SHA-256 over every dynamic input of a rendered Seatbelt profile.
 type SeatbeltProfileKey = [u8; 32];
@@ -319,20 +321,30 @@ pub enum SandboxNetwork {
     #[default]
     Deny,
     Allow,
+    /// Shell commands reach only the hosts in `sandbox-network-hosts` (plus
+    /// hosts approved at a prompt) through a local filtering proxy. Enforced
+    /// by the Seatbelt backend; others keep the network denied.
+    Allowlist,
 }
 
 impl SandboxNetwork {
-    pub const NAMES: &'static [&'static str] = &["deny", "allow"];
+    pub const NAMES: &'static [&'static str] = &["deny", "allow", "allowlist"];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Deny => "deny",
             Self::Allow => "allow",
+            Self::Allowlist => "allowlist",
         }
     }
 
+    /// Full, unfiltered host network access.
     pub fn allows(self) -> bool {
         self == Self::Allow
+    }
+
+    pub fn is_allowlist(self) -> bool {
+        self == Self::Allowlist
     }
 }
 
@@ -429,6 +441,9 @@ pub struct SandboxConfig {
     /// `shell-inherit-env` / `shell-env`: variables layered after the fixed
     /// allowlist for contained shell commands. Default closed.
     shell_env: ShellEnvPolicy,
+    /// `sandbox-network-hosts`: the proxy allowlist for
+    /// `sandbox-network = "allowlist"`.
+    network_hosts: Vec<String>,
     /// `shell-max-background-jobs`: running background jobs allowed at once.
     max_background_jobs: usize,
     read_roots: Vec<PathBuf>,
@@ -471,6 +486,11 @@ pub struct Sandbox {
     background_jobs: Arc<BackgroundJobsInner>,
     /// Lazily captured environment snapshot shared by all clones.
     cached_essential_env: EssentialEnvironmentCache,
+    /// The filtering proxy of `sandbox-network = "allowlist"`, started on the
+    /// first contained command that needs it and shared by all clones.
+    network_proxy: NetworkProxyCell,
+    /// Where the proxy asks about unlisted hosts; set once the UI exists.
+    network_prompt: Arc<Mutex<Option<crate::permission::ask::AskSender>>>,
     /// Canonicalized cache directory computed once per instance.
     cached_cache_dir: Arc<Mutex<Option<Arc<PathBuf>>>>,
     /// Cached Seatbelt profiles keyed by escaped workspace/cache/private roots and network policy.
@@ -2442,6 +2462,50 @@ impl Sandbox {
         self.network
     }
 
+    /// `sandbox-network-hosts` for `sandbox-network = "allowlist"`. Entries
+    /// are validated by the config loader; an invalid list here fails closed
+    /// when the proxy would start.
+    pub fn with_network_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.network_hosts = hosts;
+        self.network_proxy = Arc::new(OnceLock::new());
+        self
+    }
+
+    pub fn network_hosts(&self) -> &[String] {
+        &self.network_hosts
+    }
+
+    /// Route the allowlist proxy's "allow this host?" questions to the user.
+    /// Without a sender every unlisted host is refused.
+    pub fn set_network_prompt(&self, sender: Option<crate::permission::ask::AskSender>) {
+        *self
+            .network_prompt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = sender;
+    }
+
+    /// Whether shell commands are held to the allowlist proxy: the mode is
+    /// set, containment is active, and the backend can enforce it.
+    pub fn shell_network_proxied(&self) -> bool {
+        self.enabled && self.network.is_allowlist() && self.backend == "seatbelt"
+    }
+
+    /// The running allowlist proxy, started on first use. `None` unless
+    /// [`Self::shell_network_proxied`].
+    fn network_proxy(&self) -> Result<Option<Arc<net_proxy::NetworkProxy>>, String> {
+        if !self.shell_network_proxied() {
+            return Ok(None);
+        }
+        self.network_proxy
+            .get_or_init(|| {
+                let rules = net_proxy::parse_rules(&self.network_hosts)?;
+                net_proxy::NetworkProxy::start(rules, self.network_prompt.clone())
+                    .map_err(|error| format!("sandbox network proxy failed to start: {error}"))
+            })
+            .clone()
+            .map(Some)
+    }
+
     /// `shell-inherit-env` / `shell-env` / `shell-env-allow-secrets` for
     /// shell, background, pty, `!` and validation commands. Hooks and
     /// workspace services keep the fixed allowlist.
@@ -2456,7 +2520,8 @@ impl Sandbox {
         self
     }
 
-    pub fn max_background_jobs(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn max_background_jobs(&self) -> usize {
         self.max_background_jobs
     }
 
@@ -2641,6 +2706,7 @@ impl Sandbox {
                 profile: SandboxProfile::Workspace,
                 network: SandboxNetwork::Deny,
                 shell_env: ShellEnvPolicy::default(),
+                network_hosts: Vec::new(),
                 max_background_jobs: DEFAULT_MAX_BACKGROUND_JOBS,
                 read_roots: Vec::new(),
                 write_roots: Vec::new(),
@@ -2667,6 +2733,8 @@ impl Sandbox {
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
             background_jobs: Arc::new(BackgroundJobsInner::default()),
             cached_essential_env: Arc::new(OnceLock::new()),
+            network_proxy: Arc::new(OnceLock::new()),
+            network_prompt: Arc::default(),
             cached_cache_dir: Arc::new(Mutex::new(None)),
             cached_seatbelt_profiles: Arc::new(Mutex::new(SeatbeltProfileMap::default())),
             cached_general_roots: Arc::new(Mutex::new(Vec::new())),
@@ -2973,6 +3041,11 @@ impl Sandbox {
         if policy == SandboxPolicy::RequiredAndAvailable && self.shell_network_effective() {
             matrix.network = "shell commands may use the host network (sandbox-network = allow); hooks, workspace services and JS spawn remain denied";
             matrix.requested_network_policy = "allow for shell commands (sandbox-network opt-in)";
+        }
+        if policy == SandboxPolicy::RequiredAndAvailable && self.shell_network_proxied() {
+            matrix.network = "shell commands reach only sandbox-network-hosts (and prompted hosts) through a local filtering proxy; hooks, workspace services and JS spawn remain denied";
+            matrix.requested_network_policy =
+                "allowlist for shell commands (sandbox-network = allowlist)";
         }
         if policy == SandboxPolicy::RequiredAndAvailable
             && matches!(self.backend.as_str(), "bwrap" | "seatbelt")
@@ -4309,9 +4382,21 @@ impl Sandbox {
     ) -> Result<Command, String> {
         let profile =
             self.get_seatbelt_profile_for_launch(cwd, cache_dir, !self.network.allows(), launch)?;
+        // `sandbox-network = "allowlist"`: the blanket network deny stays, and
+        // shell commands (never hooks or workspace services) may additionally
+        // connect to the loopback filtering proxy. Seatbelt applies the last
+        // matching rule, so the allow goes after the deny.
+        let proxy = self.network_proxy()?;
+        let profile = match &proxy {
+            Some(proxy) => format!(
+                "{profile}{}\n{SEATBELT_NETWORK_READS}\n{SEATBELT_PROXY_TRUST}\n",
+                proxy.seatbelt_rule()
+            ),
+            None => profile.to_string(),
+        };
 
         let mut cmd = Command::new(seatbelt);
-        cmd.arg("-p").arg(profile.as_ref());
+        cmd.arg("-p").arg(&profile);
         // `env -i` is inside the sandbox wrapper, so callers cannot restore
         // credentials by adding environment variables to the returned command.
         cmd.arg("/usr/bin/env").arg("-i");
@@ -4320,6 +4405,11 @@ impl Sandbox {
         }
         for (key, value) in self.shell_env_extra() {
             cmd.arg(format!("{key}={value}"));
+        }
+        if let Some(proxy) = &proxy {
+            for (key, value) in proxy.env() {
+                cmd.arg(format!("{key}={value}"));
+            }
         }
         for key in ["TMPDIR", "TMP", "TEMP"] {
             let mut assignment = OsString::from(format!("{key}="));
@@ -7165,6 +7255,10 @@ fn seatbelt_root_inputs(
 /// Network opt-in rules: sockets plus the system services name resolution
 /// and certificate evaluation reach over Mach IPC.
 const SEATBELT_ALLOW_NETWORK: &str = "(allow network*)\n(allow system-socket)\n(allow mach-lookup (global-name \"com.apple.dnssd.service\") (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.SystemConfiguration.DNSConfiguration\"))";
+/// Certificate evaluation services TLS clients reach over Mach IPC when they
+/// verify a server through the filtering proxy. Name resolution is not
+/// granted: the proxy resolves.
+const SEATBELT_PROXY_TRUST: &str = "(allow mach-lookup (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\"))";
 /// Resolver and CA files the workspace profile does not otherwise read.
 const SEATBELT_NETWORK_READS: &str = "(allow file-read* (literal \"/etc\") (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\") (literal \"/private/etc/services\") (literal \"/private/etc/protocols\") (subpath \"/private/etc/ssl\") (literal \"/private/etc/gitconfig\") (subpath \"/private/var/run/resolv.conf\") (subpath \"/Library/Keychains\"))";
 

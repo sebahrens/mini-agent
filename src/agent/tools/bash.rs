@@ -3118,14 +3118,14 @@ mod tests {
         assert!(stopped.contains("Status: completed"), "{stopped}");
     }
 
+    #[cfg(unix)]
+    type EscalationPrompts = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
     /// Answers every escalation prompt with `decision`, recording the prompts.
     #[cfg(unix)]
     fn escalation_responder(
         decision: crate::permission::ask::UserDecision,
-    ) -> (
-        crate::permission::ask::AskSender,
-        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    ) {
+    ) -> (crate::permission::ask::AskSender, EscalationPrompts) {
         use crate::permission::ask::UserRequest;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UserRequest>(4);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

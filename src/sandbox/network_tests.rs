@@ -200,3 +200,101 @@ async fn sandbox_network_opt_in_never_reaches_brokered_js_spawn() {
     );
     assert_eq!(service.sandbox_network(), SandboxNetwork::Deny);
 }
+
+#[test]
+fn sandbox_network_allowlist_parses_and_is_not_full_network() {
+    let cfg: crate::config::Config = toml::from_str(
+        "sandbox-network = \"allowlist\"\nsandbox-network-hosts = [\"registry.npmjs.org\", \"*.github.com\"]\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.sandbox_network, Some(SandboxNetwork::Allowlist));
+    assert_eq!(cfg.sandbox_network_hosts.len(), 2);
+    assert!(!SandboxNetwork::Allowlist.allows());
+    // bwrap cannot enforce the proxy: network stays unshared and the mode is
+    // not reported as effective.
+    let sandbox = Sandbox::new(true, "bwrap")
+        .with_network(SandboxNetwork::Allowlist)
+        .with_network_hosts(cfg.sandbox_network_hosts);
+    assert!(!sandbox.shell_network_proxied() && !sandbox.shell_network_effective());
+    assert!(
+        bwrap_shell_args(&sandbox)
+            .iter()
+            .any(|arg| arg == "--unshare-net")
+    );
+    // Default closed even with a host list.
+    let denied = Sandbox::new(true, "seatbelt").with_network_hosts(vec!["a.example.com".into()]);
+    assert!(!denied.shell_network_proxied());
+    assert!(denied.network_proxy().unwrap().is_none());
+}
+
+/// Live check on macOS: with `allowlist`, the sandbox can reach only the
+/// loopback filtering proxy. Direct connections are denied by Seatbelt, an
+/// unlisted host gets the proxy's 403, and the proxy environment is set. No
+/// Internet access is needed.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sandbox_network_allowlist_seatbelt_live_only_the_proxy_is_reachable() {
+    let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+    if seatbelt_path().is_none() || !seatbelt_exists() {
+        skip_unusable_real_sandbox_test("Seatbelt is unavailable for the live allowlist probe");
+        return;
+    }
+    let workspace = Arc::new(
+        crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+    );
+    let sandbox = Sandbox::new(true, "seatbelt")
+        .with_network(SandboxNetwork::Allowlist)
+        .with_network_hosts(vec!["allowed.example.com".into()])
+        .with_workspace_binding(workspace);
+    let run = |command: &'static str| {
+        let sandbox = sandbox.clone();
+        async move {
+            let output = sandbox
+                .output_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+                .await
+                .unwrap();
+            (
+                output.exit_status.is_some_and(|exit| exit.success()),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        }
+    };
+    let (_, env, _) = run("printf '%s' \"$HTTPS_PROXY\"").await;
+    assert!(
+        env.starts_with("http://mini-agent:") && env.contains("@127.0.0.1:"),
+        "{env}"
+    );
+    // Bypassing the proxy: the profile denies the direct connection.
+    let (ok, out, err) = run(
+        "curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 8 http://93.184.216.34/",
+    )
+    .await;
+    assert!(
+        !ok && out.trim() != "200",
+        "direct connection must be denied: {out} {err}"
+    );
+    // Through the proxy, an unlisted host is refused by the proxy itself (the
+    // tunnel is rejected with 403), which also proves the proxy is reachable.
+    let (ok, _, err) =
+        run("curl -sS -o /dev/null --max-time 15 https://unlisted.example.net/").await;
+    assert!(!ok && err.contains("403"), "proxy must answer 403: {err}");
+    // Loopback is never reachable through the proxy even when listed.
+    let (_, code, err) =
+        run("curl -sS -o /dev/null -w '%{http_code}' --max-time 15 http://127.0.0.1:9/").await;
+    assert_eq!(code.trim(), "403", "{err}");
+    // Needs Internet access: a listed host works end to end through the proxy.
+    if std::env::var_os("MINI_AGENT_NETWORK_TESTS").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let listed = sandbox
+            .clone()
+            .with_network_hosts(vec!["example.com".into()]);
+        let output = listed
+            .output_command_with_limits(
+                "curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://example.com",
+                DEFAULT_COMMAND_LIMITS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "200");
+    }
+}

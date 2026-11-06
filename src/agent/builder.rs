@@ -1162,6 +1162,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             cfg.headless_questions.unwrap_or_default(),
         )));
         if shell_tool_enabled {
+            // Unlisted hosts of `sandbox-network = "allowlist"` prompt here.
+            sandbox.set_network_prompt(ask_tx.clone());
             base_tools.push(Box::new(
                 tools::ShellTool::new(
                     permission.clone(),

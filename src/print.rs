@@ -2218,7 +2218,12 @@ pub(crate) fn print_sessions(
 fn sandbox_network_entry(cfg: &config::Config) -> (&'static str, String) {
     (
         "sandbox-network",
-        cfg.sandbox_network.unwrap_or_default().to_string(),
+        match cfg.sandbox_network.unwrap_or_default() {
+            crate::sandbox::SandboxNetwork::Allowlist => {
+                format!("allowlist [{}]", cfg.sandbox_network_hosts.join(", "))
+            }
+            other => other.to_string(),
+        },
     )
 }
 
@@ -2301,6 +2306,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         cfg.sandbox_home_masks.clone(),
     )
     .with_network(cfg.sandbox_network.unwrap_or_default())
+    .with_network_hosts(cfg.sandbox_network_hosts.clone())
     .with_shell_env(cfg.shell_env_policy())
     .with_max_background_jobs(
         cfg.shell_max_background_jobs

@@ -502,6 +502,15 @@ pub struct Config {
         alias = "sandbox_network"
     )]
     pub sandbox_network: Option<crate::sandbox::SandboxNetwork>,
+    /// `sandbox-network-hosts`: host allowlist for
+    /// `sandbox-network = "allowlist"`. Sensitive in project layers.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "sandbox-network-hosts",
+        alias = "sandbox_network_hosts"
+    )]
+    pub sandbox_network_hosts: Vec<String>,
     /// `shell-inherit-env`: variable names (or `*` globs) copied from the
     /// parent process into contained shell commands, on top of the fixed
     /// allowlist. Credential-looking names are refused. Sensitive in project

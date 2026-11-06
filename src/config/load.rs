@@ -211,6 +211,7 @@ pub(crate) fn validate_responses_extra_body(
 /// keys that would be dropped in silence.
 pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, String> {
     cfg.shell_env_policy().validate()?;
+    crate::sandbox::net_proxy::parse_rules(&cfg.sandbox_network_hosts)?;
     if let Some(max) = cfg.shell_max_background_jobs
         && !(1..=crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT).contains(&max)
     {
@@ -3840,7 +3841,7 @@ mod project_config_trust_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "shell-inherit-env = ['JAVA_HOME']\nshell-env = { FOO = 'bar' }\nshell-env-allow-secrets = true\nshell-allow-escalation = true\nshell-max-background-jobs = 3\nchat_left_margin = 3\n",
+            "shell-inherit-env = ['JAVA_HOME']\nshell-env = { FOO = 'bar' }\nshell-env-allow-secrets = true\nshell-allow-escalation = true\nshell-max-background-jobs = 3\nsandbox-network = 'allowlist'\nsandbox-network-hosts = ['a.example.com']\nchat_left_margin = 3\n",
         )
         .unwrap();
         let mut cfg = Config::default();
@@ -3855,11 +3856,20 @@ mod project_config_trust_tests {
             "untrusted project cannot offer escalation"
         );
         assert_eq!(cfg.shell_max_background_jobs, None);
+        assert!(cfg.sandbox_network.is_none() && cfg.sandbox_network_hosts.is_empty());
         assert_eq!(cfg.chat_left_margin, Some(3));
         apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
         assert_eq!(cfg.shell_inherit_env, vec!["JAVA_HOME".to_string()]);
         assert_eq!(cfg.shell_allow_escalation, Some(true));
         assert_eq!(cfg.shell_max_background_jobs, Some(3));
+        assert_eq!(
+            cfg.sandbox_network,
+            Some(crate::sandbox::SandboxNetwork::Allowlist)
+        );
+        assert_eq!(cfg.sandbox_network_hosts, vec!["a.example.com".to_string()]);
+        let mut bad_host =
+            toml::from_str::<Config>("sandbox-network-hosts = ['https://a.com/x']").unwrap();
+        assert!(super::validate_extra_body(&mut bad_host).is_err());
         assert_eq!(cfg.shell_env.get("FOO").map(String::as_str), Some("bar"));
         assert_eq!(
             cfg.shell_env_allow_secrets, None,
