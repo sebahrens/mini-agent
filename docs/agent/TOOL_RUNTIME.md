@@ -359,7 +359,7 @@ only if the glob is invalid. `src/*.rs` matches files directly in `src`, while
 basename globs such as `*.rs` and `test_*.rs` match at any depth. Other patterns
 retain filename-regex matching. Set `mode: "regex"` explicitly for patterns such
 as `^test_.*\.rs$`, or `mode: "glob"` for literal glob semantics. An empty result
-names the interpretation and suggests an alternative. Capped output is selected
+names the interpretation and suggests an alternative. `offset` (matches to skip) and `limit` (lowers the cap) page a capped result in the same stable order; the truncation notice names `continue with offset=N`. Capped output is selected
 with a bounded top-N heap: omitted `sort` or `sort: "name"` selects paths in
 lexicographic order; `sort: "mtime"` selects the most recently modified files first.
 Equal timestamps use ascending path order, and unavailable timestamps sort last.
@@ -410,7 +410,8 @@ paged header names the window (`entries 151-160 of 160`). Depth 2-3 expands
 subdirectories into an indented, directory-first tree of relative paths that
 shares the same cap and paging; subdirectories are opened no-follow relative to
 their parent descriptor with the same ignore, skip and deny filters, and a tree
-stops collecting at 10,000 entries with a notice. Read windows size their line-number
+stops collecting at 10,000 entries with a notice; a flat depth-1 listing is
+pageable through every entry (safety ceiling 1,000,000, named in the notice). `read` decodes invalid UTF-8 with U+FFFD replacement and appends a warning naming the replaced byte count (or that the file has invalid bytes outside the window) and that `edit`/`write` stay unavailable for it; data with NUL bytes or mostly invalid bytes is still refused as binary. Read windows size their line-number
 column from the actual range and report an offset past EOF directly instead of
 showing an inverted range.
 
@@ -985,8 +986,9 @@ The default `read` view shows virtual cell/source/output lines. Its existing
 by `max_read_lines`. Returned text is capped at 64 KiB: a window that would exceed
 it stops early and ends with `[view truncated after N line(s) at the 64 KiB notebook
 view cap; continue with offset=M]`, and a single virtual line longer than the cap is
-clipped with a pointer to `raw_notebook:true` character windows. Text outputs have separate 4 KiB per-cell and 16 KiB overall
-limits with explicit omissions, and at most 4,096 output objects per cell.
+clipped with a pointer to `raw_notebook:true` character windows. Text outputs have a 4 KiB per-output-cell limit with explicit omissions (there
+is no notebook-wide output allowance: the 64 KiB view cap applies per window, so any
+cell range is inspectable with offset/limit), and at most 4,096 output objects per cell.
 Stream outputs show their text; `execute_result` and `display_data` outputs show
 their `text/plain` data; `error` outputs show `ename: evalue` and the traceback with
 ANSI colour codes removed (an over-budget traceback keeps the exception line and its
@@ -1851,9 +1853,17 @@ decompression bomb is truncated (`web_fetch`) or rejected (`web_search`) without
 being materialized; other codings (`br`, `zstd`, stacked lists) are refused.
 Text is decoded with the `Content-Type` charset (or, for HTML without one, a
 `<meta charset>` sniff over the first KiB; UTF-8 otherwise). `web_fetch` decodes
-malformed text with replacement characters and refuses binary media types (PDF,
-images, archives, `application/octet-stream`) by name without downloading the
-body; HTML and XHTML are converted, other text types (plain, JSON, XML, source)
+malformed text with replacement characters and refuses binary media types (images,
+archives, `application/octet-stream`) by name without downloading the body.
+`application/pdf` responses within the body cap are text-extracted by the same
+extractor as `read` (page markers, at most 500 pages / 1,000,000 characters, no
+OCR) and then quoted and spilled like any page; a PDF over the cap is refused with
+guidance. `web_fetch` retries a GET once after HTTP 429/502/503/504 (honoring a
+`Retry-After` of at most 10 s) or a connection failure, only while the wait fits
+inside the total deadline, and reuses a converted page for 15 minutes (16 pages,
+2 MiB each; a hit still requires the permission policy to allow the URL outright and
+is labelled in the output). A near-empty HTML conversion adds a JavaScript-rendering
+hint. HTML and XHTML are converted, other text types (plain, JSON, XML, source)
 are quoted literally. Search and the JS broker reject non-UTF-8 bodies. A native HTTP operation has one deadline spanning DNS,
 approval, redirects and body consumption: ten seconds for `web_search` and the JS
 broker, `web-fetch-timeout-secs` (default 30, clamped 1..=300) for `web_fetch`,

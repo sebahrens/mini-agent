@@ -1080,7 +1080,23 @@ fn render_background_job(output: BackgroundJobOutput, max_output_lines: Option<u
         "\nOutput (bytes {}..{} of {total}; next poll continues at since={}{stripped}):\n",
         window.start, window.next, window.next
     ));
-    result.push_str(&bound_output_lines(text, max_output_lines));
+    let range_hint = match &transcript.log {
+        Some(log) => format!(
+            "the omitted lines are inside bytes {}..{} of this job's output; read them from the log {}",
+            window.start,
+            window.next,
+            log.path.display()
+        ),
+        None => format!(
+            "the omitted lines are inside bytes {}..{} of this job's output and were not retained; pass since={} to re-read this window",
+            window.start, window.next, window.start
+        ),
+    };
+    result.push_str(&bound_output_lines_with_hint(
+        text,
+        max_output_lines,
+        &range_hint,
+    ));
     result
 }
 
@@ -1089,6 +1105,14 @@ fn render_background_job(output: BackgroundJobOutput, max_output_lines: Option<u
 /// starts and ends (exit codes and final errors live at the end). `None`
 /// returns the text unchanged.
 fn bound_output_lines(text: String, max_output_lines: Option<u64>) -> String {
+    bound_output_lines_with_hint(
+        text,
+        max_output_lines,
+        "re-run with a narrower invocation or pipe through `head`/`tail`/`grep` to see the rest",
+    )
+}
+
+fn bound_output_lines_with_hint(text: String, max_output_lines: Option<u64>, hint: &str) -> String {
     let Some(cap) = max_output_lines else {
         return text;
     };
@@ -1100,7 +1124,7 @@ fn bound_output_lines(text: String, max_output_lines: Option<u64>) -> String {
         let omitted = total - head - tail;
         format!(
             "\n\n[... {omitted} lines omitted — showing the first {head} and last {tail} of {total} lines; \
-             re-run with a narrower invocation or pipe through `head`/`tail`/`grep` to see the rest ...]\n"
+             {hint} ...]\n"
         )
     })
     .unwrap_or(text)
@@ -1220,6 +1244,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn job_line_bound_names_the_omitted_byte_range() {
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let bounded = bound_output_lines_with_hint(text, Some(10), "bytes 0..900 are in the log");
+        assert!(bounded.contains("lines omitted"), "{bounded}");
+        assert!(bounded.contains("bytes 0..900 are in the log"), "{bounded}");
+        assert!(crate::session::tool_result_is_self_bounded("job_status"));
+    }
 
     fn test_tool() -> BashTool {
         BashTool::new(None, None, Sandbox::new(false, "bwrap"), None)

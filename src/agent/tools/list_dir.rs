@@ -27,8 +27,18 @@ const NOT_A_DIRECTORY_HINT: &str =
 
 /// Deepest tree `depth` accepts.
 const MAX_LIST_DEPTH: usize = 3;
-/// Rows collected for one call before the listing is reported incomplete.
+/// Rows collected for one depth 2-3 tree before the listing is reported incomplete.
 const MAX_TREE_ROWS: usize = 10_000;
+/// Safety ceiling for a flat (depth 1) listing; offset paging reaches every entry below it.
+const MAX_FLAT_ROWS: usize = 1_000_000;
+
+fn row_cap(max_depth: usize) -> usize {
+    if max_depth <= 1 {
+        MAX_FLAT_ROWS
+    } else {
+        MAX_TREE_ROWS
+    }
+}
 
 struct Row {
     level: usize,
@@ -53,7 +63,7 @@ fn collect_level(
             .then_with(|| a.file_name.cmp(&b.file_name))
     });
     for entry in entries {
-        if rows.len() >= MAX_TREE_ROWS {
+        if rows.len() >= row_cap(max_depth) {
             *incomplete = true;
             return Ok(());
         }
@@ -346,6 +356,10 @@ impl Tool for ListDirTool {
                 end - start,
                 total_entries - end,
             ));
+        } else if incomplete && depth <= 1 {
+            result.push_str(&format!(
+                "\n[listing stopped at {MAX_FLAT_ROWS} entries; use find_files with a narrower pattern or shell to reach the rest]"
+            ));
         } else if incomplete {
             result.push_str(&format!(
                 "\n[listing stopped at {MAX_TREE_ROWS} entries; use a smaller depth or list a subdirectory]"
@@ -398,6 +412,36 @@ mod tests {
 
         assert!(listing.contains("[link]  link.txt"), "{listing}");
         assert!(listing.contains("-> target.txt"), "{listing}");
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn flat_listing_pages_past_ten_thousand_entries() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-agent-list-dir-big-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        for i in 0..10_050 {
+            std::fs::write(temp.join(format!("f{i:05}")), "").unwrap();
+        }
+        let listing = ListDirTool::new(None, None, None)
+            .with_workspace(&temp)
+            .call(ListDirArgs {
+                path: None,
+                offset: Some(10_040),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(listing.contains("f10049"), "{listing}");
+        assert!(
+            listing.contains("entries 10041-10050 of 10050"),
+            "{listing}"
+        );
+        assert!(!listing.contains("listing stopped"), "{listing}");
         std::fs::remove_dir_all(temp).unwrap();
     }
 

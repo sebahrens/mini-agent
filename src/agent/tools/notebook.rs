@@ -15,7 +15,6 @@ const MAX_CELLS: usize = 4096;
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_VIEW_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_CELL: usize = 4096;
-const MAX_OUTPUT_TOTAL: usize = 16 * 1024;
 
 fn error(message: &'static str) -> ToolError {
     ToolError::Msg(message.into())
@@ -576,7 +575,6 @@ pub(crate) fn view(
     let mut total = 0usize;
     let mut selected_lines = 0usize;
     let mut end = offset.saturating_add(limit);
-    let mut output_budget = MAX_OUTPUT_TOTAL;
     // Room for the header and continuation notice inside the view cap.
     let selected_cap = cap.saturating_sub(1024);
     let mut truncated_at: Option<usize> = None;
@@ -644,7 +642,7 @@ pub(crate) fn view(
                 push(&format!("[output: {kind}]"))?;
                 let rendered = render_output(&kind, output);
                 if let Some(text) = rendered.text {
-                    let permitted = cell_budget.min(output_budget).min(text.len());
+                    let permitted = cell_budget.min(text.len());
                     if rendered.keep_tail {
                         let mut start = text.len() - permitted;
                         while !text.is_char_boundary(start) {
@@ -661,7 +659,6 @@ pub(crate) fn view(
                         }
                         let kept = text.len() - start;
                         cell_budget -= kept;
-                        output_budget -= kept;
                     } else {
                         let mut cutoff = permitted;
                         while !text.is_char_boundary(cutoff) {
@@ -671,7 +668,6 @@ pub(crate) fn view(
                             push(line)?;
                         }
                         cell_budget -= cutoff;
-                        output_budget -= cutoff;
                         if cutoff < text.len() {
                             push(&format!("[{} output bytes omitted]", text.len() - cutoff))?;
                         }
@@ -1230,6 +1226,37 @@ mod tests {
     }
     /// mini-agent-0eep6: execute_result/display_data text/plain, error
     /// tracebacks (ANSI-stripped) and image mime labels are rendered.
+    #[test]
+    fn later_cell_outputs_are_visible_in_a_window_that_starts_late() {
+        let cells: Vec<String> = (0..30)
+            .map(|i| {
+                format!(
+                    r#"{{"cell_type":"code","id":"c{i}","metadata":{{}},"execution_count":null,"source":["x"],"outputs":[{{"output_type":"stream","name":"stdout","text":["{}"]}}]}}"#,
+                    format!("out{i}-").repeat(150)
+                )
+            })
+            .collect();
+        let nb = format!(
+            r#"{{"cells":[{}],"metadata":{{}},"nbformat":4,"nbformat_minor":5}}"#,
+            cells.join(",")
+        );
+        // Find the first virtual line of cell 25 by viewing everything once.
+        let all = view(nb.as_bytes(), "n.ipynb", 0, 100_000, 32 * 1024 * 1024).unwrap();
+        let marker = all
+            .text
+            .lines()
+            .find(|l| l.ends_with("[cell 25: code; id=c25]"))
+            .unwrap();
+        let line_no: usize = marker.split('|').next().unwrap().parse().unwrap();
+        let window = view(nb.as_bytes(), "n.ipynb", line_no - 1, 8, 32 * 1024 * 1024).unwrap();
+        assert!(window.text.contains("out25-out25-"), "{}", window.text);
+        assert!(
+            !window.text.contains("output bytes omitted"),
+            "{}",
+            window.text
+        );
+    }
+
     #[test]
     fn notebook_view_renders_results_errors_and_labels_images() {
         let outputs = serde_json::json!([

@@ -1853,6 +1853,16 @@ impl Tool for FindFilesTool {
                     "default": "name",
                     "description": "Name order, or newest modification time first; path breaks ties and unavailable times sort last"
                 },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Matches to skip (0-based) to continue a truncated result; order is stable on an unchanged tree"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Lower the configured result cap for this call"
+                },
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "glob", "regex"],
@@ -1948,7 +1958,13 @@ impl Tool for FindFilesTool {
         };
         let coaching = combine_coaching(coaching, path_coaching);
 
-        let max_results = usize::try_from(self.max_results).unwrap_or(usize::MAX);
+        let configured_cap = usize::try_from(self.max_results).unwrap_or(usize::MAX);
+        let max_results = args
+            .limit
+            .map_or(configured_cap, |limit| limit.clamp(1, configured_cap));
+        let offset = args.offset.unwrap_or(0);
+        // The heap keeps the first `offset + page` matches in stable order.
+        let keep = offset.saturating_add(max_results);
         let sort = args.sort;
         let cancellation = crate::agent::runner::current_work_cancellation();
         let limits = super::limits::current();
@@ -1963,14 +1979,14 @@ impl Tool for FindFilesTool {
                     .with_file_filter(Box::new(move |relative_path, file_name| {
                         pattern.is_match(&file_name.to_string_lossy(), relative_path)
                     }));
-                let mut first_results = BinaryHeap::with_capacity(max_results.min(64));
+                let mut first_results = BinaryHeap::with_capacity(keep.min(64));
                 let mut total_matches = 0_usize;
 
                 for entry in walker.by_ref() {
                     total_matches = total_matches.saturating_add(1);
                     let path = entry.path.to_string_lossy();
                     let modified = entry.metadata.modified().ok();
-                    if first_results.len() < max_results {
+                    if first_results.len() < keep {
                         first_results.push(find_file_rank(sort, modified, path.into_owned()));
                     } else if let Some(current_last) = first_results.peek() {
                         // Compare against the heap top on the borrowed
@@ -2027,19 +2043,41 @@ impl Tool for FindFilesTool {
             });
         }
 
-        let limit_hit = total_matches > max_results;
+        let start = offset.min(total_matches);
+        let end = total_matches.min(start.saturating_add(max_results));
+        let limit_hit = end < total_matches;
         let mut results = first_results.into_vec();
         results.sort();
-        let results: Vec<_> = results.into_iter().map(|(_, path)| path).collect();
+        let results: Vec<_> = results
+            .into_iter()
+            .skip(start)
+            .map(|(_, path)| path)
+            .collect();
 
-        let result = if limit_hit {
+        let result = if start >= total_matches {
             format!(
-                "{} files found (showing first {}):\n{}\n\n[truncated after {} entries — {} additional entries; narrow the pattern or path]",
+                "{total_matches} files found (no entries at offset {offset}; the search has {total_matches} matches)"
+            )
+        } else if limit_hit {
+            let window = if start == 0 {
+                format!("first {max_results}")
+            } else {
+                format!("{}-{}", start + 1, end)
+            };
+            format!(
+                "{} files found (showing {window}):\n{}\n\n[truncated after {} entries — {} additional entries; continue with offset={end}, or narrow the pattern or path]",
                 total_matches,
-                max_results,
                 results.join("\n"),
-                max_results,
-                total_matches - max_results,
+                end - start,
+                total_matches - end,
+            )
+        } else if start > 0 {
+            format!(
+                "{} files found (showing {}-{}):\n{}",
+                total_matches,
+                start + 1,
+                end,
+                results.join("\n")
             )
         } else {
             format!("{} files found:\n{}", total_matches, results.join("\n"))
@@ -2143,6 +2181,8 @@ mod tests {
         );
 
         let call = tool.call(FindFilesArgs {
+            offset: None,
+            limit: None,
             sort: crate::agent::tools::FindFilesSort::Name,
             mode: crate::agent::tools::FindFilesMode::Regex,
             pattern: "needle".to_string(),
@@ -2182,6 +2222,8 @@ mod tests {
         let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
             .with_workspace(workspace.path())
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
@@ -2197,6 +2239,8 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^find_files\.rs$".to_string(),
@@ -2221,6 +2265,8 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
@@ -2250,6 +2296,8 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
@@ -2273,6 +2321,8 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(workspace.path()),
             FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
@@ -2301,6 +2351,8 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
@@ -2333,6 +2385,8 @@ mod tests {
         let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
+            offset: None,
+            limit: None,
             sort: crate::agent::tools::FindFilesSort::Name,
             mode: crate::agent::tools::FindFilesMode::Regex,
             pattern: "marker".to_string(),
@@ -2373,6 +2427,8 @@ mod tests {
         let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
+            offset: None,
+            limit: None,
             sort: crate::agent::tools::FindFilesSort::Name,
             mode: crate::agent::tools::FindFilesMode::Regex,
             pattern: "must_not_be_returned".to_string(),
@@ -2439,6 +2495,8 @@ mod tests {
 
         let output = FindFilesTool::new(Some(standard_permission(&workspace)), None, 10)
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!(".*{marker}$"),
@@ -2463,6 +2521,8 @@ mod tests {
         let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
             .with_workspace(workspace.path())
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
@@ -2477,6 +2537,8 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^find_files\.rs$".to_string(),
@@ -2495,6 +2557,8 @@ mod tests {
 
         let result = tool
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "needle".to_string(),
@@ -2524,6 +2588,8 @@ mod tests {
 
         let result = tool
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: format!("^{marker}$"),
@@ -2546,6 +2612,8 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 100)
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^match_\d+\.txt$".to_string(),
@@ -2559,6 +2627,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pages_across_three_pages_in_stable_order() {
+        let dir = TempDir::new("paging");
+        for index in 0..25 {
+            std::fs::write(dir.path().join(format!("match_{index:03}.txt")), "").unwrap();
+        }
+        let tool = FindFilesTool::new(None, None, 10);
+        let mut seen = Vec::new();
+        let mut offset = None;
+        for page in 0..3 {
+            let output = tool
+                .call(FindFilesArgs {
+                    offset,
+                    limit: None,
+                    mode: crate::agent::tools::FindFilesMode::Regex,
+                    pattern: r"^match_\d+\.txt$".to_string(),
+                    path: Some(dir.path().to_string_lossy().into_owned()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            seen.extend(
+                output
+                    .lines()
+                    .filter(|l| l.contains("match_"))
+                    .map(str::to_owned),
+            );
+            if page < 2 {
+                let next = (page + 1) * 10;
+                assert!(
+                    output.contains(&format!("continue with offset={next}")),
+                    "{output}"
+                );
+                offset = Some(next);
+            } else {
+                assert!(!output.contains("truncated"), "{output}");
+            }
+        }
+        let expected: Vec<String> = (0..25)
+            .map(|i| {
+                dir.path()
+                    .join(format!("match_{i:03}.txt"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(seen.len(), 25, "{seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]));
+        let _ = expected;
+
+        let past = tool
+            .call(FindFilesArgs {
+                offset: Some(99),
+                mode: crate::agent::tools::FindFilesMode::Regex,
+                pattern: r"^match_\d+\.txt$".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(past.contains("no entries at offset 99"), "{past}");
+    }
+
+    #[tokio::test]
     async fn does_not_report_truncation_when_walker_is_exhausted_at_result_limit() {
         let dir = TempDir::new("exact_limit");
         for index in 0..100 {
@@ -2567,6 +2698,8 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 100)
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^match_\d+\.txt$".to_string(),
@@ -2589,6 +2722,8 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 10)
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: FindFilesMode::Auto,
                 pattern: "**/*.rs".to_string(),
@@ -2697,6 +2832,8 @@ mod tests {
         ] {
             let output = FindFilesTool::new(None, None, 10)
                 .call(FindFilesArgs {
+                    offset: None,
+                    limit: None,
                     sort: crate::agent::tools::FindFilesSort::Name,
                     pattern: pattern.to_string(),
                     path: Some(dir.path().to_string_lossy().into_owned()),
@@ -2713,6 +2850,8 @@ mod tests {
         ] {
             let error = FindFilesTool::new(None, None, 10)
                 .call(FindFilesArgs {
+                    offset: None,
+                    limit: None,
                     sort: crate::agent::tools::FindFilesSort::Name,
                     pattern: "[".to_string(),
                     path: Some(dir.path().to_string_lossy().into_owned()),
@@ -2733,6 +2872,8 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 2)
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r"^[a-z]\.txt$".to_string(),
@@ -3144,6 +3285,8 @@ mod tests {
         ] {
             let listing = tool
                 .call(FindFilesArgs {
+                    offset: None,
+                    limit: None,
                     sort: crate::agent::tools::FindFilesSort::Name,
                     mode: crate::agent::tools::FindFilesMode::Regex,
                     pattern: r"\.txt$".to_string(),
@@ -3174,6 +3317,8 @@ mod tests {
         ] {
             let error = tool
                 .call(FindFilesArgs {
+                    offset: None,
+                    limit: None,
                     pattern: "*".to_string(),
                     path: Some(path.to_string()),
                     mode: Default::default(),

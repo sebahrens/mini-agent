@@ -841,6 +841,12 @@ pub(crate) struct NativeFetchLimits {
     /// Do not download a body whose content type is binary (see
     /// `is_textual_content_type`); the result reports the type instead.
     pub(crate) skip_binary_body: bool,
+    /// With `skip_binary_body`, still download `application/pdf` bodies (never
+    /// truncated into a prefix) and return them in `NativeFetchResult::pdf`.
+    pub(crate) accept_pdf: bool,
+    /// Retry a GET once after 429/502/503/504 (honoring `Retry-After`) or a
+    /// connection failure, inside the same total deadline.
+    pub(crate) retry_transient: bool,
 }
 
 impl Default for NativeFetchLimits {
@@ -852,6 +858,8 @@ impl Default for NativeFetchLimits {
             read_timeout: FETCH_READ_TIMEOUT,
             lossy_text: false,
             skip_binary_body: false,
+            accept_pdf: false,
+            retry_transient: false,
         }
     }
 }
@@ -894,6 +902,10 @@ pub(crate) struct NativeFetchResult {
     pub truncated_at: Option<usize>,
     pub content_type: Option<String>,
     pub binary: bool,
+    /// Complete `application/pdf` body, only when `accept_pdf` was set.
+    pub pdf: Option<Vec<u8>>,
+    /// Parsed delta-seconds `Retry-After`, if the response carried one.
+    pub retry_after: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1184,13 +1196,24 @@ pub(crate) async fn send_async(
     let content_type = native_media_type(response.headers());
     let charset = native_charset(response.headers());
     let status = response.status().as_u16();
-    if native.skip_binary_body && !is_textual_content_type(content_type.as_deref()) {
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let pdf = native.accept_pdf
+        && (200..300).contains(&status)
+        && content_type.as_deref() == Some("application/pdf");
+    if native.skip_binary_body && !pdf && !is_textual_content_type(content_type.as_deref()) {
         return Ok(NativeTransportOutcome::Complete(NativeFetchResult {
             status,
             text: String::new(),
             truncated_at: None,
             content_type,
             binary: true,
+            pdf: None,
+            retry_after,
         }));
     }
     let cap = native.body_max_bytes;
@@ -1216,6 +1239,17 @@ pub(crate) async fn send_async(
         Some(coding) => native_decode_coding(coding, &body, cap, native.truncate_body, truncated)?,
         None => (body, truncated),
     };
+    if pdf {
+        return Ok(NativeTransportOutcome::Complete(NativeFetchResult {
+            status,
+            text: String::new(),
+            truncated_at: truncated.then_some(cap),
+            content_type,
+            binary: true,
+            pdf: (!truncated).then_some(body),
+            retry_after,
+        }));
+    }
     let html = content_type
         .as_deref()
         .is_none_or(|t| t == "text/html" || t == "application/xhtml+xml");
@@ -1226,6 +1260,8 @@ pub(crate) async fn send_async(
         truncated_at: truncated.then_some(cap),
         content_type,
         binary: false,
+        pdf: None,
+        retry_after,
     }))
 }
 
@@ -1263,6 +1299,23 @@ impl NativeWebClient {
     pub(crate) fn with_limits(mut self, limits: NativeFetchLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Whether a response cached for `raw_url` may be served without a new
+    /// request: the URL passes the fetch policy and the permission policy
+    /// allows it outright (never prompts, never turns a denial into a hit).
+    pub(crate) async fn authorize_cached(&self, raw_url: &str, tool: &str) -> bool {
+        let Ok(url) = self.policy.authorize(raw_url) else {
+            return false;
+        };
+        let Some(permission) = &self.permission else {
+            return true;
+        };
+        let mut guard = permission.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(
+            guard.check(tool, url.as_str()),
+            crate::permission::checker::CheckResult::Allowed
+        )
     }
 
     #[cfg(all(test, feature = "acp"))]
@@ -1318,7 +1371,9 @@ impl NativeWebClient {
         tool: &str,
         follow: bool,
     ) -> Result<(Url, NativeFetchResult), super::ToolError> {
+        let started = std::time::Instant::now();
         let work = async {
+            let mut retried = false;
             let mut url = self.policy.authorize(raw_url).map_err(native_error)?;
             for redirects in 0..=FETCH_MAX_REDIRECTS {
                 if url.as_str().len() > NATIVE_MAX_URL_BYTES {
@@ -1369,10 +1424,22 @@ impl NativeWebClient {
                 } else {
                     send_url
                 };
-                match send_async(send_url, request, &addresses, &self.limits)
-                    .await
-                    .map_err(native_error)?
+                let mut outcome =
+                    send_async(send_url.clone(), request, &addresses, &self.limits).await;
+                if self.limits.retry_transient
+                    && !retried
+                    && request.method == reqwest::Method::GET
+                    && let Some(delay) = transient_retry_delay(&outcome)
                 {
+                    retried = true;
+                    let remaining = self.limits.total_timeout.saturating_sub(started.elapsed());
+                    // Only retry when the wait leaves time for the second try.
+                    if delay < remaining / 2 {
+                        tokio::time::sleep(delay).await;
+                        outcome = send_async(send_url, request, &addresses, &self.limits).await;
+                    }
+                }
+                match outcome.map_err(native_error)? {
                     NativeTransportOutcome::Complete(result) => return Ok((url, result)),
                     NativeTransportOutcome::Redirect(next) => {
                         if !follow || request.method != reqwest::Method::GET {
@@ -1398,6 +1465,29 @@ impl NativeWebClient {
             _ = crate::agent::runner::current_work_scope_cancelled() => Err(native_error(FetchError::Cancelled)),
             result = tokio::time::timeout(total_timeout, work) => result.unwrap_or_else(|_| Err(native_error(FetchError::TimedOut))),
         }
+    }
+}
+
+/// Longest `Retry-After` honored for the single transient retry.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// The wait before the one bounded retry, if this outcome is transient: HTTP
+/// 429/502/503/504 or a connection-level failure (timeouts are not retried).
+fn transient_retry_delay(outcome: &Result<NativeTransportOutcome, FetchError>) -> Option<Duration> {
+    match outcome {
+        Ok(NativeTransportOutcome::Complete(result))
+            if matches!(result.status, 429 | 502 | 503 | 504) =>
+        {
+            Some(
+                result
+                    .retry_after
+                    .unwrap_or(DEFAULT_RETRY_DELAY)
+                    .min(MAX_RETRY_DELAY),
+            )
+        }
+        Err(FetchError::RequestFailed(_)) => Some(DEFAULT_RETRY_DELAY),
+        _ => None,
     }
 }
 

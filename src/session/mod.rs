@@ -124,6 +124,8 @@ pub(crate) fn tool_result_is_self_bounded(name: &str) -> bool {
             | "web_search"
             | "task"
             | "task_evidence"
+            | "git"
+            | "job_status"
     )
 }
 /// Count-only pruning is opt-in. The normal context-budget compactor decides
@@ -3778,6 +3780,8 @@ mod preflight_tests {
             "web_fetch",
             "web_search",
             "task",
+            "git",
+            "job_status",
         ] {
             let (content, replay, artifact) = session.tool_result_content("id", tool, &output);
             assert_eq!(content, format!("{tool}:\n{output}"));

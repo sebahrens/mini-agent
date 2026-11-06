@@ -86,6 +86,8 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
         let found = FindFilesTool::new(None, None, 100)
             .with_workspace(&root)
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r".*\.txt".into(),
@@ -691,7 +693,7 @@ async fn multibyte_characters_split_across_chunks_stay_valid() {
 }
 
 #[tokio::test]
-async fn invalid_utf8_late_in_a_long_line_is_still_rejected() {
+async fn invalid_utf8_late_in_a_long_line_is_replaced_with_a_warning() {
     let root = read_temp_root("utf8-invalid");
     let mut bytes = vec![b'a'; 40_000];
     bytes.push(0xFF);
@@ -699,8 +701,18 @@ async fn invalid_utf8_late_in_a_long_line_is_still_rejected() {
     std::fs::write(root.join("binary.txt"), bytes).unwrap();
 
     let tool = bounded_read_tool(&root, 1024 * 1024);
-    let error = tool
+    let output = tool
         .call(read_args("binary.txt", None, None))
+        .await
+        .unwrap();
+    assert!(
+        output.contains("1 invalid UTF-8 byte(s) replaced"),
+        "{output}"
+    );
+    // Mostly-invalid or NUL-bearing data is still treated as binary.
+    std::fs::write(root.join("blob.bin"), [0xFFu8, 0, 0xFE, 0xFF, 0, 1, 2]).unwrap();
+    let error = tool
+        .call(read_args("blob.bin", None, None))
         .await
         .unwrap_err()
         .to_string();
@@ -709,7 +721,7 @@ async fn invalid_utf8_late_in_a_long_line_is_still_rejected() {
 }
 
 #[tokio::test]
-async fn a_truncated_multibyte_sequence_at_eof_is_rejected() {
+async fn a_truncated_multibyte_sequence_at_eof_is_replaced_with_a_warning() {
     let root = read_temp_root("utf8-truncated");
     let mut bytes = "ok\n".as_bytes().to_vec();
     // Leading byte of a three-byte sequence with no continuation bytes.
@@ -717,12 +729,14 @@ async fn a_truncated_multibyte_sequence_at_eof_is_rejected() {
     std::fs::write(root.join("truncated.txt"), bytes).unwrap();
 
     let tool = bounded_read_tool(&root, 1024 * 1024);
-    let error = tool
+    let output = tool
         .call(read_args("truncated.txt", None, None))
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("not valid UTF-8"), "{error}");
+        .unwrap();
+    assert!(
+        output.contains("invalid UTF-8 byte(s) replaced"),
+        "{output}"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

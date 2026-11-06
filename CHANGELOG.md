@@ -15,6 +15,21 @@ Notable changes to mini-agent are documented in this file. The format follows
   approval apply), its write times out after 5 s and reports bytes accepted, and `pty` output is
   shown without terminal escapes or redraw noise (mini-agent-jj068, mini-agent-y53qh,
   mini-agent-ktcqn).
+### Tool layer
+
+- `list_dir` pages through every entry of a flat directory (the 10,000-entry cap now applies only to
+  depth 2-3 trees); `find_files` accepts `offset`/`limit` and names `continue with offset=N`.
+- `git` diff/show pages and `job_status` polls are self-bounded (git pages scale under
+  `max_result_chars`), so the generic spill no longer cuts them; `job_status` line bounds name the
+  omitted byte range.
+- Notebook cell views no longer spend one notebook-wide output budget, so later cells' outputs are
+  visible by choosing `offset`/`limit`.
+- `write` `overwrite=true` on a file too large for one read result now explains the ceiling and
+  recommends `edit`/`shell`.
+- `read` decodes text with stray invalid UTF-8 bytes lossily (U+FFFD plus a visible warning that
+  `edit`/`write` are unavailable) instead of failing the whole file; binary data is still refused.
+- `web_fetch` retries transient failures once, caches converted pages for 15 minutes, extracts PDF
+  text, and hints when a page converts to almost no text.
 
 ### Subagents
 
