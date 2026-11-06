@@ -40,6 +40,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Root context files now share a window-relative budget (window tokens as bytes, 16 KiB–512 KiB,
   `context_files_max_bytes` overrides) instead of a fixed 512 KiB, and an oversized nested or
   included instruction source loads truncated with a notice instead of failing (mini-agent-59sgr).
+- The TUI attachment preflight estimates images from their dimensions and PDFs per page instead of
+  a flat 2,048 tokens per attachment, so large images or long PDFs trigger compaction or a local
+  rejection before the provider call (mini-agent-d6x7s).
 
 ### Security
 

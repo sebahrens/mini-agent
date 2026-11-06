@@ -34,6 +34,14 @@ selected provider's document support; it does not convert a scan into images.
 Export the needed pages as PNG/JPEG to use the image paths above. No local
 image renderer or OCR service is started implicitly.
 
+Before a TUI prompt with pending attachments is sent, a local context preflight
+estimates each attachment: an image by its header dimensions
+(`ceil(w/28) * ceil(h/28)` tokens, at most 4,784), a PDF at 3,000 tokens per page,
+another document by its text, and audio at a flat 2,048 tokens. A payload that
+cannot fit even after compaction is rejected locally; otherwise the estimate feeds
+the compaction decision. Provider-reported usage replaces it once a response
+arrives.
+
 The actual captured model/transport decides admission. An exact model declared
 text-only in the embedded catalogue returns `model has no vision`. Unknown
 custom model capabilities retain normal provider error handling; they are not
