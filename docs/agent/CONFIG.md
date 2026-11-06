@@ -734,6 +734,10 @@ Accepted top-level keys:
 | `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, and other command classes, including brokered JS `spawn`, retain their existing limits. Sensitive in project-local configuration: changing it requires project trust. |
 | `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Headless, loop, and ACP modes skip it. Requires project trust when set locally. No automatic download or installation. |
 | `session_retention_days` | integer | Delete saved session snapshots (`<uuid>.json` in the sessions directory) whose modification time is older than this many days, once per interactive startup in a background thread. Default: unset/`0` (keep forever). A session open in this or another live process (its lock is held) is never removed; tool-output spill directories are left in place. Requires project trust when set locally. |
+| `acp_history_max_turns` | integer | ACP only: summarize live history after this many user turns. Default: unset/`0` (no turn cap; compaction follows token pressure under `compact_enabled` and the byte guard). |
+| `acp_history_max_bytes` | integer | ACP only: serialized live-history memory guard. Default: max(2 MiB, 4 bytes per context-window token); minimum 64 KiB. |
+| `acp_max_sessions` | integer | ACP only: concurrently loaded sessions per process. Default: `64`. |
+| `acp_max_client_mcp_servers` | integer | ACP only: client-supplied MCP servers accepted per `session/new`. Default: `8`. |
 | `max_grep_results`        | integer | Maximum grep matches returned to the main agent. Default: `150`. |
 | `max_find_results`        | integer | Maximum file matches returned to the main agent. Default: `150`. |
 | `max_list_dir_entries`    | integer | Maximum directory entries returned to the main agent. Default: `150`. |
@@ -2911,14 +2915,23 @@ Each ACP session owns one canonical `Session` history. Accepted user content,
 correlated structured tool call/results, observed usage and terminal assistant
 content are retained together, including accepted progress before cancellation.
 The next prompt receives that committed history before its current user message.
-Live history is bounded to 128 user-started intervals and 2 MiB of serialized
-canonical messages;
-before an over-bound history is reused, the ordinary provider-backed rolling
+Live history is compacted on the same triggers as the TUI: with
+`compact_enabled = true`, when the estimated context exceeds the routed model's
+`context_window` minus `reserve_tokens` (keeping `keep_recent_tokens` of recent
+turns); independently, a memory guard of `acp_history_max_bytes` serialized
+bytes (default max(2 MiB, 4 bytes per context-window token), minimum 64 KiB)
+always applies. There is no turn-count trigger unless `acp_history_max_turns`
+is set (previously a fixed 128). Native (provider-owned) history is never
+auto-compacted on token pressure, as in the TUI.
+Before an over-bound history is reused, the ordinary provider-backed rolling
 summarizer replaces the oldest complete intervals with a bounded recap and
 records actual compaction metadata. Failure or zero progress uses an explicitly
 labelled emergency recap; original durable rows remain archived. The process
-retains at most 64 ACP sessions, counting pending loads and retiring owners.
-Creating a 65th session is rejected rather than silently invalidating a live session. Each
+retains at most `acp_max_sessions` (default 64) ACP sessions, counting pending
+loads and retiring owners, and each session accepts at most
+`acp_max_client_mcp_servers` (default 8) client-supplied MCP servers. A prompt
+is limited to 2 MiB of rendered text (it must fit the 4 MiB frame).
+Creating a session beyond the cap is rejected rather than silently invalidating a live session. Each
 session accepts one active prompt; a concurrent prompt for the same session is
 rejected instead of queued. Protocol dispatch and work in other sessions remain
 independent. Unless `--no-session` is set, checkpoints save through the shared

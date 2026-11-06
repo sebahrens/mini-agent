@@ -15,6 +15,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- ACP (IDE) sessions no longer force a paid summarization after 128 user turns or 2 MiB regardless
+  of the model: compaction follows token pressure against the routed model's context window under
+  `compact_enabled` (as in the TUI), the byte guard scales with the window, and the turn cap,
+  byte guard, session cap and client MCP server cap are configurable (`acp_history_max_turns`,
+  `acp_history_max_bytes`, `acp_max_sessions`, `acp_max_client_mcp_servers`).
 - `/sessions` and the `--resume` picker sort the whole sessions directory by mtime before applying
   the 2,048-entry cap, and a workspace listing skips other workspaces' sessions via a 4 KiB head
   peek instead of charging them to the 256 MiB budget, so the newest current-workspace sessions are

@@ -750,6 +750,20 @@ pub struct Config {
     /// interactive startup. `None`/`0` (default) keeps sessions forever.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_retention_days: Option<u32>,
+    /// ACP: summarize live history after this many user turns. `None`/`0`
+    /// (default) disables the turn trigger; token pressure applies instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_history_max_turns: Option<usize>,
+    /// ACP: serialized live-history memory guard in bytes. Default
+    /// max(2 MiB, 4 bytes per context-window token); minimum 64 KiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_history_max_bytes: Option<usize>,
+    /// ACP: concurrently loaded sessions (default 64).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_max_sessions: Option<usize>,
+    /// ACP: client-supplied MCP servers per session (default 8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_max_client_mcp_servers: Option<usize>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///

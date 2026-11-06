@@ -45,7 +45,11 @@ const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_TCP_HOST: &str = "127.0.0.1";
 const DEFAULT_TCP_PORT: u16 = 7243;
 const MAX_PENDING_AUTHENTICATIONS: usize = 16;
+/// Legacy fixed interval cap, now only the test default and an opt-in
+/// `acp_history_max_turns` value; production defaults to no turn cap.
 const MAX_ACP_HISTORY_TURNS: usize = 128;
+/// Floor of the live-history byte guard; production scales it with the model
+/// window (`acp_history_max_bytes`, default max(2 MiB, 4 bytes per token)).
 const MAX_ACP_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACP_SESSIONS: usize = 64;
 const MAX_ACP_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -116,6 +120,63 @@ struct SessionHistory {
     manual_compact: bool,
     /// Servers and managers that outlive a single prompt.
     reuse: SessionReuse,
+    /// Compaction triggers, refreshed from config and the routed model's
+    /// context window before each prompt.
+    limits: AcpHistoryLimits,
+}
+
+/// When ACP live history is summarized. Token pressure mirrors the TUI's
+/// between-turn auto-compaction (`compact_enabled`); the byte guard is a
+/// memory bound scaled to the model window; the turn cap is opt-in.
+#[derive(Clone, Copy, Debug)]
+struct AcpHistoryLimits {
+    /// 0 disables the interval-count trigger.
+    max_turns: usize,
+    max_bytes: usize,
+    token_pressure: Option<AcpTokenPressure>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AcpTokenPressure {
+    window: u64,
+    reserve: u64,
+    keep_recent_tokens: u64,
+    keep_recent_tool_results: usize,
+}
+
+impl Default for AcpHistoryLimits {
+    /// The pre-configuration bounds; real prompts replace them via
+    /// [`AcpHistoryLimits::from_config`].
+    fn default() -> Self {
+        Self {
+            max_turns: MAX_ACP_HISTORY_TURNS,
+            max_bytes: MAX_ACP_HISTORY_BYTES,
+            token_pressure: None,
+        }
+    }
+}
+
+impl AcpHistoryLimits {
+    fn from_config(cfg: &Config, window: u64, reserve: u64, native: bool) -> Self {
+        let scaled = usize::try_from(window.saturating_mul(4)).unwrap_or(usize::MAX);
+        Self {
+            max_turns: cfg.acp_history_max_turns.unwrap_or(0),
+            max_bytes: cfg
+                .acp_history_max_bytes
+                .unwrap_or_else(|| scaled.max(MAX_ACP_HISTORY_BYTES))
+                .max(64 * 1024),
+            // Native (provider-owned) history is never auto-compacted in
+            // place, exactly as in the TUI; only hard bounds apply to it.
+            token_pressure: (cfg.resolve_compact_enabled() && !native && window > 0).then(|| {
+                AcpTokenPressure {
+                    window,
+                    reserve,
+                    keep_recent_tokens: cfg.resolve_keep_recent_tokens(window),
+                    keep_recent_tool_results: cfg.resolve_keep_recent_tool_results(),
+                }
+            }),
+        }
+    }
 }
 
 /// Prompt-spanning runtime owned by one ACP session. Each prompt builds a new
@@ -214,6 +275,7 @@ impl Default for SessionHistory {
             pending_question: None,
             manual_compact: false,
             reuse: Default::default(),
+            limits: Default::default(),
         }
     }
 }
@@ -288,7 +350,7 @@ impl SessionHistory {
         // is counted once and gets its own finite allowance, not a text-sized
         // ceiling that would reject an otherwise valid 2 MiB input image.
         let image_bytes = self.session.compacted_image_bytes();
-        let limit = MAX_ACP_HISTORY_BYTES.saturating_add(image_bytes);
+        let limit = self.limits.max_bytes.saturating_add(image_bytes);
         let mut count = Count {
             bytes: image_bytes,
             limit,
@@ -306,11 +368,26 @@ impl SessionHistory {
 
     fn needs_compaction(&self) -> bool {
         (self.manual_compact && self.live_start() < self.session.messages.len())
-            || self.user_starts().len() > MAX_ACP_HISTORY_TURNS
-            || {
-                let (bytes, limit) = self.live_bytes();
-                bytes > limit
-            }
+            || self.over_turn_cap()
+            || self.over_token_pressure().is_some()
+            || self.exceeds_hard_bound()
+    }
+    fn over_turn_cap(&self) -> bool {
+        self.limits.max_turns > 0 && self.user_starts().len() > self.limits.max_turns
+    }
+    /// The serialized live-history memory guard. Unlike token pressure this
+    /// bound must hold after compaction for the prompt to proceed.
+    fn exceeds_hard_bound(&self) -> bool {
+        let (bytes, limit) = self.live_bytes();
+        bytes > limit
+    }
+    fn over_token_pressure(&self) -> Option<AcpTokenPressure> {
+        let pressure = self.limits.token_pressure?;
+        (self
+            .session
+            .effective_context_tokens_after_tool_result_pruning(pressure.keep_recent_tool_results)
+            > pressure.window.saturating_sub(pressure.reserve))
+        .then_some(pressure)
     }
     fn next_cut(&self) -> usize {
         if self.manual_compact {
@@ -320,7 +397,21 @@ impl SessionHistory {
         if starts.is_empty() {
             return self.session.messages.len();
         }
-        let excess = starts.len().saturating_sub(MAX_ACP_HISTORY_TURNS).max(1);
+        let mut excess = 1;
+        if self.limits.max_turns > 0 {
+            excess = excess.max(starts.len().saturating_sub(self.limits.max_turns));
+        }
+        if let Some(pressure) = self.over_token_pressure() {
+            // Keep the most recent `keep_recent_tokens`, as the TUI does, and
+            // cut at the last completed interval boundary before them.
+            let live = self.live_start();
+            let cut = live.saturating_add(crate::session::Session::select_compaction_cut(
+                &self.session.messages[live..],
+                pressure.keep_recent_tokens,
+            ));
+            let fitting = starts.iter().filter(|start| **start <= cut).count();
+            excess = excess.max(fitting.saturating_sub(1));
+        }
         starts
             .get(excess)
             .copied()
@@ -798,6 +889,8 @@ fn acp_hook_root_claims() -> Option<Arc<HookRootClaims>> {
 #[derive(Default)]
 struct SessionLeases {
     ids: StdMutex<HashSet<SessionId>>,
+    /// `acp_max_sessions`; `None` means [`MAX_ACP_SESSIONS`].
+    max_sessions: Option<usize>,
     #[cfg(test)]
     storage_scope_for_test: StdMutex<Option<Arc<crate::agent::runner::AgentWorkScope>>>,
 }
@@ -823,7 +916,7 @@ impl SessionLeases {
                 "ACP session identity is already owned",
             ));
         }
-        if ids.len() >= MAX_ACP_SESSIONS {
+        if ids.len() >= self.max_sessions.unwrap_or(MAX_ACP_SESSIONS).max(1) {
             return Err(agent_client_protocol::Error::new(
                 -32000,
                 "ACP session capacity is full",
@@ -1356,10 +1449,13 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
             cli.idle_exit_secs
                 .map(|seconds| std::time::Duration::from_secs(seconds.get())),
         )?,
+        leases: Arc::new(SessionLeases {
+            max_sessions: cfg.acp_max_sessions,
+            ..Default::default()
+        }),
         cli,
         cfg,
         context,
-        leases: Arc::default(),
         provider_clients: Default::default(),
         sessions: Mutex::new(HashMap::new()),
         cancel_routes: StdMutex::new(HashMap::new()),
@@ -1898,6 +1994,7 @@ async fn install_session(
                 pending_question,
                 manual_compact: false,
                 reuse: Default::default(),
+                limits: Default::default(),
             })),
             workspace,
             base_context: Arc::new(base_context),
@@ -2111,9 +2208,13 @@ fn client_mcp_servers(
     #[cfg(feature = "mcp")]
     {
         use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
-        if servers.len() > MAX_ACP_CLIENT_MCP_SERVERS {
+        let max_servers = state
+            .cfg
+            .acp_max_client_mcp_servers
+            .unwrap_or(MAX_ACP_CLIENT_MCP_SERVERS);
+        if servers.len() > max_servers {
             return refuse(format!(
-                "ACP session accepts at most {MAX_ACP_CLIENT_MCP_SERVERS} client-supplied MCP servers"
+                "ACP session accepts at most {max_servers} client-supplied MCP servers (acp_max_client_mcp_servers)"
             ));
         }
         let (sandbox, network) = match state.client_mcp {
@@ -4368,6 +4469,16 @@ async fn execute_prompt(
 
     let native = matches!(&client, crate::provider::AnyClient::Anthropic(_))
         || crate::session::native_publication::is_native_bearing(&history.session);
+    {
+        let quick_models = crate::config::quick_models_map(&state.cfg);
+        let window = state
+            .cfg
+            .resolve_context_window(&provider_str, &model_str, quick_models);
+        let reserve = state
+            .cfg
+            .resolve_reserve_tokens(&model_str, quick_models, window);
+        history.limits = AcpHistoryLimits::from_config(&state.cfg, window, reserve, native);
+    }
     let needs_compaction = history.needs_compaction();
     if native && needs_compaction {
         return Ok(PromptOutcome::failed(
@@ -4464,7 +4575,7 @@ async fn execute_prompt(
         let Some(usage) = compacted else {
             return Ok(PromptOutcome::cancelled(None));
         };
-        if history.needs_compaction() {
+        if history.exceeds_hard_bound() || history.over_turn_cap() {
             return Ok(PromptOutcome::failed(
                 "retained historical image evidence exceeds the ACP history limit; start a fresh session or provide fewer/smaller images".into(),
             ));
@@ -5486,6 +5597,78 @@ mod history_tests {
         history.commit_completed_turn("start", model_visible_transcript[1..].to_vec());
 
         assert_eq!(history.snapshot(), model_visible_transcript);
+    }
+
+    #[test]
+    fn mv5wx_configured_history_has_no_default_turn_cap() {
+        let cfg = Config::default();
+        let mut history = SessionHistory {
+            limits: AcpHistoryLimits::from_config(&cfg, 1_000_000, 16_384, false),
+            ..Default::default()
+        };
+        assert_eq!(history.limits.max_turns, 0);
+        assert_eq!(history.limits.max_bytes, 4_000_000);
+        assert!(history.limits.token_pressure.is_none());
+        for index in 0..(MAX_ACP_HISTORY_TURNS * 2) {
+            history.commit_completed_turn(
+                &format!("user-{index}"),
+                vec![Message::assistant(format!("assistant-{index}"))],
+            );
+        }
+        assert!(!history.needs_compaction());
+        // The byte guard never drops below its documented floor.
+        let small = AcpHistoryLimits::from_config(&cfg, 1_000, 100, false);
+        assert_eq!(small.max_bytes, MAX_ACP_HISTORY_BYTES);
+        let explicit = AcpHistoryLimits::from_config(
+            &Config {
+                acp_history_max_turns: Some(5),
+                acp_history_max_bytes: Some(1),
+                ..Default::default()
+            },
+            1_000_000,
+            0,
+            false,
+        );
+        assert_eq!((explicit.max_turns, explicit.max_bytes), (5, 64 * 1024));
+        history.limits = explicit;
+        assert!(history.needs_compaction());
+        assert!(history.over_turn_cap());
+    }
+
+    #[test]
+    fn mv5wx_token_pressure_drives_compaction_under_compact_enabled() {
+        let cfg = Config {
+            compact_enabled: Some(true),
+            keep_recent_tokens: Some(2_000),
+            ..Default::default()
+        };
+        let mut history = SessionHistory {
+            limits: AcpHistoryLimits::from_config(&cfg, 20_000, 2_000, false),
+            ..Default::default()
+        };
+        assert!(history.limits.token_pressure.is_some());
+        for index in 0..8 {
+            history.commit_completed_turn(
+                &format!("user-{index} {}", "word ".repeat(4_000)),
+                vec![Message::assistant(format!("assistant-{index}"))],
+            );
+        }
+        assert!(history.over_token_pressure().is_some());
+        assert!(history.needs_compaction());
+        assert!(!history.exceeds_hard_bound() && !history.over_turn_cap());
+        let cut = history.next_cut();
+        let starts = history.user_starts();
+        assert!(starts.contains(&cut), "cut lands on an interval boundary");
+        assert!(
+            cut > starts[1],
+            "token pressure drops more than one interval"
+        );
+        assert!(cut <= *starts.last().unwrap(), "recent turns are kept");
+        // Native history is never auto-compacted on token pressure.
+        let native = AcpHistoryLimits::from_config(&cfg, 20_000, 2_000, true);
+        assert!(native.token_pressure.is_none());
+        history.limits = native;
+        assert!(!history.needs_compaction());
     }
 
     #[tokio::test]
