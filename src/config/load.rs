@@ -72,6 +72,8 @@ pub(super) const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "tool_result_spill_chars",
     "tool_result_spill_head_chars",
     "tool_result_spill_tail_chars",
+    // Output/traversal bounds only limit what tool output reaches the model.
+    "tool_limits",
     // Masks only hide more of HOME from contained commands, and project
     // layers can only add to the list (see `merge_config_value_layer`).
     "sandbox-home-masks",

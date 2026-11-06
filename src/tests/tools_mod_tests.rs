@@ -11,9 +11,11 @@ fn skip_node_modules() {
     assert!(is_skip_dir("node_modules"));
 }
 
+/// `target` depends on its parent (build manifest beside it), so the
+/// name-only rule does not skip it; see the find_files skip tests.
 #[test]
-fn skip_target() {
-    assert!(is_skip_dir("target"));
+fn skip_target_is_context_dependent() {
+    assert!(!is_skip_dir("target"));
 }
 
 #[test]
@@ -51,7 +53,10 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
     {
         let listing = ListDirTool::new(None, None, None)
             .with_workspace(&root)
-            .call(ListDirArgs { path: None })
+            .call(ListDirArgs {
+                path: None,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert!(listing.contains("src"), "{listing}");
@@ -61,6 +66,7 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
         let grep = GrepTool::new(None, None, 100)
             .with_workspace(&root)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "SENTINEL".into(),
@@ -94,6 +100,7 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
             .with_workspace(&root)
             .call(ListDirArgs {
                 path: Some(".git".into()),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -105,6 +112,7 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
         let explicit_grep = GrepTool::new(None, None, 100)
             .with_workspace(&root)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "VCS_SENTINEL".into(),
@@ -247,6 +255,7 @@ async fn concurrent_read_tools_with_different_settings_do_not_share_history() {
     let denying = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(true));
     let allowing = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(false));
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -281,6 +290,7 @@ async fn repeated_read_is_allowed_after_same_length_mtime_preserving_change() {
     tokio::fs::write(&path, "before").await.unwrap();
     let tool = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(true));
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -318,6 +328,7 @@ async fn failed_read_is_not_recorded_as_successful() {
     tokio::fs::write(&path, "too large").await.unwrap();
     let tool = ReadTool::new_with_tracker(None, None, Some(1), 100, ReadTracker::new(true));
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -350,6 +361,7 @@ async fn rebuilt_read_tool_keeps_its_logical_session_history() {
     let session_tracker = ReadTracker::new(true);
     let first_build = ReadTool::new_with_tracker(None, None, None, 100, session_tracker.clone());
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -382,6 +394,7 @@ async fn loading_another_session_starts_fresh_read_history() {
     tokio::fs::write(&path, "contents").await.unwrap();
     let path = path.to_string_lossy().into_owned();
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -415,6 +428,7 @@ async fn imported_session_uses_active_allow_repeated_reads_setting() {
     tokio::fs::write(&path, "contents").await.unwrap();
     let path = path.to_string_lossy().into_owned();
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -453,6 +467,7 @@ async fn canonical_path_key_blocks_dot_alias_of_same_file() {
 
     assert!(
         tool.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -465,6 +480,7 @@ async fn canonical_path_key_blocks_dot_alias_of_same_file() {
     );
     assert!(
         tool.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -495,6 +511,7 @@ async fn edit_file_version_change_invalidates_every_session_tracker() {
     let other_read = ReadTool::new_with_tracker(None, None, None, 100, other_tracker);
     let owner_edit = EditTool::new_with_tracker(None, None, None, owner_tracker);
     let read_args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -542,6 +559,7 @@ async fn edit_of_canonical_target_invalidates_read_through_symlink_alias() {
     let read = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone());
     let edit = EditTool::new_with_tracker(None, None, None, tracker);
     let alias_args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -582,6 +600,7 @@ fn bounded_read_tool(root: &std::path::Path, cap: u64) -> ReadTool {
 
 fn read_args(path: &str, offset: Option<usize>, limit: Option<usize>) -> ReadArgs {
     ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,

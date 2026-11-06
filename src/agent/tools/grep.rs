@@ -6,9 +6,7 @@ use std::path::Path;
 use regex::{Regex, RegexBuilder};
 use rig::tool::Tool;
 
-use super::find_files::{
-    BoundDirectory, BoundFile, SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH,
-};
+use super::find_files::{BoundDirectory, BoundFile};
 use crate::agent::tools::{
     AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_bound_path, check_perm_path,
     combine_coaching,
@@ -16,21 +14,97 @@ use crate::agent::tools::{
 const MAX_OUTPUT_LINE_CHARS: usize = 500;
 const MAX_SEARCH_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: u64 = 8 * 1024;
-const MAX_SEARCH_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_MULTILINE_MATCHES: usize = 100_000;
 
 struct GrepSearchResult {
     file_count: usize,
+    skipped: SkippedFiles,
+    skipped_directories: String,
+    /// First path a work limit left unsearched.
+    stop_path: Option<std::path::PathBuf>,
     files_with_matches: usize,
     results: Vec<String>,
     emitted_results: usize,
+    /// Result lines (or files) produced before `offset` skipping.
+    seen_results: usize,
     limit_hit: bool,
     work_limit_hit: bool,
+}
+
+/// Files a search could not inspect. They are reported instead of being
+/// silently treated as match-free.
+#[derive(Clone, Copy, Default)]
+struct SkippedFiles {
+    /// Larger than the per-file search limit (including files that grew).
+    large: usize,
+    /// A NUL byte in the first 8 KiB.
+    binary: usize,
+    /// The read failed.
+    unreadable: usize,
+}
+
+impl SkippedFiles {
+    fn total(self) -> usize {
+        self.large + self.binary + self.unreadable
+    }
+
+    /// One-line footer for a directory search; empty when nothing was skipped.
+    fn notice(self) -> String {
+        if self.total() == 0 {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        if self.large > 0 {
+            parts.push(format!(
+                "{} larger than the {} MiB per-file search limit",
+                self.large,
+                MAX_SEARCH_FILE_BYTES / (1024 * 1024)
+            ));
+        }
+        if self.binary > 0 {
+            parts.push(format!(
+                "{} binary (NUL byte in the first 8 KiB)",
+                self.binary
+            ));
+        }
+        if self.unreadable > 0 {
+            parts.push(format!("{} unreadable", self.unreadable));
+        }
+        format!(
+            "\n[skipped {} files not searched: {}; absence of a match does not cover them — inspect them with read offset/limit or a binary-aware shell command]",
+            self.total(),
+            parts.join(", ")
+        )
+    }
+
+    /// Error for an explicitly named file the search could not inspect.
+    fn explicit_file_error(self, path: &Path, len: u64) -> Option<ToolError> {
+        let path = path.display();
+        if self.large > 0 {
+            return Some(ToolError::Msg(format!(
+                "grep did not search '{path}': it is {len} bytes, larger than the {} MiB per-file search limit. Use read with offset/limit (or character_offset for long lines), or a shell command such as `grep -n` for a large file.",
+                MAX_SEARCH_FILE_BYTES / (1024 * 1024)
+            )));
+        }
+        if self.binary > 0 {
+            return Some(ToolError::Msg(format!(
+                "grep did not search '{path}': it looks binary (NUL byte in the first 8 KiB; UTF-16 text also triggers this). Use a binary-aware shell command such as `strings` or `iconv` before searching."
+            )));
+        }
+        if self.unreadable > 0 {
+            return Some(ToolError::Msg(format!(
+                "grep did not search '{path}': the file could not be read."
+            )));
+        }
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
 struct GrepSearchOptions {
     max_results: usize,
+    /// Result lines (or matching files in files_only/count mode) to skip.
+    offset: usize,
     context: usize,
     files_only: bool,
     count: bool,
@@ -303,12 +377,15 @@ struct GrepSearch {
     include_re: Option<(Regex, bool)>,
     options: GrepSearchOptions,
     file_count: usize,
+    skipped: SkippedFiles,
     files_with_matches: usize,
     results: Vec<String>,
     emitted_results: usize,
+    seen_results: usize,
     limit_hit: bool,
     work_limit_hit: bool,
     remaining_bytes: u64,
+    stop_path: Option<std::path::PathBuf>,
     /// Reused across files so each read reuses one allocation.
     read_buffer: Vec<u8>,
 }
@@ -320,14 +397,24 @@ impl GrepSearch {
             include_re,
             options,
             file_count: 0,
+            skipped: SkippedFiles::default(),
             files_with_matches: 0,
             results: Vec::with_capacity(options.max_results.min(64)),
             emitted_results: 0,
+            seen_results: 0,
             limit_hit: false,
             work_limit_hit: false,
-            remaining_bytes: MAX_SEARCH_TOTAL_BYTES,
+            remaining_bytes: super::limits::current().search_max_bytes,
+            stop_path: None,
             read_buffer: Vec::with_capacity(64 * 1024),
         }
+    }
+
+    /// Count one produced result; `true` while it falls before `offset` and
+    /// must be skipped rather than emitted.
+    fn skip_result(seen_results: &mut usize, offset: usize) -> bool {
+        *seen_results += 1;
+        *seen_results <= offset
     }
 
     /// Search one file. `include_root` anchors path-aware include globs.
@@ -360,6 +447,7 @@ impl GrepSearch {
         }
 
         if entry.metadata.len() > MAX_SEARCH_FILE_BYTES {
+            self.skipped.large += 1;
             return ControlFlow::Continue(());
         }
 
@@ -368,16 +456,28 @@ impl GrepSearch {
         // Bind the read itself, not only the earlier metadata length: the file
         // may grow while its descriptor remains open.
         let mut bounded = (&mut file).take(self.remaining_bytes);
-        let is_text = GrepTool::read_non_binary(&mut bounded, &mut self.read_buffer, capacity)
-            .unwrap_or(false);
+        let read = GrepTool::read_non_binary(&mut bounded, &mut self.read_buffer, capacity);
         self.remaining_bytes = bounded.limit();
         if self.remaining_bytes == 0 {
             self.work_limit_hit = true;
             // The final file may be only a prefix; never search that prefix.
+            self.stop_path.get_or_insert_with(|| entry.path.clone());
             return ControlFlow::Break(());
         }
-        if !is_text {
-            return ControlFlow::Continue(());
+        match read {
+            Ok(true) => {}
+            Ok(false) if GrepTool::is_binary(&self.read_buffer) => {
+                self.skipped.binary += 1;
+                return ControlFlow::Continue(());
+            }
+            Ok(false) => {
+                self.skipped.large += 1;
+                return ControlFlow::Continue(());
+            }
+            Err(_) => {
+                self.skipped.unreadable += 1;
+                return ControlFlow::Continue(());
+            }
         }
         self.file_count += 1;
         let re = &self.re;
@@ -407,11 +507,17 @@ impl GrepSearch {
         let path_str = entry.path.to_string_lossy().to_string();
 
         if options.files_only {
+            if Self::skip_result(&mut self.seen_results, options.offset) {
+                return ControlFlow::Continue(());
+            }
             self.results.push(path_str);
             self.emitted_results += 1;
             return ControlFlow::Continue(());
         }
         if options.count {
+            if Self::skip_result(&mut self.seen_results, options.offset) {
+                return ControlFlow::Continue(());
+            }
             self.results.push(format!("{}:{}", path_str, match_count));
             self.emitted_results += 1;
             return ControlFlow::Continue(());
@@ -419,6 +525,9 @@ impl GrepSearch {
 
         if options.context == 0 {
             for (match_index, &matched_line) in match_lines.iter().enumerate() {
+                if Self::skip_result(&mut self.seen_results, options.offset) {
+                    continue;
+                }
                 let matched = match_ranges.get(&matched_line).cloned();
                 let displayed = truncate_output_line(lines[matched_line], matched);
                 self.results
@@ -453,11 +562,16 @@ impl GrepSearch {
                     continue;
                 }
 
-                if !self.results.is_empty() {
-                    self.results.push("--".to_string());
-                }
-
+                let mut separator_pending = !self.results.is_empty();
                 while index < total && shown[index] && self.emitted_results < options.max_results {
+                    if Self::skip_result(&mut self.seen_results, options.offset) {
+                        index += 1;
+                        continue;
+                    }
+                    if separator_pending {
+                        self.results.push("--".to_string());
+                        separator_pending = false;
+                    }
                     let is_match = match_lines.binary_search(&index).is_ok();
                     let separator = if is_match { ':' } else { '-' };
                     let matched = match_ranges.get(&index).cloned();
@@ -489,12 +603,21 @@ impl GrepSearch {
         }
     }
 
-    fn finish(self, walker_work_limit_hit: bool) -> GrepSearchResult {
+    fn finish(
+        self,
+        walker_work_limit_hit: bool,
+        skipped_directories: String,
+        walker_stop_path: Option<std::path::PathBuf>,
+    ) -> GrepSearchResult {
         GrepSearchResult {
             file_count: self.file_count,
+            skipped: self.skipped,
+            skipped_directories,
+            stop_path: self.stop_path.or(walker_stop_path),
             files_with_matches: self.files_with_matches,
             results: self.results,
             emitted_results: self.emitted_results,
+            seen_results: self.seen_results,
             limit_hit: self.limit_hit,
             work_limit_hit: self.work_limit_hit || walker_work_limit_hit,
         }
@@ -513,13 +636,14 @@ fn search_target(
     // (needed for an explicitly named single-file target, which never goes
     // through the walker).
     let walker_include_re = include_re.clone();
+    let limits = super::limits::current();
     let mut search = GrepSearch::new(re, include_re, options);
     match target {
         SearchTarget::Directory(bound_directory) => {
             let include_root = bound_directory.approved_root().to_path_buf();
             let mut walker = bound_directory
                 .walker()?
-                .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH)
+                .with_search_limits(limits.search_max_entries, limits.search_max_depth)
                 .with_cancellation(cancellation);
             // The include glob is evaluated on the name before a file is
             // opened, so excluded files cost no open, fstat or read.
@@ -540,7 +664,11 @@ fn search_target(
             if walker.cancelled() {
                 return Err(ToolError::Msg("grep cancelled".into()));
             }
-            Ok(search.finish(walker.work_limit_hit()))
+            Ok(search.finish(
+                walker.work_limit_hit(),
+                walker.skipped_directories().notice(),
+                walker.stop_path().map(Path::to_path_buf),
+            ))
         }
         SearchTarget::File(entry) => {
             // An explicitly named file is searched even when an ignore rule
@@ -558,8 +686,13 @@ fn search_target(
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_default();
+            let path = entry.path.clone();
+            let len = entry.metadata.len();
             let _ = search.visit(entry, &include_root);
-            Ok(search.finish(false))
+            if let Some(error) = search.skipped.explicit_file_error(&path, len) {
+                return Err(error);
+            }
+            Ok(search.finish(false, String::new(), None))
         }
     }
 }
@@ -618,8 +751,12 @@ impl Tool for GrepTool {
 
     fn description(&self) -> String {
         format!(
-            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped. Respects .gitignore. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly. `path` may name a single file to search only that file.",
-            self.max_results, MAX_OUTPUT_LINE_CHARS
+            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. A call visits at most {} directory entries, depth {} and {} MiB of file bytes; a partial result names the first unsearched path. Respects .gitignore. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. `path` may name a single file to search only that file.",
+            self.max_results,
+            MAX_OUTPUT_LINE_CHARS,
+            super::limits::current().search_max_entries,
+            super::limits::current().search_max_depth,
+            super::limits::current().search_max_bytes / (1024 * 1024)
         )
     }
 
@@ -665,6 +802,11 @@ impl Tool for GrepTool {
                 "count": {
                     "type": "boolean",
                     "description": "Return each matching path and its match count (default false)"
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Skip this many result lines (matching files in files_only/count mode) to page past a truncated result; the truncation notice names the next offset. Results follow directory-walk order, stable while the tree is unchanged"
                 }
             },
             "required": ["pattern"]
@@ -791,6 +933,9 @@ impl Tool for GrepTool {
             .transpose()?;
 
         let max_results = usize::try_from(max_results).unwrap_or(usize::MAX);
+        let offset = args
+            .offset
+            .map_or(0, |offset| usize::try_from(offset).unwrap_or(usize::MAX));
         let multiline = args.multiline;
         let files_only = args.files_only;
         let count = args.count;
@@ -802,6 +947,7 @@ impl Tool for GrepTool {
                 include_re,
                 GrepSearchOptions {
                     max_results,
+                    offset,
                     context,
                     files_only,
                     count,
@@ -814,17 +960,44 @@ impl Tool for GrepTool {
         .map_err(|error| ToolError::Msg(format!("grep directory walker failed: {error}")))??;
         let GrepSearchResult {
             file_count,
+            skipped,
+            skipped_directories,
+            stop_path,
             files_with_matches,
             results: all_results,
             emitted_results,
+            seen_results,
             limit_hit,
             work_limit_hit,
         } = search;
         let work_notice = if work_limit_hit {
-            "\n[search work limit reached (100000 directory entries, depth 256, 100 MiB read bytes, or 100000 multiline matches/touched lines per file); results cover only visited complete files and inspected matches — narrow the path or pattern]"
+            let limits = super::limits::current();
+            format!(
+                "\n[search work limit reached ({} directory entries, depth {}, {} MiB read bytes ([tool_limits] search_max_entries/search_max_depth/search_max_bytes), or 100000 multiline matches/touched lines per file); results cover only visited complete files and inspected matches{} — narrow the path or pattern]",
+                limits.search_max_entries,
+                limits.search_max_depth,
+                limits.search_max_bytes / (1024 * 1024),
+                stop_path
+                    .map(|path| format!(
+                        "; first unsearched path: {} (search it and the paths after it separately)",
+                        path.display()
+                    ))
+                    .unwrap_or_default()
+            )
         } else {
-            ""
+            String::new()
         };
+        let skipped_notice = skipped.notice();
+        let work_notice = format!("{skipped_notice}{skipped_directories}{work_notice}");
+        if all_results.is_empty() && offset > 0 && seen_results > 0 {
+            let msg = format!(
+                "No results at offset {offset}: this search produced {seen_results} results in total; use a smaller offset.{work_notice}"
+            );
+            return Ok(match coaching {
+                Some(c) => format!("{}\n\n{}", c, msg),
+                None => msg,
+            });
+        }
         if all_results.is_empty() {
             let msg = format!("No matches found.{work_notice}");
             return Ok(match coaching {
@@ -845,23 +1018,35 @@ impl Tool for GrepTool {
         } else {
             "unknown number of additional matches"
         };
+        let window = if offset > 0 {
+            format!(
+                "{}-{} after offset {offset}, ",
+                offset.saturating_add(1),
+                offset.saturating_add(total)
+            )
+        } else {
+            String::new()
+        };
         let result = if truncated {
             format!(
-                "{} {} (showing first {}, searched {} files):\n{}\n\n[truncated after {} {} — {}; narrow the pattern or restrict to a path]",
+                "{} {} ({}showing first {}, searched {} files):\n{}\n\n[truncated after {} {} — {}; continue with offset={} (same pattern, path and options), or narrow the pattern or restrict to a path]",
                 total,
                 result_label,
+                window,
                 max_results,
                 file_count,
                 all_results.join("\n"),
                 max_results,
                 result_label,
                 truncation_detail,
+                offset.saturating_add(total),
             )
         } else {
             format!(
-                "{} {} (searched {} files):\n{}",
+                "{} {} ({}searched {} files):\n{}",
                 total,
                 result_label,
+                window,
                 file_count,
                 all_results.join("\n")
             )
@@ -963,6 +1148,7 @@ mod tests {
                     .run(async move {
                         GrepTool::new(None, None, 10)
                             .call(GrepArgs {
+                                offset: None,
                                 max_results: None,
                                 multiline: false,
                                 pattern: "needle".to_owned(),
@@ -1165,6 +1351,7 @@ mod tests {
         );
 
         let call = tool.call(GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "needle".to_string(),
@@ -1198,6 +1385,7 @@ mod tests {
 
     fn grep_args(pattern: &str, path: Option<&str>, include: Option<&str>) -> GrepArgs {
         GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: pattern.to_string(),
@@ -1250,6 +1438,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1303,6 +1492,7 @@ mod tests {
 
         let result = GrepTool::new(Some(permission), None, 10)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: marker.to_string(),
@@ -1334,6 +1524,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1362,6 +1553,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(workspace.path()),
             GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1395,6 +1587,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1436,6 +1629,7 @@ mod tests {
         let tool = GrepTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "binding_marker".to_string(),
@@ -1481,6 +1675,7 @@ mod tests {
         let tool = GrepTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "must_not_be_returned".to_string(),
@@ -1556,6 +1751,7 @@ mod tests {
 
         let output = GrepTool::new(Some(standard_permission(&workspace)), None, 10)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: marker.to_string(),
@@ -1603,6 +1799,7 @@ mod tests {
 
         let result = tool
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1637,6 +1834,7 @@ mod tests {
 
         let result = tool
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: marker.to_string(),
@@ -1664,6 +1862,7 @@ mod tests {
 
         let output = tool
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1690,6 +1889,7 @@ mod tests {
 
         let output = tool
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1716,6 +1916,7 @@ mod tests {
 
         let output = GrepTool::new(None, None, 10)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1756,6 +1957,7 @@ mod tests {
 
         let output = GrepTool::new(None, None, 10)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1818,6 +2020,7 @@ mod tests {
 
     fn ergonomic_args(path: &Path, include: Option<&str>) -> GrepArgs {
         GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "needle".to_string(),
@@ -2101,13 +2304,39 @@ mod tests {
             "{explicit}"
         );
 
-        for skipped in ["binary.bin", "large.txt"] {
-            let found = tool
-                .call(grep_args("needle", Some(skipped), None))
-                .await
-                .unwrap();
-            assert_eq!(found, "No matches found.", "{skipped}");
-        }
+        // mini-agent-u790d: an explicitly named file the search cannot
+        // inspect is an error naming the limit, never "No matches found.".
+        let large = tool
+            .call(grep_args("needle", Some("large.txt"), None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            large.contains("larger than the 10 MiB per-file search limit"),
+            "{large}"
+        );
+        let binary = tool
+            .call(grep_args("needle", Some("binary.bin"), None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(binary.contains("looks binary"), "{binary}");
+
+        // A directory search reports what it skipped in a footer.
+        assert!(
+            walked.contains(
+                "[skipped 2 files not searched: 1 larger than the 10 MiB per-file search limit, 1 binary (NUL byte in the first 8 KiB);"
+            ),
+            "{walked}"
+        );
+        let none = tool
+            .call(grep_args("absent-token", None, None))
+            .await
+            .unwrap();
+        assert!(
+            none.starts_with("No matches found.\n[skipped 2 files"),
+            "{none}"
+        );
     }
 
     #[tokio::test]

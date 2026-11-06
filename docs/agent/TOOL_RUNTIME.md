@@ -300,19 +300,42 @@ dot to match newlines (`(?-s:...)` can disable that flag locally). Output keeps 
 existing numbered source-line format, showing each touched line once plus requested
 context. In multiline mode `count` counts non-overlapping regex matches; ordinary
 line mode continues counting matching source lines. Result limits still apply if
-one match spans many lines.
+one match spans many lines. `offset` (default `0`) skips that many result lines, or
+matching files in `files_only` and `count` modes, so a truncated result can be paged:
+the truncation notice ends with `continue with offset=N`, the header names the
+returned window (`151-300 after offset 150`), and an offset past the end reports how
+many results the search produced. Results follow directory-walk order, which is
+stable while the tree is unchanged.
 
 Both recursive searches visit at most 100,000 directory entries and descend at
 most 256 directories. Grep additionally reads at most 100 MiB per call, loads at
 most 10 MiB per file (including files that grow during a read), and inspects at most
 100,000 multiline matches and 100,000 touched source lines per file. A byte-budget-ending file is skipped rather
-than searched as an incomplete prefix. Binary sniffing consumes the same byte
+than searched as an incomplete prefix. Files skipped for the 10 MiB per-file limit,
+for binary content (a NUL byte in the first 8 KiB, which includes UTF-16 text) or
+for a read error are counted: a directory search appends `[skipped N files not
+searched: M larger than the 10 MiB per-file search limit, K binary ...]`, also after
+`No matches found.`, so absence of a match is never claimed for them. Naming such a
+file explicitly as `path` returns an error naming the limit instead of an empty result. Binary sniffing consumes the same byte
 budget. Work limits produce a partial-result notice, including when no matches
-were found; narrow the path or pattern to continue. These bounds leave path,
+were found. The notice states the budgets in force and names the first unsearched
+path (the entry at which the entry budget ran out, the first directory beyond the
+depth limit, or the file at which grep's byte budget ran out), so the model can
+search that path and the ones after it separately or narrow the path or pattern.
+The entry, depth and byte budgets are `[tool_limits] search_max_entries`
+(default 100,000), `search_max_depth` (256) and `search_max_bytes` (100 MiB); both
+tool descriptions state them. These bounds leave path,
 read-deny, external-directory approval, ignore, and no-follow traversal policy
 unchanged.
 `list_dir` keeps only actual directories in its directory-first sort group and
-renders symbolic links as `name -> target`. Read windows size their line-number
+renders symbolic links as `name -> target`. It accepts `offset` (entries to skip),
+`limit` (lowers the configured `max_list_dir_entries` cap) and `depth` (1 by
+default, at most 3). A capped listing ends with `continue with offset=N`, and a
+paged header names the window (`entries 151-160 of 160`). Depth 2-3 expands
+subdirectories into an indented, directory-first tree of relative paths that
+shares the same cap and paging; subdirectories are opened no-follow relative to
+their parent descriptor with the same ignore, skip and deny filters, and a tree
+stops collecting at 10,000 entries with a notice. Read windows size their line-number
 column from the actual range and report an offset past EOF directly instead of
 showing an inverted range.
 
@@ -350,6 +373,16 @@ Ignore rules use a metadata-invalidated, per-workspace parent-chain cache and a
 persistent chain for nested directories, so descent does not clone every prior
 matcher. `grep` reads only an 8 KiB prefix before rejecting a binary file and
 does not load the remainder of that file.
+
+Recursive `grep`, `find_files` and `list_dir` skip VCS metadata (`.git`, `.hg`,
+`.svn`, `.bzr`), every `node_modules` directory, and a `target` directory only when
+its parent holds a build manifest (`Cargo.toml`, `pom.xml`, `build.sbt`,
+`build.gradle`, `build.gradle.kts`, `project.clj`). A source package named `target`
+elsewhere is searched; `.gitignore` still hides ignored output. `grep` and
+`find_files` end with `[skipped dependency/build directories: a/node_modules,
+crate/target (+N more); ...]` when a non-ignored directory was skipped. Naming a
+skipped directory as `path` searches it. `[tool_limits] skip_dirs` replaces the
+built-in rule with an explicit list of names.
 
 `write` creates files by default. For a deliberate full-file replacement, the
 caller must first read the current file completely and then set
@@ -748,6 +781,33 @@ an owned Unix child held before exec. Explicit unlock ends the lock's ownership
 before receipt acknowledgement; inherited descriptors cannot extend it after
 the ledger operation completes. Corrupt-tail failures retain bytes and charges.
 
+### PDF text from `read`
+
+`read` recognises a `%PDF-` header and returns the document's extracted text
+layer instead of the UTF-8 error. `src/agent/tools/pdf_text.rs` is a bounded,
+in-process extractor, not a renderer: it locates indirect objects by scanning
+(damaged cross-reference tables are tolerated), expands compressed object
+streams, walks the page tree, inflates `FlateDecode`/`ASCIIHexDecode` content
+streams and collects the strings shown by text operators, placing line breaks
+and word spaces from the text and graphics matrices. Fonts with a `ToUnicode`
+CMap decode through it; simple fonts use WinAnsi or MacRoman. Form XObjects and
+annotations are not searched. Nothing executes, renders or touches the network.
+
+Output starts with `PDF: <path> (N pages; extracted text layer of page(s) ...)`
+and marks each page with `--- page N ---`. `pages` selects 1-indexed pages
+(`"3"`, `"1-5"`, `"2,4,7-9"`, `"8-"`), at most 20 per call; a PDF over 20 pages
+without `pages` returns guidance naming the page count and the next ranges. Line
+`offset`/`limit` and character windows are refused for PDFs, and `pages` is
+refused for other files. Output shares the `[tool_limits] max_result_chars`
+budget: selection stops before the first page that would exceed it with
+`continue with pages:"N-M"`, and an oversized single page is clipped. Pages
+without text show `[no text layer on this page]`; when no selected page has a
+text layer the result says the PDF is probably scanned and suggests exporting
+the pages as PNG (for example with `pdftoppm`) and reading the images. Encrypted
+PDFs are refused. Limits: 64 MiB per file, 32 MiB decoded per stream, 256 MiB
+decoded per call, nesting depth 64. The extracted text never authorizes an
+overwrite of the PDF.
+
 ### Notebook cells
 
 `src/agent/tools/notebook.rs` implements `notebook_edit` and the cell view used
@@ -775,8 +835,12 @@ change in a git diff.
 Untouched JSON field payloads remain validated raw JSON, preserving large
 integers and opaque metadata. Opaque nesting is not recursively traversed;
 byte caps, rather than an assumed semantic nesting limit, bound its handling.
-Notebook input and resulting serialization must fit `max_edit_file_size`
-(default 16 MiB), with an absolute 8 MiB ceiling. There are at most 4,096 cells,
+Notebook input and resulting serialization must fit the notebook limit,
+`[tool_limits] notebook_max_bytes` (default 32 MiB), or `max_text_file_size` when
+that is larger, with an absolute 64 MiB ceiling. Notebooks have their own limit
+because embedded image outputs routinely make executed notebooks larger than the
+1 MiB text cap even though the cell view never renders those payloads. A notebook
+above the limit is refused with a message naming it. There are at most 4,096 cells,
 256 interpreted fields per notebook/cell/output object, 1,024 bytes per field
 name and 1 MiB of decoded source per cell. Duplicate interpreted object fields,
 invalid UTF-8 and ambiguous cell IDs are rejected. Unselected unknown cell
@@ -784,10 +848,17 @@ types are preserved; mutation of an unknown type is refused.
 
 The default `read` view shows virtual cell/source/output lines. Its existing
 `offset`/`limit` arguments address those virtual lines, and the limit is capped
-by `max_read_lines`. Returned text is capped at 64 KiB (or the configured text
-cap, if smaller); text outputs have separate 4 KiB per-cell and 16 KiB overall
+by `max_read_lines`. Returned text is capped at 64 KiB: a window that would exceed
+it stops early and ends with `[view truncated after N line(s) at the 64 KiB notebook
+view cap; continue with offset=M]`, and a single virtual line longer than the cap is
+clipped with a pointer to `raw_notebook:true` character windows. Text outputs have separate 4 KiB per-cell and 16 KiB overall
 limits with explicit omissions, and at most 4,096 output objects per cell.
-Opaque rich output payloads are omitted. This view provides no raw line hashes,
+Stream outputs show their text; `execute_result` and `display_data` outputs show
+their `text/plain` data; `error` outputs show `ename: evalue` and the traceback with
+ANSI colour codes removed (an over-budget traceback keeps the exception line and its
+last frames after a `[N traceback bytes omitted]` marker). Other mime types, such as
+images and HTML, are listed as `[image/png output omitted]`; their payloads are never
+rendered. Outputs with nothing decodable show `[opaque output payload omitted]`. This view provides no raw line hashes,
 raw-file CRC or whole-file overwrite authorization. Set `raw_notebook: true`
 to use the ordinary raw JSON line reader and its existing edit/write contract.
 

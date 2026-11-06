@@ -8879,6 +8879,7 @@ mod tests {
                 .with_workspace_binding(workspace.clone());
         let native_output = native_read
             .call(crate::agent::tools::ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,

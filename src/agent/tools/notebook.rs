@@ -8,7 +8,9 @@ use serde_json::value::RawValue;
 
 use super::ToolError;
 
-pub(crate) const MAX_NOTEBOOK_BYTES: u64 = 8 * 1024 * 1024;
+/// Hard ceiling for any notebook parse; `[tool_limits] notebook_max_bytes`
+/// (default 32 MiB) selects the effective limit below it.
+pub(crate) const MAX_NOTEBOOK_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CELLS: usize = 4096;
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_VIEW_BYTES: usize = 64 * 1024;
@@ -20,6 +22,12 @@ fn error(message: &'static str) -> ToolError {
 }
 pub(crate) fn byte_limit(configured: u64) -> u64 {
     configured.min(MAX_NOTEBOOK_BYTES)
+}
+/// Effective notebook raw-size limit: notebooks get their own limit
+/// (`[tool_limits] notebook_max_bytes`) because image outputs routinely make
+/// them larger than `max_text_file_size`; a larger text cap still applies.
+pub(crate) fn notebook_byte_limit(configured_text_cap: u64) -> u64 {
+    byte_limit(configured_text_cap.max(super::limits::current().notebook_max_bytes))
 }
 
 // A map visitor rejects duplicate interpreted fields. Opaque nested values are
@@ -457,6 +465,99 @@ impl Notebook {
     }
 }
 
+/// Decode a notebook string field stored as a string or a list of strings.
+fn multiline_text(raw: &RawValue) -> Option<String> {
+    serde_json::from_str::<String>(raw.get()).ok().or_else(|| {
+        serde_json::from_str::<Vec<String>>(raw.get())
+            .ok()
+            .map(|parts| parts.concat())
+    })
+}
+
+/// Remove ANSI escape sequences (colour codes in IPython tracebacks).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                // CSI: parameters/intermediates until a final byte @..~.
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// What the view shows for one output: decoded text (kept from the end when
+/// `keep_tail`, so a traceback's last frames survive the budget) plus labels
+/// for payloads that are not rendered.
+struct RenderedOutput {
+    text: Option<String>,
+    keep_tail: bool,
+    labels: Vec<String>,
+}
+
+fn render_output(kind: &str, output: &Fields) -> RenderedOutput {
+    let mut rendered = RenderedOutput {
+        text: None,
+        keep_tail: false,
+        labels: Vec::new(),
+    };
+    match kind {
+        "execute_result" | "display_data" | "update_display_data" => {
+            let data = output
+                .0
+                .get("data")
+                .and_then(|raw| serde_json::from_str::<Fields>(raw.get()).ok());
+            if let Some(data) = data {
+                for (mime, raw) in &data.0 {
+                    if mime == "text/plain" {
+                        rendered.text = multiline_text(raw).map(|text| strip_ansi(&text));
+                    } else {
+                        rendered.labels.push(format!("[{mime} output omitted]"));
+                    }
+                }
+            }
+        }
+        "error" => {
+            let ename = output.get::<String>("ename").unwrap_or_default();
+            let evalue = output.get::<String>("evalue").unwrap_or_default();
+            let traceback = output
+                .get::<Vec<String>>("traceback")
+                .unwrap_or_default()
+                .join("\n");
+            let mut text = format!("{ename}: {evalue}");
+            if !traceback.is_empty() {
+                text.push('\n');
+                text.push_str(&traceback);
+            }
+            rendered.text = Some(strip_ansi(&text));
+            rendered.keep_tail = true;
+        }
+        _ => rendered.text = output.0.get("text").and_then(|raw| multiline_text(raw)),
+    }
+    if rendered.text.is_none() && rendered.labels.is_empty() {
+        rendered
+            .labels
+            .push("[opaque output payload omitted]".to_owned());
+    }
+    rendered
+}
+
 /// A virtual line window, deliberately without raw CRC/hashedit/file-line semantics.
 pub(crate) struct NotebookView {
     pub text: String,
@@ -474,14 +575,40 @@ pub(crate) fn view(
     let mut selected = String::new();
     let mut total = 0usize;
     let mut selected_lines = 0usize;
-    let end = offset.saturating_add(limit);
+    let mut end = offset.saturating_add(limit);
     let mut output_budget = MAX_OUTPUT_TOTAL;
+    // Room for the header and continuation notice inside the view cap.
+    let selected_cap = cap.saturating_sub(1024);
+    let mut truncated_at: Option<usize> = None;
     let mut push = |line: &str| -> Result<(), ToolError> {
         if total >= offset && total < end {
-            if selected.len().saturating_add(line.len()).saturating_add(32) > cap {
-                return Err(error(
-                    "Notebook view exceeds its output cap; use a narrower virtual line window",
-                ));
+            if selected.len().saturating_add(line.len()).saturating_add(32) > selected_cap {
+                use std::fmt::Write;
+                if selected_lines == 0 {
+                    // A single over-cap virtual line is clipped, not refused.
+                    let mut cut = selected_cap.saturating_sub(256).min(line.len());
+                    while !line.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    writeln!(
+                        &mut selected,
+                        "{}| {} … [virtual line truncated: {} bytes; use raw_notebook:true with character_offset/character_limit for the rest]",
+                        total + 1,
+                        &line[..cut],
+                        line.len()
+                    )
+                    .expect("string writing");
+                    selected_lines += 1;
+                    total += 1;
+                    truncated_at = Some(total);
+                    end = total;
+                    return Ok(());
+                }
+                // Stop the window before this line and say where to resume.
+                truncated_at = Some(total);
+                end = total;
+                total += 1;
+                return Ok(());
             }
             use std::fmt::Write;
             writeln!(&mut selected, "{}| {}", total + 1, line).expect("string writing");
@@ -515,29 +642,43 @@ pub(crate) fn view(
                     .get::<String>("output_type")
                     .unwrap_or_else(|_| "unknown".into());
                 push(&format!("[output: {kind}]"))?;
-                let text = output.0.get("text").and_then(|r| {
-                    serde_json::from_str::<String>(r.get()).ok().or_else(|| {
-                        serde_json::from_str::<Vec<String>>(r.get())
-                            .ok()
-                            .map(|s| s.concat())
-                    })
-                });
-                if let Some(text) = text {
+                let rendered = render_output(&kind, output);
+                if let Some(text) = rendered.text {
                     let permitted = cell_budget.min(output_budget).min(text.len());
-                    let mut cutoff = permitted;
-                    while !text.is_char_boundary(cutoff) {
-                        cutoff -= 1;
+                    if rendered.keep_tail {
+                        let mut start = text.len() - permitted;
+                        while !text.is_char_boundary(start) {
+                            start += 1;
+                        }
+                        // The exception line itself always leads.
+                        let (first, _) = text.split_once('\n').unwrap_or((&text, ""));
+                        if start > 0 {
+                            push(first)?;
+                            push(&format!("[{start} traceback bytes omitted]"))?;
+                        }
+                        for line in text[start..].split('\n') {
+                            push(line)?;
+                        }
+                        let kept = text.len() - start;
+                        cell_budget -= kept;
+                        output_budget -= kept;
+                    } else {
+                        let mut cutoff = permitted;
+                        while !text.is_char_boundary(cutoff) {
+                            cutoff -= 1;
+                        }
+                        for line in text[..cutoff].split('\n') {
+                            push(line)?;
+                        }
+                        cell_budget -= cutoff;
+                        output_budget -= cutoff;
+                        if cutoff < text.len() {
+                            push(&format!("[{} output bytes omitted]", text.len() - cutoff))?;
+                        }
                     }
-                    for line in text[..cutoff].split('\n') {
-                        push(line)?;
-                    }
-                    cell_budget -= cutoff;
-                    output_budget -= cutoff;
-                    if cutoff < text.len() {
-                        push(&format!("[{} output bytes omitted]", text.len() - cutoff))?;
-                    }
-                } else {
-                    push("[opaque output payload omitted]")?;
+                }
+                for label in &rendered.labels {
+                    push(label)?;
                 }
             }
         }
@@ -553,7 +694,17 @@ pub(crate) fn view(
             "Notebook view exceeds its output cap; use a narrower virtual line window",
         ));
     }
-    let text = header + &selected;
+    let mut text = header + &selected;
+    if let Some(next) = truncated_at {
+        use std::fmt::Write;
+        write!(
+            &mut text,
+            "\n[view truncated after {selected_lines} line(s) at the {} KiB notebook view cap; continue with offset={}]",
+            cap / 1024,
+            next + 1
+        )
+        .expect("string writing");
+    }
     let mut crc = super::crc::Crc32::new();
     crc.update(text.as_bytes());
     Ok(NotebookView {
@@ -598,7 +749,7 @@ impl NotebookTool {
             ask_tx,
             workspace,
             tracker,
-            limit: byte_limit(limit.unwrap_or(1024 * 1024)),
+            limit: notebook_byte_limit(limit.unwrap_or(1024 * 1024)),
             diff_options,
             #[cfg(test)]
             publication_cancellation: None,
@@ -1077,6 +1228,124 @@ mod tests {
         assert!(output.contains("output bytes omitted"));
         assert!(output.len() < MAX_VIEW_BYTES);
     }
+    /// mini-agent-0eep6: execute_result/display_data text/plain, error
+    /// tracebacks (ANSI-stripped) and image mime labels are rendered.
+    #[test]
+    fn notebook_view_renders_results_errors_and_labels_images() {
+        let outputs = serde_json::json!([
+            {"output_type":"execute_result","execution_count":1,"metadata":{},
+             "data":{"text/plain":["   a  b\n","0  1  2"],"text/html":"<table/>"}},
+            {"output_type":"display_data","metadata":{},
+             "data":{"image/png":"iVBORw0KGgo=","text/plain":"<Figure size 640x480>"}},
+            {"output_type":"error","ename":"ZeroDivisionError","evalue":"division by zero",
+             "traceback":["\u{1b}[0;31m---------\u{1b}[0m","\u{1b}[0;32mCell In[1], line 1\u{1b}[0m\n----> 1 1/0"]},
+            {"output_type":"display_data","metadata":{},"data":{"image/jpeg":"/9j/"}}
+        ]);
+        let notebook = serde_json::json!({
+            "nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"code","id":"c","source":"df","metadata":{},
+                      "execution_count":1,"outputs":outputs}]
+        })
+        .to_string();
+        let text = view(
+            notebook.as_bytes(),
+            "book.ipynb",
+            0,
+            200,
+            MAX_NOTEBOOK_BYTES,
+        )
+        .unwrap()
+        .text;
+        for expected in [
+            "[output: execute_result]",
+            "| 0  1  2",
+            "[text/html output omitted]",
+            "| <Figure size 640x480>",
+            "[image/png output omitted]",
+            "| ZeroDivisionError: division by zero",
+            "| Cell In[1], line 1",
+            "| ----> 1 1/0",
+            "[image/jpeg output omitted]",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text}");
+        }
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(!text.contains("opaque output payload"), "{text}");
+        assert!(!text.contains("iVBORw0KGgo"), "{text}");
+
+        // An oversized traceback keeps the exception line and the last frames.
+        let frames: Vec<String> = (0..2_000).map(|n| format!("frame {n}")).collect();
+        let long = serde_json::json!({
+            "nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"code","id":"c","source":"x","metadata":{},
+                      "execution_count":1,"outputs":[{"output_type":"error","ename":"E",
+                      "evalue":"boom","traceback":frames}]}]
+        })
+        .to_string();
+        let text = view(long.as_bytes(), "book.ipynb", 0, 5_000, MAX_NOTEBOOK_BYTES)
+            .unwrap()
+            .text;
+        assert!(text.contains("| E: boom"), "{text}");
+        assert!(text.contains("traceback bytes omitted]"), "{text}");
+        assert!(text.contains("| frame 1999"), "{text}");
+        assert!(!text.contains("| frame 5\n"), "{text}");
+    }
+    /// mini-agent-qsttm: a window over the 64 KiB view cap is truncated with
+    /// the exact next offset instead of failing; a lone huge line is clipped.
+    #[test]
+    fn notebook_view_truncates_oversized_windows_with_a_next_offset() {
+        let source: Vec<String> = (0..2_000)
+            .map(|n| format!("{n:04} {}\n", "s".repeat(95)))
+            .collect();
+        let notebook = serde_json::json!({
+            "nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"code","id":"c","source":source,"metadata":{},
+                      "execution_count":null,"outputs":[]}]
+        })
+        .to_string();
+        let first = view(
+            notebook.as_bytes(),
+            "book.ipynb",
+            0,
+            5_000,
+            MAX_NOTEBOOK_BYTES,
+        )
+        .unwrap()
+        .text;
+        assert!(first.len() <= MAX_VIEW_BYTES, "{}", first.len());
+        let next: usize = first
+            .split("continue with offset=")
+            .nth(1)
+            .and_then(|rest| rest.trim_end_matches(']').parse().ok())
+            .expect("next offset");
+        assert!(first.contains(&format!("{}| ", next - 1)), "{first:.200}");
+        assert!(!first.contains(&format!("\n{next}| ")), "{first:.200}");
+        let second = view(
+            notebook.as_bytes(),
+            "book.ipynb",
+            next - 1,
+            5,
+            MAX_NOTEBOOK_BYTES,
+        )
+        .unwrap()
+        .text;
+        assert!(second.contains(&format!("\n{next}| ")), "{second}");
+
+        let wide = serde_json::json!({
+            "nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"markdown","id":"m","source":"w".repeat(200_000),"metadata":{}}]
+        })
+        .to_string();
+        let clipped = view(wide.as_bytes(), "book.ipynb", 1, 1, MAX_NOTEBOOK_BYTES)
+            .unwrap()
+            .text;
+        assert!(
+            clipped.contains("[virtual line truncated: 200000 bytes"),
+            "{:.200}",
+            &clipped[clipped.len() - 300..]
+        );
+        assert!(clipped.len() <= MAX_VIEW_BYTES);
+    }
     fn policy(root: &Path, mode: SecurityMode, config: PermissionConfig) -> PermCheck {
         Arc::new(std::sync::Mutex::new(
             PermissionChecker::new(
@@ -1276,6 +1545,7 @@ mod tests {
             WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(root.path());
         let view = read
             .call(ReadArgs {
+                pages: None,
                 path: "book.ipynb".into(),
                 raw_notebook: false,
                 character_offset: None,
@@ -1294,6 +1564,7 @@ mod tests {
         assert!(write.call(write_args()).await.is_err());
         let raw = read
             .call(ReadArgs {
+                pages: None,
                 path: "book.ipynb".into(),
                 raw_notebook: true,
                 character_offset: None,

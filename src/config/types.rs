@@ -1077,3 +1077,34 @@ pub struct FileCheckpointsConfig {
     /// Mutation records (and distinct preimages) retained per session.
     pub max_records: Option<u64>,
 }
+
+/// `[tool_limits]`: output and traversal bounds for the built-in tools. Every
+/// field is optional; an omitted field keeps the documented default (see
+/// `crate::agent::tools::limits::ToolLimits`). Benign in project config: the
+/// values bound how much tool output reaches the model, never what may run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolLimitsConfig {
+    /// Final per-result character backstop for self-bounded tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_result_chars: Option<u64>,
+    /// Characters of one `read` line shown before it is clipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_read_line_chars: Option<u64>,
+    /// Raw notebook size accepted by the cell view and `notebook_edit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notebook_max_bytes: Option<u64>,
+    /// Directory names recursive searches and listings skip at any depth.
+    /// Unset keeps the built-in rule; `[]` skips only VCS metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_dirs: Option<Vec<String>>,
+    /// Directory entries one recursive `grep`/`find_files` call visits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_entries: Option<u64>,
+    /// Directory depth one recursive search descends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_depth: Option<u64>,
+    /// File bytes one `grep` call reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_bytes: Option<u64>,
+}

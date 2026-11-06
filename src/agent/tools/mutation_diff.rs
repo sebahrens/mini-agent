@@ -950,6 +950,7 @@ mod tests {
                 .is_err()
         );
         read.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -997,6 +998,7 @@ mod tests {
         );
         // An already-read snapshot does not override a later read denial.
         read.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -1030,6 +1032,7 @@ mod tests {
             "replacement\n"
         );
         read.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -1270,6 +1273,7 @@ mod tests {
             ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
                 .with_workspace(root.path())
                 .call(ReadArgs {
+                    pages: None,
                     raw_notebook: false,
                     character_offset: None,
                     character_limit: None,
@@ -1697,6 +1701,7 @@ mod tests {
         let tracker = ReadTracker::new(true);
         ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1808,6 +1813,7 @@ mod tests {
             ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
                 .with_workspace(root.path())
                 .call(ReadArgs {
+                    pages: None,
                     raw_notebook: false,
                     character_offset: None,
                     character_limit: None,

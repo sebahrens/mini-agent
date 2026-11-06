@@ -1536,6 +1536,7 @@ async fn utf16_bom_files_are_read_decoded_and_edited_in_their_own_encoding() {
                 path: tmp.path().into(),
                 offset: None,
                 limit: None,
+                pages: None,
             })
             .await
             .unwrap();

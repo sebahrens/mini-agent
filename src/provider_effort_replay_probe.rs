@@ -4759,6 +4759,7 @@ async fn cache71_memory_actual_paused_write_checkpoint_tracks_the_literal_user_a
     crate::agent::tools::read::ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
         .with_workspace_binding(workspace.clone())
         .call(crate::agent::tools::ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,

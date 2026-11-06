@@ -563,7 +563,10 @@ mod tests {
         );
         let listed = crate::agent::tools::ListDirTool::new(None, None, None)
             .with_workspace_binding(workspace.clone())
-            .call(crate::agent::tools::ListDirArgs { path: None })
+            .call(crate::agent::tools::ListDirArgs {
+                path: None,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert!(listed.contains("tracked.txt"));

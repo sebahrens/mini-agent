@@ -11701,6 +11701,7 @@ mod workspace_tests {
         let second_read = ReadTool::new(None, None, None, 100).with_workspace_root(second.clone());
         let (first_value, second_value) = tokio::join!(
             first_read.call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -11709,6 +11710,7 @@ mod workspace_tests {
                 limit: None,
             }),
             second_read.call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -11753,6 +11755,7 @@ mod workspace_tests {
             GrepTool::new(None, None, 100).with_workspace_binding(second_workspace.clone());
         let (first_grep, second_grep) = tokio::join!(
             first_grep_tool.call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "first-only".into(),
@@ -11764,6 +11767,7 @@ mod workspace_tests {
                 count: false,
             }),
             second_grep_tool.call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "second-only".into(),
@@ -11792,6 +11796,7 @@ mod workspace_tests {
             .with_workspace_binding(second_workspace.clone())
             .call(ListDirArgs {
                 path: Some(".".into()),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -11876,6 +11881,7 @@ mod workspace_tests {
             .join("sentinel.txt");
         let error = tool
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -11963,6 +11969,7 @@ mod workspace_tests {
         assert!(workspace.validate().is_err());
         assert!(
             read.call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -12027,6 +12034,7 @@ mod workspace_tests {
         let read = ReadTool::new(None, None, None, 100)
             .with_workspace_binding(workspace.clone())
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,

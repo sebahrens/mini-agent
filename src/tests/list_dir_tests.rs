@@ -32,7 +32,13 @@ async fn list_dir_reports_actual_child_counts_and_empty_directories() {
     std::fs::write(root.path().join("populated/file.txt"), "contents").unwrap();
     let tool = ListDirTool::new(None, None, None).with_workspace(root.path());
 
-    let listing = tool.call(ListDirArgs { path: None }).await.unwrap();
+    let listing = tool
+        .call(ListDirArgs {
+            path: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     let rows: Vec<Vec<_>> = listing
         .lines()
         .skip(1)
@@ -46,6 +52,7 @@ async fn list_dir_reports_actual_child_counts_and_empty_directories() {
     let listing = tool
         .call(ListDirArgs {
             path: Some("empty".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -59,6 +66,7 @@ async fn list_dir_rejects_missing_directory_instead_of_reporting_empty() {
         .with_workspace(root.path())
         .call(ListDirArgs {
             path: Some("missing".into()),
+            ..Default::default()
         })
         .await;
     assert!(result.is_err(), "missing directory must fail: {result:?}");
@@ -102,7 +110,13 @@ async fn list_dir_omits_denied_entries() {
     let tool = ListDirTool::new(Some(permission), None, None).with_workspace(&workspace);
     let absolute = workspace.join("config").to_string_lossy().into_owned();
     for path in ["config".to_string(), absolute] {
-        let listing = tool.call(ListDirArgs { path: Some(path) }).await.unwrap();
+        let listing = tool
+            .call(ListDirArgs {
+                path: Some(path),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(listing.contains("app.toml"), "{listing}");
         assert!(!listing.contains(".env"), "{listing}");
         assert!(!listing.contains("secrets"), "{listing}");
@@ -117,7 +131,10 @@ async fn list_dir_sizes_name_padding_by_characters_instead_of_utf8_bytes() {
     std::fs::write(root.path().join("x"), "").unwrap();
     let listing = ListDirTool::new(None, None, None)
         .with_workspace(root.path())
-        .call(ListDirArgs { path: None })
+        .call(ListDirArgs {
+            path: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
     let rows: Vec<_> = listing.lines().skip(1).collect();
@@ -129,4 +146,83 @@ async fn list_dir_sizes_name_padding_by_characters_instead_of_utf8_bytes() {
         rows.iter().any(|row| row.ends_with("x    0 B")),
         "{listing}"
     );
+}
+
+/// mini-agent-yyfbq: offset/limit page past the entry cap and depth renders
+/// a bounded tree under the same cap.
+#[tokio::test]
+async fn list_dir_pages_with_offset_and_renders_a_bounded_depth_tree() {
+    let root = TempDir::new("list-pages");
+    for n in 0..160 {
+        std::fs::write(root.path().join(format!("f{n:03}.txt")), "x").unwrap();
+    }
+    let tool = ListDirTool::new(None, None, Some(150)).with_workspace(root.path());
+    let first = tool.call(ListDirArgs::default()).await.unwrap();
+    assert!(first.contains("[file]  f149.txt"), "{first}");
+    assert!(!first.contains("f150.txt"), "{first}");
+    assert!(
+        first.contains("10 more; continue with offset=150,"),
+        "{first}"
+    );
+    let second = tool
+        .call(ListDirArgs {
+            offset: Some(150),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(second.contains("(entries 151-160 of 160)"), "{second}");
+    let rows: Vec<&str> = second
+        .lines()
+        .filter(|line| line.contains("[file]"))
+        .collect();
+    assert_eq!(rows.len(), 10, "{second}");
+    assert!(rows[0].contains("f150.txt"), "{second}");
+    assert!(!second.contains("truncated"), "{second}");
+    let limited = tool
+        .call(ListDirArgs {
+            limit: Some(5),
+            offset: Some(3),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        limited.contains("f003.txt") && limited.contains("f007.txt"),
+        "{limited}"
+    );
+    assert!(limited.contains("continue with offset=8,"), "{limited}");
+
+    let tree = TempDir::new("list-tree");
+    std::fs::create_dir_all(tree.path().join("src/nested/deeper/deepest")).unwrap();
+    std::fs::write(tree.path().join("src/lib.rs"), "x").unwrap();
+    std::fs::write(tree.path().join("src/nested/mod.rs"), "x").unwrap();
+    std::fs::write(tree.path().join("README.md"), "x").unwrap();
+    let tool = ListDirTool::new(None, None, Some(4)).with_workspace(tree.path());
+    let listing = tool
+        .call(ListDirArgs {
+            depth: Some(3),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(listing.contains("(depth 3; entries 1-4 of 6)"), "{listing}");
+    assert!(listing.contains("  [dir(2)]  src"), "{listing}");
+    assert!(listing.contains("    [dir(2)]  src/nested"), "{listing}");
+    assert!(
+        listing.contains("      [dir(1)]  src/nested/deeper"),
+        "{listing}"
+    );
+    assert!(!listing.contains("deepest"), "{listing}");
+    assert!(listing.contains("continue with offset=4,"), "{listing}");
+    for depth in [0, 4] {
+        assert!(
+            tool.call(ListDirArgs {
+                depth: Some(depth),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+        );
+    }
 }

@@ -1122,6 +1122,7 @@ mod tests {
         )
         .with_workspace(workspace.root())
         .call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -1527,6 +1528,7 @@ mod tests {
         )
         .with_workspace(root.path())
         .call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,

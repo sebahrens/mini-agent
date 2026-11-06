@@ -8,6 +8,9 @@ pub(crate) mod format_after_edit;
 pub(crate) mod grep;
 #[cfg(all(test, unix))]
 mod home_path_tests;
+#[cfg(feature = "multimodal")]
+pub(crate) mod image_fit;
+pub(crate) mod limits;
 pub(crate) mod list_dir;
 #[cfg(feature = "lsp")]
 pub(crate) mod lsp;
@@ -15,6 +18,7 @@ pub(crate) mod memoize;
 pub(crate) mod mutation_diff;
 pub(crate) mod normalize;
 pub(crate) mod notebook;
+pub(crate) mod pdf_text;
 pub(crate) mod read;
 pub(crate) mod read_image;
 pub(crate) mod schedule_wakeup;
@@ -660,8 +664,17 @@ impl From<serde_json::Error> for ToolError {
     }
 }
 
+/// Directory names skipped by name alone: VCS metadata plus `node_modules`,
+/// or exactly the configured `[tool_limits] skip_dirs`. `target` is skipped
+/// only beside a build manifest (see `find_files::skip_directory`).
 pub fn is_skip_dir(name: &str) -> bool {
-    matches!(name, "node_modules" | "target") || is_vcs_metadata(name)
+    if is_vcs_metadata(name) {
+        return true;
+    }
+    match limits::skip_dirs() {
+        Some(names) => names.iter().any(|skip| skip == name),
+        None => name == "node_modules",
+    }
 }
 
 pub fn is_vcs_metadata(name: &str) -> bool {
@@ -678,6 +691,9 @@ pub struct ReadArgs {
     /// 1-indexed Unicode scalar value offset, independent of text lines.
     pub character_offset: Option<usize>,
     pub character_limit: Option<usize>,
+    /// 1-indexed PDF page selection such as `1-5` or `2,4`.
+    #[serde(default)]
+    pub pages: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -759,6 +775,9 @@ pub struct GrepArgs {
     pub max_results: Option<u64>,
     #[serde(default)]
     pub multiline: bool,
+    /// Result lines (or matching files) to skip, for paging.
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -789,9 +808,18 @@ pub struct FindFilesArgs {
     pub sort: FindFilesSort,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct ListDirArgs {
     pub path: Option<String>,
+    /// Entries to skip (0-based) for paging past the entry cap.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Lower the configured entry cap for this call.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Levels to expand (1 = this directory only; at most 3).
+    #[serde(default)]
+    pub depth: Option<usize>,
 }
 
 /// Turns a diagnosed permission verdict into the tool-facing result: coaching

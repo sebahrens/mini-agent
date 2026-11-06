@@ -870,6 +870,7 @@ mod tests {
         ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
             .with_workspace_binding(Arc::clone(&workspace))
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1327,6 +1328,7 @@ mod tests {
         ReadTool::new_with_tracker(None, None, None, 100, tracker)
             .with_workspace_binding(Arc::clone(&workspace))
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,

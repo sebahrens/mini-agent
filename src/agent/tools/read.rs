@@ -12,6 +12,49 @@ use crate::config::types::EditSystem;
 
 const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
 
+/// Characters of the tool-result backstop reserved for the file header,
+/// coaching and continuation notices around a line-mode excerpt.
+const READ_RESULT_RESERVE_CHARS: usize = 2_000;
+/// Approximate per-line rendering overhead (line number, tag, separator)
+/// counted against the character budget.
+const READ_LINE_OVERHEAD_CHARS: usize = 20;
+
+/// Number of Unicode scalar values in a valid UTF-8 byte slice, counted
+/// without decoding (continuation bytes are skipped).
+fn utf8_chars(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| (**byte & 0xC0) != 0x80).count()
+}
+
+/// Render one selected line, clipping it to `width` characters with a marker
+/// that names the exact `character_offset` of the first omitted character.
+/// `start_char` is the 1-indexed file character offset of the line's start.
+fn clip_line(
+    line: &str,
+    width: usize,
+    line_num: usize,
+    start_char: usize,
+) -> std::borrow::Cow<'_, str> {
+    let Some((cut, _)) = line.char_indices().nth(width) else {
+        return std::borrow::Cow::Borrowed(line);
+    };
+    let total = line.chars().count();
+    std::borrow::Cow::Owned(format!(
+        "{} … [line {line_num} truncated: {total} chars, showing {width}; continue with character_offset={}]",
+        &line[..cut],
+        start_char.saturating_add(width)
+    ))
+}
+
+/// Characters a selected line contributes to the rendered excerpt.
+fn clipped_line_chars(line_chars: usize, width: usize) -> usize {
+    if line_chars > width {
+        width.saturating_add(120)
+    } else {
+        line_chars
+    }
+    .saturating_add(READ_LINE_OVERHEAD_CHARS)
+}
+
 /// Feed one already-validated slice of line content to the whole-file CRC and,
 /// when the line is inside the requested window, to the retained excerpt.
 fn absorb(
@@ -177,7 +220,9 @@ impl Tool for ReadTool {
             ),
         };
         format!(
-            "{text} For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization."
+            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB or 8000 px per side are downscaled to at most 2000 px and re-encoded; the summary names the new size); line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per cell and 16 KiB per view; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); scanned PDFs without a text layer are reported as such.",
+            super::limits::current().max_result_chars,
+            super::limits::current().max_read_line_chars
         )
     }
 
@@ -190,6 +235,7 @@ impl Tool for ReadTool {
                 "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to read" },
                 "character_offset": { "type": "integer", "minimum": 1, "description": "1-indexed Unicode character offset for a bounded text slice, including inside very long lines. Cannot combine with line offset/limit." },
                 "character_limit": { "type": "integer", "minimum": 1, "description": "Maximum Unicode characters for a text slice (default 16000); output byte cap still applies. Partial slices never authorize a text overwrite." },
+                "pages": { "type": "string", "description": "PDF only: 1-indexed pages to extract, e.g. \"1-5\" or \"2,4,7-9\" (at most 20 per call; required for PDFs over 20 pages)" },
                 "raw_notebook": { "type": "boolean", "description": "For .ipynb: read raw JSON instead of virtual cell/source/output lines; required for raw hashedit or full-file overwrite authorization", "default": false }
             },
             "required": ["path"]
@@ -355,9 +401,15 @@ impl ReadTool {
 
         if notebook_view {
             use tokio::io::AsyncReadExt;
-            let cap = super::notebook::byte_limit(self.max_text_file_size);
-            if !metadata.is_file() || metadata.len() > cap {
-                return Err(ToolError::Msg("Notebook view requires a regular bounded notebook; use raw_notebook:true for raw line windows".into()));
+            let cap = super::notebook::notebook_byte_limit(self.max_text_file_size);
+            if !metadata.is_file() {
+                return Err(ToolError::Msg("Notebook view requires a regular notebook file; use raw_notebook:true for raw line windows".into()));
+            }
+            if metadata.len() > cap {
+                return Err(ToolError::Msg(format!(
+                    "Notebook is {} bytes, larger than the {cap} byte notebook view limit ([tool_limits] notebook_max_bytes); use raw_notebook:true with offset/limit or character_offset/character_limit for raw windows",
+                    metadata.len()
+                )));
             }
             let mut bytes = Vec::with_capacity(metadata.len() as usize);
             file.take(cap.saturating_add(1))
@@ -422,11 +474,14 @@ impl ReadTool {
                     "Image reads do not accept text offset/limit or character_offset/character_limit; read the whole image".into(),
                 ));
             }
-            let cap = super::read_image::MAX_IMAGE_BYTES;
+            // Oversized images are downscaled rather than refused; only the
+            // encoded input read for that is bounded here.
+            let cap = super::image_fit::MAX_FIT_INPUT_BYTES;
             if !metadata.is_file() || metadata.len() > cap as u64 {
-                return Err(ToolError::Msg(
-                    "Image reads require a regular file no larger than 5 MiB".into(),
-                ));
+                return Err(ToolError::Msg(format!(
+                    "Image reads require a regular file no larger than {} MiB",
+                    cap / (1024 * 1024)
+                )));
             }
             let mut bytes = Vec::with_capacity(metadata.len() as usize);
             reader
@@ -434,20 +489,41 @@ impl ReadTool {
                 .read_to_end(&mut bytes)
                 .await?;
             if bytes.len() > cap {
-                return Err(ToolError::Msg(
-                    "Image grew beyond the 5 MiB input limit".into(),
-                ));
+                return Err(ToolError::Msg("Image grew beyond the input limit".into()));
             }
-            let info = super::read_image::inspect(&bytes)
-                .map_err(|message| ToolError::Msg(message.into()))?
-                .ok_or_else(|| ToolError::Msg("Image signature changed during the read".into()))?;
+            let (bytes, info, note) = match super::read_image::inspect(&bytes) {
+                Ok(Some(info)) => (bytes, info, None),
+                Ok(None) => {
+                    return Err(ToolError::Msg(
+                        "Image signature changed during the read".into(),
+                    ));
+                }
+                Err(_) => {
+                    let fitted = crate::agent::runner::spawn_blocking_scoped(move || {
+                        super::image_fit::fit(
+                            &bytes,
+                            super::read_image::MAX_IMAGE_BYTES,
+                            super::read_image::MAX_IMAGE_SIDE,
+                        )
+                    })
+                    .await
+                    .map_err(|_| ToolError::Msg("Image resize job failed".into()))?
+                    .map_err(ToolError::Msg)?;
+                    let note = fitted.note();
+                    let info = super::read_image::inspect(&fitted.data)
+                        .map_err(|message| ToolError::Msg(message.into()))?
+                        .ok_or_else(|| ToolError::Msg("Resized image is invalid".into()))?;
+                    (fitted.data, info, Some(note))
+                }
+            };
             self.read_tracker.untrack_read_path(&permission_path);
             let summary = format!(
-                "Image: {path} ({}; {} x {}; {} bytes)",
+                "Image: {path} ({}; {} x {}; {} bytes{})",
                 info.format.mime(),
                 info.width,
                 info.height,
-                info.bytes
+                info.bytes,
+                note.map(|note| format!("; {note}")).unwrap_or_default()
             );
             *image = Some(super::read_image::ImageRead {
                 mime: info.format.mime(),
@@ -456,6 +532,49 @@ impl ReadTool {
             return Ok(match coaching {
                 Some(coaching) => format!("{coaching}\n\n{summary}"),
                 None => summary,
+            });
+        }
+        let pdf = super::pdf_text::is_pdf(reader.fill_buf().await?);
+        if args.pages.is_some() && !pdf {
+            return Err(ToolError::Msg(
+                "pages applies only to PDF files; use offset/limit for text files".into(),
+            ));
+        }
+        if pdf {
+            use tokio::io::AsyncReadExt;
+            if args.offset.is_some() || args.limit.is_some() || character_window {
+                return Err(ToolError::Msg(
+                    "PDF reads select pages with pages (for example \"1-5\"), not offset/limit or character_offset/character_limit".into(),
+                ));
+            }
+            let cap = super::pdf_text::MAX_PDF_BYTES;
+            if !metadata.is_file() || metadata.len() > cap {
+                return Err(ToolError::Msg(format!(
+                    "PDF reads require a regular file no larger than {} MiB",
+                    cap / (1024 * 1024)
+                )));
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            reader.take(cap + 1).read_to_end(&mut bytes).await?;
+            if bytes.len() as u64 > cap {
+                return Err(ToolError::Msg("PDF grew beyond the read limit".into()));
+            }
+            let budget = super::limits::current()
+                .max_result_chars
+                .saturating_sub(READ_RESULT_RESERVE_CHARS);
+            let render_path = path.clone();
+            let pages = args.pages.clone();
+            let text = crate::agent::runner::spawn_blocking_scoped(move || {
+                super::pdf_text::render(&bytes, &render_path, pages.as_deref(), budget)
+            })
+            .await
+            .map_err(|_| ToolError::Msg("PDF text extraction job failed".into()))?
+            .map_err(ToolError::Msg)?;
+            // Extracted text never authorizes an overwrite of the PDF.
+            self.read_tracker.untrack_read_path(&permission_path);
+            return Ok(match coaching {
+                Some(coaching) => format!("{coaching}\n\n{text}"),
+                None => text,
             });
         }
         // A BOM-marked UTF-16 file is decoded whole (bounded) and served as
@@ -576,6 +695,22 @@ impl ReadTool {
         let scan_to_eof = !oversized || es == EditSystem::Hashedit;
         let hashedit = es == EditSystem::Hashedit;
         let requested_end = offset.saturating_add(limit);
+        // The final `[tool_limits] max_result_chars` backstop applies to the
+        // rendered excerpt: selection stops before the first line that would
+        // exceed it, and the notice names the exact next offset.
+        let tool_limits = super::limits::current();
+        let char_budget = tool_limits
+            .max_result_chars
+            .saturating_sub(READ_RESULT_RESERVE_CHARS);
+        let clip_width = tool_limits
+            .max_read_line_chars
+            .min(char_budget.saturating_sub(200))
+            .max(1);
+        let mut selection_end = requested_end;
+        let mut budget_stop: Option<usize> = None;
+        let mut excerpt_chars = 0_usize;
+        let mut file_chars = 0_usize;
+        let mut excerpt_starts: Vec<usize> = Vec::with_capacity(limit.min(256));
         let mut excerpt_lines: Vec<String> = Vec::with_capacity(limit.min(256));
         let mut excerpt_bytes = 0_u64;
         let mut total_lines = 0_usize;
@@ -593,7 +728,8 @@ impl ReadTool {
 
         'lines: loop {
             let line_index = total_lines;
-            let selected = line_index >= offset && line_index < requested_end;
+            let selected = line_index >= offset && line_index < selection_end;
+            let line_start_char = file_chars.saturating_add(1);
             let separator_bytes = u64::from(!excerpt_lines.is_empty());
             let mut retained: Vec<u8> = Vec::new();
             let mut held_cr = false;
@@ -635,6 +771,7 @@ impl ReadTool {
                     }
                     absorb(chunk, hashedit, &mut file_crc, selected, &mut retained);
                 }
+                file_chars = file_chars.saturating_add(utf8_chars(&available[..consumed]));
                 reader.consume(consumed);
                 scan_budget = scan_budget.saturating_sub(consumed as u64);
                 saw_bytes = true;
@@ -673,9 +810,22 @@ impl ReadTool {
             }
 
             total_lines += 1;
+            let selected = selected && {
+                let rendered = clipped_line_chars(utf8_chars(&retained), clip_width);
+                if !excerpt_lines.is_empty() && excerpt_chars.saturating_add(rendered) > char_budget
+                {
+                    budget_stop = Some(line_index);
+                    selection_end = line_index;
+                    false
+                } else {
+                    excerpt_chars = excerpt_chars.saturating_add(rendered);
+                    true
+                }
+            };
             if selected {
                 let line = String::from_utf8(retained)
                     .expect("line bytes were validated as UTF-8 while streaming");
+                excerpt_starts.push(line_start_char);
                 excerpt_bytes = excerpt_bytes
                     .saturating_add(separator_bytes)
                     .saturating_add(line.len() as u64);
@@ -723,19 +873,28 @@ impl ReadTool {
                     .enumerate()
                     .map(|(i, line)| {
                         let line_num = start + i + 1;
+                        // The tag always covers the complete line, so a
+                        // clipped display still authorizes the same edit.
                         let tag = crc32_hex(line.as_bytes());
                         format!(
                             "{:>width$}|{} {}",
                             line_num,
                             tag,
-                            line,
+                            clip_line(line, clip_width, line_num, excerpt_starts[i]),
                             width = line_num_width
                         )
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
             }
-            EditSystem::Similarity => numbered_excerpt(&excerpt_lines, start, line_num_width),
+            EditSystem::Similarity => {
+                let clipped: Vec<std::borrow::Cow<'_, str>> = excerpt_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| clip_line(line, clip_width, start + i + 1, excerpt_starts[i]))
+                    .collect();
+                numbered_excerpt(&clipped, start, line_num_width)
+            }
         };
 
         let total_lines_label = if has_more_lines {
@@ -790,7 +949,15 @@ impl ReadTool {
             }
         };
 
-        let info = if has_more_lines {
+        let info = if let Some(stop) = budget_stop {
+            format!(
+                "{}\n\n[truncated after {} lines — the output reached the {} character tool-result budget ([tool_limits] max_result_chars); re-call with offset {} and a bounded limit to continue]",
+                info,
+                end - start,
+                tool_limits.max_result_chars,
+                stop + 1,
+            )
+        } else if has_more_lines {
             format!(
                 "{}\n\n[truncated after {} lines — more lines are available; re-call with offset {} and a bounded limit to continue]",
                 info,
@@ -899,11 +1066,18 @@ fn line_number_width(total_lines: usize) -> usize {
     total_lines.max(1).to_string().len().max(3)
 }
 
-fn numbered_excerpt(lines: &[String], start: usize, width: usize) -> String {
+fn numbered_excerpt<S: AsRef<str>>(lines: &[S], start: usize, width: usize) -> String {
     lines
         .iter()
         .enumerate()
-        .map(|(i, line)| format!("{:>width$}| {}", start + i + 1, line, width = width))
+        .map(|(i, line)| {
+            format!(
+                "{:>width$}| {}",
+                start + i + 1,
+                line.as_ref(),
+                width = width
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1097,6 +1271,7 @@ mod tests {
         let tool = ReadTool::new(None, None, None, 100);
         let error = tool
             .call(crate::agent::tools::ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1113,6 +1288,7 @@ mod tests {
         let tool = ReadTool::new(None, None, None, 0);
         assert!(
             tool.call(crate::agent::tools::ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1164,6 +1340,7 @@ mod tests {
 
         let output = ReadTool::new(None, None, None, 100)
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1193,6 +1370,7 @@ mod tests {
 
         let output = tool
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1222,6 +1400,7 @@ mod tests {
 
         let error = tool
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1248,6 +1427,7 @@ mod tests {
 
         let error = tool
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1302,6 +1482,7 @@ mod tests {
         let tool = ReadTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None, 100);
 
         let call = tool.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -1377,6 +1558,7 @@ mod tests {
 
         let error = ReadTool::new(None, None, Some(4), 100)
             .call(ReadArgs {
+                pages: None,
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -1412,6 +1594,7 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
         let output = ReadTool::new(None, None, None, 100)
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1425,5 +1608,250 @@ mod tests {
         assert!(output.contains("line 19997 "), "{output}");
         assert!(output.contains("line 19998 "), "{output}");
         assert!(!output.contains("line 19996 "), "{output}");
+    }
+
+    fn read_args(path: &std::path::Path) -> ReadArgs {
+        ReadArgs {
+            pages: None,
+            raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
+            path: path.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn wide_line_read_stops_at_the_result_backstop_with_an_exact_next_offset() {
+        let dir = crate::tests::support::temp::TempDir::new("read-backstop");
+        let path = dir.path().join("wide.txt");
+        let line = "w".repeat(600);
+        let body: String = (0..2000).map(|_| format!("{line}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let backstop = crate::agent::tools::limits::DEFAULT_MAX_RESULT_CHARS;
+
+        let output = ReadTool::new(None, None, Some(4 * 1024 * 1024), 2000)
+            .call(read_args(&path))
+            .await
+            .unwrap();
+
+        assert!(output.chars().count() <= backstop, "{}", output.len());
+        let marker = "tool-result budget ([tool_limits] max_result_chars); re-call with offset ";
+        let next = output
+            .split(marker)
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .expect("explicit next offset");
+        assert!(
+            output.contains(&format!("showing lines 1-{}", next - 1)),
+            "{output:.200}"
+        );
+        let resumed = ReadTool::new(None, None, Some(4 * 1024 * 1024), 2000)
+            .call(ReadArgs {
+                offset: Some(next),
+                limit: Some(3),
+                ..read_args(&path)
+            })
+            .await
+            .unwrap();
+        assert!(
+            resumed.contains(&format!("showing lines {next}-{}", next + 2)),
+            "{resumed:.200}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_huge_line_is_clipped_with_a_character_offset_continuation() {
+        let dir = crate::tests::support::temp::TempDir::new("read-backstop");
+        let path = dir.path().join("one-line.min.js");
+        std::fs::write(&path, format!("ab\n{}\n", "é".repeat(300_000))).unwrap();
+
+        let output = ReadTool::new(None, None, Some(4 * 1024 * 1024), 2000)
+            .call(ReadArgs {
+                offset: Some(2),
+                limit: Some(1),
+                ..read_args(&path)
+            })
+            .await
+            .unwrap();
+
+        let backstop = crate::agent::tools::limits::DEFAULT_MAX_RESULT_CHARS;
+        assert!(
+            output.chars().count() <= backstop,
+            "{}",
+            output.chars().count()
+        );
+        // Line 2 starts at character 4 ("a", "b", "\n" precede it).
+        let shown = output
+            .split("chars, showing ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .expect("clip width");
+        assert!(
+            output.contains(&format!(
+                "[line 2 truncated: 300000 chars, showing {shown}; continue with character_offset={}]",
+                4 + shown
+            )),
+            "{}",
+            &output[output.len() - 300..]
+        );
+    }
+
+    /// mini-agent-xm2o6: a single 500 KB line is clipped to the configured
+    /// width with a character_offset marker; the hashedit tag still covers
+    /// the complete line, so tag-based edits remain valid.
+    #[tokio::test]
+    async fn long_line_is_clipped_to_line_width_and_keeps_a_full_line_hashedit_tag() {
+        let dir = crate::tests::support::temp::TempDir::new("read-line-clip");
+        let path = dir.path().join("bundle.min.js");
+        let line = "x".repeat(500_000);
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let width = crate::agent::tools::limits::DEFAULT_MAX_READ_LINE_CHARS;
+        let read = || async {
+            ReadTool::new(None, None, None, 2000)
+                .call(read_args(&path))
+                .await
+                .unwrap()
+        };
+
+        let output = read().await;
+        let marker = format!(
+            "[line 1 truncated: 500000 chars, showing {width}; continue with character_offset={}]",
+            width + 1
+        );
+        assert!(output.contains(&marker), "{output:.300}");
+        assert!(output.chars().count() <= width + 400, "{}", output.len());
+        let resumed = ReadTool::new(None, None, None, 2000)
+            .call(ReadArgs {
+                character_offset: Some(width + 1),
+                character_limit: Some(10),
+                ..read_args(&path)
+            })
+            .await
+            .unwrap();
+        assert!(resumed.contains(&format!("Characters {}-{}", width + 1, width + 10)));
+
+        assert!(crate::agent::tools::set_edit_system(
+            crate::config::types::EditSystem::Hashedit
+        ));
+        let tagged = read().await;
+        crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
+        let tag = crate::agent::tools::crc::crc32_hex(line.as_bytes());
+        assert!(tagged.contains(&format!("  1|{tag} ")), "{tagged:.300}");
+        assert!(tagged.contains(&marker), "{tagged:.300}");
+    }
+
+    /// mini-agent-qsttm: notebooks have their own size limit, so a 3 MiB
+    /// notebook dominated by an image output reads in the virtual view under
+    /// the default 1 MiB text cap.
+    #[tokio::test]
+    async fn three_mib_notebook_with_image_output_reads_in_virtual_view() {
+        let dir = crate::tests::support::temp::TempDir::new("read-big-notebook");
+        let path = dir.path().join("plots.ipynb");
+        let notebook = serde_json::json!({
+            "nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"code","id":"plot","source":"plt.plot(x)","metadata":{},
+                      "execution_count":1,"outputs":[{"output_type":"display_data","metadata":{},
+                      "data":{"image/png":"A".repeat(3 * 1024 * 1024),"text/plain":"<Figure>"}}]}]
+        })
+        .to_string();
+        assert!(notebook.len() > 3 * 1024 * 1024);
+        std::fs::write(&path, notebook).unwrap();
+        let output = ReadTool::new(None, None, None, 2000)
+            .call(read_args(&path))
+            .await
+            .unwrap();
+        assert!(output.contains("Notebook cell view:"), "{output}");
+        assert!(output.contains("plt.plot(x)"), "{output}");
+        assert!(output.contains("[image/png output omitted]"), "{output}");
+        assert!(output.len() < 4096, "{}", output.len());
+    }
+
+    /// mini-agent-yjixs: PDFs return their text layer with page markers,
+    /// large documents require pages, and scanned PDFs say so.
+    #[tokio::test]
+    async fn pdf_reads_extract_selected_pages_and_guide_large_or_scanned_documents() {
+        use crate::agent::tools::pdf_text::test_pdf::{Content, build};
+        let dir = crate::tests::support::temp::TempDir::new("read-pdf");
+        let pages: Vec<Content> = (1..=25)
+            .map(|n| Content::Deflated(format!("BT /F1 12 Tf 72 720 Td (Text of page {n}) Tj ET")))
+            .collect();
+        let path = dir.path().join("spec.pdf");
+        std::fs::write(&path, build(&pages, false)).unwrap();
+        let read = |pages: Option<&str>| {
+            let args = ReadArgs {
+                pages: pages.map(str::to_owned),
+                ..read_args(&path)
+            };
+            async move { ReadTool::new(None, None, None, 2000).call(args).await }
+        };
+
+        let selected = read(Some("1-5")).await.unwrap();
+        assert!(
+            selected.contains("(25 pages; extracted text layer of page(s) 1-5;"),
+            "{selected}"
+        );
+        assert!(
+            selected.contains("--- page 1 ---\nText of page 1"),
+            "{selected}"
+        );
+        assert!(
+            selected.contains("--- page 5 ---\nText of page 5"),
+            "{selected}"
+        );
+        assert!(!selected.contains("page 6"), "{selected}");
+
+        let guidance = read(None).await.unwrap_err().to_string();
+        assert!(guidance.contains("is a PDF with 25 pages"), "{guidance}");
+        assert!(guidance.contains("pages:\"1-20\""), "{guidance}");
+        assert!(!guidance.contains("UTF-8"), "{guidance}");
+        assert!(read(Some("1-21")).await.is_err());
+
+        let scanned = dir.path().join("scan.pdf");
+        std::fs::write(
+            &scanned,
+            build(
+                &[Content::Plain("q 612 0 0 792 0 0 cm /Im0 Do Q".into())],
+                false,
+            ),
+        )
+        .unwrap();
+        let output = ReadTool::new(None, None, None, 2000)
+            .call(read_args(&scanned))
+            .await
+            .unwrap();
+        assert!(
+            output.contains("no text layer found on page(s) 1"),
+            "{output}"
+        );
+        assert!(output.contains("pdftoppm -png"), "{output}");
+
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, "plain\n").unwrap();
+        let error = ReadTool::new(None, None, None, 2000)
+            .call(ReadArgs {
+                pages: Some("1".into()),
+                ..read_args(&text)
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pages applies only to PDF files"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn reads_under_the_backstop_are_unchanged() {
+        let dir = crate::tests::support::temp::TempDir::new("read-backstop");
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let output = ReadTool::new(None, None, None, 100)
+            .call(read_args(&path))
+            .await
+            .unwrap();
+        assert!(output.ends_with("  1| one\n  2| two"), "{output}");
+        assert!(!output.contains("truncated"), "{output}");
     }
 }

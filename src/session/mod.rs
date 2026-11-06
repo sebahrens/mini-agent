@@ -2165,8 +2165,32 @@ impl Session {
         if let Some(path) = self.tool_result_spills.take(id, name, output) {
             return (format!("{name}:\n{output}"), output.to_string(), Some(path));
         }
+        if tool_result_is_self_bounded(name) {
+            let limits = crate::agent::tools::limits::current();
+            let Some(output_chars) = exceeds_self_bounded_backstop(output, limits.max_result_chars)
+            else {
+                return (format!("{name}:\n{output}"), output.to_string(), None);
+            };
+            return match storage::save_tool_output(&self.id, name, output) {
+                Ok(path) => {
+                    let replay_output =
+                        format_backstopped_tool_output(output, output_chars, Some(&path), limits);
+                    (
+                        format!("{name}:\n{replay_output}"),
+                        replay_output,
+                        Some(path),
+                    )
+                }
+                Err(err) => {
+                    let replay_output = format!(
+                        "{output}\n\n[failed to save long tool output separately; kept full output in session to avoid data loss: {err}]"
+                    );
+                    (format!("{name}:\n{replay_output}"), replay_output, None)
+                }
+            };
+        }
         let output_chars = output.chars().count();
-        if tool_result_is_self_bounded(name) || output_chars <= TOOL_RESULT_SAVE_THRESHOLD {
+        if output_chars <= TOOL_RESULT_SAVE_THRESHOLD {
             return (format!("{name}:\n{output}"), output.to_string(), None);
         }
 
@@ -3037,6 +3061,49 @@ pub(crate) fn format_unpersisted_tool_output_with(
     )
 }
 
+/// Whether a self-bounded tool result still exceeds the final character
+/// backstop (`[tool_limits] max_result_chars`). Byte length is checked first
+/// because it is an upper bound on the character count.
+pub(crate) fn exceeds_self_bounded_backstop(output: &str, max_chars: usize) -> Option<usize> {
+    if output.len() <= max_chars {
+        return None;
+    }
+    let chars = output.chars().count();
+    (chars > max_chars).then_some(chars)
+}
+
+/// Head/tail-trim a self-bounded result that exceeded the final backstop. The
+/// complete output was saved at `path`; the notice names the backstop and how
+/// to continue.
+pub(crate) fn format_backstopped_tool_output(
+    output: &str,
+    output_chars: usize,
+    path: Option<&Path>,
+    limits: crate::agent::tools::limits::ToolLimits,
+) -> String {
+    let notice = match path {
+        Some(path) => format!(
+            "[result exceeded the {} character tool-result backstop ([tool_limits] max_result_chars); full output saved to: {}; use the read tool on this path with offset/limit or character_offset/character_limit to inspect the omitted part, or narrow the command]",
+            limits.max_result_chars,
+            path.display()
+        ),
+        None => format!(
+            "[result exceeded the {} character tool-result backstop ([tool_limits] max_result_chars); the full output could not be saved; narrow the command or request a smaller window]",
+            limits.max_result_chars
+        ),
+    };
+    format_truncated_tool_output_with_limits(
+        ToolResultSpillLimits {
+            threshold: limits.max_result_chars,
+            head: limits.backstop_head_chars(),
+            tail: limits.backstop_tail_chars(),
+        },
+        output,
+        output_chars,
+        &notice,
+    )
+}
+
 fn format_truncated_tool_output_with_limits(
     limits: ToolResultSpillLimits,
     output: &str,
@@ -3656,6 +3723,36 @@ mod preflight_tests {
         assert!(!tool_result_is_self_bounded("server__read"));
         assert!(!tool_result_is_self_bounded("mcp_tool"));
         session.add_tool_result_with_id("id", "read", &output);
+    }
+
+    /// mini-agent-i417o: replay applies the same final backstop the live hook
+    /// does, so a resumed session never re-injects a megabyte result.
+    #[test]
+    fn self_bounded_results_over_the_backstop_are_spilled_on_replay() {
+        let root = crate::tests::support::temp::TempDir::new_canonical("replay-backstop");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().as_os_str().to_owned()),
+            ),
+        ]);
+        let session = Session::new("test", "mock", 128_000, "");
+        let backstop = crate::agent::tools::limits::DEFAULT_MAX_RESULT_CHARS;
+        let output = format!("{}\n{}", "a".repeat(backstop), "z".repeat(backstop));
+        let (_, replay, artifact) = session.tool_result_content("id", "shell", &output);
+        let artifact = artifact.expect("backstop spill artifact");
+        assert!(replay.chars().count() <= backstop);
+        assert!(replay.contains(&artifact.display().to_string()));
+        assert!(replay.contains("[tool_limits] max_result_chars"));
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), output);
     }
 }
 

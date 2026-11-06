@@ -111,12 +111,20 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
             return Flow::cont();
         };
 
-        // Cheap checks first: self-bounded tools and byte lengths under the
-        // threshold (bytes >= chars) never need the UTF-8 char walk.
+        // Cheap checks first: byte lengths under the threshold (bytes >=
+        // chars) never need the UTF-8 char walk. Self-bounded tools keep their
+        // own continuation contracts and only meet the final, much larger
+        // `[tool_limits] max_result_chars` backstop; every other tool spills at
+        // the configurable, window-scaled generic limits.
+        let self_bounded = crate::session::tool_result_is_self_bounded(tool_name);
         let limits = self.limits;
-        if crate::session::tool_result_is_self_bounded(tool_name)
-            || result.len() <= limits.threshold
-        {
+        let backstop = crate::agent::tools::limits::current();
+        let threshold = if self_bounded {
+            backstop.max_result_chars
+        } else {
+            limits.threshold
+        };
+        if result.len() <= threshold {
             return Flow::cont();
         }
         // Image-producing tools bound their response text before assembling
@@ -139,7 +147,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
             return Flow::cont();
         }
         let output_chars = result.chars().count();
-        if output_chars <= limits.threshold {
+        if output_chars <= threshold {
             return Flow::cont();
         }
 
@@ -159,12 +167,21 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
 
         match saved {
             Ok(Ok(spill)) => {
-                let bounded = crate::session::format_spilled_tool_output_with(
-                    limits,
-                    &output,
-                    output_chars,
-                    spill.path(),
-                );
+                let bounded = if self_bounded {
+                    crate::session::format_backstopped_tool_output(
+                        &output,
+                        output_chars,
+                        Some(spill.path()),
+                        backstop,
+                    )
+                } else {
+                    crate::session::format_spilled_tool_output_with(
+                        limits,
+                        &output,
+                        output_chars,
+                        spill.path(),
+                    )
+                };
                 let path = spill.commit();
                 if let Some(spills) = &self.spills {
                     spills.register(
@@ -184,12 +201,21 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
                     %error,
                     "failed to persist oversized live tool result"
                 );
-                Flow::rewrite_result(crate::session::format_unpersisted_tool_output_with(
-                    limits,
-                    &output,
-                    output_chars,
-                    &error.to_string(),
-                ))
+                Flow::rewrite_result(if self_bounded {
+                    crate::session::format_backstopped_tool_output(
+                        &output,
+                        output_chars,
+                        None,
+                        backstop,
+                    )
+                } else {
+                    crate::session::format_unpersisted_tool_output_with(
+                        limits,
+                        &output,
+                        output_chars,
+                        &error.to_string(),
+                    )
+                })
             }
             Err(error) => {
                 tracing::warn!(
@@ -198,12 +224,21 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
                     %error,
                     "tool-result spill worker failed"
                 );
-                Flow::rewrite_result(crate::session::format_unpersisted_tool_output_with(
-                    limits,
-                    &output,
-                    output_chars,
-                    "the spill worker failed",
-                ))
+                Flow::rewrite_result(if self_bounded {
+                    crate::session::format_backstopped_tool_output(
+                        &output,
+                        output_chars,
+                        None,
+                        backstop,
+                    )
+                } else {
+                    crate::session::format_unpersisted_tool_output_with(
+                        limits,
+                        &output,
+                        output_chars,
+                        "the spill worker failed",
+                    )
+                })
             }
         }
     }
@@ -7499,6 +7534,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Stands in for the self-bounded `shell` tool: three 400 KiB lines pass
+    /// its line cap untouched.
+    #[derive(Clone)]
+    struct WideShellStub;
+
+    impl Tool for WideShellStub {
+        const NAME: &'static str = "shell";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Print three very long lines".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok(format!(
+                "{}\n{}\n{}",
+                "H".repeat(400 * 1024),
+                "M".repeat(400 * 1024),
+                "T".repeat(400 * 1024)
+            ))
+        }
+    }
+
+    /// mini-agent-i417o: self-bounded tools skip the generic spill but still
+    /// meet the `[tool_limits] max_result_chars` backstop, with a spill path.
+    #[tokio::test]
+    async fn self_bounded_shell_output_over_the_backstop_is_trimmed_and_spilled() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "mini-agent-backstop-spill-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("MINI_AGENT_DATA_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_CONFIG_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_STATE_DIR", Some(root.clone().into_os_string())),
+        ]);
+        let mut session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "wide-shell-id",
+                    WideShellStub::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(WideShellStub)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        let mut streamed_result = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(MultiTurnStreamItem::StreamUserItem(
+                rig::streaming::StreamedUserContent::ToolResult { tool_result, .. },
+            )) = item
+            {
+                streamed_result = Some(tool_result);
+            }
+        }
+        let requests = model.requests();
+        let live_output = requests[1]
+            .chat_history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|content| match content {
+                    UserContent::ToolResult(result) => {
+                        result.content.iter().find_map(|content| match content {
+                            ToolResultContent::Text(text) => Some(text.text.clone()),
+                            ToolResultContent::Image(_) => None,
+                        })
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the next request must contain the bounded tool result");
+        let backstop = crate::agent::tools::limits::DEFAULT_MAX_RESULT_CHARS;
+        assert!(live_output.chars().count() <= backstop);
+        assert!(live_output.starts_with("HHHH"));
+        assert!(live_output.ends_with("TTTT"));
+        assert!(live_output.contains("character tool-result backstop ([tool_limits] max_result_chars); full output saved to: "));
+        assert!(!live_output.contains(&"M".repeat(80)));
+
+        let streamed_result = streamed_result.expect("stream surfaces the rewritten result");
+        session.add_tool_result_with_id(&streamed_result.id, WideShellStub::NAME, &live_output);
+        let Some(crate::session::PersistedToolMessage::Result {
+            artifact_path: Some(path),
+            ..
+        }) = &session.messages[0].tool
+        else {
+            panic!("persistence must receive the backstop artifact out of band")
+        };
+        assert!(live_output.contains(path.as_str()));
+        let full_output = std::fs::read_to_string(path.as_str()).unwrap();
+        assert_eq!(full_output.chars().count(), 3 * 400 * 1024 + 2);
+
+        drop(_environment);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Stands in for the subagent `task` tool: a 30 KB rendered report is
     /// inside the default per-child (32 KiB) and per-call (128 KiB) caps.
     #[derive(Clone)]
@@ -7801,6 +7955,7 @@ mod tests {
         let repeated =
             crate::agent::tools::ReadTool::new_with_tracker(None, None, None, 2_000, tracker)
                 .call(crate::agent::tools::ReadArgs {
+                    pages: None,
                     raw_notebook: false,
                     character_offset: None,
                     character_limit: None,

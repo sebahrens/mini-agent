@@ -165,6 +165,7 @@ async fn read_and_edit_home_paths_resolve_through_the_ambient_path() {
     let read = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
         .with_workspace(fixture.workspace.clone())
         .call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -221,6 +222,7 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
         .with_workspace(fixture.workspace.clone())
         .call(ListDirArgs {
             path: Some("$HOME/project".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -230,6 +232,7 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
     let grep = GrepTool::new(None, None, 100)
         .with_workspace(fixture.workspace.clone())
         .call(GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "needle".into(),

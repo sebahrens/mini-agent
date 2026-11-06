@@ -51,6 +51,39 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Self-bounded tools (`read`, `shell`, `js`, `web_fetch`, ...) now meet a final per-result
+  character backstop, `[tool_limits] max_result_chars` (default 100,000). Larger results keep a
+  head and tail around a notice with the private spill path, live and on replay; `read` stops line
+  mode at the budget and names the exact next `offset`.
+- `read` clips each displayed line to `[tool_limits] max_read_line_chars` (default 2,000) with a
+  marker naming the exact `character_offset` that continues it; hashedit tags still cover the full
+  line.
+- `grep` no longer reports skipped files as match-free: a directory search appends a
+  `[skipped N files not searched: ...]` line for files over the 10 MiB per-file limit, binary or
+  unreadable files, and naming such a file as `path` returns an error naming the limit.
+- `grep` accepts `offset` to page past its result cap; the truncation notice names the exact
+  `offset` that continues, in line, `files_only` and `count` modes.
+- The notebook `read` view now shows `execute_result`/`display_data` `text/plain` data and
+  `error` outputs (`ename: evalue` plus the ANSI-stripped traceback) and labels image and other
+  rich outputs by mime type instead of `[opaque output payload omitted]`.
+- Notebooks have their own size limit, `[tool_limits] notebook_max_bytes` (default 32 MiB, hard
+  ceiling 64 MiB), so executed notebooks with image outputs read and edit under the 1 MiB text
+  cap; a view window over the 64 KiB cap is truncated with the next `offset` instead of failing.
+- `read` extracts the text layer of PDF files in every build, with `--- page N ---` markers and a
+  `pages` selection (at most 20 per call, required above 20 pages), instead of the UTF-8 error;
+  scanned PDFs report that they have no text layer and suggest exporting pages as images.
+- `list_dir` accepts `offset`, `limit` and `depth` (up to 3): entries past the cap are reachable
+  through the `continue with offset=N` notice, and depth renders a bounded indented tree.
+- `grep`, `find_files` and `list_dir` no longer hide every directory named `target`: only one beside
+  a build manifest (`Cargo.toml`, `pom.xml`, ...) is skipped, skipped dependency/build directories
+  are named in a notice, and `[tool_limits] skip_dirs` makes the set configurable.
+- Oversized images are downscaled instead of refused: `read` resizes images over 5 MiB or 8000 px
+  (up to 64 MiB input) to a 2000 px long edge and reports the new size, and `/add` and clipboard
+  images over 2 MiB are shrunk to fit the per-image limit (multimodal; `image` is the version
+  fastembed already resolves).
+- `grep` and `find_files` search budgets are configurable (`[tool_limits] search_max_entries`,
+  `search_max_depth`, `search_max_bytes`), stated in the tool descriptions, and a partial result
+  names the first unsearched path.
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

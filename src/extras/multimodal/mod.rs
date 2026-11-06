@@ -178,6 +178,28 @@ fn sniff_media(data: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Downscale an image attachment above the per-image user limit
+/// (`MAX_USER_IMAGE_BYTES`) instead of letting submission refuse it. Returns
+/// a note describing the resize, or `None` when the image already fits.
+/// Non-image attachments are untouched.
+pub fn fit_image_attachment(attachment: &mut MediaAttachment) -> Result<Option<String>, String> {
+    let MediaAttachment::Image { data, mime, .. } = attachment else {
+        return Ok(None);
+    };
+    if data.len() <= crate::session::user::MAX_USER_IMAGE_BYTES {
+        return Ok(None);
+    }
+    let fitted = crate::agent::tools::image_fit::fit(
+        data,
+        crate::session::user::MAX_USER_IMAGE_BYTES,
+        crate::agent::tools::read_image::MAX_IMAGE_SIDE,
+    )?;
+    let note = fitted.note();
+    *mime = fitted.format.mime().to_owned();
+    *data = fitted.data;
+    Ok(Some(note))
+}
+
 /// Load a regular media file, limiting bytes read even if it grows while open.
 /// Symlinks to regular files are supported. Metadata and content are read from
 /// the same handle so a later pathname replacement cannot switch the input.
@@ -457,6 +479,34 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains("not a regular file"), "{error}");
         }
+    }
+
+    /// mini-agent-4hupe: a 3 MiB screenshot attached with /add is downscaled
+    /// under the 2 MiB per-image limit and then submits normally.
+    #[test]
+    fn oversized_image_attachment_is_downscaled_to_the_user_limit() {
+        let png = crate::agent::tools::image_fit::tests::noisy_png(1100, 1000);
+        assert!(png.len() > 3 * 1024 * 1024);
+        let mut attachment = MediaAttachment::Image {
+            path: "screenshot.png".into(),
+            data: png,
+            mime: "image/png".into(),
+            clipboard: None,
+        };
+        let note = super::fit_image_attachment(&mut attachment)
+            .unwrap()
+            .unwrap();
+        assert!(note.starts_with("resized from 1100 x 1000 to "), "{note}");
+        let MediaAttachment::Image { data, mime, .. } = &attachment else {
+            unreachable!()
+        };
+        assert!(data.len() <= crate::session::user::MAX_USER_IMAGE_BYTES);
+        assert_eq!(
+            crate::agent::tools::read_image::ImageFormat::from_magic(data)
+                .map(|format| format.mime()),
+            Some(mime.as_str())
+        );
+        assert_eq!(super::fit_image_attachment(&mut attachment).unwrap(), None);
     }
 }
 

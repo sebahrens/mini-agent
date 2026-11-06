@@ -70,6 +70,7 @@ async fn read_through_in_workspace_symlink_names_the_link() {
 
     let error = tool
         .call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -88,6 +89,7 @@ async fn read_through_in_workspace_symlink_names_the_link() {
 
     let error = tool
         .call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -107,6 +109,7 @@ async fn read_through_in_workspace_symlink_names_the_link() {
     // The suggested absolute path is readable through the ambient route.
     let ok = tool
         .call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -203,6 +206,7 @@ async fn non_symlink_errors_pass_through_unchanged() {
     let error = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(true))
         .with_workspace(fixture.workspace.clone())
         .call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -226,6 +230,7 @@ async fn escaping_symlink_target_is_not_disclosed() {
     let error = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(true))
         .with_workspace(fixture.workspace.clone())
         .call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,

@@ -785,6 +785,9 @@ pub struct Config {
     /// (mini-agent-59sgr).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_files_max_bytes: Option<u64>,
+    /// Output and traversal bounds for built-in tools (`[tool_limits]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_limits: Option<types::ToolLimitsConfig>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///
