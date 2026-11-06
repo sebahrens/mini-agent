@@ -225,6 +225,9 @@ pub(crate) const FETCH_RESPONSE_HEADER_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const FETCH_RESPONSE_HEADER_MAX_COUNT: usize = 128;
 pub(crate) const FETCH_RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
 
+// Only the JS broker transport uses these since the native exchange
+// returns `NativeFetchResult`.
+#[cfg_attr(not(all(feature = "js", feature = "sandbox")), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FetchResult {
     pub status: u16,
@@ -433,12 +436,18 @@ impl std::fmt::Display for FetchError {
 
 impl std::error::Error for FetchError {}
 
+// Only the JS broker transport uses these since the native exchange
+// returns `NativeFetchResult`.
+#[cfg_attr(not(all(feature = "js", feature = "sandbox")), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FetchTransportOutcome {
     Complete(FetchResult),
     Redirect(Url),
 }
 
+// Only the JS broker transport uses these since the native exchange
+// returns `NativeFetchResult`.
+#[cfg_attr(not(all(feature = "js", feature = "sandbox")), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FetchLimits {
     pub(crate) connect_timeout: Duration,
