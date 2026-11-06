@@ -54,6 +54,25 @@ brokered JS `spawn` is bounded by the remaining `js-step-timeout-secs` deadline.
 `background = true` instead returns a session-scoped job id immediately and
 uses a 24-hour maximum (again lowerable with `timeout`).
 
+With `auto_background = true` on the call (or `shell_auto_background = true` in
+config) a foreground command runs as a job from the start: if it finishes
+before its deadline the result reads exactly like a foreground result (output,
+exit code, log footer) and the job record is dropped; if it reaches the
+deadline it is not killed but returned as `[status: promoted_to_background;
+job_id: ...]` with the output so far, and keeps running as an ordinary
+background job whose next `job_status` poll continues after that output. If the
+call is interrupted before either happens, the job is stopped.
+
+| Command class | Deadline |
+|---------------|----------|
+| `shell` foreground | `shell_timeout_secs` (default 120 s, 1..=600); call `timeout` can only lower it; optional promotion to a job |
+| `shell` background job | 24 h, call `timeout` can lower it |
+| `!` commands (TUI and headless) | `command_timeout_secs` (default 30 s, 1..=600) |
+| Loop and goal validation commands | Their own configured validation limits |
+| Hooks | Their own hook timeouts |
+| Brokered JS `spawn` | Remaining `js-step-timeout-secs` deadline (default 30 s) |
+| Structured Git | 10 s queries, 30 s diff/show pages, 60 s local mutations |
+
 On Unix a shell command's stdout and stderr share one pipe by default (like
 `2>&1`), so the result shows lines in their exact write order without stream
 labels. `separate_streams = true` captures two pipes instead and labels each run

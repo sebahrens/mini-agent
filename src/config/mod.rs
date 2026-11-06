@@ -271,6 +271,14 @@ pub struct Config {
     /// their own limits; this does not alter brokered JavaScript spawn limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell_timeout_secs: Option<u64>,
+    /// Promote a foreground shell command that reaches its deadline to a
+    /// background job instead of killing it (per-call `auto_background`
+    /// overrides). Default `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_auto_background: Option<bool>,
+    /// Deadline of `!` commands in seconds, clamped to 1..=600 (default 30).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_timeout_secs: Option<u64>,
     /// Opt-in anonymous release check, only during interactive startup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,

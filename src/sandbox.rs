@@ -799,6 +799,27 @@ pub(crate) const DEFAULT_COMMAND_LIMITS: CommandLimits = CommandLimits {
     combined_bytes: 1536 * 1024,
 };
 
+/// Bounds of `command_timeout_secs`, the deadline of `!` commands and loop
+/// validation commands (default 30 s).
+pub(crate) const MAX_COMMAND_TIMEOUT_SECS: u64 = 600;
+static COMMAND_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(30);
+
+/// Set the process-wide `command_timeout_secs` (clamped to 1..=600).
+pub(crate) fn set_command_timeout_secs(seconds: u64) {
+    COMMAND_TIMEOUT_SECS.store(
+        seconds.clamp(1, MAX_COMMAND_TIMEOUT_SECS),
+        Ordering::Relaxed,
+    );
+}
+
+/// [`DEFAULT_COMMAND_LIMITS`] with the configured `command_timeout_secs`.
+pub(crate) fn configured_command_limits() -> CommandLimits {
+    CommandLimits {
+        timeout: std::time::Duration::from_secs(COMMAND_TIMEOUT_SECS.load(Ordering::Relaxed)),
+        ..DEFAULT_COMMAND_LIMITS
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandOutputLimit {
     Stdout,
@@ -4583,7 +4604,7 @@ impl Sandbox {
         command: String,
         timeout: std::time::Duration,
     ) -> std::io::Result<String> {
-        self.start_background_command_logged(command, timeout, None, false, false)
+        self.start_background_command_logged(command, timeout, None, false, false, None)
             .await
     }
 
@@ -4596,6 +4617,7 @@ impl Sandbox {
         log_dir: Option<&Path>,
         pty: bool,
         separate_streams: bool,
+        progress: Option<CommandProgress>,
     ) -> std::io::Result<String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             std::io::Error::other("background commands require an active Tokio runtime")
@@ -4663,7 +4685,14 @@ impl Sandbox {
         let run = crate::spend::run::Run::current();
         std::mem::drop(runtime.spawn(crate::spend::run::scope(run, async move {
             let terminal = match sandbox
-                .run_background_command(command, timeout, &cancellation, capture.clone(), stdio)
+                .run_background_command(
+                    command,
+                    timeout,
+                    &cancellation,
+                    capture.clone(),
+                    stdio,
+                    progress,
+                )
                 .await
             {
                 Ok(output) => {
@@ -4923,6 +4952,19 @@ impl Sandbox {
         sandbox
     }
 
+    /// Drop a finished job's record (its log file stays). Used when a command
+    /// that ran as a job finished within its foreground deadline.
+    pub(crate) fn forget_background_job(&self, id: &str) {
+        let mut jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if jobs.get(id).is_some_and(|job| job.terminal.is_some()) {
+            jobs.remove(id);
+        }
+    }
+
     /// Stop every running background job: session shutdown and `/quit`.
     /// Turn interruption deliberately does not call this.
     pub(crate) fn cancel_background_jobs(&self) {
@@ -4944,6 +4986,7 @@ impl Sandbox {
         cancellation: &CommandCancellation,
         capture: SharedCommandCapture,
         stdio: CommandStdio,
+        progress: Option<CommandProgress>,
     ) -> std::io::Result<CommandOutput> {
         if cancellation.is_cancelled() {
             return Ok(CommandOutput {
@@ -4970,7 +5013,7 @@ impl Sandbox {
                 audit: None,
                 input: None,
                 capture: Some(capture),
-                progress: None,
+                progress,
                 stdio,
             },
             response_tx,

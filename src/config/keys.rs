@@ -181,6 +181,8 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("max_read_lines").shaped(ConfigShape::Integer),
     key("max_bash_output_lines").shaped(ConfigShape::Integer),
     key("shell_timeout_secs").described("Foreground shell tool deadline. Other sandbox command classes retain their own limits; this does not alter brokered JavaScript spawn limits.").shaped(ConfigShape::Integer),
+    key("shell_auto_background").described("Keep a foreground shell command that reaches its deadline running as a background job instead of killing it. Default: false.").shaped(ConfigShape::Bool),
+    key("command_timeout_secs").described("Deadline of `!` commands in seconds, 1..=600. Default: 30.").shaped(ConfigShape::Integer),
     key("update_check").described("Opt-in anonymous release check, only during interactive startup.").shaped(ConfigShape::Bool),
     key("max_grep_results").shaped(ConfigShape::Integer),
     key("max_find_results").shaped(ConfigShape::Integer),

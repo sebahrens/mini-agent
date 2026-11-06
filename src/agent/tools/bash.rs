@@ -213,6 +213,9 @@ pub struct ShellTool {
     /// Private directory (the session tool-output directory) receiving
     /// full-output logs when a command's output exceeds in-memory retention.
     output_log_dir: Option<std::path::PathBuf>,
+    /// `shell_auto_background`: promote a foreground command that reaches
+    /// its deadline to a background job instead of killing it.
+    auto_background: bool,
 }
 
 impl ShellTool {
@@ -231,7 +234,14 @@ impl ShellTool {
                 crate::config::DEFAULT_SHELL_TIMEOUT_SECS,
             ),
             output_log_dir: None,
+            auto_background: false,
         }
+    }
+
+    /// Default for the per-call `auto_background` flag.
+    pub fn with_auto_background(mut self, enabled: bool) -> Self {
+        self.auto_background = enabled;
+        self
     }
 
     /// Spool oversized output to private logs in `dir` so the model can
@@ -297,6 +307,10 @@ impl Tool for ShellTool {
                 "background": {
                     "type": "boolean",
                     "description": "Start a session-scoped background job and return its id (default false)"
+                },
+                "auto_background": {
+                    "type": "boolean",
+                    "description": "Foreground only: if the command reaches its deadline, keep it running as a background job (returning its job id and output so far) instead of killing it. Defaults to the shell_auto_background setting."
                 },
                 "separate_streams": {
                     "type": "boolean",
@@ -386,6 +400,7 @@ impl ShellTool {
                     self.output_log_dir.as_deref(),
                     args.pty,
                     args.separate_streams,
+                    None,
                 )
                 .await?;
             let log = self
@@ -414,6 +429,16 @@ impl ShellTool {
         limits.timeout = self.foreground_timeout;
         if let Some(timeout_ms) = args.timeout {
             limits.timeout = std::time::Duration::from_millis(timeout_ms);
+        }
+        if args.auto_background.unwrap_or(self.auto_background) {
+            let result = self.run_auto_background(&args, limits.timeout).await?;
+            return Ok((
+                match coaching {
+                    Some(message) => format!("{message}\n\n{result}"),
+                    None => result,
+                },
+                None,
+            ));
         }
         // Retention never stops the child; only this ceiling does.
         limits.combined_bytes = usize::try_from(SHELL_HARD_OUTPUT_BYTES).unwrap_or(usize::MAX);
@@ -516,6 +541,166 @@ impl ShellTool {
             output_len,
         );
         Ok((result, metadata))
+    }
+}
+
+/// Stops a job started for an auto-background call if the call is dropped
+/// (turn interrupted) before the command finished or was promoted.
+struct PendingAutoJob<'a> {
+    sandbox: &'a Sandbox,
+    id: String,
+    armed: bool,
+}
+
+impl Drop for PendingAutoJob<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.sandbox.request_stop_background_job(&self.id);
+        }
+    }
+}
+
+impl ShellTool {
+    /// Run a foreground command as a job so that reaching `deadline` promotes
+    /// it to a background job (output preserved) instead of killing it. A
+    /// command that finishes in time is reported like a foreground result and
+    /// its job record is dropped.
+    async fn run_auto_background(
+        &self,
+        args: &BashArgs,
+        deadline: std::time::Duration,
+    ) -> Result<String, ToolError> {
+        let progress = CommandProgress::new();
+        let id = self
+            .sandbox
+            .start_background_command_logged(
+                args.command.clone(),
+                DEFAULT_BACKGROUND_COMMAND_TIMEOUT,
+                self.output_log_dir.as_deref(),
+                args.pty,
+                args.separate_streams,
+                Some(progress.clone()),
+            )
+            .await?;
+        let mut pending = PendingAutoJob {
+            sandbox: &self.sandbox,
+            id: id.clone(),
+            armed: true,
+        };
+        let live = SHELL_CALL_ID
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .zip(crate::agent::tools::mutation_diff::scoped_event_sender());
+        let started = tokio::time::Instant::now();
+        let wait = async {
+            loop {
+                let remaining = deadline.saturating_sub(started.elapsed());
+                let snapshot = self
+                    .sandbox
+                    .wait_background_job(&id, remaining)
+                    .await
+                    .map_err(ToolError::Msg)?;
+                if snapshot.status.is_terminal() || started.elapsed() >= deadline {
+                    return Ok::<_, ToolError>(snapshot);
+                }
+            }
+        };
+        let snapshot = match live {
+            Some((call_id, events)) => forward_progress(&progress, wait, call_id, events).await?,
+            None => wait.await?,
+        };
+        pending.armed = false;
+        if !snapshot.status.is_terminal() {
+            let so_far = self
+                .sandbox
+                .read_background_job_output(&id, None, JOB_OUTPUT_READ_BYTES)
+                .map_err(ToolError::Msg)?;
+            let rendered = render_background_job(so_far, self.max_output_lines);
+            let deadline_ms = deadline.as_millis();
+            return Ok(format!(
+                "[status: promoted_to_background; job_id: {id}; the command reached its {deadline_ms} ms foreground deadline and keeps running as a background job. Use job_status with this id to poll (only new output), wait or stop it]\n{rendered}"
+            ));
+        }
+        let transcript = snapshot.transcript.clone();
+        self.sandbox.forget_background_job(&id);
+        let status = match snapshot.status {
+            crate::sandbox::BackgroundJobStatus::Completed => CommandStatus::Completed,
+            crate::sandbox::BackgroundJobStatus::TimedOut => CommandStatus::TimedOut,
+            crate::sandbox::BackgroundJobStatus::Cancelled => CommandStatus::Cancelled,
+            crate::sandbox::BackgroundJobStatus::OutputLimitExceeded => {
+                CommandStatus::OutputLimitExceeded(CommandOutputLimit::Combined)
+            }
+            _ => CommandStatus::Failed,
+        };
+        if status != CommandStatus::Completed {
+            let mut limits = DEFAULT_COMMAND_LIMITS;
+            limits.timeout = deadline;
+            return Err(resource_limit_error(
+                status,
+                &transcript,
+                limits,
+                self.max_output_lines,
+            ));
+        }
+        let mut result = render_transcript(&transcript);
+        if snapshot.descendants_escaped {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(
+                "[status: descendants_escaped; direct command result preserved; containment cleanup incomplete]",
+            );
+        }
+        if let Some(code) = snapshot.exit_code.filter(|code| *code != 0) {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&format!("Exit code: {code}"));
+        }
+        let mut result = bound_output_lines(result, self.max_output_lines);
+        push_log_footer(&mut result, &transcript);
+        Ok(result)
+    }
+}
+
+/// Forward throttled display-only previews of `progress` while `work` runs.
+async fn forward_progress<T>(
+    progress: &CommandProgress,
+    work: impl std::future::Future<Output = T>,
+    id: CompactString,
+    events: tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
+) -> T {
+    let mut changes = progress.subscribe();
+    tokio::pin!(work);
+    let mut last_sent: Option<tokio::time::Instant> = None;
+    let mut pending = false;
+    loop {
+        let due = last_sent.map(|sent| sent + SHELL_PROGRESS_INTERVAL);
+        tokio::select! {
+            biased;
+            result = &mut work => return result,
+            changed = changes.changed(), if !pending => {
+                if changed.is_ok() {
+                    pending = true;
+                }
+            }
+            _ = async {
+                if let Some(due) = due {
+                    tokio::time::sleep_until(due).await;
+                }
+            }, if pending => {
+                pending = false;
+                last_sent = Some(tokio::time::Instant::now());
+                let text = progress.tail_lines(SHELL_PROGRESS_LINES);
+                if !text.is_empty() {
+                    let _ = events.try_send(crate::event::AgentEvent::ToolProgress {
+                        id: id.clone(),
+                        text: CompactString::from(text),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1836,6 +2021,143 @@ mod tests {
         drop(shell);
         wait_for_process_exit(pid).await;
         let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_background_promotes_a_command_at_its_deadline_and_keeps_its_output() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = Instant::now();
+        let promoted = shell
+            .call(BashArgs {
+                command: "printf 'begin-%s\\n' ok; sleep 2; printf 'finish-%s\\n' ok".to_string(),
+                timeout: Some(500),
+                auto_background: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("promotion is not an error");
+        assert!(
+            started.elapsed() < Duration::from_millis(1800),
+            "did not return at the deadline"
+        );
+        assert!(
+            promoted.contains("[status: promoted_to_background; job_id: job-"),
+            "{promoted}"
+        );
+        assert!(promoted.contains("begin-ok"), "{promoted}");
+        let id = promoted
+            .split("job_id: ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .unwrap()
+            .to_string();
+        let finished = status
+            .call(JobStatusArgs {
+                id: Some(id.clone()),
+                action: JobAction::Wait,
+                timeout_ms: Some(10_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(finished.contains("Status: completed"), "{finished}");
+        assert!(finished.contains("finish-ok"), "{finished}");
+        assert!(
+            !finished.contains("begin-ok"),
+            "only new output after promotion: {finished}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_background_command_finishing_in_time_reads_like_a_foreground_result() {
+        let shell = test_tool();
+        let output = shell
+            .call(BashArgs {
+                command: "printf quick; exit 4".to_string(),
+                auto_background: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(output, "quick\nExit code: 4");
+        assert!(
+            shell.sandbox.background_job_summaries().is_empty(),
+            "record not dropped"
+        );
+        // Without the flag the deadline still kills the command.
+        let error = shell
+            .call(BashArgs {
+                command: "sleep 5".to_string(),
+                timeout: Some(300),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("[status: timed_out"), "{error}");
+        // The configured default applies when the call does not say.
+        let configured = test_tool().with_auto_background(true);
+        let promoted = configured
+            .call(BashArgs {
+                command: "sleep 2".to_string(),
+                timeout: Some(300),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(promoted.contains("promoted_to_background"), "{promoted}");
+        configured.sandbox.cancel_background_jobs();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_an_auto_background_call_before_its_deadline_stops_the_job() {
+        let shell = test_tool();
+        let call = shell.call(BashArgs {
+            command: "sleep 30".to_string(),
+            auto_background: Some(true),
+            ..Default::default()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), call)
+                .await
+                .is_err()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let jobs = shell.sandbox.background_job_summaries();
+            assert_eq!(jobs.len(), 1);
+            if jobs[0].status.is_terminal() {
+                assert_eq!(jobs[0].status.as_str(), "cancelled");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "interrupted call left its job running"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn command_timeout_secs_sets_the_bang_command_deadline_within_bounds() {
+        crate::sandbox::set_command_timeout_secs(45);
+        assert_eq!(
+            crate::sandbox::configured_command_limits().timeout,
+            Duration::from_secs(45)
+        );
+        crate::sandbox::set_command_timeout_secs(100_000);
+        assert_eq!(
+            crate::sandbox::configured_command_limits().timeout,
+            Duration::from_secs(600)
+        );
+        crate::sandbox::set_command_timeout_secs(30);
+        assert_eq!(
+            crate::sandbox::configured_command_limits().stdout_bytes,
+            DEFAULT_COMMAND_LIMITS.stdout_bytes
+        );
     }
 
     async fn poll_job(status: &JobStatusTool, id: &str, since: Option<u64>) -> String {

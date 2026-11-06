@@ -729,6 +729,9 @@ pub struct BashArgs {
     /// Capture stdout and stderr separately instead of one merged stream.
     #[serde(default)]
     pub separate_streams: bool,
+    /// Promote the foreground command to a background job at its deadline.
+    #[serde(default)]
+    pub auto_background: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]

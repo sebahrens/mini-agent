@@ -1115,6 +1115,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     max_bash_output_lines,
                 )
                 .with_foreground_timeout_secs(cfg.resolve_shell_timeout_secs())
+                .with_auto_background(cfg.shell_auto_background.unwrap_or(false))
                 .with_output_log_dir(crate::session::storage::command_log_dir(
                     tool_output_session_id,
                 )),

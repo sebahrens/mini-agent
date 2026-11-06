@@ -30,6 +30,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   the step protocol (version 12) and refuses out-of-range values. Every JavaScript limit is now
   listed in `docs/agent/TOOL_RUNTIME.md`; the 64 MiB heap stays fixed (mini-agent-blbmw).
 
+- `shell` calls accept `auto_background` (default from the new `shell_auto_background` setting): a
+  foreground command that reaches its deadline is promoted to a background job with its output
+  preserved instead of being killed. `command_timeout_secs` (default 30 s, 1..=600) sets the
+  deadline of `!` commands, and `TOOL_RUNTIME.md` lists which command class uses which deadline
+  (mini-agent-tl5kw).
+
 ### Changed
 
 - Foreground `shell` commands that print more than 1 MiB are no longer killed: the capture keeps

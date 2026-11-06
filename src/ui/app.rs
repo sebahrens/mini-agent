@@ -23,9 +23,7 @@ use crate::event::{AgentEvent, BtwEvent, UserEvent};
 use crate::extras::mcp::{McpClientManager, McpNoticeLevel};
 use crate::provider::AnyAgent;
 use crate::sandbox::CommandCancellation;
-use crate::sandbox::{
-    CommandLimits, CommandStatus, DEFAULT_COMMAND_LIMITS, SupportCommandAudit, SupportCommandLimits,
-};
+use crate::sandbox::{CommandLimits, CommandStatus, SupportCommandAudit, SupportCommandLimits};
 use crate::session::{GitStatus, Session};
 use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
@@ -7475,7 +7473,7 @@ impl<'a> App<'a> {
         let mut progress_changes = progress.subscribe();
         let operation = sandbox.run_explicit_shell_with_progress(
             text,
-            DEFAULT_COMMAND_LIMITS,
+            crate::sandbox::configured_command_limits(),
             Some(&cancellation),
             Some(progress.clone()),
         );
