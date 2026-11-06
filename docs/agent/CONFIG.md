@@ -4483,8 +4483,13 @@ not registered (the names would collide). Other providers (Chat Completions,
 OpenRouter, Gemini, Ollama, Copilot) are unchanged. Hosted tools run on the
 provider side, so they bypass the per-call `web_search` network permission and
 the native domain/recency parameters; the opt-in is the only approval. The
-setting is ignored when `web-search-provider = "off"`, when a `web_search` deny
-rule exists, or when `--no-tools`/`--tools` excludes `web_search`. Subagents and
+setting is ignored when `web-search-provider = "off"`, when any `web_search`
+deny rule exists (a `permission-deny` entry with or without patterns, `web_search
+= "deny"`, a granular map such as `{ "*" = "deny" }` or one with any deny entry,
+or the same in `permission-regex`; provider-hosted search cannot evaluate URL
+patterns, so a partial deny withholds it entirely), when the startup permission
+mode is `readonly`/`planwrite` (`--read-only`, `default_permission_mode`) and no
+explicit `web_search` rule is set, or when `--no-tools`/`--tools` excludes `web_search`. Subagents and
 auxiliary calls never receive the hosted tool. It is authority-sensitive, so an
 untrusted project config cannot enable it.
 

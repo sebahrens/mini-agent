@@ -105,3 +105,62 @@ fn hosted_web_search_skips_providers_without_a_bridge() {
         None
     );
 }
+
+fn hosted_with(cfg: Config, cli: &Cli) -> Option<serde_json::Value> {
+    with_hosted_web_search(&model("anthropic", "responses"), cli, &cfg, None)
+}
+
+#[test]
+fn hosted_web_search_is_withheld_for_every_deny_shape() {
+    let plain = cli();
+    let mut string_deny = cfg(Some(true));
+    string_deny.permission = Some(json!({"web_search": "deny"}));
+    assert_eq!(hosted_with(string_deny, &plain), None);
+
+    let mut granular = cfg(Some(true));
+    granular.permission = Some(json!({"web_search": {"*": "deny"}}));
+    assert_eq!(hosted_with(granular, &plain), None);
+
+    // A partial (pattern) deny cannot be enforced provider-side: closed.
+    let mut partial = cfg(Some(true));
+    partial.permission = Some(json!({"web_search": {"*": "allow", "*.evil.test": "deny"}}));
+    assert_eq!(hosted_with(partial, &plain), None);
+
+    let mut regex = cfg(Some(true));
+    regex.permission_regex = Some(json!({"web_search": {"^https://x": "deny"}}));
+    assert_eq!(hosted_with(regex, &plain), None);
+
+    let mut deny_patterns = cfg(Some(true));
+    deny_patterns.permission_deny =
+        Some([("web_search".to_string(), vec!["https://x.test/*".to_string()])].into());
+    assert_eq!(hosted_with(deny_patterns, &plain), None);
+}
+
+#[test]
+fn hosted_web_search_is_withheld_in_readonly_and_planwrite_modes() {
+    let ro = Cli::parse_from(["mini-agent", "--read-only"]);
+    assert_eq!(hosted_with(cfg(Some(true)), &ro), None);
+    for mode in ["readonly", "planwrite"] {
+        let mut c = cfg(Some(true));
+        c.default_permission_mode = Some(mode.into());
+        assert_eq!(hosted_with(c, &cli()), None, "{mode}");
+    }
+    // An explicit allow rule or a more permissive flag wins over the mode default.
+    let mut allow = cfg(Some(true));
+    allow.default_permission_mode = Some("readonly".into());
+    allow.permission = Some(json!({"web_search": "allow"}));
+    assert!(declares_hosted_web_search(hosted_with(allow, &cli()).as_ref()));
+}
+
+#[test]
+fn hosted_web_search_stays_available_under_allow_ask_and_standard_modes() {
+    let plain = cli();
+    for rule in [json!("allow"), json!("ask"), json!({"*": "ask"})] {
+        let mut c = cfg(Some(true));
+        c.permission = Some(json!({"web_search": rule}));
+        assert!(declares_hosted_web_search(hosted_with(c, &plain).as_ref()));
+    }
+    let mut guarded = cfg(Some(true));
+    guarded.default_permission_mode = Some("guarded".into());
+    assert!(declares_hosted_web_search(hosted_with(guarded, &plain).as_ref()));
+}

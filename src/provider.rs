@@ -483,16 +483,83 @@ fn hosted_web_search_tool(model: &AnyModel) -> Option<serde_json::Value> {
     }
 }
 
-fn web_search_denied(cfg: &Config) -> bool {
-    cfg.permission_deny
+/// True when a `permission`/`permission-regex` value carries a `deny` for
+/// `web_search`: the plain string form (`web_search = "deny"`) or any granular
+/// map entry (`web_search = { "*" = "deny" }`). Provider-hosted search cannot
+/// evaluate per-URL patterns, so a partial deny is treated as a total one.
+fn permission_value_denies_web_search(value: &serde_json::Value) -> bool {
+    let Some(rule) = value.get("web_search") else {
+        return false;
+    };
+    let is_deny = |v: &serde_json::Value| {
+        v.as_str()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("deny"))
+    };
+    match rule {
+        serde_json::Value::Object(map) => map.values().any(is_deny),
+        other => is_deny(other),
+    }
+}
+
+/// True when the startup permission mode denies `web_search` by default
+/// (`readonly` and `planwrite` deny every non-read tool). Mirrors the mode
+/// precedence of `resolve_execution_authority`; runtime Shift+Tab switches are
+/// not re-evaluated because the hosted tool is attached when the agent is built.
+fn startup_mode_denies_web_search(cli: &Cli, cfg: &Config) -> bool {
+    if cli.yolo || cli.accept_all {
+        return false;
+    }
+    if cli.read_only {
+        return true;
+    }
+    if cli.guarded || cli.restrictive {
+        return false;
+    }
+    if cfg.yolo.unwrap_or(false)
+        || cfg.accept_all.unwrap_or(false)
+        || cfg.restrictive.unwrap_or(false)
+    {
+        return false;
+    }
+    cfg.default_permission_mode
+        .as_deref()
+        .is_some_and(|mode| matches!(mode, "readonly" | "planwrite"))
+}
+
+/// Whether any configured rule or startup mode denies `web_search`. Hosted
+/// search runs provider-side, so any deny shape (`permission-deny` key with or
+/// without patterns, string or granular `permission`/`permission-regex`, or a
+/// read-only/plan-write startup mode without an explicit web_search rule)
+/// withholds the hosted tool. An explicit `ask` does not: it matches the
+/// standard-mode default under which hosted search is already opt-in.
+fn web_search_denied(cli: &Cli, cfg: &Config) -> bool {
+    if cfg
+        .permission_deny
         .as_ref()
         .is_some_and(|rules| rules.contains_key("web_search"))
-        || cfg
-            .permission
-            .as_ref()
-            .and_then(|value| value.get("web_search"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|mode| mode.eq_ignore_ascii_case("deny"))
+    {
+        return true;
+    }
+    let sources = [cfg.permission.as_ref(), cfg.permission_regex.as_ref()];
+    if sources
+        .iter()
+        .flatten()
+        .any(|v| permission_value_denies_web_search(v))
+    {
+        return true;
+    }
+    let explicit_rule = sources
+        .iter()
+        .flatten()
+        .any(|v| v.get("web_search").is_some())
+        || [
+            &cfg.permission_allow,
+            &cfg.permission_allow_prefix,
+            &cfg.permission_ask,
+        ]
+        .iter()
+        .any(|m| m.as_ref().is_some_and(|m| m.contains_key("web_search")));
+    !explicit_rule && startup_mode_denies_web_search(cli, cfg)
 }
 
 /// Adds the provider-hosted web-search tool to the main agent's request
@@ -509,7 +576,7 @@ pub(crate) fn with_hosted_web_search(
 ) -> Option<serde_json::Value> {
     if !cfg.hosted_web_search.unwrap_or(false)
         || cfg.web_search_provider.as_deref() == Some("off")
-        || web_search_denied(cfg)
+        || web_search_denied(cli, cfg)
         || !cli.tool_is_eligible(cfg, "web_search")
     {
         return extra_body;
