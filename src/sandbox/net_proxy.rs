@@ -499,6 +499,10 @@ fn parse_request(head: &[u8]) -> Result<Request, &'static str> {
         match lower.as_str() {
             "proxy-authorization" => auth = Some(value.trim().to_string()),
             "proxy-connection" | "connection" | "keep-alive" => {}
+            // The allowlist vetted the request-URI authority, so the client's
+            // own Host (a different virtual host on a shared front end) is
+            // never forwarded; the URI authority replaces it below.
+            "host" => {}
             _ => headers.push(header.to_string()),
         }
     }
@@ -526,7 +530,7 @@ fn parse_request(head: &[u8]) -> Result<Request, &'static str> {
         path.to_string()
     };
     let (host, port) = split_authority(authority, 80)?;
-    let mut forward = format!("{method} {path} HTTP/1.1\r\n");
+    let mut forward = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n");
     for header in headers {
         forward.push_str(&header);
         forward.push_str("\r\n");

@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- The sandbox HTTP proxy replaces the client's `Host` header with the allowlisted request-URI authority before
+  forwarding, so a contained command cannot reach another virtual host behind an allowed address (mini-agent-9svy4).
 - The built-in `jdtls`, `csharp-ls`, `ruby-lsp`, `kotlin-language-server`, `sourcekit-lsp` and `zls` servers evaluate
   repository build files, so they now start only in a workspace whose project config is trusted; a same-named
   `[lsp.servers.<name>]` entry in user config still opts in explicitly (mini-agent-xb0h3).

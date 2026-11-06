@@ -145,6 +145,14 @@ fn requests_parse_to_the_destination_that_is_judged() {
         "{forwarded}"
     );
 
+    // The client's mismatched Host never reaches the origin: the vetted URI
+    // authority is the only Host forwarded.
+    assert!(
+        forwarded.contains("\r\nHost: example.com:8080\r\n"),
+        "{forwarded}"
+    );
+    assert!(!forwarded.contains("other.example"), "{forwarded}");
+
     let query_only = parse_request(b"GET http://example.com?x=1 HTTP/1.1\r\n\r\n").unwrap();
     assert!(
         String::from_utf8(query_only.forward_head)
@@ -587,5 +595,35 @@ mod control_channel {
         let id = first_pending(&state).await;
         answer(&state, &id, r#"{"behavior":"allow"}"#);
         again.await.unwrap().unwrap();
+    }
+}
+
+#[test]
+fn client_host_headers_are_replaced_by_the_vetted_uri_authority() {
+    for (request, expected) in [
+        // Different case and spacing of the header name, duplicates and a
+        // Host that names another virtual host on the same front end.
+        (
+            &b"GET http://allowed.example/ HTTP/1.1\r\nHost: other.example\r\n\r\n"[..],
+            "allowed.example",
+        ),
+        (
+            &b"GET http://allowed.example/p HTTP/1.1\r\nhOsT : other.example\r\nHOST: third.example\r\n\r\n"[..],
+            "allowed.example",
+        ),
+        (
+            &b"GET http://allowed.example:8080/ HTTP/1.1\r\nX-A: 1\r\nHost: allowed.example:80\r\n\r\n"[..],
+            "allowed.example:8080",
+        ),
+        (&b"GET http://allowed.example/ HTTP/1.1\r\n\r\n"[..], "allowed.example"),
+    ] {
+        let parsed = parse_request(request).unwrap();
+        let forwarded = String::from_utf8(parsed.forward_head).unwrap();
+        let hosts: Vec<_> = forwarded
+            .split("\r\n")
+            .filter(|line| line.to_ascii_lowercase().starts_with("host"))
+            .collect();
+        assert_eq!(hosts, [format!("Host: {expected}")], "{forwarded}");
+        assert!(!forwarded.contains("other.example") && !forwarded.contains("third.example"));
     }
 }
