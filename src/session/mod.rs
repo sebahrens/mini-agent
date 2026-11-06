@@ -1950,13 +1950,28 @@ impl Session {
     /// total. Terminal responses are deliberately absent from this API so UI
     /// and headless callers cannot charge an aggregate a second time.
     pub fn charge_usage_delta(&mut self, usage: crate::event::UsageDelta, anthropic_native: bool) {
-        self.charge_usage_delta_at(
-            usage,
-            anthropic_native,
-            self.input_token_cost,
-            self.output_token_cost,
-            self.cache_prices(),
-        );
+        let (input, output, cache) = self.request_prices(usage, anthropic_native);
+        self.charge_usage_delta_at(usage, anthropic_native, input, output, cache);
+    }
+
+    /// The session's rates for one request, with the model's long-context
+    /// premium when this request's prompt exceeds its threshold.
+    fn request_prices(
+        &self,
+        usage: crate::event::UsageDelta,
+        anthropic_native: bool,
+    ) -> (f64, f64, crate::pricing::CachePrices) {
+        let cache = self.cache_prices();
+        match crate::pricing::LongContextPrices::for_model(
+            &self.provider,
+            &self.model,
+            self.known_input_output_prices().map(|(input, _)| input),
+        ) {
+            Some(tier) if tier.applies(anthropic_native, usage) => {
+                tier.reprice(self.input_token_cost, cache)
+            }
+            _ => (self.input_token_cost, self.output_token_cost, cache),
+        }
     }
 
     /// Charge a goal completion-judge call at the judge model's own prices

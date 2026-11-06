@@ -27,6 +27,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `fallback_model` / `--fallback-model`: a headless turn whose primary model fails with retries
   exhausted (overload, rate limit, 5xx) before any progress is re-sent once to a same-provider
   fallback model; a notice names both models and spend is attributed to the fallback.
+- Cost tracking prices requests above a model's long-context threshold (catalog
+  `long_context` tier, e.g. Gemini 2.5 Pro over 200k prompt tokens) at the premium rate, so
+  `/cost` and `max_budget_usd` no longer undercount large prompts; `/cost` names the premium and
+  COST_TRACKING.md lists the tiers still unsupported.
 
 **Fork release 1.14.2 (2026-10-28)**
 

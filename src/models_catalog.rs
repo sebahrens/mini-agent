@@ -38,6 +38,9 @@ struct RawModel {
     cache_read_price: Option<f64>,
     #[serde(default)]
     cache_write_price: Option<f64>,
+    /// Prompt-size premium tier (models.dev `cost.tiers[]` of type context).
+    #[serde(default)]
+    long_context: Option<crate::pricing::LongContextPrices>,
 }
 
 struct Catalog {
@@ -45,15 +48,26 @@ struct Catalog {
     #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
     image_input: HashMap<String, HashMap<String, bool>>,
     max_output: HashMap<String, HashMap<String, u32>>,
+    long_context: HashMap<String, HashMap<String, crate::pricing::LongContextPrices>>,
 }
 static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
-    let (entries, image_input, max_output) = parse_catalog_parts(CATALOG_JSON);
+    let (entries, image_input, max_output, long_context) = parse_catalog_parts(CATALOG_JSON);
     Catalog {
         entries,
         image_input,
         max_output,
+        long_context,
     }
 });
+
+/// The long-context (prompt-size) premium tier for an exact embedded
+/// provider/model id, or `None` when the catalog lists none.
+pub(crate) fn model_long_context(
+    provider: &str,
+    model: &str,
+) -> Option<crate::pricing::LongContextPrices> {
+    CATALOG.long_context.get(provider)?.get(model).copied()
+}
 
 /// The provider's maximum output tokens per response for an exact embedded
 /// provider/model id, or `None` when the catalog does not list it.
@@ -81,6 +95,7 @@ type CatalogParts = (
     HashMap<String, Vec<ModelEntry>>,
     HashMap<String, HashMap<String, bool>>,
     HashMap<String, HashMap<String, u32>>,
+    HashMap<String, HashMap<String, crate::pricing::LongContextPrices>>,
 );
 
 /// One deserialisation yields both the entry lists and the explicit image flags.
@@ -91,16 +106,23 @@ fn parse_catalog_parts(json: &str) -> CatalogParts {
             tracing::warn!(
                 "embedded data/models.json is malformed; using an empty model catalog: {error}"
             );
-            return (HashMap::new(), HashMap::new(), HashMap::new());
+            return (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            );
         }
     };
 
     let mut entries = HashMap::with_capacity(raw.len());
     let mut image_input = HashMap::with_capacity(raw.len());
     let mut max_output = HashMap::with_capacity(raw.len());
+    let mut long_context = HashMap::with_capacity(raw.len());
     for (provider, models) in raw {
         let mut flags = HashMap::new();
         let mut outputs = HashMap::new();
+        let mut tiers = HashMap::new();
         let list = models
             .into_iter()
             .map(|m| {
@@ -109,6 +131,12 @@ fn parse_catalog_parts(json: &str) -> CatalogParts {
                 }
                 if let Some(tokens) = m.max_output.filter(|&tokens| tokens > 0) {
                     outputs.insert(m.id.clone(), tokens);
+                }
+                if let Some(tier) = m
+                    .long_context
+                    .filter(crate::pricing::LongContextPrices::is_valid)
+                {
+                    tiers.insert(m.id.clone(), tier);
                 }
                 ModelEntry {
                     id: m.id,
@@ -124,9 +152,10 @@ fn parse_catalog_parts(json: &str) -> CatalogParts {
             .collect();
         entries.insert(provider.clone(), list);
         image_input.insert(provider.clone(), flags);
-        max_output.insert(provider, outputs);
+        max_output.insert(provider.clone(), outputs);
+        long_context.insert(provider, tiers);
     }
-    (entries, image_input, max_output)
+    (entries, image_input, max_output, long_context)
 }
 
 /// Baked model entries for a provider, or `None` when the provider is not in the
@@ -141,7 +170,7 @@ mod tests {
 
     #[test]
     fn catalog_max_output_is_parsed_and_embedded() {
-        let (_, _, outputs) = super::parse_catalog_parts(
+        let (_, _, outputs, _) = super::parse_catalog_parts(
             r#"{"anthropic":[{"id":"a","name":"a","context":1000,"max_output":64000},{"id":"b","name":"b","context":1000},{"id":"c","name":"c","max_output":0}]}"#,
         );
         assert_eq!(outputs["anthropic"].get("a"), Some(&64_000));

@@ -53,7 +53,13 @@
       "input_price": 0.1,
       "output_price": 0.5,
       "cache_read_price": 0.01,
-      "cache_write_price": 0.125
+      "cache_write_price": 0.125,
+      "long_context": {
+        "threshold": 100000,
+        "input_price": 0.5,
+        "output_price": 2.5,
+        "cache_read_price": 0.05
+      }
     },
     {
       "id": "claude-opus-4-5",
@@ -418,7 +424,13 @@
       "input_price": 2.5,
       "output_price": 15,
       "cache_read_price": 0.25,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 5,
+        "output_price": 22.5,
+        "cache_read_price": 0.5
+      }
     },
     {
       "id": "gpt-5.4-mini",
@@ -451,7 +463,12 @@
       "input_price": 30,
       "output_price": 180,
       "cache_read_price": null,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 60,
+        "output_price": 270
+      }
     },
     {
       "id": "gpt-5.5",
@@ -462,7 +479,13 @@
       "input_price": 5,
       "output_price": 30,
       "cache_read_price": 0.5,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 10,
+        "output_price": 45,
+        "cache_read_price": 1
+      }
     },
     {
       "id": "gpt-5.5-pro",
@@ -473,7 +496,12 @@
       "input_price": 30,
       "output_price": 180,
       "cache_read_price": null,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 60,
+        "output_price": 270
+      }
     },
     {
       "id": "gpt-5.6",
@@ -484,7 +512,13 @@
       "input_price": 4,
       "output_price": 20,
       "cache_read_price": 0.4,
-      "cache_write_price": 5
+      "cache_write_price": 5,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 8,
+        "output_price": 30,
+        "cache_read_price": 0.8
+      }
     },
     {
       "id": "gpt-5.6-luna",
@@ -495,7 +529,13 @@
       "input_price": 0.2,
       "output_price": 1.2,
       "cache_read_price": 0.02,
-      "cache_write_price": 0.25
+      "cache_write_price": 0.25,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 0.4,
+        "output_price": 1.8,
+        "cache_read_price": 0.04
+      }
     },
     {
       "id": "gpt-5.6-sol",
@@ -506,7 +546,13 @@
       "input_price": 4,
       "output_price": 20,
       "cache_read_price": 0.4,
-      "cache_write_price": 5
+      "cache_write_price": 5,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 8,
+        "output_price": 30,
+        "cache_read_price": 0.8
+      }
     },
     {
       "id": "gpt-5.6-terra",
@@ -517,7 +563,13 @@
       "input_price": 2,
       "output_price": 12,
       "cache_read_price": 0.2,
-      "cache_write_price": 2.5
+      "cache_write_price": 2.5,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 4,
+        "output_price": 18,
+        "cache_read_price": 0.4
+      }
     },
     {
       "id": "gpt-6-astra",
@@ -528,7 +580,13 @@
       "input_price": 10,
       "output_price": 50,
       "cache_read_price": 1,
-      "cache_write_price": 12.5
+      "cache_write_price": 12.5,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 20,
+        "output_price": 75,
+        "cache_read_price": 2
+      }
     },
     {
       "id": "gpt-6-luna",
@@ -539,7 +597,13 @@
       "input_price": 0.1,
       "output_price": 0.5,
       "cache_read_price": 0.01,
-      "cache_write_price": 0.125
+      "cache_write_price": 0.125,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 0.2,
+        "output_price": 0.75,
+        "cache_read_price": 0.02
+      }
     },
     {
       "id": "gpt-6-sol",
@@ -550,7 +614,13 @@
       "input_price": 2,
       "output_price": 10,
       "cache_read_price": 0.2,
-      "cache_write_price": 2.5
+      "cache_write_price": 2.5,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 4,
+        "output_price": 15,
+        "cache_read_price": 0.4
+      }
     },
     {
       "id": "gpt-6.1-sol",
@@ -561,7 +631,13 @@
       "input_price": 2,
       "output_price": 10,
       "cache_read_price": 0.1,
-      "cache_write_price": 2.5
+      "cache_write_price": 2.5,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 4,
+        "output_price": 15,
+        "cache_read_price": 0.2
+      }
     },
     {
       "id": "gpt-daybreak-blue-latest",
@@ -572,7 +648,13 @@
       "input_price": 4,
       "output_price": 20,
       "cache_read_price": 0.4,
-      "cache_write_price": 5
+      "cache_write_price": 5,
+      "long_context": {
+        "threshold": 272000,
+        "input_price": 8,
+        "output_price": 30,
+        "cache_read_price": 0.8
+      }
     },
     {
       "id": "gpt-daybreak-red-latest",
@@ -662,7 +744,13 @@
       "input_price": 2,
       "output_price": 12,
       "cache_read_price": 0.2,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 200000,
+        "input_price": 4,
+        "output_price": 18,
+        "cache_read_price": 0.4
+      }
     },
     {
       "id": "deep-research-preview-04-2026",
@@ -673,7 +761,13 @@
       "input_price": 2,
       "output_price": 12,
       "cache_read_price": 0.2,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 200000,
+        "input_price": 4,
+        "output_price": 18,
+        "cache_read_price": 0.4
+      }
     },
     {
       "id": "gemini-2.5-computer-use-preview-10-2025",
@@ -684,7 +778,12 @@
       "input_price": 1.25,
       "output_price": 10,
       "cache_read_price": null,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 200000,
+        "input_price": 2.5,
+        "output_price": 15
+      }
     },
     {
       "id": "gemini-2.5-flash",
@@ -728,7 +827,13 @@
       "input_price": 1.25,
       "output_price": 10,
       "cache_read_price": 0.125,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 200000,
+        "input_price": 2.5,
+        "output_price": 15,
+        "cache_read_price": 0.25
+      }
     },
     {
       "id": "gemini-3-flash-preview",
@@ -838,7 +943,13 @@
       "input_price": 2,
       "output_price": 12,
       "cache_read_price": 0.2,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 200000,
+        "input_price": 4,
+        "output_price": 18,
+        "cache_read_price": 0.4
+      }
     },
     {
       "id": "gemini-3.1-pro-preview-customtools",
@@ -849,7 +960,13 @@
       "input_price": 2,
       "output_price": 12,
       "cache_read_price": 0.2,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 200000,
+        "input_price": 4,
+        "output_price": 18,
+        "cache_read_price": 0.4
+      }
     },
     {
       "id": "gemini-3.5-flash",
@@ -959,7 +1076,13 @@
       "input_price": 2,
       "output_price": 12,
       "cache_read_price": 0.2,
-      "cache_write_price": null
+      "cache_write_price": null,
+      "long_context": {
+        "threshold": 200000,
+        "input_price": 4,
+        "output_price": 18,
+        "cache_read_price": 0.4
+      }
     }
   ],
   "openrouter": [

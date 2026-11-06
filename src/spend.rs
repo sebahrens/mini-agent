@@ -16,6 +16,8 @@ mod report;
 #[cfg(test)]
 mod request_tests;
 pub(crate) use report::cost_lines;
+#[cfg(test)]
+pub(crate) use report::long_context_label;
 pub(crate) mod run;
 pub(crate) use ledger::{Ledger, LedgerSummary};
 const MAX_PENDING_RECEIPTS: usize = 1024;
@@ -94,6 +96,39 @@ impl PriceSnapshot {
             cfg.is_anthropic_native(&session.provider),
         )
         .with_cache_policy(cfg, &session.model)
+    }
+
+    /// The captured rates for one request: the long-context `tier` replaces
+    /// the base rates when the request's prompt exceeds its threshold.
+    /// Unknown base rates stay unknown.
+    pub(crate) fn with_long_context(
+        self,
+        tier: crate::pricing::LongContextPrices,
+        usage: UsageDelta,
+    ) -> Self {
+        let Some(input) = self.input else {
+            return self;
+        };
+        if self.output.is_none() || !tier.applies(self.anthropic_native, usage) {
+            return self;
+        }
+        let (input, output, cache) = tier.reprice(
+            input,
+            crate::pricing::CachePrices {
+                read: self.cache_read,
+                write: self.cache_write,
+                write_1h: self.cache_write_1h,
+                split_required: self.cache_split_required,
+            },
+        );
+        Self {
+            input: Some(input),
+            output: Some(output),
+            cache_read: cache.read,
+            cache_write: cache.write,
+            cache_write_1h: cache.write_1h,
+            ..self
+        }
     }
 
     pub(crate) fn with_cache_policy(mut self, cfg: &crate::config::Config, model: &str) -> Self {

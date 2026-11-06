@@ -73,6 +73,30 @@ session ends. A later ledger-only report cannot infer the missing invoice amount
 Ledger totals cover stored observations and are exact only for complete, priced
 observations; they are not an invoice reconciliation.
 
+## Long-context pricing and unsupported tiers
+
+Some models bill a whole request at higher rates once its prompt exceeds a size
+threshold (for example Gemini 2.5 Pro above 200k prompt tokens, GPT-5.x above 272k).
+The embedded catalog records the first such tier from models.dev as `long_context`
+(`threshold`, `input_price`, `output_price`, optional `cache_read_price`). For each
+request whose prompt exceeds the threshold, the receipt captures the premium rates
+instead of the base rates; cache tiers without a listed premium keep their ratio to
+the input rate. The prompt size is the request's input tokens; on native Anthropic it
+also counts cache-read and cache-write input. The premium applies only while the
+session is billed at the model's catalog base rate, so configured custom prices are
+never replaced. `/cost` names the active model's premium (`Long-context premium:
+requests with prompts over N tokens are priced at ...`), and the USD ceiling sees the
+premium cost.
+
+Not modelled, so `/cost` and the USD ceiling can undercount them:
+
+- long-context premiums the catalog does not list (the Anthropic 1M-context beta
+  premium above 200k input tokens is not in the models.dev snapshot; configure an
+  explicit quick-model price if you rely on it);
+- service tiers: OpenAI `priority`/`flex`, Anthropic priority tier, batch discounts;
+- a separate reasoning-token rate (reasoning tokens are priced as output tokens);
+- provider fees, regional surcharges (Bedrock/Vertex) and gateway markups.
+
 ## Runtime ownership
 
 `src/spend.rs` owns immutable parent-minted receipts, captured pricing, and the
