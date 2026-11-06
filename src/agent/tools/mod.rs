@@ -13,6 +13,7 @@ pub(crate) mod grep;
 mod home_path_tests;
 #[cfg(feature = "multimodal")]
 pub(crate) mod image_fit;
+pub(crate) mod job_monitor;
 pub(crate) mod limits;
 pub(crate) mod list_dir;
 #[cfg(feature = "lsp")]
@@ -782,6 +783,10 @@ pub struct BashArgs {
     /// Why the command needs to leave the sandbox; shown in the approval.
     #[serde(default)]
     pub justification: Option<String>,
+    /// Background only: regex watched against the job's new output while it
+    /// runs; matching lines queue rate-limited notices.
+    #[serde(default)]
+    pub monitor: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]

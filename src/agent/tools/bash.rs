@@ -428,6 +428,11 @@ impl Tool for ShellTool {
                     "type": "boolean",
                     "description": "Start a session-scoped background job and return its id (default false)"
                 },
+                "monitor": {
+                    "type": "string",
+                    "maxLength": MAX_UNTIL_PATTERN_BYTES,
+                    "description": "Only with background=true: a regex (Rust syntax) watched against each new output line while the job runs. Matching lines queue a bounded notice (first matching line, match count, log path) delivered like a completion notice: with the next tool result, the next model request, or by waking an idle session. At most one notice per 5 seconds and 20 per job (then use job_status until=); the full output stays in the job log."
+                },
                 "auto_background": {
                     "type": "boolean",
                     "description": "Foreground only: if the command reaches its deadline, keep it running as a background job (returning its job id and output so far) instead of killing it. Defaults to the shell_auto_background setting."
@@ -577,6 +582,22 @@ impl ShellTool {
             args.background,
         );
         let mut args = args;
+        let monitor = match args.monitor.take() {
+            None => None,
+            Some(_) if !args.background => {
+                return Err(ToolError::Msg(
+                    "shell monitor requires background=true. Example: {\"command\":\"npm run dev\",\"background\":true,\"monitor\":\"ERROR|ready\"}".into(),
+                ));
+            }
+            Some(pattern) => Some(compile_until_pattern(&pattern).map_err(
+                |error| match error {
+                    ToolError::Msg(text) => {
+                        ToolError::Msg(text.replace("job_status until", "shell monitor"))
+                    }
+                    other => other,
+                },
+            )?),
+        };
         if let Some(workdir) = args.workdir.take() {
             let plain = args.command.clone();
             args.command = self
@@ -647,6 +668,18 @@ impl ShellTool {
             if let Some(scope) = &self.job_scope {
                 scope.record(&id);
             }
+            let monitor_note = match monitor {
+                Some(regex) if self.sandbox.job_notice_queue().enabled() => {
+                    let note = format!(
+                        "\nMonitor: output lines matching /{}/ queue notices (at most 1 per 5 s, 20 per job).",
+                        regex.as_str()
+                    );
+                    super::job_monitor::spawn_monitor(&self.sandbox, &id, regex);
+                    note
+                }
+                Some(_) => "\nMonitor not started: shell-job-notifications is off.".to_string(),
+                None => String::new(),
+            };
             let log = self
                 .output_log_dir
                 .as_ref()
@@ -658,7 +691,7 @@ impl ShellTool {
                 })
                 .unwrap_or_default();
             let result = format!(
-                "Background job started: {id}\nUse job_status with this id to poll output or stop it; each poll returns only output not returned before.{log}"
+                "Background job started: {id}\nUse job_status with this id to poll output or stop it; each poll returns only output not returned before.{log}{monitor_note}"
             );
             return Ok((
                 match coaching {

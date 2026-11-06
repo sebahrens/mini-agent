@@ -72,8 +72,11 @@ return as soon as output not yet read (or after `since`) matches, for a server
 or watcher that never exits; the result begins with `Wait: output matched /re/
 (in bytes A..B): <matched line>` and the job keeps running. Terminal escape
 sequences are stripped before matching. If nothing matches before the deadline
-or the job's exit, the result says so and the unread output follows. `until` is
-refused with any action other than `wait`.
+or the job's exit, the result says so and the unread output follows. The wait
+scans unread output one final time after the job exits or the deadline passes, and
+walks a backlog larger than 256 KiB in 256 KiB chunks from the job's log; bytes
+that were neither retained nor logged are named in the result instead of being
+skipped silently. `until` is refused with any action other than `wait`.
 
 When the shell line cap (`max_output_lines`, default 2000) omits lines but the
 byte cap did not, the complete output is saved to a private log in the session
@@ -121,6 +124,19 @@ next model request, and in the TUI an idle session is woken with a short prompt
 naming only the job id, status, exit code and log path (at most 8 wakes in a row
 without a user turn). ACP and headless runs get the injection on their next
 request but are not woken. `shell-job-notifications = false` turns it all off.
+
+`shell` with `background = true` also takes `monitor=<regex>` (same syntax and
+512-byte limit as `until`; refused without `background`). A watcher scans the
+job's new output about every 500 ms while it runs and queues a notice, delivered
+exactly like a completion notice, when lines match: the first matching line (fenced
+untrusted text, at most 300 characters), the number of matching lines since the
+previous notice, the job's status and log path. Limits: one monitor per job, at
+most one notice every 5 seconds (matches in between are counted into the next
+notice), at most 20 notices per job (the 20th says the monitor stopped; use
+`job_status until=` to keep watching), and the notice queue itself keeps the 32
+newest. Output that is neither retained nor logged cannot be scanned. Stopping the
+job or `shell-job-notifications = false` ends the watching; a notice grants no
+permission and the watcher runs no commands.
 
 Shell commands start from a cleared environment plus a fixed allowlist.
 `shell-inherit-env` / `shell-env` add named variables (never credential-looking

@@ -168,11 +168,14 @@ impl Drop for RelaySlot {
     }
 }
 
-/// Relay every loopback connection to the proxy socket.
+/// Relay every loopback connection to the proxy socket (test entry point;
+/// production uses [`serve_capped_notify`] with the stderr notice sink).
+#[cfg(test)]
 pub(crate) fn serve(listener: &TcpListener, socket: &Path) {
     serve_capped(listener, socket, max_concurrent_relays());
 }
 
+#[cfg(test)]
 fn serve_capped(listener: &TcpListener, socket: &Path, cap: usize) {
     serve_capped_notify(listener, socket, cap, None);
 }

@@ -22,6 +22,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `shell` `background=true` accepts `monitor=<regex>`: matching lines of the running job queue rate-limited notices (first line, match count, log path; at most 1 per 5 s and 20 per job) delivered like completion notices, including the idle wake (mini-agent-1cg19).
 - Built-in language servers for Java (`jdtls`), C# (`csharp-ls`), Ruby (`ruby-lsp`), PHP (`intelephense`), Kotlin
   (`kotlin-language-server`), Swift (`sourcekit-lsp`) and Zig (`zls`), used only when on PATH (mini-agent-f8tdh).
 - `job_status action=wait` takes `until=<regex>` and returns as soon as new output matches, reporting the

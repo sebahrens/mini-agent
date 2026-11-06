@@ -6532,6 +6532,7 @@ fn finish_background_job(
                 log_path: job.log_path.clone(),
                 tail,
                 earlier_bytes: start,
+                output_match: None,
             });
         }
         job.changed.clone()
