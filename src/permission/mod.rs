@@ -2,6 +2,7 @@ pub mod ask;
 pub mod checker;
 pub(crate) mod cli_rules;
 pub mod pattern;
+pub(crate) mod project_approvals;
 pub(crate) mod readonly_shell;
 pub(crate) mod shell_prefix;
 

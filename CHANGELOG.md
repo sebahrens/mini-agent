@@ -27,6 +27,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   subdirectories becomes a namespace (`/deploy:ship`), Claude Code `argument-hint`/`allowed-tools`
   frontmatter is accepted (granting nothing), and `/help` lists every skipped command file with its
   reason.
+- Opt-in `persist_project_approvals`: TUI approval prompts offer `(p) always allow in this
+  project`, stored privately per workspace in the state directory (never in the repository) and
+  loaded at interactive startup; `/permissions rules` and `/permissions forget <n|all>` manage
+  them. Headless runs are unaffected and deny rules still win.
 - `Ctrl+R` opens an incremental reverse search over the prompt history (rebindable as
   `history_search`); reasoning-display cycling moves to `Alt+R` (`cycle_reasoning`).
   `/history [n|text]` shows the last `n` entries or matching ones instead of only the last 10.

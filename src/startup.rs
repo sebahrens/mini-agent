@@ -1943,6 +1943,26 @@ impl Startup {
                 .collect();
             let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
             guard.load_session_allowlist(&allowlist);
+            // Opt-in persisted project approvals: interactive TUI only, never
+            // headless; deny rules keep precedence over these allow entries.
+            if self.is_interactive
+                && !self.cli.print
+                && self.cfg.persist_project_approvals.unwrap_or(false)
+            {
+                match crate::permission::project_approvals::load(
+                    &self.paths.state_dir,
+                    self.workspace.root(),
+                ) {
+                    Ok(rules) => {
+                        let rules: Vec<(String, String)> = rules
+                            .into_iter()
+                            .map(|rule| (rule.tool, rule.pattern))
+                            .collect();
+                        guard.load_session_allowlist(&rules);
+                    }
+                    Err(error) => tracing::warn!("project approvals not loaded: {error:#}"),
+                }
+            }
             // Project-sourced prompts only carry a directive when the project
             // config is trusted (context::prompts), and the checker refuses
             // any directive that would raise the mode above the user's

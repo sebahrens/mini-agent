@@ -152,6 +152,8 @@ built-in prompts, or create a custom `code.md` prompt).
 | `/permissions` | Open the approval-mode picker. |
 | `/permissions auto` | Auto-approve workspace-safe operations; equivalent to `/mode standard`. `auto-approval` is accepted as an alias. |
 | `/permissions manual` | Ask before every operation; equivalent to `/mode restrictive`. `manual-approval` is accepted as an alias. |
+| `/permissions rules` | List this project's persisted `(p)` approvals (see `persist_project_approvals` in CONFIG.md). |
+| `/permissions forget <n\|all>` | Remove persisted project approval `n` (from `/permissions rules`) or all of them; effective at the next interactive start. |
 | `/permissions yolo` | Allow everything except destructive shell commands, which still ask; equivalent to `/mode yolo`. |
 | `/mode accept` | Alias for `/mode standard`, matching `default_permission_mode`. |
 | `/sandbox` | Show the current ordinary command filesystem profile and describe `workspace`, `host-read` and `host-full`. Works while the agent runs. |

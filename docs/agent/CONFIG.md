@@ -734,6 +734,7 @@ Accepted top-level keys:
 | `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, and other command classes, including brokered JS `spawn`, retain their existing limits. Sensitive in project-local configuration: changing it requires project trust. |
 | `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Headless, loop, and ACP modes skip it. Requires project trust when set locally. No automatic download or installation. |
 | `session_retention_days` | integer | Delete saved session snapshots (`<uuid>.json` in the sessions directory) whose modification time is older than this many days, once per interactive startup in a background thread. Default: unset/`0` (keep forever). A session open in this or another live process (its lock is held) is never removed; tool-output spill directories are left in place. Requires project trust when set locally. |
+| `persist_project_approvals` | boolean | Offer `(p) always allow in this project` on TUI approval prompts and load those rules at interactive startup. Default: `false`. Rules are stored privately per workspace in the state directory, never in the repository; headless runs ignore them. See [Interactive approvals](#interactive-approvals). |
 | `hooks_http_enabled` | boolean | Allow `type: "http"` hook handlers to POST event JSON to their configured URL. Default: `false` (http hooks load but are never contacted). Requires `hooks`. See [HTTP handlers](#http-handlers). |
 | `hooks_permission_decisions` | boolean | Let `PermissionRequest` hooks answer a pending approval with allow (once) or deny, including in headless runs. Default: `false` (observe only). Requires `hooks`. See [Hook event parity](#hook-event-parity). |
 | `skills_max_selected` | integer | Agent Skills injected per turn by prompt relevance. Default: `3` (at most 16). Requires `agent-skills`. See [SKILLS.md](SKILLS.md#selection-limits-and-the-always-visible-catalog). |
@@ -2375,6 +2376,16 @@ When a rule resolves to `ask`, the TUI shows the request and these keys:
   literally so `*` or `?` inside it never widens the grant) for
   the rest of this session. It is recorded with the session for `--resume`
   but never written to the config.
+- `p` (only with `persist_project_approvals = true`; default off, the key is
+  inert otherwise) allows the same scope as `a` and also remembers it for this
+  project: the rule is stored in a private per-user file keyed by the canonical
+  workspace root (`<state_dir>/project-approvals/<sha256>.json`), never in the
+  repository or the trusted project config, so a checkout cannot ship
+  pre-approved rules. Saved rules load as session allow entries at the next
+  interactive start (at most 256 per project); headless (`-p`, `--loop`) and
+  ACP runs never load them, and `deny` rules always win. `/permissions rules`
+  lists them and `/permissions forget <n|all>` removes them (effective at the
+  next interactive start).
 - `f` (only for `read`, `edit`, and `list_dir` requests) allows `read`,
   `edit`, and `list_dir` on the request's folder and everything beneath it
   for this session in one approval: the directory itself for `list_dir`,

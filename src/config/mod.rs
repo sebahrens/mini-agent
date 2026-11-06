@@ -785,6 +785,10 @@ pub struct Config {
     /// Skill packages discovered across all roots (default 64, at most 1024).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills_max_packages: Option<usize>,
+    /// Offer `(p) always allow in this project` on TUI approval prompts and
+    /// load those rules at interactive startup. Default false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_project_approvals: Option<bool>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///

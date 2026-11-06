@@ -18,6 +18,9 @@ enum PromptInput {
     AllowOnce,
     /// Allow the suggested pattern for the rest of this session.
     AllowSession,
+    /// As `AllowSession`, and persist the rule for this project
+    /// (`persist_project_approvals`).
+    AllowProject,
     /// Allow read, edit and list_dir on the request's folder for the session.
     AllowFolder,
     /// Only native write/edit under the captured workspace, for this session.
@@ -68,6 +71,7 @@ fn classify_prompt_key(key: KeyEvent) -> PromptInput {
     match key.code {
         KeyCode::Char('y' | 'Y') if plain => PromptInput::AllowOnce,
         KeyCode::Char('a' | 'A') if plain => PromptInput::AllowSession,
+        KeyCode::Char('p' | 'P') if plain => PromptInput::AllowProject,
         KeyCode::Char('f' | 'F') if plain => PromptInput::AllowFolder,
         KeyCode::Char('w' | 'W') if plain => PromptInput::AllowWorkspaceEdits,
         KeyCode::Char('n' | 'N') if plain => PromptInput::Deny,
@@ -155,6 +159,8 @@ pub(crate) struct PermissionState {
     offer: Option<PromptGrantOffer>,
     folder: Option<std::path::PathBuf>,
     workspace_edits: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
+    /// Canonical workspace root when `persist_project_approvals` is on.
+    project: Option<std::path::PathBuf>,
     was_at_bottom: bool,
     instruction: Option<String>,
 }
@@ -211,6 +217,11 @@ impl PermissionState {
             offer,
             folder,
             workspace_edits,
+            project: ui
+                .cfg
+                .persist_project_approvals
+                .unwrap_or(false)
+                .then(|| ui.workspace.root().to_path_buf()),
             was_at_bottom: !renderer.is_scrolling(),
             instruction: None,
         };
@@ -229,6 +240,7 @@ impl PermissionState {
             offer: None,
             folder: None,
             workspace_edits: None,
+            project: None,
             was_at_bottom: !renderer.is_scrolling(),
             instruction: Some(String::new()),
         };
@@ -305,6 +317,9 @@ impl PermissionState {
                 "  (w) allow writes/edits in {} for this session",
                 workspace.root().display()
             ));
+        }
+        if self.offer.is_none() && self.project.is_some() {
+            options.push_str("  (p) always allow in this project");
         }
         if self.offer.is_none() {
             options.push_str(PERMISSION_MODE_HINT);
@@ -420,8 +435,14 @@ impl PermissionState {
         if input == PromptInput::Ignore
             || (input == PromptInput::AllowFolder && self.folder.is_none())
             || (input == PromptInput::AllowWorkspaceEdits && self.workspace_edits.is_none())
+            || (input == PromptInput::AllowProject && self.project.is_none())
             || (self.offer.is_some()
-                && matches!(input, PromptInput::AllowSession | PromptInput::AllowFolder))
+                && matches!(
+                    input,
+                    PromptInput::AllowSession
+                        | PromptInput::AllowFolder
+                        | PromptInput::AllowProject
+                ))
         {
             return Ok(PermissionEvent::Waiting);
         }
@@ -554,7 +575,7 @@ impl PermissionState {
         }
         let (decision, entries) = match input {
             PromptInput::AllowOnce => (UserDecision::AllowOnce, Vec::new()),
-            PromptInput::AllowSession => {
+            PromptInput::AllowSession | PromptInput::AllowProject => {
                 let pattern = request
                     .suggested_pattern
                     .clone()
@@ -570,8 +591,10 @@ impl PermissionState {
             }
             _ => (UserDecision::Deny, Vec::new()),
         };
+        let persist = input == PromptInput::AllowProject;
         let verb = match &decision {
             UserDecision::AllowOnce => "allowed",
+            UserDecision::AllowAlways(_) if persist => "allowed (always, this project)",
             UserDecision::AllowAlways(_) => "allowed (this session)",
             _ => "denied",
         };
@@ -581,9 +604,43 @@ impl PermissionState {
         if sent {
             note_decision(renderer, &request.tool, &request.input, verb)?;
         }
+        if persist && let Some(project) = &self.project {
+            persist_project_rules(&entries, project, renderer)?;
+        }
         record_session_grants(entries, renderer, ui, run)?;
         Ok(PermissionEvent::Finished)
     }
+}
+
+/// Store `(p)` rules privately for `project`; failures are visible and leave
+/// the session grant in place.
+fn persist_project_rules(
+    entries: &[(String, String)],
+    project: &std::path::Path,
+    renderer: &mut Renderer,
+) -> std::io::Result<()> {
+    let Ok(paths) = crate::paths::process_paths_ref() else {
+        return renderer.write_line(
+            "warning: project approval not saved (application paths unavailable)",
+            C_ERROR,
+        );
+    };
+    for (tool, pattern) in entries {
+        if let Err(error) = crate::permission::project_approvals::add(
+            &paths.state_dir,
+            project,
+            crate::permission::project_approvals::ProjectApproval {
+                tool: tool.clone(),
+                pattern: pattern.clone(),
+            },
+        ) {
+            renderer.write_line(
+                &format!("warning: project approval not saved: {error}"),
+                C_ERROR,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// The single compact transcript line left behind by a permission decision.
