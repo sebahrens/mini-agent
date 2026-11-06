@@ -23,6 +23,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   mini-agent-ktcqn).
 ### Tool layer
 
+- `git` diff/log accept revision ranges (`a..b`, `a...b`), `diff` a second revision and `staged`,
+  `log` `skip`/`next_skip`/`author`/`grep`, and a new `blame` operation; history-rewriting and
+  network operations stay intentionally excluded (mini-agent-kg67c).
 - `git commit` gains `signoff`, `allow_empty` and a guarded `amend` (new `git/amend` permission;
   refused when HEAD is already in a remote-tracking ref); commit and tag results state that hooks
   and signing were not run (mini-agent-v7fnv).

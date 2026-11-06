@@ -61,6 +61,8 @@ pub(crate) enum GitOperation {
     Diff,
     Log,
     Show,
+    /// Line-by-line authorship of one file.
+    Blame,
     Stage,
     Unstage,
     Commit,
@@ -90,6 +92,7 @@ impl GitOperation {
             Self::Diff => "diff",
             Self::Log => "log",
             Self::Show => "show",
+            Self::Blame => "blame",
             Self::Stage => "stage",
             Self::Unstage => "unstage",
             Self::Commit => "commit",
@@ -132,6 +135,27 @@ pub(crate) struct GitArgs {
     /// Byte offset of the diff/show page to return.
     #[serde(default)]
     pub offset: Option<u64>,
+    /// diff: second revision (`diff <revision> <revision_to>`).
+    #[serde(default)]
+    pub revision_to: Option<String>,
+    /// diff: compare the index (`--cached`) instead of the working tree.
+    #[serde(default)]
+    pub staged: Option<bool>,
+    /// log: number of commits to skip (page past `max_count` with `next_skip`).
+    #[serde(default)]
+    pub skip: Option<u32>,
+    /// log: only commits whose author matches this fixed string.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// log: only commits whose message contains this fixed string.
+    #[serde(default)]
+    pub grep: Option<String>,
+    /// blame: first line (1-based) of the range.
+    #[serde(default)]
+    pub start_line: Option<u32>,
+    /// blame: last line (inclusive).
+    #[serde(default)]
+    pub end_line: Option<u32>,
     /// commit: replace the unpushed HEAD commit (guarded; needs `git/amend`).
     #[serde(default)]
     pub amend: Option<bool>,
@@ -459,6 +483,33 @@ impl GitTool {
         .await
         .map(|_| ())
         .map_err(|_| ToolError::Msg("invalid Git revision".to_string()))
+    }
+
+    /// `a..b` or `a...b`: both sides must be valid revisions (an unvalidated
+    /// side could smuggle an option or a pathspec-like operand).
+    async fn validate_range(&self, range: &str) -> Result<(), ToolError> {
+        let (left, right) = range
+            .split_once("...")
+            .or_else(|| range.split_once(".."))
+            .ok_or_else(|| ToolError::Msg("invalid Git revision range".to_string()))?;
+        if left.is_empty() || right.is_empty() {
+            return Err(ToolError::Msg(
+                "invalid Git revision range: both sides are required".to_string(),
+            ));
+        }
+        self.validate_revision(left).await?;
+        self.validate_revision(right).await
+    }
+
+    /// A single revision, or a `..`/`...` range.
+    async fn validate_revision_or_range(&self, revision: &str) -> Result<bool, ToolError> {
+        if revision.contains("..") {
+            self.validate_range(revision).await?;
+            Ok(true)
+        } else {
+            self.validate_revision(revision).await?;
+            Ok(false)
+        }
     }
 
     async fn validate_paths(
@@ -1334,10 +1385,13 @@ impl GitTool {
     }
 
     async fn read_operation(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
-        let pages = matches!(args.operation, GitOperation::Diff | GitOperation::Show);
+        let pages = matches!(
+            args.operation,
+            GitOperation::Diff | GitOperation::Show | GitOperation::Blame
+        );
         if !pages && (args.format.is_some() || args.offset.is_some()) {
             return Err(ToolError::Msg(
-                "format and offset are supported only by diff and show".to_string(),
+                "format and offset are supported only by diff, show and blame".to_string(),
             ));
         }
         if args.operation != GitOperation::Commit
@@ -1345,6 +1399,24 @@ impl GitTool {
         {
             return Err(ToolError::Msg(
                 "amend, signoff and allow_empty are supported only by commit".to_string(),
+            ));
+        }
+        let is_diff = args.operation == GitOperation::Diff;
+        let is_log = args.operation == GitOperation::Log;
+        let is_blame = args.operation == GitOperation::Blame;
+        if !is_diff && (args.revision_to.is_some() || args.staged.is_some()) {
+            return Err(ToolError::Msg(
+                "revision_to and staged are supported only by diff".to_string(),
+            ));
+        }
+        if !is_log && (args.skip.is_some() || args.author.is_some() || args.grep.is_some()) {
+            return Err(ToolError::Msg(
+                "skip, author and grep are supported only by log".to_string(),
+            ));
+        }
+        if !is_blame && (args.start_line.is_some() || args.end_line.is_some()) {
+            return Err(ToolError::Msg(
+                "start_line and end_line are supported only by blame".to_string(),
             ));
         }
         let named = matches!(
@@ -1375,8 +1447,11 @@ impl GitTool {
             GitOperation::Diff => {
                 reject_irrelevant_fields(&args, false, true, false)?;
                 let paths = self.validate_paths(&args.paths, None).await?;
+                let staged = args.staged.unwrap_or(false);
                 let identity = serde_json::to_string(&serde_json::json!({
                     "revision": args.revision,
+                    "revision_to": args.revision_to,
+                    "staged": staged,
                     "paths": paths,
                 }))?;
                 let coaching = self.permission("git/diff", &identity).await?;
@@ -1387,9 +1462,27 @@ impl GitTool {
                     "--ignore-submodules=all".into(),
                 ];
                 command.extend(format_args(args.format));
+                if staged {
+                    command.push("--cached".into());
+                }
+                let mut is_range = false;
                 if let Some(revision) = args.revision.as_deref() {
-                    self.validate_revision(revision).await?;
+                    is_range = self.validate_revision_or_range(revision).await?;
                     command.push(revision.to_string());
+                }
+                if let Some(second) = args.revision_to.as_deref() {
+                    if args.revision.is_none() || is_range || staged {
+                        return Err(ToolError::Msg(
+                            "revision_to needs a single `revision` and cannot be combined with a range or staged".to_string(),
+                        ));
+                    }
+                    self.validate_revision(second).await?;
+                    command.push(second.to_string());
+                }
+                if is_range && staged {
+                    return Err(ToolError::Msg(
+                        "a revision range cannot be combined with staged".to_string(),
+                    ));
                 }
                 command.push("--".into());
                 command.extend(paths);
@@ -1408,12 +1501,23 @@ impl GitTool {
                 let paths = self.validate_paths(&args.paths, None).await?;
                 let count = args.max_count.unwrap_or(20).clamp(1, 100);
                 if let Some(revision) = args.revision.as_deref() {
-                    self.validate_revision(revision).await?;
+                    self.validate_revision_or_range(revision).await?;
+                }
+                let skip = args.skip.unwrap_or(0);
+                for value in [&args.author, &args.grep].into_iter().flatten() {
+                    if value.is_empty() || value.contains('\0') || value.len() > 512 {
+                        return Err(ToolError::Msg(
+                            "author and grep must be 1-512 bytes without NUL".to_string(),
+                        ));
+                    }
                 }
                 let identity = serde_json::to_string(&serde_json::json!({
                     "revision": args.revision,
                     "paths": paths,
                     "max_count": count,
+                    "skip": skip,
+                    "author": args.author,
+                    "grep": args.grep,
                 }))?;
                 let coaching = self.permission("git/log", &identity).await?;
                 let mut command = vec![
@@ -1422,6 +1526,18 @@ impl GitTool {
                     "--date=iso-strict".into(),
                     LOG_FORMAT.into(),
                 ];
+                if skip > 0 {
+                    command.push(format!("--skip={skip}"));
+                }
+                if args.author.is_some() || args.grep.is_some() {
+                    command.push("--fixed-strings".into());
+                }
+                if let Some(author) = args.author.as_deref() {
+                    command.push(format!("--author={author}"));
+                }
+                if let Some(grep) = args.grep.as_deref() {
+                    command.push(format!("--grep={grep}"));
+                }
                 if let Some(revision) = args.revision {
                     command.push(revision);
                 }
@@ -1429,8 +1545,13 @@ impl GitTool {
                 command.extend(paths);
                 let output = self.run("log", command, TEXT_LIMITS, true).await?;
                 let commits = parse_log_records(&output.stdout)?;
+                // A full page may have more behind it: say how to continue.
+                let next_skip = (commits.len() == usize::from(count))
+                    .then(|| u64::from(skip) + commits.len() as u64);
                 Ok(serde_json::json!({
                     "operation": "log",
+                    "skip": skip,
+                    "next_skip": next_skip,
                     "commits": commits,
                     "truncated": matches!(output.status, CommandStatus::OutputLimitExceeded(_)),
                     "coaching": coaching,
@@ -1464,6 +1585,54 @@ impl GitTool {
                     "show",
                     coaching,
                     self.run("show", command, PAGED_TEXT_LIMITS, true).await?,
+                    args.offset,
+                )
+            }
+            GitOperation::Blame => {
+                reject_irrelevant_fields(&args, false, true, false)?;
+                if args.paths.len() != 1 {
+                    return Err(ToolError::Msg(
+                        "blame requires exactly one repository-relative path".to_string(),
+                    ));
+                }
+                let paths = self.validate_paths(&args.paths, None).await?;
+                if let Some(revision) = args.revision.as_deref() {
+                    self.validate_revision(revision).await?;
+                }
+                let range = match (args.start_line, args.end_line) {
+                    (None, None) => None,
+                    (Some(start), end) if start >= 1 && end.is_none_or(|end| end >= start) => {
+                        Some(format!("-L{start},{}", end.unwrap_or(start)))
+                    }
+                    _ => {
+                        return Err(ToolError::Msg(
+                            "blame needs start_line >= 1 and end_line >= start_line".to_string(),
+                        ));
+                    }
+                };
+                let identity = serde_json::to_string(&serde_json::json!({
+                    "revision": args.revision,
+                    "paths": paths,
+                    "range": range,
+                }))?;
+                let coaching = self.permission("git/show", &identity).await?;
+                let mut command = vec![
+                    "blame".into(),
+                    "--no-textconv".into(),
+                    "--date=short".into(),
+                ];
+                command.extend(range);
+                if let Some(revision) = args.revision {
+                    command.push(revision);
+                }
+                command.push("--".into());
+                command.extend(paths);
+                let guard = self.filter_guard("blame").await?;
+                render_paged_text_result(
+                    "blame",
+                    coaching,
+                    self.run("blame", guarded(&guard, command), PAGED_TEXT_LIMITS, true)
+                        .await?,
                     args.offset,
                 )
             }
@@ -1523,7 +1692,7 @@ impl Tool for GitTool {
     type Output = serde_json::Value;
 
     fn description(&self) -> String {
-        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff/show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log, stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches, branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available.".to_string()
+        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; author/grep are fixed strings), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches, branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; reset, revert, cherry-pick, merge, rebase, fetch, pull and push are intentionally not offered.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1532,7 +1701,7 @@ impl Tool for GitTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "show", "stage", "unstage", "commit", "branches", "branch_create", "switch", "stash_push", "stash_pop", "stash_list", "tag", "restore"]
+                    "enum": ["status", "diff", "log", "show", "blame", "stage", "unstage", "commit", "branches", "branch_create", "switch", "stash_push", "stash_pop", "stash_list", "tag", "restore"]
                 },
                 "name": { "type": "string", "maxLength": 255, "description": "Branch name for branch_create/switch, tag name for tag" },
                 "format": { "type": "string", "enum": ["patch", "stat", "name_status"], "description": "diff/show output format (default patch)" },
@@ -1543,7 +1712,14 @@ impl Tool for GitTool {
                     "maxItems": 128,
                     "description": "Literal repository-relative paths; never options or globs. Commit with paths commits only that selection; with no paths it commits the existing index."
                 },
-                "revision": { "type": "string", "description": "Revision for diff, log, show, branch_create (start point), tag (target) or restore (source)" },
+                "revision": { "type": "string", "description": "Revision for diff, log, show, blame, branch_create (start point), tag (target) or restore (source); diff and log also accept a range a..b or a...b" },
+                "revision_to": { "type": "string", "description": "diff only: second revision, comparing revision with revision_to" },
+                "staged": { "type": "boolean", "description": "diff only: compare the index (git diff --cached) instead of the working tree" },
+                "skip": { "type": "integer", "minimum": 0, "description": "log only: commits to skip; pass the previous next_skip for the next page" },
+                "author": { "type": "string", "maxLength": 512, "description": "log only: fixed-string author filter" },
+                "grep": { "type": "string", "maxLength": 512, "description": "log only: fixed-string message filter" },
+                "start_line": { "type": "integer", "minimum": 1, "description": "blame only: first line" },
+                "end_line": { "type": "integer", "minimum": 1, "description": "blame only: last line (default start_line)" },
                 "message": { "type": "string", "maxLength": 16384, "description": "Commit message (required for commit), stash_push message, or annotated tag message" },
                 "max_count": { "type": "integer", "minimum": 1, "maximum": 100 },
                 "amend": { "type": "boolean", "description": "commit only: amend the HEAD commit if it is not in any remote-tracking ref (separate git/amend permission)" },
@@ -2385,6 +2561,224 @@ mod tests {
             .await
             .expect_err("amend on status");
         assert!(error.to_string().contains("only by commit"));
+    }
+
+    fn read_args(operation: GitOperation) -> GitArgs {
+        args(operation, &[], None)
+    }
+
+    #[tokio::test]
+    async fn diff_and_log_accept_ranges_two_revisions_staged_and_skip() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        repo.git(["branch", "base"]);
+        for i in 0..5 {
+            commit_file(&repo, "a.txt", &format!("v{i}\n"), &format!("change {i}"));
+        }
+        let tool = repo.tool();
+
+        // Range diff and log.
+        let range = tool
+            .call(GitArgs {
+                revision: Some("base..HEAD".into()),
+                format: Some(super::DiffFormat::NameStatus),
+                ..read_args(GitOperation::Diff)
+            })
+            .await
+            .expect("range diff");
+        assert!(range["text"].as_str().unwrap().contains("a.txt"), "{range}");
+        let triple = tool
+            .call(GitArgs {
+                revision: Some("base...HEAD".into()),
+                ..read_args(GitOperation::Diff)
+            })
+            .await
+            .expect("merge-base diff");
+        assert!(triple["text"].as_str().unwrap().contains("+v4"), "{triple}");
+        let log = tool
+            .call(GitArgs {
+                revision: Some("base..HEAD".into()),
+                ..read_args(GitOperation::Log)
+            })
+            .await
+            .expect("range log");
+        assert_eq!(log["commits"].as_array().unwrap().len(), 5, "{log}");
+
+        // Two-commit diff.
+        let two = tool
+            .call(GitArgs {
+                revision: Some("HEAD~2".into()),
+                revision_to: Some("HEAD".into()),
+                ..read_args(GitOperation::Diff)
+            })
+            .await
+            .expect("two revision diff");
+        assert!(two["text"].as_str().unwrap().contains("-v2"), "{two}");
+        assert!(two["text"].as_str().unwrap().contains("+v4"), "{two}");
+
+        // Staged-only diff ignores unstaged edits.
+        repo.write("a.txt", "staged\n");
+        repo.git(["add", "a.txt"]);
+        repo.write("a.txt", "unstaged\n");
+        let staged = tool
+            .call(GitArgs {
+                staged: Some(true),
+                ..read_args(GitOperation::Diff)
+            })
+            .await
+            .expect("staged diff");
+        let text = staged["text"].as_str().unwrap();
+        assert!(
+            text.contains("+staged") && !text.contains("unstaged"),
+            "{text}"
+        );
+
+        // Log pages past max_count with skip / next_skip.
+        let page1 = tool
+            .call(GitArgs {
+                max_count: Some(2),
+                ..read_args(GitOperation::Log)
+            })
+            .await
+            .unwrap();
+        assert_eq!(page1["next_skip"], 2);
+        let page2 = tool
+            .call(GitArgs {
+                max_count: Some(2),
+                skip: page1["next_skip"].as_u64().map(|v| v as u32),
+                ..read_args(GitOperation::Log)
+            })
+            .await
+            .unwrap();
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["commits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["id"].as_str().unwrap().into())
+                .collect()
+        };
+        assert!(ids(&page1).iter().all(|id| !ids(&page2).contains(id)));
+        assert_eq!(page2["commits"][0]["subject"], "change 2");
+        let filtered = tool
+            .call(GitArgs {
+                grep: Some("change 3".into()),
+                ..read_args(GitOperation::Log)
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtered["commits"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revision_ranges_reject_option_and_malformed_operands() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        let tool = repo.tool();
+        for bad in [
+            "--output=/tmp/pwn..HEAD",
+            "HEAD..--output=/tmp/pwn",
+            "..HEAD",
+            "HEAD..",
+            "HEAD..nope",
+            "HEAD...nope",
+            "a..b..c",
+        ] {
+            for op in [GitOperation::Diff, GitOperation::Log] {
+                let error = tool
+                    .call(GitArgs {
+                        revision: Some(bad.into()),
+                        ..read_args(op)
+                    })
+                    .await
+                    .expect_err(bad);
+                assert!(
+                    error.to_string().contains("invalid Git revision"),
+                    "{bad}: {error}"
+                );
+            }
+        }
+        for combo in [
+            GitArgs {
+                revision: Some("HEAD..HEAD".into()),
+                revision_to: Some("HEAD".into()),
+                ..read_args(GitOperation::Diff)
+            },
+            GitArgs {
+                revision: Some("HEAD..HEAD".into()),
+                staged: Some(true),
+                ..read_args(GitOperation::Diff)
+            },
+            GitArgs {
+                revision_to: Some("HEAD".into()),
+                ..read_args(GitOperation::Diff)
+            },
+            GitArgs {
+                revision_to: Some("--output=x".into()),
+                revision: Some("HEAD".into()),
+                ..read_args(GitOperation::Diff)
+            },
+            GitArgs {
+                staged: Some(true),
+                ..read_args(GitOperation::Log)
+            },
+            GitArgs {
+                skip: Some(1),
+                ..read_args(GitOperation::Diff)
+            },
+        ] {
+            assert!(tool.call(combo).await.is_err());
+        }
+        // Option-looking author/grep values stay values (single `--author=` argv).
+        let log = tool
+            .call(GitArgs {
+                author: Some("--output=/tmp/pwn".into()),
+                ..read_args(GitOperation::Log)
+            })
+            .await
+            .unwrap();
+        assert!(log["commits"].as_array().unwrap().is_empty());
+        assert!(!Path::new("/tmp/pwn").exists());
+    }
+
+    #[tokio::test]
+    async fn blame_reports_line_authorship_for_one_path() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\ntwo\nthree\n", "first");
+        let tool = repo.tool();
+        let blame = tool
+            .call(GitArgs {
+                paths: vec!["a.txt".into()],
+                start_line: Some(2),
+                end_line: Some(3),
+                ..read_args(GitOperation::Blame)
+            })
+            .await
+            .expect("blame range");
+        let text = blame["text"].as_str().unwrap();
+        assert!(
+            text.contains("two") && text.contains("three") && !text.contains("one"),
+            "{text}"
+        );
+        assert!(tool.call(read_args(GitOperation::Blame)).await.is_err());
+        assert!(
+            tool.call(GitArgs {
+                paths: vec!["../x".into()],
+                ..read_args(GitOperation::Blame)
+            })
+            .await
+            .is_err()
+        );
+        assert!(
+            tool.call(GitArgs {
+                paths: vec!["a.txt".into()],
+                start_line: Some(3),
+                end_line: Some(1),
+                ..read_args(GitOperation::Blame)
+            })
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

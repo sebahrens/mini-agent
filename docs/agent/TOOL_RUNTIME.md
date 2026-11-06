@@ -757,6 +757,16 @@ is guarded: it needs the separate `git/amend` permission in addition to `git/com
 `HEAD`, and a `HEAD` not contained in any remote-tracking ref (`refs/remotes/*`), so published
 history is never rewritten (mini-agent-v7fnv).
 
+`diff` and `log` take `revision` as a single revision or a range (`a..b`, `a...b`; each side is
+validated with `rev-parse --verify`, so options and malformed operands are rejected). `diff` also
+accepts `revision_to` (two-commit diff) and `staged` (index vs HEAD, or vs `revision`); ranges
+cannot be combined with those. `log` accepts `skip` and returns `skip`/`next_skip` (non-null when a
+full `max_count` page was returned) so history beyond 100 commits is reachable, plus fixed-string
+`author` and `grep` filters. `blame` (one `path`, optional `start_line`/`end_line`/`revision`) is
+paged like `diff` and uses the `git/show` permission key. `reset`, `revert`, `cherry-pick`,
+`merge`, `rebase`, `fetch`, `pull` and `push` are intentionally not offered: they rewrite history
+or touch remotes/network, outside the fixed local-only surface (mini-agent-kg67c).
+
 `src/ui/slash/git.rs` owns parsing, bounded request-path selection, proposal
 validation and SDK-free native actors for `/diff`, `/commit` and `/pr`. The App
 owns the preview, async event receiver and captured session/workspace identity.
