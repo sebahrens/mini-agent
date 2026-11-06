@@ -412,6 +412,48 @@ impl WorkspaceBinding {
         max_entries: usize,
         max_files: usize,
     ) -> io::Result<Vec<(String, Result<String, String>)>> {
+        self.read_relative_definition_layer_inner(
+            path,
+            extension,
+            max_bytes,
+            max_entries,
+            max_files,
+            false,
+        )
+        .map(|(entries, _)| entries)
+    }
+
+    /// Like [`Self::read_relative_definition_layer`], but a layer with more
+    /// than `max_files` matching files degrades instead of failing: the first
+    /// `max_files` names in sorted order are read and the remaining file
+    /// names are returned so the caller can report them.
+    pub(crate) fn read_relative_definition_layer_degrading(
+        &self,
+        path: &Path,
+        extension: &str,
+        max_bytes: usize,
+        max_entries: usize,
+        max_files: usize,
+    ) -> io::Result<(Vec<(String, Result<String, String>)>, Vec<String>)> {
+        self.read_relative_definition_layer_inner(
+            path,
+            extension,
+            max_bytes,
+            max_entries,
+            max_files,
+            true,
+        )
+    }
+
+    fn read_relative_definition_layer_inner(
+        &self,
+        path: &Path,
+        extension: &str,
+        max_bytes: usize,
+        max_entries: usize,
+        max_files: usize,
+        degrade: bool,
+    ) -> io::Result<(Vec<(String, Result<String, String>)>, Vec<String>)> {
         let directory = self.open_dir_relative(path)?;
         let mut names = Vec::new();
         for (index, entry) in directory.read_dir(".")?.enumerate() {
@@ -429,7 +471,7 @@ impl WorkspaceBinding {
                     .file_stem()
                     .is_some_and(|value| value.to_str().is_some())
             {
-                if names.len() >= max_files {
+                if !degrade && names.len() >= max_files {
                     return Err(io::Error::other(
                         "project definition directory exceeds file limit",
                     ));
@@ -438,7 +480,16 @@ impl WorkspaceBinding {
             }
         }
         names.sort_unstable();
-        Ok(names
+        let skipped = if names.len() > max_files {
+            names
+                .split_off(max_files)
+                .into_iter()
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let entries = names
             .into_iter()
             .map(|name| {
                 let stem = Path::new(&name)
@@ -459,7 +510,8 @@ impl WorkspaceBinding {
                     });
                 (stem, content)
             })
-            .collect())
+            .collect();
+        Ok((entries, skipped))
     }
 
     /// Bounded first-line previews from one retained directory. Enumeration is
