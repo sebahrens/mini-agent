@@ -1885,7 +1885,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 // the trusted persona names, with an independent permission
                 // checker; outer-agent MCP connections are never inherited.
                 #[cfg(feature = "mcp")]
-                let (mcp_manager, mcp_tools) =
+                let (mcp_manager, mcp_tools, mcp_granted) =
                     match builder::build_persona_mcp(&persona, &config, &authorization).await {
                         Ok(runtime) => runtime,
                         Err(error) => {
@@ -1905,10 +1905,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                 #[cfg(not(feature = "mcp"))]
                 let evidence_mcp: Vec<(String, String)> = Vec::new();
                 #[cfg(feature = "mcp")]
-                let evidence_mcp: Vec<(String, String)> = persona
-                    .mcp_servers
+                let evidence_mcp: Vec<(String, String)> = mcp_granted
                     .iter()
-                    .flatten()
                     .flat_map(|(server, tools)| {
                         tools.iter().map(move |tool| (server.clone(), tool.clone()))
                     })

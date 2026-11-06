@@ -326,10 +326,34 @@ fn normalize_agent_definition(
         .get(serde_yaml_ng::Value::String("tools".into()))
         .map(|value| parse_agent_tools(value, mode.as_deref() == Some("write")))
         .transpose()?;
-    let (tools, tool_narrowing_notice, read_only_shell) = match parsed_tools {
+    let (mut tools, tool_narrowing_notice, mut read_only_shell) = match parsed_tools {
         Some((tools, notice, shell)) => (Some(tools), notice, shell),
         None => (None, None, false),
     };
+    // Claude Code `disallowedTools`: subtracted from the child tool set.
+    if let Some(value) = mapping.get(serde_yaml_ng::Value::String("disallowedTools".into())) {
+        let (denied, unsupported) = parse_disallowed_tools(value)?;
+        if !unsupported.is_empty() {
+            compat_notices.push(format!(
+                "[specialist metadata: disallowedTools {} not applied: only the child tools read, grep, find_files, list_dir, write, edit, shell, web_fetch, web_search, js, skills_search, memory_read and memory_search can be removed; the child never receives other tools unless granted explicitly]",
+                unsupported.join(", ")
+            ));
+        }
+        if denied.contains(&AgentTool::Shell) {
+            read_only_shell = false;
+        }
+        let write_mode = mode.as_deref() == Some("write");
+        match tools.as_mut() {
+            Some(list) => list.retain(|tool| !denied.contains(tool)),
+            None => {
+                let mut default = default_child_tools(write_mode);
+                if default.iter().any(|tool| denied.contains(tool)) {
+                    default.retain(|tool| !denied.contains(tool));
+                    tools = Some(default);
+                }
+            }
+        }
+    }
     let required_tools = mapping
         .get(serde_yaml_ng::Value::String("required_tools".into()))
         .map(parse_required_agent_tools)
@@ -404,9 +428,19 @@ fn normalize_agent_definition(
             _ => Err(error),
         },
     };
+    let max_turns_key = match (
+        mapping.contains_key(serde_yaml_ng::Value::String("max_turns".into())),
+        mapping.contains_key(serde_yaml_ng::Value::String("maxTurns".into())),
+    ) {
+        (true, true) => {
+            return Err("frontmatter sets both max_turns and maxTurns; keep only one");
+        }
+        (false, true) => "maxTurns",
+        _ => "max_turns",
+    };
     let run = AgentRunSettings {
         max_turns: bounded_integer(
-            "max_turns",
+            max_turns_key,
             MAX_FRONTMATTER_TURNS,
             "frontmatter max_turns must be an integer from 1 to 10000",
         )?
@@ -427,10 +461,38 @@ fn normalize_agent_definition(
         },
     };
     #[cfg(feature = "mcp")]
-    let mcp_servers = mapping
-        .get(serde_yaml_ng::Value::String("mcp_servers".into()))
-        .map(parse_agent_mcp_servers)
-        .transpose()?;
+    let mcp_servers = {
+        let snake = mapping.get(serde_yaml_ng::Value::String("mcp_servers".into()));
+        let camel = mapping.get(serde_yaml_ng::Value::String("mcpServers".into()));
+        match (snake, camel) {
+            (Some(_), Some(_)) => {
+                return Err("frontmatter sets both mcp_servers and mcpServers; keep only one");
+            }
+            (Some(value), None) => Some(parse_agent_mcp_servers(value)?),
+            (None, Some(value)) => {
+                let (servers, notices) = parse_claude_mcp_servers(value)?;
+                compat_notices.extend(notices);
+                Some(servers)
+            }
+            (None, None) => None,
+        }
+    };
+    #[cfg(not(feature = "mcp"))]
+    if mapping.contains_key(serde_yaml_ng::Value::String("mcpServers".into())) {
+        compat_notices.push(
+            "[specialist metadata: mcpServers not applied: MCP support is not compiled into this build]"
+                .into(),
+        );
+    }
+    // Claude Code keys with no mini-agent equivalent: say what is not applied
+    // rather than only listing them as unknown.
+    for (key, behaviour) in UNSUPPORTED_CLAUDE_KEYS {
+        if mapping.contains_key(serde_yaml_ng::Value::String((*key).into())) {
+            compat_notices.push(format!(
+                "[specialist metadata: {key} not applied: {behaviour}]"
+            ));
+        }
+    }
     #[cfg(feature = "mcp")]
     let known_keys = [
         "name",
@@ -447,6 +509,14 @@ fn normalize_agent_definition(
         "timeout_secs",
         "contract",
         "mcp_servers",
+        "mcpServers",
+        "maxTurns",
+        "disallowedTools",
+        "skills",
+        "permissionMode",
+        "background",
+        "memory",
+        "hooks",
     ];
     #[cfg(not(feature = "mcp"))]
     let known_keys = [
@@ -463,6 +533,14 @@ fn normalize_agent_definition(
         "max_turns",
         "timeout_secs",
         "contract",
+        "maxTurns",
+        "disallowedTools",
+        "mcpServers",
+        "skills",
+        "permissionMode",
+        "background",
+        "memory",
+        "hooks",
     ];
     let mut unknown_keys = mapping
         .keys()
@@ -500,6 +578,176 @@ fn normalize_agent_definition(
             )
         })
         .ok_or("prompt body is empty")
+}
+
+/// Claude Code frontmatter keys that are recognised but have no effect here,
+/// with the behaviour that is not applied.
+const UNSUPPORTED_CLAUDE_KEYS: &[(&str, &str)] = &[
+    (
+        "skills",
+        "skills are not preloaded into the child; it can still call skills_search when granted",
+    ),
+    (
+        "permissionMode",
+        "the child always uses the parent's permission rules and prompts",
+    ),
+    (
+        "background",
+        "delegations run in the foreground unless the task call sets run_in_background",
+    ),
+    (
+        "memory",
+        "no persistent per-agent memory directory is created",
+    ),
+    ("hooks", "agent-scoped lifecycle hooks are not run"),
+];
+
+/// Tools a persona child gets with no `tools` narrowing: the read set (plus
+/// the optional capabilities compiled in) and, for write personas, the
+/// parent-eligible mutating tools. Web and read-only shell tools need an
+/// explicit `tools` entry and are never in the default.
+fn default_child_tools(write_mode: bool) -> Vec<AgentTool> {
+    let mut tools = vec![
+        AgentTool::Read,
+        AgentTool::Grep,
+        AgentTool::FindFiles,
+        AgentTool::ListDir,
+    ];
+    #[cfg(feature = "js")]
+    tools.push(AgentTool::Js);
+    #[cfg(feature = "skills")]
+    tools.push(AgentTool::SkillsSearch);
+    #[cfg(feature = "memory")]
+    tools.extend([AgentTool::MemoryRead, AgentTool::MemorySearch]);
+    if write_mode {
+        tools.extend([AgentTool::Write, AgentTool::Edit, AgentTool::Shell]);
+    }
+    tools
+}
+
+/// `disallowedTools`: recognised child tools to remove, and the names that
+/// are not child tools (reported, never silently dropped).
+fn parse_disallowed_tools(
+    value: &serde_yaml_ng::Value,
+) -> Result<(Vec<AgentTool>, Vec<String>), &'static str> {
+    let names = if let Some(list) = value.as_sequence() {
+        list.iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .ok_or("frontmatter disallowedTools entries must be strings")
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else if let Some(list) = value.as_str() {
+        list.split(',').map(str::trim).collect()
+    } else {
+        return Err("frontmatter disallowedTools must be a comma-separated string or string list");
+    };
+    if names.len() > MAX_DECLARED_TOOLS {
+        return Err("frontmatter disallowedTools exceeds the 128 entry limit");
+    }
+    let mut denied = Vec::new();
+    let mut unsupported: Vec<String> = Vec::new();
+    for name in names {
+        if name.is_empty()
+            || name.chars().count() > MAX_TOOL_NAME_CHARS
+            || !name.is_ascii()
+            || name.chars().any(char::is_control)
+        {
+            return Err(
+                "frontmatter disallowedTools names must be non-empty printable ASCII of at most 64 characters",
+            );
+        }
+        match AgentTool::parse(name) {
+            Some(tool) => {
+                if !denied.contains(&tool) {
+                    denied.push(tool);
+                }
+            }
+            None if unsupported.len() < MAX_NOTICE_NAMES => {
+                if !unsupported.iter().any(|existing| existing == name) {
+                    unsupported.push(name.to_string());
+                }
+            }
+            None => {}
+        }
+    }
+    Ok((denied, unsupported))
+}
+
+/// Claude Code `mcpServers`: a list of configured server names (each grants
+/// all tools of that server, stored as an empty tool list) or a mapping. A
+/// mapping value that is a tool-name list is read like `mcp_servers`; an
+/// inline server definition is not applied (only servers the user configured
+/// are ever started) and is reported.
+#[cfg(feature = "mcp")]
+fn parse_claude_mcp_servers(
+    value: &serde_yaml_ng::Value,
+) -> Result<(std::collections::BTreeMap<String, Vec<String>>, Vec<String>), &'static str> {
+    const MAX_SERVERS: usize = 8;
+    const MAX_NAME_CHARS: usize = 256;
+    let valid_name = |name: &str| {
+        let name = name.trim();
+        !name.is_empty()
+            && name.chars().count() <= MAX_NAME_CHARS
+            && !name.chars().any(char::is_control)
+    };
+    let mut servers = std::collections::BTreeMap::new();
+    let mut inline = Vec::new();
+    if let Some(list) = value.as_sequence() {
+        for entry in list {
+            match entry {
+                serde_yaml_ng::Value::String(name) if valid_name(name) => {
+                    servers.insert(name.trim().to_string(), Vec::new());
+                }
+                serde_yaml_ng::Value::Mapping(map) => {
+                    inline.extend(
+                        map.keys()
+                            .filter_map(|key| key.as_str().map(str::to_string)),
+                    );
+                }
+                _ => return Err("frontmatter mcpServers entries must be server names"),
+            }
+        }
+    } else if let Some(map) = value.as_mapping() {
+        for (name, entry) in map {
+            let name = name
+                .as_str()
+                .filter(|name| valid_name(name))
+                .ok_or("frontmatter mcpServers contains an invalid server name")?;
+            if entry.as_sequence().is_some() {
+                let mut single = serde_yaml_ng::Mapping::new();
+                single.insert(name.into(), entry.clone());
+                servers.extend(parse_agent_mcp_servers(&serde_yaml_ng::Value::Mapping(
+                    single,
+                ))?);
+            } else {
+                inline.push(name.to_string());
+            }
+        }
+    } else {
+        return Err("frontmatter mcpServers must be a list of server names or a mapping");
+    }
+    if servers.len() > MAX_SERVERS {
+        return Err("frontmatter mcpServers exceeds the 8-server limit");
+    }
+    inline.sort_unstable();
+    inline.dedup();
+    let notices = if inline.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "[specialist metadata: mcpServers inline definition(s) {} not applied: only MCP servers already configured in mini-agent can be referenced by name]",
+            inline
+                .iter()
+                .take(MAX_NOTICE_NAMES)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )]
+    };
+    Ok((servers, notices))
 }
 
 #[cfg(feature = "mcp")]
@@ -2697,6 +2945,110 @@ pub(crate) mod tests {
                 "accepted invalid MCP metadata: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn claude_code_camel_case_keys_map_to_limits_and_unsupported_ones_are_reported() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition(
+                "cc".into(),
+                format!("---\nname: cc\n{frontmatter}\n---\nbody"),
+            )
+        };
+        let parsed = parse("maxTurns: 7").unwrap().2;
+        assert_eq!(parsed.run.max_turns, Some(7));
+        assert!(parsed.unknown_keys.is_empty());
+        assert!(parse("maxTurns: 0").is_err());
+        assert!(parse("maxTurns: 3\nmax_turns: 4").is_err());
+
+        // disallowedTools subtracts from an explicit tools list ...
+        let parsed = parse("tools: Read, Grep, Glob\ndisallowedTools: Grep")
+            .unwrap()
+            .2;
+        assert_eq!(
+            parsed.tools,
+            Some(vec![AgentTool::Read, AgentTool::FindFiles])
+        );
+        // ... and from the default set when `tools` is absent.
+        let parsed = parse("disallowedTools: [Read, Glob]").unwrap().2;
+        let tools = parsed.tools.expect("default set made explicit");
+        assert!(tools.contains(&AgentTool::Grep) && tools.contains(&AgentTool::ListDir));
+        assert!(!tools.contains(&AgentTool::Read) && !tools.contains(&AgentTool::FindFiles));
+        // A write persona loses the shell it was denied, nothing else.
+        let parsed = parse("mode: write\ndisallowedTools: Bash").unwrap().2;
+        let tools = parsed.tools.unwrap();
+        assert!(tools.contains(&AgentTool::Write) && !tools.contains(&AgentTool::Shell));
+        // Denying a tool the child never had changes nothing; web stays opt-in.
+        assert_eq!(parse("disallowedTools: WebFetch").unwrap().2.tools, None);
+        // Names that are not child tools are reported, not silently dropped.
+        let parsed = parse("tools: Read\ndisallowedTools: mcp__x__y").unwrap().2;
+        assert!(
+            parsed
+                .compat_notices
+                .iter()
+                .any(|notice| notice.contains("disallowedTools mcp__x__y not applied")),
+            "{:?}",
+            parsed.compat_notices
+        );
+        // Denying the shell also drops the read-only-shell opt-in.
+        let parsed = parse("tools: Read, Bash\ndisallowedTools: Bash").unwrap().2;
+        assert!(!parsed.run.read_only_shell);
+        assert_eq!(parsed.tools, Some(vec![AgentTool::Read]));
+
+        let parsed =
+            parse("skills: [a]\npermissionMode: acceptEdits\nbackground: true\nmemory: user")
+                .unwrap()
+                .2;
+        assert!(parsed.unknown_keys.is_empty());
+        for key in ["skills", "permissionMode", "background", "memory"] {
+            assert!(
+                parsed
+                    .compat_notices
+                    .iter()
+                    .any(|notice| notice.contains(&format!("{key} not applied"))),
+                "{key}: {:?}",
+                parsed.compat_notices
+            );
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn claude_code_mcp_servers_reference_configured_servers_by_name() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition(
+                "cc".into(),
+                format!("---\nname: cc\n{frontmatter}\n---\nbody"),
+            )
+        };
+        let parsed = parse("mcpServers: [docs, source]").unwrap().2;
+        assert_eq!(
+            parsed.mcp_servers,
+            Some(std::collections::BTreeMap::from([
+                ("docs".to_string(), Vec::new()),
+                ("source".to_string(), Vec::new()),
+            ]))
+        );
+        // An inline definition is never started; it is reported.
+        let parsed = parse("mcpServers:\n  - docs\n  - evil:\n      command: sh")
+            .unwrap()
+            .2;
+        assert_eq!(
+            parsed.mcp_servers.unwrap().keys().collect::<Vec<_>>(),
+            vec!["docs"]
+        );
+        assert!(
+            parsed
+                .compat_notices
+                .iter()
+                .any(|notice| notice.contains("evil") && notice.contains("not applied"))
+        );
+        let parsed = parse("mcpServers:\n  docs: [search]").unwrap().2;
+        assert_eq!(parsed.mcp_servers.unwrap()["docs"], vec!["search"]);
+        // Same bounds as mcp_servers, and the two spellings cannot be mixed.
+        assert!(parse("mcpServers: [a,b,c,d,e,f,g,h,i]").is_err());
+        assert!(parse("mcpServers: [docs]\nmcp_servers:\n  docs: [x]").is_err());
+        assert!(parse("mcpServers: 3").is_err());
     }
 
     #[test]

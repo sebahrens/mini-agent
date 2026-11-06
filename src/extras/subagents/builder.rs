@@ -617,14 +617,17 @@ pub(crate) async fn build_persona_mcp(
     (
         Option<crate::extras::mcp::McpClientManager>,
         Vec<Box<dyn rig::tool::ToolDyn>>,
+        // The exact server -> tool names granted, with a bare server-name
+        // reference (an empty list) resolved to the tools it exposes.
+        std::collections::BTreeMap<String, Vec<String>>,
     ),
     String,
 > {
     let Some(allowlist) = persona.mcp_servers.as_ref() else {
-        return Ok((None, Vec::new()));
+        return Ok((None, Vec::new(), Default::default()));
     };
     if allowlist.is_empty() {
-        return Ok((None, Vec::new()));
+        return Ok((None, Vec::new(), Default::default()));
     }
     let configured = cfg
         .mcp_servers
@@ -656,20 +659,29 @@ pub(crate) async fn build_persona_mcp(
     tools.retain(|tool| {
         let server = tool.server_name.as_str();
         let name = tool.definition.name.as_ref();
+        // An empty list is a server-name reference: all of that server's tools.
         let allowed = allowlist
             .get(server)
-            .is_some_and(|names| names.iter().any(|allowed| allowed == name));
+            .is_some_and(|names| names.is_empty() || names.iter().any(|allowed| allowed == name));
         if allowed {
             discovered.insert((server.to_string(), name.to_string()));
         }
         allowed
     });
-    let missing = allowlist
+    let mut missing = allowlist
         .iter()
         .flat_map(|(server, names)| names.iter().map(move |name| (server, name)))
         .filter(|(server, name)| !discovered.contains(&(server.to_string(), name.to_string())))
         .map(|(server, name)| format!("{server}:{name}"))
         .collect::<Vec<_>>();
+    missing.extend(
+        allowlist
+            .iter()
+            .filter(|(server, names)| {
+                names.is_empty() && !discovered.iter().any(|(found, _)| found == *server)
+            })
+            .map(|(server, _)| format!("{server}:*")),
+    );
     if !missing.is_empty() {
         let notices = manager
             .take_notices()
@@ -691,7 +703,11 @@ pub(crate) async fn build_persona_mcp(
         .into_iter()
         .map(|tool| Box::new(tool) as Box<dyn rig::tool::ToolDyn>)
         .collect();
-    Ok((Some(manager), tools))
+    let mut granted = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (server, name) in discovered {
+        granted.entry(server).or_default().push(name);
+    }
+    Ok((Some(manager), tools, granted))
 }
 
 /// The memory tools a subagent is granted: read-only access ONLY
@@ -1466,6 +1482,35 @@ mod persona_mcp_tests {
             Err(error) => error,
         };
         assert!(error.contains("not configured"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn persona_mcp_server_name_reference_is_still_limited_to_configured_servers() {
+        // `mcpServers: [missing]` stores an empty tool list (all tools); it
+        // must not start or grant anything the user did not configure.
+        let persona = PersonaExecution {
+            mcp_servers: Some(std::collections::BTreeMap::from([(
+                "missing".to_string(),
+                Vec::new(),
+            )])),
+            ..PersonaExecution::default()
+        };
+        let config = crate::config::Config {
+            mcp_servers: Some(std::collections::HashMap::new()),
+            ..crate::config::Config::default()
+        };
+        let authorization =
+            SubagentAuthorization::new(None, None, true).with_workspace_binding(Some(workspace()));
+        let error = match build_persona_mcp(&persona, &config, &authorization).await {
+            Ok(_) => panic!("unconfigured server reference was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("not configured"), "{error}");
+        // No frontmatter reference, no MCP authority.
+        let none = build_persona_mcp(&PersonaExecution::default(), &config, &authorization)
+            .await
+            .unwrap();
+        assert!(none.0.is_none() && none.1.is_empty() && none.2.is_empty());
     }
 }
 

@@ -96,6 +96,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   (was 160) under a 12,000-character combined budget, with an explicit shortened/omitted count
   instead of a silent per-agent cut (mini-agent-767y1).
 
+- Claude Code agent files: `maxTurns`, `mcpServers` (a configured server name grants all its tools,
+  inline definitions are never started) and `disallowedTools` (subtracted from the child tool set)
+  are honoured; `skills`, `permissionMode`, `background`, `memory` and `hooks` now produce a notice
+  naming the behaviour that is not applied (mini-agent-syofy).
+
 ### Shell and pty jobs (round 7, group P)
 
 - `job_status` input no longer accepts TAB or shell history expansion (`!` followed by text, a

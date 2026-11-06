@@ -574,6 +574,18 @@ mode: review
   and installs only tools returned under the exact allowlist. An unknown
   server or missing tool fails the child instead of widening or silently
   degrading its capability.
+- Claude Code camelCase frontmatter in `.claude/agents` files: `maxTurns` is read as `max_turns`
+  (same 1 to 10,000 bound; setting both spellings is an error); `disallowedTools` removes the
+  named child tools (`Read`, `Grep`, `Glob`, `Bash`, `Edit`, ... ) from the explicit `tools` list
+  or, without one, from the default set, and names that are not child tools are reported in the
+  result notice rather than ignored silently; `mcpServers` takes a list of configured server names
+  (each grants all of that server's tools; a mapping to a tool-name list is read like
+  `mcp_servers`), within the same 8-server limit, still child-only, trust-gated like any project
+  persona and permission-checked per call. A server that is not configured in mini-agent fails the
+  child, and an inline server definition is never started (it is reported as not applied).
+  `skills`, `permissionMode`, `background`, `memory` and `hooks` are recognised but have no effect;
+  each produces a `[specialist metadata: <key> not applied: ...]` notice naming the behaviour that
+  is missing.
 - `model` is first resolved as a configured quick-model alias, including its
   provider and `extra_body`. Otherwise it is a raw model ID on the current
   subagent provider. A provider switch that cannot authenticate fails the task
