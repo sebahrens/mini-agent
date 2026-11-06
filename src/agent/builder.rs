@@ -1721,9 +1721,15 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         &cli.resolve_model(cfg),
         crate::config::quick_models_map(cfg),
     );
+    // The session shares this store, so transcript persistence and resume
+    // replay bound results with the same limits as the live hook.
+    let spill_limits = cfg.resolve_tool_result_spill_limits(spill_window);
+    if let Some(spills) = &tool_result_spills {
+        spills.set_limits(spill_limits);
+    }
     builder = builder.add_hook(
         crate::agent::runner::ToolResultSpillHook::new(tool_output_session_id, tool_result_spills)
-            .with_limits(cfg.resolve_tool_result_spill_limits(spill_window)),
+            .with_limits(spill_limits),
     );
     #[cfg(feature = "advisor")]
     if registered_tools.contains(&"advisor") {

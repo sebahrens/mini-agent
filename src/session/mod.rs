@@ -151,9 +151,29 @@ struct PendingToolResultSpills {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ToolResultSpillStore {
     pending: Arc<Mutex<PendingToolResultSpills>>,
+    /// Generic spill limits the live hook uses. Shared with the session that
+    /// owns the store, so transcript persistence and resume replay bound
+    /// results exactly as the live turn did (mini-agent-lh2pe).
+    limits: Arc<Mutex<ToolResultSpillLimits>>,
 }
 
 impl ToolResultSpillStore {
+    /// Record the configured generic spill limits for this session.
+    pub(crate) fn set_limits(&self, limits: ToolResultSpillLimits) {
+        *self
+            .limits
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = limits;
+    }
+
+    /// The generic spill limits in force (historical defaults until set).
+    pub(crate) fn limits(&self) -> ToolResultSpillLimits {
+        *self
+            .limits
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     pub(crate) fn register(
         &self,
         internal_call_id: &str,
@@ -2204,14 +2224,19 @@ impl Session {
                 }
             };
         }
+        let limits = self.tool_result_spills.limits();
+        if output.len() <= limits.threshold {
+            return (format!("{name}:\n{output}"), output.to_string(), None);
+        }
         let output_chars = output.chars().count();
-        if output_chars <= TOOL_RESULT_SAVE_THRESHOLD {
+        if output_chars <= limits.threshold {
             return (format!("{name}:\n{output}"), output.to_string(), None);
         }
 
         match storage::save_tool_output(&self.id, name, output) {
             Ok(path) => {
-                let replay_output = format_truncated_tool_output(output, output_chars, &path);
+                let replay_output =
+                    format_spilled_tool_output_with(limits, output, output_chars, &path);
                 (
                     format!("{name}:\n{replay_output}"),
                     replay_output,
@@ -2999,6 +3024,7 @@ impl PrunedContext<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn format_truncated_tool_output(
     output: &str,
     output_chars: usize,
@@ -3029,6 +3055,7 @@ pub(crate) fn format_unpersisted_truncated_tool_output(
     )
 }
 
+#[cfg(test)]
 fn format_truncated_tool_output_with_notice(
     output: &str,
     output_chars: usize,
@@ -3674,6 +3701,29 @@ mod preflight_tests {
             next_turn < 2_050,
             "the next turn should newly clear the two in-turn results that the calibrated request kept verbatim"
         );
+    }
+
+    // mini-agent-lh2pe: persistence/replay uses the configured spill limits,
+    // and keeps the historical 12,000-char default when none are configured.
+    #[test]
+    fn replay_content_honours_configured_spill_limits() {
+        let session = Session::new("test", "mock", 128_000, "");
+        let output = "M".repeat(30_000);
+
+        let default = session.tool_result_content("id", "mcp__srv__tool", &output);
+        assert!(default.1.contains("[tool output truncated:"));
+        if let Some(path) = default.2 {
+            let _ = std::fs::remove_file(path);
+        }
+
+        session.tool_result_spills.set_limits(
+            ToolResultSpillLimits::for_window(128_000).with_overrides(Some(40_000), None, None),
+        );
+        let (content, replay, artifact) =
+            session.tool_result_content("id", "mcp__srv__tool", &output);
+        assert_eq!(replay, output);
+        assert_eq!(content, format!("mcp__srv__tool:\n{output}"));
+        assert!(artifact.is_none());
     }
 
     #[test]

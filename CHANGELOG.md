@@ -206,6 +206,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Session transcript recording and resume replay now use the configured `tool_result_spill_*` limits for
+  generic tool results instead of a fixed 12,000-character cut, so a resumed session matches the live
+  turn (mini-agent-lh2pe).
 - Self-bounded tools (`read`, `shell`, `js`, `web_fetch`, ...) now meet a final per-result
   character backstop, `[tool_limits] max_result_chars` (default 100,000). Larger results keep a
   head and tail around a notice with the private spill path, live and on replay; `read` stops line
