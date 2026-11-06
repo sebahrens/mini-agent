@@ -717,12 +717,15 @@ pub(crate) struct EditOp {
     pub text: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct BashArgs {
     pub command: String,
     pub timeout: Option<u64>,
     #[serde(default)]
     pub background: bool,
+    /// Run under a pseudo-terminal (Unix): stdin/stdout/stderr are one TTY.
+    #[serde(default)]
+    pub pty: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -733,9 +736,11 @@ pub enum JobAction {
     Stop,
     Wait,
     List,
+    /// Write `input` to a `pty = true` job's terminal.
+    Input,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct JobStatusArgs {
     pub id: Option<String>,
     #[serde(default)]
@@ -745,6 +750,9 @@ pub struct JobStatusArgs {
     /// Byte offset to read job output from instead of the previous read end.
     #[serde(default)]
     pub since: Option<u64>,
+    /// Text typed into a `pty = true` job with `action = "input"`.
+    #[serde(default)]
+    pub input: Option<String>,
 }
 
 #[derive(Deserialize)]

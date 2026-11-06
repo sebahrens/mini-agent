@@ -136,13 +136,19 @@ async fn output_with_progress(
     command: &str,
     limits: CommandLimits,
     capture: &ShellOutputCapture,
+    pty: bool,
     id: CompactString,
     events: tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
 ) -> std::io::Result<CommandOutput> {
     let progress = CommandProgress::new();
     let mut changes = progress.subscribe();
-    let command_run =
-        sandbox.output_shell_command_captured(command, limits, Some(progress.clone()), capture);
+    let command_run = sandbox.output_shell_command_captured(
+        command,
+        limits,
+        Some(progress.clone()),
+        capture,
+        pty,
+    );
     tokio::pin!(command_run);
     let mut last_sent: Option<tokio::time::Instant> = None;
     let mut pending = false;
@@ -290,6 +296,10 @@ impl Tool for ShellTool {
                 "background": {
                     "type": "boolean",
                     "description": "Start a session-scoped background job and return its id (default false)"
+                },
+                "pty": {
+                    "type": "boolean",
+                    "description": "Run under a pseudo-terminal so isatty() is true and stdin/stdout/stderr are one 120x40 TTY (Unix only; default false). With background=true, job_status action=input types into it, e.g. for REPLs or prompts."
                 }
             },
             "required": ["command"]
@@ -369,6 +379,7 @@ impl ShellTool {
                     args.command,
                     timeout,
                     self.output_log_dir.as_deref(),
+                    args.pty,
                 )
                 .await?;
             let log = self
@@ -412,12 +423,20 @@ impl ShellTool {
             .zip(crate::agent::tools::mutation_diff::scoped_event_sender());
         let output = match live {
             Some((id, events)) => {
-                output_with_progress(&self.sandbox, &args.command, limits, &capture, id, events)
-                    .await?
+                output_with_progress(
+                    &self.sandbox,
+                    &args.command,
+                    limits,
+                    &capture,
+                    args.pty,
+                    id,
+                    events,
+                )
+                .await?
             }
             None => {
                 self.sandbox
-                    .output_shell_command_captured(&args.command, limits, None, &capture)
+                    .output_shell_command_captured(&args.command, limits, None, &capture, args.pty)
                     .await?
             }
         };
@@ -523,8 +542,13 @@ impl Tool for JobStatusTool {
                 },
                 "action": {
                     "type": "string",
-                    "enum": ["poll", "stop", "wait", "list"],
-                    "description": "Poll status/output, wait for completion, stop and reap, or list current session jobs (default poll)"
+                    "enum": ["poll", "stop", "wait", "list", "input"],
+                    "description": "Poll status/output, wait for completion, stop and reap, list current session jobs, or type input into a pty=true job (default poll)"
+                },
+                "input": {
+                    "type": "string",
+                    "maxLength": 16384,
+                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The result shows output produced within 200 ms."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -549,6 +573,11 @@ impl Tool for JobStatusTool {
         {
             return Err(ToolError::Msg(
                 "job_status timeout_ms is only valid with action=wait and must be between 1 and 60000 milliseconds. Example: {\"id\":\"job-...\",\"action\":\"wait\",\"timeout_ms\":10000}".into(),
+            ));
+        }
+        if args.input.is_some() != (args.action == JobAction::Input) {
+            return Err(ToolError::Msg(
+                "job_status input is required with, and only valid with, action=input. Example: {\"id\":\"job-...\",\"action\":\"input\",\"input\":\"print(1+1)\\n\"}".into(),
             ));
         }
         if args.action == JobAction::List {
@@ -596,6 +625,24 @@ impl Tool for JobStatusTool {
                 )
                 .await
                 .map(drop),
+            JobAction::Input => {
+                let input = args.input.as_deref().unwrap_or_default();
+                match self
+                    .sandbox
+                    .write_background_job_input(id, input.as_bytes())
+                    .await
+                {
+                    Ok(()) => {
+                        // Give the program a moment to echo and answer.
+                        let _ = self
+                            .sandbox
+                            .wait_background_job(id, std::time::Duration::from_millis(200))
+                            .await;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             JobAction::List => unreachable!("list returned before id lookup"),
         }
         .map_err(ToolError::Msg)?;
@@ -846,6 +893,7 @@ mod tests {
             command: command.to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         };
         let plain = tool.execute(args()).await.unwrap().0;
 
@@ -998,6 +1046,7 @@ mod tests {
                     ),
                     timeout: Some(30_000),
                     background: true,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -1064,6 +1113,7 @@ mod tests {
                 ),
                 timeout: None,
                 background: false,
+                ..Default::default()
             }),
         )
         .await
@@ -1098,6 +1148,7 @@ mod tests {
                 command: "printf CONFIGURED_DEADLINE".into(),
                 timeout: Some(60_001),
                 background: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1106,7 +1157,8 @@ mod tests {
             tool.call(BashArgs {
                 command: "must-not-execute".into(),
                 timeout: Some(600_001),
-                background: false
+                background: false,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1124,7 +1176,8 @@ mod tests {
                     id: None,
                     action,
                     timeout_ms: None,
-                    since: None
+                    since: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err()
@@ -1143,7 +1196,8 @@ mod tests {
                     id: Some("not-a-job-id".into()),
                     action,
                     timeout_ms: Some(timeout_ms),
-                    since: None
+                    since: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err()
@@ -1156,7 +1210,8 @@ mod tests {
                 id: Some("ignored-id".into()),
                 action: JobAction::List,
                 timeout_ms: None,
-                since: None
+                since: None,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1181,6 +1236,7 @@ mod tests {
             action: JobAction::Wait,
             timeout_ms: Some(60_000),
             since: None,
+            ..Default::default()
         });
         tokio::pin!(wait);
         assert!(
@@ -1192,6 +1248,7 @@ mod tests {
             action: JobAction::Wait,
             timeout_ms: Some(60_000),
             since: None,
+            ..Default::default()
         });
         tokio::pin!(sibling_wait);
         assert!(futures::poll!(sibling_wait.as_mut()).is_pending());
@@ -1224,6 +1281,7 @@ mod tests {
                 action: JobAction::List,
                 timeout_ms: None,
                 since: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1242,7 +1300,8 @@ mod tests {
                     id: None,
                     action: JobAction::List,
                     timeout_ms: None,
-                    since: None
+                    since: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap(),
@@ -1262,6 +1321,7 @@ mod tests {
                 action: JobAction::Wait,
                 timeout_ms: Some(60_000),
                 since: None,
+                ..Default::default()
             });
             tokio::pin!(wait);
             assert!(futures::poll!(wait.as_mut()).is_pending());
@@ -1273,6 +1333,7 @@ mod tests {
                 action: JobAction::Wait,
                 timeout_ms: Some(25),
                 since: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1336,6 +1397,7 @@ mod tests {
                     timeout_ms: None,
                     since: Some(0),
                     action: JobAction::Poll,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -1365,6 +1427,7 @@ mod tests {
                 command: "while :; do :; done".to_string(),
                 timeout: Some(100),
                 background: false,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1384,6 +1447,7 @@ mod tests {
                         command: "printf must-not-run".into(),
                         timeout: Some(timeout),
                         background,
+                        ..Default::default()
                     })
                     .await
                     .unwrap_err()
@@ -1402,6 +1466,7 @@ mod tests {
                 command: "printf should-not-run".to_string(),
                 timeout: Some(0),
                 background: false,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1435,6 +1500,7 @@ mod tests {
                     command,
                     timeout: Some(timeout_ms),
                     background: false,
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err()
@@ -1476,6 +1542,7 @@ mod tests {
                     command,
                     timeout: None,
                     background: false,
+                    ..Default::default()
                 })
                 .await
         });
@@ -1556,6 +1623,7 @@ mod tests {
                 command: "printf stdout; printf stderr >&2; exit 7".to_string(),
                 timeout: None,
                 background: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1571,6 +1639,7 @@ mod tests {
                 command: "printf 'one\\ntwo\\nthree\\n'; exit 9".to_string(),
                 timeout: None,
                 background: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1600,6 +1669,7 @@ mod tests {
                 command: "printf start; sleep 0.2; printf end >&2; exit 7".to_string(),
                 timeout: Some(2_000),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1613,6 +1683,7 @@ mod tests {
                     timeout_ms: None,
                     since: None,
                     action: JobAction::Poll,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -1652,6 +1723,7 @@ mod tests {
                 command,
                 timeout: None,
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1665,6 +1737,7 @@ mod tests {
                 timeout_ms: None,
                 since: None,
                 action: JobAction::Stop,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1683,6 +1756,7 @@ mod tests {
                 command: "seq 1 50000".to_string(),
                 timeout: Some(2_000),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1702,6 +1776,7 @@ mod tests {
                 timeout_ms: None,
                 since,
                 action: JobAction::Poll,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1719,6 +1794,7 @@ mod tests {
                         .to_string(),
                 timeout: Some(5_000),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1755,6 +1831,146 @@ mod tests {
         assert!(poll_job(&status, &id, None).await.contains("No new output"));
     }
 
+    async fn job_input(status: &JobStatusTool, id: &str, input: &str) -> Result<String, ToolError> {
+        status
+            .call(JobStatusArgs {
+                id: Some(id.to_string()),
+                action: JobAction::Input,
+                input: Some(input.to_string()),
+                ..Default::default()
+            })
+            .await
+    }
+
+    /// Drive an interactive program in a `pty = true` job: one line of input,
+    /// an answer that only the program (not the echo) can contain, then exit.
+    async fn run_pty_repl(shell: BashTool, program: &str, line: &str, answer: &str, exit: &str) {
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: program.to_string(),
+                timeout: Some(20_000),
+                background: true,
+                pty: true,
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        let mut seen = job_input(&status, &id, line).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !seen.contains(answer) {
+            assert!(Instant::now() < deadline, "program never answered: {seen}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen.push_str(&poll_job(&status, &id, None).await);
+        }
+        job_input(&status, &id, exit).await.unwrap();
+        let terminal = wait_for_terminal_job(&status, &id).await;
+        assert!(terminal.contains("Status: completed"), "{terminal}");
+        assert!(terminal.contains("Exit code: 0"), "{terminal}");
+        // A finished job no longer accepts input.
+        let error = job_input(&status, &id, "1\n").await.unwrap_err();
+        assert!(error.to_string().contains("already finished"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_background_job_drives_an_interactive_repl_through_job_status_input() {
+        run_pty_repl(
+            test_tool(),
+            "python3 -i -q",
+            "import os; print('tty', os.isatty(0), os.isatty(1), 1+1)\n",
+            "tty True True 2",
+            "exit()\n",
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn pty_background_job_works_inside_the_real_seatbelt_sandbox() {
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        if !crate::sandbox::seatbelt_exists() {
+            crate::sandbox::skip_unusable_real_sandbox_test("Seatbelt is unavailable");
+            return;
+        }
+        let workspace = std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let sandbox = Sandbox::new(true, "seatbelt").with_workspace_binding(workspace);
+        run_pty_repl(
+            BashTool::new(None, None, sandbox, None),
+            "sh -i",
+            "test -t 0 && test -t 1 && echo tty-$((1+1))-ok\n",
+            "tty-2-ok",
+            "exit 0\n",
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_foreground_command_sees_a_terminal_and_default_commands_do_not() {
+        let tool = test_tool();
+        let probe = "if test -t 0 && test -t 1 && test -t 2; then echo is-$((1+1))-tty; else echo no-$((1+1))-tty; fi";
+        let pty = tool
+            .call(BashArgs {
+                command: probe.to_string(),
+                pty: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(pty.contains("is-2-tty"), "{pty}");
+        assert!(
+            !pty.contains("[stdout]"),
+            "pty output is one merged stream: {pty}"
+        );
+        let plain = tool
+            .call(BashArgs {
+                command: probe.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(plain.contains("no-2-tty"), "{plain}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_input_requires_a_pty_job_and_is_size_bounded() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: "sleep 5".to_string(),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        let error = job_input(&status, &id, "hello\n").await.unwrap_err();
+        assert!(error.to_string().contains("pty=true"), "{error}");
+        let error = job_input(&status, &id, &"x".repeat(16 * 1024 + 1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("16384 bytes"), "{error}");
+        let error = status
+            .call(JobStatusArgs {
+                id: Some(id.clone()),
+                action: JobAction::Poll,
+                input: Some("x".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("only valid with, action=input"),
+            "{error}"
+        );
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn background_job_output_is_fully_recoverable_from_its_private_log() {
@@ -1767,6 +1983,7 @@ mod tests {
                 command: "yes 0123456789abcde | head -c 10485760".to_string(),
                 timeout: Some(20_000),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1812,6 +2029,7 @@ mod tests {
                     command: format!("printf 'job-{index}'"),
                     timeout: Some(5_000),
                     background: true,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -1826,6 +2044,7 @@ mod tests {
                 timeout_ms: None,
                 since: None,
                 action: JobAction::Poll,
+                ..Default::default()
             })
             .await
             .expect_err("the oldest record is pruned");
@@ -1846,6 +2065,7 @@ mod tests {
                 command: "sleep 1".to_string(),
                 timeout: Some(50),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1866,6 +2086,7 @@ mod tests {
                 timeout_ms: None,
                 since: None,
                 action: JobAction::Poll,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1878,6 +2099,7 @@ mod tests {
                 timeout_ms: None,
                 since: None,
                 action: JobAction::Poll,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1895,6 +2117,7 @@ mod tests {
                 command: "exit 0".to_string(),
                 timeout: Some(1_000),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1908,6 +2131,7 @@ mod tests {
                 timeout_ms: None,
                 since: None,
                 action: JobAction::Stop,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1926,6 +2150,7 @@ mod tests {
                     command: "while :; do sleep 1; done".to_string(),
                     timeout: None,
                     background: true,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -1938,6 +2163,7 @@ mod tests {
                 command: "exit 0".to_string(),
                 timeout: None,
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -2006,6 +2232,7 @@ mod foreground_metadata_tests {
                     command: command.into(),
                     timeout: None,
                     background: false,
+                    ..Default::default()
                 },
                 &extensions,
             )
@@ -2034,6 +2261,7 @@ mod foreground_metadata_tests {
                 command: "head -c 65537 /dev/zero | tr '\\000' x".into(),
                 timeout: None,
                 background: false,
+                ..Default::default()
             },
             &extensions,
         )
@@ -2048,6 +2276,7 @@ mod foreground_metadata_tests {
                 command: "printf 'https://never-claimed.invalid/pull/1\\n'; sleep 5".into(),
                 timeout: Some(30),
                 background: false,
+                ..Default::default()
             },
             &extensions,
         )
@@ -2067,6 +2296,7 @@ mod foreground_metadata_tests {
                 command: "printf BACKGROUND32".into(),
                 timeout: None,
                 background: true,
+                ..Default::default()
             },
             &ToolCallExtensions::default(),
         )

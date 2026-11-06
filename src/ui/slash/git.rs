@@ -2435,6 +2435,7 @@ mod windows_native_pr_tests {
                 let work = scope.run(async {
                     rig::tool::Tool::call_structured(&tool, crate::agent::tools::BashArgs {
                         command: command.into(), timeout: None, background: false,
+                        ..Default::default()
                     }, &ToolCallExtensions::default()).await
                 });
                 tokio::pin!(work);
@@ -2744,6 +2745,7 @@ mod windows_native_pr_tests {
                             command: command.clone(),
                             timeout: None,
                             background: false,
+                            ..Default::default()
                         },
                         &ToolCallExtensions::default(),
                     ).await

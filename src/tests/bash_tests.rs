@@ -61,6 +61,7 @@ async fn bash_compound_command_permission_denies_before_starting_any_child() {
                     command: command.clone(),
                     timeout: None,
                     background,
+                    ..Default::default()
                 })
                 .await;
 
@@ -85,6 +86,7 @@ async fn bash_compound_command_permission_rejects_malformed_script_before_launch
             command: "echo $(".to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         })
         .await;
 
@@ -100,6 +102,7 @@ async fn bash_compound_command_permission_allows_exact_complete_script() {
             command: command.to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -140,6 +143,7 @@ async fn bash_success_output_is_bounded_to_head_and_tail_with_omitted_marker() {
             command: "seq 1 100".to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -173,6 +177,7 @@ async fn bash_output_within_line_cap_is_returned_with_a_stream_label() {
             command: "seq 1 5".to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -189,6 +194,7 @@ async fn bash_large_output_runs_to_completion_with_head_tail_and_line_cap() {
             command: "yes | head -n 2000000; echo finished".to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         })
         .await
         .expect("large output must not stop the command");
@@ -214,6 +220,7 @@ async fn bash_five_mebibytes_completes_and_spools_the_complete_output_to_a_priva
             command: "yes | head -c 5000000".to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         })
         .await
         .expect("5 MiB of output completes");
@@ -242,6 +249,7 @@ async fn bash_build_like_script_keeps_its_real_exit_status_and_final_lines() {
             command: "i=0; while [ $i -lt 120000 ]; do echo \"   Compiling crate-$i v0.1.0\"; i=$((i+1)); done; echo 'error: build failed' >&2; exit 3".to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         })
         .await
         .expect("a nonzero exit is a completed result");
@@ -263,6 +271,7 @@ async fn bash_output_beyond_the_hard_ceiling_is_stopped_with_a_clear_status() {
             command: "yes | head -c 80000000; echo never-reached".to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         })
         .await
         .expect_err("pathological volume must still be stopped");
@@ -285,6 +294,7 @@ async fn bash_without_line_cap_returns_all_lines() {
             command: "seq 1 100".to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         })
         .await
         .unwrap();

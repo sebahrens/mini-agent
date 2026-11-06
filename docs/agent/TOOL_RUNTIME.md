@@ -68,6 +68,17 @@ combined; byte_cap: 67108864; ...]` with the partial transcript. The
 `max_bash_output_lines` head/tail line cap still bounds the rendered text; the
 log footer is appended after it so it is never cut. Hook, validation and other
 sandbox command classes keep their existing bounded 1 MiB/1.5 MiB capture.
+`pty = true` (Unix only) runs the command under a fresh 120x40
+pseudo-terminal instead of pipes: its stdin, stdout and stderr are one TTY, so
+`isatty()` is true and colour/progress/prompt behaviour matches an interactive
+terminal. The output is one merged, unlabelled stream. The terminal belongs to
+the command; it is never the user's terminal, the command still gets a new
+session with no controlling terminal, and the same sandbox wrapper, workspace
+and permission decision apply. A foreground pty command reads end-of-file
+behaviour from an idle terminal, so drive interactive programs as background
+jobs: `job_status` `action = "input"` with `input` (at most 16 KiB per call,
+include `\n` for Enter) types into a running pty job and returns the output
+produced within 200 ms. Jobs without `pty` keep a null stdin and reject input.
 The companion `job_status` tool polls live output, stops and reaps
 the job, or waits for completion. `poll`, `wait` and `stop` return only output
 produced since the previous such call for that job (at most 64 KiB; a larger

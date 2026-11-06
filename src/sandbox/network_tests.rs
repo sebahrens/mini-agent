@@ -149,14 +149,14 @@ async fn sandbox_network_seatbelt_live_default_denies_and_opt_in_reaches_the_net
     );
     let probe = "curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://example.com";
     let denied = Sandbox::new(true, "seatbelt").with_workspace_binding(workspace.clone());
-    let output = denied
+    let run = denied
         .output_command_with_limits(probe, DEFAULT_COMMAND_LIMITS)
         .await
         .unwrap();
     assert!(
-        !output.exit_status.is_some_and(|status| status.success()),
+        !run.exit_status.is_some_and(|exit| exit.success()),
         "default sandbox must deny the network: {}",
-        String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&run.stdout)
     );
     if std::env::var_os("MINI_AGENT_NETWORK_TESTS").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return;
@@ -171,15 +171,15 @@ async fn sandbox_network_seatbelt_live_default_denies_and_opt_in_reaches_the_net
             "4",
         ),
     ] {
-        let output = allowed
+        let run = allowed
             .output_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
             .await
             .unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&run.stdout).trim(),
             expect,
             "{command}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&run.stderr)
         );
     }
 }

@@ -23,6 +23,8 @@ mod general_profile;
 #[cfg(test)]
 mod network_tests;
 mod output_capture;
+#[cfg(unix)]
+pub(crate) mod pty;
 pub(crate) use output_capture::{
     OutputChannel, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy,
     TranscriptPart,
@@ -908,6 +910,8 @@ struct BackgroundJobRecord {
     log_path: Option<PathBuf>,
     /// Offset up to which `poll`/`wait` already delivered output.
     delivered: u64,
+    /// Terminal input of a `pty = true` job.
+    input: Option<BackgroundJobInput>,
     terminal: Option<BackgroundJobTerminal>,
     stop_requested: bool,
     changed: Arc<Notify>,
@@ -944,6 +948,18 @@ struct OutputCommandOptions {
     input: Option<Vec<u8>>,
     capture: Option<SharedCommandCapture>,
     progress: Option<CommandProgress>,
+    stdio: CommandStdio,
+}
+
+/// How a captured command's stdio is connected.
+#[derive(Debug, Default)]
+enum CommandStdio {
+    /// Separate stdout/stderr pipes (stdin null or caller input).
+    #[default]
+    Pipes,
+    /// One pseudo-terminal for stdin, stdout and stderr.
+    #[cfg(unix)]
+    Pty(pty::PtyPair),
 }
 
 /// Bytes of recent output a [`CommandProgress`] keeps for display.
@@ -4541,7 +4557,7 @@ impl Sandbox {
         command: String,
         timeout: std::time::Duration,
     ) -> std::io::Result<String> {
-        self.start_background_command_logged(command, timeout, None)
+        self.start_background_command_logged(command, timeout, None, false)
             .await
     }
 
@@ -4552,6 +4568,7 @@ impl Sandbox {
         command: String,
         timeout: std::time::Duration,
         log_dir: Option<&Path>,
+        pty: bool,
     ) -> std::io::Result<String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             std::io::Error::other("background commands require an active Tokio runtime")
@@ -4560,6 +4577,8 @@ impl Sandbox {
             .background_jobs
             .next_sequence
             .fetch_add(1, Ordering::Relaxed);
+        let stdio = command_stdio(pty)?;
+        let input = background_input(&stdio);
         let id = format!("job-{}", uuid::Uuid::new_v4());
         let cancellation = CommandCancellation::new();
         let log_path = log_dir.map(|dir| dir.join(format!("shell-{id}.log")));
@@ -4600,6 +4619,7 @@ impl Sandbox {
                     capture: capture.clone(),
                     log_path,
                     delivered: 0,
+                    input,
                     terminal: None,
                     stop_requested: false,
                     changed,
@@ -4616,7 +4636,7 @@ impl Sandbox {
         let run = crate::spend::run::Run::current();
         std::mem::drop(runtime.spawn(crate::spend::run::scope(run, async move {
             let terminal = match sandbox
-                .run_background_command(command, timeout, &cancellation, capture.clone())
+                .run_background_command(command, timeout, &cancellation, capture.clone(), stdio)
                 .await
             {
                 Ok(output) => {
@@ -4779,6 +4799,50 @@ impl Sandbox {
         }
     }
 
+    /// Type `bytes` into a running `pty = true` job's terminal.
+    pub(crate) async fn write_background_job_input(
+        &self,
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        validate_background_job_id(id)?;
+        #[cfg(unix)]
+        if bytes.len() > pty::MAX_PTY_INPUT_BYTES {
+            return Err(format!(
+                "job_status input is limited to {} bytes per call",
+                pty::MAX_PTY_INPUT_BYTES
+            ));
+        }
+        let input = {
+            let jobs = self
+                .background_jobs
+                .jobs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let job = jobs
+                .get(id)
+                .ok_or_else(|| self.missing_background_job(id))?;
+            if job.terminal.is_some() {
+                return Err("background job has already finished; input was not sent".into());
+            }
+            job.input.clone().ok_or_else(|| {
+                "background job was not started with pty=true and has no terminal input".to_string()
+            })?
+        };
+        #[cfg(unix)]
+        {
+            input
+                .write_all(bytes)
+                .await
+                .map_err(|error| format!("failed to write job input: {error}"))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (input, bytes);
+            Err("pseudo-terminal input is not supported on this platform".into())
+        }
+    }
+
     pub(crate) fn background_job_summaries(&self) -> Vec<BackgroundJobSummary> {
         let jobs = self
             .background_jobs
@@ -4833,6 +4897,7 @@ impl Sandbox {
         timeout: std::time::Duration,
         cancellation: &CommandCancellation,
         capture: SharedCommandCapture,
+        stdio: CommandStdio,
     ) -> std::io::Result<CommandOutput> {
         if cancellation.is_cancelled() {
             return Ok(CommandOutput {
@@ -4860,6 +4925,7 @@ impl Sandbox {
                 input: None,
                 capture: Some(capture),
                 progress: None,
+                stdio,
             },
             response_tx,
         )
@@ -4897,7 +4963,9 @@ impl Sandbox {
         limits: CommandLimits,
         progress: Option<CommandProgress>,
         capture: &ShellOutputCapture,
+        pty: bool,
     ) -> std::io::Result<CommandOutput> {
+        let stdio = command_stdio(pty)?;
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
         let pending = PendingCommand::Shell {
@@ -4917,6 +4985,7 @@ impl Sandbox {
                             input: None,
                             capture: Some(capture),
                             progress,
+                            stdio,
                         },
                         response_tx,
                     )
@@ -5056,6 +5125,7 @@ impl Sandbox {
                             input,
                             capture: None,
                             progress,
+                            stdio: CommandStdio::Pipes,
                         },
                         response_tx,
                     )
@@ -5160,6 +5230,7 @@ impl Sandbox {
             input,
             capture,
             progress,
+            stdio,
         } = options;
         let settle_early = |output: CommandOutput, response_tx: oneshot::Sender<CommandOutput>| {
             if let Some(audit) = &audit {
@@ -5249,6 +5320,28 @@ impl Sandbox {
             // Captured/model-authored commands never own the user's terminal.
             cmd.stdin(Stdio::null());
         }
+        #[cfg(unix)]
+        if let CommandStdio::Pty(pair) = &stdio {
+            match pair.child_stdio() {
+                Ok([stdin, stdout, stderr]) => {
+                    cmd.stdin(stdin).stdout(stdout).stderr(stderr);
+                }
+                Err(error) => {
+                    settle_early(
+                        CommandOutput {
+                            exit_status: None,
+                            stdout: Vec::new(),
+                            stderr: format!("failed to prepare pseudo-terminal: {error}")
+                                .into_bytes(),
+                            status: CommandStatus::Failed,
+                            descendants_escaped: false,
+                        },
+                        response_tx,
+                    );
+                    return;
+                }
+            }
+        }
         let helper_owns_tree = cmd.helper_owns_tree();
         let (mut child, process) = match self.spawn_execution_command(&mut cmd, deadline, || {
             cancellation
@@ -5285,14 +5378,32 @@ impl Sandbox {
         let mut lifecycle = OutputCommandLifecycleGuard::new(process, audit);
         let captured = capture.unwrap_or_else(SharedCommandCapture::bounded);
         let (reader_error_tx, mut reader_error_rx) = mpsc::unbounded_channel();
-        let stdout_handle = spawn_bounded_pipe_reader(
-            child.stdout.take(),
-            CommandOutputStream::Stdout,
-            captured.clone(),
-            limits,
-            reader_error_tx.clone(),
-            progress.clone(),
-        );
+        let stdout_handle = match stdio {
+            CommandStdio::Pipes => spawn_bounded_pipe_reader(
+                child.stdout.take(),
+                CommandOutputStream::Stdout,
+                captured.clone(),
+                limits,
+                reader_error_tx.clone(),
+                progress.clone(),
+            ),
+            #[cfg(unix)]
+            CommandStdio::Pty(pair) => {
+                // Drop the command's copies of the slave so the terminal
+                // reports end of output once the child tree closes it.
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                spawn_bounded_pipe_reader(
+                    Some(pair.into_reader()),
+                    CommandOutputStream::Merged,
+                    captured.clone(),
+                    limits,
+                    reader_error_tx.clone(),
+                    progress.clone(),
+                )
+            }
+        };
         let stderr_handle = spawn_bounded_pipe_reader(
             child.stderr.take(),
             CommandOutputStream::Stderr,
@@ -5775,6 +5886,36 @@ fn validate_background_job_id(id: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
+type BackgroundJobInput = pty::PtyInput;
+#[cfg(not(unix))]
+type BackgroundJobInput = std::convert::Infallible;
+
+fn command_stdio(pty: bool) -> std::io::Result<CommandStdio> {
+    if !pty {
+        return Ok(CommandStdio::Pipes);
+    }
+    #[cfg(unix)]
+    {
+        pty::PtyPair::open().map(CommandStdio::Pty)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "pty=true is not supported on this platform",
+        ))
+    }
+}
+
+fn background_input(stdio: &CommandStdio) -> Option<BackgroundJobInput> {
+    match stdio {
+        CommandStdio::Pipes => None,
+        #[cfg(unix)]
+        CommandStdio::Pty(pair) => Some(pair.input()),
+    }
+}
+
 /// Drop the oldest terminal records over capacity, returning their ids and
 /// log paths (the log files themselves are kept).
 fn prune_background_jobs(
@@ -5986,7 +6127,7 @@ impl CapturedCommandOutput {
         limits: CommandLimits,
     ) -> Result<(), CommandOutputLimit> {
         let (output, stream_limit, stream_error) = match stream {
-            CommandOutputStream::Stdout => (
+            CommandOutputStream::Stdout | CommandOutputStream::Merged => (
                 &mut self.stdout,
                 limits.stdout_bytes,
                 CommandOutputLimit::Stdout,
@@ -6017,6 +6158,9 @@ impl CapturedCommandOutput {
 enum CommandOutputStream {
     Stdout,
     Stderr,
+    /// One stream carrying both (pseudo-terminal or merged pipe).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Merged,
 }
 
 impl CommandOutputStream {
@@ -6024,6 +6168,7 @@ impl CommandOutputStream {
         match self {
             Self::Stdout => OutputChannel::Stdout,
             Self::Stderr => OutputChannel::Stderr,
+            Self::Merged => OutputChannel::Merged,
         }
     }
 }
@@ -7140,6 +7285,7 @@ mod sandbox_tests {
             capture: SharedCommandCapture::spooled(SpoolPolicy::background(None)),
             log_path: None,
             delivered: 0,
+            input: None,
             terminal: terminal.then_some(BackgroundJobTerminal {
                 status: BackgroundJobStatus::Completed,
                 exit_code: Some(0),

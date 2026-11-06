@@ -11842,11 +11842,13 @@ mod workspace_tests {
                 command: "pwd; cat sentinel.txt".into(),
                 timeout: None,
                 background: false,
+                ..Default::default()
             }),
             second_bash.call(BashArgs {
                 command: "pwd; cat sentinel.txt".into(),
                 timeout: None,
                 background: false,
+                ..Default::default()
             })
         );
         let first_pwd = first_pwd.unwrap();
@@ -11990,6 +11992,7 @@ mod workspace_tests {
                 command: "cat sentinel.txt".into(),
                 timeout: None,
                 background: false,
+                ..Default::default()
             })
             .await
             .is_err()

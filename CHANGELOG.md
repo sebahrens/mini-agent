@@ -14,6 +14,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   `sandbox:net` status segment show it. Hooks, services and JS `spawn` stay denied
   (mini-agent-p0ski).
 
+- `shell` accepts `pty = true` (Unix) to run a command under its own pseudo-terminal, and
+  `job_status` gains `action = "input"` (at most 16 KiB per call) to type into a running pty
+  background job, so REPLs and prompting tools can be driven inside the sandbox
+  (mini-agent-gklvo).
+
 ### Changed
 
 - Foreground `shell` commands that print more than 1 MiB are no longer killed: the capture keeps
