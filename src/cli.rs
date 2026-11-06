@@ -204,6 +204,13 @@ pub struct Cli {
     pub stream_json_preview_bytes: Option<u32>,
 
     #[arg(
+        long = "include-partial-messages",
+        requires = "print",
+        help = "With -p --output stream-json: also emit coalesced text_delta and reasoning_delta events as the model streams (default off; other records are unchanged)"
+    )]
+    pub include_partial_messages: bool,
+
+    #[arg(
         long = "max-stdin-bytes",
         value_name = "BYTES",
         requires = "print",

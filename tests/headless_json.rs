@@ -2677,6 +2677,55 @@ fn stream_json_reports_real_tool_order_usage_identity_and_terminal_failures() {
 }
 
 #[test]
+fn include_partial_messages_adds_deltas_and_leaves_default_output_unchanged() {
+    let run = |partial: bool| -> Vec<serde_json::Value> {
+        let root = TempRoot::new();
+        let server = root.local_provider("tool_completed");
+        let mut command = root.provider_command("write");
+        command.args(["-p", "--output", "stream-json", "--no-session"]);
+        if partial {
+            command.arg("--include-partial-messages");
+        }
+        command.arg("write the file");
+        let output = bounded_output(command);
+        server.join().unwrap().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let plain = run(false);
+    let partial = run(true);
+    let is_delta = |row: &serde_json::Value| {
+        matches!(row["type"].as_str(), Some("text_delta" | "reasoning_delta"))
+    };
+    // Default output has no delta records.
+    assert!(!plain.iter().any(is_delta));
+    let delta = partial
+        .iter()
+        .find(|row| row["type"] == "text_delta")
+        .expect("a text_delta under --include-partial-messages");
+    assert_eq!(delta["text"], "partial reply");
+    assert_eq!(delta["message_id"], "msg_1");
+    assert_eq!(delta["truncated"], false);
+    // Everything else keeps its type order: final assistant_text and result unchanged.
+    let kinds = |rows: &[serde_json::Value]| -> Vec<String> {
+        rows.iter()
+            .filter(|row| !is_delta(row))
+            .map(|row| row["type"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(kinds(&plain), kinds(&partial));
+    assert!(
+        partial
+            .iter()
+            .any(|row| row["type"] == "assistant_text" && row["text"] == "partial reply")
+    );
+}
+
+#[test]
 fn piped_stdin_is_bounded_untrusted_model_context_and_invalid_input_is_local() {
     use std::process::Stdio;
     let root = TempRoot::new();

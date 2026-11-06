@@ -133,9 +133,29 @@ static PROGRESS_BYTES: std::sync::atomic::AtomicUsize =
 static STDIN_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(HEADLESS_STDIN_BYTES);
 
+static PARTIAL_MESSAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Completions finished so far this process; a delta's `message_id` names the
+/// completion in progress (`msg_<n>`, 1-based), so a driver can group deltas.
+static COMPLETIONS_FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn partial_messages() -> bool {
+    PARTIAL_MESSAGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn current_message_id() -> String {
+    format!(
+        "msg_{}",
+        COMPLETIONS_FINISHED.load(std::sync::atomic::Ordering::Relaxed) + 1
+    )
+}
+
 /// Apply `--stream-json-preview-bytes` / `--max-stdin-bytes` (clap already
-/// enforced their ranges).
+/// enforced their ranges) and `--include-partial-messages`.
 pub(crate) fn configure_headless_limits(cli: &cli::Cli) {
+    PARTIAL_MESSAGES.store(
+        cli.include_partial_messages,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if let Some(bytes) = cli.stream_json_preview_bytes {
         PROGRESS_BYTES.store(bytes as usize, std::sync::atomic::Ordering::Relaxed);
     }
@@ -161,6 +181,11 @@ pub(crate) struct HeadlessOutputPolicy {
     pub quiet: bool,
     /// Preserve the loop/test streaming contract; normal -p buffers its answer.
     pub legacy_stream: bool,
+}
+
+/// The opt-in token-level record; `text` is already bounded by the caller.
+fn partial_event(kind: &str, text: &str, truncated: bool) -> serde_json::Value {
+    serde_json::json!({"type":kind, "message_id":current_message_id(), "text":text, "truncated":truncated})
 }
 
 impl HeadlessOutputPolicy {
@@ -205,12 +230,27 @@ impl HeadlessOutputPolicy {
         }
         if self.format == cli::OutputFormat::StreamJson {
             let (text, truncated) = bounded_progress(text, progress_bytes());
+            if partial_messages() {
+                self.emit_event(partial_event("text_delta", &text, truncated))
+                    .await?;
+            }
             self.emit_event(
                 serde_json::json!({"type":"assistant_text", "text":text, "truncated":truncated}),
             )
             .await?;
         }
         Ok(())
+    }
+
+    /// A streamed reasoning fragment: the usual stderr display, plus a
+    /// `reasoning_delta` event under `--include-partial-messages`.
+    pub(crate) async fn reasoning_delta(self, text: &str) -> anyhow::Result<()> {
+        if self.format == cli::OutputFormat::StreamJson && partial_messages() {
+            let (bounded, truncated) = bounded_progress(text, progress_bytes());
+            self.emit_event(partial_event("reasoning_delta", &bounded, truncated))
+                .await?;
+        }
+        self.reasoning(text).await
     }
 
     pub(crate) async fn reasoning(self, text: &str) -> anyhow::Result<()> {
@@ -290,6 +330,7 @@ impl HeadlessOutputPolicy {
         delta: crate::event::UsageDelta,
         cumulative: Usage,
     ) -> anyhow::Result<()> {
+        COMPLETIONS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if delta.has_values() {
             let delta: Usage = delta.into();
             self.emit_event(
