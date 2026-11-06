@@ -26,6 +26,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `/import` accepts the persisted-session bounds (100,000 messages; 48 MiB JSONL for the 32 MiB
+  snapshot cap plus framing) instead of 10,000 messages / 16 MiB, so every saved session that
+  `/export` writes as JSONL can be re-imported.
 - ACP (IDE) sessions no longer force a paid summarization after 128 user turns or 2 MiB regardless
   of the model: compaction follows token pressure against the routed model's context window under
   `compact_enabled` (as in the TUI), the byte guard scales with the window, and the turn cap,

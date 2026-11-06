@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::session::Session;
 
 pub(crate) const MAX_SESSION_BYTES: usize = 32 * 1024 * 1024;
-const MAX_SESSION_MESSAGES: usize = 100_000;
+pub(crate) const MAX_SESSION_MESSAGES: usize = 100_000;
 
 /// The persisted-storage error remains static and never includes session data.
 /// Frontends can use the attached counts for an actionable, deduplicated notice.
