@@ -3733,6 +3733,16 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    fn project_config_cannot_set_api_key_commands_without_trust() {
+        let (benign, _, sensitive) =
+            split_project_override("[api_key_commands.gw]\ncommand = [\"print-token\"]\n").unwrap();
+        assert!(sensitive.contains("api_key_commands"), "{sensitive:?}");
+        assert!(benign.get("api_key_commands").is_none());
+        // Closed unless configured.
+        assert!(crate::config::Config::default().api_key_commands.is_none());
+    }
+
+    #[test]
     fn project_config_cannot_enable_user_instruction_files_without_trust() {
         let (benign, _, sensitive) =
             split_project_override("user_instruction_files = true\nmax_tokens = 1\n").unwrap();

@@ -150,8 +150,57 @@ impl ProviderHttpClient {
     }
     async fn prepare_request(
         &self,
-        mut request: Request<Bytes>,
+        request: Request<Bytes>,
     ) -> http_client::Result<reqwest::RequestBuilder> {
+        self.prepare_request_applied(request)
+            .await
+            .map(|(builder, _)| builder)
+    }
+
+    /// Sends `request`. When it carried a command-issued credential
+    /// (`api_key_commands`) and got `401`, the credential is renewed and the
+    /// same request is resent exactly once (mini-agent-toywy).
+    async fn send_with_credentials(
+        &self,
+        request: Request<Bytes>,
+    ) -> http_client::Result<reqwest::Response> {
+        let (parts, body) = request.into_parts();
+        let rebuild = |headers: http::HeaderMap| -> http_client::Result<Request<Bytes>> {
+            let mut again = Request::builder()
+                .method(parts.method.clone())
+                .uri(parts.uri.clone())
+                .version(parts.version)
+                .body(body.clone())
+                .map_err(http_client::Error::Protocol)?;
+            *again.headers_mut() = headers;
+            Ok(again)
+        };
+        let original_headers = parts.headers.clone();
+        let (builder, applied) = self
+            .prepare_request_applied(rebuild(original_headers.clone())?)
+            .await?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
+        if response.status() != http::StatusCode::UNAUTHORIZED
+            || applied.is_empty()
+            || !crate::key_command::renew_after_unauthorized(&applied).await
+        {
+            return Ok(response);
+        }
+        self.prepare_request(rebuild(original_headers)?)
+            .await?
+            .send()
+            .await
+            .map_err(|error| http_client::Error::Instance(Box::new(error)))
+    }
+
+    async fn prepare_request_applied(
+        &self,
+        mut request: Request<Bytes>,
+    ) -> http_client::Result<(reqwest::RequestBuilder, Vec<crate::key_command::Applied>)> {
+        let applied = crate::key_command::apply_all(request.headers_mut()).await;
         #[cfg(feature = "bedrock")]
         if let Some(auth) = &self.0.bedrock {
             auth.prepare(&mut request).await?;
@@ -197,13 +246,15 @@ impl ProviderHttpClient {
                 .to_string(),
             None => destination,
         };
-        Ok(self
-            .0
-            .client
-            .request(parts.method, destination)
-            .version(parts.version)
-            .headers(parts.headers)
-            .body(body))
+        Ok((
+            self.0
+                .client
+                .request(parts.method, destination)
+                .version(parts.version)
+                .headers(parts.headers)
+                .body(body),
+            applied,
+        ))
     }
     pub(crate) fn listing_identity(&self) -> std::sync::Weak<()> {
         std::sync::Arc::downgrade(&self.0.identity)
@@ -363,12 +414,7 @@ impl HttpClientExt for ProviderHttpClient {
         let this = self.clone();
         let request = request.map(Into::into);
         async move {
-            let mut response = this
-                .prepare_request(request)
-                .await?
-                .send()
-                .await
-                .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
+            let mut response = this.send_with_credentials(request).await?;
             if !response.status().is_success() {
                 return Err(response_error(response, this.private_error_message()).await);
             }
@@ -454,22 +500,13 @@ impl HttpClientExt for ProviderHttpClient {
         let request = request.map(Into::into);
         let budget_guard = crate::spend::run::Run::current().and_then(|run| run.sdk_stream_guard());
         async move {
-            let request = match client.prepare_request(request).await {
-                Ok(request) => request,
-                Err(error) => {
-                    if let Some(guard) = &budget_guard {
-                        guard.finished();
-                    }
-                    return Err(error);
-                }
-            };
-            let response = match request.send().await {
+            let response = match client.send_with_credentials(request).await {
                 Ok(response) => response,
                 Err(error) => {
                     if let Some(guard) = &budget_guard {
                         guard.finished();
                     }
-                    return Err(http_client::Error::Instance(Box::new(error)));
+                    return Err(error);
                 }
             };
             if !response.status().is_success() {

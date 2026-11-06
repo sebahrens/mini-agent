@@ -860,6 +860,11 @@ pub struct Config {
     pub editor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<HashMap<String, String>>,
+    /// Per-provider trusted commands that print an API key or bearer token, for
+    /// short-lived gateway credentials. Opt-in, global or trusted-project only;
+    /// see `key_command` (mini-agent-toywy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_commands: Option<HashMap<String, crate::key_command::ApiKeyCommandSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quick_models: Option<HashMap<String, types::QuickModelConfig>>,
     /// Map prompt names to quick-model names. When switching to a prompt,

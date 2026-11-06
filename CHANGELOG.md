@@ -45,6 +45,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Opt-in `api_key_commands` (per provider, built-in or custom): a trusted argv command prints the API key or bearer token, cached for a configurable TTL and re-run once on a `401` before the request is resent, so short-lived gateway tokens no longer end a session. No shell, bounded timeout and output, run outside the model sandbox, trust-gated for project config, and failures never echo command output (mini-agent-toywy).
 - `user_instruction_files = true` (default off, trust-gated for project config) also reads `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` as user-level instructions after mini-agent's own global `AGENTS.md`, under the shared context-file budget and the global file's captured read; `/context` shows their full paths (mini-agent-4l9rf).
 - `.claude/CLAUDE.md` and `.claude/rules/**/*.md` are now read like Claude Code's modular project instructions: unconditional rules load with the root context, and rules whose `paths:` frontmatter lists globs are delivered the first time a tool touches a matching file, through the same trust gate, budget and data framing as a nested `CLAUDE.md` (mini-agent-dzrup).
 - `-p --output stream-json` `system` records now describe the effective run: `init` gains `subtype`, `cwd`, `permission_mode` and `sandbox`, and a new `capabilities` record lists the model's tool names and each configured MCP server's connection status (with a credential-free error for a failed one) (mini-agent-f71r6).

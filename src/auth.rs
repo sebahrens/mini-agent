@@ -245,6 +245,8 @@ pub enum ResolvedCredential {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialSource {
     Cli,
+    /// A trusted `api_key_commands` entry; names the provider only.
+    Command(String),
     Environment(String),
     Config(String),
     NotRequired,
@@ -364,7 +366,7 @@ impl AuthResolver {
         &self,
         get_env: F,
     ) -> anyhow::Result<CredentialSource> {
-        self.resolve_credential_from_sources(get_env)
+        self.resolve_credential_from_sources_with(get_env, false)
             .map(|(_, source)| source)
     }
 
@@ -381,6 +383,16 @@ impl AuthResolver {
         &self,
         get_env: F,
     ) -> anyhow::Result<(ResolvedCredential, CredentialSource)> {
+        self.resolve_credential_from_sources_with(get_env, true)
+    }
+
+    /// `run_command` is false for read-only reporting, which names a
+    /// configured credential command without running it.
+    fn resolve_credential_from_sources_with<F: Fn(&str) -> Result<String, VarError>>(
+        &self,
+        get_env: F,
+        run_command: bool,
+    ) -> anyhow::Result<(ResolvedCredential, CredentialSource)> {
         let custom = self.custom_provider();
 
         // Priority 1: CLI argument
@@ -393,6 +405,20 @@ impl AuthResolver {
                     .unwrap_or_else(|| self.env_var_name())
             );
             return Ok((self.explicit_credential(key.clone()), CredentialSource::Cli));
+        }
+
+        // Priority 1b: a trusted `api_key_commands` entry for this provider
+        // (opt-in configuration; explicit enough to outrank an ambient
+        // environment variable).
+        if let Some(name) = self.custom_provider_name.as_deref()
+            && let Some(command) = crate::key_command::for_provider(name)
+        {
+            let source = CredentialSource::Command(name.to_owned());
+            if !run_command {
+                return Ok((self.explicit_credential(String::new()), source));
+            }
+            let key = command.resolve_blocking().map_err(anyhow::Error::msg)?;
+            return Ok((self.explicit_credential(key), source));
         }
 
         // Priority 2: Environment variable. Custom providers only ever read

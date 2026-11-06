@@ -343,10 +343,12 @@ Header values can reference environment variables with `${VAR}` syntax:
 The API key is resolved in this priority order:
 
 1. **CLI flag** `--api-key` (visible in process listings — use with care)
-2. **Environment variable** — either the custom one from `api_key_env`, or the
+2. **Credential command** — an opt-in `[api_key_commands.<provider>]` entry (see
+   [Command-backed credentials](#command-backed-credentials) below)
+3. **Environment variable** — either the custom one from `api_key_env`, or the
    default env var for the provider kind
-3. **Config file** `api_keys` map — keyed by provider slug or custom provider name
-4. **Ollama** — returns an empty string (no key required)
+4. **Config file** `api_keys` map — keyed by provider slug or custom provider name
+5. **Ollama** — returns an empty string (no key required)
 
 For native Anthropic, `ANTHROPIC_AUTH_TOKEN` is a typed bearer alternative after
 `--api-key` and the designated API-key environment variable, before config keys.
@@ -355,6 +357,31 @@ following [Anthropic's API authentication contract](https://platform.claude.com/
 An isolated custom route or an explicit `api_key_env` does not inherit this token;
 `inherit_builtin_key = true` permits the native fallback for a custom route without
 an alternate `api_key_env`. Credentials are never classified by their string contents.
+
+### Command-backed credentials
+
+Enterprise gateways and cloud-minted tokens (one-hour JWTs, SSO bearer tokens) expire
+mid-session. A provider, built-in or custom, can name a trusted command that prints the
+current key or token instead of a static one:
+
+```toml
+[api_key_commands.my-gateway]
+command = ["print-gateway-token", "--audience", "llm"]
+ttl_secs = 300      # reuse a result this long; 0 = re-run only after a 401
+timeout_secs = 10   # kill the command after this long (1-120)
+```
+
+The command is an argv vector run without a shell, with your environment, outside the model
+sandbox. It is read from your own configuration only; a project `.mini-agent/config.toml` can
+supply it only after the project is trusted. Standard output (at most 16 KiB) must be a single
+line, the credential; standard error is discarded. A result is cached for `ttl_secs`. A request
+that gets HTTP `401` re-runs the command once and is resent once with the new credential, and
+every later request from already-built clients carries it as well, so an expired token does not
+end the session. If the command prints the same rejected credential the `401` is returned
+unchanged. A failing, timing-out or malformed command is reported by provider and program name
+only. The credential is not written to logs or saved sessions. `--doctor` names the command as
+the credential source without running it. Bedrock, Vertex and the Copilot login use their own
+flows and ignore this table.
 
 `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` are endpoint fallbacks when no endpoint
 is configured. Configured custom endpoints always win. An OpenAI gateway fallback
