@@ -125,6 +125,22 @@ pub(crate) enum AgentTurnBudget {
     High,
 }
 
+/// Per-persona child run settings from frontmatter (`max_turns`,
+/// `timeout_secs`). Each is checked against `[subagents]` ceilings when a
+/// task uses the persona; a value above its ceiling rejects the call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgentRunSettings {
+    /// Child model turns; replaces the `turn_budget` fraction of `task_max_turns`.
+    pub(crate) max_turns: Option<usize>,
+    /// Whole-call deadline in seconds for calls using this persona.
+    pub(crate) timeout_secs: Option<u64>,
+}
+
+/// Largest `max_turns` frontmatter value accepted while parsing.
+const MAX_FRONTMATTER_TURNS: u64 = 10_000;
+/// Largest `timeout_secs` frontmatter value accepted while parsing.
+const MAX_FRONTMATTER_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AgentMetadata {
     mode: Option<String>,
@@ -138,6 +154,7 @@ struct AgentMetadata {
     isolation_worktree: bool,
     /// `inline_images: N` (0-3) narrows `[subagents] task_inline_images`.
     inline_images: Option<u8>,
+    run: AgentRunSettings,
     /// The turn budget came from the deprecated `effort` alias.
     deprecated_effort_alias: bool,
     #[cfg(feature = "mcp")]
@@ -310,6 +327,28 @@ fn normalize_agent_definition(
             _ => return Err("frontmatter inline_images must be an integer from 0 to 3"),
         },
     };
+    let bounded_integer = |key: &str, max: u64, error: &'static str| match mapping
+        .get(serde_yaml_ng::Value::String(key.into()))
+    {
+        None => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(count @ 1..) if count <= max => Ok(Some(count)),
+            _ => Err(error),
+        },
+    };
+    let run = AgentRunSettings {
+        max_turns: bounded_integer(
+            "max_turns",
+            MAX_FRONTMATTER_TURNS,
+            "frontmatter max_turns must be an integer from 1 to 10000",
+        )?
+        .map(|turns| turns as usize),
+        timeout_secs: bounded_integer(
+            "timeout_secs",
+            MAX_FRONTMATTER_TIMEOUT_SECS,
+            "frontmatter timeout_secs must be an integer from 1 to 86400",
+        )?,
+    };
     #[cfg(feature = "mcp")]
     let mcp_servers = mapping
         .get(serde_yaml_ng::Value::String("mcp_servers".into()))
@@ -327,6 +366,8 @@ fn normalize_agent_definition(
         "turn_budget",
         "effort",
         "inline_images",
+        "max_turns",
+        "timeout_secs",
         "mcp_servers",
     ];
     #[cfg(not(feature = "mcp"))]
@@ -341,6 +382,8 @@ fn normalize_agent_definition(
         "turn_budget",
         "effort",
         "inline_images",
+        "max_turns",
+        "timeout_secs",
     ];
     let mut unknown_keys = mapping
         .keys()
@@ -368,6 +411,7 @@ fn normalize_agent_definition(
                     turn_budget,
                     isolation_worktree,
                     inline_images,
+                    run,
                     deprecated_effort_alias,
                     #[cfg(feature = "mcp")]
                     mcp_servers,
@@ -622,6 +666,8 @@ pub struct AgentDefinition {
     pub(crate) isolation_worktree: bool,
     /// `inline_images: N`: narrows the configured inline image lane cap.
     pub(crate) inline_images: Option<u8>,
+    /// `max_turns` / `timeout_secs` child run settings.
+    pub(crate) run: AgentRunSettings,
     pub source: AgentDefinitionSource,
     project_notes_path: Option<PathBuf>,
     ignored_definition_notices: Vec<String>,
@@ -649,6 +695,7 @@ fn merge_definitions(
                 mcp_servers: metadata.mcp_servers,
                 isolation_worktree: metadata.isolation_worktree,
                 inline_images: metadata.inline_images,
+                run: metadata.run,
                 source: source.clone(),
                 project_notes_path: None,
                 ignored_definition_notices: notices,
@@ -692,6 +739,7 @@ impl AgentDefinition {
             mcp_servers: None,
             isolation_worktree: false,
             inline_images: None,
+            run: AgentRunSettings::default(),
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -1066,6 +1114,7 @@ fn merge_external_definitions(
                         mcp_servers: metadata.mcp_servers,
                         isolation_worktree: metadata.isolation_worktree,
                         inline_images: metadata.inline_images,
+                        run: metadata.run,
                         source: source.clone(),
                         project_notes_path: None,
                         ignored_definition_notices: notices,
@@ -2371,6 +2420,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn persona_max_turns_and_timeout_are_bounded_positive_integers() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition(
+                "long".into(),
+                format!("---\nname: long\n{frontmatter}\n---\nbody"),
+            )
+        };
+        assert_eq!(
+            parse("tools: Read").unwrap().2.run,
+            AgentRunSettings::default()
+        );
+        let parsed = parse("max_turns: 60\ntimeout_secs: 1800").unwrap().2;
+        assert_eq!(parsed.run.max_turns, Some(60));
+        assert_eq!(parsed.run.timeout_secs, Some(1800));
+        assert!(parsed.unknown_keys.is_empty());
+        assert!(parse("max_turns: 0").unwrap_err().contains("max_turns"));
+        assert!(parse("max_turns: lots").unwrap_err().contains("max_turns"));
+        assert!(
+            parse("timeout_secs: 86401")
+                .unwrap_err()
+                .contains("timeout_secs")
+        );
+    }
+
+    #[test]
     fn persona_isolation_is_an_explicit_worktree_opt_in() {
         let parse = |frontmatter: &str| {
             normalize_agent_definition(
@@ -2582,6 +2656,7 @@ pub(crate) mod tests {
             mcp_servers: None,
             isolation_worktree: false,
             inline_images: None,
+            run: AgentRunSettings::default(),
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -2598,6 +2673,7 @@ pub(crate) mod tests {
             mcp_servers: None,
             isolation_worktree: false,
             inline_images: None,
+            run: AgentRunSettings::default(),
             source: AgentDefinitionSource::UserGlobal,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -2620,6 +2696,7 @@ pub(crate) mod tests {
             mcp_servers: None,
             isolation_worktree: false,
             inline_images: None,
+            run: AgentRunSettings::default(),
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),

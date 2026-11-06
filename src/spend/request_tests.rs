@@ -1013,6 +1013,7 @@ async fn usd_budget_native_actual_task_batch_held_children_keep_independent_prof
         briefs: None,
         agent_type: Some("cost-fixture".into()),
         run_in_background: false,
+        options: Default::default(),
     };
     let work = super::run::scope(
         Some(run.clone()),

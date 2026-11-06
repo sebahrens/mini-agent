@@ -20,6 +20,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Background reports longer than the 16 KiB saved-entry ceiling are kept in full in the session's
   private tool-output directory; after a restart `task_result` and `/tasks result` return the full
   report, and the saved copy ends with an explicit truncation notice naming its size and path.
+- `task` accepts per-call `max_turns` and `timeout_secs`, and personas accept `max_turns` and
+  `timeout_secs` frontmatter; values above `[subagents] task_max_turns_ceiling` (default 100) or
+  `task_timeout_ceiling_secs` (default 3600) are rejected instead of clamped.
 
 **Fork release 1.14.2 (2026-10-28)**
 

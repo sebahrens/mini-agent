@@ -33,6 +33,10 @@ const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Default deadline of a `run_in_background` call (`[subagents]
 /// task_background_timeout_secs`): background work is meant to be long.
 const DEFAULT_BACKGROUND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Default `[subagents] task_max_turns_ceiling` for per-call/persona turns.
+const DEFAULT_MAX_TURNS_CEILING: usize = 100;
+/// Default `[subagents] task_timeout_ceiling_secs` for per-call/persona deadlines.
+const DEFAULT_TIMEOUT_CEILING_SECS: u64 = 60 * 60;
 const MIN_OUTPUT_BYTES: usize = 256;
 const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BRIEF_BYTES: usize = 64 * 1024;
@@ -57,6 +61,18 @@ pub struct TaskArgs {
     pub agent_type: Option<String>,
     /// Return a session-owned job ID instead of waiting for the child batch.
     pub run_in_background: bool,
+    /// Optional per-call execution settings (turns, deadline, ...).
+    pub options: TaskCallOptions,
+}
+
+/// Optional per-call settings of a `task` call. Each is bounded by a
+/// configured ceiling and rejected, never silently clamped, beyond it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskCallOptions {
+    /// Model turns per child, overriding the persona and `task_max_turns`.
+    pub max_turns: Option<usize>,
+    /// Whole-call deadline in seconds, overriding the persona and config.
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -218,9 +234,17 @@ impl<'de> Deserialize<'de> for TaskArgs {
             agent_type: Option<String>,
             #[serde(default)]
             run_in_background: bool,
+            #[serde(default)]
+            max_turns: Option<usize>,
+            #[serde(default)]
+            timeout_secs: Option<u64>,
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
+        let options = TaskCallOptions {
+            max_turns: raw.max_turns,
+            timeout_secs: raw.timeout_secs,
+        };
         let mut raw_briefs = raw.briefs.map(|briefs| briefs.0);
         let mut agent_type = raw.agent_type;
         if let Some(briefs) = raw_briefs.as_mut() {
@@ -281,12 +305,14 @@ impl<'de> Deserialize<'de> for TaskArgs {
                 briefs: None,
                 agent_type: raw.agent_type,
                 run_in_background: raw.run_in_background,
+                options,
             }),
             (false, true) => Ok(Self {
                 prompts: Vec::new(),
                 briefs: raw.briefs,
                 agent_type: raw.agent_type,
                 run_in_background: raw.run_in_background,
+                options,
             }),
             // Neither form is populated. Keep a present-but-empty field so
             // `TaskTool::call` reports the specific validation failure.
@@ -296,12 +322,14 @@ impl<'de> Deserialize<'de> for TaskArgs {
                     briefs: None,
                     agent_type: raw.agent_type,
                     run_in_background: raw.run_in_background,
+                    options,
                 }),
                 (None, Some(briefs)) => Ok(Self {
                     prompts: Vec::new(),
                     briefs: Some(briefs),
                     agent_type: raw.agent_type,
                     run_in_background: raw.run_in_background,
+                    options,
                 }),
                 _ => Err(serde::de::Error::custom(TASK_MISSING_HANDOFF_ERROR)),
             },
@@ -399,6 +427,72 @@ impl TaskLimits {
         }
         Ok(self)
     }
+}
+
+/// The configured ceilings for per-call and persona run settings.
+fn run_ceilings(config: &crate::config::Config) -> (usize, u64) {
+    let policy = config.subagents.as_ref();
+    (
+        policy
+            .and_then(|policy| policy.task_max_turns_ceiling)
+            .unwrap_or(DEFAULT_MAX_TURNS_CEILING),
+        policy
+            .and_then(|policy| policy.task_timeout_ceiling_secs)
+            .unwrap_or(DEFAULT_TIMEOUT_CEILING_SECS)
+            .min(MAX_CALL_TIMEOUT.as_secs()),
+    )
+}
+
+/// Apply per-call `max_turns`/`timeout_secs` (taking precedence) and the
+/// persona's frontmatter values. A value above its configured ceiling is
+/// rejected with the key that raises it, never clamped.
+fn apply_run_settings(
+    options: &TaskCallOptions,
+    persona: Option<crate::context::agents::AgentRunSettings>,
+    config: &crate::config::Config,
+    max_turns: &mut usize,
+    limits: &mut TaskLimits,
+) -> Result<(), ToolError> {
+    let (turns_ceiling, timeout_ceiling) = run_ceilings(config);
+    let persona = persona.unwrap_or_default();
+    let check_turns = |turns: usize, source: &str| {
+        if turns == 0 {
+            return Err(ToolError::Msg(format!(
+                "task: {source} max_turns must be at least 1"
+            )));
+        }
+        if turns > turns_ceiling {
+            return Err(ToolError::Msg(format!(
+                "task: {source} max_turns {turns} exceeds the ceiling of {turns_ceiling}; raise [subagents] task_max_turns_ceiling to allow it"
+            )));
+        }
+        Ok(turns)
+    };
+    let check_timeout = |secs: u64, source: &str| {
+        if secs == 0 {
+            return Err(ToolError::Msg(format!(
+                "task: {source} timeout_secs must be at least 1"
+            )));
+        }
+        if secs > timeout_ceiling {
+            return Err(ToolError::Msg(format!(
+                "task: {source} timeout_secs {secs} exceeds the ceiling of {timeout_ceiling}; raise [subagents] task_timeout_ceiling_secs (at most {}) to allow it",
+                MAX_CALL_TIMEOUT.as_secs()
+            )));
+        }
+        Ok(Duration::from_secs(secs))
+    };
+    if let Some(turns) = options.max_turns {
+        *max_turns = check_turns(turns, "the call's")?;
+    } else if let Some(turns) = persona.max_turns {
+        *max_turns = check_turns(turns, "the persona's")?;
+    }
+    if let Some(secs) = options.timeout_secs {
+        limits.timeout = check_timeout(secs, "the call's")?;
+    } else if let Some(secs) = persona.timeout_secs {
+        limits.timeout = check_timeout(secs, "the persona's")?;
+    }
+    Ok(())
 }
 
 fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolError> {
@@ -533,6 +627,8 @@ struct ResolvedSpecialization {
     turn_budget: Option<crate::context::agents::AgentTurnBudget>,
     /// Persona narrowing of the inline image lane.
     inline_images: Option<u8>,
+    /// Frontmatter `max_turns` / `timeout_secs`.
+    run: crate::context::agents::AgentRunSettings,
     #[cfg(feature = "mcp")]
     mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
@@ -727,6 +823,7 @@ fn resolve_specialization(
         model: definition.model,
         turn_budget: definition.turn_budget,
         inline_images: definition.inline_images,
+        run: definition.run,
         #[cfg(feature = "mcp")]
         mcp_servers: definition.mcp_servers,
     }))
@@ -978,8 +1075,16 @@ editing in a known location, grepping for a literal you will act on immediately.
     }
 
     fn parameters(&self) -> serde_json::Value {
-        let max_prompts =
-            with_config(|cfg| cfg.config.resolve_task_max_prompts()).unwrap_or(DEFAULT_MAX_PROMPTS);
+        let (max_prompts, (turns_ceiling, timeout_ceiling)) = with_config(|cfg| {
+            (
+                cfg.config.resolve_task_max_prompts(),
+                run_ceilings(&cfg.config),
+            )
+        })
+        .unwrap_or((
+            DEFAULT_MAX_PROMPTS,
+            (DEFAULT_MAX_TURNS_CEILING, DEFAULT_TIMEOUT_CEILING_SECS),
+        ));
         let specialist_entries = crate::context::agents::available_schema_entries_for_workspace(
             self.workspace.as_deref(),
         );
@@ -1029,6 +1134,18 @@ editing in a known location, grepping for a literal you will act on immediately.
                         "required": ["objective"]
                     },
                     "description": "Structured handoffs for independent subagents. Each gives an objective plus optional file scope hints, constraints, and expected content. Send either briefs or prompts, never both populated: omit this field or pass [] when using prompts."
+                },
+                "max_turns": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": turns_ceiling,
+                    "description": format!("Optional model turns per child for this call (default: the persona's max_turns, else task_max_turns, normally 20). Values above the configured ceiling ({turns_ceiling}, [subagents] task_max_turns_ceiling) are rejected.")
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": timeout_ceiling,
+                    "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs 300 in the foreground or task_background_timeout_secs 3600 in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
                 },
                 "run_in_background": {
                     "type": "boolean",
@@ -1167,7 +1284,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         let result_notice = specialization
             .as_ref()
             .and_then(|resolved| resolved.result_notice.clone());
-        let runtime = resolve_persona_runtime(
+        let mut runtime = resolve_persona_runtime(
             client,
             &provider_name,
             &session_provider,
@@ -1176,6 +1293,13 @@ editing in a known location, grepping for a literal you will act on immediately.
             api_key.as_deref(),
             &config,
             specialization.as_ref(),
+        )?;
+        apply_run_settings(
+            &args.options,
+            specialization.as_ref().map(|persona| persona.run),
+            &config,
+            &mut runtime.max_turns,
+            &mut limits,
         )?;
         let selected_alias = specialization
             .as_ref()
@@ -4380,6 +4504,7 @@ mod tests {
             }]),
             agent_type: None,
             run_in_background: false,
+            options: Default::default(),
         };
 
         let prompts = prepare_task_prompts(&args, limits()).unwrap();
@@ -4400,6 +4525,7 @@ mod tests {
             briefs: Some(Vec::new()),
             agent_type: None,
             run_in_background: false,
+            options: Default::default(),
         };
         assert!(prepare_task_prompts(&empty, limits()).is_err());
 
@@ -4413,6 +4539,7 @@ mod tests {
             }]),
             agent_type: None,
             run_in_background: false,
+            options: Default::default(),
         };
         let error = prepare_task_prompts(&oversized, limits()).unwrap_err();
         assert!(error.to_string().contains("files item 1"));
@@ -4436,6 +4563,7 @@ mod tests {
             }]),
             agent_type: None,
             run_in_background: false,
+            options: Default::default(),
         };
         let response = "## Findings\n- [confidence: high] No finding.\n\n## Unverified\n- Runtime behavior.\n\n## Coverage\n- Covered: src/auth.rs.\n- Skipped: None.";
 
@@ -4546,6 +4674,7 @@ mod tests {
             model: None,
             turn_budget: None,
             inline_images: None,
+            run: Default::default(),
             #[cfg(feature = "mcp")]
             mcp_servers: None,
         };
@@ -4583,6 +4712,7 @@ mod tests {
             model: Some("fast-review".into()),
             turn_budget: Some(crate::context::agents::AgentTurnBudget::Medium),
             inline_images: None,
+            run: Default::default(),
             #[cfg(feature = "mcp")]
             mcp_servers: None,
         }
@@ -5363,6 +5493,102 @@ mod tests {
         )
         .await;
         assert!(matches!(report.stop_reason, Some(StopReason::Deadline)));
+    }
+
+    #[test]
+    fn per_call_and_persona_run_settings_are_bounded_by_ceilings() {
+        use crate::context::agents::AgentRunSettings;
+        let mut config = crate::config::Config::default();
+        let base = TaskLimits::from_config(&config).validate().unwrap();
+        let run = |options: TaskCallOptions,
+                   persona: Option<AgentRunSettings>,
+                   config: &crate::config::Config| {
+            let mut turns = 20;
+            let mut limits = base;
+            apply_run_settings(&options, persona, config, &mut turns, &mut limits)
+                .map(|()| (turns, limits.timeout.as_secs()))
+        };
+        assert_eq!(
+            run(TaskCallOptions::default(), None, &config).unwrap(),
+            (20, 300)
+        );
+        let persona = AgentRunSettings {
+            max_turns: Some(60),
+            timeout_secs: Some(900),
+        };
+        assert_eq!(
+            run(TaskCallOptions::default(), Some(persona), &config).unwrap(),
+            (60, 900)
+        );
+        // The call takes precedence over the persona.
+        let call = TaskCallOptions {
+            max_turns: Some(40),
+            timeout_secs: Some(1200),
+        };
+        assert_eq!(
+            run(call.clone(), Some(persona), &config).unwrap(),
+            (40, 1200)
+        );
+        // Above the ceiling is rejected, naming the key that raises it.
+        let error = run(
+            TaskCallOptions {
+                max_turns: Some(101),
+                ..Default::default()
+            },
+            None,
+            &config,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exceeds the ceiling of 100"), "{error}");
+        assert!(error.contains("task_max_turns_ceiling"));
+        let error = run(
+            TaskCallOptions::default(),
+            Some(AgentRunSettings {
+                timeout_secs: Some(7200),
+                ..Default::default()
+            }),
+            &config,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("task_timeout_ceiling_secs"), "{error}");
+        assert!(
+            run(
+                TaskCallOptions {
+                    max_turns: Some(0),
+                    ..Default::default()
+                },
+                None,
+                &config
+            )
+            .is_err()
+        );
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_max_turns_ceiling: Some(500),
+            task_timeout_ceiling_secs: Some(7200),
+            ..Default::default()
+        });
+        let raised = TaskCallOptions {
+            max_turns: Some(400),
+            timeout_secs: Some(7200),
+        };
+        assert_eq!(run(raised, None, &config).unwrap(), (400, 7200));
+    }
+
+    #[test]
+    fn task_args_accept_per_call_run_settings() {
+        let args: TaskArgs = serde_json::from_value(serde_json::json!({
+            "prompts": ["q"],
+            "max_turns": 50,
+            "timeout_secs": 600
+        }))
+        .unwrap();
+        assert_eq!(args.options.max_turns, Some(50));
+        assert_eq!(args.options.timeout_secs, Some(600));
+        let schema = TaskTool::new(None, None, false).parameters();
+        assert_eq!(schema["properties"]["max_turns"]["maximum"], 100);
+        assert_eq!(schema["properties"]["timeout_secs"]["maximum"], 3600);
     }
 
     #[tokio::test(start_paused = true)]

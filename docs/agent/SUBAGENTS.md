@@ -151,6 +151,14 @@ permission grants. `constraints` bound the investigation, while
 sections rather than replacing them. Each list is limited to 64 non-empty
 items, each item to 8 KiB, and the complete rendered brief to 64 KiB.
 
+Optional `max_turns` and `timeout_secs` arguments set the child model-turn
+budget and the whole-call deadline for one call (for example
+`{"prompts": ["…"], "max_turns": 60, "timeout_secs": 1800}`). They override a
+persona's frontmatter values and the configured defaults, and are rejected
+when above `[subagents] task_max_turns_ceiling` (default 100) or
+`task_timeout_ceiling_secs` (default 3600, at most 86400); the schema states
+the current ceilings.
+
 - **Single prompt**: one subagent explores, returns findings.
 - **Multiple prompts or briefs**: up to `task_max_concurrency` subagents run at once.
   Each result appears under a `## Task N:` heading in original prompt order.
@@ -504,6 +512,14 @@ mode: review
   `[reasoning] effort`. The older `effort` key is still accepted as a
   deprecated alias and logs a warning; setting both `turn_budget` and `effort`
   rejects the definition.
+- `max_turns` (1–10000) sets the child's model-turn budget, replacing the
+  `turn_budget` fraction of `task_max_turns`; `timeout_secs` (1–86400) sets
+  the whole-call deadline of calls using the persona. Both may exceed the
+  global defaults but are checked against `[subagents] task_max_turns_ceiling`
+  (default 100) and `task_timeout_ceiling_secs` (default 3600): a value above
+  its ceiling rejects the `task` call with an error naming the key, never a
+  silent clamp. A per-call `max_turns`/`timeout_secs` argument takes
+  precedence over the persona.
 - `inline_images` is an integer from 0 to 3 that narrows
   `[subagents] task_inline_images` for this persona (it can never widen it);
   see [Inline image lane](#inline-image-lane).
@@ -1000,6 +1016,8 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
 | `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline of foreground calls; completed sibling results and in-flight narration are retained when it expires |
 | `[subagents] task_background_timeout_secs` | `u64` | `3600` | Whole-call deadline of `run_in_background` calls (at most 86400) |
+| `[subagents] task_max_turns_ceiling` | `usize` | `100` | Highest per-call or persona `max_turns`; larger values are rejected |
+| `[subagents] task_timeout_ceiling_secs` | `u64` | `3600` | Highest per-call or persona `timeout_secs` (at most 86400); larger values are rejected |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `task_evidence`             | `bool`   | `true`                   | Host-minted evidence handles, citations, the Evidence section and `task_evidence` ([details](#evidence-handles)); tool registration follows a restart |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |

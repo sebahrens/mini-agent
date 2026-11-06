@@ -355,6 +355,7 @@ fn alias_persona(alias: &str) -> ResolvedSpecialization {
         model: Some(alias.into()),
         turn_budget: None,
         inline_images: None,
+        run: Default::default(),
         #[cfg(feature = "mcp")]
         mcp_servers: None,
     }

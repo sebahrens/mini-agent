@@ -4013,6 +4013,12 @@ the whole-call deadline of `run_in_background` task calls; foreground calls
 keep `task_timeout_secs` (default 300). See
 [Background tasks](SUBAGENTS.md#background-tasks).
 
+`[subagents] task_max_turns_ceiling` (default 100) and
+`task_timeout_ceiling_secs` (default 3600, at most 86400) bound the per-call
+`max_turns`/`timeout_secs` task arguments and the persona `max_turns`/
+`timeout_secs` frontmatter. A larger requested value rejects the call. See
+[The task tool](SUBAGENTS.md#the-task-tool).
+
 ### Hook event parity
 
 `PreCompact` observes an actual compaction before summarization. Its envelope has

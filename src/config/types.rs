@@ -24,6 +24,13 @@ pub struct SubagentPolicy {
     /// (default 3600, at most 86400). Foreground calls keep `task_timeout_secs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_background_timeout_secs: Option<u64>,
+    /// Highest per-call or persona `max_turns` accepted (default 100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_max_turns_ceiling: Option<usize>,
+    /// Highest per-call or persona `timeout_secs` accepted (default 3600,
+    /// at most 86400).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_timeout_ceiling_secs: Option<u64>,
 }
 
 #[cfg(feature = "subagents")]
