@@ -4626,11 +4626,6 @@ impl<'a> App<'a> {
             _ => {}
         }
 
-        #[cfg(feature = "loop")]
-        let loop_running = self.ui.session.goal_store.is_active();
-        #[cfg(not(feature = "loop"))]
-        let loop_running = false;
-
         let context_complete_usage_delta = matches!(
             &event,
             AgentEvent::UsageDelta {
@@ -4650,9 +4645,10 @@ impl<'a> App<'a> {
             context_complete: true,
             awaits_compaction_decision: true,
         } = &event
+            // Goal/loop rounds are the longest tool-driven turns and
+            // `--no-session` compacts the in-memory session, so neither
+            // excludes in-turn protection (mini-agent-wr9nw).
             && self.run.is_running
-            && !loop_running
-            && !self.ui.cli.no_session
             && self.ui.cfg.resolve_compact_enabled()
             && self.ui.session.context_window > 0
             && let Some(threshold) = self.ui.cfg.resolve_mid_turn_compact_threshold()
@@ -9489,6 +9485,117 @@ mod interrupt_rewind_tests {
                     "follow-up draft héllo after context exhaustion"
                 );
             }
+        }
+    }
+
+    /// mini-agent-wr9nw: an over-threshold completion is acted on during a goal
+    /// round and under `--no-session`, not just in an ordinary persisted turn.
+    #[tokio::test]
+    async fn mid_turn_pressure_gate_is_open_for_goal_rounds_and_no_session() {
+        for (no_session, goal) in [(true, false), (false, true), (true, true)] {
+            let root = crate::tests::OwnedTestDirectory::new("app-mid-turn-gate");
+            let _environment = crate::tests::ScopedProcessEnv::set(&[
+                (
+                    "MINI_AGENT_CONFIG_DIR",
+                    Some(root.path().join("config").into_os_string()),
+                ),
+                (
+                    "MINI_AGENT_DATA_DIR",
+                    Some(root.path().join("data").into_os_string()),
+                ),
+                (
+                    "MINI_AGENT_LOCAL_DATA_DIR",
+                    Some(root.path().join("local-data").into_os_string()),
+                ),
+                (
+                    "MINI_AGENT_STATE_DIR",
+                    Some(root.path().join("state").into_os_string()),
+                ),
+                (
+                    "MINI_AGENT_CACHE_DIR",
+                    Some(root.path().join("cache").into_os_string()),
+                ),
+                (
+                    "MINI_AGENT_CREDENTIALS_DIR",
+                    Some(root.path().join("credentials").into_os_string()),
+                ),
+            ]);
+            let cli = crate::cli::Cli {
+                no_tools: true,
+                no_sandbox: true,
+                no_session,
+                ..Default::default()
+            };
+            let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+                "compact_enabled": true, "mid_turn_compact_threshold": 0.8
+            }))
+            .unwrap();
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new("openrouter", "test-model", 128_000, "");
+            session.working_dir = workspace.root().to_string_lossy().into();
+            session.add_message(MessageRole::User, "earlier prompt");
+            session.add_message(MessageRole::Assistant, "earlier answer");
+            #[cfg(feature = "loop")]
+            if goal {
+                session
+                    .goal_store
+                    .set(
+                        crate::extras::goal::Goal::new("finish the task", Vec::new()).unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                assert!(session.goal_store.is_active());
+            }
+            #[cfg(not(feature = "loop"))]
+            let _ = goal;
+            let ui = UiContext {
+                native_startup: None,
+                native_ticket: None,
+                #[cfg(feature = "hooks")]
+                pending_session_start_context: None,
+                cli: &cli,
+                cfg: &cfg,
+                session: &mut session,
+                context: &mut context,
+                workspace,
+                client: crate::provider::create_client(
+                    "openrouter",
+                    Some("unused-test-key"),
+                    cfg.custom_providers_map(),
+                    cfg.api_keys.as_ref(),
+                )
+                .unwrap(),
+                permission: None,
+                ask_tx: None,
+                sandbox: crate::sandbox::Sandbox::new(false, "none"),
+                prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+                status_signals: None,
+                #[cfg(feature = "skills")]
+                skill_services: Arc::new(
+                    crate::extras::js::skills::session::SkillServiceOwner::new(),
+                ),
+                #[cfg(feature = "mcp")]
+                mcp_manager: None,
+            };
+            let mut app = fixture_app(ui);
+            app.run.is_running = true;
+            app.handle_agent_event(AgentEvent::UsageDelta {
+                usage: crate::event::UsageDelta {
+                    input_tokens: 110_000,
+                    output_tokens: 100,
+                    total_tokens: 110_100,
+                    ..Default::default()
+                },
+                context_complete: true,
+                awaits_compaction_decision: true,
+            })
+            .await
+            .unwrap();
+            assert!(
+                app.run.pending_compaction_pressure.is_some(),
+                "over-threshold usage must request relief (no_session={no_session}, goal={goal})"
+            );
         }
     }
 
