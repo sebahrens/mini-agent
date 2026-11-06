@@ -3,6 +3,7 @@ import { SessionUnavailableError, type ConversationSession } from './conversatio
 
 const MAX_REPLAY_UPDATES = 100_000;
 const MAX_REPLAY_BYTES = 48 * 1024 * 1024;
+const MAX_COMMANDS = 256;
 
 /** One connection's current conversation, with bounded load-time update routing. */
 export class SessionUpdateRouter {
@@ -31,14 +32,15 @@ export class SessionUpdateRouter {
   }
 
   finish(client: acp.ClientContext, sessionId: string,
-    configOptions: readonly acp.SessionConfigOption[] = []): PublicProtocolSession {
+    configOptions: readonly acp.SessionConfigOption[] = [],
+    modes?: acp.SessionModeState | null): PublicProtocolSession {
     const loading = this.loading;
     this.loading = undefined;
     if (!loading || loading.overflow || (loading.expectedId && loading.expectedId !== sessionId)) {
       throw new Error('The saved ACP conversation exceeded its bounded replay or identity contract.');
     }
     const session = new PublicProtocolSession(client, sessionId, this,
-      loading.updates.filter(update => update.sessionId === sessionId).map(update => update.update), configOptions);
+      loading.updates.filter(update => update.sessionId === sessionId).map(update => update.update), configOptions, modes ?? undefined);
     this.current = session;
     return session;
   }
@@ -61,13 +63,37 @@ export class PublicProtocolSession implements ConversationSession {
 
   constructor(private readonly client: acp.ClientContext, readonly sessionId: string,
     private readonly router: SessionUpdateRouter, private replay: acp.SessionUpdate[],
-    private options: readonly acp.SessionConfigOption[] = []) {}
+    private options: readonly acp.SessionConfigOption[] = [],
+    private modeState: acp.SessionModeState | undefined = undefined) {}
+
+  private availableCommands: readonly acp.AvailableCommand[] = [];
 
   receive(update: acp.SessionUpdate): void {
     // Routing is exact-ID scoped. Late updates cannot be adopted by a new owner.
     if (this.disposed) { return; }
     if (update.sessionUpdate === 'config_option_update') { this.options = update.configOptions; }
+    if (update.sessionUpdate === 'current_mode_update' && this.modeState) {
+      this.modeState = { ...this.modeState, currentModeId: update.currentModeId };
+    }
+    if (update.sessionUpdate === 'available_commands_update') {
+      this.availableCommands = update.availableCommands.slice(0, MAX_COMMANDS);
+    }
     this.subscriber?.(update);
+  }
+
+  modes(): acp.SessionModeState | undefined { return this.modeState; }
+
+  commands(): readonly acp.AvailableCommand[] { return this.availableCommands; }
+
+  /** Switch the permission mode; the agent confirms it with a current_mode_update. */
+  async setMode(modeId: string): Promise<void> {
+    if (this.disposed || this.activePrompt) { throw new Error('ACP conversation is unavailable or busy.'); }
+    if (!this.modeState?.availableModes.some(mode => mode.id === modeId)) {
+      throw new Error('The agent does not offer that permission mode.');
+    }
+    await this.client.request(acp.methods.agent.session.setMode,
+      { sessionId: this.sessionId, modeId }, { cancellationSignal: AbortSignal.timeout(10_000) });
+    if (!this.disposed && this.modeState) { this.modeState = { ...this.modeState, currentModeId: modeId }; }
   }
 
   configOptions(): readonly acp.SessionConfigOption[] { return this.options; }
@@ -80,7 +106,7 @@ export class PublicProtocolSession implements ConversationSession {
     if (!this.disposed) { this.options = response.configOptions; }
   }
 
-  async prompt(text: string, onUpdate: (update: acp.SessionUpdate) => void,
+  async prompt(content: string | readonly acp.ContentBlock[], onUpdate: (update: acp.SessionUpdate) => void,
     signal: AbortSignal): Promise<acp.StopReason> {
     if (signal.aborted) { return 'cancelled'; }
     if (this.disposed || this.activePrompt) { throw new Error('ACP conversation is unavailable or busy.'); }
@@ -99,7 +125,8 @@ export class PublicProtocolSession implements ConversationSession {
     // Cancellation requests the server's owned retirement. Do not locally
     // abandon this response and mistake that for model/effect settlement.
     const pending = this.client.request(acp.methods.agent.session.prompt, {
-      sessionId: this.sessionId, prompt: [{ type: 'text', text }],
+      sessionId: this.sessionId,
+      prompt: typeof content === 'string' ? [{ type: 'text', text: content }] : [...content],
     });
     this.activePrompt = pending;
     try { return (await pending).stopReason; }

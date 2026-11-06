@@ -1,11 +1,14 @@
 import * as vscode from 'vscode';
 import * as os from 'node:os';
+import { realpath } from 'node:fs/promises';
 import type * as acp from '@agentclientprotocol/sdk';
 import { ChatUpdateRenderer, stopResult } from './chat';
 import { ensureConfigFile, resolveConfigDirectory } from './config';
 import { resolveConfiguredExecutable } from './executable';
 import { buildPermissionDetail, permissionOptionTitle } from './permission';
 import { AgentSession } from './session';
+import { buildPromptBlocks } from './references';
+import { collectReferences } from './vscodeReferences';
 import { log, setLogLevel, showOutput } from './log';
 import { assertExecutableScope, gatedFolderPick } from './trust';
 
@@ -40,6 +43,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('mini-agent.stop', () => cmdStop()),
     vscode.commands.registerCommand('mini-agent.restart', () => cmdRestart(context)),
     vscode.commands.registerCommand('mini-agent.resume', async () => { const active = await ensureSession(context); await active?.resumeSavedSession(); }),
+    vscode.commands.registerCommand('mini-agent.selectMode', async () => { const active = await ensureSession(context); await active?.selectMode(); }),
     vscode.commands.registerCommand('mini-agent.selectPersona', async () => { const active = await ensureSession(context); await active?.selectPersona(); }),
     vscode.commands.registerCommand('mini-agent.selectFolder', () => cmdSelectFolder(context)),
     vscode.commands.registerCommand('mini-agent.openConfig', () => cmdOpenConfig()),
@@ -146,7 +150,7 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
   const participant = vscode.chat.createChatParticipant(
     'mini-agent.chat',
     async (request, _chatContext, response, token): Promise<vscode.ChatResult> => {
-      if (!request.prompt.trim()) {
+      if (!request.prompt.trim() && request.command !== 'commands' && request.command !== 'selection') {
         return { errorDetails: { message: 'Enter a prompt for Mini Agent.' } };
       }
 
@@ -158,11 +162,33 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
       const cancellation = new AbortController();
       if (token.isCancellationRequested) { cancellation.abort(); }
       const cancellationSubscription = token.onCancellationRequested(() => cancellation.abort());
-      const renderer = new ChatUpdateRenderer();
-      response.progress('Connecting to Mini Agent…');
+      const renderer = new ChatUpdateRenderer({
+        keepThoughts: vscode.workspace.getConfiguration('mini-agent').get<boolean>('showThoughts', false),
+      });
 
       try {
-        const reason = await active.prompt(request.prompt, update => {
+        if (request.command === 'commands') {
+          response.markdown(await describeCommands(active));
+          return { metadata: { stopReason: 'end_turn' } };
+        }
+        let promptText = request.prompt;
+        if (request.command === 'run') {
+          const checked = await checkServerCommand(active, request.prompt);
+          if (typeof checked !== 'string') { return checked; }
+          promptText = checked;
+        }
+        response.progress('Connecting to Mini Agent…');
+        const references = await collectReferences(request, request.command === 'selection');
+        const built = await buildPromptBlocks({
+          text: promptText,
+          references,
+          workspaceRoot: active.workspaceFolder.uri.fsPath,
+          trusted: vscode.workspace.isTrusted,
+          embeddedContext: active.acceptsEmbeddedContext,
+          realpath,
+        });
+        for (const note of built.notes) { response.markdown(`_${note}_\n\n`); }
+        const reason = await active.prompt(built.blocks, update => {
           for (const event of renderer.render(update)) {
             if (event.kind === 'markdown') { response.markdown(event.value); }
             else { response.progress(event.value); }
@@ -181,6 +207,24 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
   );
   participant.iconPath = new vscode.ThemeIcon('sparkle');
   return participant;
+}
+
+async function describeCommands(active: AgentSession): Promise<string> {
+  const commands = await active.availableCommands();
+  if (commands.length === 0) { return 'The Mini Agent server has not advertised any commands yet.'; }
+  const lines = commands.slice(0, 100).map(command => `- \`/${command.name.replace(/[^\w-]/gu, '?')}\`: ${command.description.replace(/[\r\n]+/gu, ' ').slice(0, 200)}`);
+  return `Server commands (run one with \`/run <command>\`):\n\n${lines.join('\n')}\n`;
+}
+
+/** `/run name args` becomes the prompt `/name args`, only for a command the server advertised. */
+async function checkServerCommand(active: AgentSession, input: string): Promise<string | vscode.ChatResult> {
+  const text = input.trim().replace(/^\//u, '');
+  const name = text.split(/\s+/u)[0] ?? '';
+  const commands = await active.availableCommands();
+  if (!name || !commands.some(command => command.name === name)) {
+    return { errorDetails: { message: `Unknown Mini Agent command "${name.slice(0, 60)}". Use /commands to list them.` } };
+  }
+  return `/${text}`;
 }
 
 export async function ensureSession(context: vscode.ExtensionContext): Promise<AgentSession | undefined> {

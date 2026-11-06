@@ -1,4 +1,5 @@
 import type * as acp from '@agentclientprotocol/sdk';
+import { diffSummaryLines } from './toolcontent';
 
 /** Upper bound for the input text rendered in the permission modal. */
 export const PERMISSION_DETAIL_LIMIT = 800;
@@ -60,7 +61,7 @@ export function toolCallInputLines(toolCall: acp.ToolCallUpdate): string[] {
         break;
       }
       case 'diff':
-        lines.push(`edit ${entry.path}`);
+        lines.push(`edit ${entry.path}`, ...diffSummaryLines(entry).slice(1));
         break;
       case 'terminal':
         lines.push(`terminal ${entry.terminalId}`);

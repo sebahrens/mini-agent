@@ -33,7 +33,12 @@
         "name": "mini-agent",
         "fullName": "Mini Agent",
         "description": "Work with Mini Agent in the current trusted workspace.",
-        "isSticky": true
+        "isSticky": true,
+        "commands": [
+          { "name": "selection", "description": "Include the active editor selection as context" },
+          { "name": "commands", "description": "List the slash commands the Mini Agent server offers" },
+          { "name": "run", "description": "Run a Mini Agent server command, e.g. /run compact" }
+        ]
       }
     ],
     "commands": [
@@ -68,6 +73,10 @@
       {
         "command": "mini-agent.selectPersona",
         "title": "Mini Agent: Select Persona"
+      },
+      {
+        "command": "mini-agent.selectMode",
+        "title": "Mini Agent: Select Permission Mode"
       }
     ],
     "configuration": {
@@ -78,6 +87,12 @@
           "default": "",
           "description": "Path to the mini-agent executable. Leave empty to use the bundled artifact.",
           "scope": "machine"
+        },
+        "mini-agent.showThoughts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep the agent's reasoning text in the chat transcript instead of a transient progress line.",
+          "scope": "window"
         },
         "mini-agent.logLevel": {
           "type": "string",

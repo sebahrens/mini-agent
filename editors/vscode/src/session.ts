@@ -47,6 +47,7 @@ export class AgentSession {
   private client: acp.ClientContext | undefined;
   private readonly updates = new SessionUpdateRouter();
   private supportsLoad = false;
+  private embeddedContext = false;
   private state: SessionState = 'stopped';
   private readonly transitions = new SerialTransitionQueue();
   private readonly statusBar: vscode.StatusBarItem;
@@ -67,6 +68,45 @@ export class AgentSession {
 
   get workspaceFolder(): vscode.WorkspaceFolder { return this.folder; }
 
+  /** Whether the running agent accepts embedded resource blocks in prompts. */
+  get acceptsEmbeddedContext(): boolean { return this.embeddedContext; }
+
+  /** Slash commands the agent advertised (empty until it has sent them). */
+  async availableCommands(): Promise<readonly acp.AvailableCommand[]> {
+    await this.start();
+    const active = await this.conversation.current();
+    return active.commands?.() ?? [];
+  }
+
+  /** Pick the permission mode (the agent's ACP session modes) for the workspace conversation. */
+  async selectMode(): Promise<void> {
+    await this.start();
+    return this.transitions.run(async () => {
+      requireTrustedWorkspace();
+      if (this.state !== 'running') { throw new Error('Mini Agent failed to start.'); }
+      if (this.conversation.isPrompting) { throw new Error('Wait for the current prompt to settle before switching permission mode.'); }
+      const active = await this.conversation.current();
+      const modes = active.modes?.();
+      if (!modes || !active.setMode || modes.availableModes.length === 0) {
+        void vscode.window.showInformationMessage('This Mini Agent session offers no permission modes.');
+        return;
+      }
+      const items = modes.availableModes.slice(0, 64).map(mode => ({
+        label: safeSessionLabel(mode.name),
+        description: safeSessionLabel(mode.id === modes.currentModeId ? `${mode.id} (current)` : mode.id),
+        ...(mode.description ? { detail: safeSessionLabel(mode.description) } : {}),
+        modeId: mode.id,
+      }));
+      const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select the Mini Agent permission mode' });
+      if (!picked || picked.modeId === modes.currentModeId) { return; }
+      requireTrustedWorkspace();
+      if (this.conversation.isPrompting) { throw new Error('A prompt started meanwhile; the permission mode was not changed.'); }
+      await active.setMode(picked.modeId);
+      log.info(`ACP permission mode selected: ${picked.modeId}`);
+      void vscode.window.showInformationMessage(`Mini Agent permission mode: ${picked.label}.`);
+    });
+  }
+
   async start(): Promise<void> {
     return this.transitions.run(async () => {
       if (!vscode.workspace.isTrusted) {
@@ -78,7 +118,7 @@ export class AgentSession {
   }
 
   async prompt(
-    text: string,
+    text: string | readonly acp.ContentBlock[],
     onUpdate: (update: acp.SessionUpdate) => void,
     signal: AbortSignal,
   ): Promise<acp.StopReason> {
@@ -184,6 +224,7 @@ export class AgentSession {
         clientInfo: { name: 'mini-agent-vscode', version: extensionVersion(this.context) },
       }, { cancellationSignal: AbortSignal.timeout(10_000) });
       this.supportsLoad = initialized.agentCapabilities?.loadSession === true;
+      this.embeddedContext = initialized.agentCapabilities?.promptCapabilities?.embeddedContext === true;
       log.info(`ACP initialized at protocol ${initialized.protocolVersion}`);
       requireTrustedWorkspace();
       this.setState('running');
@@ -213,7 +254,7 @@ export class AgentSession {
       const response = await client.request(acp.methods.agent.session.new, { cwd: this.folder.uri.fsPath, mcpServers: [] },
         { cancellationSignal: AbortSignal.timeout(10_000) });
       requireTrustedWorkspace();
-      const session = this.updates.finish(client, response.sessionId, response.configOptions ?? []);
+      const session = this.updates.finish(client, response.sessionId, response.configOptions ?? [], response.modes);
       log.info(`ACP session created: ${session.sessionId}`);
       return session;
     } catch (error) { this.updates.reset(); throw error; }
@@ -245,7 +286,7 @@ export class AgentSession {
         const loaded = await client.request(acp.methods.agent.session.load, { sessionId: selected.sessionId, cwd: this.folder.uri.fsPath, mcpServers: [] },
           { cancellationSignal: AbortSignal.timeout(10_000) });
         requireTrustedWorkspace();
-        attached = this.updates.finish(client, selected.sessionId, loaded.configOptions ?? []);
+        attached = this.updates.finish(client, selected.sessionId, loaded.configOptions ?? [], loaded.modes);
         await this.conversation.adopt(attached);
         log.info(`ACP saved session resumed: ${selected.sessionId}`);
       } catch (error) {

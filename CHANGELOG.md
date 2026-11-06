@@ -13,6 +13,14 @@ Notable changes to mini-agent are documented in this file. The format follows
   edit/write approval dialogs show the proposed change, and results carry the recorded mutation
   as an ACP diff (bounded hunks, marked `_meta."mini-agent-partial"`/`"mini-agent-truncated"`)
   instead of an `agent_thought_chunk`.
+- VS Code: chat prompts now carry the references the user attached (files, ranges, #-variables)
+  and, with `/selection`, the active selection, as ACP `resource_link`/`resource` blocks. At most
+  20 references and 256 KiB are sent, only existing files inside the trusted workspace (symlinks
+  resolved), and every dropped or clipped reference is reported in the chat. The ACP server now
+  advertises `promptCapabilities.embeddedContext` (text resources only).
+- VS Code: tool calls show their title (not the call id) and a fenced result or diff; `Mini Agent:
+  Select Permission Mode` calls `session/set_mode`; `/commands` lists and `/run <name>` runs the
+  server slash commands; `mini-agent.showThoughts` keeps reasoning text in the transcript.
 
 ### Subagents
 

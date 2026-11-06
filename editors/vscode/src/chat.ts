@@ -1,4 +1,5 @@
 import type * as acp from '@agentclientprotocol/sdk';
+import { inlineCode, toolContentMarkdown } from './toolcontent';
 
 export const MAX_RENDER_CHARS = 32 * 1024;
 
@@ -20,9 +21,16 @@ function contentText(content: acp.ContentBlock): string | undefined {
   return content.type === 'text' ? content.text : undefined;
 }
 
+export interface RendererOptions {
+  /** Keep agent thought text in the transcript (quoted) instead of a vanishing progress line. */
+  readonly keepThoughts?: boolean;
+}
+
 /** Converts typed ACP updates into the stable VS Code 1.90 chat stream surface. */
 export class ChatUpdateRenderer {
   private readonly toolTitles = new Map<string, string>();
+
+  constructor(private readonly options: RendererOptions = {}) {}
 
   render(update: acp.SessionUpdate): RenderEvent[] {
     switch (update.sessionUpdate) {
@@ -32,22 +40,36 @@ export class ChatUpdateRenderer {
       }
       case 'agent_thought_chunk': {
         const text = contentText(update.content);
-        return text ? [{ kind: 'progress', value: bounded(text) }] : [];
+        if (!text) { return []; }
+        if (this.options.keepThoughts) {
+          const quoted = bounded(text).split('\n').map(line => `> ${line}`).join('\n');
+          return [{ kind: 'markdown', value: `\n${quoted}\n\n` }];
+        }
+        return [{ kind: 'progress', value: bounded(text) }];
       }
       case 'tool_call': {
         this.toolTitles.set(update.toolCallId, update.title);
         return [{
           kind: 'progress',
-          value: bounded(`Tool ${update.toolCallId}: ${update.title} (${update.status ?? 'pending'})`),
+          value: bounded(`${update.title} (${update.status ?? 'pending'})`),
         }];
       }
       case 'tool_call_update': {
         const title = update.title ?? this.toolTitles.get(update.toolCallId) ?? 'tool call';
         this.toolTitles.set(update.toolCallId, title);
-        return [{
+        const events: RenderEvent[] = [{
           kind: 'progress',
-          value: bounded(`Tool ${update.toolCallId}: ${title} (${update.status ?? 'updated'})`),
+          value: bounded(`${title} (${update.status ?? 'updated'})`),
         }];
+        const finished = update.status === 'completed' || update.status === 'failed';
+        const body = finished ? toolContentMarkdown(update.content) : '';
+        if (body) {
+          events.push({
+            kind: 'markdown',
+            value: bounded(`\n\n**${inlineCode(title)}** ${update.status}\n\n${body}\n\n`),
+          });
+        }
+        return events;
       }
       case 'plan': {
         const summary = update.entries
