@@ -358,6 +358,16 @@ impl History {
             stamp: state.stamp.clone(),
         })
     }
+    /// Drop finished rows. The admitted job whose admission evicted them is
+    /// the attribution; a user `/tasks clear` passes none.
+    fn remove(&self, ids: &[String], observation: Option<&JobObservation>) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let before = state.rows.len();
+        state.rows.retain(|row| !ids.contains(&row.id));
+        if state.rows.len() != before {
+            state.stamp.changed(observation);
+        }
+    }
     fn set(&self, saved: &SavedTask, observation: Option<&JobObservation>) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         // notified is runtime-only and cannot rewrite persisted/native bytes.
@@ -657,11 +667,23 @@ impl Pool {
             !state.closing && !state.history_paused,
             "background task owner is closing or changing history"
         );
-        anyhow::ensure!(
-            state.jobs.len() < MAX_JOBS,
-            "background task capacity reached; start a new session after inspecting existing results"
-        );
+        // A full history makes room by dropping its oldest finished entry
+        // whose completion was already delivered; running and undelivered
+        // entries are never evicted.
+        let evict = if state.jobs.len() < MAX_JOBS {
+            None
+        } else {
+            Some(self.finished_ids(&state).into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "background task capacity reached: {MAX_JOBS} tasks are running or have undelivered results; inspect them with task_result or /tasks, or cancel one"
+                )
+            })?)
+        };
         let (observation, lifetime) = self.observations.admit()?;
+        if let Some(id) = evict {
+            state.jobs.remove(&id);
+            self.history.remove(&[id], Some(&observation));
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let job_scope = AgentWorkScope::new();
         state.jobs.insert(
@@ -840,6 +862,38 @@ impl Pool {
                 scope: None,
             })
         }
+    }
+
+    /// Finished entries whose completion was delivered (or that were
+    /// restored from a saved session), oldest first.
+    fn finished_ids(&self, state: &State) -> Vec<String> {
+        self.history
+            .rows()
+            .into_iter()
+            .filter(|row| {
+                state.jobs.get(&row.id).is_some_and(|entry| {
+                    !entry.saved.status.is_active()
+                        && entry.scope.is_none()
+                        && (entry.saved.notified || entry.observation.is_none())
+                })
+            })
+            .map(|row| row.id)
+            .collect()
+    }
+
+    /// `/tasks clear`: forget every finished, delivered entry. Running jobs
+    /// and results not yet announced to the model are kept.
+    pub(crate) fn clear_finished(&self) -> usize {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ids = self.finished_ids(&state);
+        for id in &ids {
+            state.jobs.remove(id);
+        }
+        self.history.remove(&ids, None);
+        if !ids.is_empty() {
+            self.changed.notify_one();
+        }
+        ids.len()
     }
 
     pub(crate) fn list(&self) -> Vec<SavedTask> {
@@ -1480,6 +1534,72 @@ mod tests {
         assert!(serde_json::from_value::<History>(too_many).is_err());
         pool.close().await;
         reloaded.close().await;
+    }
+
+    #[tokio::test]
+    async fn full_history_evicts_the_oldest_delivered_finished_entry() {
+        let root = crate::tests::OwnedTestDirectory::new("background-evict");
+        let (session, pool, workspace, run, recorder) = fixture(&root);
+        let mut ids = Vec::new();
+        for index in 0..MAX_JOBS {
+            let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+            let id = admission
+                .start(async move { Ok(format!("report {index}")) }, run.clone())
+                .unwrap();
+            settled(&pool, &id).await;
+            ids.push(id);
+        }
+        // Undelivered completions are never evicted.
+        assert!(pool.reserve(&workspace, &run, &recorder).is_err());
+        pool.pending_notices().unwrap().acknowledge();
+
+        // A running entry is never evicted either: hold the oldest slot open.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let running = admission
+            .start(
+                async move {
+                    let _ = release_rx.await;
+                    Ok("late".into())
+                },
+                run.clone(),
+            )
+            .unwrap();
+        assert!(
+            pool.result(&ids[0]).is_err(),
+            "oldest delivered entry dropped"
+        );
+        assert!(pool.result(&ids[1]).is_ok());
+        assert_eq!(pool.list().len(), MAX_JOBS);
+        assert_eq!(session.background_history.rows().len(), MAX_JOBS);
+        assert!(
+            !session
+                .background_history
+                .rows()
+                .iter()
+                .any(|row| row.id == ids[0])
+        );
+
+        // The 34th admission evicts the next delivered entry, not the running one.
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        drop(admission);
+        assert!(pool.result(&running).is_ok());
+        assert!(pool.result(&ids[1]).is_err());
+
+        // `/tasks clear` keeps running and undelivered entries only.
+        let cleared = pool.clear_finished();
+        assert_eq!(cleared, MAX_JOBS - 2);
+        let kept = pool.list();
+        assert_eq!(
+            kept.len(),
+            2,
+            "the running job and the undelivered cancellation"
+        );
+        assert!(kept.iter().any(|row| row.id == running));
+        assert_eq!(session.background_history.rows().len(), 2);
+        release_tx.send(()).unwrap();
+        settled(&pool, &running).await;
+        pool.close().await;
     }
 
     #[tokio::test]

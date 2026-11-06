@@ -14,6 +14,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   narration as a quoted `[partial: cancelled ...]` section instead of only `[cancelled: ...]`.
 - Background `task` calls get their own deadline, `[subagents] task_background_timeout_secs`
   (default 3600 s), instead of sharing the 300 s foreground `task_timeout_secs`.
+- A full 32-entry background task history now evicts its oldest finished, delivered entry on the
+  next admission instead of refusing every later background task; `/tasks clear` forgets all
+  finished, delivered entries. Running tasks and undelivered results are never evicted.
 
 **Fork release 1.14.2 (2026-10-28)**
 

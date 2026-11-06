@@ -56,7 +56,11 @@ session cost cap apply. A background call has its own whole-call deadline,
 86400), instead of the foreground `task_timeout_secs` (300 s); when it expires,
 in-flight children return their narration so far as `[partial: cancelled ...]`
 sections (see [Bounded execution](#bounded-execution-and-partial-results)). The session keeps at most 32 tasks, including
-finished reports; start a new session when that bounded history is full.
+finished reports. When it is full, the next admission drops the oldest finished
+task whose completion notice was already delivered (or that was restored from a
+saved session); running tasks and undelivered results are never evicted, and
+admission fails with an actionable error only when every entry is one of those.
+`/tasks clear` forgets every finished, delivered entry at once.
 Background batches share one lane of `task_max_concurrency` children, while the
 parent turn's own foreground `task` call uses a separate lane of the same size,
 so running background jobs cannot serialize it. Write-enabled children across
@@ -68,7 +72,7 @@ waiting for a lane is not charged to its deadline (see
 [Configuration](#configuration)).
 
 Use `task_list`, `task_result {"id":"…"}` and `task_cancel {"id":"…"}` from an
-agent (and `task_evidence`, see [Evidence handles](#evidence-handles)), or `/tasks`, `/tasks result <id>` and `/tasks cancel <id>` from the TUI.
+agent (and `task_evidence`, see [Evidence handles](#evidence-handles)), or `/tasks`, `/tasks result <id>`, `/tasks cancel <id>` and `/tasks clear` from the TUI.
 Agent controls obey ordinary tool ceilings and permissions. Cancellation reports
 `cancelling` until the actual model, approvals and effects settle. The default
 `background_tasks` footer item shows active tasks and reports awaiting delivery.
