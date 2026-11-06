@@ -1072,7 +1072,13 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let max_find_results = cfg.resolve_max_find_results();
         let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
         let formatter = shell_tool_enabled
-            .then(|| tools::format_after_edit::FormatAfterEdit::new(&cfg.format, sandbox.clone()))
+            .then(|| {
+                tools::format_after_edit::FormatAfterEdit::new_with_timeout(
+                    &cfg.format,
+                    sandbox.clone(),
+                    cfg.resolve_format_timeout(),
+                )
+            })
             .flatten();
         let write_tool = tools::WriteTool::new_with_tracker(
             permission.clone(),

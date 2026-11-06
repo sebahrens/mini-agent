@@ -85,6 +85,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   final newline) with untouched fields copied verbatim, so editing a Jupyter-written notebook
   changes only the edited cell in `git diff` instead of re-indenting the whole file
   (mini-agent-mnhpz).
+- The post-edit formatter timeout is configurable with `format_timeout_secs` (default 10, clamped
+  to 1-600), and one invalid `[format]` entry no longer disables every formatter: it is named in a
+  startup warning, only that extension's formatting is skipped, and the valid formatters still run
+  (mini-agent-ksg12).
 
 ### Added
 

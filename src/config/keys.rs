@@ -178,6 +178,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("verify_timeout_secs").described("Wall-clock bound for one verification attempt. Default: 300 seconds.").shaped(ConfigShape::Integer),
     key("verify_max_attempts").described("Total verification attempts within one agent turn. Default: 3; capped at 8 so a persistently failing command cannot loop indefinitely.").shaped(ConfigShape::Integer),
     key("max_text_file_size").shaped(ConfigShape::Integer),
+    key("format_timeout_secs").described("Seconds one post-edit [format] command may run (default 10, clamped to 1-600).").shaped(ConfigShape::Integer),
     key("max_edit_file_size").described("Largest file edit/write/notebook_edit will change (default 16 MiB, or max_text_file_size if larger); independent of how much one read returns.").shaped(ConfigShape::Integer),
     key("file_checkpoints").described("/rewind file checkpoint limits: max_file_bytes (default: the edit/write size limit), max_total_bytes (64 MiB), max_records (2048).").shaped(ConfigShape::Object),
     key("max_read_lines").shaped(ConfigShape::Integer),

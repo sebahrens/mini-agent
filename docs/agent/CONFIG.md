@@ -633,6 +633,8 @@ doom_loop = "ask"
 Formatting is disabled until an extension is configured:
 
 ```toml
+format_timeout_secs = 30   # top-level; default 10, clamped to 1-600
+
 [format]
 rs = 'rustfmt --edition 2024 "{file}"'
 js = 'prettier --write "{file}"'
@@ -649,15 +651,24 @@ At most one placeholder is allowed. The canonical UTF-8 target is substituted
 **after** tokenization and each resulting argument is quoted for the configured
 POSIX shell or PowerShell. Non-UTF-8 paths skip formatting without redirecting to
 a lossy alias. The map accepts at most 64 extensions of 1–16 ASCII letters,
-digits or underscores; commands accept at most 8 KiB and 64 arguments.
+digits or underscores; commands accept at most 8 KiB and 64 arguments. Each
+entry is validated on its own: an invalid extension or oversized template
+produces a startup warning naming that entry (`format."<ext>": ...`, the
+command itself is not echoed), only that formatter is ignored (edits of that
+extension report `Formatter skipped: invalid [format] entry for this
+extension`), and every valid formatter still runs. Entries beyond the first 64
+valid ones (in key order) are ignored with the same warning.
 
 The original edit commits first. The formatter then runs in the original captured
 workspace, preserving project config and plugin discovery, through normal `shell`
 permission. An unknown command asks once; an edit approval does not approve its
 formatter. CLI shell exclusions and unavailable containment disable formatting.
 Project-local `[format]` is a sensitive setting covered by the existing
-content-bound project-config approval. Commands have a 10-second timeout and a
-combined 1 MiB output limit. A failed, denied or stopped formatter never rolls back
+content-bound project-config approval. Each command may run for
+`format_timeout_secs` seconds (top-level key, default 10, clamped to 1–600;
+raise it for `cargo fmt`, `prettier` on a monorepo or a cold `black`) with a
+combined 1 MiB output limit; a timed-out run reports `Formatter failed or
+stopped: it exceeded format_timeout_secs`. A failed, denied or stopped formatter never rolls back
 the committed edit. Results append a static status; formatter stdout/stderr is not
 shown. After retirement, authorized bounded final source determines previews and
 diffs even when the command failed after modifying the file.
