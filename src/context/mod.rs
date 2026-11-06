@@ -541,6 +541,14 @@ fn walk_bound_context_files(
         );
         agent_parts.push(format!("# Global AGENTS.md\n{content}"));
     }
+    // Opt-in compat: the user-level files Claude Code and Codex users already
+    // maintain, after mini-agent's own global file and under the same budget
+    // and capture rules (mini-agent-4l9rf).
+    if USER_INSTRUCTION_FILES.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(home) = dirs::home_dir()
+    {
+        load_user_instruction_files(&home, &mut budget, &mut roots, &mut agent_parts);
+    }
     #[cfg(feature = "archmd")]
     if let Some((content, truncated, _, _, _)) =
         load_captured_global_file(&storage::architecture_path())
@@ -799,6 +807,54 @@ const MAX_ANCESTOR_CONTEXT_BYTES: usize = 524_288;
 /// Appended where a context file was cut to fit the budget.
 const CONTEXT_TRUNCATION_NOTICE: &str =
     "\n\n[context file truncated: combined limit reached; see context_files_max_bytes]";
+
+/// Whether the user-level Claude Code and Codex instruction files are read
+/// (`user_instruction_files`). Closed by default; set at startup from the
+/// effective configuration, which a project layer can only change after the
+/// project is trusted (mini-agent-4l9rf).
+static USER_INSTRUCTION_FILES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Install the `user_instruction_files` opt-in used by later loads.
+pub(crate) fn set_user_instruction_files(enabled: bool) {
+    USER_INSTRUCTION_FILES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The compat user-level instruction files, in load order, under `home`:
+/// Claude Code's `~/.claude/CLAUDE.md` and Codex's `~/.codex/AGENTS.md`.
+fn user_instruction_candidates(home: &Path) -> [(String, PathBuf); 2] {
+    [
+        (
+            "user ~/.claude/CLAUDE.md".to_owned(),
+            home.join(".claude").join("CLAUDE.md"),
+        ),
+        (
+            "user ~/.codex/AGENTS.md".to_owned(),
+            home.join(".codex").join("AGENTS.md"),
+        ),
+    ]
+}
+
+/// Reads the compat user-level files under `home` into the root context.
+fn load_user_instruction_files(
+    home: &Path,
+    budget: &mut ContextBudget,
+    roots: &mut Vec<instructions::InstructionRoot>,
+    agent_parts: &mut SmallVec<[String; 4]>,
+) {
+    for (label, path) in user_instruction_candidates(home) {
+        if let Some((content, truncated, binding, relative, identity)) =
+            load_captured_global_file(&path)
+            && let Some(content) = budget.admit(&label, content, truncated)
+        {
+            roots.push(
+                instructions::InstructionRoot::global(binding, relative, &content)
+                    .with_identity(identity),
+            );
+            agent_parts.push(format!("# {label} ({})\n{content}", path.display()));
+        }
+    }
+}
 
 /// Smallest accepted combined context-file budget.
 const MIN_CONTEXT_FILE_BUDGET: usize = 16 * 1024;
@@ -1348,5 +1404,62 @@ mod claude_layout_tests {
         let agents = agents.unwrap();
         assert_eq!(roots.len(), rules::MAX_RULE_FILES);
         assert!(agents.contains("RULE_000") && !agents.contains("RULE_083"));
+    }
+
+    // mini-agent-4l9rf: the user-level compat files load in a fixed order from
+    // a home directory, under the shared budget, and never by default.
+    #[cfg(unix)]
+    #[test]
+    fn user_instruction_files_load_in_order_and_are_closed_by_default() {
+        let root = crate::tests::OwnedTestDirectory::new("user-instruction-files");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".claude/CLAUDE.md"), "HOME_CLAUDE_RULES").unwrap();
+        std::fs::write(home.join(".codex/AGENTS.md"), "HOME_CODEX_RULES").unwrap();
+
+        let mut roots = Vec::new();
+        let mut parts: SmallVec<[String; 4]> = SmallVec::new();
+        let mut budget = ContextBudget {
+            used: 0,
+            limit: MAX_ANCESTOR_CONTEXT_BYTES,
+        };
+        load_user_instruction_files(&home, &mut budget, &mut roots, &mut parts);
+        assert_eq!(roots.len(), 2);
+        assert!(
+            parts[0].starts_with("# user ~/.claude/CLAUDE.md"),
+            "{parts:?}"
+        );
+        assert!(parts[0].contains("HOME_CLAUDE_RULES"));
+        assert!(
+            parts[1].starts_with("# user ~/.codex/AGENTS.md"),
+            "{parts:?}"
+        );
+
+        // The shared budget applies: a spent budget admits nothing.
+        let mut roots = Vec::new();
+        let mut parts: SmallVec<[String; 4]> = SmallVec::new();
+        let mut spent = ContextBudget {
+            used: 10,
+            limit: 10,
+        };
+        load_user_instruction_files(&home, &mut spent, &mut roots, &mut parts);
+        assert!(roots.is_empty() && parts.is_empty());
+
+        // Default closed: with HOME pointing at the files and no opt-in the
+        // workspace walk never reads them.
+        let _environment =
+            crate::tests::ScopedProcessEnv::set(&[("HOME", Some(home.clone().into_os_string()))]);
+        assert!(!USER_INSTRUCTION_FILES.load(std::sync::atomic::Ordering::Relaxed));
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "PROJECT_RULES").unwrap();
+        let (agents, _, _) = walk_bound_context_files(&bound(&workspace));
+        let agents = agents.unwrap();
+        assert!(agents.contains("PROJECT_RULES"));
+        assert!(
+            !agents.contains("HOME_CLAUDE_RULES") && !agents.contains("HOME_CODEX_RULES"),
+            "{agents}"
+        );
     }
 }

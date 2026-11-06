@@ -1343,6 +1343,7 @@ impl Startup {
             ),
             cfg.context_files_max_bytes,
         ));
+        context::set_user_instruction_files(cfg.user_instruction_files == Some(true));
         let no_context_files = cli.resolve_no_context_files(&cfg);
         // Persistent memory is read once below, after the session is known,
         // so a resumed session's compaction exclusion is applied in one pass.

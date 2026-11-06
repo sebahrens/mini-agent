@@ -3733,6 +3733,22 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    fn project_config_cannot_enable_user_instruction_files_without_trust() {
+        let (benign, _, sensitive) =
+            split_project_override("user_instruction_files = true\nmax_tokens = 1\n").unwrap();
+        assert!(
+            sensitive.contains("user_instruction_files"),
+            "{sensitive:?}"
+        );
+        assert!(benign.get("user_instruction_files").is_none());
+        // Closed unless configured.
+        assert_eq!(
+            crate::config::Config::default().user_instruction_files,
+            None
+        );
+    }
+
+    #[test]
     #[cfg(feature = "mcp")]
     fn project_config_cannot_enable_the_mcp_headers_helper_without_trust() {
         let (benign, _, sensitive) =
