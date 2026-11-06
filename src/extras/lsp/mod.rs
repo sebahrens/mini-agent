@@ -81,6 +81,8 @@ const HEALTH_MAX_NAME_CHARS: usize = 128;
 pub(crate) struct LspHealthSnapshot {
     pub configured_count: usize,
     pub configured_names: Vec<String>,
+    /// Withheld built-ins with their remedy, bounded.
+    pub withheld: Vec<String>,
     pub live_count: Option<usize>,
     pub live_names: Option<Vec<String>>,
     pub failure_count: Option<usize>,
@@ -127,6 +129,8 @@ impl From<PathBuf> for LspWorkspace {
 struct Inner {
     workspace: Arc<crate::paths::WorkspaceBinding>,
     servers: Vec<(String, crate::config::types::LspServerConfig)>,
+    /// Built-ins left out because the project config is not trusted.
+    withheld: Vec<registry::WithheldBuiltin>,
     /// server name → currently live client. Failed or stopped clients are not
     /// retained so a later edit can restart a repaired server.
     clients: tokio::sync::Mutex<HashMap<String, Arc<LspClient>>>,
@@ -361,6 +365,13 @@ impl LspManager {
                 .take(HEALTH_MAX_NAMES)
                 .map(|(name, _)| health_name(name))
                 .collect(),
+            withheld: self
+                .inner
+                .withheld
+                .iter()
+                .take(HEALTH_MAX_NAMES)
+                .map(registry::WithheldBuiltin::explanation)
+                .collect(),
             live_count: live.as_ref().map(|clients| clients.len()),
             live_names: live.as_ref().map(|clients| {
                 let mut names: Vec<_> = clients
@@ -405,12 +416,12 @@ impl LspManager {
                     .expect("LSP workspace must be a stable directory"),
             ),
         };
-        let servers = registry::withhold_untrusted_builtins(
+        let (servers, withheld) = registry::split_untrusted_builtins(
             registry::resolve_servers(&cfg.servers),
             &cfg.servers,
             || workspace_is_trusted(&workspace),
         );
-        let manager = Self::with_servers(servers, workspace);
+        let manager = Self::with_servers_withheld(servers, withheld, workspace);
         manager.apply_idle_timeout(cfg);
         manager
     }
@@ -491,17 +502,30 @@ impl LspManager {
         let cancelled = scope.is_cancelled();
         cleanup.settle().await;
         let servers = result.ok()?;
-        let servers = registry::withhold_untrusted_builtins(servers, &user, || {
-            workspace_is_trusted(&workspace)
-        });
-        if cancelled || servers.is_empty() || workspace.validate().is_err() {
+        let (servers, withheld) =
+            registry::split_untrusted_builtins(servers, &user, || workspace_is_trusted(&workspace));
+        // A manager with only withheld servers is still returned so the `lsp`
+        // tool and `/doctor` can say why nothing runs.
+        if cancelled || (servers.is_empty() && withheld.is_empty()) || workspace.validate().is_err()
+        {
             return None;
         }
-        Some(Self::with_servers(servers, workspace))
+        Some(Self::with_servers_withheld(servers, withheld, workspace))
     }
 
-    fn with_servers(
+    /// Explanation when `path` would be served by a withheld built-in.
+    pub(crate) fn withheld_explanation(&self, path: &Path) -> Option<String> {
+        let ext = format!(".{}", path.extension()?.to_str()?.to_ascii_lowercase());
+        self.inner
+            .withheld
+            .iter()
+            .find(|entry| entry.extensions.contains(&ext))
+            .map(registry::WithheldBuiltin::explanation)
+    }
+
+    fn with_servers_withheld(
         servers: Vec<(String, crate::config::types::LspServerConfig)>,
+        withheld: Vec<registry::WithheldBuiltin>,
         workspace: Arc<crate::paths::WorkspaceBinding>,
     ) -> Self {
         let root = workspace.root();
@@ -513,6 +537,7 @@ impl LspManager {
         let inner = Arc::new(Inner {
             workspace,
             servers,
+            withheld,
             clients: tokio::sync::Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             diags: DiagStore::default(),
@@ -1704,7 +1729,22 @@ mod untrusted_builtin_tests {
         )
         .await
         .expect("rust-analyzer is available");
-        assert_eq!(manager.diagnostic_snapshot().configured_names, ["rust"]);
+        let snapshot = manager.diagnostic_snapshot();
+        assert!(snapshot.configured_names.is_empty(), "{snapshot:?}");
+        assert!(
+            snapshot.withheld.iter().any(|w| w.contains("'kotlin'")
+                && w.contains("[lsp.servers.kotlin]")
+                && w.contains("trust")),
+            "{snapshot:?}"
+        );
+        let kt = fixture.workspace.join("A.kt");
+        assert!(!manager.handles(&kt));
+        assert!(manager.withheld_explanation(&kt).is_some());
+        assert!(
+            manager
+                .withheld_explanation(&fixture.workspace.join("a.txt"))
+                .is_none()
+        );
 
         // Explicit mode applies the same gate.
         let explicit = LspManager::new(&LspConfig::default(), workspace.clone());
@@ -1712,7 +1752,7 @@ mod untrusted_builtin_tests {
         for gated in registry::BUILD_EVALUATING_BUILTINS {
             assert!(!names.iter().any(|n| n == gated), "{gated} in {names:?}");
         }
-        assert!(names.iter().any(|n| n == "rust"));
+        assert!(names.iter().any(|n| n == "clangd"));
 
         // The user's own entry for the language is explicit and stays.
         let mut cfg = LspConfig::default();

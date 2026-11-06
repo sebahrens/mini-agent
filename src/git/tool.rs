@@ -44,6 +44,8 @@ const PAGED_TEXT_LIMITS: crate::sandbox::CommandLimits = crate::sandbox::Command
     combined_bytes: 16 * 1024 * 1024 + 64 * 1024,
 };
 /// Bytes of diff/show text one call returns; `offset` pages through the rest.
+/// Most commits one `log` call returns; larger requests are rejected.
+const LOG_MAX_COUNT: u16 = 100;
 const TEXT_PAGE_BYTES: usize = 192 * 1024;
 
 /// Page size actually used: the diff/show page is delivered inline by the
@@ -1707,7 +1709,12 @@ impl GitTool {
             GitOperation::Log => {
                 reject_irrelevant_fields(&args, false, true, true)?;
                 let paths = self.validate_paths(&args.paths, None).await?;
-                let count = args.max_count.unwrap_or(20).clamp(1, 100);
+                let count = args.max_count.unwrap_or(20);
+                if !(1..=LOG_MAX_COUNT).contains(&count) {
+                    return Err(ToolError::Msg(format!(
+                        "log max_count must be between 1 and {LOG_MAX_COUNT} (got {count}); page past {LOG_MAX_COUNT} commits with skip/next_skip. branches accepts up to 1000."
+                    )));
+                }
                 let timeout = query_timeout(&args)?;
                 if let Some(revision) = args.revision.as_deref() {
                     self.validate_revision_or_range(revision).await?;
@@ -1961,7 +1968,7 @@ impl Tool for GitTool {
                 "start_line": { "type": "integer", "minimum": 1, "description": "blame only: first line" },
                 "end_line": { "type": "integer", "minimum": 1, "description": "blame only: last line (default start_line)" },
                 "message": { "type": "string", "maxLength": 16384, "description": "Commit message (required for commit), stash_push message, or annotated tag message" },
-                "max_count": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "log: commits per page (at most 100); branches: refs per page (default 100, at most 1000)" },
+                "max_count": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "log: commits per page (1-100; larger values are rejected, page with skip); branches: refs per page (default 100, at most 1000)" },
                 "scope": { "type": "string", "enum": ["local", "remote", "all", "tags"], "description": "branches only: local branches (default), remote-tracking branches, both, or tags; page with skip/next_skip; nothing is fetched" },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 120, "description": "log, blame, branches, stash_list: time budget for this call (default 30); retry with a larger value after a timeout" },
                 "amend": { "type": "boolean", "description": "commit only: amend the HEAD commit if it is not in any remote-tracking ref (separate git/amend permission)" },
@@ -2670,6 +2677,22 @@ mod tests {
             max_count,
             ..args(GitOperation::Log, &[], None)
         }
+    }
+
+    #[tokio::test]
+    async fn log_rejects_max_count_above_its_cap_instead_of_clamping() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        let tool = repo.tool();
+        for bad in [0u16, 101, 500, 1000] {
+            let error = tool
+                .call(log_args(Some(bad)))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("between 1 and 100"), "{bad}: {error}");
+        }
+        tool.call(log_args(Some(100))).await.unwrap();
     }
 
     #[tokio::test]

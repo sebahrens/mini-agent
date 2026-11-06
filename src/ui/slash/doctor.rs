@@ -34,6 +34,9 @@ pub(crate) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             for name in snapshot.configured_names {
                 report.row("configured server", name);
             }
+            for why in snapshot.withheld {
+                report.row("withheld server", why);
+            }
             report.row(
                 "retained live clients",
                 snapshot

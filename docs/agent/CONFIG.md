@@ -433,7 +433,7 @@ so fixture names remain visible without advertising them as product configuratio
 | Command-file fixtures | `MINI_AGENT_TEST_COMMAND_FIFO`: test-only bounded child probe for command-file and project-trust FIFO reads. |
 | Harness evaluation seed | `HARNESS_EVAL_SEED`: optional generator seed for the ignored evidence-axis harness evaluation (drift runs); test-only, never read by the product. |
 | Process-env lock fixture | `ZS_SHARED_READER_TEST`: test-only variable set under the exclusive process-env scope to prove a shared reader never observes a mutator scope; never read by production code. |
-| MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `MINI_AGENT_NETWORK_TESTS`, `MINI_AGENT_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_NAV_BEHAVIOR`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_PUBLISH_DELAY_MS`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_SAVE_LOG`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYMBOL_URI`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
+| MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `MINI_AGENT_NETWORK_TESTS`, `MINI_AGENT_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_CONFIG_LOG`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_NAV_BEHAVIOR`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_PUBLISH_DELAY_MS`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_SAVE_LOG`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYMBOL_URI`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
 
 mini-agent sends no analytics or network telemetry. Learned-skill telemetry is stored in the
 local skill store; provider, embedding, MCP, sharing and explicitly invoked tool requests
@@ -763,7 +763,7 @@ Accepted top-level keys:
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
 | `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, other command classes retain their existing limits, and brokered JS `spawn` is bounded by `js-step-timeout-secs`. Sensitive in project-local configuration: changing it requires project trust. |
 | `shell_auto_background` | boolean | Default for the shell call flag `auto_background`: a foreground command that reaches its deadline keeps running as a background job (its id and output so far are returned) instead of being killed. Default: `false`. Same sandbox, permission decision and job limits as `background = true`. Sensitive in project-local configuration. |
-| `command_timeout_secs` | integer | Deadline of `!` commands (TUI and headless) in seconds. Default: `120`; clamped to 1–600. A single command can set its own deadline with `!timeout=300 cargo test` (same clamp). A timed-out run reports `timed out after N s` and how to raise it. Loop/goal validators, hooks and brokered JS `spawn` keep their own deadlines. Sensitive in project-local configuration. |
+| `command_timeout_secs` | integer | Deadline of `!` commands (TUI and headless) in seconds. Default: `120`; clamped to 1–600. A single command can set its own deadline with `!timeout=300 cargo test` (same clamp). A timed-out run reports `timed out after N s` and how to raise it. Loop/goal validators, hooks and brokered JS `spawn` keep their own deadlines. Output volume never fails these commands: `!` commands, `verify_command`, goal checks and loop validators capture a spooled 500 KiB head plus 256 KiB tail (fixed, not configurable), write the full output to a private log in the session's tool-output directory (readable with `read`, which pages with offset/limit) once it overflows, and name that log in the result (`[output truncated: N bytes omitted ...; full output log: PATH ...]`). Only a 64 MiB total-output ceiling stops a command, reported as `output_truncated` / `hard ceiling`; the command's real exit status otherwise decides pass or fail. Sensitive in project-local configuration. |
 | `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Loop and ACP modes skip it; `-p` prints a one-line stderr notice from the cached result only (no network; `--quiet` silences it). Requires project trust when set locally. Nothing is downloaded unless you run `mini-agent update`. |
 | `session_retention_days` | integer | Delete saved session snapshots (`<uuid>.json` in the sessions directory) whose modification time is older than this many days, once per startup in a background thread: interactive startup always, and headless (`-p`, `--loop`) and ACP startup when this key is set and the run persists sessions (not `--no-session`); a short-lived `-p` run waits at most 2 seconds for it to finish. Default: unset/`0` (keep forever; a deliberate choice so an unconfigured CI run never deletes sessions). The orphan tool-output sweep accompanies retention in headless/ACP runs and always runs at interactive startup. A session open in this or another live process (its lock is held) is never removed. Deleting a session (retention or `/sessions delete`) also removes its private tool-output directory (spills, full command logs, `/rewind` file-checkpoint preimages); independently of this key, startup removes tool-output directories that match no saved session and have been idle for 14 days. Requires project trust when set locally. |
 | `persist_project_approvals` | boolean | Offer `(p) always allow in this project` on TUI approval prompts and load those rules at interactive startup. Default: `false`. Rules are stored privately per workspace in the state directory, never in the repository; headless runs ignore them. See [Interactive approvals](#interactive-approvals). |
@@ -4215,6 +4215,10 @@ extensions = [".my"]
 # initialization = { ... }   # server-specific initializationOptions
 # disabled = false           # true removes a same-named built-in
 # wait_ms = 1000             # post-edit diagnostics wait (default 1000, max 60000)
+# startup_timeout_ms = 15000 # initialize handshake deadline (default 15000, clamped 1000-300000)
+# request_timeout_ms = 10000 # per navigation request deadline for the lsp tool (default 10000, clamped 1000-300000)
+# [lsp.servers.myserver.settings.python.analysis]  # answered for workspace/configuration and pushed
+# typeCheckingMode = "strict"                      # via workspace/didChangeConfiguration
 ```
 
 ### YAML
@@ -4241,18 +4245,22 @@ be overridden or set `disabled = true` like the others.
 
 **Trade-off for the build-evaluating built-ins.** `jdtls`, `csharp-ls`, `ruby-lsp`,
 `kotlin-language-server`, `sourcekit-lsp` and `zls` load the repository's build definitions
-(Gradle scripts, MSBuild projects and analyzers, the Gemfile, `Package.swift`, `build.zig`) to
-resolve a project, which runs repository code in the server process outside the shell sandbox. The
-built-in entries for these six (the names `java`, `csharp`, `ruby`, `kotlin`, `swift`, `zig`)
-therefore start **only when the workspace's `.mini-agent/config.toml` is trusted** (the same
-content-bound project-config trust as other project settings, read without prompting). In an
-untrusted workspace, one without a project config, or when the trust store is unavailable they are
-not registered and a warning is logged naming the server. This default is closed: a repository
-cannot make them run just by being opened and edited. To use one anyway without trusting the
-project, define it yourself in your user config (for example `[lsp.servers.kotlin]` with an absolute
-`command` and `extensions`): a same-named user entry is your explicit choice and is never withheld.
-`rust-analyzer` (`build.rs` and proc macros run when it loads a crate) and the other built-ins keep
-their existing behaviour. `/doctor` lists configured servers without applying this gate.
+(Gradle scripts, MSBuild projects and analyzers, the Gemfile, `Package.swift`, `build.zig`);
+`rust-analyzer` runs `build.rs` and proc macros when it loads a crate; `pyright-langserver`
+executes the interpreter a repository's `pyrightconfig.json`/virtualenv selects;
+`typescript-language-server` loads `tsconfig.json` plugins and a workspace TypeScript; `gopls`
+runs the Go toolchain a repository's `go.mod` selects. All of this is repository code running in
+the server process outside the shell sandbox. The built-in entries for these ten (the names `java`,
+`csharp`, `ruby`, `kotlin`, `swift`, `zig`, `rust`, `python`, `typescript`, `go`) therefore start
+**only when the workspace's `.mini-agent/config.toml` is trusted** (the same content-bound
+project-config trust as other project settings, read without prompting). In an untrusted
+workspace, one without a project config, or when the trust store is unavailable they are not
+registered. The withheld state is visible: `/doctor` lists each as `withheld server`, and the `lsp`
+tool's no-server message names the withheld built-in and how to enable it. This default is closed:
+a repository cannot make them run just by being opened and edited. To use one anyway without
+trusting the project, define it yourself in your user config (for example `[lsp.servers.rust]` with
+`command = "rust-analyzer"` and `extensions = [".rs"]`): a same-named user entry is your explicit
+choice and is never withheld. `clangd`, `bash`, `lua` and `php` keep their existing behaviour.
 
 Behavior notes:
 
@@ -4262,6 +4270,19 @@ Behavior notes:
   A relative `command` with a directory component (`./my-ls`) is rejected; use
   an absolute path. mini-agent never auto-installs a language server. A missing
   binary is skipped with a debug log.
+- `settings` (a table, at most 64 KiB serialized; anything else is ignored) is what the
+  server reads through `workspace/configuration`: an item with a `section` such as
+  `python.analysis` gets the value at that dotted path (or a literal top-level key of the same
+  name), an item without a section gets the whole table, and anything unset gets `null`. When
+  `settings` is set the client also declares `workspace.configuration` and sends
+  `workspace/didChangeConfiguration` with the table after `initialized`. Without `settings`
+  behaviour is unchanged (every item answered `null`). It is neutral to capability: it is
+  delivered only to the server you already configured, and like the rest of `[lsp.servers]` a
+  project config's `lsp` table is ignored until the project config is trusted.
+- `startup_timeout_ms` bounds the `initialize` handshake and `request_timeout_ms` each navigation
+  request of the `lsp` tool; raise `startup_timeout_ms` for slow cold starts (`jdtls`,
+  `kotlin-language-server`, `omnisharp`, large `rust-analyzer` workspaces) that otherwise fail
+  initialization and enter the failure cooldown.
 - Servers start lazily on the first edit touching one of their extensions
   using the canonical session cwd for both process cwd and `rootUri`.
 - A started server that sees no edit or request for `idle_timeout_secs`

@@ -55,7 +55,26 @@ pub(crate) const BACKGROUND_HEAD_BYTES: usize = 48 * 1024;
 pub(crate) const BACKGROUND_TAIL_BYTES: usize = 16 * 1024;
 pub(crate) const BACKGROUND_LOG_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Retention for user-typed `!` commands, `verify_command`, goal checks and
+/// loop validators: 500 KiB head plus 256 KiB tail per rendering. Two streams
+/// of that size plus the omission marker still fit the 1.5 MiB combined cap
+/// of the diagnostic renderers, so the tail is never clipped a second time.
+pub(crate) const COMMAND_HEAD_BYTES: usize = 500 * 1024;
+pub(crate) const COMMAND_TAIL_BYTES: usize = 256 * 1024;
+
 impl SpoolPolicy {
+    /// Spooled capture for commands the user or the configuration chose to
+    /// run: never stopped for volume below the 64 MiB pathological ceiling,
+    /// full output kept in `log` once retention overflows.
+    pub(crate) fn captured_command(log: Option<PathBuf>) -> Self {
+        Self {
+            head_bytes: COMMAND_HEAD_BYTES,
+            tail_bytes: COMMAND_TAIL_BYTES,
+            hard_limit: Some(SHELL_HARD_OUTPUT_BYTES),
+            log: log.map_or(LogPolicy::Disabled, LogPolicy::OnOverflow),
+            log_limit: SHELL_HARD_OUTPUT_BYTES,
+        }
+    }
     pub(crate) fn foreground_shell(log: Option<PathBuf>) -> Self {
         Self {
             head_bytes: SHELL_HEAD_BYTES,

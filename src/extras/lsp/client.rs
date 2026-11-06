@@ -224,7 +224,6 @@ fn valid_percent_escapes(bytes: &[u8]) -> bool {
     true
 }
 
-const INIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Deadline covering writer-lock acquisition plus the frame write and flush.
 ///
 /// A server that initializes successfully and then stops reading fills its
@@ -542,6 +541,8 @@ pub struct LspClient {
     capabilities: std::sync::OnceLock<Value>,
     /// Active `$/progress` work-done tokens.
     progress: Arc<ProgressState>,
+    /// Deadline of one navigation request (`request_timeout_ms`).
+    request_timeout: Duration,
     #[cfg(test)]
     sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
     #[cfg(test)]
@@ -568,7 +569,7 @@ impl LspClient {
             workspace,
             diags,
             diag_notify,
-            INIT_TIMEOUT,
+            cfg.startup_timeout(),
         )
         .await
     }
@@ -678,6 +679,7 @@ impl LspClient {
             let parent_workspace_uri = file_uri(workspace.root())?;
             let workspace = workspace.clone();
             let server_root = server_root.clone();
+            let settings = cfg.workspace_settings().cloned().map(Arc::new);
             let transport = transport.clone();
             let diagnostic_work = diagnostic_work.clone();
             let progress = progress.clone();
@@ -700,7 +702,7 @@ impl LspClient {
                     };
                     let method = msg.get("method").and_then(Value::as_str);
                     let id = msg.get("id").and_then(Value::as_i64);
-                    if let Some(reply) = server_request_reply(&msg) {
+                    if let Some(reply) = server_request_reply(&msg, settings.as_deref()) {
                         // Server→client request (numeric or string id).
                         let body = serde_json::to_vec(&reply).unwrap_or_default();
                         if !write_owned_frame_with_deadline(
@@ -874,6 +876,7 @@ impl LspClient {
             save_mode: AtomicU8::new(SAVE_NONE),
             capabilities: std::sync::OnceLock::new(),
             progress,
+            request_timeout: cfg.request_timeout(),
             #[cfg(test)]
             sync_probes: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
@@ -911,6 +914,8 @@ impl LspClient {
                 },
                 "window": { "workDoneProgress": true },
                 "workspace": {
+                    "configuration": cfg.workspace_settings().is_some(),
+                    "didChangeConfiguration": { "dynamicRegistration": false },
                     "workspaceEdit": {
                         "documentChanges": true,
                         "resourceOperations": ["create", "rename", "delete"]
@@ -948,6 +953,17 @@ impl LspClient {
             client.shutdown().await;
             return None;
         }
+        if let Some(settings) = cfg.workspace_settings()
+            && !client
+                .notify(
+                    "workspace/didChangeConfiguration",
+                    json!({ "settings": settings }),
+                )
+                .await
+        {
+            client.shutdown().await;
+            return None;
+        }
         tracing::info!("lsp[{name}]: initialized (root {})", root.display());
         Some(client)
     }
@@ -975,6 +991,11 @@ impl LspClient {
     /// before it shuts the client down.
     pub(crate) fn detach_idle_task(&self) {
         drop(self.idle_task.lock().unwrap().take());
+    }
+
+    /// Deadline of one navigation request to this server.
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Option<Value> {
@@ -1473,7 +1494,7 @@ const MAX_CONFIGURATION_ITEMS: usize = 1024;
 /// `workspace/configuration` must answer with one entry per requested item;
 /// every other request gets `null`, since this client declares no
 /// capabilities that would legitimately trigger one.
-fn server_request_reply(msg: &Value) -> Option<Value> {
+fn server_request_reply(msg: &Value, settings: Option<&Value>) -> Option<Value> {
     let method = msg.get("method")?.as_str()?;
     let id = msg.get("id")?;
     if !(id.is_number() || id.is_string()) {
@@ -1484,13 +1505,39 @@ fn server_request_reply(msg: &Value) -> Option<Value> {
             .get("params")
             .and_then(|params| params.get("items"))
             .and_then(Value::as_array)
-            .map_or(0, Vec::len)
-            .min(MAX_CONFIGURATION_ITEMS);
-        Value::Array(vec![Value::Null; items])
+            .map_or(&[][..], Vec::as_slice);
+        Value::Array(
+            items
+                .iter()
+                .take(MAX_CONFIGURATION_ITEMS)
+                .map(|item| configuration_value(settings, item.get("section")))
+                .collect(),
+        )
     } else {
         Value::Null
     };
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+/// The configured value for one `workspace/configuration` item: the whole
+/// settings object when the item names no section, else the value at its
+/// dotted section path, else `null`. A section that is a literal top-level key
+/// (`"python.analysis"`) also matches.
+fn configuration_value(settings: Option<&Value>, section: Option<&Value>) -> Value {
+    let Some(settings) = settings else {
+        return Value::Null;
+    };
+    let Some(section) = section.and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+        return settings.clone();
+    };
+    if let Some(value) = settings.get(section) {
+        return value.clone();
+    }
+    section
+        .split('.')
+        .try_fold(settings, |value, part| value.get(part))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 struct PendingRequest {
@@ -2276,26 +2323,48 @@ mod boundary_tests {
 
     #[test]
     fn server_requests_are_answered_with_their_exact_id() {
-        let string_id = server_request_reply(&json!({
-            "jsonrpc": "2.0", "id": "req-7", "method": "window/workDoneProgress/create",
-            "params": {"token": "t"}
-        }))
+        let string_id = server_request_reply(
+            &json!({
+                "jsonrpc": "2.0", "id": "req-7", "method": "window/workDoneProgress/create",
+                "params": {"token": "t"}
+            }),
+            None,
+        )
         .expect("a string-id request must be answered");
         assert_eq!(string_id["id"], "req-7");
         assert_eq!(string_id["result"], Value::Null);
 
-        let configuration = server_request_reply(&json!({
-            "jsonrpc": "2.0", "id": 3, "method": "workspace/configuration",
-            "params": {"items": [{"section": "a"}, {"section": "b"}, {}]}
-        }))
+        let configuration = server_request_reply(
+            &json!({
+                "jsonrpc": "2.0", "id": 3, "method": "workspace/configuration",
+                "params": {"items": [{"section": "a"}, {"section": "b"}, {}]}
+            }),
+            None,
+        )
         .unwrap();
         assert_eq!(configuration["id"], 3);
         assert_eq!(configuration["result"], json!([null, null, null]));
 
         // Notifications and responses are not requests.
-        assert!(server_request_reply(&json!({"method": "window/logMessage"})).is_none());
-        assert!(server_request_reply(&json!({"id": 1, "result": {}})).is_none());
-        assert!(server_request_reply(&json!({"id": null, "method": "x"})).is_none());
+        assert!(server_request_reply(&json!({"method": "window/logMessage"}), None).is_none());
+        assert!(server_request_reply(&json!({"id": 1, "result": {}}), None).is_none());
+        assert!(server_request_reply(&json!({"id": null, "method": "x"}), None).is_none());
+
+        // Configured settings: whole object without a section, nested and
+        // literal dotted sections, and null for anything unset.
+        let settings = json!({"python": {"analysis": {"x": 1}}, "a.b": 2});
+        let reply = server_request_reply(
+            &json!({
+                "jsonrpc": "2.0", "id": 4, "method": "workspace/configuration",
+                "params": {"items": [{}, {"section": "python.analysis"}, {"section": "a.b"}, {"section": "nope"}]}
+            }),
+            Some(&settings),
+        )
+        .unwrap();
+        assert_eq!(
+            reply["result"],
+            json!([settings.clone(), {"x": 1}, 2, null])
+        );
     }
 
     #[tokio::test]

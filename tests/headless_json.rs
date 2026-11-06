@@ -1644,7 +1644,7 @@ fn loop_validation_cli_preserves_command_results_and_output_limits() {
             "exit_code=7",
             "read",
         ),
-        ("yes loop-output", "output_truncated", "limit=stdout", ""),
+        ("yes loop-output", "output_truncated", "limit=combined", ""),
     ] {
         let root = TempRoot::new();
         let server = root.local_provider(if tools.is_empty() {

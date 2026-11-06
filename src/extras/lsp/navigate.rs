@@ -17,9 +17,6 @@ use serde_json::{Value, json};
 
 use super::LspManager;
 
-/// Bound for one navigation request; indexing servers can be slow to answer
-/// the first query.
-const NAV_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an empty answer waits for a server that is still indexing before
 /// the result is reported as "still indexing".
 const INDEX_WAIT: Duration = if cfg!(test) {
@@ -254,11 +251,15 @@ impl LspManager {
         let ask = |method: &'static str, params: Value| {
             let client = &client;
             async move {
-                let mut result = client.query(method, params.clone(), NAV_TIMEOUT).await?;
+                let mut result = client
+                    .query(method, params.clone(), client.request_timeout())
+                    .await?;
                 let mut indexing = false;
                 if result_is_empty(query.op, &result) && client.is_indexing() {
                     if client.wait_until_idle(INDEX_WAIT).await {
-                        result = client.query(method, params, NAV_TIMEOUT).await?;
+                        result = client
+                            .query(method, params, client.request_timeout())
+                            .await?;
                     }
                     indexing = client.is_indexing() && result_is_empty(query.op, &result);
                 }
@@ -289,7 +290,11 @@ impl LspManager {
                     "to"
                 };
                 let calls = client
-                    .query(query.op.method(), json!({ "item": item }), NAV_TIMEOUT)
+                    .query(
+                        query.op.method(),
+                        json!({ "item": item }),
+                        client.request_timeout(),
+                    )
                     .await?;
                 (calls_answer(&calls, key, &map), false)
             }
