@@ -60,11 +60,127 @@ impl Fields {
             .and_then(|raw| serde_json::from_str(raw.get()).ok())
             .ok_or_else(|| error("Notebook has a missing or invalid required field"))
     }
-    fn set<T: Serialize>(&mut self, key: &str, value: &T) -> Result<(), ToolError> {
-        let raw = serde_json::value::to_raw_value(value)
-            .map_err(|_| error("Cannot encode notebook field"))?;
+    /// Sets a cell field, encoded in the notebook's own layout at cell-field
+    /// depth so the written file matches what Jupyter would produce.
+    fn set<T: Serialize>(
+        &mut self,
+        key: &str,
+        value: &T,
+        layout: &Layout,
+    ) -> Result<(), ToolError> {
+        let encoded = layout.encode(value, CELL_FIELD_DEPTH)?;
+        let raw =
+            RawValue::from_string(encoded).map_err(|_| error("Cannot encode notebook field"))?;
         self.0.insert(key.into(), raw);
         Ok(())
+    }
+}
+
+/// Nesting depth of a cell field value: root object (0) -> `cells` array
+/// (1) -> cell object (2) -> field value (3).
+const CELL_FIELD_DEPTH: usize = 3;
+
+/// Whitespace layout of the original notebook file. nbformat writes
+/// `indent=1`, sorted keys and a final newline; reproducing the detected
+/// layout keeps unchanged cells byte-identical, so a git diff shows only the
+/// edited cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Layout {
+    /// Indentation unit, `None` for single-line (compact) JSON.
+    indent: Option<String>,
+    trailing_newline: bool,
+}
+impl Layout {
+    fn detect(bytes: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+        let trimmed = text.trim_start();
+        let indent = trimmed.find('\n').map(|newline| {
+            let next = &trimmed[newline + 1..];
+            let unit: String = next
+                .chars()
+                .take_while(|ch| *ch == ' ' || *ch == '\t')
+                .take(16)
+                .collect();
+            if unit.is_empty() {
+                " ".to_string()
+            } else {
+                unit
+            }
+        });
+        Self {
+            indent,
+            trailing_newline: bytes.ends_with(b"\n"),
+        }
+    }
+    /// Encodes `value` as it appears at `depth` in this layout.
+    fn encode<T: Serialize>(&self, value: &T, depth: usize) -> Result<String, ToolError> {
+        let Some(indent) = &self.indent else {
+            return serde_json::to_string(value).map_err(|_| error("Cannot encode notebook field"));
+        };
+        let mut out = Vec::new();
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+        let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+        value
+            .serialize(&mut serializer)
+            .map_err(|_| error("Cannot encode notebook field"))?;
+        let pretty = String::from_utf8(out).map_err(|_| error("Cannot encode notebook field"))?;
+        Ok(pretty.replace('\n', &format!("\n{}", indent.repeat(depth))))
+    }
+    /// Writes `{ "key": value, ... }` at `depth`; values are written by
+    /// `value` (raw fragments verbatim).
+    fn object<'a>(
+        &self,
+        out: &mut String,
+        fields: impl ExactSizeIterator<Item = (&'a String, &'a RawValue)>,
+        depth: usize,
+        cells: Option<&[Fields]>,
+    ) -> Result<(), ToolError> {
+        let count = fields.len();
+        if count == 0 {
+            out.push_str("{}");
+            return Ok(());
+        }
+        out.push('{');
+        for (index, (key, raw)) in fields.enumerate() {
+            self.break_line(out, depth + 1);
+            out.push_str(&serde_json::to_string(key).map_err(|_| error("Cannot encode notebook"))?);
+            out.push_str(if self.indent.is_some() { ": " } else { ":" });
+            match cells {
+                Some(cells) if depth == 0 && key == "cells" => self.cells(out, cells)?,
+                _ => out.push_str(raw.get()),
+            }
+            if index + 1 < count {
+                out.push(',');
+            }
+        }
+        self.break_line(out, depth);
+        out.push('}');
+        Ok(())
+    }
+    fn cells(&self, out: &mut String, cells: &[Fields]) -> Result<(), ToolError> {
+        if cells.is_empty() {
+            out.push_str("[]");
+            return Ok(());
+        }
+        out.push('[');
+        for (index, cell) in cells.iter().enumerate() {
+            self.break_line(out, 2);
+            self.object(out, cell.0.iter().map(|(k, v)| (k, &**v)), 2, None)?;
+            if index + 1 < cells.len() {
+                out.push(',');
+            }
+        }
+        self.break_line(out, 1);
+        out.push(']');
+        Ok(())
+    }
+    fn break_line(&self, out: &mut String, depth: usize) {
+        if let Some(indent) = &self.indent {
+            out.push('\n');
+            for _ in 0..depth {
+                out.push_str(indent);
+            }
+        }
     }
 }
 
@@ -192,8 +308,24 @@ struct Notebook {
     root: Fields,
     cells: Vec<Fields>,
     minor: u64,
+    layout: Layout,
 }
 impl Notebook {
+    /// Serializes in the original layout; unchanged fields are written from
+    /// their raw source fragments.
+    fn encode(&self) -> Result<Vec<u8>, ToolError> {
+        let mut out = String::new();
+        self.layout.object(
+            &mut out,
+            self.root.0.iter().map(|(k, v)| (k, &**v)),
+            0,
+            Some(&self.cells),
+        )?;
+        if self.layout.trailing_newline {
+            out.push('\n');
+        }
+        Ok(out.into_bytes())
+    }
     fn parse(bytes: &[u8], limit: u64) -> Result<Self, ToolError> {
         if bytes.len() as u64 > byte_limit(limit) {
             return Err(error(
@@ -233,6 +365,7 @@ impl Notebook {
             root,
             cells: cells.0,
             minor,
+            layout: Layout::detect(bytes),
         })
     }
     fn edit(mut self, args: &NotebookArgs, limit: u64) -> Result<Option<Vec<u8>>, ToolError> {
@@ -270,11 +403,21 @@ impl Notebook {
                 if old == text {
                     return Ok(None);
                 }
+                let layout = &self.layout;
+                let cell = &mut self.cells[index];
                 if array {
-                    self.cells[index]
-                        .set("source", &text.split_inclusive('\n').collect::<Vec<_>>())?;
+                    cell.set(
+                        "source",
+                        &text.split_inclusive('\n').collect::<Vec<_>>(),
+                        layout,
+                    )?;
                 } else {
-                    self.cells[index].set("source", &text)?;
+                    cell.set("source", &text, layout)?;
+                }
+                // Outputs of the old source would look like results of the new one.
+                if kind == "code" {
+                    cell.set("outputs", &Vec::<u8>::new(), layout)?;
+                    cell.set("execution_count", &Option::<u64>::None, layout)?;
                 }
             }
             NotebookMode::Insert => {
@@ -282,9 +425,10 @@ impl Notebook {
                     return Err(error("Notebook exceeds the 4096-cell cap"));
                 }
                 let kind = args.cell_type.as_deref().unwrap_or("code");
+                let layout = &self.layout;
                 let mut cell = Fields(BTreeMap::new());
-                cell.set("cell_type", &kind)?;
-                cell.set("metadata", &serde_json::json!({}))?;
+                cell.set("cell_type", &kind, layout)?;
+                cell.set("metadata", &serde_json::json!({}), layout)?;
                 cell.set(
                     "source",
                     &args
@@ -293,20 +437,19 @@ impl Notebook {
                         .expect("validated source")
                         .split_inclusive('\n')
                         .collect::<Vec<_>>(),
+                    layout,
                 )?;
                 if kind == "code" {
-                    cell.set("outputs", &Vec::<u8>::new())?;
-                    cell.set("execution_count", &Option::<u64>::None)?;
+                    cell.set("outputs", &Vec::<u8>::new(), layout)?;
+                    cell.set("execution_count", &Option::<u64>::None, layout)?;
                 }
                 if self.minor >= 5 {
-                    cell.set("id", &uuid::Uuid::new_v4().to_string())?;
+                    cell.set("id", &uuid::Uuid::new_v4().to_string(), layout)?;
                 }
                 self.cells.insert(index, cell);
             }
         }
-        self.root.set("cells", &self.cells)?;
-        let result =
-            serde_json::to_vec_pretty(&self.root).map_err(|_| error("Cannot encode notebook"))?;
+        let result = self.encode()?;
         if result.len() as u64 > byte_limit(limit) {
             return Err(error("Resulting notebook exceeds the bounded raw-file cap"));
         }
@@ -585,6 +728,26 @@ impl NotebookTool {
             crate::spend::run::admit_current_effect()
                 .await
                 .map_err(|err| ToolError::Msg(err.to_string()))?;
+            // Capture the exact preimage for /rewind like native write/edit.
+            let before: Arc<[u8]> = Arc::from(before);
+            let mut checkpoint = match &bound {
+                Some(relative) => {
+                    crate::session::file_checkpoints::prepare(
+                        &self.workspace,
+                        relative,
+                        Some(crate::session::file_checkpoints::Preimage::new(
+                            Arc::clone(&before),
+                            &base,
+                        )),
+                        disclose,
+                    )
+                    .await
+                }
+                None => {
+                    crate::session::file_checkpoints::skipped();
+                    None
+                }
+            };
             #[cfg(test)]
             let cancellation = self.publication_cancellation.clone().unwrap_or_default();
             #[cfg(not(test))]
@@ -619,6 +782,10 @@ impl NotebookTool {
                 )
                 .await?;
             }
+            crate::session::file_checkpoints::published();
+            if let Some(checkpoint) = &mut checkpoint {
+                checkpoint.committed(&crate::fs::ContentDigest::of(&after), after.len());
+            }
             if disclose {
                 diff = MutationDiff::replacement(
                     &identity,
@@ -639,6 +806,9 @@ impl NotebookTool {
             },
             args.path
         );
+        if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
+            output.push_str(&notice);
+        }
         if let Some(coaching) = coaching {
             output = format!("{coaching}\n\n{output}");
         }
@@ -651,7 +821,7 @@ impl Tool for NotebookTool {
     type Args = NotebookArgs;
     type Output = String;
     fn description(&self) -> String {
-        "Edit an .ipynb notebook cell without execution. replace changes source only, preserving outputs/metadata/type. insert adds before a zero-based index or cell ID (index=len appends); delete removes the selected cell. Exactly one cell_index or cell_id is required. Legacy notebooks retain their format version. Use read for cell views, raw_notebook:true for raw JSON.".into()
+        "Edit an .ipynb notebook cell without execution. replace changes source and keeps metadata/type; a replaced code cell has its stale outputs and execution_count cleared. insert adds before a zero-based index or cell ID (index=len appends); delete removes the selected cell. Exactly one cell_index or cell_id is required. Legacy notebooks retain their format version. Use read for cell views, raw_notebook:true for raw JSON.".into()
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({"type":"object","additionalProperties":false,"properties":{
@@ -707,9 +877,13 @@ mod tests {
         let output = transformed(FIXTURE, args(NotebookMode::Replace, Some("new\r\nlast\n")));
         let notebook = Notebook::parse(output.as_bytes(), MAX_NOTEBOOK_BYTES).unwrap();
         let old = Notebook::parse(FIXTURE.as_bytes(), MAX_NOTEBOOK_BYTES).unwrap();
-        for key in ["outputs", "metadata", "execution_count"] {
-            assert_eq!(notebook.cells[0].0[key].get(), old.cells[0].0[key].get());
-        }
+        assert_eq!(
+            notebook.cells[0].0["metadata"].get(),
+            old.cells[0].0["metadata"].get()
+        );
+        // The old outputs belong to the old source.
+        assert_eq!(notebook.cells[0].0["outputs"].get(), "[]");
+        assert_eq!(notebook.cells[0].0["execution_count"].get(), "null");
         assert_eq!(
             notebook.root.0["metadata"].get(),
             old.root.0["metadata"].get()
@@ -732,6 +906,65 @@ mod tests {
             ("literal $HOME\n!cmd".into(), false)
         );
     }
+    /// As written by Jupyter/nbformat: indent 1, sorted keys, final newline.
+    const JUPYTER: &str = "{\n \"cells\": [\n  {\n   \"cell_type\": \"code\",\n   \"execution_count\": 3,\n   \"id\": \"a1\",\n   \"metadata\": {},\n   \"outputs\": [\n    {\n     \"name\": \"stdout\",\n     \"output_type\": \"stream\",\n     \"text\": [\n      \"1\\n\"\n     ]\n    }\n   ],\n   \"source\": [\n    \"print(1)\\n\",\n    \"x = 1\"\n   ]\n  },\n  {\n   \"cell_type\": \"markdown\",\n   \"id\": \"b2\",\n   \"metadata\": {},\n   \"source\": [\n    \"# Title é\"\n   ]\n  }\n ],\n \"metadata\": {\n  \"kernelspec\": {\n   \"name\": \"python3\"\n  }\n },\n \"nbformat\": 4,\n \"nbformat_minor\": 5\n}\n";
+
+    #[test]
+    fn notebook_round_trip_is_byte_identical_and_edits_touch_only_their_cell() {
+        let notebook = Notebook::parse(JUPYTER.as_bytes(), MAX_NOTEBOOK_BYTES).unwrap();
+        assert_eq!(
+            String::from_utf8(notebook.encode().unwrap()).unwrap(),
+            JUPYTER
+        );
+        // The compact fixture keeps its compact layout too.
+        let compact = Notebook::parse(FIXTURE.as_bytes(), MAX_NOTEBOOK_BYTES).unwrap();
+        let reencoded = String::from_utf8(compact.encode().unwrap()).unwrap();
+        assert!(!reencoded.contains('\n'), "{reencoded}");
+        assert!(reencoded.starts_with("{\"cells\":[{\"cell_type\":\"code\""));
+        assert_eq!(
+            Notebook::parse(reencoded.as_bytes(), MAX_NOTEBOOK_BYTES)
+                .unwrap()
+                .cells
+                .len(),
+            2
+        );
+
+        let mut replace = args(NotebookMode::Replace, Some("print(2)\n"));
+        replace.cell_id = Some("a1".into());
+        replace.cell_index = None;
+        let output = transformed(JUPYTER, replace);
+        let expected = JUPYTER
+            .replace(
+                "   \"execution_count\": 3,\n",
+                "   \"execution_count\": null,\n",
+            )
+            .replace(
+                "   \"outputs\": [\n    {\n     \"name\": \"stdout\",\n     \"output_type\": \"stream\",\n     \"text\": [\n      \"1\\n\"\n     ]\n    }\n   ],\n",
+                "   \"outputs\": [],\n",
+            )
+            .replace(
+                "    \"print(1)\\n\",\n    \"x = 1\"\n",
+                "    \"print(2)\\n\"\n",
+            );
+        assert_eq!(output, expected);
+
+        let mut markdown = args(NotebookMode::Replace, Some("# New"));
+        markdown.cell_id = Some("b2".into());
+        markdown.cell_index = None;
+        let output = transformed(JUPYTER, markdown);
+        assert_eq!(output, JUPYTER.replace("\"# Title é\"", "\"# New\""));
+
+        let mut insert = args(NotebookMode::Insert, Some("y = 2"));
+        insert.cell_index = Some(2);
+        let output = transformed(JUPYTER, insert);
+        assert!(output.starts_with(&JUPYTER[..JUPYTER.find("\n ],\n").unwrap()]));
+        assert!(
+            output.contains(",\n  {\n   \"cell_type\": \"code\",\n   \"execution_count\": null,\n"),
+            "{output}"
+        );
+        assert!(output.ends_with("\n \"nbformat_minor\": 5\n}\n"));
+    }
+
     #[test]
     fn notebook_insert_delete_selectors_and_legacy_ids() {
         for kind in ["code", "markdown", "raw"] {

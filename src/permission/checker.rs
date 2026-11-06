@@ -1103,6 +1103,7 @@ impl PermissionChecker {
             "read"
                 | "js/read_file"
                 | "lsp_diagnostics"
+                | "lsp_navigate"
                 | "grep"
                 | "find_files"
                 | "list_dir"
@@ -2955,6 +2956,7 @@ fn is_path_tool_name(tool: &str) -> bool {
             | "js/read_file"
             | "js/write_file"
             | "lsp_diagnostics"
+            | "lsp_navigate"
     )
 }
 
@@ -2962,7 +2964,7 @@ fn permission_tool_aliases(tool: &str) -> &'static [&'static str] {
     match tool {
         "shell" => &["bash"],
         "bash" => &["shell"],
-        "read" => &["js/read_file", "lsp_diagnostics"],
+        "read" => &["js/read_file", "lsp_diagnostics", "lsp_navigate"],
         "write" => &["js/write_file"],
         _ => &[],
     }

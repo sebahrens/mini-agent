@@ -8,9 +8,101 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
-const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RECORDS: usize = 512;
+/// Checkpoint limits. Configurable through `[file_checkpoints]`; the
+/// per-file default follows the edit/write size limit (see
+/// [`configure`]). Deserialized inventories are validated against the hard
+/// ceilings so a session saved under larger limits still loads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits {
+    pub file_bytes: usize,
+    pub total_bytes: usize,
+    pub records: usize,
+}
+impl Limits {
+    pub(crate) const DEFAULT_FILE_BYTES: usize = 16 * 1024 * 1024;
+    pub(crate) const DEFAULT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+    pub(crate) const DEFAULT_RECORDS: usize = 2048;
+    const HARD_FILE_BYTES: usize = 1024 * 1024 * 1024;
+    const HARD_TOTAL_BYTES: usize = 4 * 1024 * 1024 * 1024;
+    const HARD_RECORDS: usize = 100_000;
+    const DEFAULT: Self = Self {
+        file_bytes: Self::DEFAULT_FILE_BYTES,
+        total_bytes: Self::DEFAULT_TOTAL_BYTES,
+        records: Self::DEFAULT_RECORDS,
+    };
+    const HARD: Self = Self {
+        file_bytes: Self::HARD_FILE_BYTES,
+        total_bytes: Self::HARD_TOTAL_BYTES,
+        records: Self::HARD_RECORDS,
+    };
+    /// Resolves configured values: absent fields use the defaults (the file
+    /// limit follows `edit_limit` when given), zero is raised to one record or
+    /// byte, and everything is clamped to the hard ceilings.
+    pub(crate) fn resolve(
+        file_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+        records: Option<u64>,
+        edit_limit: Option<u64>,
+    ) -> Self {
+        let clamp = |value: Option<u64>, default: usize, hard: usize| {
+            value
+                .map_or(default, |value| {
+                    usize::try_from(value).unwrap_or(usize::MAX)
+                })
+                .clamp(1, hard)
+        };
+        let file_default = edit_limit.map_or(Self::DEFAULT_FILE_BYTES, |limit| {
+            usize::try_from(limit).unwrap_or(usize::MAX)
+        });
+        Self {
+            file_bytes: clamp(file_bytes, file_default, Self::HARD_FILE_BYTES),
+            total_bytes: clamp(
+                total_bytes,
+                Self::DEFAULT_TOTAL_BYTES,
+                Self::HARD_TOTAL_BYTES,
+            ),
+            records: clamp(records, Self::DEFAULT_RECORDS, Self::HARD_RECORDS),
+        }
+    }
+}
+static LIMITS: std::sync::RwLock<Limits> = std::sync::RwLock::new(Limits::DEFAULT);
+/// Installs the process-wide checkpoint limits (agent construction).
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn configure(limits: Limits) {
+    *LIMITS.write().unwrap_or_else(|e| e.into_inner()) = limits;
+}
+fn limits() -> Limits {
+    *LIMITS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Why a mutation could not be checkpointed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkipReason {
+    ReadPolicy,
+    Outside,
+    Records(usize),
+    FileSize(usize),
+    TotalBytes(usize),
+    Storage,
+}
+impl SkipReason {
+    fn describe(self) -> String {
+        match self {
+            Self::ReadPolicy => "read permission does not cover the previous content".into(),
+            Self::Outside => "the file is outside the bound session workspace".into(),
+            Self::Records(limit) => format!(
+                "the session reached the {limit}-mutation checkpoint limit (file_checkpoints.max_records)"
+            ),
+            Self::FileSize(limit) => format!(
+                "the file is larger than the {limit}-byte checkpoint limit (file_checkpoints.max_file_bytes)"
+            ),
+            Self::TotalBytes(limit) => format!(
+                "the session reached its {limit}-byte checkpoint storage limit (file_checkpoints.max_total_bytes)"
+            ),
+            Self::Storage => "checkpoint storage failed".into(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Record {
@@ -31,6 +123,9 @@ struct Data {
     skipped: BTreeMap<usize, usize>,
     #[serde(default)]
     mutations: u64,
+    /// Why the most recent uncaptured mutation was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skip_reason: Option<String>,
 }
 #[derive(Debug)]
 struct State {
@@ -40,10 +135,31 @@ struct State {
     /// Blob directory whose contents are already merged into `data.blobs`.
     /// Runtime-only; cleared by any create failure so the next prepare rescans.
     scanned: Option<PathBuf>,
+    /// Runtime-only: the one-time "not captured" notice for this store.
+    notice: UncapturedNotice,
+    /// Test-only per-store limits; production uses the process-wide ones.
+    #[cfg(test)]
+    limits: Option<Limits>,
     #[cfg(test)]
     scans: usize,
     #[cfg(feature = "subagents")]
     observation: crate::session::background_observation::ObservationStamp,
+}
+impl State {
+    fn limits(&self) -> Limits {
+        #[cfg(test)]
+        if let Some(limits) = self.limits {
+            return limits;
+        }
+        limits()
+    }
+}
+#[derive(Debug, Default)]
+enum UncapturedNotice {
+    #[default]
+    None,
+    Pending(SkipReason),
+    Shown,
 }
 /// Live clones deliberately share actual filesystem observations, like TodoStore.
 #[derive(Clone, Debug)]
@@ -55,6 +171,9 @@ impl Default for FileCheckpoints {
             trusted: true,
             memory: BTreeMap::new(),
             scanned: None,
+            notice: UncapturedNotice::None,
+            #[cfg(test)]
+            limits: None,
             #[cfg(test)]
             scans: 0,
             #[cfg(feature = "subagents")]
@@ -74,15 +193,20 @@ impl Serialize for FileCheckpoints {
 impl<'de> Deserialize<'de> for FileCheckpoints {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let data = Data::deserialize(d)?;
-        if data.skipped.len() > MAX_RECORDS
-            || data.records.len() > MAX_RECORDS
-            || data.blobs.len() > MAX_RECORDS
-            || data.blobs.values().any(|n| *n > MAX_FILE_BYTES)
+        let hard = Limits::HARD;
+        if data.skipped.len() > hard.records
+            || data.records.len() > hard.records
+            || data.blobs.len() > hard.records
+            || data.blobs.values().any(|n| *n > hard.file_bytes)
             || data
                 .blobs
                 .values()
                 .try_fold(0usize, |a, n| a.checked_add(*n))
-                .is_none_or(|n| n > MAX_TOTAL_BYTES)
+                .is_none_or(|n| n > hard.total_bytes)
+            || data
+                .skip_reason
+                .as_ref()
+                .is_some_and(|reason| reason.len() > 512)
             || data.blobs.keys().any(|s| !valid_digest(s))
             || data.records.iter().any(|r| {
                 r.session.len() > 256
@@ -103,6 +227,9 @@ impl<'de> Deserialize<'de> for FileCheckpoints {
             trusted: false,
             memory: BTreeMap::new(),
             scanned: None,
+            notice: UncapturedNotice::None,
+            #[cfg(test)]
+            limits: None,
             #[cfg(test)]
             scans: 0,
             #[cfg(feature = "subagents")]
@@ -171,6 +298,9 @@ impl FileObservation {
             trusted: false,
             memory: Default::default(),
             scanned: None,
+            notice: UncapturedNotice::None,
+            #[cfg(test)]
+            limits: None,
             #[cfg(test)]
             scans: 0,
             observation: Default::default(),
@@ -199,6 +329,10 @@ fn relative_path(p: &Path) -> bool {
             .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 impl FileCheckpoints {
+    #[cfg(test)]
+    pub(crate) fn set_limits_for_test(&self, limits: Limits) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).limits = Some(limits);
+    }
     #[cfg(feature = "subagents")]
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -300,15 +434,28 @@ impl FileCheckpoints {
             .map(|path| format!("{path:?}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let missing = state.data.skipped.range(index..).next().is_some();
+        let missing = state
+            .data
+            .skipped
+            .range(index..)
+            .fold(0usize, |total, (_, count)| total.saturating_add(*count));
+        let unavailable = if missing == 0 {
+            String::new()
+        } else {
+            format!(
+                "; unavailable checkpoints: {missing} edit{} not restorable{}",
+                if missing == 1 { "" } else { "s" },
+                state
+                    .data
+                    .skip_reason
+                    .as_deref()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default()
+            )
+        };
         format!(
-            "{} files{}: {names}{}",
+            "{} files{unavailable}: {names}{}",
             paths.len(),
-            if missing {
-                "; unavailable checkpoints"
-            } else {
-                ""
-            },
             if paths.len() > 5 { ", …" } else { "" }
         )
     }
@@ -408,10 +555,10 @@ impl FileCheckpoints {
             let mut bytes = Vec::new();
             current
                 .by_ref()
-                .take(MAX_FILE_BYTES as u64 + 1)
+                .take(Limits::HARD_FILE_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)?;
             anyhow::ensure!(
-                bytes.len() <= MAX_FILE_BYTES && digest(&bytes) == record.after,
+                bytes.len() <= Limits::HARD_FILE_BYTES && digest(&bytes) == record.after,
                 "file changed since checkpoint: {}",
                 record.path
             );
@@ -582,12 +729,29 @@ pub(crate) fn scope<F: std::future::Future>(
 ) -> impl std::future::Future<Output = F::Output> {
     CURRENT.scope(recorder, future)
 }
+/// Records a mutation that cannot be checkpointed because its target is
+/// outside the bound workspace.
 pub(crate) fn skipped() {
     if let Some(recorder) = current() {
         let mut state = recorder.edit_store();
-        skip(&mut state, recorder.turn());
+        skip(&mut state, recorder.turn(), SkipReason::Outside);
         state.mark();
     }
+}
+/// The one-time model- and user-visible notice for the first mutation in
+/// this session that file checkpoints could not capture; `None` afterwards
+/// and while every mutation is captured.
+pub(crate) fn take_uncaptured_notice() -> Option<String> {
+    let recorder = current()?;
+    let mut state = recorder.store.0.lock().unwrap_or_else(|e| e.into_inner());
+    let UncapturedNotice::Pending(reason) = state.notice else {
+        return None;
+    };
+    state.notice = UncapturedNotice::Shown;
+    Some(format!(
+        "\n\nNote: this change is not captured by /rewind file checkpoints because {}. /rewind cannot restore files for this turn; further uncaptured changes in this session are not reported again.",
+        reason.describe()
+    ))
 }
 pub(crate) fn published() {
     if let Some(recorder) = current() {
@@ -609,7 +773,10 @@ fn existing_blobs(root: &Path) -> anyhow::Result<BTreeMap<String, usize>> {
     let mut blobs = BTreeMap::new();
     let mut total = 0usize;
     for (index, entry) in directory.read_dir(".")?.enumerate() {
-        anyhow::ensure!(index < MAX_RECORDS, "checkpoint directory entry limit");
+        anyhow::ensure!(
+            index < Limits::HARD_RECORDS,
+            "checkpoint directory entry limit"
+        );
         let entry = entry?;
         let name = entry.file_name();
         let name = name
@@ -630,8 +797,9 @@ fn existing_blobs(root: &Path) -> anyhow::Result<BTreeMap<String, usize>> {
         total = total
             .checked_add(size)
             .ok_or_else(|| anyhow::anyhow!("checkpoint byte limit"))?;
+        // Blobs written under earlier (larger) limits still count.
         anyhow::ensure!(
-            size <= MAX_FILE_BYTES && total <= MAX_TOTAL_BYTES,
+            size <= Limits::HARD_FILE_BYTES && total <= Limits::HARD_TOTAL_BYTES,
             "checkpoint byte limit"
         );
         blobs.insert(hash.into(), size);
@@ -648,10 +816,10 @@ fn read_blob(root: PathBuf, hash: &str) -> anyhow::Result<Vec<u8>> {
     crate::fs::validate_private_file(&file)?;
     let mut bytes = Vec::new();
     file.by_ref()
-        .take(MAX_FILE_BYTES as u64 + 1)
+        .take(Limits::HARD_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     anyhow::ensure!(
-        bytes.len() <= MAX_FILE_BYTES && digest(&bytes) == hash,
+        bytes.len() <= Limits::HARD_FILE_BYTES && digest(&bytes) == hash,
         "checkpoint blob changed"
     );
     crate::fs::validate_private_file(&file)?;
@@ -706,7 +874,7 @@ pub(crate) async fn prepare(
         Ok(pending) => pending,
         Err(_) => {
             let mut state = recorder.edit_store();
-            skip(&mut state, recorder.turn());
+            skip(&mut state, recorder.turn(), SkipReason::Storage);
             state.mark();
             None
         }
@@ -737,11 +905,17 @@ fn prepare_with(
     read_allowed: bool,
 ) -> Option<Pending> {
     let mut state = recorder.edit_store();
+    let limits = state.limits();
+    let mut reason = SkipReason::Storage;
     let make = (|| -> anyhow::Result<Record> {
-        anyhow::ensure!(
-            read_allowed && state.data.records.len() < MAX_RECORDS,
-            "checkpoint limit or read policy"
-        );
+        if !read_allowed {
+            reason = SkipReason::ReadPolicy;
+            anyhow::bail!("checkpoint read policy");
+        }
+        if state.data.records.len() >= limits.records {
+            reason = SkipReason::Records(limits.records);
+            anyhow::bail!("checkpoint record limit");
+        }
         let mut normalized = PathBuf::new();
         for component in path.components() {
             match component {
@@ -756,19 +930,26 @@ fn prepare_with(
             .ok_or_else(|| anyhow::anyhow!("checkpoint path is not contained UTF-8"))?;
         let hash = before.map(|(_, hash)| hash.to_owned());
         if let Some((bytes, hash)) = before {
-            anyhow::ensure!(bytes.len() <= MAX_FILE_BYTES, "checkpoint file limit");
+            if bytes.len() > limits.file_bytes {
+                reason = SkipReason::FileSize(limits.file_bytes);
+                anyhow::bail!("checkpoint file limit");
+            }
             if !state.data.blobs.contains_key(hash) {
-                anyhow::ensure!(
-                    state.data.blobs.len() < MAX_RECORDS
-                        && state
-                            .data
-                            .blobs
-                            .values()
-                            .sum::<usize>()
-                            .saturating_add(bytes.len())
-                            <= MAX_TOTAL_BYTES,
-                    "checkpoint session byte limit"
-                );
+                if state.data.blobs.len() >= limits.records {
+                    reason = SkipReason::Records(limits.records);
+                    anyhow::bail!("checkpoint blob limit");
+                }
+                if state
+                    .data
+                    .blobs
+                    .values()
+                    .sum::<usize>()
+                    .saturating_add(bytes.len())
+                    > limits.total_bytes
+                {
+                    reason = SkipReason::TotalBytes(limits.total_bytes);
+                    anyhow::bail!("checkpoint session byte limit");
+                }
                 if recorder.ephemeral {
                     state.memory.insert(hash.to_owned(), bytes.to_vec());
                 } else {
@@ -790,16 +971,14 @@ fn prepare_with(
                             state.scans += 1;
                         }
                         let existing = existing_blobs(&root)?;
-                        anyhow::ensure!(
-                            existing.contains_key(hash)
-                                || (existing.len() < MAX_RECORDS
-                                    && existing
-                                        .values()
-                                        .sum::<usize>()
-                                        .saturating_add(bytes.len())
-                                        <= MAX_TOTAL_BYTES),
-                            "physical checkpoint byte limit"
-                        );
+                        if !(existing.contains_key(hash)
+                            || (existing.len() < limits.records
+                                && existing.values().sum::<usize>().saturating_add(bytes.len())
+                                    <= limits.total_bytes))
+                        {
+                            reason = SkipReason::TotalBytes(limits.total_bytes);
+                            anyhow::bail!("physical checkpoint byte limit");
+                        }
                         let before_len = state.data.blobs.len();
                         state.data.blobs.extend(existing);
                         if state.data.blobs.len() != before_len {
@@ -853,7 +1032,7 @@ fn prepare_with(
             })
         }
         Err(_) => {
-            skip(&mut state, recorder.turn());
+            skip(&mut state, recorder.turn(), reason);
             state.mark();
             None
         }
@@ -863,8 +1042,16 @@ impl Pending {
     pub(crate) fn committed(&mut self, after: &crate::fs::ContentDigest, after_len: usize) {
         self.record.after = after.hex();
         let mut state = self.recorder.edit_store();
-        if state.data.records.len() >= MAX_RECORDS || after_len > MAX_FILE_BYTES {
-            skip(&mut state, self.record.turn);
+        let limits = state.limits();
+        let reason = if state.data.records.len() >= limits.records {
+            Some(SkipReason::Records(limits.records))
+        } else if after_len > limits.file_bytes {
+            Some(SkipReason::FileSize(limits.file_bytes))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            skip(&mut state, self.record.turn, reason);
             state.mark();
             return;
         }
@@ -894,8 +1081,13 @@ impl Pending {
     }
 }
 
-fn skip(state: &mut State, turn: usize) {
-    let key = if state.data.skipped.len() >= MAX_RECORDS && !state.data.skipped.contains_key(&turn)
+fn skip(state: &mut State, turn: usize, reason: SkipReason) {
+    state.data.skip_reason = Some(reason.describe());
+    if matches!(state.notice, UncapturedNotice::None) {
+        state.notice = UncapturedNotice::Pending(reason);
+    }
+    let key = if state.data.skipped.len() >= state.limits().records
+        && !state.data.skipped.contains_key(&turn)
     {
         state.data.skipped.pop_last();
         usize::MAX
@@ -911,6 +1103,13 @@ mod tests {
     use super::*;
     use crate::agent::tools::{EditArgs, ReadArgs, ReadTracker, WriteArgs};
     use rig::tool::Tool;
+
+    /// The historical defaults, small enough to exhaust in a test.
+    const SMALL: Limits = Limits {
+        file_bytes: 1024 * 1024,
+        total_bytes: 16 * 1024 * 1024,
+        records: 512,
+    };
 
     async fn overwrite(workspace: &Arc<crate::paths::WorkspaceBinding>, path: &str, text: &str) {
         let tracker = ReadTracker::new(true);
@@ -981,6 +1180,179 @@ mod tests {
             store.restore("session", 0, &workspace).unwrap(),
             0,
             "retired files are not applied twice"
+        );
+    }
+    #[tokio::test]
+    async fn uncaptured_mutations_warn_once_and_rewind_summary_names_the_reason() {
+        let root = crate::tests::OwnedTestDirectory::new("rewind-limit-notice");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let store = FileCheckpoints::default();
+        store.set_limits_for_test(Limits {
+            file_bytes: 1024,
+            total_bytes: 4096,
+            records: 2,
+        });
+        let outputs = scope(Some(store.recorder("session", 0, true)), async {
+            let mut outputs = Vec::new();
+            for index in 0..4 {
+                outputs.push(
+                    crate::agent::tools::write::WriteTool::new(None, None, None)
+                        .with_workspace_binding(workspace.clone())
+                        .call(WriteArgs {
+                            path: format!("new-{index}.txt"),
+                            content: "created".into(),
+                            overwrite: false,
+                        })
+                        .await
+                        .unwrap(),
+                );
+            }
+            outputs
+        })
+        .await;
+        assert!(!outputs[0].contains("not captured"), "{}", outputs[0]);
+        assert!(!outputs[1].contains("not captured"), "{}", outputs[1]);
+        assert!(
+            outputs[2].contains("not captured by /rewind file checkpoints")
+                && outputs[2].contains("2-mutation checkpoint limit"),
+            "{}",
+            outputs[2]
+        );
+        assert!(!outputs[3].contains("not captured"), "warned only once");
+        let summary = store.summary_from("session", 0);
+        assert!(
+            summary.contains("2 edits not restorable (the session reached the 2-mutation"),
+            "{summary}"
+        );
+
+        // An oversized preimage is reported with the per-file limit.
+        std::fs::write(root.path().join("big.txt"), "x".repeat(64)).unwrap();
+        let sized = FileCheckpoints::default();
+        sized.set_limits_for_test(Limits {
+            file_bytes: 16,
+            total_bytes: 4096,
+            records: 64,
+        });
+        let edited = scope(Some(sized.recorder("session", 0, true)), async {
+            crate::agent::tools::edit::EditTool::new(None, None)
+                .with_workspace(root.path())
+                .call(
+                    serde_json::from_value::<EditArgs>(serde_json::json!({
+                        "path": "big.txt",
+                        "block": format!("<<<<<<< SEARCH\n{}\n=======\nsmall\n>>>>>>> REPLACE", "x".repeat(64))
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(edited.contains("16-byte checkpoint limit"), "{edited}");
+        assert!(
+            sized
+                .summary_from("session", 0)
+                .contains("1 edit not restorable (the file is larger than the 16-byte")
+        );
+    }
+
+    #[test]
+    fn limits_resolve_defaults_follow_edit_limit_and_clamp() {
+        assert_eq!(
+            Limits::resolve(None, None, None, None),
+            Limits {
+                file_bytes: Limits::DEFAULT_FILE_BYTES,
+                total_bytes: Limits::DEFAULT_TOTAL_BYTES,
+                records: Limits::DEFAULT_RECORDS,
+            }
+        );
+        assert_eq!(
+            Limits::resolve(None, None, None, Some(5 * 1024 * 1024)).file_bytes,
+            5 * 1024 * 1024
+        );
+        let explicit = Limits::resolve(Some(10), Some(0), Some(u64::MAX), Some(1 << 30));
+        assert_eq!(explicit.file_bytes, 10);
+        assert_eq!(explicit.total_bytes, 1);
+        assert_eq!(explicit.records, Limits::HARD_RECORDS);
+        let parsed: crate::config::types::FileCheckpointsConfig =
+            toml::from_str("max_records = 4096\nmax_total_bytes = 1000").unwrap();
+        assert_eq!(parsed.max_records, Some(4096));
+        assert!(
+            toml::from_str::<crate::config::types::FileCheckpointsConfig>("max_files = 1").is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_restores_exact_utf16_preimage_after_edit() {
+        use crate::agent::tools::text_encoding::{TextEncoding, encode};
+        let root = crate::tests::OwnedTestDirectory::new("rewind-utf16");
+        let original = encode("alpha\r\nbeta\r\n", TextEncoding::Utf16Le);
+        std::fs::write(root.path().join("script.ps1"), &original).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let store = FileCheckpoints::default();
+        scope(Some(store.recorder("session", 0, true)), async {
+            crate::agent::tools::edit::EditTool::new(None, None)
+                .with_workspace(root.path())
+                .call(
+                    serde_json::from_value::<EditArgs>(serde_json::json!({
+                        "path": "script.ps1",
+                        "block": "<<<<<<< SEARCH\nbeta\n=======\ngamma\n>>>>>>> REPLACE"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            std::fs::read(root.path().join("script.ps1")).unwrap(),
+            encode("alpha\r\ngamma\r\n", TextEncoding::Utf16Le)
+        );
+        assert_eq!(store.restore("session", 0, &workspace).unwrap(), 1);
+        assert_eq!(
+            std::fs::read(root.path().join("script.ps1")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_restores_exact_notebook_preimage_after_notebook_edit() {
+        let root = crate::tests::OwnedTestDirectory::new("rewind-notebook");
+        // Jupyter-style bytes (indent 1, trailing newline) must come back exactly.
+        let original = "{\n \"cells\": [\n  {\n   \"cell_type\": \"code\",\n   \"execution_count\": 3,\n   \"metadata\": {},\n   \"outputs\": [],\n   \"source\": [\n    \"print(1)\"\n   ]\n  }\n ],\n \"metadata\": {},\n \"nbformat\": 4,\n \"nbformat_minor\": 4\n}\n";
+        std::fs::write(root.path().join("book.ipynb"), original).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let store = FileCheckpoints::default();
+        scope(Some(store.recorder("session", 0, true)), async {
+            crate::agent::tools::notebook::NotebookTool::new(
+                None,
+                None,
+                workspace.clone(),
+                ReadTracker::new(true),
+                None,
+                crate::agent::tools::mutation_diff::DiffOptions::default(),
+            )
+            .call(
+                serde_json::from_value(serde_json::json!({
+                    "path": "book.ipynb", "mode": "replace", "cell_index": 0, "source": "print(2)"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        assert_ne!(
+            std::fs::read_to_string(root.path().join("book.ipynb")).unwrap(),
+            original
+        );
+        let summary = store.summary_from("session", 0);
+        assert!(summary.contains("1 files"), "{summary}");
+        assert!(summary.contains("book.ipynb"), "{summary}");
+        assert!(!summary.contains("unavailable"), "{summary}");
+        assert_eq!(store.restore("session", 0, &workspace).unwrap(), 1);
+        assert_eq!(
+            std::fs::read(root.path().join("book.ipynb")).unwrap(),
+            original.as_bytes()
         );
     }
     #[tokio::test]
@@ -1110,8 +1482,9 @@ mod tests {
                 .to_string()
                 .contains("no restorable checkpoint")
         );
-        let large = vec![b'x'; MAX_FILE_BYTES + 1];
+        let large = vec![b'x'; SMALL.file_bytes + 1];
         let bounded = FileCheckpoints::default();
+        bounded.set_limits_for_test(SMALL);
         scope(Some(bounded.recorder("session", 0, true)), async {
             assert!(prepare_sync(&workspace, Path::new("file"), Some(&large), true).is_none());
         })
@@ -1462,13 +1835,14 @@ mod tests {
         let blobs = root.path().join("blobs");
         crate::paths::ensure_private_directory(&blobs).unwrap();
         for value in 0..16u8 {
-            let bytes = vec![value; MAX_FILE_BYTES];
+            let bytes = vec![value; SMALL.file_bytes];
             let name = digest(&bytes);
             crate::fs::private_atomic_create_sync(&blobs.join(format!("{name}.bin")), &bytes)
                 .unwrap();
         }
         let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
         let store = FileCheckpoints::default();
+        store.set_limits_for_test(SMALL);
         let mut recorder = store.recorder("session", 1, false);
         recorder.blob_root = Some(blobs.clone());
         scope(Some(recorder), async {

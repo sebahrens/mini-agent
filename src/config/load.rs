@@ -1649,6 +1649,10 @@ fn load_from_path_with_sources(
     }
 
     emit_config_warnings(&mut warnings, cfg.shell_exact_allow_warnings());
+    emit_config_warnings(
+        &mut warnings,
+        crate::agent::tools::format_after_edit::config_warnings(&cfg.format),
+    );
 
     #[cfg(feature = "mcp")]
     inject_mcp_defaults(&mut cfg);

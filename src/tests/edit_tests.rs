@@ -1305,22 +1305,36 @@ async fn edit_accepts_a_file_at_the_size_limit_and_rejects_one_above_it() {
 }
 
 #[tokio::test]
-async fn edit_rejects_a_large_file_under_the_default_limit() {
+async fn edit_default_limit_admits_a_5_mib_file_and_rejects_above_16_mib() {
     select_edit_system(EditSystem::Similarity);
     let root = edit_temp_root("default-limit");
+    let filler = "generated line of a large lockfile or bundle\n";
+    let five_mib = format!("needle\n{}", filler.repeat(5 * 1024 * 1024 / filler.len()));
+    std::fs::write(root.join("large.txt"), &five_mib).unwrap();
+    // No read (and no raised read limit) is needed to edit a unique SEARCH.
+    let tool = edit::EditTool::new(None, None).with_workspace(root.clone());
+    let output = tool
+        .call(block_args("large.txt", "needle", "replacement", false))
+        .await
+        .expect("a 5 MiB file is within the default edit limit");
+    assert!(output.len() < 64 * 1024, "edit must not return the file");
+    let after = std::fs::read_to_string(root.join("large.txt")).unwrap();
+    assert!(after.starts_with("replacement\n"));
+    assert_eq!(
+        after.len(),
+        five_mib.len() + "replacement".len() - "needle".len()
+    );
+
     std::fs::write(
-        root.join("large.txt"),
-        format!("needle\n{}", "x".repeat(2 * 1024 * 1024)),
+        root.join("huge.txt"),
+        format!("needle\n{}", "x".repeat(16 * 1024 * 1024)),
     )
     .unwrap();
-    let tool = edit::EditTool::new(None, None).with_workspace(root.clone());
-    let result = tool
-        .call(block_args("large.txt", "needle", "replacement", false))
-        .await;
-    assert!(
-        result.is_err(),
-        "the default 1 MiB budget must apply to edit: {result:?}"
-    );
+    let error = tool
+        .call(block_args("huge.txt", "needle", "replacement", false))
+        .await
+        .expect_err("the default 16 MiB edit budget must apply");
+    assert!(error.to_string().contains("max_edit_file_size"), "{error}");
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1503,4 +1517,48 @@ async fn edit_fuzzy_opt_in_rejects_low_confidence_and_invalid_modes_atomically()
             .to_string();
         assert!(error.contains("'fuzzy' is only supported"), "{error}");
     }
+}
+
+#[tokio::test]
+async fn utf16_bom_files_are_read_decoded_and_edited_in_their_own_encoding() {
+    use crate::agent::tools::text_encoding::{TextEncoding, encode};
+    select_edit_system(EditSystem::Similarity);
+    for encoding in [TextEncoding::Utf16Le, TextEncoding::Utf16Be] {
+        let tmp = TempFile::new("utf16.ps1");
+        let original = "Write-Host \"héllo\"\r\n$x = 1\r\n";
+        std::fs::write(tmp.path(), encode(original, encoding)).unwrap();
+
+        let read = ReadTool::new(None, None, None, 1024)
+            .call(crate::agent::tools::ReadArgs {
+                raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
+                path: tmp.path().into(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert!(read.contains("Write-Host \"héllo\""), "{read}");
+        assert!(
+            read.contains(&format!("decoded from {}", encoding.label())),
+            "{read}"
+        );
+
+        let output = sim_edit(&tmp, "$x = 1", "$x = 2").await.unwrap();
+        assert!(output.contains("preserved the file's UTF-16"), "{output}");
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(
+            bytes,
+            encode("Write-Host \"héllo\"\r\n$x = 2\r\n", encoding)
+        );
+    }
+
+    // A BOM with a broken payload fails closed without touching the file.
+    let broken = TempFile::new("broken-utf16.txt");
+    let bytes = [0xFF, 0xFE, b'a', 0x00, 0x00, 0xD8];
+    std::fs::write(broken.path(), bytes).unwrap();
+    let error = sim_edit(&broken, "a", "b").await.unwrap_err();
+    assert!(error.contains("UTF-16 byte-order mark"), "{error}");
+    assert_eq!(std::fs::read(broken.path()).unwrap(), bytes);
 }

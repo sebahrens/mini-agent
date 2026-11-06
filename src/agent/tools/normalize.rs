@@ -152,6 +152,8 @@ pub fn levenshtein_similarity(a: &str, b: &str) -> f64 {
 
 /// Similarity of two character slices. The caller owns the two DP rows so a
 /// matcher comparing one search string against many windows allocates them once.
+/// The edit tool's fuzzy tier uses a bit-parallel bounded variant instead.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn levenshtein_similarity_chars(
     a_chars: &[char],
     b_chars: &[char],

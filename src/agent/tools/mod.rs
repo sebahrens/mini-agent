@@ -20,15 +20,14 @@ pub(crate) mod read_image;
 pub(crate) mod schedule_wakeup;
 #[cfg(all(test, unix))]
 mod symlink_hint_tests;
+pub(crate) mod text_encoding;
 pub(crate) mod todo;
 pub(crate) mod web_fetch;
 pub(crate) mod web_http;
 pub(crate) mod web_search;
 pub(crate) mod write;
 
-pub(crate) use normalize::{
-    levenshtein_similarity_chars, normalize_line_into, normalize_whitespace,
-};
+pub(crate) use normalize::{normalize_line_into, normalize_whitespace};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

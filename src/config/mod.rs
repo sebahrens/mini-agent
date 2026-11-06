@@ -116,6 +116,9 @@ impl ConfigProvenance {
     }
 }
 
+/// Default `max_edit_file_size`: 16 MiB.
+pub const DEFAULT_MAX_EDIT_FILE_SIZE: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -224,6 +227,9 @@ pub struct Config {
     /// sensitive-config approval; commands retain ordinary shell permission.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub format: BTreeMap<String, String>,
+    /// Seconds one post-edit `[format]` command may run (default 10, 1-600).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format_timeout_secs: Option<u64>,
     /// Goal defaults. Benign: these only bound how long the harness keeps
     /// working, never what it is allowed to run.
     #[cfg(feature = "goal")]
@@ -263,6 +269,14 @@ pub struct Config {
     pub verify_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_text_file_size: Option<u64>,
+    /// Largest file `edit`/`write`/`notebook_edit` will change, independent
+    /// of how much text one `read` returns. Default:
+    /// [`DEFAULT_MAX_EDIT_FILE_SIZE`] or `max_text_file_size` if larger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_edit_file_size: Option<u64>,
+    /// `/rewind` file checkpoint limits (`[file_checkpoints]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_checkpoints: Option<crate::config::types::FileCheckpointsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_read_lines: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1137,6 +1151,18 @@ impl Config {
             Some(t) if t > 0.0 && t <= 1.0 => Some(t),
             _ => None,
         }
+    }
+
+    /// Size limit for files changed by edit/write/notebook_edit (see
+    /// [`Config::max_edit_file_size`]).
+    pub fn resolve_max_edit_file_size(&self) -> u64 {
+        self.max_edit_file_size
+            .unwrap_or_else(|| DEFAULT_MAX_EDIT_FILE_SIZE.max(self.max_text_file_size.unwrap_or(0)))
+    }
+
+    /// Post-edit formatter timeout, clamped to 1-600 seconds.
+    pub fn resolve_format_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.format_timeout_secs.unwrap_or(10).clamp(1, 600))
     }
 
     pub fn resolve_max_read_lines(&self) -> u64 {

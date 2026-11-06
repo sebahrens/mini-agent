@@ -99,6 +99,12 @@ fn write_probe(body: &str) {
     fs::write(path, value).unwrap();
 }
 
+fn publish_message(writer: &mut impl Write, uri: &str, version: i64, message: &str) {
+    write_frame(writer, &format!(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{uri}\",\"version\":{version},\"diagnostics\":[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}},\"severity\":1,\"message\":\"{message} version {version}\"}}]}}}}"
+    ));
+}
+
 fn append_launch(pid: u32) {
     let Some(path) = env::var_os("LSP_FIXTURE_LAUNCH_LOG") else {
         return;
@@ -159,6 +165,7 @@ fn main() {
                 .is_ok()
         });
 
+    let mut last_synced: Option<(String, i64)> = None;
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = io::stdout().lock();
@@ -181,9 +188,16 @@ fn main() {
                 _ => {}
             }
             let id = request_id(&body);
+            let capabilities = if mode == "save-diagnostics" {
+                "{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}}}"
+            } else if mode == "navigate" {
+                "{\"definitionProvider\":true,\"referencesProvider\":true,\"hoverProvider\":true,\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true}"
+            } else {
+                "{}"
+            };
             write_frame(
                 &mut stdout,
-                &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{}}}}}}"),
+                &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{capabilities}}}}}"),
             );
         } else if body.contains("\"method\":\"initialized\"") {
             if restart_first {
@@ -199,6 +213,15 @@ fn main() {
             if mode == "close-stdin" {
                 break;
             }
+        } else if body.contains("\"method\":\"textDocument/didSave\"") {
+            if let Some(path) = env::var_os("LSP_FIXTURE_SAVE_LOG") {
+                let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
+                writeln!(file, "{body}").unwrap();
+            }
+            // Like rust-analyzer's flycheck: the checker runs on save only.
+            if let Some((uri, version)) = last_synced.clone() {
+                publish_message(&mut stdout, &uri, version, "fixture saved diagnostic");
+            }
         } else if body.contains("\"method\":\"textDocument/didClose\"") {
             if let Some(path) = env::var_os("LSP_FIXTURE_SYNC_LOG") {
                 let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
@@ -210,6 +233,17 @@ fn main() {
             if let Some(path) = env::var_os("LSP_FIXTURE_SYNC_LOG") {
                 let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
                 writeln!(file, "{body}").unwrap();
+            }
+            if mode == "save-diagnostics" || mode == "delayed-diagnostics" {
+                let uri = body.split_once("\"uri\":").unwrap().1.split('"').nth(1).unwrap();
+                let version: i64 = body.split_once("\"version\":").unwrap().1
+                    .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+                last_synced = Some((uri.to_string(), version));
+                if mode == "delayed-diagnostics" {
+                    let delay: u64 = env::var("LSP_FIXTURE_PUBLISH_DELAY_MS").unwrap().parse().unwrap();
+                    thread::sleep(Duration::from_millis(delay));
+                    publish_message(&mut stdout, uri, version, "fixture delayed diagnostic");
+                }
             }
             if mode == "diagnostics" {
                 let wire_uri = body.split_once("\"uri\":").unwrap().1.split('"').nth(1).unwrap();
@@ -240,6 +274,51 @@ fn main() {
                     publish(&uri, version);
                 }
             }
+        } else if mode == "navigate"
+            && (body.contains("\"method\":\"textDocument/")
+                || body.contains("\"method\":\"workspace/symbol\""))
+        {
+            let id = request_id(&body);
+            let uri = body
+                .split_once("\"uri\":")
+                .map(|(_, rest)| rest.split('"').nth(1).unwrap().to_string())
+                .unwrap_or_default();
+            let number = |key: &str| -> String {
+                body.split_once(&format!("\"{key}\":"))
+                    .map(|(_, rest)| rest.chars().take_while(|c| c.is_ascii_digit()).collect())
+                    .unwrap_or_default()
+            };
+            let range = |line: u32, character: u32| format!(
+                "{{\"start\":{{\"line\":{line},\"character\":{character}}},\"end\":{{\"line\":{line},\"character\":{}}}}}",
+                character + 1
+            );
+            let result = if body.contains("textDocument/definition") {
+                format!("{{\"uri\":\"{uri}\",\"range\":{}}}", range(2, 4))
+            } else if body.contains("textDocument/references") {
+                format!(
+                    "[{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"file:///nonexistent-outside/lib.rs\",\"range\":{}}}]",
+                    range(0, 3), range(5, 0), range(1, 1)
+                )
+            } else if body.contains("textDocument/hover") {
+                format!(
+                    "{{\"contents\":{{\"kind\":\"markdown\",\"value\":\"fixture hover at {}:{}\"}}}}",
+                    number("line"), number("character")
+                )
+            } else if body.contains("textDocument/documentSymbol") {
+                format!(
+                    "[{{\"name\":\"Outer\",\"kind\":23,\"range\":{},\"selectionRange\":{},\"children\":[{{\"name\":\"inner\",\"kind\":6,\"range\":{},\"selectionRange\":{}}}]}}]",
+                    range(0, 0), range(0, 7), range(1, 0), range(1, 4)
+                )
+            } else if body.contains("workspace/symbol") {
+                let workspace_uri = env::var("LSP_FIXTURE_SYMBOL_URI").unwrap_or_default();
+                format!(
+                    "[{{\"name\":\"found_symbol\",\"kind\":12,\"location\":{{\"uri\":\"{workspace_uri}\",\"range\":{}}}}}]",
+                    range(7, 2)
+                )
+            } else {
+                "null".to_string()
+            };
+            write_frame(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}"));
         } else if body.contains("\"method\":\"mini-agent/test\"") {
             if let Some(path) = env::var_os("LSP_FIXTURE_REQUEST_FILE") {
                 fs::write(path, "seen").unwrap();
@@ -325,6 +404,7 @@ impl FixtureBuild {
             network: LspNetwork::Inherit,
             initialization: None,
             disabled: false,
+            wait_ms: None,
         }
     }
 
@@ -1117,6 +1197,262 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
             "{output}"
         );
     }
+}
+
+/// Runs one write and one edit through the real tools against a fixture
+/// server in `mode`, returning both tool results.
+async fn write_then_edit_with_fixture(
+    fixture: &FixtureBuild,
+    mode: &str,
+    configure: impl FnOnce(&mut LspServerConfig),
+) -> (Result<String, String>, Result<String, String>) {
+    use crate::agent::tools::{EditArgs, WriteArgs, edit::EditTool, write::WriteTool};
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+    let lease = fixture.path(&format!("{mode}.lease"));
+    let mut server = fixture.config(mode, &lease);
+    server.extensions = vec![".rs".into()];
+    configure(&mut server);
+    let manager = LspManager::new(
+        &LspConfig {
+            servers: HashMap::from([("fixture".into(), server)]),
+            ..Default::default()
+        },
+        Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+    );
+    let write = WriteTool::new(None, None, None)
+        .with_workspace(workspace.clone())
+        .with_lsp(Some(manager.clone()));
+    let edit = EditTool::new(None, None)
+        .with_workspace(workspace.clone())
+        .with_lsp(Some(manager.clone()));
+    crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
+    let path = workspace
+        .join(format!("{mode}.rs"))
+        .to_string_lossy()
+        .into_owned();
+    let written = write
+        .call(WriteArgs {
+            path: path.clone(),
+            content: "before".into(),
+            overwrite: false,
+        })
+        .await
+        .map_err(|error| error.to_string());
+    let edited = edit
+        .call(EditArgs {
+            fuzzy: false,
+            path,
+            block: Some("<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE".into()),
+            replace_all: false,
+            file_crc: None,
+            edits: None,
+        })
+        .await
+        .map_err(|error| error.to_string());
+    manager.shutdown().await;
+    drop(write);
+    drop(edit);
+    drop(manager);
+    (written, edited)
+}
+
+#[tokio::test]
+async fn lsp_process_did_save_delivers_save_only_diagnostics_to_edit_results() {
+    let fixture = FixtureBuild::compile("did-save");
+    let save_log = fixture.path("save.log");
+    let (written, edited) = write_then_edit_with_fixture(&fixture, "save-diagnostics", |server| {
+        server.env.insert(
+            "LSP_FIXTURE_SAVE_LOG".into(),
+            save_log.display().to_string(),
+        );
+    })
+    .await;
+    let saves = fs::read_to_string(&save_log).unwrap_or_default();
+    // A server that does not register for didSave never receives it.
+    let quiet_log = fixture.path("quiet-save.log");
+    let (_, quiet) = write_then_edit_with_fixture(&fixture, "diagnostics", |server| {
+        server.env.insert(
+            "LSP_FIXTURE_SAVE_LOG".into(),
+            quiet_log.display().to_string(),
+        );
+    })
+    .await;
+    let quiet_exists = quiet_log.exists();
+    fixture.cleanup().await;
+    let written = written.unwrap();
+    assert!(written.contains("LSP diagnostics"), "{written}");
+    assert!(
+        written.contains("fixture saved diagnostic version 1"),
+        "{written}"
+    );
+    let edited = edited.unwrap();
+    assert!(
+        edited.contains("fixture saved diagnostic version 2"),
+        "{edited}"
+    );
+    assert_eq!(saves.lines().count(), 2, "{saves}");
+    assert!(
+        saves.lines().all(|line| !line.contains("\"text\"")),
+        "includeText=false must omit the text: {saves}"
+    );
+    assert!(quiet.unwrap().contains("fixture diagnostic version 2"));
+    assert!(
+        !quiet_exists,
+        "didSave sent to a server that did not register"
+    );
+}
+
+#[tokio::test]
+async fn lsp_process_configured_wait_admits_slow_publish_and_timeout_is_reported() {
+    let fixture = FixtureBuild::compile("slow-publish");
+    // Publishes 3 s after each sync: beyond the 1 s default. The window is
+    // generous so a loaded test host cannot turn it into a timeout; the wait
+    // still ends at the publish.
+    let (written, _) = write_then_edit_with_fixture(&fixture, "delayed-diagnostics", |server| {
+        server
+            .env
+            .insert("LSP_FIXTURE_PUBLISH_DELAY_MS".into(), "3000".into());
+        server.wait_ms = Some(15_000);
+    })
+    .await;
+    let workspace = fixture.workspace("workspace");
+    fs::remove_file(workspace.join("delayed-diagnostics.rs")).unwrap();
+    let (timed_out, _) = write_then_edit_with_fixture(&fixture, "delayed-diagnostics", |server| {
+        server
+            .env
+            .insert("LSP_FIXTURE_PUBLISH_DELAY_MS".into(), "1500".into());
+        server.wait_ms = Some(200);
+    })
+    .await;
+    fixture.cleanup().await;
+    let written = written.unwrap();
+    assert!(
+        written.contains("fixture delayed diagnostic version 1"),
+        "{written}"
+    );
+    let timed_out = timed_out.unwrap();
+    assert!(
+        timed_out.contains("LSP (fixture): no diagnostics received within 200 ms"),
+        "{timed_out}"
+    );
+    assert!(
+        !timed_out.contains("fixture delayed diagnostic"),
+        "{timed_out}"
+    );
+}
+
+#[tokio::test]
+async fn lsp_process_navigate_tool_maps_locations_and_respects_read_denies() {
+    use crate::agent::tools::lsp::{LspNavigateArgs, LspNavigateTool};
+    let fixture = FixtureBuild::compile("navigate");
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("src/nav.rs"),
+        "struct Outer;\nfn inner() {}\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/secret.rs"), "fn hidden() {}\n").unwrap();
+    let symbol_uri = file_uri(&workspace.join("src/nav.rs")).unwrap();
+    let lease = fixture.path("navigate.lease");
+    let mut server = fixture.config("navigate", &lease);
+    server.extensions = vec![".rs".into()];
+    server
+        .env
+        .insert("LSP_FIXTURE_SYMBOL_URI".into(), symbol_uri);
+    let manager = LspManager::new(
+        &LspConfig {
+            servers: HashMap::from([("fixture".into(), server)]),
+            ..Default::default()
+        },
+        Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+    );
+    let tool = LspNavigateTool::new(manager.clone(), None, None);
+    let args = |op: &str, path: &str, position: Option<(u32, u32)>| LspNavigateArgs {
+        op: op.into(),
+        path: path.into(),
+        line: position.map(|(line, _)| line),
+        column: position.map(|(_, column)| column),
+        query: Some("found".into()),
+    };
+    let definition = tool
+        .call(args("definition", "src/nav.rs", Some((2, 4))))
+        .await;
+    let references = tool
+        .call(args("references", "src/nav.rs", Some((1, 1))))
+        .await;
+    let hover = tool.call(args("hover", "src/nav.rs", Some((2, 6)))).await;
+    let symbols = tool.call(args("symbols", "src/nav.rs", None)).await;
+    let workspace_symbols = tool
+        .call(args("workspace_symbols", "src/nav.rs", None))
+        .await;
+    let unsupported = tool
+        .call(args("implementation", "src/nav.rs", Some((1, 1))))
+        .await;
+    let missing_position = tool.call(args("references", "src/nav.rs", None)).await;
+    let outside = tool.call(args("symbols", "../outside.rs", None)).await;
+
+    // A read deny rule blocks the query and hides denied result files.
+    let permission = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                read: Some(crate::permission::ToolPerm::Granular(
+                    [("**/secret.rs".to_string(), crate::permission::Action::Deny)].into(),
+                )),
+                ..Default::default()
+            }),
+            crate::permission::SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["guarded".into(), "standard".into()]),
+        )
+        .unwrap(),
+    ));
+    let guarded = LspNavigateTool::new(manager.clone(), Some(permission), None);
+    let denied = guarded.call(args("symbols", "src/secret.rs", None)).await;
+    let allowed = guarded
+        .call(args("definition", "src/nav.rs", Some((2, 4))))
+        .await;
+    manager.shutdown().await;
+    drop(tool);
+    drop(guarded);
+    drop(manager);
+    fixture.cleanup().await;
+
+    assert_eq!(definition.unwrap(), "src/nav.rs:3:5");
+    let references = references.unwrap();
+    assert!(
+        references.starts_with("src/nav.rs:1:4\nsrc/nav.rs:6:1"),
+        "{references}"
+    );
+    assert!(
+        references.contains("[1 results outside the workspace omitted]"),
+        "{references}"
+    );
+    assert!(!references.contains("nonexistent-outside"), "{references}");
+    // The 1-based position is sent zero-based.
+    assert_eq!(hover.unwrap(), "fixture hover at 1:5");
+    assert_eq!(
+        symbols.unwrap(),
+        "struct Outer — src/nav.rs:1:8\n  method inner — src/nav.rs:2:5"
+    );
+    assert_eq!(
+        workspace_symbols.unwrap(),
+        "function found_symbol — src/nav.rs:8:3"
+    );
+    let unsupported = unsupported.unwrap_err().to_string();
+    assert!(
+        unsupported.contains("implementationProvider"),
+        "{unsupported}"
+    );
+    assert!(
+        missing_position
+            .unwrap_err()
+            .to_string()
+            .contains("needs 1-based `line` and `column`")
+    );
+    assert!(outside.is_err());
+    assert!(denied.is_err(), "read deny must block the query");
+    assert_eq!(allowed.unwrap(), "src/nav.rs:3:5");
 }
 
 #[cfg(unix)]

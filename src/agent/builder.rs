@@ -81,6 +81,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "memory_search"
             | "advisor"
             | "lsp_diagnostics"
+            | "lsp_navigate"
             | "skills_search"
             | "ask_user_question"
             | "mcp_search"
@@ -597,6 +598,12 @@ fn compose_registered_preamble(
         }
     }
     #[cfg(feature = "lsp")]
+    if has("lsp_navigate") {
+        composition
+            .text
+            .push_str(crate::agent::prompt::LSP_NAVIGATE_PROMPT);
+    }
+    #[cfg(feature = "lsp")]
     if has("lsp_diagnostics") {
         composition.text.push_str(crate::agent::prompt::LSP_PROMPT);
         if has("edit") || has("write") {
@@ -612,6 +619,22 @@ fn compose_registered_preamble(
     }
     record_part(&mut composition.parts, &composition.text, "Tool guidance");
     composition
+}
+
+/// Installs the `/rewind` checkpoint limits from configuration. Tests keep
+/// the process-wide defaults so concurrent checkpoint tests are not affected.
+fn configure_file_checkpoints(cfg: &Config) {
+    let checkpoints = cfg.file_checkpoints.unwrap_or_default();
+    let limits = crate::session::file_checkpoints::Limits::resolve(
+        checkpoints.max_file_bytes,
+        checkpoints.max_total_bytes,
+        checkpoints.max_records,
+        Some(cfg.resolve_max_edit_file_size()),
+    );
+    #[cfg(not(test))]
+    crate::session::file_checkpoints::configure(limits);
+    #[cfg(test)]
+    let _ = limits;
 }
 
 fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec<&'static str> {
@@ -659,6 +682,10 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
     #[cfg(feature = "lsp")]
     if cli.tool_is_eligible(cfg, "lsp_diagnostics") && cfg.resolve_lsp().is_some() {
         names.push("lsp_diagnostics");
+    }
+    #[cfg(feature = "lsp")]
+    if cli.tool_is_eligible(cfg, "lsp_navigate") && cfg.resolve_lsp().is_some() {
+        names.push("lsp_navigate");
     }
     names.retain(|name| {
         if *name == "job_status" {
@@ -1011,7 +1038,9 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     #[cfg(feature = "js")]
     let js_tool_enabled = cli.tool_is_eligible(cfg, "js");
     #[cfg(feature = "lsp")]
-    let lsp_manager = if !cli.tool_is_eligible(cfg, "lsp_diagnostics") {
+    let lsp_manager = if !cli.tool_is_eligible(cfg, "lsp_diagnostics")
+        && !cli.tool_is_eligible(cfg, "lsp_navigate")
+    {
         None
     } else {
         match cfg.resolve_lsp() {
@@ -1034,18 +1063,27 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         None
     } else {
         let max_text_file_size = cfg.max_text_file_size;
+        // Edits never return the file, so they use their own, larger limit.
+        let max_edit_file_size = Some(cfg.resolve_max_edit_file_size());
+        configure_file_checkpoints(cfg);
         let max_read_lines = cfg.resolve_max_read_lines();
         let max_bash_output_lines = cfg.resolve_max_bash_output_lines();
         let max_grep_results = cfg.resolve_max_grep_results();
         let max_find_results = cfg.resolve_max_find_results();
         let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
         let formatter = shell_tool_enabled
-            .then(|| tools::format_after_edit::FormatAfterEdit::new(&cfg.format, sandbox.clone()))
+            .then(|| {
+                tools::format_after_edit::FormatAfterEdit::new_with_timeout(
+                    &cfg.format,
+                    sandbox.clone(),
+                    cfg.resolve_format_timeout(),
+                )
+            })
             .flatten();
         let write_tool = tools::WriteTool::new_with_tracker(
             permission.clone(),
             ask_tx.clone(),
-            max_text_file_size,
+            max_edit_file_size,
             read_tracker.clone(),
         )
         .with_workspace_binding(workspace.clone())
@@ -1056,7 +1094,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let edit_tool = tools::EditTool::new_with_tracker(
             permission.clone(),
             ask_tx.clone(),
-            max_text_file_size,
+            max_edit_file_size,
             read_tracker.clone(),
         )
         .with_workspace_binding(workspace.clone())
@@ -1125,7 +1163,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             ask_tx.clone(),
             workspace.clone(),
             read_tracker.clone(),
-            cfg.max_text_file_size,
+            max_edit_file_size,
             cfg.mutation_diff_options(),
         )));
         base_tools.push(Box::new(
@@ -1215,7 +1253,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     write_enabled: cli.tool_is_eligible(cfg, "write"),
                     edit_enabled: cli.tool_is_eligible(cfg, "edit"),
                     shell_enabled: shell_tool_enabled,
-                    max_text_file_size,
+                    max_text_file_size: max_edit_file_size,
                     max_shell_output_lines: max_bash_output_lines,
                     shell_timeout_secs: cfg.resolve_shell_timeout_secs(),
                     diff_options: cfg.mutation_diff_options(),
@@ -1389,11 +1427,20 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
 
         #[cfg(feature = "lsp")]
         if let Some(lsp) = &lsp_manager {
-            all_tools.push(Box::new(tools::lsp::LspTool::new(
-                lsp.clone(),
-                permission.clone(),
-                ask_tx.clone(),
-            )));
+            if cli.tool_is_eligible(cfg, "lsp_diagnostics") {
+                all_tools.push(Box::new(tools::lsp::LspTool::new(
+                    lsp.clone(),
+                    permission.clone(),
+                    ask_tx.clone(),
+                )));
+            }
+            if cli.tool_is_eligible(cfg, "lsp_navigate") {
+                all_tools.push(Box::new(tools::lsp::LspNavigateTool::new(
+                    lsp.clone(),
+                    permission.clone(),
+                    ask_tx.clone(),
+                )));
+            }
         }
 
         #[cfg(feature = "agent-skills")]
@@ -2553,6 +2600,7 @@ mod mcp_tests {
             "memory_search",
             "advisor",
             "lsp_diagnostics",
+            "lsp_navigate",
             "skills_search",
             <crate::agent::tools::schedule_wakeup::ScheduleWakeup as rig::tool::Tool>::NAME,
         ] {

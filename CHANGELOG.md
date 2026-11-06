@@ -57,6 +57,38 @@ Notable changes to mini-agent are documented in this file. The format follows
   lives in the application data directory, which the workspace profile never mounted and which
   explicit-roots profiles mask. The git service launch now binds only the guarded runtime
   directory read-only, after the masks (mini-agent-j053j).
+- LSP post-edit diagnostics now send `textDocument/didSave` after each synchronized edit to
+  servers that register for it (`textDocumentSync.save`, with text only for `includeText`), so
+  save-triggered checkers such as rust-analyzer's `cargo check` can report compiler errors in the
+  edit result. Servers that do not register never receive it (mini-agent-ehqci).
+- The post-edit LSP diagnostics wait is configurable per server (`[lsp.servers.<name>] wait_ms`,
+  default 1000, max 60000). A wait that elapses without a publish now appends
+  `LSP (<server>): no diagnostics received within N ms` instead of looking like a clean file, and
+  the shortened 50 ms wait used after a miss re-probes the full window after 30 s
+  (mini-agent-zoq2d).
+- The edit tool's fuzzy fallback (closest-match preview and `fuzzy: true`) now works on ordinary
+  source files: windows are pruned with a character-histogram bound and scored with a bounded
+  bit-parallel Levenshtein distance, and overlapping windows count as one region. The old
+  8M-cell budget made it inert for multi-line SEARCH blocks beyond ~45-line files; the new
+  64M-word budget is documented in `docs/agent/TOOL_RUNTIME.md` (mini-agent-73js3).
+- `notebook_edit` changes are now captured by file checkpoints, so `/rewind` "restore files" lists
+  and restores the exact pre-edit `.ipynb` bytes instead of silently skipping them
+  (mini-agent-qs5dg).
+- File checkpoints no longer stop silently: the first mutation a session cannot capture (record,
+  per-file or session byte limit, read policy, outside workspace) appends a one-time notice with
+  the reason to the tool result, `/rewind` reports `N edits not restorable (<reason>)`, and the
+  limits are configurable under `[file_checkpoints]` (`max_file_bytes` defaulting to the edit/write
+  size limit, `max_total_bytes` 64 MiB, `max_records` 2048; previously fixed at 1 MiB / 16 MiB /
+  512) (mini-agent-m4au3).
+- `notebook_edit` replace now clears a changed code cell's stale `outputs` and `execution_count`,
+  and notebooks are rewritten in their original layout (detected indent, nbformat's sorted keys,
+  final newline) with untouched fields copied verbatim, so editing a Jupyter-written notebook
+  changes only the edited cell in `git diff` instead of re-indenting the whole file
+  (mini-agent-mnhpz).
+- The post-edit formatter timeout is configurable with `format_timeout_secs` (default 10, clamped
+  to 1-600), and one invalid `[format]` entry no longer disables every formatter: it is named in a
+  startup warning, only that extension's formatting is skipped, and the valid formatters still run
+  (mini-agent-ksg12).
 
 ### Added
 
@@ -130,6 +162,23 @@ Notable changes to mini-agent are documented in this file. The format follows
   gives a sandboxed agent guarded `push_branch` and `wait_for_checks`, plus opt-in
   `create_release`). `make install` now also runs `make install-ghagent`, which installs it under
   `$(PREFIX)` (default `~/.local`); it never touches `~/.config/ghagent` or the mini-agent config.
+- `lsp_navigate` tool: read-only semantic navigation through the configured language servers
+  (`definition`, `type_definition`, `implementation`, `references`, `hover`, `symbols`,
+  `workspace_symbols`). It follows `read` permission rules, only queries workspace files, maps
+  result URIs back to workspace paths (outside locations are counted, not named) and caps results
+  at 100 entries and hover text at 8 KiB (mini-agent-8v84r).
+- `read` and `edit` handle BOM-marked UTF-16 files (UTF-16LE/BE, common in Windows, .NET and
+  PowerShell repositories): `read` decodes them strictly and labels the encoding, and `edit` writes
+  the result back in the same byte order with its BOM, checkpointing the original raw bytes for
+  `/rewind`. Other non-UTF-8 files are still rejected (mini-agent-w6euw).
+
+### Changed
+
+- `edit`, `write` and `notebook_edit` use a separate `max_edit_file_size` limit (default 16 MiB, or
+  `max_text_file_size` when larger) instead of the 1 MiB read limit, so large generated files and
+  lockfiles can be edited natively without enlarging read windows; the `/rewind` per-file
+  checkpoint limit follows it, and the size errors name `max_edit_file_size` instead of suggesting
+  `sed`/`awk` (mini-agent-p8c8z).
 
 **Fork release 1.14.1 (2026-10-26)**
 

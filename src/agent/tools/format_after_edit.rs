@@ -15,8 +15,13 @@ use crate::sandbox::{CommandLimits, CommandStatus, Sandbox, ShellDialect};
 const MAX_COMMAND_BYTES: usize = 8192;
 const MAX_ARGS: usize = 64;
 const MAX_OBSERVATION_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FORMATTERS: usize = 64;
+const MAX_EXTENSION_BYTES: usize = 16;
+/// Default and bounds of `format_timeout_secs`.
+pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 10;
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 600;
 const LIMITS: CommandLimits = CommandLimits {
-    timeout: Duration::from_secs(10),
+    timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
     stdout_bytes: 1024 * 1024,
     stderr_bytes: 1024 * 1024,
     combined_bytes: 1024 * 1024,
@@ -24,8 +29,72 @@ const LIMITS: CommandLimits = CommandLimits {
 
 pub(crate) struct FormatAfterEdit {
     commands: BTreeMap<String, String>,
-    invalid_map: bool,
+    /// Extensions whose entry was rejected; their edits report the skip.
+    invalid: std::collections::BTreeSet<String>,
+    limits: CommandLimits,
     sandbox: Sandbox,
+}
+
+/// Why one `[format]` entry is unusable, `None` when it is valid.
+fn entry_problem(extension: &str, template: &str) -> Option<&'static str> {
+    if extension.is_empty()
+        || extension.len() > MAX_EXTENSION_BYTES
+        || !extension
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        Some("the extension must be 1-16 ASCII letters, digits or underscores")
+    } else if template.len() > MAX_COMMAND_BYTES {
+        Some("the command template exceeds 8 KiB")
+    } else {
+        None
+    }
+}
+
+/// Splits `[format]` into usable entries and rejected extension names. Only
+/// the first [`MAX_FORMATTERS`] valid entries (in key order) are kept.
+fn partition(
+    commands: &BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, Vec<(String, &'static str)>) {
+    let mut valid = BTreeMap::new();
+    let mut invalid = Vec::new();
+    for (extension, template) in commands {
+        match entry_problem(extension, template) {
+            Some(problem) => invalid.push((extension.clone(), problem)),
+            None if valid.len() >= MAX_FORMATTERS => {
+                invalid.push((extension.clone(), "more than 64 formatters are configured"))
+            }
+            None => {
+                valid.insert(extension.clone(), template.clone());
+            }
+        }
+    }
+    (valid, invalid)
+}
+
+/// Bounded, terminal-safe spelling of an authored extension for warnings.
+fn display_extension(extension: &str) -> String {
+    let shown: String = extension
+        .chars()
+        .take(32)
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect();
+    format!("{shown:?}")
+}
+
+/// Startup warnings naming each rejected `[format]` entry. Command
+/// templates are never echoed: they may contain private paths.
+pub(crate) fn config_warnings(commands: &BTreeMap<String, String>) -> Vec<String> {
+    partition(commands)
+        .1
+        .into_iter()
+        .map(|(extension, problem)| {
+            format!(
+                "format.{}: {problem}; this formatter is ignored and the other formatters still run",
+                display_extension(&extension)
+            )
+        })
+        .collect()
 }
 
 pub(crate) struct FormatResult {
@@ -37,26 +106,33 @@ pub(crate) struct FormatResult {
 }
 
 impl FormatAfterEdit {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(commands: &BTreeMap<String, String>, sandbox: Sandbox) -> Option<Arc<Self>> {
+        Self::new_with_timeout(commands, sandbox, LIMITS.timeout)
+    }
+
+    /// Formatter with a configured per-run timeout (`format_timeout_secs`).
+    /// Invalid entries are dropped individually; valid ones keep working.
+    pub(crate) fn new_with_timeout(
+        commands: &BTreeMap<String, String>,
+        sandbox: Sandbox,
+        timeout: Duration,
+    ) -> Option<Arc<Self>> {
         (!commands.is_empty()).then(|| {
-            let invalid_map = commands.len() > 64
-                || commands
-                    .values()
-                    .any(|template| template.len() > MAX_COMMAND_BYTES)
-                || commands.keys().any(|extension| {
-                    extension.is_empty()
-                        || extension.len() > 16
-                        || !extension
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                });
+            let (commands, invalid) = partition(commands);
             Arc::new(Self {
-                commands: if invalid_map {
-                    BTreeMap::new()
-                } else {
-                    commands.clone()
+                commands,
+                invalid: invalid
+                    .into_iter()
+                    .map(|(extension, _)| extension)
+                    .collect(),
+                limits: CommandLimits {
+                    timeout: timeout.clamp(
+                        Duration::from_secs(1),
+                        Duration::from_secs(MAX_TIMEOUT_SECS),
+                    ),
+                    ..LIMITS
                 },
-                invalid_map,
                 sandbox,
             })
         })
@@ -77,12 +153,12 @@ impl FormatAfterEdit {
             #[cfg(feature = "lsp")]
             notify_lsp: false,
         };
-        if self.invalid_map {
+        let extension = path.extension()?.to_str()?;
+        if self.invalid.contains(extension) {
             return Some(unavailable(
-                "Formatter skipped: invalid configuration; edit remains committed.",
+                "Formatter skipped: invalid [format] entry for this extension; edit remains committed.",
             ));
         }
-        let extension = path.extension()?.to_str()?;
         let template = self.commands.get(extension)?;
         let Some(operand) = path.to_str() else {
             return Some(unavailable(
@@ -167,7 +243,7 @@ impl FormatAfterEdit {
             // through actual family retirement, including a dropped receiver.
             match self
                 .sandbox
-                .output_command_with_limits(&command, LIMITS)
+                .output_command_with_limits(&command, self.limits)
                 .await
             {
                 Ok(output) if output.descendants_escaped => {
@@ -181,6 +257,9 @@ impl FormatAfterEdit {
                         && !output.descendants_escaped =>
                 {
                     "Formatted."
+                }
+                Ok(output) if output.status == CommandStatus::TimedOut => {
+                    "Formatter failed or stopped: it exceeded format_timeout_secs; edit remains committed."
                 }
                 Ok(_) => "Formatter failed or stopped; edit remains committed.",
                 Err(_) => "Formatter could not start; edit remains committed.",
@@ -609,6 +688,56 @@ mod tests {
         assert!(command(&at_limit, "a.rs", ShellDialect::Posix).is_some());
         assert!(command(&format!("{at_limit} "), "a.rs", ShellDialect::Posix).is_some());
         assert!(command(&format!("{at_limit} word"), "a.rs", ShellDialect::Posix).is_none());
+    }
+
+    #[test]
+    fn format_invalid_entries_are_named_and_valid_ones_kept() {
+        let commands = BTreeMap::from([
+            ("rs".to_string(), "rustfmt {file}".to_string()),
+            ("bad.ext".to_string(), "x {file}".to_string()),
+            ("py".to_string(), "x".repeat(MAX_COMMAND_BYTES + 1)),
+        ]);
+        let (valid, invalid) = partition(&commands);
+        assert_eq!(valid.keys().collect::<Vec<_>>(), ["rs"]);
+        assert_eq!(invalid.len(), 2);
+        let warnings = config_warnings(&commands);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with("format.\"bad.ext\": the extension"));
+        assert!(warnings[1].starts_with("format.\"py\": the command template exceeds 8 KiB"));
+        assert!(warnings.iter().all(|warning| !warning.contains("xxxx")));
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("other formatters still run"))
+        );
+        assert!(config_warnings(&BTreeMap::from([("rs".into(), "fmt {file}".into())])).is_empty());
+        // More than 64 valid entries keep the first 64 and name the rest.
+        let many: BTreeMap<String, String> = (0..66)
+            .map(|index| (format!("e{index:02}"), "fmt {file}".to_string()))
+            .collect();
+        let (valid, invalid) = partition(&many);
+        assert_eq!(valid.len(), 64);
+        assert_eq!(invalid.len(), 2);
+    }
+
+    #[test]
+    fn format_timeout_is_configurable_and_clamped() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(cfg.resolve_format_timeout(), Duration::from_secs(10));
+        let cfg: crate::config::Config = toml::from_str("format_timeout_secs = 45").unwrap();
+        assert_eq!(cfg.resolve_format_timeout(), Duration::from_secs(45));
+        let cfg: crate::config::Config = toml::from_str("format_timeout_secs = 0").unwrap();
+        assert_eq!(cfg.resolve_format_timeout(), Duration::from_secs(1));
+        let formatter = FormatAfterEdit::new_with_timeout(
+            &BTreeMap::from([("rs".into(), "fmt {file}".into())]),
+            Sandbox::new(false, "bwrap"),
+            Duration::from_secs(100_000),
+        )
+        .unwrap();
+        assert_eq!(
+            formatter.limits.timeout,
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
     }
 
     #[test]
@@ -1092,6 +1221,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn format_invalid_entry_skips_only_its_extension_and_timeout_is_configurable() {
+        use super::super::{WriteArgs, WriteTool};
+        use rig::tool::Tool;
+        let (root, workspace, formatter) = fixture(0);
+        let mixed = FormatAfterEdit::new_with_timeout(
+            &BTreeMap::from([
+                ("rs".into(), "./formatter.sh \"{file}\"".into()),
+                (
+                    "way_too_long_extension".into(),
+                    "./formatter.sh \"{file}\"".into(),
+                ),
+            ]),
+            formatter.sandbox.clone(),
+            Duration::from_secs(10),
+        );
+        let tool = WriteTool::new(None, None, None)
+            .with_workspace_binding(Arc::clone(&workspace))
+            .with_formatter(mixed);
+        let valid = tool
+            .call(WriteArgs {
+                path: "source.rs".into(),
+                content: "committed\n".into(),
+                overwrite: false,
+            })
+            .await
+            .unwrap();
+        assert!(valid.contains("Formatted."), "{valid}");
+        let invalid = tool
+            .call(WriteArgs {
+                path: "notes.way_too_long_extension".into(),
+                content: "kept\n".into(),
+                overwrite: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            invalid.contains("invalid [format] entry for this extension"),
+            "{invalid}"
+        );
+
+        // A one-second timeout stops a slow formatter quickly.
+        std::fs::write(
+            root.path().join("formatter.sh"),
+            "#!/bin/sh\nsleep 30\nprintf late > \"$1\"\n",
+        )
+        .unwrap();
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let _cleanup = Cleanup {
+            scope: Arc::clone(&scope),
+            sandbox: formatter.sandbox.clone(),
+        };
+        let slow = FormatAfterEdit::new_with_timeout(
+            &BTreeMap::from([("rs".into(), "./formatter.sh \"{file}\"".into())]),
+            formatter.sandbox.clone(),
+            Duration::from_secs(1),
+        );
+        let tool = WriteTool::new(None, None, None)
+            .with_workspace_binding(Arc::clone(&workspace))
+            .with_formatter(slow);
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            scope.run(tool.call(WriteArgs {
+                path: "slow.rs".into(),
+                content: "committed\n".into(),
+                overwrite: false,
+            })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("exceeded format_timeout_secs"), "{result}");
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("slow.rs")).unwrap(),
+            "committed\n"
+        );
     }
 
     #[cfg(unix)]

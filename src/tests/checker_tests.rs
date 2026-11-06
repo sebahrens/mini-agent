@@ -616,18 +616,23 @@ fn lsp_diagnostics_inherits_read_rules_and_path_semantics() {
     )
     .expect("valid permission test configuration");
 
-    assert_eq!(
-        checker.check_path("lsp_diagnostics", &workspace_path("src/main.rs")),
-        CheckResult::Allowed
-    );
-    assert_eq!(
-        checker.check_path("lsp_diagnostics", &workspace_path("src/secret.rs")),
-        CheckResult::Denied("Blocked by deny rule".to_string())
-    );
-    assert_eq!(
-        checker.check_path("lsp_diagnostics", "/outside/file.rs"),
-        CheckResult::Ask
-    );
+    for tool in ["lsp_diagnostics", "lsp_navigate"] {
+        assert_eq!(
+            checker.check_path(tool, &workspace_path("src/main.rs")),
+            CheckResult::Allowed,
+            "{tool}"
+        );
+        assert_eq!(
+            checker.check_path(tool, &workspace_path("src/secret.rs")),
+            CheckResult::Denied("Blocked by deny rule".to_string()),
+            "{tool}"
+        );
+        assert_eq!(
+            checker.check_path(tool, "/outside/file.rs"),
+            CheckResult::Ask,
+            "{tool}"
+        );
+    }
 }
 
 // --- Standard mode: allow path tools in CWD only when no rule matches ---

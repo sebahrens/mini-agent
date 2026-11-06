@@ -314,8 +314,25 @@ unchanged.
 `list_dir` keeps only actual directories in its directory-first sort group and
 renders symbolic links as `name -> target`. Read windows size their line-number
 column from the actual range and report an offset past EOF directly instead of
-showing an inverted range. When edit's bounded fuzzy search is too expensive,
-the error says that no closest-match suggestion was computed.
+showing an inverted range.
+
+When a SEARCH block matches neither exactly nor after whitespace
+normalization, edit compares it with every line-aligned window of the same
+line count. A sliding character-histogram difference (a lower bound on the
+edit distance) prunes windows that cannot reach the current threshold
+(60% for a closest-match suggestion, raised to the best similarity seen so
+far, or 85% once a window qualifies to be applied); windows are scored
+best-bound first with a bit-parallel bounded Levenshtein distance (Myers /
+Hyyrö) that stops as soon as the threshold is out of reach. Overlapping
+windows above 85% are one region (the best-scoring alignment is used); two
+disjoint regions above 85% are ambiguous. The scan is bounded to 64,000,000
+work units per SEARCH block, where one unit is one window character times
+one 64-character word of the normalized SEARCH text: for example a 20-line,
+~700-character block costs about 11 units per window character, so a
+3000-line file is far inside the budget. Only many windows whose character
+composition is close to the SEARCH text (heavily repetitive or generated
+files) can exhaust it; the error then says that no closest-match suggestion
+was computed.
 
 SEARCH/REPLACE edits require a unique match, including occurrences that overlap
 in the original or whitespace-normalized text. For example, `aba` is ambiguous
@@ -738,19 +755,28 @@ by `read` for `.ipynb` files. Notebook source is literal data; these operations
 never run a kernel, shell, or cell. The builtin name is reserved against MCP
 shadowing and included in cold context schema estimates. Select exactly one
 zero-based `cell_index`
-or `cell_id`. `replace` updates source while preserving type, execution count,
-outputs, attachments, metadata and unknown fields. `insert` adds before the
+or `cell_id`. `replace` updates source while preserving type, attachments,
+metadata and unknown fields; when it changes a code cell's source it also
+clears that cell's `outputs` and sets `execution_count` to `null`, since the old
+results no longer belong to the new source. `insert` adds before the
 selected cell (index equal to the cell count appends), with an optional
 `cell_type` of `code`, `markdown` or `raw`; `delete` removes that cell. Source
 strings remain strings, and source arrays remain arrays. Inserts into notebook
 4.0–4.4 do not mint cell IDs or change the format version; 4.5+ requires valid
 unique IDs and receives a new ID on insertion.
 
+The rewritten file keeps the original layout: the indentation unit is detected
+from the file (nbformat/Jupyter writes one space), single-line files stay
+compact, keys are written in sorted order like nbformat, and a final newline is
+kept when the original had one. Unchanged fields are written from their raw
+source fragments, so for a Jupyter-written notebook only the edited cell's lines
+change in a git diff.
+
 Untouched JSON field payloads remain validated raw JSON, preserving large
 integers and opaque metadata. Opaque nesting is not recursively traversed;
 byte caps, rather than an assumed semantic nesting limit, bound its handling.
-Notebook input and resulting serialization must fit `max_text_file_size`
-(default 1 MiB), with an absolute 8 MiB ceiling. There are at most 4,096 cells,
+Notebook input and resulting serialization must fit `max_edit_file_size`
+(default 16 MiB), with an absolute 8 MiB ceiling. There are at most 4,096 cells,
 256 interpreted fields per notebook/cell/output object, 1,024 bytes per field
 name and 1 MiB of decoded source per cell. Duplicate interpreted object fields,
 invalid UTF-8 and ambiguous cell IDs are rejected. Unselected unknown cell

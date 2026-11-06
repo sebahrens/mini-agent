@@ -95,6 +95,12 @@ a file or list diagnostics across the project. Files with no configured server \
 return no diagnostics.";
 
 #[cfg(feature = "lsp")]
+pub const LSP_NAVIGATE_PROMPT: &str = "\n\n## LSP navigation\n\
+Use **lsp_navigate** for semantic code navigation (definition, references, implementation, \
+type_definition, hover, symbols, workspace_symbols) instead of guessing with grep when a \
+language server covers the file. Positions are 1-based line/column of the symbol.";
+
+#[cfg(feature = "lsp")]
 pub const LSP_MUTATION_PROMPT: &str = "\nFresh diagnostics are appended after supported file changes. Trust them and \
 fix what they report before moving on; no separate typecheck is needed just to confirm.";
 

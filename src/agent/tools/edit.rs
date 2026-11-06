@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::mutation_diff::{AppliedRange, DiffOptions, MutationDiff, MutationOutcome};
 use rig::tool::{Tool, ToolCallExtensions, ToolReturn};
 use tokio::io::AsyncReadExt;
@@ -6,17 +8,17 @@ use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::normalize::NormalizedText;
 use crate::agent::tools::{
     AskSender, EditArgs, EditBlock, EditOp, PermCheck, ReadTracker, ToolError,
-    check_perm_bound_path, check_perm_path, edit_system, levenshtein_similarity_chars,
-    normalize_line_into, normalize_whitespace,
+    check_perm_bound_path, check_perm_path, edit_system, normalize_line_into, normalize_whitespace,
 };
 use crate::config::types::EditSystem;
 #[cfg(feature = "lsp")]
 use crate::extras::lsp::LspManager;
 
-/// Same default as the read and write tools: an edit that would have to
-/// materialize more than this many bytes in the unsandboxed parent is refused
-/// before the file is opened.
-const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
+/// Same default as the write tool and `max_edit_file_size`: an edit that
+/// would have to materialize more than this many bytes in the unsandboxed
+/// parent is refused before the file is opened. Independent of read limits:
+/// an edit never returns the file.
+const DEFAULT_MAX_TEXT_SIZE: u64 = crate::config::DEFAULT_MAX_EDIT_FILE_SIZE;
 
 pub struct EditTool {
     pub permission: Option<PermCheck>,
@@ -192,7 +194,16 @@ enum MatchResult {
     NotFound,
 }
 
-const MAX_FUZZY_DISTANCE_CELLS: u128 = 8_000_000;
+/// Bit-parallel distance work (64-bit word steps, i.e. text characters times
+/// 64-character SEARCH blocks) the fuzzy fallback may spend on one SEARCH
+/// block after histogram pruning; documented in TOOL_RUNTIME.md.
+const MAX_FUZZY_DISTANCE_WORK: u128 = 64_000_000;
+/// A unique fuzzy match at or above this similarity may be applied with
+/// `fuzzy: true` (and is previewed otherwise).
+const FUZZY_APPLY_SIMILARITY: f64 = 0.85;
+/// Below the apply threshold, a closest match at or above this similarity is
+/// shown as a suggestion.
+const FUZZY_SUGGEST_SIMILARITY: f64 = 0.60;
 
 #[derive(Clone, Copy)]
 struct LineSpan<'a> {
@@ -343,34 +354,88 @@ fn find_best_match(
 
     let window_size = search_lines.len();
     let candidate_count = content_lines.len() - window_size + 1;
-    let search_chars = search_norm_chars.len() as u128;
-    let line_chars: Vec<u128> = (0..norm_lines.len())
-        .map(|index| norm_lines.line(index).len() as u128)
-        .collect();
-    let mut window_chars =
-        line_chars[..window_size].iter().sum::<u128>() + window_size.saturating_sub(1) as u128;
-    let mut fuzzy_cells = 0u128;
-    for start in 0..candidate_count {
-        fuzzy_cells = fuzzy_cells.saturating_add(search_chars.saturating_mul(window_chars));
-        if fuzzy_cells > MAX_FUZZY_DISTANCE_CELLS {
-            return MatchResult::FuzzyBudgetExceeded;
+    let search_len = search_norm_chars.len();
+
+    // Prefilter: a character-histogram difference is a lower bound on the
+    // Levenshtein distance (each edit adds and removes at most one character
+    // occurrence), and the window histograms slide line by line. Windows are
+    // then scored best-bound first, so the similarity threshold rises early and
+    // most windows are rejected without any distance computation.
+    let mut histogram: HashMap<char, i64> = HashMap::new();
+    let (mut surplus, mut deficit) = (0usize, 0usize);
+    let mut bump = |ch: char, delta: i64, surplus: &mut usize, deficit: &mut usize| {
+        if ch == '\n' {
+            return; // Separators match: both sides have window_size - 1.
         }
-        if start + window_size < line_chars.len() {
-            window_chars = window_chars
-                .saturating_sub(line_chars[start])
-                .saturating_add(line_chars[start + window_size]);
+        let entry = histogram.entry(ch).or_insert(0);
+        if delta > 0 {
+            if *entry >= 0 {
+                *surplus += 1;
+            } else {
+                *deficit -= 1;
+            }
+        } else if *entry > 0 {
+            *surplus -= 1;
+        } else {
+            *deficit += 1;
+        }
+        *entry += delta;
+    };
+    for &ch in &search_norm_chars {
+        bump(ch, -1, &mut surplus, &mut deficit);
+    }
+    let mut window_len = (0..window_size)
+        .map(|index| norm_lines.line(index).len())
+        .sum::<usize>()
+        + window_size
+        - 1;
+    for index in 0..window_size {
+        for &ch in norm_lines.line(index) {
+            bump(ch, 1, &mut surplus, &mut deficit);
         }
     }
+    let mut candidates: Vec<(usize, usize, usize)> = Vec::with_capacity(candidate_count);
+    for start in 0..candidate_count {
+        let max_len = search_len.max(window_len);
+        candidates.push((surplus.max(deficit), start, max_len));
+        if start + window_size < norm_lines.len() {
+            for &ch in norm_lines.line(start) {
+                bump(ch, -1, &mut surplus, &mut deficit);
+            }
+            for &ch in norm_lines.line(start + window_size) {
+                bump(ch, 1, &mut surplus, &mut deficit);
+            }
+            window_len = window_len - norm_lines.line(start).len()
+                + norm_lines.line(start + window_size).len();
+        }
+    }
+    // Order by the bound relative to the window length, ties in file order.
+    candidates.sort_unstable_by(|a, b| {
+        (a.0 as u128 * b.2.max(1) as u128)
+            .cmp(&(b.0 as u128 * a.2.max(1) as u128))
+            .then(a.1.cmp(&b.1))
+    });
 
     let mut best_sim = 0.0f64;
-    let mut best_start = 0usize;
-    let mut applicable = None;
-    // Scratch buffers reused for every window.
+    let mut best_start = usize::MAX;
+    // Windows at or above the apply threshold, as (start, similarity).
+    let mut applicable: Vec<(usize, f64)> = Vec::new();
+    let mut work = 0u128;
+    let mut pattern = BitParallelPattern::new(&search_norm_chars);
+    // Scratch buffer reused for every window.
     let mut window: Vec<char> = Vec::new();
-    let mut prev: Vec<usize> = Vec::new();
-    let mut curr: Vec<usize> = Vec::new();
 
-    for start in 0..candidate_count {
+    for &(bound, start, max_len) in &candidates {
+        let threshold = if applicable.is_empty() {
+            FUZZY_SUGGEST_SIMILARITY.max(best_sim)
+        } else {
+            FUZZY_APPLY_SIMILARITY
+        };
+        // sim = 1 - distance / max_len >= threshold.
+        let allowed = ((1.0 - threshold) * max_len as f64 + 1e-9).floor() as usize;
+        if bound > allowed {
+            continue;
+        }
         window.clear();
         for index in start..start + window_size {
             if index > start {
@@ -378,24 +443,50 @@ fn find_best_match(
             }
             window.extend_from_slice(norm_lines.line(index));
         }
-        let sim = levenshtein_similarity_chars(&search_norm_chars, &window, &mut prev, &mut curr);
-        if sim > best_sim {
+        let Some(distance) = pattern.distance_within(&window, allowed, &mut work) else {
+            if work > MAX_FUZZY_DISTANCE_WORK {
+                return MatchResult::FuzzyBudgetExceeded;
+            }
+            continue;
+        };
+        let sim = if max_len == 0 {
+            1.0
+        } else {
+            1.0 - distance as f64 / max_len as f64
+        };
+        if sim > best_sim || (sim == best_sim && start < best_start) {
             best_sim = sim;
             best_start = start;
         }
-        if sim >= 0.85 {
-            if let Some((first_start, first_sim)) = applicable {
-                return MatchResult::AmbiguousFuzzy((first_start + 1, first_sim), (start + 1, sim));
-            }
-            applicable = Some((start, sim));
+        if sim >= FUZZY_APPLY_SIMILARITY {
+            applicable.push((start, sim));
         }
     }
 
-    if let Some((start, sim)) = applicable {
+    // Windows that overlap describe the same region shifted by a line or
+    // two; only disjoint regions above the threshold are ambiguous.
+    applicable.sort_unstable_by_key(|&(start, _)| start);
+    let mut regions: Vec<(usize, f64)> = Vec::new();
+    let mut region_end = 0usize;
+    for &(start, sim) in &applicable {
+        match regions.last_mut() {
+            Some(best) if start < region_end => {
+                if sim > best.1 {
+                    *best = (start, sim);
+                }
+            }
+            _ => regions.push((start, sim)),
+        }
+        region_end = region_end.max(start + window_size);
+    }
+    if let [first, second, ..] = regions[..] {
+        return MatchResult::AmbiguousFuzzy((first.0 + 1, first.1), (second.0 + 1, second.1));
+    }
+    if let Some(&(start, sim)) = regions.first() {
         let byte_start = spans[start].start;
         let byte_end = spans[start + search_lines.len() - 1].content_end;
         MatchResult::FuzzyApply(byte_start, byte_end, sim)
-    } else if best_sim >= 0.60 {
+    } else if best_start != usize::MAX && best_sim >= FUZZY_SUGGEST_SIMILARITY {
         let preview: String = content_lines[best_start..]
             .iter()
             .take(3)
@@ -405,6 +496,116 @@ fn find_best_match(
         MatchResult::FuzzySuggest(best_start + 1, best_sim, preview)
     } else {
         MatchResult::NotFound
+    }
+}
+
+/// The SEARCH text prepared for bit-parallel Levenshtein distance (Myers'
+/// algorithm in Hyyrö's multi-word form): one 64-bit word per 64 pattern
+/// characters per text character, instead of one DP cell per pair.
+struct BitParallelPattern {
+    len: usize,
+    blocks: usize,
+    /// Character -> offset of its `blocks` match words in `masks`.
+    index: HashMap<char, usize>,
+    masks: Vec<u64>,
+    /// Scratch vertical delta vectors, reused for every window.
+    positive: Vec<u64>,
+    negative: Vec<u64>,
+}
+
+impl BitParallelPattern {
+    fn new(pattern: &[char]) -> Self {
+        let blocks = pattern.len().div_ceil(64).max(1);
+        let mut index = HashMap::new();
+        let mut masks = Vec::new();
+        for (position, &ch) in pattern.iter().enumerate() {
+            let offset = *index.entry(ch).or_insert_with(|| {
+                masks.resize(masks.len() + blocks, 0);
+                masks.len() - blocks
+            });
+            masks[offset + position / 64] |= 1u64 << (position % 64);
+        }
+        Self {
+            len: pattern.len(),
+            blocks,
+            index,
+            masks,
+            positive: Vec::with_capacity(blocks),
+            negative: Vec::with_capacity(blocks),
+        }
+    }
+
+    /// Global Levenshtein distance to `text` if it is at most `limit`. Each
+    /// processed text character adds `blocks` to `work`; the scan stops
+    /// early once the distance provably exceeds `limit`, or when `work`
+    /// passes [`MAX_FUZZY_DISTANCE_WORK`] (returning `None`).
+    fn distance_within(&mut self, text: &[char], limit: usize, work: &mut u128) -> Option<usize> {
+        let (m, n) = (self.len, text.len());
+        if m.abs_diff(n) > limit {
+            return None;
+        }
+        if m == 0 || n == 0 {
+            return Some(m.max(n));
+        }
+        let last_bit = 1u64 << ((m - 1) % 64);
+        self.positive.clear();
+        self.positive.resize(self.blocks, u64::MAX);
+        self.negative.clear();
+        self.negative.resize(self.blocks, 0);
+        let mut score = m;
+        for (column, ch) in text.iter().enumerate() {
+            let masks = self
+                .index
+                .get(ch)
+                .map(|&offset| &self.masks[offset..offset + self.blocks]);
+            // Global distance: the top row grows by one per column.
+            let mut carry: i8 = 1;
+            for block in 0..self.blocks {
+                let mut eq = masks.map_or(0, |masks| masks[block]);
+                let pv = self.positive[block];
+                let mv = self.negative[block];
+                let xv = eq | mv;
+                if carry < 0 {
+                    eq |= 1;
+                }
+                let xh = ((eq & pv).wrapping_add(pv) ^ pv) | eq;
+                let mut ph = mv | !(xh | pv);
+                let mut mh = pv & xh;
+                let high = if block + 1 == self.blocks {
+                    last_bit
+                } else {
+                    1u64 << 63
+                };
+                let out = if ph & high != 0 {
+                    1
+                } else if mh & high != 0 {
+                    -1
+                } else {
+                    0
+                };
+                ph <<= 1;
+                mh <<= 1;
+                if carry < 0 {
+                    mh |= 1;
+                } else if carry > 0 {
+                    ph |= 1;
+                }
+                self.positive[block] = mh | !(xv | ph);
+                self.negative[block] = ph & xv;
+                carry = out;
+            }
+            score = match carry {
+                1 => score + 1,
+                -1 => score - 1,
+                _ => score,
+            };
+            *work += self.blocks as u128;
+            // Each remaining column lowers the final score by at most one.
+            if score.saturating_sub(n - column - 1) > limit || *work > MAX_FUZZY_DISTANCE_WORK {
+                return None;
+            }
+        }
+        (score <= limit).then_some(score)
     }
 }
 
@@ -1081,7 +1282,7 @@ fn reject_overlapping_ranges(
 
 fn file_too_large(path: &str, size: u64, limit: u64) -> ToolError {
     ToolError::Msg(format!(
-        "Cannot edit '{}': the file is {} bytes, above the {}-byte limit. Use bash (sed/awk) for very large files or raise max_text_file_size.",
+        "Cannot edit '{}': the file is {} bytes, above the {}-byte limit. Raise max_edit_file_size to edit it natively (shell edits bypass /rewind checkpoints and the diff preview).",
         path, size, limit
     ))
 }
@@ -1313,14 +1514,30 @@ impl EditTool {
         // Fail closed on invalid UTF-8: the whole file is rewritten, so a lossy
         // decode would replace every invalid byte (even in untouched regions)
         // with U+FFFD and silently corrupt e.g. Latin-1 files.
-        let content = match String::from_utf8(bytes) {
-            Ok(text) => text,
+        // A UTF-16 file announced by its BOM is decoded strictly and written
+        // back in the same encoding; its raw bytes are the checkpoint preimage.
+        use super::text_encoding::{TextEncoding, decode_utf16_bom};
+        let (content, encoding, raw_preimage) = match String::from_utf8(bytes) {
+            Ok(text) => (text, TextEncoding::Utf8, None),
             Err(e) => {
-                return Err(ToolError::Msg(format!(
-                    "Cannot edit '{}': file is not valid UTF-8 (invalid byte at offset {}). The edit tool only handles UTF-8 text; convert the file first or use bash for binary/legacy encodings.",
-                    expanded,
-                    e.utf8_error().valid_up_to(),
-                )));
+                let offset = e.utf8_error().valid_up_to();
+                let bytes = e.into_bytes();
+                match decode_utf16_bom(&bytes) {
+                    Some(Ok((text, encoding))) => {
+                        (text, encoding, Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    }
+                    Some(Err(problem)) => {
+                        return Err(ToolError::Msg(format!(
+                            "Cannot edit '{expanded}': it starts with a UTF-16 byte-order mark but {problem}. No edits were applied."
+                        )));
+                    }
+                    None => {
+                        return Err(ToolError::Msg(format!(
+                            "Cannot edit '{}': file is not valid UTF-8 (invalid byte at offset {}). The edit tool handles UTF-8 and BOM-marked UTF-16 text; convert the file first or use bash for binary/legacy encodings.",
+                            expanded, offset,
+                        )));
+                    }
+                }
             }
         };
 
@@ -1404,12 +1621,12 @@ impl EditTool {
                 crate::session::file_checkpoints::prepare(
                     workspace,
                     relative,
-                    shared_preimage.map(|preimage| {
-                        crate::session::file_checkpoints::Preimage::new(
-                            std::sync::Arc::<[u8]>::from(preimage),
-                            &base,
-                        )
-                    }),
+                    raw_preimage
+                        .clone()
+                        .or_else(|| shared_preimage.map(std::sync::Arc::<[u8]>::from))
+                        .map(|preimage| {
+                            crate::session::file_checkpoints::Preimage::new(preimage, &base)
+                        }),
                     disclose_source,
                 )
                 .await
@@ -1432,10 +1649,13 @@ impl EditTool {
         }
 
         let output = modified;
-        let output_bytes = output.len() as u64;
+        // Bytes actually published: re-encoded for UTF-16 sources.
+        let encoded = (encoding != TextEncoding::Utf8)
+            .then(|| super::text_encoding::encode(&output, encoding));
+        let output_bytes = encoded.as_ref().map_or(output.len(), Vec::len) as u64;
         if output_bytes > limit {
             return Err(ToolError::Msg(format!(
-                "Edit rejected: the result would be {output_bytes} bytes, above the {limit}-byte limit for '{expanded}'. Split the change or raise max_text_file_size."
+                "Edit rejected: the result would be {output_bytes} bytes, above the {limit}-byte limit for '{expanded}'. Split the change or raise max_edit_file_size."
             )));
         }
         let excerpts = if disclose_source {
@@ -1453,10 +1673,11 @@ impl EditTool {
                 let expected = expected.clone();
                 // Move the output through the blocking publication and take it
                 // back instead of copying the whole file.
+                let encoded = encoded.clone();
                 let (published, output) = crate::agent::runner::spawn_blocking_scoped(move || {
                     let published = workspace.replace_relative_atomic_expecting(
                         &owned_relative,
-                        output.as_bytes(),
+                        encoded.as_deref().unwrap_or(output.as_bytes()),
                         &expected,
                         &base,
                     );
@@ -1477,7 +1698,7 @@ impl EditTool {
                 }
                 crate::fs::atomic_write_resolved_expecting(
                     &resolved,
-                    &output,
+                    encoded.as_deref().unwrap_or(output.as_bytes()),
                     approved_parent.expect("external edit must capture its parent"),
                     base,
                 )
@@ -1485,15 +1706,19 @@ impl EditTool {
                 output
             };
         crate::session::file_checkpoints::published();
-        let after_digest = crate::fs::ContentDigest::of(output.as_bytes());
+        let written = encoded.as_deref().unwrap_or(output.as_bytes());
+        let after_digest = crate::fs::ContentDigest::of(written);
+        let written_len = written.len();
+        drop(encoded);
         if let Some(checkpoint) = &mut checkpoint {
-            checkpoint.committed(&after_digest, output.len());
+            checkpoint.committed(&after_digest, written_len);
         }
         // Publication succeeded against the exact source identity and bytes.
         // Invalidate overwrite proof before optional formatter approval/effects.
         self.read_tracker.untrack_read_path(&path);
+        // Formatters observe UTF-8 text; a re-encoded file is left as written.
         let formatted = match &self.formatter {
-            Some(formatter) => {
+            Some(formatter) if encoding == TextEncoding::Utf8 => {
                 crate::startup::heap_future(|| {
                     formatter.run(
                         &formatting_path,
@@ -1506,7 +1731,7 @@ impl EditTool {
                 })
                 .await
             }
-            None => None,
+            _ => None,
         };
         // Without formatter content the committed postimage digest already stands.
         if let Some(checkpoint) = &checkpoint
@@ -1551,6 +1776,12 @@ impl EditTool {
             notes.len(),
         );
         let mut result = format!("Applied {} edit(s) to {}", edit_count, expanded);
+        if encoding != TextEncoding::Utf8 {
+            result.push_str(&format!(
+                "\n  Note: preserved the file's {} encoding",
+                encoding.label()
+            ));
+        }
         for note in &notes {
             result.push_str(&format!("\n  Note: {}", note));
         }
@@ -1624,6 +1855,9 @@ impl EditTool {
             result =
                 private_fallback.expect("configured formatting retains an input-only fallback");
             diff = None;
+        }
+        if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
+            result.push_str(&notice);
         }
         Ok(MutationOutcome {
             output: result,
@@ -1890,6 +2124,164 @@ mod tests {
         let second = find_best_match(content, "fn b() {\n    two();\n}", &cache);
         assert!(matches!(second, MatchResult::Normalized(..)));
         assert!(std::ptr::eq(built, cache.get().unwrap()));
+    }
+
+    /// Deterministic, diverse pseudo-source lines.
+    fn diverse_lines(count: usize, seed: u64) -> Vec<String> {
+        const WORDS: [&str; 24] = [
+            "let", "value", "config", "parse", "result", "match", "items", "error", "into",
+            "buffer", "len", "map", "iter", "self", "count", "push", "path", "await", "return",
+            "options", "state", "index", "format", "clone",
+        ];
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                let mut line = String::from("    ");
+                for _ in 0..6 {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    line.push_str(WORDS[(state >> 33) as usize % WORDS.len()]);
+                    line.push(if (state >> 20).is_multiple_of(3) {
+                        '.'
+                    } else {
+                        ' '
+                    });
+                }
+                line.push(';');
+                line
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bit_parallel_distance_agrees_with_full_distance_within_its_limit() {
+        let long_a = "ab".repeat(70);
+        let long_b = format!("x{}y", "ab".repeat(69));
+        let words = [
+            "", "a", "ab", "kitten", "sitting", "flaw", "lawn", "é-ab", "abcdefgh", &long_a,
+            &long_b,
+        ];
+        for a in words {
+            for b in words {
+                let (a_chars, b_chars): (Vec<char>, Vec<char>) =
+                    (a.chars().collect(), b.chars().collect());
+                let max = a_chars.len().max(b_chars.len());
+                let sim = crate::agent::tools::normalize::levenshtein_similarity(a, b);
+                let full = ((1.0 - sim) * max as f64).round() as usize;
+                for limit in [0, 1, 2, 3, 5, 8, 140] {
+                    let mut work = 0;
+                    let bounded = super::BitParallelPattern::new(&a_chars)
+                        .distance_within(&b_chars, limit, &mut work);
+                    assert_eq!(
+                        bounded,
+                        (full <= limit).then_some(full),
+                        "a={a:?} b={b:?} limit={limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn twenty_line_search_with_one_typo_matches_in_a_3000_line_file() {
+        let lines = diverse_lines(3000, 7);
+        let content = lines.join("\n") + "\n";
+        let mut search_lines = lines[1500..1520].to_vec();
+        search_lines[9] = search_lines[9].replacen('e', "3", 1);
+        let search = search_lines.join("\n");
+        let cache = std::sync::OnceLock::new();
+        let started = std::time::Instant::now();
+        let result = find_best_match(&content, &search, &cache);
+        let elapsed = started.elapsed();
+        let MatchResult::FuzzyApply(start, end, sim) = result else {
+            let kind = match result {
+                MatchResult::Exact(_) => "exact".to_string(),
+                MatchResult::Normalized(..) => "normalized".to_string(),
+                MatchResult::AmbiguousNormalized(..) => "ambiguous-normalized".to_string(),
+                MatchResult::AmbiguousFuzzy(a, b) => format!("ambiguous {a:?} {b:?}"),
+                MatchResult::FuzzySuggest(line, sim, _) => format!("suggest {line} {sim}"),
+                MatchResult::FuzzyBudgetExceeded => "budget".to_string(),
+                MatchResult::NotFound => "not found".to_string(),
+                MatchResult::FuzzyApply(..) => unreachable!(),
+            };
+            panic!("expected a unique fuzzy match, got {kind}");
+        };
+        assert_eq!(content[..start].matches('\n').count(), 1500);
+        assert_eq!(&content[start..end], lines[1500..1520].join("\n"));
+        assert!(sim > 0.99, "{sim}");
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+
+        // A search far from any region still yields a closest-match preview.
+        let mut drifted = lines[2000..2020].to_vec();
+        for line in drifted.iter_mut().step_by(2) {
+            *line = line.replace("value", "amount").replace("self", "this");
+        }
+        let suggestion = find_best_match(&content, &drifted.join("\n"), &cache);
+        assert!(
+            matches!(
+                suggestion,
+                MatchResult::FuzzySuggest(2001, ..) | MatchResult::FuzzyApply(..)
+            ),
+            "expected a suggestion near line 2001"
+        );
+    }
+
+    #[test]
+    fn overlapping_windows_are_one_region_but_disjoint_copies_are_ambiguous() {
+        let lines = diverse_lines(400, 11);
+        let mut search_lines = lines[100..120].to_vec();
+        search_lines[3].push('x');
+        let search = search_lines.join("\n");
+        let unique = lines.join("\n");
+        let cache = std::sync::OnceLock::new();
+        assert!(matches!(
+            find_best_match(&unique, &search, &cache),
+            MatchResult::FuzzyApply(..)
+        ));
+        let mut duplicated = lines.clone();
+        duplicated.extend(lines[100..120].iter().cloned());
+        let duplicated = duplicated.join("\n");
+        let cache = std::sync::OnceLock::new();
+        let MatchResult::AmbiguousFuzzy(first, second) =
+            find_best_match(&duplicated, &search, &cache)
+        else {
+            panic!("disjoint copies must be ambiguous");
+        };
+        assert_eq!((first.0, second.0), (101, 401));
+    }
+
+    #[test]
+    fn fuzzy_budget_is_exceeded_only_beyond_the_documented_work() {
+        // Every line is a permutation of the SEARCH characters, so no window
+        // can be pruned by its character histogram. Each window then costs
+        // at most 2000 text characters x 32 pattern words = 64,000 work units
+        // (less when the scan stops early), so the 64M budget admits every
+        // set of at most 1000 such windows.
+        let alphabet: Vec<char> = ('a'..='z').chain('A'..='Z').collect();
+        let search: String = (0..2000).map(|i| alphabet[i % alphabet.len()]).collect();
+        let permuted = |seed: usize| -> String {
+            let mut chars: Vec<char> = search.chars().collect();
+            let mut state = seed as u64 + 1;
+            for index in (1..chars.len()).rev() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                chars.swap(index, (state >> 33) as usize % (index + 1));
+            }
+            chars.into_iter().collect()
+        };
+        let lines: Vec<String> = (0..2500).map(permuted).collect();
+        let many = lines.join("\n");
+        let cache = std::sync::OnceLock::new();
+        assert!(matches!(
+            find_best_match(&many, &search, &cache),
+            MatchResult::FuzzyBudgetExceeded
+        ));
+        let within = lines[..900].join("\n");
+        let cache = std::sync::OnceLock::new();
+        assert!(!matches!(
+            find_best_match(&within, &search, &cache),
+            MatchResult::FuzzyBudgetExceeded
+        ));
     }
 
     #[test]

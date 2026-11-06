@@ -1379,6 +1379,8 @@ impl Cli {
             "advisor",
             #[cfg(feature = "lsp")]
             "lsp_diagnostics",
+            #[cfg(feature = "lsp")]
+            "lsp_navigate",
             "web_fetch",
             "web_search",
         ];

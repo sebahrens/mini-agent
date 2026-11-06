@@ -634,6 +634,8 @@ doom_loop = "ask"
 Formatting is disabled until an extension is configured:
 
 ```toml
+format_timeout_secs = 30   # top-level; default 10, clamped to 1-600
+
 [format]
 rs = 'rustfmt --edition 2024 "{file}"'
 js = 'prettier --write "{file}"'
@@ -650,15 +652,24 @@ At most one placeholder is allowed. The canonical UTF-8 target is substituted
 **after** tokenization and each resulting argument is quoted for the configured
 POSIX shell or PowerShell. Non-UTF-8 paths skip formatting without redirecting to
 a lossy alias. The map accepts at most 64 extensions of 1–16 ASCII letters,
-digits or underscores; commands accept at most 8 KiB and 64 arguments.
+digits or underscores; commands accept at most 8 KiB and 64 arguments. Each
+entry is validated on its own: an invalid extension or oversized template
+produces a startup warning naming that entry (`format."<ext>": ...`, the
+command itself is not echoed), only that formatter is ignored (edits of that
+extension report `Formatter skipped: invalid [format] entry for this
+extension`), and every valid formatter still runs. Entries beyond the first 64
+valid ones (in key order) are ignored with the same warning.
 
 The original edit commits first. The formatter then runs in the original captured
 workspace, preserving project config and plugin discovery, through normal `shell`
 permission. An unknown command asks once; an edit approval does not approve its
 formatter. CLI shell exclusions and unavailable containment disable formatting.
 Project-local `[format]` is a sensitive setting covered by the existing
-content-bound project-config approval. Commands have a 10-second timeout and a
-combined 1 MiB output limit. A failed, denied or stopped formatter never rolls back
+content-bound project-config approval. Each command may run for
+`format_timeout_secs` seconds (top-level key, default 10, clamped to 1–600;
+raise it for `cargo fmt`, `prettier` on a monorepo or a cold `black`) with a
+combined 1 MiB output limit; a timed-out run reports `Formatter failed or
+stopped: it exceeded format_timeout_secs`. A failed, denied or stopped formatter never rolls back
 the committed edit. Results append a static status; formatter stdout/stderr is not
 shown. After retirement, authorized bounded final source determines previews and
 diffs even when the command failed after modifying the file.
@@ -729,7 +740,9 @@ Accepted top-level keys:
 | `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. When unset globally, falls back to the active quick model's `reserve_tokens` field, then to a default that scales with the context window: `window/10`, never below `16384` (so one maximal response cannot overshoot the window) and never above half the window. Examples: 128k window → 16384, 1M window → 100000. |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. When unset, scales with the context window: `window/20` clamped to `[10000, 50000]` and at most a quarter of the window. Examples: 128k window → 10000, 1M window → 50000.                          |
 | `keep_recent_tool_results` | integer | Optional count-only pruning policy. Omit it (the default) to retain every historical tool result until context-budget compaction. An explicit finite value keeps only that many newest results verbatim and replaces older results with recovery notices; `0` clears all historical results. Calls, durable session records, and spill files remain intact. |
-| `max_text_file_size`      | integer | Maximum write size and maximum raw text returned by one `read` call. A larger file can be read only with an explicit `offset` or `limit`, and the selected line window must fit this byte cap. The resolved config default is `1048576` (1 MiB); subagent construction has a defensive `10485760` (10 MiB) fallback only when handed an unresolved config with this field absent. |
+| `max_text_file_size`      | integer | Maximum raw text returned by one `read` call (edits and writes use `max_edit_file_size`). A larger file can be read only with an explicit `offset` or `limit`, and the selected line window must fit this byte cap. The resolved config default is `1048576` (1 MiB); subagent construction has a defensive `10485760` (10 MiB) fallback only when handed an unresolved config with this field absent. |
+| `max_edit_file_size`      | integer | Largest file that `edit`, `write` and `notebook_edit` will change (preimage and result). Default `16777216` (16 MiB), or `max_text_file_size` when that is larger. Independent of the read limit: an edit never returns the file, so a 5 MiB lockfile can be edited with a unique SEARCH block without enlarging read windows. `write` with `overwrite: true` still needs a complete prior `read`, so it stays bounded by `max_text_file_size`. The `/rewind` per-file checkpoint limit defaults to this value; notebooks stay capped at 8 MiB and LSP synchronization at 4 MiB (larger files are edited without diagnostics). |
+| `file_checkpoints`        | object  | `/rewind` file checkpoint limits: `max_file_bytes` (largest pre-/postimage captured; default follows the edit/write size limit), `max_total_bytes` (preimage bytes per session, default `67108864` = 64 MiB) and `max_records` (mutation records and distinct preimages per session, default `2048`). Values are clamped to 1 GiB, 4 GiB and 100000. The first mutation a session cannot capture appends a one-time notice to that tool result, and the `/rewind` picker reports `N edits not restorable (<reason>)`. See [file-checkpoints.md](file-checkpoints.md). |
 | `max_read_lines`          | integer | Default maximum lines returned by one `read` call. Default: `2000`. |
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
 | `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, and other command classes, including brokered JS `spawn`, retain their existing limits. Sensitive in project-local configuration: changing it requires project trust. |
@@ -2151,7 +2164,7 @@ cannot be rooted at `/proc` or a process directory. This keeps env-held tokens
 out of the model's reach through the in-process read tools.
 An `external_directory` deny is a security baseline: it takes precedence over
 matching tool-specific allows and prior session AllowAlways scopes, including
-inherited `read` access used by `lsp_diagnostics`. When several
+inherited `read` access used by `lsp_diagnostics` and `lsp_navigate`. When several
 `external_directory` rules match one path they follow the same
 order-independent precedence as tool rules (see Rule precedence): any `deny`
 wins, otherwise the most specific pattern, with `ask` beating `allow` on a tie.
@@ -3564,6 +3577,25 @@ take precedence in alphabetical server-name order, followed by built-ins in
 their declaration order. A same-named user entry replaces its built-in;
 `disabled = true` or an empty command removes that entry from selection.
 
+An `lsp_navigate` tool offers read-only semantic navigation through the same
+servers: `op` = `definition`, `type_definition`, `implementation`,
+`references` (these take the 1-based `line`/`column` of the symbol; columns
+are UTF-16 code units as in LSP, equal to characters for BMP text), `hover`,
+`symbols` (outline of `path`) and `workspace_symbols` (`query`; `path`
+selects the server). It returns workspace-relative `path:line:column`
+locations (1-based). Only files inside the session workspace can be queried;
+the file is checked against the `read` policy (rules written for `read`
+apply, as for `lsp_diagnostics`) and synchronized from disk before the
+request. Result locations are mapped back through the same URI translation
+as diagnostics: locations outside the workspace or through symlink aliases
+are counted but never named, and files hidden by a `read` deny rule are
+counted as hidden. Results are capped at 100 locations/symbols (excess is
+reported with a count), hover text at 8 KiB (marked when truncated), and
+each request at 10 seconds. An op the server does not advertise in its
+`initialize` capabilities (for example no `implementationProvider`) fails
+with a message naming the missing capability. Restrict the tool with
+`--tools` like any other; it is registered whenever an LSP manager is.
+
 `lsp_diagnostics` uses the existing `read` permission policy. A file query
 checks the canonical file path before synchronizing it or starting a language
 server. Canonical paths must be UTF-8 and regular files; other filesystem node
@@ -3691,6 +3723,7 @@ extensions = [".my"]
 # network = "deny"           # requires a sandbox that enforces denial
 # initialization = { ... }   # server-specific initializationOptions
 # disabled = false           # true removes a same-named built-in
+# wait_ms = 1000             # post-edit diagnostics wait (default 1000, max 60000)
 ```
 
 ### YAML
@@ -3747,6 +3780,25 @@ Behavior notes:
   diagnostics", never a failed edit.
 - Post-edit diagnostics are capped (errors first, ~20 lines); nothing is
   appended when the file is clean.
+- After an edit or write, the tool waits up to the server's `wait_ms`
+  (default 1000 ms, clamped to 60000 ms) for the `publishDiagnostics` that
+  answers the synchronized version. Slow checkers (rust-analyzer flycheck,
+  tsserver on large projects, a cold pyright) usually need a larger value,
+  e.g. `wait_ms = 10000` for `[lsp.servers.rust]`; the wait ends as soon as
+  the publish arrives. When the window elapses without a publish the result
+  says so explicitly (`LSP (<server>): no diagnostics received within N ms;
+  ...`), so a timeout is never mistaken for a clean file. After such a miss
+  later edits on that server wait only 50 ms until the server is seen
+  publishing again (including late, after a wait gave up); the full window is
+  re-probed at most 30 s after the last full-window miss.
+- The client advertises `textDocument/didSave` support. A server that
+  registers for it in its `initialize` result (`textDocumentSync.save`)
+  receives `didSave` right after each synchronized `didOpen`/`didChange`
+  (with the full text only when it asks for `includeText`), because the file
+  is already published on disk. This lets save-triggered checkers such as
+  rust-analyzer's `cargo check` flycheck report type and borrow errors after an
+  edit. Servers that do not register (or use the legacy numeric sync kind)
+  never receive `didSave`.
 
 ## Mutation previews
 

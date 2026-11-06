@@ -193,3 +193,209 @@ fn with_coaching(coaching: Option<String>, output: String) -> String {
         None => output,
     }
 }
+
+/// `lsp_navigate`: read-only semantic navigation (definition, references,
+/// implementation, type definition, hover, document and workspace symbols)
+/// through the configured language server.
+pub struct LspNavigateTool {
+    pub manager: LspManager,
+    pub permission: Option<PermCheck>,
+    pub ask_tx: Option<AskSender>,
+}
+
+#[derive(Deserialize)]
+pub struct LspNavigateArgs {
+    /// definition | type_definition | implementation | references | hover |
+    /// symbols | workspace_symbols
+    pub op: String,
+    /// File the request is about (for workspace_symbols: any file of the
+    /// language whose server should be asked).
+    pub path: String,
+    /// 1-based line of the symbol (position ops).
+    pub line: Option<u32>,
+    /// 1-based column of the symbol (position ops); UTF-16 code units.
+    pub column: Option<u32>,
+    /// Symbol name filter for workspace_symbols.
+    pub query: Option<String>,
+}
+
+impl LspNavigateTool {
+    pub fn new(
+        manager: LspManager,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+    ) -> Self {
+        Self {
+            manager,
+            permission,
+            ask_tx,
+        }
+    }
+}
+
+impl Tool for LspNavigateTool {
+    const NAME: &'static str = "lsp_navigate";
+
+    type Error = ToolError;
+    type Args = LspNavigateArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "Semantic code navigation through the project's language server. `op`: definition, type_definition, implementation, references (need `line` and `column`, 1-based, pointing at the symbol), hover (type/docs at that position), symbols (outline of `path`), workspace_symbols (search by `query`; `path` selects the language server). Returns workspace-relative `path:line:column` locations (1-based), capped at 100.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["definition", "type_definition", "implementation", "references", "hover", "symbols", "workspace_symbols"]
+                },
+                "path": { "type": "string", "description": "File to query" },
+                "line": { "type": "integer", "minimum": 1, "description": "1-based line (position ops)" },
+                "column": { "type": "integer", "minimum": 1, "description": "1-based column (position ops)" },
+                "query": { "type": "string", "description": "Symbol filter for workspace_symbols" }
+            },
+            "required": ["op", "path"]
+        })
+    }
+
+    async fn call(&self, args: LspNavigateArgs) -> Result<String, ToolError> {
+        use crate::extras::lsp::navigate::{NavAnswer, NavOp, NavQuery};
+        let op = NavOp::parse(args.op.trim()).ok_or_else(|| {
+            ToolError::Msg(format!(
+                "Unknown op '{}'. Use definition, type_definition, implementation, references, hover, symbols or workspace_symbols.",
+                args.op
+            ))
+        })?;
+        let (line, character) = if op.needs_position() {
+            match (args.line, args.column) {
+                (Some(line @ 1..), Some(column @ 1..)) => (line - 1, column - 1),
+                _ => {
+                    return Err(ToolError::Msg(format!(
+                        "op '{}' needs 1-based `line` and `column` of the symbol.",
+                        args.op
+                    )));
+                }
+            }
+        } else {
+            (0, 0)
+        };
+        let expanded = crate::fs::expand_tilde(&args.path);
+        let path = self
+            .manager
+            .resolve_path(Path::new(&expanded))
+            .map_err(ToolError::Msg)?;
+        if !path.starts_with(self.manager.root()) {
+            return Err(ToolError::Msg(
+                "lsp_navigate only queries files inside the session workspace.".to_string(),
+            ));
+        }
+        if !tokio::fs::symlink_metadata(&path).await?.is_file() {
+            return Err(ToolError::Msg(format!(
+                "File '{expanded}' is not a regular file."
+            )));
+        }
+        if !self.manager.handles(&path) {
+            return Err(ToolError::Msg(format!(
+                "No language server is configured for '{expanded}'."
+            )));
+        }
+        let permission_path = canonical_permission_path(&path)?;
+        let coaching = check_perm_canonical_path(
+            &self.permission,
+            &self.ask_tx,
+            Self::NAME,
+            permission_path.as_ref(),
+            false,
+        )
+        .await?;
+        // Synchronize the authorized bytes so positions refer to the file on
+        // disk, then ask the server.
+        let relative = Path::new(&expanded);
+        if !relative.is_absolute() && !expanded.starts_with('~') {
+            self.manager.notify_changed_relative(relative).await;
+        } else {
+            self.manager.notify_changed(&path).await;
+        }
+        let query = NavQuery {
+            op,
+            line,
+            character,
+            query: args.query.unwrap_or_default(),
+        };
+        let answer = self
+            .manager
+            .navigate(&path, &query)
+            .await
+            .map_err(|error| ToolError::Msg(format!("lsp_navigate: {error}")))?;
+        let root = self.manager.root().to_path_buf();
+        let output = match answer {
+            NavAnswer::Hover { text, truncated } => {
+                if text.is_empty() {
+                    "No hover information at that position.".to_string()
+                } else if truncated {
+                    format!(
+                        "{text}\n[hover text truncated at {} bytes]",
+                        crate::extras::lsp::navigate::MAX_HOVER_BYTES
+                    )
+                } else {
+                    text
+                }
+            }
+            NavAnswer::Items {
+                items,
+                outside,
+                truncated,
+            } => {
+                // Results are filtered like a workspace walk: a read deny
+                // rule hides the location rather than naming the file.
+                let deny = super::walk_deny_filter(&self.permission, "read", Some(&root));
+                let mut denied = 0usize;
+                let mut lines = Vec::new();
+                for item in items {
+                    if deny.as_ref().is_some_and(|deny| deny(&item.path, false)) {
+                        denied += 1;
+                        continue;
+                    }
+                    let shown = item
+                        .path
+                        .strip_prefix(&root)
+                        .unwrap_or(&item.path)
+                        .display()
+                        .to_string()
+                        .replace('\\', "/");
+                    let location = format!("{shown}:{}:{}", item.line + 1, item.character + 1);
+                    lines.push(match item.label {
+                        Some(label) => {
+                            format!("{}{label} — {location}", "  ".repeat(item.depth))
+                        }
+                        None => location,
+                    });
+                }
+                let mut output = if lines.is_empty() {
+                    "No results.".to_string()
+                } else {
+                    lines.join("\n")
+                };
+                if truncated > 0 {
+                    output.push_str(&format!(
+                        "\n[{truncated} more results not shown (limit {}); narrow the query]",
+                        crate::extras::lsp::navigate::MAX_NAV_ITEMS
+                    ));
+                }
+                if outside > 0 {
+                    output.push_str(&format!(
+                        "\n[{outside} results outside the workspace omitted]"
+                    ));
+                }
+                if denied > 0 {
+                    output.push_str(&format!("\n[{denied} results hidden by permission rules]"));
+                }
+                output
+            }
+        };
+        Ok(with_coaching(coaching, output))
+    }
+}
