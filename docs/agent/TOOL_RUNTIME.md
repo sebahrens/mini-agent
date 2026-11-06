@@ -771,7 +771,12 @@ The default `read` view shows virtual cell/source/output lines. Its existing
 by `max_read_lines`. Returned text is capped at 64 KiB (or the configured text
 cap, if smaller); text outputs have separate 4 KiB per-cell and 16 KiB overall
 limits with explicit omissions, and at most 4,096 output objects per cell.
-Opaque rich output payloads are omitted. This view provides no raw line hashes,
+Stream outputs show their text; `execute_result` and `display_data` outputs show
+their `text/plain` data; `error` outputs show `ename: evalue` and the traceback with
+ANSI colour codes removed (an over-budget traceback keeps the exception line and its
+last frames after a `[N traceback bytes omitted]` marker). Other mime types, such as
+images and HTML, are listed as `[image/png output omitted]`; their payloads are never
+rendered. Outputs with nothing decodable show `[opaque output payload omitted]`. This view provides no raw line hashes,
 raw-file CRC or whole-file overwrite authorization. Set `raw_notebook: true`
 to use the ordinary raw JSON line reader and its existing edit/write contract.
 
