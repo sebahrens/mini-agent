@@ -340,14 +340,13 @@ async fn run_prompt(
     let pid = child.id();
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
+    type Captured = (
+        (Vec<u8>, bool),
+        (Vec<u8>, bool),
+        std::io::Result<std::process::ExitStatus>,
+    );
     enum Stop {
-        Done(
-            (
-                (Vec<u8>, bool),
-                (Vec<u8>, bool),
-                std::io::Result<std::process::ExitStatus>,
-            ),
-        ),
+        Done(Captured),
         TimedOut,
         Cancelled,
     }
