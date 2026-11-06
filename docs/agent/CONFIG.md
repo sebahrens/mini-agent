@@ -4482,7 +4482,15 @@ requests carry the hosted tool and the native Exa `web_search` function tool is
 not registered (the names would collide). Other providers (Chat Completions,
 OpenRouter, Gemini, Ollama, Copilot) are unchanged. Hosted tools run on the
 provider side, so they bypass the per-call `web_search` network permission and
-the native domain/recency parameters; the opt-in is the only approval. The
+the native domain/recency parameters; the opt-in is the only approval. Optional
+`hosted-web-search-allowed-domains` or `hosted-web-search-blocked-domains` (bare
+domains, at most 20, not both) are sent as Anthropic `allowed_domains` /
+`blocked_domains`; the OpenAI Responses tool takes `filters.allowed_domains`
+only, so a block-list there withholds hosted search (fail closed, with a
+warning) instead of searching unfiltered. `hosted-web-search-max-uses` (1..=50,
+default 5) sets the Anthropic per-request search cap. Invalid filters, both lists,
+or an out-of-range cap also withhold the hosted tool. The filters never enable
+hosted search by themselves. The
 setting is ignored when `web-search-provider = "off"`, when any `web_search`
 deny rule exists (a `permission-deny` entry with or without patterns, `web_search
 = "deny"`, a granular map such as `{ "*" = "deny" }` or one with any deny entry,
@@ -4499,6 +4507,7 @@ untrusted project config cannot enable it.
 | `web-fetch-allow-http` (`web_fetch_allow_http`) | `false` | Permit plaintext HTTP to otherwise-safe public destinations. Private addresses remain denied. |
 | `web-search-provider` (`web_search_provider`) | `"exa"` | Fixed-endpoint Exa search, or `"off"` to omit the tool. Other provider names fail visibly before I/O. |
 | `hosted-web-search` (`hosted_web_search`) | `false` | Opt in to the Anthropic or OpenAI Responses provider-hosted web search instead of native Exa. Bypasses per-call `web_search` permission; see above. |
+| `hosted-web-search-allowed-domains` / `-blocked-domains` / `-max-uses` | omitted / omitted / `5` | Domain filters and the Anthropic `max_uses` cap for hosted search (see above). Authority-sensitive: need project trust. |
 | `web-fetch-timeout-secs` (`web_fetch_timeout_secs`) | `30` | Total `web_fetch` deadline in seconds, spanning DNS, approval, redirects and body. Clamped to 1..=300. The idle gap allowed between body reads is half of it (at least 3 s). `web_search` keeps its fixed 10 s deadline. |
 
 These are authority-sensitive project config keys and require existing project

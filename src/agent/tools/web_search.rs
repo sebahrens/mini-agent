@@ -38,7 +38,10 @@ pub(crate) fn exa_api_key_present() -> bool {
     std::env::var("EXA_API_KEY").is_ok_and(|key| !key.trim().is_empty())
 }
 
-fn normalized_domains(field: &str, domains: Option<Vec<String>>) -> Result<Vec<String>, ToolError> {
+pub(crate) fn normalized_domains(
+    field: &str,
+    domains: Option<Vec<String>>,
+) -> Result<Vec<String>, ToolError> {
     let domains = domains.unwrap_or_default();
     if domains.len() > MAX_DOMAIN_FILTERS {
         return Err(ToolError::Msg(format!(

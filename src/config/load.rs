@@ -4330,6 +4330,22 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    fn hosted_web_search_keys_are_never_benign_project_keys() {
+        for key in [
+            "hosted-web-search",
+            "hosted_web_search",
+            "hosted-web-search-allowed-domains",
+            "hosted-web-search-blocked-domains",
+            "hosted-web-search-max-uses",
+        ] {
+            assert!(
+                !super::BENIGN_PROJECT_CONFIG_KEYS.contains(&key),
+                "{key} must need project trust"
+            );
+        }
+    }
+
+    #[test]
     fn project_statusline_without_git_status_segments_stays_benign() {
         let (_root, _, sensitive) = split_project_override(
             "[[statusline.lines]]\n\

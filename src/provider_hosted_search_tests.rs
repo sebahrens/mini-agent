@@ -131,8 +131,13 @@ fn hosted_web_search_is_withheld_for_every_deny_shape() {
     assert_eq!(hosted_with(regex, &plain), None);
 
     let mut deny_patterns = cfg(Some(true));
-    deny_patterns.permission_deny =
-        Some([("web_search".to_string(), vec!["https://x.test/*".to_string()])].into());
+    deny_patterns.permission_deny = Some(
+        [(
+            "web_search".to_string(),
+            vec!["https://x.test/*".to_string()],
+        )]
+        .into(),
+    );
     assert_eq!(hosted_with(deny_patterns, &plain), None);
 }
 
@@ -149,7 +154,9 @@ fn hosted_web_search_is_withheld_in_readonly_and_planwrite_modes() {
     let mut allow = cfg(Some(true));
     allow.default_permission_mode = Some("readonly".into());
     allow.permission = Some(json!({"web_search": "allow"}));
-    assert!(declares_hosted_web_search(hosted_with(allow, &cli()).as_ref()));
+    assert!(declares_hosted_web_search(
+        hosted_with(allow, &cli()).as_ref()
+    ));
 }
 
 #[test]
@@ -162,5 +169,71 @@ fn hosted_web_search_stays_available_under_allow_ask_and_standard_modes() {
     }
     let mut guarded = cfg(Some(true));
     guarded.default_permission_mode = Some("guarded".into());
-    assert!(declares_hosted_web_search(hosted_with(guarded, &plain).as_ref()));
+    assert!(declares_hosted_web_search(
+        hosted_with(guarded, &plain).as_ref()
+    ));
+}
+
+fn tool_for(provider: &str, cfg: Config) -> Option<serde_json::Value> {
+    with_hosted_web_search(&model(provider, "responses"), &cli(), &cfg, None)
+        .map(|body| body["tools"][0].clone())
+}
+
+#[test]
+fn hosted_web_search_defaults_are_unchanged() {
+    assert_eq!(
+        tool_for("anthropic", cfg(Some(true))).unwrap(),
+        json!({"type":"web_search_20250305","name":"web_search","max_uses":5})
+    );
+    assert_eq!(
+        tool_for("openai", cfg(Some(true))).unwrap(),
+        json!({"type":"web_search"})
+    );
+}
+
+#[test]
+fn hosted_web_search_maps_domain_filters_and_max_uses() {
+    let mut allow = cfg(Some(true));
+    allow.hosted_web_search_allowed_domains =
+        Some(vec!["https://Docs.RS/".into(), "a.example".into()]);
+    allow.hosted_web_search_max_uses = Some(2);
+    assert_eq!(
+        tool_for("anthropic", allow.clone()).unwrap(),
+        json!({"type":"web_search_20250305","name":"web_search","max_uses":2,
+               "allowed_domains":["docs.rs","a.example"]})
+    );
+    assert_eq!(
+        tool_for("openai", allow).unwrap(),
+        json!({"type":"web_search","filters":{"allowed_domains":["docs.rs","a.example"]}})
+    );
+    let mut block = cfg(Some(true));
+    block.hosted_web_search_blocked_domains = Some(vec!["bad.example".into()]);
+    assert_eq!(
+        tool_for("anthropic", block).unwrap()["blocked_domains"],
+        json!(["bad.example"])
+    );
+}
+
+#[test]
+fn hosted_web_search_fails_closed_on_unenforceable_or_invalid_filters() {
+    // OpenAI has no block filter: withheld rather than unfiltered.
+    let mut block = cfg(Some(true));
+    block.hosted_web_search_blocked_domains = Some(vec!["bad.example".into()]);
+    assert_eq!(tool_for("openai", block), None);
+    let mut both = cfg(Some(true));
+    both.hosted_web_search_allowed_domains = Some(vec!["a.example".into()]);
+    both.hosted_web_search_blocked_domains = Some(vec!["b.example".into()]);
+    assert_eq!(tool_for("anthropic", both), None);
+    let mut bad = cfg(Some(true));
+    bad.hosted_web_search_allowed_domains = Some(vec!["not a domain".into()]);
+    assert_eq!(tool_for("anthropic", bad), None);
+    for uses in [0, 51] {
+        let mut c = cfg(Some(true));
+        c.hosted_web_search_max_uses = Some(uses);
+        assert_eq!(tool_for("anthropic", c), None);
+    }
+    // Filters never open the capability on their own.
+    let mut closed = cfg(None);
+    closed.hosted_web_search_allowed_domains = Some(vec!["a.example".into()]);
+    assert_eq!(tool_for("anthropic", closed), None);
 }

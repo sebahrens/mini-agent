@@ -604,6 +604,31 @@ pub struct Config {
         alias = "hosted_web_search"
     )]
     pub hosted_web_search: Option<bool>,
+    /// Domain allow-list for provider-hosted web search (Anthropic
+    /// `allowed_domains`, OpenAI Responses `filters.allowed_domains`). At most
+    /// 20 bare domains; not combinable with the block-list.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "hosted-web-search-allowed-domains",
+        alias = "hosted_web_search_allowed_domains"
+    )]
+    pub hosted_web_search_allowed_domains: Option<Vec<String>>,
+    /// Domain block-list for provider-hosted web search (Anthropic only; the
+    /// OpenAI Responses tool has no block filter, so hosted search is withheld
+    /// there rather than run unfiltered).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "hosted-web-search-blocked-domains",
+        alias = "hosted_web_search_blocked_domains"
+    )]
+    pub hosted_web_search_blocked_domains: Option<Vec<String>>,
+    /// Anthropic hosted-search `max_uses` per request (1..=50, default 5).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "hosted-web-search-max-uses",
+        alias = "hosted_web_search_max_uses"
+    )]
+    pub hosted_web_search_max_uses: Option<u32>,
     /// Total `web_fetch` deadline in seconds (DNS, approval, redirects and
     /// body). Default 30; clamped to 1..=300.
     #[serde(

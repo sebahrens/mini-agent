@@ -467,17 +467,93 @@ pub(crate) fn merge_extra_body(
     }
 }
 
+/// Default Anthropic hosted-search `max_uses`.
+const DEFAULT_HOSTED_SEARCH_MAX_USES: u32 = 5;
+/// Upper bound accepted for `hosted-web-search-max-uses`.
+const MAX_HOSTED_SEARCH_MAX_USES: u32 = 50;
+
+/// Validated hosted-search domain filters and use cap.
+struct HostedSearchOptions {
+    allowed: Vec<String>,
+    blocked: Vec<String>,
+    max_uses: u32,
+}
+
+fn hosted_search_options(cfg: &Config) -> Result<HostedSearchOptions, String> {
+    use crate::agent::tools::web_search::normalized_domains;
+    let allowed = normalized_domains(
+        "hosted-web-search-allowed-domains",
+        cfg.hosted_web_search_allowed_domains.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+    let blocked = normalized_domains(
+        "hosted-web-search-blocked-domains",
+        cfg.hosted_web_search_blocked_domains.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+    if !allowed.is_empty() && !blocked.is_empty() {
+        return Err("hosted web search accepts allowed or blocked domains, not both".into());
+    }
+    let max_uses = cfg
+        .hosted_web_search_max_uses
+        .unwrap_or(DEFAULT_HOSTED_SEARCH_MAX_USES);
+    if !(1..=MAX_HOSTED_SEARCH_MAX_USES).contains(&max_uses) {
+        return Err(format!(
+            "hosted-web-search-max-uses must be between 1 and {MAX_HOSTED_SEARCH_MAX_USES}"
+        ));
+    }
+    Ok(HostedSearchOptions {
+        allowed,
+        blocked,
+        max_uses,
+    })
+}
+
 /// Hosted web-search tool definition for providers that run search
-/// server-side, or `None` where the provider has no supported bridge.
-fn hosted_web_search_tool(model: &AnyModel) -> Option<serde_json::Value> {
+/// server-side, or `None` where the provider has no supported bridge. Invalid
+/// filter configuration, or a block-list on a provider that cannot express one,
+/// withholds the tool (fail closed) with a warning rather than searching
+/// unfiltered.
+fn hosted_web_search_tool(model: &AnyModel, cfg: &Config) -> Option<serde_json::Value> {
+    if !matches!(
+        model,
+        AnyModel::Anthropic(_) | AnyModel::OpenAI(OpenAiModel::Responses(_))
+    ) {
+        return None;
+    }
+    let options = match hosted_search_options(cfg) {
+        Ok(options) => options,
+        Err(error) => {
+            tracing::warn!("hosted web search withheld: {error}");
+            return None;
+        }
+    };
     match model {
-        AnyModel::Anthropic(_) => Some(serde_json::json!({
-            "type": "web_search_20250305",
-            "name": "web_search",
-            "max_uses": 5
-        })),
+        AnyModel::Anthropic(_) => {
+            let mut tool = serde_json::json!({
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": options.max_uses
+            });
+            if !options.allowed.is_empty() {
+                tool["allowed_domains"] = options.allowed.into();
+            } else if !options.blocked.is_empty() {
+                tool["blocked_domains"] = options.blocked.into();
+            }
+            Some(tool)
+        }
         AnyModel::OpenAI(OpenAiModel::Responses(_)) => {
-            Some(serde_json::json!({"type": "web_search"}))
+            if !options.blocked.is_empty() {
+                tracing::warn!(
+                    "hosted web search withheld: OpenAI Responses web_search has no blocked-domain filter"
+                );
+                return None;
+            }
+            let mut tool = serde_json::json!({"type": "web_search"});
+            if !options.allowed.is_empty() {
+                tool["filters"] = serde_json::json!({"allowed_domains": options.allowed});
+            }
+            Some(tool)
         }
         _ => None,
     }
@@ -581,7 +657,7 @@ pub(crate) fn with_hosted_web_search(
     {
         return extra_body;
     }
-    let Some(tool) = hosted_web_search_tool(model) else {
+    let Some(tool) = hosted_web_search_tool(model, cfg) else {
         return extra_body;
     };
     let mut body = match extra_body {
