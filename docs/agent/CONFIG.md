@@ -1137,6 +1137,10 @@ require_permission_checks = true                      # refuse --dangerously-ski
 
 [sandbox]
 required = true                                       # force sandbox on; refuses --no-sandbox, sandbox = false
+max_profile = "workspace"                             # ceiling: workspace | host-read | host-full
+max_network = "allowlist"                             # ceiling: deny | allowlist | allow
+allowed_hosts = ["registry.npmjs.org", "*.github.com"] # pin sandbox-network-hosts; absent = no pin
+forbid_home_mounts = true                             # ignore sandbox-home-mounts
 
 [mcp]
 disabled = false                                      # true refuses every MCP server
@@ -1156,8 +1160,14 @@ directive is ignored; Shift+Tab skips disallowed modes; the permission checker a
 change to the nearest permitted one. MCP servers outside the policy are dropped from the merged
 configuration (with a warning) and refused at connect time, including servers from `.mcp.json`. A
 provider outside the policy is refused wherever it is resolved. `/doctor` (`--doctor`) shows the
-`managed policy` path and a values-free summary of what it enforces. Managed hooks keep their own
-`managed-settings.json` (see Hooks).
+`managed policy` path and a values-free summary of what it enforces. Sandbox pins only matter while the sandbox
+is on, so combine them with `required = true`. `max_profile` refuses `--sandbox-profile` above the
+ceiling and lowers a configured `sandbox-profile`; `max_network` lowers `sandbox-network`;
+`allowed_hosts` drops `sandbox-network-hosts` entries that are not covered by a pinned entry (a
+pinned `*.github.com` covers `api.github.com`, an entry's port must fit the pinned one) and turns
+off run-time approval of unlisted hosts, so pinned hosts are the only ones a user can list;
+`forbid_home_mounts` clears `sandbox-home-mounts`. Each lowering adds a load warning naming the file.
+Managed hooks keep their own `managed-settings.json` (see Hooks).
 
 ## Hooks
 

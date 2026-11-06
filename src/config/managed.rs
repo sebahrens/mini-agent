@@ -15,6 +15,10 @@
 //!
 //! [sandbox]
 //! required = true                                       # force the sandbox on
+//! max_profile = "workspace"                             # ceiling: workspace | host-read | host-full
+//! max_network = "allowlist"                             # ceiling: deny | allowlist | allow
+//! allowed_hosts = ["registry.npmjs.org"]                # pin sandbox-network-hosts; no run-time approvals
+//! forbid_home_mounts = true                             # ignore sandbox-home-mounts
 //!
 //! [mcp]
 //! disabled = false
@@ -54,6 +58,15 @@ struct PermissionsPolicy {
 #[serde(deny_unknown_fields, default)]
 struct SandboxPolicy {
     required: bool,
+    /// Widest filesystem profile a user may select.
+    max_profile: Option<crate::sandbox::SandboxProfile>,
+    /// Widest network reach a user may select (`deny` < `allowlist` < `allow`).
+    max_network: Option<crate::sandbox::SandboxNetwork>,
+    /// Host pin: user `sandbox-network-hosts` entries must fall inside it and
+    /// unlisted hosts are never offered for approval. Absent = no pin.
+    allowed_hosts: Option<Vec<String>>,
+    /// Drop every `sandbox-home-mounts` entry.
+    forbid_home_mounts: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -225,10 +238,15 @@ impl ManagedPolicy {
             ("mcp.allowed_servers", file.mcp.allowed_servers.as_ref()),
             ("providers.allowed", file.providers.allowed.as_ref()),
             ("providers.denied", Some(&file.providers.denied)),
+            ("sandbox.allowed_hosts", file.sandbox.allowed_hosts.as_ref()),
         ] {
             if let Some(list) = list {
                 bounded_list(what, list).map_err(|e| format!("managed policy {shown}: {e}"))?;
             }
+        }
+        if let Some(hosts) = &file.sandbox.allowed_hosts {
+            crate::sandbox::net_proxy::parse_rules(hosts)
+                .map_err(|e| format!("managed policy {shown}: sandbox.allowed_hosts: {e}"))?;
         }
         let mut allowed: Vec<SecurityMode> = match &permissions.allowed_modes {
             None => SecurityMode::all().collect(),
@@ -324,6 +342,38 @@ impl ManagedPolicy {
     /// True when `--dangerously-skip-permissions` must be refused: either the
     /// file says so, or it sets deny rules or mode limits, which only a live
     /// permission checker can enforce (skipping checks would void them).
+    /// Refusal when `--sandbox-profile` asks for more than `max_profile`.
+    pub(crate) fn profile_violation(
+        &self,
+        profile: crate::sandbox::SandboxProfile,
+    ) -> Option<String> {
+        let max = self.file.sandbox.max_profile?;
+        (profile.rank() > max.rank()).then(|| {
+            self.refusal(&format!(
+                "sandbox profile `{profile}` (widest permitted: {max})"
+            ))
+        })
+    }
+
+    /// True when `sandbox.allowed_hosts` pins the network host list.
+    pub(crate) fn network_hosts_pinned(&self) -> bool {
+        self.file.sandbox.allowed_hosts.is_some()
+    }
+
+    /// Whether a user host entry stays inside the managed `allowed_hosts` pin.
+    fn host_entry_allowed(&self, entry: &str) -> bool {
+        let Some(pinned) = &self.file.sandbox.allowed_hosts else {
+            return true;
+        };
+        let Ok(rule) = crate::sandbox::net_proxy::HostRule::parse(entry) else {
+            return false;
+        };
+        pinned.iter().any(|pin| {
+            crate::sandbox::net_proxy::HostRule::parse(pin)
+                .is_ok_and(|pin| rule.covered_by(&pin))
+        })
+    }
+
     pub(crate) fn permission_checks_required(&self) -> bool {
         let permissions = &self.file.permissions;
         permissions.require_permission_checks
@@ -375,6 +425,28 @@ impl ManagedPolicy {
         }
     }
 
+    fn sandbox_pins_summary(&self) -> String {
+        let sandbox = &self.file.sandbox;
+        let mut pins = Vec::new();
+        if let Some(profile) = sandbox.max_profile {
+            pins.push(format!("max profile {profile}"));
+        }
+        if let Some(network) = sandbox.max_network {
+            pins.push(format!("max network {network}"));
+        }
+        if let Some(hosts) = &sandbox.allowed_hosts {
+            pins.push(format!("{} allowed host(s)", hosts.len()));
+        }
+        if sandbox.forbid_home_mounts {
+            pins.push("no home mounts".to_string());
+        }
+        if pins.is_empty() {
+            "none".to_string()
+        } else {
+            pins.join(", ")
+        }
+    }
+
     /// One-line summary for `/doctor`; patterns and names are omitted.
     pub(crate) fn summary(&self) -> String {
         let deny: usize = self
@@ -385,7 +457,7 @@ impl ManagedPolicy {
             .map(|p| p.len().max(1))
             .sum();
         format!(
-            "modes: {}; deny rules: {deny}; sandbox required: {}; permission checks required: {}; mcp: {}; providers: {}",
+            "modes: {}; deny rules: {deny}; sandbox required: {}; permission checks required: {}; sandbox pins: {}; mcp: {}; providers: {}",
             self.allowed_modes
                 .iter()
                 .map(|mode| mode.as_str())
@@ -393,6 +465,7 @@ impl ManagedPolicy {
                 .join(","),
             self.file.sandbox.required,
             self.permission_checks_required(),
+            self.sandbox_pins_summary(),
             if self.file.mcp.disabled {
                 "disabled".to_string()
             } else if self.file.mcp.allowed_servers.is_some() {
@@ -406,6 +479,45 @@ impl ManagedPolicy {
                 "unrestricted"
             },
         )
+    }
+
+    /// Clamp the sandbox settings of `cfg` to the managed pins, warning for
+    /// each value that was lowered or dropped.
+    fn apply_sandbox_pins(&self, cfg: &mut super::Config) {
+        let sandbox = &self.file.sandbox;
+        let file = self.path.display();
+        if let Some(max) = sandbox.max_profile
+            && cfg.sandbox_profile.is_some_and(|p| p.rank() > max.rank())
+        {
+            cfg.sandbox_profile = Some(max);
+            cfg.load_warnings.push(format!(
+                "sandbox-profile was lowered to `{max}` by the managed policy {file}"
+            ));
+        }
+        if let Some(max) = sandbox.max_network
+            && cfg.sandbox_network.is_some_and(|n| n.rank() > max.rank())
+        {
+            cfg.sandbox_network = Some(max);
+            cfg.load_warnings.push(format!(
+                "sandbox-network was lowered to `{max}` by the managed policy {file}"
+            ));
+        }
+        if sandbox.allowed_hosts.is_some() {
+            let before = cfg.sandbox_network_hosts.len();
+            cfg.sandbox_network_hosts
+                .retain(|entry| self.host_entry_allowed(entry));
+            if cfg.sandbox_network_hosts.len() != before {
+                cfg.load_warnings.push(format!(
+                    "sandbox-network-hosts entries outside the managed allowed_hosts were removed by the managed policy {file}"
+                ));
+            }
+        }
+        if sandbox.forbid_home_mounts && !cfg.sandbox_home_mounts.is_empty() {
+            cfg.sandbox_home_mounts.clear();
+            cfg.load_warnings.push(format!(
+                "sandbox-home-mounts was cleared by the managed policy {file}"
+            ));
+        }
     }
 
     /// Merge the policy into `cfg` after every other layer: the result is what
@@ -424,6 +536,7 @@ impl ManagedPolicy {
             cfg.sandbox = Some(true);
             cfg.sandbox_required = Some(true);
         }
+        self.apply_sandbox_pins(cfg);
         if self.permission_checks_required() {
             cfg.permission_checks_required = Some(true);
         }
@@ -699,6 +812,67 @@ mod tests {
         let mut applied: super::super::Config = toml::from_str("").unwrap();
         policy("[permissions]\ndisable_yolo = true\n").apply(&mut applied);
         assert_eq!(applied.permission_checks_required, Some(true));
+    }
+
+    #[test]
+    fn sandbox_pins_refuse_flags_and_clamp_every_config_layer() {
+        let policy = policy(
+            "[sandbox]\nrequired = true\nmax_profile = \"workspace\"\nmax_network = \"allowlist\"\nallowed_hosts = [\"registry.npmjs.org\", \"*.github.com\"]\nforbid_home_mounts = true\n",
+        );
+        let cfg: super::super::Config = toml::from_str("").unwrap();
+        let error = authority(&policy, &["--sandbox-profile", "host-full"], &cfg).unwrap_err();
+        assert!(error.contains("managed-config.toml") && error.contains("host-full"), "{error}");
+        assert!(authority(&policy, &["--sandbox-profile", "workspace"], &cfg).is_ok());
+        assert!(authority(&policy, &[], &cfg).is_ok());
+
+        // User/project config that widens everything is clamped by apply().
+        let mut cfg: super::super::Config = toml::from_str(
+            "sandbox_profile = \"host-full\"\nsandbox_network = \"allow\"\nsandbox_home_mounts = [\".aws:rw\"]\nsandbox_network_hosts = [\"registry.npmjs.org\", \"evil.example.com\", \"*.github.com\", \"api.github.com\", \"npmjs.org\", \"registry.npmjs.org:8080\", \"*.org\"]\n",
+        )
+        .unwrap();
+        policy.apply(&mut cfg);
+        assert_eq!(cfg.sandbox_profile, Some(crate::sandbox::SandboxProfile::Workspace));
+        assert_eq!(cfg.sandbox_network, Some(crate::sandbox::SandboxNetwork::Allowlist));
+        assert!(cfg.sandbox_home_mounts.is_empty());
+        assert_eq!(
+            cfg.sandbox_network_hosts,
+            ["registry.npmjs.org", "*.github.com", "api.github.com"]
+        );
+        assert!(cfg.load_warnings.iter().all(|w| w.contains("managed-config.toml")));
+        assert_eq!(cfg.load_warnings.len(), 4);
+        assert!(policy.network_hosts_pinned());
+        let summary = policy.summary();
+        assert!(
+            summary.contains("max profile workspace") && summary.contains("max network allowlist")
+                && summary.contains("2 allowed host(s)") && summary.contains("no home mounts"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn sandbox_pins_are_validated_and_absent_pins_change_nothing() {
+        for bad in [
+            "[sandbox]\nmax_profile = \"root\"\n",
+            "[sandbox]\nmax_network = \"open\"\n",
+        ] {
+            assert!(toml::from_str::<ManagedFile>(bad).is_err(), "{bad}");
+        }
+        let invalid_host = ManagedPolicy::from_file(
+            PathBuf::from("/m.toml"),
+            toml::from_str("[sandbox]\nallowed_hosts = [\"https://x.example\"]\n").unwrap(),
+        );
+        assert!(invalid_host.is_err());
+        let open = policy("[sandbox]\nrequired = true\n");
+        let mut cfg: super::super::Config = toml::from_str(
+            "sandbox_profile = \"host-full\"\nsandbox_network = \"allow\"\nsandbox_home_mounts = [\".aws:rw\"]\nsandbox_network_hosts = [\"x.example.com\"]\n",
+        )
+        .unwrap();
+        open.apply(&mut cfg);
+        assert_eq!(cfg.sandbox_profile, Some(crate::sandbox::SandboxProfile::HostFull));
+        assert_eq!(cfg.sandbox_home_mounts.len(), 1);
+        assert_eq!(cfg.sandbox_network_hosts.len(), 1);
+        assert!(!open.network_hosts_pinned());
+        assert!(open.summary().contains("sandbox pins: none"));
     }
 
     #[test]

@@ -294,6 +294,15 @@ pub enum SandboxProfile {
 }
 
 impl SandboxProfile {
+    /// Breadth of host access, so a ceiling can compare profiles.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Workspace => 0,
+            Self::HostRead => 1,
+            Self::HostFull => 2,
+        }
+    }
+
     pub const NAMES: &'static [&'static str] = &["workspace", "host-read", "host-full"];
 
     pub fn name(self) -> &'static str {
@@ -348,6 +357,15 @@ impl SandboxNetwork {
 
     pub fn is_allowlist(self) -> bool {
         self == Self::Allowlist
+    }
+
+    /// Breadth of network reach, so a ceiling can compare modes.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Deny => 0,
+            Self::Allowlist => 1,
+            Self::Allow => 2,
+        }
     }
 }
 
@@ -2494,6 +2512,10 @@ impl Sandbox {
     /// Route the allowlist proxy's "allow this host?" questions to the user.
     /// Without a sender every unlisted host is refused.
     pub fn set_network_prompt(&self, sender: Option<crate::permission::ask::AskSender>) {
+        // A managed host pin leaves no room for run-time approvals.
+        let sender = sender.filter(|_| {
+            !crate::config::managed::active().is_some_and(|policy| policy.network_hosts_pinned())
+        });
         *self
             .network_prompt
             .lock()

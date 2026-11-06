@@ -23,6 +23,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Managed policy `[sandbox]` gains `max_profile`, `max_network`, `allowed_hosts` and `forbid_home_mounts`: user, project
+  and CLI settings can no longer widen the sandbox beyond them; `--sandbox-profile` above the ceiling is refused
+  and `/doctor` lists the pins (mini-agent-hjg3d).
 - Built-in language servers for Java (`jdtls`), C# (`csharp-ls`), Ruby (`ruby-lsp`), PHP (`intelephense`), Kotlin
   (`kotlin-language-server`), Swift (`sourcekit-lsp`) and Zig (`zls`), used only when on PATH (mini-agent-f8tdh).
 - `job_status action=wait` takes `until=<regex>` and returns as soon as new output matches, reporting the

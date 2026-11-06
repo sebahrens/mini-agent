@@ -275,6 +275,11 @@ pub(crate) fn resolve_execution_authority_under(
                 },
             )));
         }
+        if cli.sandbox_profile.is_some()
+            && let Some(message) = policy.profile_violation(cli.resolve_sandbox_profile(cfg))
+        {
+            return Err(ExecutionAuthorityError::ManagedPolicy(message));
+        }
         let (provider, _) = cli.resolve_provider_and_model(cfg);
         policy
             .check_provider(&provider)

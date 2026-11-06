@@ -94,6 +94,28 @@ impl HostRule {
         })
     }
 
+    /// Whether every destination this rule can match is also matched by
+    /// `pinned`, so a managed host list can vet a user-supplied entry.
+    pub fn covered_by(&self, pinned: &HostRule) -> bool {
+        let ports_ok = match (pinned.port, self.port) {
+            (Some(expected), Some(port)) => expected == port,
+            (Some(_), None) => false,
+            (None, None) => true,
+            (None, Some(port)) => DEFAULT_PORTS.contains(&port),
+        };
+        let under = |child: &str, parent: &str| {
+            child.len() > parent.len() + 1
+                && child.ends_with(parent)
+                && child.as_bytes()[child.len() - parent.len() - 1] == b'.'
+        };
+        let host_ok = if pinned.subdomains_only {
+            under(&self.host, &pinned.host) || (self.subdomains_only && self.host == pinned.host)
+        } else {
+            !self.subdomains_only && self.host == pinned.host
+        };
+        ports_ok && host_ok
+    }
+
     fn matches(&self, host: &str, port: u16) -> bool {
         let port_ok = match self.port {
             Some(expected) => expected == port,
