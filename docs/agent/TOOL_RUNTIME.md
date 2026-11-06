@@ -54,6 +54,15 @@ retain their existing limits. A shell call with
 `background = true` instead returns a session-scoped job id immediately and
 uses a 24-hour maximum (again lowerable with `timeout`).
 
+On Unix a shell command's stdout and stderr share one pipe by default (like
+`2>&1`), so the result shows lines in their exact write order without stream
+labels. `separate_streams = true` captures two pipes instead and labels each run
+of one stream `[stdout]`/`[stderr]` in arrival order; ordering between the two
+pipes is then only approximate. Windows always uses two labelled pipes. The
+native `/pr` flow requests separate streams so the PR URL comes from stdout
+alone. Background jobs follow the same choice, and `pty = true` output is
+always one unlabelled terminal stream.
+
 Foreground shell output is not a reason to stop a command. The capture keeps an
 arrival-ordered 768 KiB head and 256 KiB rolling tail in memory and lets the
 child run to completion, so the result carries its real exit status. Dropped

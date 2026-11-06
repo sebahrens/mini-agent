@@ -842,7 +842,8 @@ async fn call_shell(
         ask_tx: _ask_tx,
         observations: None,
     };
-    let args = serde_json::json!({"command":command,"background":false,"timeout":null});
+    // gh writes progress to stderr; the PR URL must come from stdout alone.
+    let args = serde_json::json!({"command":command,"background":false,"timeout":null,"separate_streams":true});
     emit_call("shell", args.clone(), events, None, async {
         let (actual, displayed) = tool.call(&args).await?;
         let url = actual

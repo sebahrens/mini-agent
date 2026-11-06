@@ -960,6 +960,29 @@ enum CommandStdio {
     /// One pseudo-terminal for stdin, stdout and stderr.
     #[cfg(unix)]
     Pty(pty::PtyPair),
+    /// One pipe for both stdout and stderr (`2>&1`), so the capture sees
+    /// output in exact write order.
+    #[cfg(unix)]
+    MergedPipe(MergedPipe),
+}
+
+/// Reader and the writer descriptor shared by the child's stdout and stderr.
+#[cfg(unix)]
+#[derive(Debug)]
+struct MergedPipe {
+    reader: tokio::net::unix::pipe::Receiver,
+    writer: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl MergedPipe {
+    fn open() -> std::io::Result<Self> {
+        let (sender, reader) = tokio::net::unix::pipe::pipe()?;
+        Ok(Self {
+            reader,
+            writer: sender.into_blocking_fd()?,
+        })
+    }
 }
 
 /// Bytes of recent output a [`CommandProgress`] keeps for display.
@@ -4557,7 +4580,7 @@ impl Sandbox {
         command: String,
         timeout: std::time::Duration,
     ) -> std::io::Result<String> {
-        self.start_background_command_logged(command, timeout, None, false)
+        self.start_background_command_logged(command, timeout, None, false, false)
             .await
     }
 
@@ -4569,6 +4592,7 @@ impl Sandbox {
         timeout: std::time::Duration,
         log_dir: Option<&Path>,
         pty: bool,
+        separate_streams: bool,
     ) -> std::io::Result<String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             std::io::Error::other("background commands require an active Tokio runtime")
@@ -4577,7 +4601,7 @@ impl Sandbox {
             .background_jobs
             .next_sequence
             .fetch_add(1, Ordering::Relaxed);
-        let stdio = command_stdio(pty)?;
+        let stdio = shell_command_stdio(pty, separate_streams)?;
         let input = background_input(&stdio);
         let id = format!("job-{}", uuid::Uuid::new_v4());
         let cancellation = CommandCancellation::new();
@@ -4964,8 +4988,9 @@ impl Sandbox {
         progress: Option<CommandProgress>,
         capture: &ShellOutputCapture,
         pty: bool,
+        separate_streams: bool,
     ) -> std::io::Result<CommandOutput> {
-        let stdio = command_stdio(pty)?;
+        let stdio = shell_command_stdio(pty, separate_streams)?;
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
         let pending = PendingCommand::Shell {
@@ -5321,6 +5346,28 @@ impl Sandbox {
             cmd.stdin(Stdio::null());
         }
         #[cfg(unix)]
+        if let CommandStdio::MergedPipe(pipe) = &stdio {
+            match (pipe.writer.try_clone(), pipe.writer.try_clone()) {
+                (Ok(stdout), Ok(stderr)) => {
+                    cmd.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    settle_early(
+                        CommandOutput {
+                            exit_status: None,
+                            stdout: Vec::new(),
+                            stderr: format!("failed to prepare merged output pipe: {error}")
+                                .into_bytes(),
+                            status: CommandStatus::Failed,
+                            descendants_escaped: false,
+                        },
+                        response_tx,
+                    );
+                    return;
+                }
+            }
+        }
+        #[cfg(unix)]
         if let CommandStdio::Pty(pair) = &stdio {
             match pair.child_stdio() {
                 Ok([stdin, stdout, stderr]) => {
@@ -5396,6 +5443,21 @@ impl Sandbox {
                     .stderr(Stdio::null());
                 spawn_bounded_pipe_reader(
                     Some(pair.into_reader()),
+                    CommandOutputStream::Merged,
+                    captured.clone(),
+                    limits,
+                    reader_error_tx.clone(),
+                    progress.clone(),
+                )
+            }
+            #[cfg(unix)]
+            CommandStdio::MergedPipe(MergedPipe { reader, writer }) => {
+                // Only the child (and its descendants) may hold the write
+                // end, so end of output means the whole tree closed it.
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                drop(writer);
+                spawn_bounded_pipe_reader(
+                    Some(reader),
                     CommandOutputStream::Merged,
                     captured.clone(),
                     limits,
@@ -5891,6 +5953,22 @@ type BackgroundJobInput = pty::PtyInput;
 #[cfg(not(unix))]
 type BackgroundJobInput = std::convert::Infallible;
 
+/// Stdio for a model-authored shell command: a pty, separate pipes, or (the
+/// Unix default) one merged pipe that keeps stdout/stderr write order.
+fn shell_command_stdio(pty: bool, separate_streams: bool) -> std::io::Result<CommandStdio> {
+    if pty || separate_streams {
+        return command_stdio(pty);
+    }
+    #[cfg(unix)]
+    {
+        MergedPipe::open().map(CommandStdio::MergedPipe)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(CommandStdio::Pipes)
+    }
+}
+
 fn command_stdio(pty: bool) -> std::io::Result<CommandStdio> {
     if !pty {
         return Ok(CommandStdio::Pipes);
@@ -5911,6 +5989,8 @@ fn command_stdio(pty: bool) -> std::io::Result<CommandStdio> {
 fn background_input(stdio: &CommandStdio) -> Option<BackgroundJobInput> {
     match stdio {
         CommandStdio::Pipes => None,
+        #[cfg(unix)]
+        CommandStdio::MergedPipe(_) => None,
         #[cfg(unix)]
         CommandStdio::Pty(pair) => Some(pair.input()),
     }

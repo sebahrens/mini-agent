@@ -136,7 +136,7 @@ async fn output_with_progress(
     command: &str,
     limits: CommandLimits,
     capture: &ShellOutputCapture,
-    pty: bool,
+    (pty, separate_streams): (bool, bool),
     id: CompactString,
     events: tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
 ) -> std::io::Result<CommandOutput> {
@@ -148,6 +148,7 @@ async fn output_with_progress(
         Some(progress.clone()),
         capture,
         pty,
+        separate_streams,
     );
     tokio::pin!(command_run);
     let mut last_sent: Option<tokio::time::Instant> = None;
@@ -297,6 +298,10 @@ impl Tool for ShellTool {
                     "type": "boolean",
                     "description": "Start a session-scoped background job and return its id (default false)"
                 },
+                "separate_streams": {
+                    "type": "boolean",
+                    "description": "Capture stdout and stderr in separate pipes, labelled [stdout]/[stderr] in arrival order (interleaving across the two is approximate). Default false: on Unix both share one pipe, like 2>&1, so lines keep their exact write order and are unlabelled."
+                },
                 "pty": {
                     "type": "boolean",
                     "description": "Run under a pseudo-terminal so isatty() is true and stdin/stdout/stderr are one 120x40 TTY (Unix only; default false). With background=true, job_status action=input types into it, e.g. for REPLs or prompts."
@@ -380,6 +385,7 @@ impl ShellTool {
                     timeout,
                     self.output_log_dir.as_deref(),
                     args.pty,
+                    args.separate_streams,
                 )
                 .await?;
             let log = self
@@ -428,7 +434,7 @@ impl ShellTool {
                     &args.command,
                     limits,
                     &capture,
-                    args.pty,
+                    (args.pty, args.separate_streams),
                     id,
                     events,
                 )
@@ -436,7 +442,14 @@ impl ShellTool {
             }
             None => {
                 self.sandbox
-                    .output_shell_command_captured(&args.command, limits, None, &capture, args.pty)
+                    .output_shell_command_captured(
+                        &args.command,
+                        limits,
+                        None,
+                        &capture,
+                        args.pty,
+                        args.separate_streams,
+                    )
                     .await?
             }
         };
@@ -1621,14 +1634,21 @@ mod tests {
         let output = test_tool()
             .call(BashArgs {
                 command: "printf stdout; printf stderr >&2; exit 7".to_string(),
-                timeout: None,
-                background: false,
+                separate_streams: true,
                 ..Default::default()
             })
             .await
             .unwrap();
 
         assert_eq!(output, "[stdout]\nstdout\n[stderr]\nstderr\nExit code: 7");
+        let merged = test_tool()
+            .call(BashArgs {
+                command: "printf stdout; printf stderr >&2; exit 7".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(merged, "stdoutstderr\nExit code: 7");
     }
 
     #[cfg(unix)]
@@ -1852,6 +1872,7 @@ mod tests {
                 timeout: Some(20_000),
                 background: true,
                 pty: true,
+                ..Default::default()
             })
             .await
             .unwrap();

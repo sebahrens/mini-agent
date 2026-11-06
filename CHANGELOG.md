@@ -31,6 +31,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   a 768 KiB head and 256 KiB tail, the command runs to completion with its real exit status, and
   the complete output is spooled to a private log in the session tool-output directory that the
   result names for `read`/`grep`. Only a 64 MiB total stops the command (mini-agent-ghs4t).
+- On Unix, `shell` commands and background jobs capture stdout and stderr through one shared pipe,
+  so results keep exact write order and are no longer split into `[stdout]` then `[stderr]` blocks;
+  `separate_streams = true` restores labelled separate capture (mini-agent-c1d8q).
 - Background jobs tee their complete output to a private `shell-<job id>.log` in the session
   tool-output directory, and `job_status` poll/wait/stop return only output not returned before
   (64 KiB per call) with a `since` offset for re-reading any range. Pruned job records keep their

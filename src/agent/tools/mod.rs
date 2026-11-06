@@ -726,6 +726,9 @@ pub struct BashArgs {
     /// Run under a pseudo-terminal (Unix): stdin/stdout/stderr are one TTY.
     #[serde(default)]
     pub pty: bool,
+    /// Capture stdout and stderr separately instead of one merged stream.
+    #[serde(default)]
+    pub separate_streams: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
