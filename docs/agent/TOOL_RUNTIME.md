@@ -66,10 +66,47 @@ call is interrupted before either happens, the job is stopped. At most
 table is full an explicit `background = true` call fails naming the key, while
 an `auto_background` call simply runs as an ordinary foreground command.
 
-`job_status action=input` refuses C0 control bytes other than tab, LF and CR
-(Ctrl-U, backspace, ESC, DEL, ...) and judges each chunk together with the
-unterminated line typed so far, so permission rules see the command the
-terminal will run.
+`shell` takes an optional `workdir` (workspace-relative, or absolute inside the
+workspace). It is resolved with symlinks and `..` followed and must be an
+existing directory inside the canonical workspace root; anything else is
+refused, so a link or `..` cannot leave the workspace. It applies to foreground,
+background and pty commands. Every call is still a fresh shell: `cd` does not
+persist between calls. The permission key is the script with the directory
+change (`cd -- '<dir>' || exit 1; <command>`), so allow rules and approvals are
+per directory, while a deny rule on the bare command still applies.
+
+`pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
+no ConPTY path, so on Windows the tool schemas omit them and the model is never
+offered a pseudo-terminal; a call that still sends `pty = true` is refused with
+a message saying so.
+
+`pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
+no ConPTY path, so on Windows the tool schemas omit them and the model is never
+offered a pseudo-terminal; a call that still sends `pty = true` is refused with
+a message saying so.
+
+`job_status action=input` refuses C0 control bytes other than LF and CR (Tab,
+Ctrl-U, backspace, ESC, DEL, ...) and shell history expansion (`!` followed by
+text, a line starting with `^`), because an interactive bash or zsh rewrites
+the line (completion, history) before running it. It judges each chunk together
+with the unterminated line typed so far, so permission rules see the command
+the terminal will run. Named keys go through the separate `keys` list
+(`ctrl_c`, `ctrl_d`, `esc`, `up`, `down`, `left`, `right`, `tab`, `enter`,
+`backspace`), whose bytes the tool renders: `ctrl_c`/`ctrl_d` carry no text and
+need no permission; `enter` judges the line typed so far; cursor, history and
+`esc` keys make the next Enter judged as an opaque "edited line" command (so an
+ask or deny rule can stop it; `ctrl_c` clears the line); `tab` on a partly typed
+line is refused.
+
+When a background job ends on its own (not stopped by the model or user, and not
+already read to its terminal state with `job_status`), one bounded notice (job
+id, command, status, exit code, last 20 lines or 2 KiB of output as fenced
+untrusted text, log path; nothing grants permission) is queued. It is appended
+once to the next `shell` or `job_status` result, injected as context into the
+next model request, and in the TUI an idle session is woken with a short prompt
+naming only the job id, status, exit code and log path (at most 8 wakes in a row
+without a user turn). ACP and headless runs get the injection on their next
+request but are not woken. `shell-job-notifications = false` turns it all off.
 
 Shell commands start from a cleared environment plus a fixed allowlist.
 `shell-inherit-env` / `shell-env` add named variables (never credential-looking

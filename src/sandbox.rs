@@ -20,6 +20,7 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod general_profile;
+pub(crate) mod job_notices;
 #[cfg(unix)]
 pub(crate) mod net_forwarder;
 pub(crate) mod net_proxy;
@@ -1013,6 +1014,8 @@ struct BackgroundJobsInner {
     /// Records in `jobs` without a terminal state. Updated only while `jobs`
     /// is locked, so the redraw path can read it without the lock.
     running: AtomicUsize,
+    /// Completion notices of jobs that ended on their own.
+    notices: Arc<job_notices::JobNoticeQueue>,
 }
 
 /// What the output worker launches. A shell command is wrapped by the worker
@@ -3317,6 +3320,70 @@ impl Sandbox {
         self
     }
 
+    /// The script that runs `command` from `workdir` (mini-agent-nyp3y):
+    /// workspace-relative, or absolute inside the workspace. The directory is
+    /// resolved (symlinks and `..` included) and must be an existing directory
+    /// inside the canonical workspace root, so a link or `..` cannot leave it.
+    /// Each call is a fresh shell, so the prefix is the only thing that moves
+    /// the command; the sandbox's own grants are unchanged.
+    pub(crate) fn command_in_workdir(
+        &self,
+        workdir: &str,
+        command: &str,
+    ) -> Result<String, String> {
+        let workdir = workdir.trim();
+        if workdir.is_empty() || workdir.contains('\0') {
+            return Err("workdir must be a non-empty path".into());
+        }
+        let root = match &self.workspace_binding {
+            Some(workspace) => workspace.root().to_path_buf(),
+            None => self
+                .working_dir()
+                .and_then(|dir| dir.canonicalize())
+                .map_err(|error| format!("workdir: cannot resolve the workspace: {error}"))?,
+        };
+        let requested = Path::new(workdir);
+        let joined = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            root.join(requested)
+        };
+        let resolved = joined
+            .canonicalize()
+            .map_err(|error| format!("workdir {workdir:?} cannot be used: {error}"))?;
+        if !resolved.starts_with(&root) {
+            return Err(format!(
+                "workdir {workdir:?} resolves outside the workspace; use a directory inside {}",
+                root.display()
+            ));
+        }
+        if !resolved.is_dir() {
+            return Err(format!("workdir {workdir:?} is not a directory"));
+        }
+        let shown = resolved.to_string_lossy();
+        let dialect = self
+            .shell_capability()
+            .map_or(ShellDialect::Posix, ShellCapability::dialect);
+        Ok(match dialect {
+            ShellDialect::Posix => {
+                let path = if cfg!(windows) {
+                    shown.replace('\\', "/")
+                } else {
+                    shown.into_owned()
+                };
+                format!(
+                    "cd -- '{}' || exit 1; {command}",
+                    path.replace('\'', "'\\''")
+                )
+            }
+            ShellDialect::PowerShell => format!(
+                "Set-Location -LiteralPath '{}'; if (-not $?) {{ exit 1 }}; {command}",
+                shown.replace('\'', "''")
+            ),
+            ShellDialect::Cmd => format!("cd /d \"{shown}\" && {command}"),
+        })
+    }
+
     fn working_dir(&self) -> std::io::Result<PathBuf> {
         self.working_dir
             .clone()
@@ -5024,6 +5091,9 @@ impl Sandbox {
         if since.is_none() {
             job.delivered = window.next;
         }
+        if snapshot.status.is_terminal() {
+            self.background_jobs.notices.acknowledge(id);
+        }
         Ok(BackgroundJobOutput { snapshot, window })
     }
 
@@ -5235,6 +5305,12 @@ impl Sandbox {
         if jobs.get(id).is_some_and(|job| job.terminal.is_some()) {
             jobs.remove(id);
         }
+        self.background_jobs.notices.acknowledge(id);
+    }
+
+    /// The completion-notice queue of this sandbox's background jobs.
+    pub(crate) fn job_notice_queue(&self) -> &Arc<job_notices::JobNoticeQueue> {
+        &self.background_jobs.notices
     }
 
     /// Stop every running background job: session shutdown and `/quit`.
@@ -6316,7 +6392,7 @@ fn command_stdio(pty: bool) -> std::io::Result<CommandStdio> {
     {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "pty=true is not supported on this platform",
+            "pty=true is not supported on this platform (no pseudo-terminal; Windows has no ConPTY path). Run the command without pty; programs that need a TTY cannot be driven here.",
         ))
     }
 }
@@ -6381,8 +6457,30 @@ fn finish_background_job(
         let Some(job) = jobs.get_mut(id) else {
             return;
         };
-        if job.terminal.replace(terminal).is_none() {
+        let first = job.terminal.replace(terminal).is_none();
+        if first {
             owner.running.fetch_sub(1, Ordering::Release);
+        }
+        // A job the model or user stopped is already known to them.
+        if first && !job.stop_requested && owner.notices.enabled() {
+            let snapshot = snapshot_background_job(id, job);
+            let total = snapshot.transcript.total_bytes;
+            let start = total.saturating_sub(job_notices::NOTICE_TAIL_BYTES as u64);
+            let window = job
+                .capture
+                .read_window(start, job_notices::NOTICE_TAIL_BYTES);
+            let mut tail = window.head;
+            tail.extend_from_slice(&window.tail);
+            owner.notices.push(job_notices::JobNotice {
+                id: id.to_string(),
+                command: snapshot.command,
+                status: snapshot.status,
+                exit_code: snapshot.exit_code,
+                pty: snapshot.pty,
+                log_path: job.log_path.clone(),
+                tail,
+                earlier_bytes: start,
+            });
         }
         job.changed.clone()
     };

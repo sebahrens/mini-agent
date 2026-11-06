@@ -101,6 +101,11 @@ impl Run {
         self.background_pool()?.pending_notices()
     }
 
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     #[cfg(feature = "subagents")]
     pub(crate) fn belongs_to_account(&self, session: &str, account: &Account) -> bool {
         self.session_id == session && self.account.same_owner(account)

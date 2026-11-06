@@ -31,8 +31,10 @@ fn rejects<T: serde::de::DeserializeOwned>(valid: serde_json::Value, bad_key: &s
 #[test]
 fn shell_rejects_wrong_harness_parameters() {
     rejects::<BashArgs>(json!({"command": "ls"}), "run_in_background");
-    rejects::<BashArgs>(json!({"command": "ls"}), "workdir");
-    let error = serde_json::from_value::<BashArgs>(json!({"command": "ls", "workdir": "a"}))
+    rejects::<BashArgs>(json!({"command": "ls"}), "cwd");
+    // `workdir` is a real shell parameter now (mini-agent-nyp3y).
+    assert!(serde_json::from_value::<BashArgs>(json!({"command": "ls", "workdir": "a"})).is_ok());
+    let error = serde_json::from_value::<BashArgs>(json!({"command": "ls", "cwd": "a"}))
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();

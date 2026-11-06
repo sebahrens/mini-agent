@@ -1,7 +1,7 @@
 use rig::tool::Tool;
 
 use crate::agent::tools::{
-    AskSender, BashArgs, JobAction, JobStatusArgs, PermCheck, ToolError, check_perm,
+    AskSender, BashArgs, JobAction, JobKey, JobStatusArgs, PermCheck, ToolError, check_perm,
 };
 use crate::extras::truncate::head_tail_lines;
 use crate::sandbox::{
@@ -358,6 +358,10 @@ impl Tool for ShellTool {
                     "maximum": 86_400_000,
                     "description": format!("Lower command deadline in milliseconds (optional; maximum {} foreground or 86400000 background)", self.foreground_timeout.as_secs() * 1000)
                 },
+                "workdir": {
+                    "type": "string",
+                    "description": "Directory to run the command in: workspace-relative or absolute inside the workspace (default: the workspace root). It must exist; symlinks and .. that leave the workspace are refused. Every call starts a fresh shell, so cd does NOT persist between calls: pass workdir each time. The permission check sees the command with the directory change, so rules and approvals are for that directory."
+                },
                 "background": {
                     "type": "boolean",
                     "description": "Start a session-scoped background job and return its id (default false)"
@@ -396,11 +400,13 @@ impl Tool for ShellTool {
                 }),
             );
         }
-        schema
+        without_unsupported_pty(schema, PTY_SUPPORTED)
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
-        self.execute(args).await.map(|(text, _)| text)
+        self.execute(args)
+            .await
+            .map(|(text, _)| append_job_notices(&self.sandbox, text))
     }
     #[cfg(any(feature = "git-worktree", test))]
     async fn call_structured(
@@ -409,7 +415,7 @@ impl Tool for ShellTool {
         _extensions: &rig::tool::ToolCallExtensions,
     ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
         self.execute(args).await.map(|(text, metadata)| {
-            let result = rig::tool::ToolReturn::success(text);
+            let result = rig::tool::ToolReturn::success(append_job_notices(&self.sandbox, text));
             match metadata {
                 Some(metadata) => result.with_extension(metadata),
                 None => result,
@@ -507,6 +513,26 @@ impl ShellTool {
             args.timeout,
             args.background,
         );
+        let mut args = args;
+        if let Some(workdir) = args.workdir.take() {
+            let plain = args.command.clone();
+            args.command = self
+                .sandbox
+                .command_in_workdir(&workdir, &plain)
+                .map_err(ToolError::Msg)?;
+            // The permission key is the script with the directory change, so
+            // approvals are per directory, but a deny rule on the command
+            // itself still applies.
+            if let Some(permission) = &self.permission {
+                let (result, _) = permission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .check_diagnosed(|guard| guard.check("shell", &plain));
+                if let crate::permission::checker::CheckResult::Denied(reason) = result {
+                    return Err(ToolError::Msg(format!("Permission denied: {reason}")));
+                }
+            }
+        }
         let maximum = if args.background {
             DEFAULT_BACKGROUND_COMMAND_TIMEOUT
         } else {
@@ -871,6 +897,57 @@ async fn forward_progress<T>(
     }
 }
 
+/// Whether this platform can run a command under a pseudo-terminal. Unix
+/// only: there is no ConPTY path, so on Windows the model is never offered
+/// `pty`, terminal input or named keys (mini-agent-jguj1).
+const PTY_SUPPORTED: bool = cfg!(unix);
+
+/// Remove the pseudo-terminal parameters from a `shell` or `job_status` tool
+/// schema when the platform cannot honour them.
+fn without_unsupported_pty(
+    mut schema: serde_json::Value,
+    pty_supported: bool,
+) -> serde_json::Value {
+    if pty_supported {
+        return schema;
+    }
+    if let Some(properties) = schema["properties"].as_object_mut() {
+        for name in ["pty", "input", "keys"] {
+            properties.remove(name);
+        }
+        if let Some(actions) = properties
+            .get_mut("action")
+            .and_then(|action| action["enum"].as_array_mut())
+        {
+            actions.retain(|action| action != "input");
+        }
+        if let Some(action) = properties.get_mut("action")
+            && let Some(description) = action["description"].as_str()
+        {
+            action["description"] = serde_json::Value::from(
+                description.replace(", or type input into a pty=true job", ""),
+            );
+        }
+    }
+    schema
+}
+
+/// Append the completion notices of background jobs that ended on their own
+/// since the model last heard about them, so a long turn learns of them at
+/// its next tool result (mini-agent-cw4f3). Delivered once.
+const MAX_NOTICES_PER_RESULT: usize = 4;
+
+fn append_job_notices(sandbox: &Sandbox, mut output: String) -> String {
+    let notices = sandbox
+        .job_notice_queue()
+        .take_up_to(MAX_NOTICES_PER_RESULT);
+    for message in crate::sandbox::job_notices::render_all(&notices) {
+        output.push_str("\n\n");
+        output.push_str(&message);
+    }
+    output
+}
+
 pub struct JobStatusTool {
     sandbox: Sandbox,
     max_output_lines: Option<u64>,
@@ -880,16 +957,50 @@ pub struct JobStatusTool {
     /// is judged on this plus the next chunk, so a command split across calls
     /// is seen whole.
     pending_input: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Jobs whose unterminated line was edited with cursor, history or escape
+    /// keys, so the typed text is no longer the line the program will run.
+    edited_lines: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+/// Permission text for a line the terminal's own editing (cursor, history,
+/// escape keys) changed: the model cannot know what will run, so it is judged
+/// as this opaque command, which an ask policy prompts for.
+const EDITED_LINE_JUDGED_AS: &str = "terminal input line edited with cursor or history keys";
+/// Most keys one `job_status` call may press.
+const MAX_JOB_KEYS: usize = 64;
+
 /// The first byte `job_status` input may not carry: C0 controls other than
-/// tab, LF and CR, and DEL. The terminal's line discipline and readline act
-/// on them (kill line, erase, signal), so the typed text would no longer be
-/// the command that was judged.
+/// LF and CR, and DEL. The terminal's line discipline and readline act on
+/// them (kill line, erase, signal, and TAB completion, which rewrites the
+/// word before the shell runs it), so the typed text would no longer be the
+/// command that was judged.
 fn disallowed_input_control(input: &str) -> Option<char> {
     input
         .chars()
-        .find(|c| (c.is_control() && !matches!(c, '\n' | '\r' | '\t')) || *c == '\u{7f}')
+        .find(|c| (c.is_control() && !matches!(c, '\n' | '\r')) || *c == '\u{7f}')
+}
+
+/// Text an interactive shell's history expansion would rewrite before running
+/// it: a `!` that starts an event designator, or `^old^new` quick substitution
+/// at the start of a line. The typed text would then not be the command that
+/// was judged, so such input is refused.
+fn history_expansion_trigger(typed: &str) -> Option<&'static str> {
+    for line in typed.split(['\n', '\r']) {
+        if line.starts_with('^') {
+            return Some("a line starting with ^ (history quick substitution)");
+        }
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '!'
+                && let Some(next) = chars.peek()
+                && !next.is_whitespace()
+                && *next != '='
+            {
+                return Some("! followed by text (history expansion)");
+            }
+        }
+    }
+    None
 }
 
 impl JobStatusTool {
@@ -900,6 +1011,7 @@ impl JobStatusTool {
             permission: None,
             ask_tx: None,
             pending_input: std::sync::Mutex::new(std::collections::HashMap::new()),
+            edited_lines: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -912,6 +1024,108 @@ impl JobStatusTool {
         self.permission = permission;
         self.ask_tx = ask_tx;
         self
+    }
+
+    /// Press named keys in a pty job. The tool renders the bytes. Ctrl-C and
+    /// Ctrl-D carry no text and are always allowed; Enter submits the line
+    /// typed so far and is judged like typed text; keys that rewrite the line
+    /// (cursor, history, Esc, Tab completion) make the line unknowable, so it
+    /// is judged as an opaque edited line, and Tab on typed text is refused.
+    async fn press_keys(&self, id: &str, keys: &[JobKey]) -> Result<(), String> {
+        if keys.is_empty() || keys.len() > MAX_JOB_KEYS {
+            return Err(format!(
+                "job_status keys must hold 1 to {MAX_JOB_KEYS} keys. Example: {{\"id\":\"job-...\",\"action\":\"input\",\"keys\":[\"ctrl_c\"]}}"
+            ));
+        }
+        let mut bytes = Vec::new();
+        for key in keys {
+            bytes.extend_from_slice(key.bytes());
+        }
+        self.sandbox
+            .background_job_input_handle(id, bytes.len())
+            .map(drop)?;
+        let mut text = self
+            .pending_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        let mut edited = self
+            .edited_lines
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(id);
+        let mut lines = Vec::new();
+        for key in keys {
+            match key {
+                JobKey::CtrlC => {
+                    text.clear();
+                    edited = false;
+                }
+                JobKey::CtrlD => {
+                    if !text.is_empty() {
+                        edited = true;
+                    }
+                }
+                JobKey::Backspace => {
+                    if !edited {
+                        text.pop();
+                    }
+                }
+                JobKey::Left | JobKey::Right => {
+                    if !text.is_empty() || edited {
+                        edited = true;
+                    }
+                }
+                JobKey::Up | JobKey::Down | JobKey::Esc => edited = true,
+                JobKey::Tab => {
+                    if !text.is_empty() || edited {
+                        return Err("job_status keys: tab on a partly typed line lets the shell complete it into a different command than was permission-checked. Send the full text instead, or press ctrl_c first.".into());
+                    }
+                }
+                JobKey::Enter => {
+                    lines.push(if edited {
+                        EDITED_LINE_JUDGED_AS.to_string()
+                    } else {
+                        std::mem::take(&mut text)
+                    });
+                    text.clear();
+                    edited = false;
+                }
+            }
+        }
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let (checked, _released) = super::concurrency::prompt_unlocked(check_perm(
+                &self.permission,
+                &self.ask_tx,
+                "shell",
+                &line,
+            ))
+            .await;
+            checked.map_err(|error| error.to_string())?;
+        }
+        self.sandbox.write_background_job_input(id, &bytes).await?;
+        self.pending_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id.to_string(), text);
+        {
+            let mut set = self
+                .edited_lines
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if edited {
+                set.insert(id.to_string());
+            } else {
+                set.remove(id);
+            }
+        }
+        self.settle_after_input(id).await;
+        Ok(())
     }
 
     /// Wait until the job's output goes quiet after input, bounded.
@@ -959,7 +1173,7 @@ impl Tool for JobStatusTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
+        let schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "id": {
@@ -974,7 +1188,14 @@ impl Tool for JobStatusTool {
                 "input": {
                     "type": "string",
                     "maxLength": 16384,
-                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command, together with any unterminated line already typed. C0 control characters other than tab, newline and carriage return (Ctrl-U, Ctrl-C, backspace, ESC, DEL) are refused. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
+                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command, together with any unterminated line already typed. C0 control characters other than newline and carriage return (Tab, Ctrl-U, Ctrl-C, backspace, ESC, DEL) are refused because a terminal would act on them (completion, line editing, signals); so are history expansions (`!` followed by text, a line starting with `^`). Use keys for Ctrl-C, Ctrl-D, Esc and arrows. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
+                },
+                "keys": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_JOB_KEYS,
+                    "items": {"type": "string", "enum": ["ctrl_c", "ctrl_d", "esc", "up", "down", "left", "right", "tab", "enter", "backspace"]},
+                    "description": "Only with action=input, instead of input: named keys pressed in order (ctrl_c interrupts the foreground program, ctrl_d sends EOF, plus esc, arrows, tab, enter, backspace for pagers, TUIs and REPLs). The tool renders the bytes. ctrl_c and ctrl_d are always allowed; enter judges the typed line like input; cursor, history and esc keys make the line unknowable so the next enter is judged as an opaque edited line (use ctrl_c to clear it); tab on a partly typed line is refused."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -989,10 +1210,18 @@ impl Tool for JobStatusTool {
                 }
             },
             "required": []
-        })
+        });
+        without_unsupported_pty(schema, PTY_SUPPORTED)
     }
 
     async fn call(&self, args: JobStatusArgs) -> Result<String, ToolError> {
+        let output = self.call_inner(args).await?;
+        Ok(append_job_notices(&self.sandbox, output))
+    }
+}
+
+impl JobStatusTool {
+    async fn call_inner(&self, args: JobStatusArgs) -> Result<String, ToolError> {
         if let Some(timeout) = args.timeout_ms
             && (args.action != JobAction::Wait
                 || !(1..=MAX_BACKGROUND_JOB_WAIT_MILLIS).contains(&timeout))
@@ -1001,9 +1230,19 @@ impl Tool for JobStatusTool {
                 "job_status timeout_ms is only valid with action=wait and must be between 1 and 60000 milliseconds. Example: {\"id\":\"job-...\",\"action\":\"wait\",\"timeout_ms\":10000}".into(),
             ));
         }
-        if args.input.is_some() != (args.action == JobAction::Input) {
+        if args.input.is_some() && args.keys.is_some() {
             return Err(ToolError::Msg(
-                "job_status input is required with, and only valid with, action=input. Example: {\"id\":\"job-...\",\"action\":\"input\",\"input\":\"print(1+1)\\n\"}".into(),
+                "job_status takes either input (text) or keys (named keys), not both.".into(),
+            ));
+        }
+        if args.keys.is_some() && args.action != JobAction::Input {
+            return Err(ToolError::Msg(
+                "job_status keys are only valid with action=input.".into(),
+            ));
+        }
+        if args.input.is_some() != (args.action == JobAction::Input) && args.keys.is_none() {
+            return Err(ToolError::Msg(
+                "job_status input (or keys) is required with, and only valid with, action=input. Example: {\"id\":\"job-...\",\"action\":\"input\",\"input\":\"print(1+1)\\n\"}".into(),
             ));
         }
         if args.action == JobAction::List {
@@ -1047,6 +1286,10 @@ impl Tool for JobStatusTool {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .remove(id);
+                self.edited_lines
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(id);
                 self.sandbox.stop_background_job(id).await.map(drop)
             }
             JobAction::Wait => self
@@ -1057,12 +1300,21 @@ impl Tool for JobStatusTool {
                 )
                 .await
                 .map(drop),
+            JobAction::Input if args.keys.is_some() => {
+                self.press_keys(id, args.keys.as_deref().unwrap_or_default())
+                    .await
+            }
             JobAction::Input => {
                 let input = args.input.as_deref().unwrap_or_default();
                 if let Some(control) = disallowed_input_control(input) {
                     return Err(ToolError::Msg(format!(
-                        "job_status input contains the control character U+{:04X}, which the terminal would interpret (erase, kill-line, signal, escape) instead of typing it, so the command could differ from what was permission-checked. Send plain text with \\n only; stop the job to interrupt it.",
+                        "job_status input contains the control character U+{:04X}, which the terminal would interpret (erase, kill-line, signal, escape) instead of typing it, so the command could differ from what was permission-checked. Send plain text with \\n only; use keys (ctrl_c, ctrl_d, esc, arrows) for named keys.",
                         control as u32
+                    )));
+                }
+                if let Some(trigger) = history_expansion_trigger(input) {
+                    return Err(ToolError::Msg(format!(
+                        "job_status input contains {trigger}, which an interactive shell rewrites before running it, so the command could differ from what was permission-checked. Avoid ! and a leading ^, or quote them out of the typed text."
                     )));
                 }
                 // Typed text can run anything the terminal's program accepts,
@@ -1083,6 +1335,16 @@ impl Tool for JobStatusTool {
                     .cloned()
                     .unwrap_or_default();
                 let combined = format!("{pending}{input}");
+                let edited = self
+                    .edited_lines
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains(id);
+                // Judge an edited line's first Enter as the opaque edited line.
+                let judged = match (edited, combined.find(['\n', '\r'])) {
+                    (true, Some(end)) => format!("{EDITED_LINE_JUDGED_AS}{}", &combined[end..]),
+                    _ => combined.clone(),
+                };
                 let tail = combined
                     .rsplit(['\n', '\r'])
                     .next()
@@ -1099,7 +1361,7 @@ impl Tool for JobStatusTool {
                     "shell",
                     // Typing Enter is not part of the command text a rule
                     // would name.
-                    combined.trim_end_matches(['\n', '\r']),
+                    judged.trim_end_matches(['\n', '\r']),
                 ))
                 .await;
                 checked?;
@@ -1113,6 +1375,12 @@ impl Tool for JobStatusTool {
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .insert(id.to_string(), tail);
+                        if input.contains(['\n', '\r']) {
+                            self.edited_lines
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .remove(id);
+                        }
                         // Give the program time to echo and answer.
                         self.settle_after_input(id).await;
                         Ok(())
@@ -2795,9 +3063,491 @@ mod tests {
         shell.sandbox.stop_background_job(&id).await.unwrap();
     }
 
+    async fn job_keys(
+        status: &JobStatusTool,
+        id: &str,
+        keys: &[JobKey],
+    ) -> Result<String, ToolError> {
+        status
+            .call(JobStatusArgs {
+                id: Some(id.to_string()),
+                action: JobAction::Input,
+                keys: Some(keys.to_vec()),
+                ..Default::default()
+            })
+            .await
+    }
+
+    async fn start_job(shell: &BashTool, command: &str) -> String {
+        let started = shell
+            .call(BashArgs {
+                command: command.to_string(),
+                timeout: Some(30_000),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        background_id(&started)
+    }
+
+    async fn wait_for_notice(shell: &BashTool) {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            shell.sandbox.job_notice_queue().wait_pending(),
+        )
+        .await
+        .expect("a job that ended after the turn must queue a notice");
+    }
+
+    /// A job that finishes after the turn ended queues one bounded notice,
+    /// delivered once with the next tool result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_completion_notice_is_queued_and_delivered_once() {
+        let shell = test_tool();
+        let id = start_job(&shell, "echo build-tail-marker; exit 3").await;
+        wait_for_notice(&shell).await;
+        assert_eq!(shell.sandbox.job_notice_queue().len(), 1);
+        let result = shell
+            .call(BashArgs {
+                command: "echo unrelated".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("unrelated"), "{result}");
+        assert!(
+            result.contains(&format!("Background shell job {id} completed")),
+            "{result}"
+        );
+        assert!(result.contains("exit code 3"), "{result}");
+        assert!(result.contains("build-tail-marker"), "{result}");
+        assert!(result.contains("grants no permission"), "{result}");
+        // Delivered once.
+        let again = shell
+            .call(BashArgs {
+                command: "echo second".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!again.contains("Background shell job"), "{again}");
+    }
+
+    /// Reading the terminal state, stopping a job, or turning notices off
+    /// queues nothing the model already knows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_notices_skip_known_stopped_and_disabled_jobs() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        // Seen through job_status wait: the notice is withdrawn.
+        let seen = start_job(&shell, "echo seen").await;
+        let terminal = wait_for_terminal_job(&status, &seen).await;
+        assert!(terminal.contains("Status: completed"), "{terminal}");
+        assert!(!terminal.contains("Background shell job"), "{terminal}");
+        assert_eq!(shell.sandbox.job_notice_queue().len(), 0);
+        // Stopped by the model: no notice.
+        let stopped = start_job(&shell, "sleep 300").await;
+        shell.sandbox.stop_background_job(&stopped).await.unwrap();
+        assert_eq!(shell.sandbox.job_notice_queue().len(), 0);
+        // Opt-out.
+        shell.sandbox.job_notice_queue().set_enabled(false);
+        let quiet = start_job(&shell, "echo quiet").await;
+        let _ = wait_for_terminal_job(&status, &quiet).await;
+        shell.sandbox.job_notice_queue().set_enabled(true);
+        start_job(&shell, "echo loud").await;
+        wait_for_notice(&shell).await;
+        assert_eq!(shell.sandbox.job_notice_queue().len(), 1);
+    }
+
+    fn workdir_fixture(label: &str) -> std::path::PathBuf {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(format!("workdir-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub/deep")).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workdir_runs_foreground_and_background_commands_in_the_directory() {
+        let fixture = workdir_fixture("run");
+        let rel = format!("{}/sub", fixture.file_name().unwrap().to_string_lossy());
+        let shell = test_tool();
+        let out = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                workdir: Some(rel.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let real = fixture.join("sub").canonicalize().unwrap();
+        assert!(out.contains(real.to_str().unwrap()), "{out}");
+        // Absolute inside the workspace works too.
+        let out = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                workdir: Some(fixture.join("sub/deep").to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(out.contains("deep"), "{out}");
+        // cd does not persist; the next call starts at the workspace root.
+        shell
+            .call(BashArgs {
+                command: "cd sub && pwd".into(),
+                workdir: Some(fixture.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let root = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!root.contains("workdir-run"), "{root}");
+        // A background job runs there as well.
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_job(&shell, "true").await;
+        let _ = wait_for_terminal_job(&status, &id).await;
+        let started = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                background: true,
+                workdir: Some(rel),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let terminal = wait_for_terminal_job(&status, &background_id(&started)).await;
+        assert!(terminal.contains(real.to_str().unwrap()), "{terminal}");
+        std::fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workdir_refuses_escapes_links_files_and_missing_directories() {
+        let fixture = workdir_fixture("escape");
+        let outside = std::env::temp_dir().join(format!("workdir-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, fixture.join("link")).unwrap();
+        std::fs::write(fixture.join("file.txt"), "x").unwrap();
+        let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
+        let shell = test_tool();
+        for (workdir, needle) in [
+            (format!("{name}/../.."), "outside the workspace"),
+            ("..".to_string(), "outside the workspace"),
+            (
+                outside.to_string_lossy().into_owned(),
+                "outside the workspace",
+            ),
+            ("/".to_string(), "outside the workspace"),
+            (format!("{name}/link"), "outside the workspace"),
+            (format!("{name}/file.txt"), "not a directory"),
+            (format!("{name}/missing"), "cannot be used"),
+            (String::new(), "non-empty"),
+        ] {
+            let error = shell
+                .call(BashArgs {
+                    command: format!("touch {}/escaped", outside.display()),
+                    workdir: Some(workdir.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(needle), "{workdir}: {error}");
+        }
+        assert!(!outside.join("escaped").exists());
+        std::fs::remove_dir_all(&fixture).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// The permission key carries the directory, and a deny rule on the bare
+    /// command still applies when a workdir is passed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workdir_permission_identity_includes_the_directory_and_deny_rules_hold() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        let fixture = workdir_fixture("perm");
+        let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
+        let marker = fixture.join("sub/denied");
+        let mut shell = test_tool();
+        shell.permission = Some(shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("*".to_string(), Action::Allow),
+                        ("touch *".to_string(), Action::Deny),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Yolo,
+        ));
+        let error = shell
+            .call(BashArgs {
+                command: "touch denied".into(),
+                workdir: Some(format!("{name}/sub")),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("denied"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+        let ok = shell
+            .call(BashArgs {
+                command: "echo fine".into(),
+                workdir: Some(format!("{name}/sub")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(ok.contains("fine"), "{ok}");
+        std::fs::remove_dir_all(&fixture).unwrap();
+    }
+
     #[test]
-    fn disallowed_input_control_allows_only_tab_lf_cr() {
-        assert_eq!(disallowed_input_control("a\tb\r\nc é"), None);
+    fn workdir_is_in_the_schema_and_documents_that_cd_does_not_persist() {
+        let schema = test_tool().parameters();
+        let text = schema["properties"]["workdir"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("does NOT persist"), "{text}");
+    }
+
+    #[test]
+    fn pty_parameters_are_offered_only_where_a_pty_exists() {
+        let shell = test_tool().parameters();
+        let status = JobStatusTool::new(test_tool().sandbox, None).parameters();
+        assert_eq!(shell["properties"].get("pty").is_some(), PTY_SUPPORTED);
+        assert_eq!(status["properties"].get("keys").is_some(), PTY_SUPPORTED);
+        // A platform without a pty never offers pty, input or keys.
+        let shell = without_unsupported_pty(test_tool().parameters(), false);
+        assert!(shell["properties"].get("pty").is_none());
+        assert!(shell["properties"].get("command").is_some());
+        let status = without_unsupported_pty(
+            JobStatusTool::new(test_tool().sandbox, None).parameters(),
+            false,
+        );
+        for name in ["input", "keys"] {
+            assert!(status["properties"].get(name).is_none(), "{name}");
+        }
+        let actions = status["properties"]["action"]["enum"].as_array().unwrap();
+        assert!(
+            !actions.iter().any(|action| action == "input"),
+            "{actions:?}"
+        );
+        assert!(status["properties"].get("timeout_ms").is_some());
+    }
+
+    #[test]
+    fn job_keys_render_fixed_bytes_and_reject_text_mixing() {
+        assert_eq!(JobKey::CtrlC.bytes(), b"\x03");
+        assert_eq!(JobKey::CtrlD.bytes(), b"\x04");
+        assert_eq!(JobKey::Up.bytes(), b"\x1b[A");
+        let args: JobStatusArgs = serde_json::from_value(serde_json::json!({
+            "id": "job-1", "action": "input", "keys": ["ctrl_c", "enter"]
+        }))
+        .unwrap();
+        assert_eq!(args.keys, Some(vec![JobKey::CtrlC, JobKey::Enter]));
+        assert!(
+            serde_json::from_value::<JobStatusArgs>(serde_json::json!({
+                "action": "input", "keys": ["\u{3}"]
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn job_keys_validation_errors_come_before_any_job_lookup() {
+        let status = JobStatusTool::new(test_tool().sandbox, None);
+        let both = status
+            .call(JobStatusArgs {
+                id: Some("job-x".into()),
+                action: JobAction::Input,
+                input: Some("a".into()),
+                keys: Some(vec![JobKey::Enter]),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(both.to_string().contains("not both"), "{both}");
+        let wrong_action = status
+            .call(JobStatusArgs {
+                id: Some("job-x".into()),
+                keys: Some(vec![JobKey::Enter]),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            wrong_action.to_string().contains("only valid"),
+            "{wrong_action}"
+        );
+        let too_many = job_keys(&status, "job-x", &[JobKey::Left; 65])
+            .await
+            .unwrap_err();
+        assert!(too_many.to_string().contains("1 to 64"), "{too_many}");
+    }
+
+    /// Ctrl-D ends a python REPL (EOF) and Ctrl-C interrupts a foreground
+    /// `sleep` in a pty shell without killing the shell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_keys_send_eof_to_a_repl_and_interrupt_to_a_pty_shell() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_pty_job(&shell, "python3 -i -q").await;
+        let seen = job_input(&status, &id, "print(6*7)\n").await.unwrap();
+        assert!(seen.contains("42"), "{seen}");
+        job_keys(&status, &id, &[JobKey::CtrlD]).await.unwrap();
+        let terminal = wait_for_terminal_job(&status, &id).await;
+        assert!(terminal.contains("Status: completed"), "{terminal}");
+        assert!(terminal.contains("Exit code: 0"), "{terminal}");
+
+        let id = start_pty_job(&shell, "sh").await;
+        job_input(&status, &id, "sleep 300\n").await.unwrap();
+        let started = Instant::now();
+        job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
+        let seen = job_input(&status, &id, "echo after-$((20+1))\n")
+            .await
+            .unwrap();
+        assert!(seen.contains("after-21"), "{seen}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    /// Keys are judged per policy: Enter judges the typed line, Tab on typed
+    /// text is refused, and history keys make the next Enter an opaque line
+    /// that a deny-by-default policy refuses. Ctrl-C needs no permission.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_keys_are_permission_judged_and_cannot_rewrite_a_denied_line() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        let dir = std::env::current_dir().unwrap();
+        let typed = dir.join(format!("job-keys-typed-{}", std::process::id()));
+        let _ = std::fs::remove_file(&typed);
+        let shell = test_tool();
+        let id = start_pty_job(&shell, "sh").await;
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("*".to_string(), Action::Allow),
+                        ("touch *".to_string(), Action::Deny),
+                        ("terminal input line edited*".to_string(), Action::Deny),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Yolo,
+        );
+        let status =
+            JobStatusTool::new(shell.sandbox.clone(), None).with_permission(Some(permission), None);
+        // ctrl_c is always allowed even though the default rule denies.
+        job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
+        // Typed text then Enter is judged as the typed line.
+        let name = typed.file_name().unwrap().to_string_lossy().to_string();
+        job_input(&status, &id, &format!("touch {name}"))
+            .await
+            .unwrap_err();
+        job_input(&status, &id, "echo hi").await.unwrap();
+        let tab = job_keys(&status, &id, &[JobKey::Tab]).await.unwrap_err();
+        assert!(
+            tab.to_string().contains("tab on a partly typed line"),
+            "{tab}"
+        );
+        // History recall then Enter would run an unjudged line: refused.
+        job_keys(&status, &id, &[JobKey::CtrlC, JobKey::Up])
+            .await
+            .unwrap();
+        let error = job_keys(&status, &id, &[JobKey::Enter]).await.unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("denied"),
+            "{error}"
+        );
+        job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
+        job_input(&status, &id, "echo fine\n").await.unwrap();
+        assert!(!typed.exists());
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    #[test]
+    fn history_expansion_triggers_are_detected() {
+        assert!(history_expansion_trigger("^ls^touch f\n").is_some());
+        assert!(history_expansion_trigger("ls\n^a^b\n").is_some());
+        assert!(history_expansion_trigger("echo !!\n").is_some());
+        assert!(history_expansion_trigger("echo !$").is_some());
+        assert!(history_expansion_trigger("x != 1\nnot ! x\nwow!\n").is_none());
+        assert!(history_expansion_trigger("a ^ b\n").is_none());
+    }
+
+    /// An interactive bash rewrites the line (TAB completion, history
+    /// expansion) before running it, so the judged text must be refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_input_cannot_bypass_deny_rules_through_bash_completion_or_history() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        if !std::path::Path::new("/bin/bash").exists() {
+            return;
+        }
+        let dir = std::env::current_dir().unwrap();
+        let tab = dir.join(format!("job-input-tab-{}", std::process::id()));
+        let hist = dir.join(format!("job-input-hist-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tab);
+        let _ = std::fs::remove_file(&hist);
+        let shell = test_tool();
+        let id = start_pty_job(&shell, "/bin/bash --norc --noprofile -i").await;
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("touch *".to_string(), Action::Deny),
+                        ("*".to_string(), Action::Allow),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Yolo,
+        );
+        let status =
+            JobStatusTool::new(shell.sandbox.clone(), None).with_permission(Some(permission), None);
+        let name = |path: &std::path::Path| path.file_name().unwrap().to_string_lossy().to_string();
+        let error = job_input(&status, &id, &format!("touc\t {}\n", name(&tab)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("control character"), "{error}");
+        job_input(&status, &id, "ls\n").await.unwrap();
+        let error = job_input(&status, &id, &format!("^ls^touch {}\n", name(&hist)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("history"), "{error}");
+        let error = job_input(&status, &id, "!!\n").await.unwrap_err();
+        assert!(error.to_string().contains("history"), "{error}");
+        job_input(&status, &id, "echo alive\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!tab.exists() && !hist.exists(), "rewritten input ran");
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    #[test]
+    fn disallowed_input_control_allows_only_lf_cr() {
+        assert_eq!(disallowed_input_control("ab\r\nc é"), None);
+        assert_eq!(disallowed_input_control("a\tb"), Some('\t'));
         assert_eq!(disallowed_input_control("a\u{15}"), Some('\u{15}'));
         assert_eq!(disallowed_input_control("\u{7f}"), Some('\u{7f}'));
     }

@@ -1326,6 +1326,16 @@ jobs:
           test "$(grep -Fxc "$native: test" "$RUNNER_TEMP/guarded-git-native-list.txt")" -eq 1
           cargo test --locked --bin mini-agent "$native" \
             -- --exact --ignored --nocapture --test-threads=1
+          # sandbox-network = "allowlist": the namespace keeps no route except the
+          # filtering proxy's Unix socket, relayed by the re-executed binary.
+          # The native test needs the built binary next to the test harness.
+          cargo build --locked --bin mini-agent
+          net_native='sandbox::network_tests::sandbox_network_allowlist_bwrap_native_only_the_proxy_is_reachable'
+          cargo test --locked --bin mini-agent "$net_native" -- --list \
+            | tee "$RUNNER_TEMP/net-allowlist-native-list.txt"
+          test "$(grep -Fxc "$net_native: test" "$RUNNER_TEMP/net-allowlist-native-list.txt")" -eq 1
+          cargo test --locked --bin mini-agent "$net_native" \
+            -- --exact --ignored --nocapture --test-threads=1
           # Hooks are not a default feature. script(1) gives the test process a
           # controlling terminal, so the hook's failing /dev/tty open is a real
           # proof that sandboxed hooks and workspace services start detached.
