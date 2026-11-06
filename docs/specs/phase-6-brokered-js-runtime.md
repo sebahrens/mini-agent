@@ -812,6 +812,32 @@ TUI) records them as `tracing` debug events and folds one human sentence per sta
 "could not launch the worker (nested sandbox?)") into the typed unavailable reason. This is a
 reporting change only: the availability decision is unchanged.
 
+**Closed hosted-probe phase diagnostics (`mini-agent-06mn8`; amendment 2026-11-06).** A
+first-generation attestation failure without a recognized worker `MACOS_CONTAINMENT_PROBE_FAILED`
+code previously reported only the `bootstrap` fallback, because the parent's Hello/Ready/attestation/
+shutdown exchange labelled only `ready_read`, `image_unlink` and `attestation_read`. Every owning
+step of that exchange now reports one fixed parent label `MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`
+with `<phase>` in the closed set `hello_protocol`, `hello_write`, `hello_flush`, `ready_read`,
+`ready_protocol`, `ready_frame`, `image_unlink`, `probe_protocol`, `probe_write`, `probe_flush`,
+`attestation_read`, `attestation_protocol`, `attestation_result`, `shutdown_protocol`,
+`shutdown_write`, `shutdown_flush`, `shutdown_wait`, `shutdown_exit` and `shutdown_timeout`. I/O
+phases add `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, derived only from `io::ErrorKind`
+(`broken_pipe`, `unexpected_eof`, `timed_out`, `would_block`, `interrupted`, `permission_denied`,
+`not_found`, `invalid_data`, `invalid_input`, `connection_reset`, `encode` for a frame that failed
+before I/O, otherwise `other`). The parent then classifies the guardian root before its own
+teardown as `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`: `exited_success`, `exited_failure`
+(code 1), `exited_sysexits` (64–78), `exited_other`, `signal_kill`, `signal_term`, `signal_abort`,
+`signal_segv`, `signal_bus`, `signal_cpu_limit`, `signal_other`, `running` (not yet reaped when
+observed; the parent then terminates it) or `unavailable`. The existing `bootstrap` fallback and
+`worker_attestation` stage token follow unchanged. A hosted-matrix error that reaches
+`maybe_run_hosted_lifecycle` without any stage token reports
+`MACOS_CONTAINMENT_MATRIX_FAILED=unclassified` plus its I/O class. All labels are static strings:
+no worker byte, path, token, configuration or error `Display` text is printed; parent labels are
+not in the worker-relayable code list, so worker stderr cannot forge them; the public static
+error messages, the exact `MACOS_CONTAINMENT_MATRIX_V1=passed` stdout record, timeouts and the
+fail-closed availability decision are unchanged, and no retry is added. This is observability for
+the unexplained macOS 15 bootstrap failure (`mini-agent-1fvhp`), not a repair of it.
+
 The production launcher closes that scoped transition with a fresh one-time pathname. The public
 `sandbox_init` API remains deprecated and the assurance therefore remains explicitly
 `DeprecatedBestEffort`.
