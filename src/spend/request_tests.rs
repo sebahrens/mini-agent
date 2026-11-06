@@ -2170,3 +2170,70 @@ async fn capped_run_stopped_by_an_unwritable_ledger_names_the_ledger_failure() {
     assert!(text.contains("usage ledger"), "{text}");
     assert!(text.contains(super::run::BUDGET_STOP), "{text}");
 }
+
+#[tokio::test]
+async fn compaction_request_is_retried_after_a_mid_stream_connection_failure() {
+    let root = crate::tests::OwnedTestDirectory::new("cost-compaction-midstream-retry");
+    // The first request delivers one text chunk, then an SSE overloaded error:
+    // an error after the first stream item.
+    let overloaded = format!(
+        "{}data: {{\"error\":{{\"message\":\"Overloaded\",\"type\":\"overloaded_error\"}}}}\n\n",
+        response_text_chunk()
+    );
+    let truncated = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{overloaded}",
+        overloaded.len()
+    );
+    let wire = Wire::new(vec![
+        Some(truncated),
+        Some(response("A retried summary", false)),
+    ])
+    .await;
+    let (client, mut cfg) = wire.client();
+    cfg.retry = crate::retry::RetryConfig {
+        max_attempts: 3,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 1,
+        ..Default::default()
+    };
+    let (run, _ledger) = profile(&root, &cfg, RequestKind::Compaction, None);
+    let observed = UsageObserver::with_run(run);
+    let output = client
+        .compress_messages_observed(
+            "fixture",
+            &history(100),
+            None,
+            None,
+            12000,
+            1000,
+            &cfg.retry,
+            observed,
+        )
+        .await
+        .expect("a transient mid-stream failure is retried");
+    assert_eq!(output.summary, "A retried summary");
+    assert_eq!(wire.calls.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test]
+async fn compaction_timeout_is_per_request_and_the_failure_names_its_key() {
+    let wire = Wire::new(vec![None]).await;
+    let (client, cfg) = wire.client();
+    let root = crate::tests::OwnedTestDirectory::new("cost-compaction-timeout");
+    let (run, _ledger) = profile(&root, &cfg, RequestKind::Compaction, None);
+    let error = client
+        .compress_messages_observed_with_timeout(
+            "fixture",
+            &history(100),
+            None,
+            None,
+            12000,
+            1000,
+            &cfg.retry,
+            UsageObserver::with_run(run),
+            Some(std::time::Duration::from_millis(300)),
+        )
+        .await
+        .expect_err("the held request times out");
+    assert!(error.to_string().contains("compaction_timeout_secs"), "{error}");
+}

@@ -520,11 +520,27 @@ pub async fn handle_compress(
     }
     renderer.write_line("", crossterm::style::Color::White)?;
 
-    let observed = crate::spend::run::UsageObserver::with_run(crate::spend::run::Run::for_session(
+    let compaction_run = crate::spend::run::Run::for_session(
         ui.session,
         ui.cfg,
         crate::spend::RequestKind::Compaction,
-    ));
+    );
+    // `compaction_model` swaps the summarizer model and its price profile.
+    let compaction_model = ui.cfg.resolve_compaction_model(&ui.session.provider);
+    let compaction_run = match &compaction_model {
+        Some((alias, model)) => compaction_run.for_model(
+            &ui.session.provider,
+            model,
+            ui.cfg,
+            Some(alias),
+            None,
+            crate::spend::RequestKind::Compaction,
+        ),
+        None => compaction_run,
+    };
+    let compaction_model = compaction_model.map(|(_, model)| model);
+    let compaction_timeout = ui.cfg.resolve_compaction_timeout();
+    let observed = crate::spend::run::UsageObserver::with_run(compaction_run);
     let request_observer = observed.clone();
     let client = &ui.client;
     let retry_config = &ui.cfg.retry;
@@ -539,8 +555,9 @@ pub async fn handle_compress(
         keep_recent_tool_results,
         restore_read_tokens,
         |model, messages, previous_summary, input_budget, response_budget| async move {
+            let model = compaction_model.unwrap_or(model);
             client
-                .compress_messages_observed(
+                .compress_messages_observed_with_timeout(
                     &model,
                     &messages,
                     previous_summary.as_deref(),
@@ -549,6 +566,7 @@ pub async fn handle_compress(
                     response_budget,
                     retry_config,
                     request_observer,
+                    compaction_timeout,
                 )
                 .await
         },

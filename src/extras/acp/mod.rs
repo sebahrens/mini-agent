@@ -4678,16 +4678,32 @@ async fn execute_prompt(
         let compaction_client = &client;
         #[cfg(feature = "goal")]
         let goal_store_for_compaction = goal_store.clone();
-        let compaction_model = &model_str;
+        let configured_compaction = state.cfg.resolve_compaction_model(&provider_str);
+        let compaction_model_name = configured_compaction
+            .as_ref()
+            .map_or(model_str.as_str(), |(_, model)| model.as_str());
+        let compaction_model = &compaction_model_name;
+        let compaction_timeout = state.cfg.resolve_compaction_timeout();
         let compaction_retry = &state.cfg.retry;
         let observed = crate::spend::run::Run::current().map_or_else(Default::default, |run| {
-            crate::spend::run::UsageObserver::with_run(run.with_captured_profile(
-                &provider_str,
-                &model_str,
-                run.prices,
-                &state.cfg,
-                crate::spend::RequestKind::Compaction,
-            ))
+            let compaction_run = match &configured_compaction {
+                Some((alias, model)) => run.for_model(
+                    &provider_str,
+                    model,
+                    &state.cfg,
+                    Some(alias),
+                    None,
+                    crate::spend::RequestKind::Compaction,
+                ),
+                None => run.with_captured_profile(
+                    &provider_str,
+                    &model_str,
+                    run.prices,
+                    &state.cfg,
+                    crate::spend::RequestKind::Compaction,
+                ),
+            };
+            crate::spend::run::UsageObserver::with_run(compaction_run)
         });
         let compacted = history
             .compact_with_known(
@@ -4700,7 +4716,7 @@ async fn execute_prompt(
                     let provider_str = provider_str.clone();
                     async move {
                         let mut output = compaction_client
-                            .compress_messages_observed(
+                            .compress_messages_observed_with_timeout(
                                 compaction_model,
                                 &messages,
                                 previous_summary.as_deref(),
@@ -4709,6 +4725,7 @@ async fn execute_prompt(
                                 reserve,
                                 compaction_retry,
                                 observed,
+                                compaction_timeout,
                             )
                             .await?;
                         output.usage = state.cfg.normalize_usage(&provider_str, output.usage);

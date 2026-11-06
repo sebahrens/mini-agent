@@ -847,6 +847,20 @@ async fn compact_headless_session(
 ) -> anyhow::Result<(crate::event::UsageDelta, bool)> {
     let spend =
         crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Compaction);
+    // `compaction_model` swaps the summarizer model and its price profile.
+    let compaction_model = cfg.resolve_compaction_model(&session.provider);
+    let spend = match &compaction_model {
+        Some((alias, model)) => spend.for_model(
+            &session.provider,
+            model,
+            cfg,
+            Some(alias),
+            None,
+            crate::spend::RequestKind::Compaction,
+        ),
+        None => spend,
+    };
+    let compaction_model = compaction_model.map(|(_, model)| model);
     let observed = crate::spend::run::UsageObserver::with_run(spend.clone());
     let request_observer = observed.clone();
     let compacted = compact_headless_session_with_force(
@@ -862,8 +876,9 @@ async fn compact_headless_session(
                 crate::extras::hooks::dispatch_pre_compact(true, instructions)
             })
             .await;
+            let model = compaction_model.unwrap_or(model);
             client
-                .compress_messages_observed(
+                .compress_messages_observed_with_timeout(
                     &model,
                     &messages,
                     previous_summary.as_deref(),
@@ -872,6 +887,7 @@ async fn compact_headless_session(
                     response_token_budget,
                     &cfg.retry,
                     request_observer,
+                    cfg.resolve_compaction_timeout(),
                 )
                 .await
         },

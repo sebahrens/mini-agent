@@ -6,6 +6,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Context compaction
+
+- Compaction summary requests are retried when the provider stream fails after the first chunk
+  (only the failed rolling request restarts, keeping the earlier work). The 300 s whole-compaction
+  cap is now a per-request timeout (default scaled with the summarizer input, `compaction_timeout_secs`
+  overrides it), and `compaction_model` names a same-provider `quick_models` entry for a
+  faster or cheaper summarizer.
+
 ### Cost tracking
 
 - The global usage ledger no longer has a permanent 65,536-record / 64 MiB wall: a full
