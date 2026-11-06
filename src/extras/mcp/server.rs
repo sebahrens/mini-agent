@@ -1136,9 +1136,15 @@ mod tests {
             &[
                 // A prefix of a (foreign or own) session id, a name, and a path.
                 call(1, json!({"prompt":"p","session_id":"0b9f"})),
-                call(2, json!({"prompt":"p","session_id":"my-interactive-session"})),
+                call(
+                    2,
+                    json!({"prompt":"p","session_id":"my-interactive-session"}),
+                ),
                 call(3, json!({"prompt":"p","session_id":"../other"})),
-                call(4, json!({"prompt":"p","session_id":"0b9f6c1e-1111-2222-3333-444455556666"})),
+                call(
+                    4,
+                    json!({"prompt":"p","session_id":"0b9f6c1e-1111-2222-3333-444455556666"}),
+                ),
             ],
         )
         .await;
@@ -1156,9 +1162,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_returned_session_id_is_remembered_for_the_next_call() {
-        let command = shell(
-            r#"printf '{"result":"ok","session_id":"issued-1","session_persisted":true}'"#,
-        );
+        let command =
+            shell(r#"printf '{"result":"ok","session_id":"issued-1","session_persisted":true}'"#);
         let (mut client_in, server_in) = tokio::io::duplex(1 << 16);
         let (server_out, client_out) = tokio::io::duplex(1 << 16);
         let server = tokio::spawn(serve(command, server_in, server_out));
@@ -1189,16 +1194,15 @@ mod tests {
             r#"trap 'echo "stopped at step 3" >&2; printf "%s\n" "{\"result\":\"partial\",\"session_id\":\"saved-1\",\"session_persisted\":true}"; exit 130' TERM; sleep 30 >/dev/null 2>&1 & wait"#,
         );
         saves.timeout = Duration::from_millis(300);
-        let replies = exchange(
-            saves.clone(),
-            &[call(1, json!({"prompt":"x"}))],
-        )
-        .await;
+        let replies = exchange(saves.clone(), &[call(1, json!({"prompt":"x"}))]).await;
         let result = &replies[0]["result"];
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(result["isError"], true, "{text}");
         assert!(text.contains("timed out after"), "{text}");
-        assert!(text.contains("saved-1") && text.contains("stopped at step 3"), "{text}");
+        assert!(
+            text.contains("saved-1") && text.contains("stopped at step 3"),
+            "{text}"
+        );
         assert_eq!(result["structuredContent"]["session_id"], "saved-1");
         // The reported id is now resumable.
         assert!(saves.issued_sessions.contains("saved-1"));
@@ -1210,7 +1214,10 @@ mod tests {
         let replies = exchange(stubborn, &[call(1, json!({"prompt":"x"}))]).await;
         let text = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
         assert_eq!(replies[0]["result"]["isError"], true);
-        assert!(text.contains("timed out") && text.contains("no session id"), "{text}");
+        assert!(
+            text.contains("timed out") && text.contains("no session id"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -1227,14 +1234,28 @@ mod tests {
             ],
         )
         .await;
-        let refused = replies.iter().filter(|r| r["error"]["code"] == -32000).count();
+        let refused = replies
+            .iter()
+            .filter(|r| r["error"]["code"] == -32000)
+            .count();
         assert_eq!(refused, 1, "{replies:?}");
         let listed = replies.iter().find(|r| r["id"] == 10).unwrap();
-        let description = listed["result"]["tools"][0]["description"].as_str().unwrap();
-        assert!(description.contains("90 s") && description.contains("at most 1 runs"), "{description}");
-        let args: Vec<OsString> = ["--mcp-server", "--mcp-server-timeout", "7", "--mcp-server-max-runs=2", "--read-only"]
-            .map(OsString::from)
-            .to_vec();
+        let description = listed["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            description.contains("90 s") && description.contains("at most 1 runs"),
+            "{description}"
+        );
+        let args: Vec<OsString> = [
+            "--mcp-server",
+            "--mcp-server-timeout",
+            "7",
+            "--mcp-server-max-runs=2",
+            "--read-only",
+        ]
+        .map(OsString::from)
+        .to_vec();
         assert_eq!(valued_flag(&args, "--mcp-server-timeout"), Some(7));
         assert_eq!(valued_flag(&args, "--mcp-server-max-runs"), Some(2));
         assert_eq!(forwarded_args(args), ["--read-only"].map(OsString::from));
