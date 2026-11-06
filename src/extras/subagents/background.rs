@@ -2213,8 +2213,8 @@ const EVIDENCE_PAGE_BYTES: usize = 16 * 1024;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EvidenceArgs {
-    task_id: String,
-    id: String,
+    pub(super) task_id: String,
+    pub(super) id: String,
     #[serde(default)]
     offset: Option<usize>,
     #[serde(default)]

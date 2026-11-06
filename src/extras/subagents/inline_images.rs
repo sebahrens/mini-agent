@@ -16,10 +16,11 @@
 //! makes sure the returned string can never parse as a bare JSON object with
 //! `response`/`parts` keys, which rig would otherwise lift into image content.
 //!
-//! The build has no image decoder, so nothing is resampled: an image whose
-//! longer side exceeds [`MAX_LONG_EDGE_PX`] (Claude's standard tier) is
-//! omitted with a note pointing at `task_evidence`, using the dimensions the
-//! evidence store recorded from the image header.
+//! This lane never resamples: an image whose longer side exceeds
+//! [`MAX_LONG_EDGE_PX`] (Claude's standard tier) is omitted with a note
+//! pointing at `task_evidence`, using the dimensions the evidence store
+//! recorded from the image header. (Other tools can fit images, see
+//! `image_fit`; this lane deliberately does not.)
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -184,6 +185,12 @@ pub(crate) struct Lane<'a> {
     pub(crate) permission: &'a Option<crate::permission::checker::PermCheck>,
 }
 
+/// The follow-up the parent is told to run. `task_evidence` requires the
+/// task id (`deny_unknown_fields`, no default), so the hint carries it.
+fn fetch_hint(task_id: &str, id: &str) -> String {
+    format!("open it with task_evidence {{\"task_id\":\"{task_id}\",\"id\":\"{id}\"}}")
+}
+
 /// Choose the images to inline for one child's accepted report. `charge`
 /// receives each image's patch-formula token estimate and returns whether the
 /// task cost budget admitted it (it charges the budget when it does).
@@ -197,7 +204,7 @@ pub(crate) async fn select(
     if lane.cap == 0 {
         return selection;
     }
-    let fetch = |id: &str| format!("open it with task_evidence {{\"id\":\"{id}\"}}");
+    let fetch = |id: &str| fetch_hint(&stored.task_id, id);
     for number in attach_ids(report) {
         let id = format!("E{number}");
         let Some((meta, path)) = stored.get(&id) else {
@@ -352,6 +359,16 @@ pub(crate) fn envelope(text: String, images: &[InlineImage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fetch_hint_parses_as_evidence_args() {
+        let hint = fetch_hint("task-7", "E5");
+        let json = hint.strip_prefix("open it with task_evidence ").unwrap();
+        let args: super::super::background::EvidenceArgs = serde_json::from_str(json)
+            .unwrap_or_else(|error| panic!("hint {json} must parse: {error}"));
+        assert_eq!(args.task_id, "task-7");
+        assert_eq!(args.id, "E5");
+    }
 
     #[test]
     fn caps_are_clamped_narrowed_and_need_evidence_and_foreground() {
