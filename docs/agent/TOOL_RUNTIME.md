@@ -75,6 +75,16 @@ persist between calls. The permission key is the script with the directory
 change (`cd -- '<dir>' || exit 1; <command>`), so allow rules and approvals are
 per directory, while a deny rule on the bare command still applies.
 
+`pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
+no ConPTY path, so on Windows the tool schemas omit them and the model is never
+offered a pseudo-terminal; a call that still sends `pty = true` is refused with
+a message saying so.
+
+`pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
+no ConPTY path, so on Windows the tool schemas omit them and the model is never
+offered a pseudo-terminal; a call that still sends `pty = true` is refused with
+a message saying so.
+
 `job_status action=input` refuses C0 control bytes other than LF and CR (Tab,
 Ctrl-U, backspace, ESC, DEL, ...) and shell history expansion (`!` followed by
 text, a line starting with `^`), because an interactive bash or zsh rewrites

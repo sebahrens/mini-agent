@@ -400,7 +400,7 @@ impl Tool for ShellTool {
                 }),
             );
         }
-        schema
+        without_unsupported_pty(schema, PTY_SUPPORTED)
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
@@ -897,6 +897,41 @@ async fn forward_progress<T>(
     }
 }
 
+/// Whether this platform can run a command under a pseudo-terminal. Unix
+/// only: there is no ConPTY path, so on Windows the model is never offered
+/// `pty`, terminal input or named keys (mini-agent-jguj1).
+const PTY_SUPPORTED: bool = cfg!(unix);
+
+/// Remove the pseudo-terminal parameters from a `shell` or `job_status` tool
+/// schema when the platform cannot honour them.
+fn without_unsupported_pty(
+    mut schema: serde_json::Value,
+    pty_supported: bool,
+) -> serde_json::Value {
+    if pty_supported {
+        return schema;
+    }
+    if let Some(properties) = schema["properties"].as_object_mut() {
+        for name in ["pty", "input", "keys"] {
+            properties.remove(name);
+        }
+        if let Some(actions) = properties
+            .get_mut("action")
+            .and_then(|action| action["enum"].as_array_mut())
+        {
+            actions.retain(|action| action != "input");
+        }
+        if let Some(action) = properties.get_mut("action")
+            && let Some(description) = action["description"].as_str()
+        {
+            action["description"] = serde_json::Value::from(
+                description.replace(", or type input into a pty=true job", ""),
+            );
+        }
+    }
+    schema
+}
+
 /// Append the completion notices of background jobs that ended on their own
 /// since the model last heard about them, so a long turn learns of them at
 /// its next tool result (mini-agent-cw4f3). Delivered once.
@@ -1138,7 +1173,7 @@ impl Tool for JobStatusTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
+        let schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "id": {
@@ -1175,7 +1210,8 @@ impl Tool for JobStatusTool {
                 }
             },
             "required": []
-        })
+        });
+        without_unsupported_pty(schema, PTY_SUPPORTED)
     }
 
     async fn call(&self, args: JobStatusArgs) -> Result<String, ToolError> {
@@ -3289,6 +3325,31 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(text.contains("does NOT persist"), "{text}");
+    }
+
+    #[test]
+    fn pty_parameters_are_offered_only_where_a_pty_exists() {
+        let shell = test_tool().parameters();
+        let status = JobStatusTool::new(test_tool().sandbox, None).parameters();
+        assert_eq!(shell["properties"].get("pty").is_some(), PTY_SUPPORTED);
+        assert_eq!(status["properties"].get("keys").is_some(), PTY_SUPPORTED);
+        // A platform without a pty never offers pty, input or keys.
+        let shell = without_unsupported_pty(test_tool().parameters(), false);
+        assert!(shell["properties"].get("pty").is_none());
+        assert!(shell["properties"].get("command").is_some());
+        let status = without_unsupported_pty(
+            JobStatusTool::new(test_tool().sandbox, None).parameters(),
+            false,
+        );
+        for name in ["input", "keys"] {
+            assert!(status["properties"].get(name).is_none(), "{name}");
+        }
+        let actions = status["properties"]["action"]["enum"].as_array().unwrap();
+        assert!(
+            !actions.iter().any(|action| action == "input"),
+            "{actions:?}"
+        );
+        assert!(status["properties"].get("timeout_ms").is_some());
     }
 
     #[test]

@@ -81,6 +81,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `shell` takes an optional `workdir` (workspace-relative or absolute inside the workspace, symlink
   and `..` escapes refused) for foreground, background and pty commands; `cd` still does not persist
   and the permission key includes the directory (mini-agent-nyp3y).
+- On platforms without a pseudo-terminal (Windows has no ConPTY path) the `shell` schema omits `pty`
+  and `job_status` omits `action=input` and `keys`, so the model is never offered them; a stray
+  `pty=true` fails with a clear message (mini-agent-jguj1).
+- On platforms without a pseudo-terminal (Windows has no ConPTY path) the `shell` schema omits `pty`
+  and `job_status` omits `action=input` and `keys`, so the model is never offered them; a stray
+  `pty=true` fails with a clear message (mini-agent-jguj1).
 - Background shell jobs that end on their own queue one bounded completion notice (id, command,
   status, exit code, output tail, log path), delivered once with the next `shell`/`job_status`
   result and the next model request; an idle TUI session is woken (at most 8 in a row). Opt out with

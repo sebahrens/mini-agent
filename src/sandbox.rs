@@ -6392,7 +6392,7 @@ fn command_stdio(pty: bool) -> std::io::Result<CommandStdio> {
     {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "pty=true is not supported on this platform",
+            "pty=true is not supported on this platform (no pseudo-terminal; Windows has no ConPTY path). Run the command without pty; programs that need a TTY cannot be driven here.",
         ))
     }
 }
