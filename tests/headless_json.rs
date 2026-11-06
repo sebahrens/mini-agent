@@ -5335,3 +5335,84 @@ fn headless_agent_mentions_on_refuses_an_unknown_agent_before_any_request() {
         "{stderr}"
     );
 }
+
+// mini-agent-cr55c: `--input-format stream-json` runs one turn per JSON user
+// line in one session; malformed lines are reported and skipped.
+#[test]
+fn stream_json_input_runs_each_user_line_as_a_turn_in_one_session() {
+    use std::process::Stdio;
+    let root = TempRoot::new();
+    let server = scripted_provider(
+        &root,
+        "",
+        vec![
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant", "content":"first answer"}),
+                "stop",
+            ),
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant", "content":"second answer"}),
+                "stop",
+            ),
+        ],
+    );
+    let mut command = root.provider_command("read");
+    command
+        .args([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output",
+            "stream-json",
+            "--stream-json-preview-bytes",
+            "4096",
+        ])
+        .stdin(Stdio::piped());
+    let input = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"hello one"}}"#,
+        "\n",
+        "not json\n",
+        r#"{"type":"user","message":{"content":[{"type":"text","text":"hello two"}]}}"#,
+        "\n"
+    );
+    let output = bounded_output_with_stdin(command, Some(input.as_bytes().to_vec()));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let bodies = server
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("{error}: {stderr}"));
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(bodies.len(), 2, "{stderr}");
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let results: Vec<&serde_json::Value> =
+        rows.iter().filter(|row| row["type"] == "result").collect();
+    assert_eq!(results.len(), 2, "{rows:?}");
+    assert!(rows.iter().any(|row| row["type"] == "input_error"));
+    assert_eq!(results[0]["session_id"], results[1]["session_id"]);
+    // The second request carries the first turn as history.
+    assert!(bodies[1].to_string().contains("first answer"));
+    assert!(bodies[1].to_string().contains("hello two"));
+    let session = root.saved_session();
+    let users: Vec<&str> = session["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert_eq!(users, vec!["hello one", "hello two"]);
+}
+
+#[test]
+fn stream_json_input_requires_stream_json_output() {
+    let root = TempRoot::new();
+    let mut command = root.provider_command("read");
+    command.args(["-p", "--input-format", "stream-json"]);
+    let output = bounded_output(command);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires --output stream-json"));
+}

@@ -133,7 +133,7 @@ fn main() -> anyhow::Result<ExitCode> {
 }
 
 fn report_runtime_headless_error(runtime: &tokio::runtime::Runtime, message: String) {
-    let (message, _) = print::bounded_progress(&message, print::HEADLESS_PROGRESS_BYTES);
+    let (message, _) = print::bounded_progress(&message, print::progress_bytes());
     let _ = runtime.block_on(Box::pin(print::headless_stderr_async(message)));
 }
 

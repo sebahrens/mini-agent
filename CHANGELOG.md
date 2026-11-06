@@ -27,6 +27,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   subdirectories becomes a namespace (`/deploy:ship`), Claude Code `argument-hint`/`allowed-tools`
   frontmatter is accepted (granting nothing), and `/help` lists every skipped command file with its
   reason.
+- Headless `--input-format stream-json` (with `--output stream-json`) runs one turn per JSON user
+  line on stdin in one session; `--stream-json-preview-bytes` and `--max-stdin-bytes` make the
+  8 KiB preview and 1 MiB stdin limits configurable.
 - Opt-in `persist_project_approvals`: TUI approval prompts offer `(p) always allow in this
   project`, stored privately per workspace in the state directory (never in the repository) and
   loaded at interactive startup; `/permissions rules` and `/permissions forget <n|all>` manage

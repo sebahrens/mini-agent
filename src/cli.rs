@@ -73,6 +73,17 @@ pub enum OutputFormat {
     StreamJson,
 }
 
+/// `--input-format`: how `-p` reads its prompt(s).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InputFormat {
+    /// One prompt from the arguments (plus optional piped stdin).
+    #[default]
+    Text,
+    /// Newline-delimited JSON user messages on stdin, one turn each, in one
+    /// session (requires `--output stream-json`).
+    StreamJson,
+}
+
 #[derive(Parser, Debug, Default, Clone)]
 #[command(name = "mini-agent", version,
     long_version = concat!(env!("CARGO_PKG_VERSION"), "\nbuild: ", env!("MINI_AGENT_BUILD_FINGERPRINT"), "\ntarget: ", env!("MINI_AGENT_BUILD_TARGET")),
@@ -154,6 +165,33 @@ pub struct Cli {
         help = "With -p: output format (text, json, or stream-json)"
     )]
     pub output: Option<OutputFormat>,
+
+    #[arg(
+        long = "input-format",
+        value_name = "FORMAT",
+        value_enum,
+        requires = "print",
+        help = "With -p: input format; stream-json reads one JSON user message per stdin line and runs each as a turn (requires --output stream-json)"
+    )]
+    pub input_format: Option<InputFormat>,
+
+    #[arg(
+        long = "stream-json-preview-bytes",
+        value_name = "BYTES",
+        requires = "print",
+        value_parser = clap::value_parser!(u32).range(256..=1_048_576),
+        help = "With -p: cap for stream-json text, tool argument, tool result and diff previews (default 8192)"
+    )]
+    pub stream_json_preview_bytes: Option<u32>,
+
+    #[arg(
+        long = "max-stdin-bytes",
+        value_name = "BYTES",
+        requires = "print",
+        value_parser = clap::value_parser!(u32).range(1024..=67_108_864),
+        help = "With -p: piped stdin limit, per line with --input-format stream-json (default 1048576)"
+    )]
+    pub max_stdin_bytes: Option<u32>,
 
     #[arg(
         long,
@@ -1146,6 +1184,10 @@ impl Cli {
                 .mut_arg("model", |arg| arg.env(None::<&str>));
         }
         Self::from_arg_matches(&command.try_get_matches_from(args)?)
+    }
+
+    pub fn input_format(&self) -> InputFormat {
+        self.input_format.unwrap_or_default()
     }
 
     pub fn output_format(&self) -> OutputFormat {

@@ -27,6 +27,87 @@ static HEADLESS_STDOUT_CLOSED: std::sync::atomic::AtomicBool =
 static HEADLESS_RESULT_EMITTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Multi-turn `--input-format stream-json`: each turn emits its own result.
+pub(crate) fn reset_headless_result_emitted() {
+    HEADLESS_RESULT_EMITTED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One `--input-format stream-json` line: `{"type":"user","message":
+/// {"content": "..." | [{"type":"text","text":"..."}]}}` (Claude Code shape)
+/// or the flat `{"type":"user","content":...}`. Returns the user text.
+pub(crate) fn parse_stream_input_line(line: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|error| format!("invalid JSON: {error}"))?;
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("user") => {}
+        Some(other) => return Err(format!("unsupported input type {other:?} (only \"user\")")),
+        None => return Err("input line has no \"type\"".into()),
+    }
+    let content = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .or_else(|| value.get("content"))
+        .ok_or("user message has no content")?;
+    let text = match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                match (
+                    block.get("type").and_then(serde_json::Value::as_str),
+                    block.get("text").and_then(serde_json::Value::as_str),
+                ) {
+                    (Some("text"), Some(text)) => parts.push(text),
+                    _ => return Err("only text content blocks are supported".into()),
+                }
+            }
+            parts.join("\n")
+        }
+        _ => return Err("content must be a string or an array of text blocks".into()),
+    };
+    if text.trim().is_empty() {
+        return Err("empty user message".into());
+    }
+    Ok(text)
+}
+
+/// Read one stdin line of at most [`stdin_bytes`]; `Ok(None)` at EOF. An
+/// oversized line is consumed and reported as an error (memory stays
+/// bounded).
+pub(crate) async fn read_stream_input_line() -> anyhow::Result<Option<Result<String, String>>> {
+    let limit = stdin_bytes();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Result<String, String>>> {
+        use std::io::{BufRead as _, Read as _};
+        let stdin = io::stdin();
+        let mut line = Vec::new();
+        let read = stdin
+            .lock()
+            .take(limit as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if line.len() > limit && line.last() != Some(&b'\n') {
+            // Discard the rest of the oversized line.
+            let mut sink = Vec::new();
+            loop {
+                sink.clear();
+                let more = stdin.lock().take(64 * 1024).read_until(b'\n', &mut sink)?;
+                if more == 0 || sink.last() == Some(&b'\n') {
+                    break;
+                }
+            }
+            return Ok(Some(Err(format!(
+                "input line exceeds {limit} bytes (raise with --max-stdin-bytes)"
+            ))));
+        }
+        Ok(Some(
+            String::from_utf8(line).map_err(|_| "input line is not UTF-8".to_string()),
+        ))
+    })
+    .await?
+}
+
 pub(crate) fn headless_result_emitted() -> bool {
     HEADLESS_RESULT_EMITTED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -41,8 +122,36 @@ pub(crate) fn headless_stderr(args: std::fmt::Arguments<'_>) {
     emit_headless(io::stderr().lock(), &HEADLESS_STDERR_CLOSED, args);
 }
 
+/// Default stream-json preview cap (`--stream-json-preview-bytes`).
 pub(crate) const HEADLESS_PROGRESS_BYTES: usize = 8 * 1024;
+/// Default piped-stdin cap (`--max-stdin-bytes`).
 pub(crate) const HEADLESS_STDIN_BYTES: usize = 1024 * 1024;
+
+static PROGRESS_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(HEADLESS_PROGRESS_BYTES);
+static STDIN_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(HEADLESS_STDIN_BYTES);
+
+/// Apply `--stream-json-preview-bytes` / `--max-stdin-bytes` (clap already
+/// enforced their ranges).
+pub(crate) fn configure_headless_limits(cli: &cli::Cli) {
+    if let Some(bytes) = cli.stream_json_preview_bytes {
+        PROGRESS_BYTES.store(bytes as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(bytes) = cli.max_stdin_bytes {
+        STDIN_BYTES.store(bytes as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Effective stream-json preview cap.
+pub(crate) fn progress_bytes() -> usize {
+    PROGRESS_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Effective piped-stdin cap.
+pub(crate) fn stdin_bytes() -> usize {
+    STDIN_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct HeadlessOutputPolicy {
@@ -94,7 +203,7 @@ impl HeadlessOutputPolicy {
             headless_stdout_async(text.to_string()).await?;
         }
         if self.format == cli::OutputFormat::StreamJson {
-            let (text, truncated) = bounded_progress(text, HEADLESS_PROGRESS_BYTES);
+            let (text, truncated) = bounded_progress(text, progress_bytes());
             self.emit_event(
                 serde_json::json!({"type":"assistant_text", "text":text, "truncated":truncated}),
             )
@@ -105,7 +214,7 @@ impl HeadlessOutputPolicy {
 
     pub(crate) async fn reasoning(self, text: &str) -> anyhow::Result<()> {
         if !self.quiet {
-            let (text, _) = bounded_progress(text, HEADLESS_PROGRESS_BYTES);
+            let (text, _) = bounded_progress(text, progress_bytes());
             headless_stderr_async(text).await?;
         }
         Ok(())
@@ -118,7 +227,7 @@ impl HeadlessOutputPolicy {
         name: &str,
         args: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        let (args, args_truncated) = bounded_json_value(args, HEADLESS_PROGRESS_BYTES);
+        let (args, args_truncated) = bounded_json_value(args, progress_bytes());
         let (provider_id, id_truncated) = bounded_progress(provider_id, 512);
         let (event_name, name_truncated) = bounded_progress(name, 256);
         let truncated = args_truncated || id_truncated || name_truncated;
@@ -143,7 +252,7 @@ impl HeadlessOutputPolicy {
         output: &str,
         is_error: bool,
     ) -> anyhow::Result<()> {
-        let (bounded, output_truncated) = bounded_progress(output, HEADLESS_PROGRESS_BYTES);
+        let (bounded, output_truncated) = bounded_progress(output, progress_bytes());
         let (event_name, name_truncated) = bounded_progress(name, 256);
         let truncated = output_truncated || name_truncated;
         self.emit_event(serde_json::json!({"type":"tool_result", "id":id, "name":event_name, "output":bounded, "truncated":truncated, "is_error":is_error})).await?;
@@ -238,7 +347,7 @@ impl HeadlessMutationEvents {
         let (name, _) = bounded_progress(name, 256);
         // Serialize through a capped writer, preserving useful identity even
         // when the full typed snapshot exceeds the machine preview limit.
-        let (mut preview, truncated) = bounded_json_value(diff, HEADLESS_PROGRESS_BYTES);
+        let (mut preview, truncated) = bounded_json_value(diff, progress_bytes());
         if truncated {
             // JSON escapes can expand a raw path byte to six bytes. Retain a
             // UTF-8 prefix whose worst-case encoding still fits this preview.
@@ -362,13 +471,14 @@ fn bounded_json_value(value: &impl Serialize, limit: usize) -> (serde_json::Valu
 
 fn read_stdin_bounded(mut reader: impl io::Read) -> anyhow::Result<String> {
     use std::io::Read as _;
+    let limit = stdin_bytes();
     let mut bytes = Vec::new();
     reader
         .by_ref()
-        .take(HEADLESS_STDIN_BYTES as u64 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > HEADLESS_STDIN_BYTES {
-        anyhow::bail!("piped stdin exceeds {HEADLESS_STDIN_BYTES} bytes");
+    if bytes.len() > limit {
+        anyhow::bail!("piped stdin exceeds {limit} bytes (raise with --max-stdin-bytes)");
     }
     String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("piped stdin is not UTF-8"))
 }
@@ -415,7 +525,8 @@ pub(crate) async fn read_headless_stdin(
             // a stalled stderr write cannot hold the event-loop thread.
             if !quiet {
                 headless_stderr(format_args!(
-                    "Reading piped stdin (limit {HEADLESS_STDIN_BYTES} bytes)\n"
+                    "Reading piped stdin (limit {} bytes)\n",
+                    stdin_bytes()
                 ));
             }
             read_stdin_bounded(io::stdin().lock())
@@ -3808,5 +3919,29 @@ mod config69_source_tests {
             assert!(!shown.contains(secret));
         }
         assert_eq!(entries.len(), config::keys::CONFIG_KEYS.len());
+    }
+
+    #[test]
+    fn cr55c_stream_input_lines_accept_claude_and_flat_user_shapes() {
+        assert_eq!(
+            super::parse_stream_input_line(
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#
+            )
+            .unwrap(),
+            "hi"
+        );
+        assert_eq!(
+            super::parse_stream_input_line(r#"{"type":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}"#).unwrap(),
+            "a\nb"
+        );
+        for bad in [
+            "not json",
+            r#"{"type":"control"}"#,
+            r#"{"content":"x"}"#,
+            r#"{"type":"user","content":"  "}"#,
+            r#"{"type":"user","content":[{"type":"image","source":{}}]}"#,
+        ] {
+            assert!(super::parse_stream_input_line(bad).is_err(), "{bad}");
+        }
     }
 }
