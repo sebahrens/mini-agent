@@ -71,8 +71,16 @@ identity again after waiting for that lane. Time a call's children spend
 waiting for a lane is not charged to its deadline (see
 [Configuration](#configuration)).
 
-Use `task_list`, `task_result {"id":"…"}` and `task_cancel {"id":"…"}` from an
+Use `task_list`, `task_result {"id":"…"}`, `task_cancel {"id":"…"}` and `task_send` from an
 agent (and `task_evidence`, see [Evidence handles](#evidence-handles)), or `/tasks`, `/tasks result <id>`, `/tasks cancel <id>` and `/tasks clear` from the TUI.
+`task_send {"id":"…","message":"…","task":2}` sends a follow-up message
+(at most 16 KiB, at most 8 waiting per child) to the running children of a
+background task, or only to its `## Task N` child with `task`. Each running
+child receives it as a user message, labelled as coming from the parent
+agent, at its next model-call boundary; a child that finishes first never sees
+it, and finished, cancelling, unknown or restored tasks are refused. The
+message is data: it grants no permission and changes no tool, sandbox or
+budget. Children do not message each other; there is no team mode.
 Agent controls obey ordinary tool ceilings and permissions. Cancellation reports
 `cancelling` until the actual model, approvals and effects settle. The default
 `background_tasks` footer item shows active tasks and reports awaiting delivery.

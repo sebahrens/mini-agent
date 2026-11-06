@@ -158,6 +158,9 @@ pub(crate) struct PersonaExecution {
     /// Persona `contract: none`: the child is told to answer in plain text
     /// instead of the host Findings/Unverified/Coverage sections.
     pub(crate) free_form: bool,
+    /// Background child: parent `task_send` messages arrive through this
+    /// inbox at the child's model-call boundaries.
+    pub(crate) inbox: Option<super::inbox::ChildInbox>,
     /// Host evidence handles are on for this delegation: the child is told
     /// how to cite `[evidence: En]` (see `prompt::EVIDENCE_CITATION_RULES`).
     pub(crate) evidence: bool,
@@ -983,6 +986,9 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
             window: context_window,
         })
         .add_hook(crate::extras::subagents::image_cost::ChildImageCeiling::default());
+    if let Some(inbox) = &persona.inbox {
+        builder = builder.add_hook(super::inbox::ChildInboxHook(inbox.clone()));
+    }
     builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
         uuid::Uuid::new_v4().to_string(),
         None,
@@ -2637,6 +2643,7 @@ mod provider_param_tests {
         PersonaExecution {
             write_mode: false,
             free_form: false,
+            inbox: None,
             tools: None,
             evidence: false,
             inline_images: 0,

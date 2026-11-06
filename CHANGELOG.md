@@ -38,6 +38,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   `task_evidence` for an evicted or pre-restart handle now reports it as expired.
 - `task` accepts `"isolation": "worktree"` for a write persona without editing its frontmatter,
   and `"base_ref"` to branch isolated children from a chosen commit instead of the parent `HEAD`.
+- New parent tool `task_send {id, message, task?}` delivers a follow-up message to the running
+  children of a background task as user input at their next model-call boundary; terminal tasks
+  are refused and the message grants no permission.
 
 **Fork release 1.14.2 (2026-10-28)**
 

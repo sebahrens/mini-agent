@@ -74,6 +74,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "task_result"
             | "task_list"
             | "task_cancel"
+            | "task_send"
             | "task_evidence"
             | "memory_write"
             | "memory_edit"
@@ -1267,6 +1268,13 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             ));
             all_tools.push(Box::new(
                 crate::extras::subagents::background::CancelTool::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                    workspace.clone(),
+                ),
+            ));
+            all_tools.push(Box::new(
+                crate::extras::subagents::background::SendTool::new(
                     permission.clone(),
                     ask_tx.clone(),
                     workspace.clone(),
@@ -2575,6 +2583,7 @@ mod mcp_tests {
             <crate::extras::subagents::background::ResultTool as rig::tool::Tool>::NAME,
             <crate::extras::subagents::background::ListTool as rig::tool::Tool>::NAME,
             <crate::extras::subagents::background::CancelTool as rig::tool::Tool>::NAME,
+            <crate::extras::subagents::background::SendTool as rig::tool::Tool>::NAME,
         ] {
             assert!(is_reserved_builtin_tool_name(name), "{name}");
         }

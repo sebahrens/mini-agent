@@ -396,6 +396,8 @@ struct Entry {
     result: Option<String>,
     scope: Option<Arc<AgentWorkScope>>,
     observation: Option<JobObservation>,
+    /// Parent messages for this job's running children (`task_send`).
+    inbox: Option<Arc<crate::extras::subagents::inbox::JobInbox>>,
 }
 #[derive(Default)]
 struct State {
@@ -518,6 +520,7 @@ impl NoticeLease {
 pub(crate) struct Admission {
     pool: Arc<Pool>,
     id: String,
+    inbox: Arc<crate::extras::subagents::inbox::JobInbox>,
     job_scope: Arc<AgentWorkScope>,
     observation: JobObservation,
     recorder: crate::session::file_checkpoints::Recorder,
@@ -668,6 +671,7 @@ impl Pool {
                     saved,
                     scope: None,
                     observation: None,
+                    inbox: None,
                 },
             );
         }
@@ -778,6 +782,7 @@ impl Pool {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let job_scope = AgentWorkScope::new();
+        let inbox = Arc::new(crate::extras::subagents::inbox::JobInbox::default());
         state.jobs.insert(
             id.clone(),
             Entry {
@@ -791,6 +796,7 @@ impl Pool {
                 result: None,
                 scope: Some(job_scope.clone()),
                 observation: Some(observation.clone()),
+                inbox: Some(inbox.clone()),
             },
         );
         self.history.set(&state.jobs[&id].saved, Some(&observation));
@@ -798,6 +804,7 @@ impl Pool {
         Ok(Admission {
             pool: self.clone(),
             id,
+            inbox,
             job_scope,
             recorder: recorder.for_background(observation.clone()),
             observation,
@@ -1084,6 +1091,31 @@ impl Pool {
         }
         Ok(saved)
     }
+    /// `task_send`: queue `message` for the running children of job `id`
+    /// (all, or the 0-based `child`). Refused for unknown, finished,
+    /// cancelling and restored tasks.
+    pub(crate) fn send(
+        &self,
+        id: &str,
+        child: Option<usize>,
+        message: &str,
+    ) -> anyhow::Result<usize> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = state
+            .jobs
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("unknown task in this session"))?;
+        anyhow::ensure!(
+            entry.saved.status == Status::Running,
+            "task {id} is {}; task_send reaches only running background tasks",
+            entry.saved.status.as_str()
+        );
+        let inbox = entry
+            .inbox
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("task {id} has no live children"))?;
+        inbox.send(child, message).map_err(anyhow::Error::msg)
+    }
     pub(crate) fn request_cancel(&self, id: &str) -> anyhow::Result<SavedTask> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let entry = state
@@ -1182,6 +1214,10 @@ impl Admission {
     }
     pub(crate) fn observation(&self) -> JobObservation {
         self.observation.clone()
+    }
+    /// The job's inbox for `task_send` messages to its running children.
+    pub(crate) fn inbox(&self) -> Arc<crate::extras::subagents::inbox::JobInbox> {
+        self.inbox.clone()
     }
     #[cfg(test)]
     pub(crate) fn start<F>(self, work: F, run: crate::spend::run::Run) -> anyhow::Result<String>
@@ -1815,6 +1851,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_send_reaches_running_children_and_refuses_finished_tasks() {
+        let root = crate::tests::OwnedTestDirectory::new("background-send");
+        let (_session, pool, workspace, run, recorder) = fixture(&root);
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let inbox = admission.inbox();
+        let child = inbox.child(0);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let id = admission
+            .start(
+                async move {
+                    let _guard = child.running_guard();
+                    let _ = release_rx.await;
+                    Ok("done".into())
+                },
+                run.clone(),
+            )
+            .unwrap();
+        assert_eq!(pool.send(&id, None, "steer").unwrap(), 1);
+        assert!(
+            pool.send(&uuid::Uuid::new_v4().to_string(), None, "x")
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        settled(&pool, &id).await;
+        let error = pool.send(&id, None, "too late").unwrap_err().to_string();
+        assert!(error.contains("completed"), "{error}");
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn background56_closed_owner_refuses_reserved_but_not_registered_work() {
         let root = crate::tests::OwnedTestDirectory::new("background56-close-admission");
         let (_session, pool, workspace, run, recorder) = fixture(&root);
@@ -2048,6 +2114,93 @@ impl<const OP: u8> rig::tool::Tool for ControlTool<OP> {
         }
         .map_err(|error| ToolError::Msg(error.to_string()))?;
         serde_json::to_string(&value).map_err(|error| ToolError::Msg(error.to_string()))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SendArgs {
+    id: String,
+    message: String,
+    /// 1-based task index within the job; omitted sends to every running child.
+    #[serde(default)]
+    task: Option<usize>,
+}
+
+/// `task_send`: a bounded message from the parent to the running children of
+/// one of its background tasks, delivered as user input at their next model
+/// boundary. Ordinary tool permissions apply; it grants the child nothing.
+pub(crate) struct SendTool {
+    permission: Option<crate::permission::checker::PermCheck>,
+    ask: Option<crate::permission::ask::AskSender>,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+}
+
+impl SendTool {
+    pub(crate) fn new(
+        permission: Option<crate::permission::checker::PermCheck>,
+        ask: Option<crate::permission::ask::AskSender>,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        Self {
+            permission,
+            ask,
+            workspace,
+        }
+    }
+}
+
+impl rig::tool::Tool for SendTool {
+    const NAME: &'static str = "task_send";
+    type Error = crate::agent::tools::ToolError;
+    type Args = SendArgs;
+    type Output = String;
+    fn description(&self) -> String {
+        "Send a follow-up message to the running children of one of this session's background tasks. Each running child receives it as a user message at its next model turn boundary; finished, cancelled or restored tasks are refused. The message grants no permission.".into()
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "maxLength": 64, "description": "Background task ID returned by task or task_list"},
+                "message": {"type": "string", "minLength": 1, "maxLength": crate::extras::subagents::inbox::MAX_MESSAGE_BYTES, "description": "Follow-up instruction or context for the child"},
+                "task": {"type": "integer", "minimum": 1, "description": "Optional 1-based child (Task N) within the job; omit to message every running child"}
+            },
+            "required": ["id", "message"],
+            "additionalProperties": false
+        })
+    }
+    async fn call(&self, args: SendArgs) -> Result<String, Self::Error> {
+        use crate::agent::tools::ToolError;
+        let run = crate::spend::run::Run::current()
+            .ok_or_else(|| ToolError::Msg("task_send requires the owning session run".into()))?;
+        let pool = run
+            .background_pool()
+            .ok_or_else(|| ToolError::Msg("task_send has no owning session pool".into()))?;
+        let validate = || -> anyhow::Result<()> {
+            anyhow::ensure!(
+                run.belongs_to_account(&pool.session, &pool.account),
+                "task control account changed"
+            );
+            pool.validate_workspace(&self.workspace)
+        };
+        validate().map_err(|error| ToolError::Msg(error.to_string()))?;
+        if args.id.len() > 64 || uuid::Uuid::parse_str(&args.id).is_err() {
+            return Err(ToolError::Msg("task_send requires a valid task ID".into()));
+        }
+        let child = match args.task {
+            Some(0) => return Err(ToolError::Msg("task_send: task is 1-based".into())),
+            other => other.map(|task| task - 1),
+        };
+        crate::agent::tools::check_perm(&self.permission, &self.ask, Self::NAME, &args.id).await?;
+        validate().map_err(|error| ToolError::Msg(error.to_string()))?;
+        let count = pool
+            .send(&args.id, child, &args.message)
+            .map_err(|error| ToolError::Msg(error.to_string()))?;
+        Ok(format!(
+            "Message queued for {count} running child(ren) of task {}; each receives it as a user message at its next model turn boundary (a child that finishes first never sees it).",
+            args.id
+        ))
     }
 }
 

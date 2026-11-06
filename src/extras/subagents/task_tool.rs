@@ -789,6 +789,7 @@ fn resolve_persona_runtime_with(
         execution: builder::PersonaExecution {
             write_mode: specialization.write_mode,
             free_form: specialization.run.free_form,
+            inbox: None,
             tools: specialization.tools.clone(),
             // Set per delegation from `task_evidence`.
             evidence: false,
@@ -1669,6 +1670,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             })
             .unwrap_or_default();
         let resume_history = resumed.map(|stored| Arc::new(stored.history));
+        let job_inbox = admission.as_ref().map(super::background::Admission::inbox);
         let resume_agent_type = agent_type.clone();
         let executor: TaskExecutor = Arc::new(move |index, prompt_text| {
             let details_sink = executor_sink.clone();
@@ -1713,6 +1715,11 @@ editing in a known location, grepping for a literal you will act on immediately.
             let mut persona = runtime.execution.clone();
             persona.evidence = evidence_enabled;
             persona.free_form = report_policy.free_form;
+            persona.inbox = job_inbox.as_ref().map(|inbox| inbox.child(index));
+            let inbox_guard = persona
+                .inbox
+                .as_ref()
+                .map(super::inbox::ChildInbox::running_guard);
             persona.inline_images = inline_cap;
             let inline_budget = inline_budget.clone();
             let inline_sink = executor_inline_sink.clone();
@@ -1765,6 +1772,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                     .max(cost_policy.units(&observed))
             });
             let future = crate::startup::heap_future(|| async move {
+                // Held for the child's whole run: dropping it ends delivery.
+                let _inbox_guard = inbox_guard;
                 if let Some(spend) = &spend_profile
                     && let Err(error) = spend.admit()
                 {
