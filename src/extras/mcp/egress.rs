@@ -562,8 +562,10 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("non-public address"), "{error}");
 
+        // Connection: close, because the fixture closes each socket after one
+        // response and this client's pool would otherwise reuse it for /token.
         let Some((port, _)) = loopback_server(
-            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         ) else {
             return;
         };
