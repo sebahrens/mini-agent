@@ -749,6 +749,14 @@ untracked files inside them individually. `stage` expands directory operands wit
 and checks attributes over stdin, so a directory of many thousands of files stages; a selection too
 large for that budget fails with a message to stage narrower subdirectories (mini-agent-ql57u).
 
+`commit` and `tag` results always carry `hooks_run: false`, `signed: false` and a `notice`: the
+tool forces `core.hooksPath=/dev/null` and disables commit/tag signing, so repository hooks
+(pre-commit, commit-msg) and required signatures are not applied and the model must not claim they
+passed. `commit` also accepts `signoff` (adds `Signed-off-by`), `allow_empty`, and `amend`. Amend
+is guarded: it needs the separate `git/amend` permission in addition to `git/commit`, an existing
+`HEAD`, and a `HEAD` not contained in any remote-tracking ref (`refs/remotes/*`), so published
+history is never rewritten (mini-agent-v7fnv).
+
 `src/ui/slash/git.rs` owns parsing, bounded request-path selection, proposal
 validation and SDK-free native actors for `/diff`, `/commit` and `/pr`. The App
 owns the preview, async event receiver and captured session/workspace identity.

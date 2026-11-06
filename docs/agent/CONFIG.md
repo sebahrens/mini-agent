@@ -2336,7 +2336,7 @@ Permission actions are lowercase strings: `allow`, `ask`, or `deny`. Each tool
 rule can be a single action or an object mapping patterns to actions. Supported
 permission tool keys are `shell` (`bash` is a compatibility alias), `js/fetch` (`fetch` alias), `read`, `write`, `edit`, `grep`,
 `find_files`, `list_dir`, `todo_write` (`write_todo_list` alias), `git/status`, `git/diff`, `git/log`,
-`git/show`, `git/stage`, `git/unstage`, `git/commit`, `git/branch`, `git/switch`, `git/stash`,
+`git/show`, `git/stage`, `git/unstage`, `git/commit`, `git/amend`, `git/branch`, `git/switch`, `git/stash`,
 `git/tag`, `git/restore`, and `mcp_tool`.
 MCP-backed calls use `mcp_tool` as the tool key and
 `mcp_tool:{server_name}:{tool_name}` as the matched input. Use `"*"` for the

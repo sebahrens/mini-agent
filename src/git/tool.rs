@@ -132,6 +132,25 @@ pub(crate) struct GitArgs {
     /// Byte offset of the diff/show page to return.
     #[serde(default)]
     pub offset: Option<u64>,
+    /// commit: replace the unpushed HEAD commit (guarded; needs `git/amend`).
+    #[serde(default)]
+    pub amend: Option<bool>,
+    /// commit: append a `Signed-off-by` trailer for the resolved identity.
+    #[serde(default)]
+    pub signoff: Option<bool>,
+    /// commit: allow a commit that records no change.
+    #[serde(default)]
+    pub allow_empty: Option<bool>,
+}
+
+/// Disclosure attached to commit and tag results: the tool hardens every Git
+/// call, so repository hooks and signing never run.
+const HOOKS_SIGNING_NOTICE: &str = "hooks and signing were not run: this tool disables repository hooks (pre-commit, commit-msg, ...) and commit/tag signing, so run required checks yourself and sign outside the tool if the repository requires it";
+
+fn mark_hooks_and_signing_skipped(result: &mut serde_json::Value) {
+    result["hooks_run"] = serde_json::json!(false);
+    result["signed"] = serde_json::json!(false);
+    result["notice"] = serde_json::json!(HOOKS_SIGNING_NOTICE);
 }
 
 pub(crate) struct GitTool {
@@ -892,7 +911,13 @@ impl GitTool {
                 "commit message exceeds 16 KiB or contains NUL".to_string(),
             ));
         }
-        let coaching = self.permission("git/commit", message).await?;
+        let amend = args.amend.unwrap_or(false);
+        let mut coaching = self.permission("git/commit", message).await?;
+        if amend {
+            // Rewriting history is its own capability with its own key.
+            let amend_coaching = self.permission("git/amend", message).await?;
+            coaching = coaching.or(amend_coaching);
+        }
         let _mutation = self
             .runner
             .acquire_mutation(self.workspace.root())
@@ -902,11 +927,23 @@ impl GitTool {
         let guard = self.filter_guard("commit").await?;
         let before = self.status_snapshot(&guard).await?;
         self.reject_recursive_paths(&paths)?;
+        if amend {
+            self.ensure_amendable().await?;
+        }
         let mut command = vec![
             "commit".into(),
             "--file=-".into(),
             "--cleanup=verbatim".into(),
         ];
+        if amend {
+            command.push("--amend".into());
+        }
+        if args.signoff.unwrap_or(false) {
+            command.push("--signoff".into());
+        }
+        if args.allow_empty.unwrap_or(false) {
+            command.push("--allow-empty".into());
+        }
         if !paths.is_empty() {
             command.push("--only".into());
             command.push("--".into());
@@ -930,7 +967,55 @@ impl GitTool {
         let after = self.status_snapshot(&guard).await?;
         let mut result = render_mutation_result("commit", coaching, before, after, output);
         result["commit_id"] = serde_json::json!(commit_id);
+        result["amended"] = serde_json::json!(amend);
+        mark_hooks_and_signing_skipped(&mut result);
         Ok(result)
+    }
+
+    /// Amend is allowed only for a local-only HEAD commit: one that exists and
+    /// is not reachable from any remote-tracking ref, so history already
+    /// shared is never rewritten.
+    async fn ensure_amendable(&self) -> Result<(), ToolError> {
+        let head = self
+            .run(
+                "resolve-amend-head",
+                vec![
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "--quiet".into(),
+                    "HEAD".into(),
+                ],
+                QUERY_LIMITS,
+                true,
+            )
+            .await?;
+        if !head.exit_status.is_some_and(|status| status.success()) {
+            return Err(ToolError::Msg(
+                "amend refused: there is no commit to amend".to_string(),
+            ));
+        }
+        let remote = self
+            .run(
+                "check-amend-pushed",
+                vec![
+                    "for-each-ref".into(),
+                    "--contains=HEAD".into(),
+                    "--count=1".into(),
+                    "--format=%(refname)".into(),
+                    "refs/remotes".into(),
+                ],
+                QUERY_LIMITS,
+                false,
+            )
+            .await?;
+        let published = String::from_utf8_lossy(&remote.stdout).trim().to_string();
+        if !published.is_empty() {
+            return Err(ToolError::Msg(format!(
+                "amend refused: HEAD is already contained in the remote-tracking ref {published}; \
+                 amending would rewrite published history. Create a new commit instead."
+            )));
+        }
+        Ok(())
     }
 
     /// Validate a new or existing branch/tag name with Git's own rules.
@@ -1208,7 +1293,9 @@ impl GitTool {
             }
             None => self.run_mutation("tag", command).await?,
         };
-        Ok(render_ref_result("tag", coaching, output))
+        let mut result = render_ref_result("tag", coaching, output);
+        mark_hooks_and_signing_skipped(&mut result);
+        Ok(result)
     }
 
     async fn restore(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
@@ -1251,6 +1338,13 @@ impl GitTool {
         if !pages && (args.format.is_some() || args.offset.is_some()) {
             return Err(ToolError::Msg(
                 "format and offset are supported only by diff and show".to_string(),
+            ));
+        }
+        if args.operation != GitOperation::Commit
+            && (args.amend.is_some() || args.signoff.is_some() || args.allow_empty.is_some())
+        {
+            return Err(ToolError::Msg(
+                "amend, signoff and allow_empty are supported only by commit".to_string(),
             ));
         }
         let named = matches!(
@@ -1429,7 +1523,7 @@ impl Tool for GitTool {
     type Output = serde_json::Value;
 
     fn description(&self) -> String {
-        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff/show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log, stage, unstage, commit, branches, branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available.".to_string()
+        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff/show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log, stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches, branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1451,7 +1545,10 @@ impl Tool for GitTool {
                 },
                 "revision": { "type": "string", "description": "Revision for diff, log, show, branch_create (start point), tag (target) or restore (source)" },
                 "message": { "type": "string", "maxLength": 16384, "description": "Commit message (required for commit), stash_push message, or annotated tag message" },
-                "max_count": { "type": "integer", "minimum": 1, "maximum": 100 }
+                "max_count": { "type": "integer", "minimum": 1, "maximum": 100 },
+                "amend": { "type": "boolean", "description": "commit only: amend the HEAD commit if it is not in any remote-tracking ref (separate git/amend permission)" },
+                "signoff": { "type": "boolean", "description": "commit only: add a Signed-off-by trailer" },
+                "allow_empty": { "type": "boolean", "description": "commit only: allow a commit with no changes" }
             },
             "required": ["operation"],
             "additionalProperties": false
@@ -2158,6 +2255,136 @@ mod tests {
             .expect("stage a large directory");
         assert_eq!(staged["exit_code"], 0, "{staged}");
         assert_eq!(repo.git(["ls-files"]).lines().count(), 6000);
+    }
+
+    fn commit_args(message: &str) -> GitArgs {
+        args(GitOperation::Commit, &[], Some(message))
+    }
+
+    #[tokio::test]
+    async fn commit_and_tag_disclose_that_hooks_and_signing_were_not_run() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", "one\n");
+        // A failing pre-commit hook must not run and must not block.
+        let hooks = repo.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
+        let tool = repo.tool();
+        tool.call(args(GitOperation::Stage, &["a.txt"], None))
+            .await
+            .unwrap();
+        let commit = tool.call(commit_args("first")).await.unwrap();
+        assert_eq!(commit["status"], "success", "{commit}");
+        assert_eq!(commit["hooks_run"], false);
+        assert_eq!(commit["signed"], false);
+        assert!(
+            commit["notice"]
+                .as_str()
+                .unwrap()
+                .contains("hooks and signing were not run")
+        );
+        let tag = tool.call(named(GitOperation::Tag, "v1")).await.unwrap();
+        assert_eq!(tag["hooks_run"], false);
+    }
+
+    #[tokio::test]
+    async fn commit_supports_signoff_allow_empty_and_guarded_amend() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", "one\n");
+        let tool = repo.tool();
+        tool.call(args(GitOperation::Stage, &["a.txt"], None))
+            .await
+            .unwrap();
+        tool.call(commit_args("first")).await.unwrap();
+
+        // Nothing staged: refused without allow_empty, accepted with it.
+        let refused = tool.call(commit_args("empty")).await.unwrap();
+        assert_ne!(refused["status"], "success", "{refused}");
+        let empty = tool
+            .call(GitArgs {
+                allow_empty: Some(true),
+                signoff: Some(true),
+                ..commit_args("empty")
+            })
+            .await
+            .unwrap();
+        assert_eq!(empty["status"], "success", "{empty}");
+        assert!(
+            repo.git(["log", "-1", "--format=%B"])
+                .contains("Signed-off-by:")
+        );
+
+        // Amend replaces the unpushed HEAD instead of adding a commit.
+        let before = repo.git(["rev-list", "--count", "HEAD"]);
+        let amended = tool
+            .call(GitArgs {
+                amend: Some(true),
+                allow_empty: Some(true),
+                ..commit_args("reworded")
+            })
+            .await
+            .unwrap();
+        assert_eq!(amended["status"], "success", "{amended}");
+        assert_eq!(amended["amended"], true);
+        assert_eq!(repo.git(["rev-list", "--count", "HEAD"]), before);
+        assert_eq!(repo.git(["log", "-1", "--format=%s"]).trim(), "reworded");
+
+        // Once a remote-tracking ref contains HEAD, amend is refused.
+        repo.git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let head = repo.git(["rev-parse", "HEAD"]);
+        let error = tool
+            .call(GitArgs {
+                amend: Some(true),
+                ..commit_args("rewrite published")
+            })
+            .await
+            .expect_err("amend of published history must be refused");
+        assert!(error.to_string().contains("remote-tracking"), "{error}");
+        assert_eq!(repo.git(["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
+    async fn amend_needs_a_commit_and_its_own_permission() {
+        let repo = TestRepo::new();
+        let tool = repo.tool();
+        let error = tool
+            .call(GitArgs {
+                amend: Some(true),
+                ..commit_args("x")
+            })
+            .await
+            .expect_err("amend without a commit");
+        assert!(error.to_string().contains("no commit to amend"), "{error}");
+
+        repo.write("a.txt", "one\n");
+        tool.call(args(GitOperation::Stage, &["a.txt"], None))
+            .await
+            .unwrap();
+        tool.call(commit_args("first")).await.unwrap();
+        let head = repo.git(["rev-parse", "HEAD"]);
+        let denied = repo.tool_with_permission(PermissionConfig {
+            git_commit: Some(ToolPerm::Simple(Action::Allow)),
+            git_amend: Some(ToolPerm::Simple(Action::Deny)),
+            ..PermissionConfig::default()
+        });
+        let error = denied
+            .call(GitArgs {
+                amend: Some(true),
+                ..commit_args("again")
+            })
+            .await
+            .expect_err("git/amend deny must block amend");
+        assert!(error.to_string().contains("Permission denied"), "{error}");
+        assert_eq!(repo.git(["rev-parse", "HEAD"]), head);
+        // The commit flags are commit-only.
+        let error = tool
+            .call(GitArgs {
+                amend: Some(true),
+                ..args(GitOperation::Status, &[], None)
+            })
+            .await
+            .expect_err("amend on status");
+        assert!(error.to_string().contains("only by commit"));
     }
 
     #[tokio::test]

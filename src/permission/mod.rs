@@ -44,6 +44,8 @@ pub struct PermissionConfig {
     pub git_unstage: Option<ToolPerm>,
     #[serde(rename = "git/commit")]
     pub git_commit: Option<ToolPerm>,
+    #[serde(rename = "git/amend")]
+    pub git_amend: Option<ToolPerm>,
     #[serde(rename = "git/branch")]
     pub git_branch: Option<ToolPerm>,
     #[serde(rename = "git/switch")]
@@ -108,6 +110,7 @@ pub(crate) fn is_configurable_tool_name(tool: &str) -> bool {
             | "git/stage"
             | "git/unstage"
             | "git/commit"
+            | "git/amend"
             | "git/branch"
             | "git/switch"
             | "git/stash"

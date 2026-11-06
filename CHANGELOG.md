@@ -23,6 +23,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   mini-agent-ktcqn).
 ### Tool layer
 
+- `git commit` gains `signoff`, `allow_empty` and a guarded `amend` (new `git/amend` permission;
+  refused when HEAD is already in a remote-tracking ref); commit and tag results state that hooks
+  and signing were not run (mini-agent-v7fnv).
 - `git status` collapses untracked directories, accepts `paths`, and reports `truncated`/`counts`
   instead of failing past 256 KiB (so stage/commit/restore snapshots work in repos with huge
   untracked trees); `stage` handles directories of many thousands of files (mini-agent-ql57u).

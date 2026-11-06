@@ -698,6 +698,7 @@ impl PermissionChecker {
             ("git/stage", &config.git_stage),
             ("git/unstage", &config.git_unstage),
             ("git/commit", &config.git_commit),
+            ("git/amend", &config.git_amend),
             ("git/branch", &config.git_branch),
             ("git/switch", &config.git_switch),
             ("git/stash", &config.git_stash),
