@@ -500,6 +500,21 @@ fn apply_run_settings(
     Ok(())
 }
 
+/// A persona's tool narrowing with the opt-in read-only shell added, when it
+/// is eligible (the parsed narrowing of a read persona never contains it).
+fn with_read_only_shell_tool(
+    tools: Option<Vec<crate::context::agents::AgentTool>>,
+    read_only_shell: bool,
+) -> Option<Vec<crate::context::agents::AgentTool>> {
+    use crate::context::agents::AgentTool;
+    tools.map(|mut tools| {
+        if read_only_shell && !tools.contains(&AgentTool::Shell) {
+            tools.push(AgentTool::Shell);
+        }
+        tools
+    })
+}
+
 fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolError> {
     if prompts.is_empty() {
         return Err(ToolError::Msg("task: prompts must not be empty".into()));
@@ -880,6 +895,8 @@ pub struct TaskTool {
     parent_image_support: super::inline_images::ParentSupport,
     /// Resumable child conversations when no session pool owns them.
     local_resume: Arc<super::resume::ResumeStore>,
+    /// The parent's eligible web tools, for `[subagents] allow_web` personas.
+    parent_web: Option<builder::ParentWebTools>,
 }
 
 impl TaskTool {
@@ -903,6 +920,13 @@ impl TaskTool {
         } else {
             None
         });
+        let (read_only_shell, web) = self.child_extras(Some(persona), config);
+        let authorization = if read_only_shell {
+            authorization.with_read_only_shell_planned()
+        } else {
+            authorization
+        }
+        .with_web_tools(web);
         #[cfg(feature = "js")]
         let authorization = if let Some((sandbox, status)) = &self.read_only_js {
             authorization.with_read_only_js(sandbox.clone(), status.clone(), config)
@@ -911,13 +935,11 @@ impl TaskTool {
         };
         // Same eligibility decision as the child builder, without
         // instantiating the child tool set (cttyn.46).
-        #[cfg(not(feature = "js"))]
-        let _ = config;
         let installed = builder::persona_tool_names(
             &authorization,
             &builder::PersonaExecution {
                 write_mode: persona.write_mode,
-                tools: persona.tools.clone(),
+                tools: with_read_only_shell_tool(persona.tools.clone(), read_only_shell),
                 ..Default::default()
             },
             #[cfg(feature = "skills")]
@@ -966,7 +988,47 @@ impl TaskTool {
             read_only_js: None,
             parent_image_support: None,
             local_resume: Default::default(),
+            parent_web: None,
         }
+    }
+
+    /// The parent's eligible web tools, captured by the parent builder.
+    pub(crate) fn with_parent_web_tools(mut self, web: builder::ParentWebTools) -> Self {
+        self.parent_web = Some(web);
+        self
+    }
+
+    /// Opt-in extras of a read-mode persona that names them: whether the
+    /// read-only shell is eligible, and the parent web tools to install.
+    /// Both stay closed without their `[subagents]` opt-in.
+    fn child_extras(
+        &self,
+        specialization: Option<&ResolvedSpecialization>,
+        config: &crate::config::Config,
+    ) -> (bool, Option<builder::ParentWebTools>) {
+        use crate::context::agents::AgentTool;
+        let Some(persona) = specialization else {
+            return (false, None);
+        };
+        let named = |tool: AgentTool| {
+            persona
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.contains(&tool))
+        };
+        let policy = config.subagents.clone().unwrap_or_default();
+        let shell = cfg!(feature = "git-worktree")
+            && policy.allow_read_only_shell
+            && !persona.write_mode
+            && persona.run.read_only_shell
+            && self
+                .write_tools
+                .as_ref()
+                .is_some_and(|tools| tools.shell_enabled);
+        let web = (policy.allow_web && (named(AgentTool::WebFetch) || named(AgentTool::WebSearch)))
+            .then(|| self.parent_web.clone())
+            .flatten();
+        (shell, web)
     }
 
     /// The session pool's resumable conversations, or this tool's own.
@@ -1445,6 +1507,9 @@ editing in a known location, grepping for a literal you will act on immediately.
             Some(observation) => run.with_background_observation(observation.clone()),
             None => run,
         });
+        let (read_only_shell, web_tools) = self.child_extras(specialization.as_ref(), &config);
+        runtime.execution.tools =
+            with_read_only_shell_tool(runtime.execution.tools.take(), read_only_shell);
         let specialization = specialization.map(|resolved| resolved.prompt);
 
         // A session job must not retain the foreground event channel: that
@@ -1491,6 +1556,14 @@ editing in a known location, grepping for a literal you will act on immediately.
         } else {
             None
         });
+        let authorization = if read_only_shell {
+            authorization.with_read_only_shell_planned()
+        } else {
+            authorization
+        }
+        .with_web_tools(web_tools);
+        #[cfg(feature = "git-worktree")]
+        let shell_parent = self.write_tools.clone();
         let child_name = agent_type.clone().unwrap_or_else(|| "explore".into());
         #[cfg(feature = "js")]
         let authorization = if let Some((sandbox, containment_status)) = read_only_js {
@@ -1548,6 +1621,8 @@ editing in a known location, grepping for a literal you will act on immediately.
             let resume_history = resume_history.clone();
             let resume_store = resume_store.clone();
             let resume_agent_type = resume_agent_type.clone();
+            #[cfg(feature = "git-worktree")]
+            let shell_parent = shell_parent.clone();
             let task_budget = executor_budget.clone();
             let repair_budget = LiveTaskBudget::new(repair_max_cost_units);
             let child_budget = LiveTaskBudget::new(u64::MAX);
@@ -1671,6 +1746,48 @@ editing in a known location, grepping for a literal you will act on immediately.
                         }
                     },
                     None => (None, authorization),
+                };
+                // Opt-in read-only shell: bind it to a private scratch
+                // directory (kept until this child ends) or drop it.
+                #[cfg(feature = "git-worktree")]
+                let (_scratch, authorization, execution_prompt) = match (
+                    authorization.read_only_shell_planned(),
+                    &shell_parent,
+                ) {
+                    (true, Some(parent)) => {
+                        let root = authorization
+                            .workspace()
+                            .map(|workspace| workspace.root().to_path_buf());
+                        match root
+                            .ok_or_else(|| "no captured workspace".to_string())
+                            .and_then(|root| {
+                                super::read_only_shell::prepare(parent, &root)
+                                    .map(|prepared| (prepared, root))
+                            }) {
+                            Ok(((scratch, shell), root)) => {
+                                let note =
+                                    super::read_only_shell::prompt_note(scratch.path(), &root);
+                                (
+                                    Some(scratch),
+                                    authorization.with_read_only_shell(Some(shell)),
+                                    format!("{note}\n\n{execution_prompt}"),
+                                )
+                            }
+                            Err(error) => (
+                                None,
+                                authorization.with_read_only_shell(None),
+                                format!(
+                                    "[host note: no shell tool: the read-only shell is unavailable ({error})]\n\n{execution_prompt}"
+                                ),
+                            ),
+                        }
+                    }
+                    (true, None) => (
+                        None,
+                        authorization.with_read_only_shell(None),
+                        execution_prompt,
+                    ),
+                    (false, _) => (None, authorization, execution_prompt),
                 };
                 let model = client.completion_model_with_cache_ttl(
                     model_name,
@@ -5614,6 +5731,7 @@ mod tests {
         let persona = AgentRunSettings {
             max_turns: Some(60),
             timeout_secs: Some(900),
+            ..Default::default()
         };
         assert_eq!(
             run(TaskCallOptions::default(), Some(persona), &config).unwrap(),
@@ -5675,6 +5793,106 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(run(raised, None, &config).unwrap(), (400, 7200));
+    }
+
+    #[test]
+    fn read_only_shell_and_web_tools_stay_closed_without_their_opt_ins() {
+        use crate::context::agents::AgentTool;
+        let root = crate::tests::OwnedTestDirectory::new("child-extras");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let tool = TaskTool::new(None, None, false)
+            .with_workspace_binding(workspace.clone())
+            .with_write_tools(builder::WriteChildTools {
+                sandbox: crate::sandbox::Sandbox::new(true, "auto")
+                    .with_workspace_binding(workspace),
+                write_enabled: true,
+                edit_enabled: true,
+                shell_enabled: true,
+                max_text_file_size: None,
+                max_shell_output_lines: None,
+                shell_timeout_secs: 10,
+                diff_options: Default::default(),
+                formatter: None,
+                #[cfg(feature = "lsp")]
+                lsp: None,
+            })
+            .with_parent_web_tools(builder::ParentWebTools {
+                fetch: true,
+                search: true,
+                ..Default::default()
+            });
+        let persona = |write_mode: bool| ResolvedSpecialization {
+            write_mode,
+            isolation_worktree: false,
+            prompt: "p".into(),
+            result_notice: None,
+            source: "test".into(),
+            tools: Some(vec![
+                AgentTool::Read,
+                AgentTool::WebFetch,
+                AgentTool::WebSearch,
+            ]),
+            required_tools: Vec::new(),
+            model: None,
+            turn_budget: None,
+            inline_images: None,
+            run: crate::context::agents::AgentRunSettings {
+                read_only_shell: true,
+                ..Default::default()
+            },
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
+        };
+        let mut config = crate::config::Config::default();
+        let (shell, web) = tool.child_extras(Some(&persona(false)), &config);
+        assert!(!shell && web.is_none(), "default stays closed");
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            allow_read_only_shell: true,
+            allow_web: true,
+            ..Default::default()
+        });
+        let (shell, web) = tool.child_extras(Some(&persona(false)), &config);
+        assert_eq!(shell, cfg!(feature = "git-worktree"));
+        let web = web.unwrap();
+        assert!(web.fetch && web.search);
+        // Write personas keep their own shell; no default child gets extras.
+        assert!(!tool.child_extras(Some(&persona(true)), &config).0);
+        assert!(!tool.child_extras(None, &config).0);
+        let narrowed = with_read_only_shell_tool(Some(vec![AgentTool::Read]), true).unwrap();
+        assert!(narrowed.contains(&AgentTool::Shell));
+        assert!(
+            !with_read_only_shell_tool(Some(vec![AgentTool::Read]), false)
+                .unwrap()
+                .contains(&AgentTool::Shell)
+        );
+
+        let authorization = SubagentAuthorization::new(None, None, false)
+            .with_web_tools(Some(web))
+            .with_read_only_shell_planned();
+        let names = builder::persona_tool_names(
+            &authorization,
+            &builder::PersonaExecution {
+                tools: persona(false).tools,
+                ..Default::default()
+            },
+            #[cfg(feature = "skills")]
+            false,
+        );
+        for name in ["web_fetch", "web_search"] {
+            assert!(names.contains(&name), "{names:?}");
+        }
+        let default_names = builder::persona_tool_names(
+            &authorization,
+            &builder::PersonaExecution::default(),
+            #[cfg(feature = "skills")]
+            false,
+        );
+        assert!(
+            !default_names
+                .iter()
+                .any(|name| matches!(*name, "shell" | "web_fetch" | "web_search")),
+            "{default_names:?}"
+        );
     }
 
     #[test]

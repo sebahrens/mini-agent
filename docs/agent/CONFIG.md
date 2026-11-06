@@ -4019,6 +4019,13 @@ keep `task_timeout_secs` (default 300). See
 `timeout_secs` frontmatter. A larger requested value rejects the call. See
 [The task tool](SUBAGENTS.md#the-task-tool).
 
+`[subagents] allow_read_only_shell = true` (default false) gives a read-mode
+persona that names `shell`/`Bash` a sandboxed shell whose only writable
+location is a private scratch directory; the workspace stays read-only.
+`[subagents] allow_web = true` (default false) gives a persona that names
+`web_fetch`/`web_search` the parent's eligible web tools. See
+[Opt-in read-only shell and web tools](SUBAGENTS.md#opt-in-read-only-shell-and-web-tools).
+
 ### Hook event parity
 
 `PreCompact` observes an actual compaction before summarization. Its envelope has

@@ -84,6 +84,48 @@ pub(crate) struct SubagentAuthorization {
     instructions: Option<std::sync::Arc<crate::context::instructions::WorkspaceInstructions>>,
     #[cfg(feature = "js")]
     read_only_js: Option<ReadOnlyJsAuthorization>,
+    /// Opt-in read-only shell of a read-mode persona (`[subagents]
+    /// allow_read_only_shell`), bound to a private scratch workspace.
+    read_only_shell: ReadOnlyShellState,
+    /// Opt-in parent web tools of a persona (`[subagents] allow_web`).
+    web: Option<ParentWebTools>,
+}
+
+/// The parent's eligible web tools and their settings, captured by the
+/// parent builder. A child receives them only through `[subagents]
+/// allow_web = true` and an explicit persona `tools` entry.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ParentWebTools {
+    pub(crate) fetch: bool,
+    pub(crate) search: bool,
+    pub(crate) fetch_origins: Option<Vec<String>>,
+    pub(crate) fetch_allow_http: bool,
+    pub(crate) search_provider: Option<String>,
+    /// Session whose private tool-output directory keeps large pages.
+    pub(crate) session_id: String,
+}
+
+/// A read-only child shell: the parent's sandbox rebound to a private scratch
+/// directory (its only writable workspace) with the parent workspace added as
+/// a read root. Built only when that sandbox provably cannot write the parent
+/// workspace.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+pub(crate) struct ReadOnlyShell {
+    pub(crate) sandbox: crate::sandbox::Sandbox,
+    pub(crate) max_output_lines: Option<u64>,
+    pub(crate) timeout_secs: u64,
+}
+
+#[derive(Clone, Default)]
+#[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+pub(crate) enum ReadOnlyShellState {
+    #[default]
+    None,
+    /// Eligible but not yet bound: counts for tool-name preflight only and
+    /// never installs a tool.
+    Planned,
+    Bound(ReadOnlyShell),
 }
 
 /// Captured from the actual parent builder, including its tool eligibility.
@@ -167,7 +209,38 @@ impl SubagentAuthorization {
             instructions: None,
             #[cfg(feature = "js")]
             read_only_js: None,
+            read_only_shell: ReadOnlyShellState::None,
+            web: None,
         }
+    }
+
+    /// Mark the opt-in read-only shell as eligible (see [`ReadOnlyShellState`]).
+    pub(crate) fn with_read_only_shell_planned(mut self) -> Self {
+        self.read_only_shell = ReadOnlyShellState::Planned;
+        self
+    }
+
+    /// Install the bound read-only shell, or drop a planned one (`None`).
+    #[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+    pub(crate) fn with_read_only_shell(mut self, shell: Option<ReadOnlyShell>) -> Self {
+        self.read_only_shell = shell.map_or(ReadOnlyShellState::None, ReadOnlyShellState::Bound);
+        self
+    }
+
+    #[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+    pub(crate) fn read_only_shell_planned(&self) -> bool {
+        matches!(self.read_only_shell, ReadOnlyShellState::Planned)
+    }
+
+    #[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+    pub(crate) fn workspace(&self) -> Option<&std::sync::Arc<crate::paths::WorkspaceBinding>> {
+        self.workspace.as_ref()
+    }
+
+    /// Opt-in parent web tools for a persona that names them.
+    pub(crate) fn with_web_tools(mut self, web: Option<ParentWebTools>) -> Self {
+        self.web = web;
+        self
     }
 
     pub(crate) fn with_write_tools(mut self, tools: Option<WriteChildTools>) -> Self {
@@ -362,6 +435,12 @@ impl SubagentAuthorization {
             if parent.shell_enabled && enabled(AgentTool::Shell) {
                 kinds.push(AgentTool::Shell);
             }
+        } else if !matches!(self.read_only_shell, ReadOnlyShellState::None)
+            && selected.is_some_and(|selected| selected.contains(&AgentTool::Shell))
+        {
+            // A read-mode child gets the read-only shell only when its
+            // persona names it explicitly; the default set never has one.
+            kinds.push(AgentTool::Shell);
         }
         kinds
     }
@@ -468,6 +547,18 @@ impl SubagentAuthorization {
                     .with_foreground_timeout_secs(parent.shell_timeout_secs),
                 ));
             }
+        } else if enabled(AgentTool::Shell)
+            && let ReadOnlyShellState::Bound(shell) = &self.read_only_shell
+        {
+            tools.push(Box::new(
+                tools::ShellTool::new(
+                    self.permission.clone(),
+                    self.ask_tx.clone(),
+                    shell.sandbox.clone(),
+                    shell.max_output_lines,
+                )
+                .with_foreground_timeout_secs(shell.timeout_secs),
+            ));
         }
         tools
     }
@@ -609,6 +700,15 @@ pub(crate) fn persona_tool_kinds(
     if enabled(AgentTool::Js) && authorization.read_only_js_available() {
         kinds.push(AgentTool::Js);
     }
+    // Web tools need the opt-in and an explicit persona entry.
+    if let (Some(web), Some(selected)) = (&authorization.web, selected) {
+        if web.fetch && selected.contains(&AgentTool::WebFetch) {
+            kinds.push(AgentTool::WebFetch);
+        }
+        if web.search && selected.contains(&AgentTool::WebSearch) {
+            kinds.push(AgentTool::WebSearch);
+        }
+    }
     kinds
 }
 
@@ -688,6 +788,25 @@ pub(crate) fn persona_tools(
         )
     {
         tools.push(tool);
+    }
+    if let Some(web) = &authorization.web {
+        if kinds.contains(&AgentTool::WebFetch) {
+            tools.push(Box::new(tools::web_fetch::WebFetchTool::new(
+                authorization.permission.clone(),
+                authorization.ask_tx.clone(),
+                web.fetch_origins.as_deref(),
+                web.fetch_allow_http,
+                &web.session_id,
+                None,
+            )));
+        }
+        if kinds.contains(&AgentTool::WebSearch) {
+            tools.push(Box::new(tools::web_search::WebSearchTool::new(
+                authorization.permission.clone(),
+                authorization.ask_tx.clone(),
+                web.search_provider.as_deref(),
+            )));
+        }
     }
     tools
 }

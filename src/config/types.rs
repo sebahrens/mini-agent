@@ -31,6 +31,14 @@ pub struct SubagentPolicy {
     /// at most 86400).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_timeout_ceiling_secs: Option<u64>,
+    /// Opt-in: a read-mode persona that names `shell` gets a read-only shell
+    /// (sandboxed, writes only to a private scratch directory). Default false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_read_only_shell: bool,
+    /// Opt-in: a persona that names `web_fetch`/`web_search` gets the
+    /// parent's eligible web tools under its permissions. Default false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_web: bool,
 }
 
 #[cfg(feature = "subagents")]

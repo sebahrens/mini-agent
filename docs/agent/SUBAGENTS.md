@@ -990,13 +990,56 @@ Only active pure learned-JS exports can be installed in this realm.
 | `memory_read`   | Read memory files (long-term, notes…)  |
 | `memory_search` | Keyword search across all memory       |
 
+### Opt-in read-only shell and web tools
+
+Two `[subagents]` opt-ins (both default `false`) let a read-mode persona run
+checks or fetch documentation without becoming a write child:
+
+```toml
+[subagents]
+allow_read_only_shell = true   # a persona naming shell/Bash gets a read-only shell
+allow_web = true               # a persona naming web_fetch/web_search gets them
+```
+
+```yaml
+---
+tools: Read, Grep, Bash, web_fetch, web_search
+---
+```
+
+- **Read-only shell.** A read-mode persona whose `tools` names `shell` or
+  `Bash` (without the opt-in the name is ignored with a notice, as before)
+  receives the parent's shell rebound to a fresh private scratch directory
+  under the system temporary directory. The scratch directory is the
+  command's only writable workspace and is deleted when the child ends; the
+  parent workspace is added as a read root, so commands can read but not
+  write it (use absolute paths or `cd`, and point build outputs at the scratch
+  directory, for example `CARGO_TARGET_DIR`). The child is told this in a host
+  note. The shell is installed only when the rebound sandbox provably cannot
+  write the workspace: an uncontained sandbox, the `host-full` profile or an
+  extra write root overlapping the workspace removes it (the child is told
+  why), and explicit read roots need the Seatbelt or bubblewrap backend. It
+  needs the `git-worktree` feature (default) and a parent with an eligible
+  shell tool. Permission rules, approvals, the network policy, output cap and
+  deadline are the parent's. Such children are not write children: they run
+  in parallel with other read-only children.
+- **Web tools.** A persona whose `tools` names `web_fetch` and/or
+  `web_search` receives the parent's eligible web tools with the parent's
+  origin/provider settings and permission checks. Without the opt-in, or when
+  the parent lacks the tool, they are not installed.
+
+No default child (without a persona `tools` entry) ever receives a shell or
+web tool. `required_tools` can name `shell`, `web_fetch` or `web_search` to
+refuse a call before any child request when they are unavailable.
+
 ### Default profile exclusions
 
 | Tool           | Reason                                  |
 |----------------|-----------------------------------------|
 | `write`        | Available only to an opted-in `mode: write` child         |
 | `edit`         | Available only to an opted-in `mode: write` child         |
-| `bash`         | Only opted-in write children receive the parent’s eligible `shell`; default children cannot run builds or tests |
+| `bash`         | Only opted-in write children receive the parent’s eligible `shell`; a read persona can opt into the sandboxed read-only shell (`allow_read_only_shell`) |
+| `web_fetch`, `web_search` | Only a persona that names them under `[subagents] allow_web = true` |
 | `memory_write` | Subagent should not persist memory      |
 | `todo`         | Not registered — no planning tool in child context |
 | `task`         | Nested subagents are deliberately unsupported |

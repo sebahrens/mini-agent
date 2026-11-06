@@ -15,6 +15,8 @@ pub(crate) mod inline_images;
 pub(crate) mod isolation;
 pub(crate) mod partial;
 pub(crate) mod prompt;
+#[cfg(feature = "git-worktree")]
+pub(crate) mod read_only_shell;
 pub(crate) mod resume;
 pub(crate) mod task_tool;
 

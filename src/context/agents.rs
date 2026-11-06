@@ -60,6 +60,8 @@ pub(crate) enum AgentTool {
     Write,
     Edit,
     Shell,
+    WebFetch,
+    WebSearch,
     #[cfg(feature = "js")]
     Js,
     #[cfg(feature = "skills")]
@@ -85,6 +87,8 @@ impl AgentTool {
             "write" => Some(Self::Write),
             "edit" => Some(Self::Edit),
             "bash" | "shell" => Some(Self::Shell),
+            "web_fetch" | "webfetch" => Some(Self::WebFetch),
+            "web_search" | "websearch" => Some(Self::WebSearch),
             #[cfg(feature = "js")]
             "js" | "javascript" => Some(Self::Js),
             #[cfg(feature = "skills")]
@@ -106,6 +110,8 @@ impl AgentTool {
             Self::Write => "write",
             Self::Edit => "edit",
             Self::Shell => "shell",
+            Self::WebFetch => "web_fetch",
+            Self::WebSearch => "web_search",
             #[cfg(feature = "js")]
             Self::Js => "js",
             #[cfg(feature = "skills")]
@@ -134,6 +140,9 @@ pub(crate) struct AgentRunSettings {
     pub(crate) max_turns: Option<usize>,
     /// Whole-call deadline in seconds for calls using this persona.
     pub(crate) timeout_secs: Option<u64>,
+    /// A read-mode persona named `shell`/`Bash` in `tools`: it receives the
+    /// sandboxed read-only shell when `[subagents] allow_read_only_shell`.
+    pub(crate) read_only_shell: bool,
 }
 
 /// Largest `max_turns` frontmatter value accepted while parsing.
@@ -258,9 +267,9 @@ fn normalize_agent_definition(
         .get(serde_yaml_ng::Value::String("tools".into()))
         .map(|value| parse_agent_tools(value, mode.as_deref() == Some("write")))
         .transpose()?;
-    let (tools, tool_narrowing_notice) = match parsed_tools {
-        Some((tools, notice)) => (Some(tools), notice),
-        None => (None, None),
+    let (tools, tool_narrowing_notice, read_only_shell) = match parsed_tools {
+        Some((tools, notice, shell)) => (Some(tools), notice, shell),
+        None => (None, None, false),
     };
     let required_tools = mapping
         .get(serde_yaml_ng::Value::String("required_tools".into()))
@@ -348,6 +357,7 @@ fn normalize_agent_definition(
             MAX_FRONTMATTER_TIMEOUT_SECS,
             "frontmatter timeout_secs must be an integer from 1 to 86400",
         )?,
+        read_only_shell,
     };
     #[cfg(feature = "mcp")]
     let mcp_servers = mapping
@@ -550,7 +560,7 @@ fn requires_indexer_cli(prompt: &str) -> bool {
 fn parse_agent_tools(
     value: &serde_yaml_ng::Value,
     write_mode: bool,
-) -> Result<(Vec<AgentTool>, Option<String>), &'static str> {
+) -> Result<(Vec<AgentTool>, Option<String>, bool), &'static str> {
     let names = if let Some(list) = value.as_sequence() {
         list.iter()
             .map(|value| {
@@ -571,6 +581,12 @@ fn parse_agent_tools(
     }
     let mut tools = Vec::new();
     let mut ignored = Vec::new();
+    // A read-mode persona that names `shell`/`Bash` asks for the opt-in
+    // read-only shell; its tool list itself never gains a mutating tool.
+    let shell_requested = !write_mode
+        && names
+            .iter()
+            .any(|name| AgentTool::parse(name) == Some(AgentTool::Shell));
     for name in names {
         if name.is_empty() {
             return Err("frontmatter tools contains an empty tool name");
@@ -598,11 +614,13 @@ fn parse_agent_tools(
         } else { String::new() };
         if write_mode {
             format!("tools {names}{more} ignored: write personas support only installed tools")
+        } else if shell_requested {
+            format!("tools {names}{more} ignored: subagents are read-only and support only installed read tools; a named shell becomes the sandboxed read-only shell only under [subagents] allow_read_only_shell = true")
         } else {
             format!("tools {names}{more} ignored: subagents are read-only and support only installed read tools")
         }
     });
-    Ok((tools, notice))
+    Ok((tools, notice, shell_requested))
 }
 
 #[cfg(test)]
@@ -2442,6 +2460,25 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .contains("timeout_secs")
         );
+        // A read persona naming Bash asks for the opt-in read-only shell
+        // without gaining a shell entry in its tool narrowing.
+        let shell = parse("tools: Read, Bash").unwrap().2;
+        assert!(shell.run.read_only_shell);
+        assert_eq!(shell.tools, Some(vec![AgentTool::Read]));
+        assert!(
+            shell
+                .tool_narrowing_notice
+                .unwrap()
+                .contains("allow_read_only_shell")
+        );
+        assert!(
+            !parse("mode: write\ntools: Read, Bash")
+                .unwrap()
+                .2
+                .run
+                .read_only_shell
+        );
+        assert!(!parse("tools: Read").unwrap().2.run.read_only_shell);
     }
 
     #[test]

@@ -26,6 +26,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `task {"resume": "<child id>", "prompts": ["…"]}` continues an earlier child's conversation
   (tool results included) with a follow-up turn, re-authorized and charged like any task call. Each
   report prints its child id; the 16 most recent conversations are kept in memory.
+- Opt-in `[subagents] allow_read_only_shell` gives read personas that name `shell` a sandboxed
+  shell that can read the workspace but write only a private scratch directory, and
+  `[subagents] allow_web` gives personas that name `web_fetch`/`web_search` the parent's web tools.
+  Both default off; default children never receive them.
 
 **Fork release 1.14.2 (2026-10-28)**
 

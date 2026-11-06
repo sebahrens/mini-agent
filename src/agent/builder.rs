@@ -1201,6 +1201,18 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             .with_workspace_instructions(instructions.clone());
             #[cfg(feature = "git-worktree")]
             let task_tool = task_tool.with_isolation_base_dir(cli.resolve_wt_base_dir(cfg));
+            // Captured for `[subagents] allow_web` personas only.
+            let task_tool = task_tool.with_parent_web_tools(
+                crate::extras::subagents::builder::ParentWebTools {
+                    fetch: cli.tool_is_eligible(cfg, "web_fetch"),
+                    search: cli.tool_is_eligible(cfg, "web_search")
+                        && cfg.web_search_provider.as_deref() != Some("off"),
+                    fetch_origins: cfg.web_fetch_origins.clone(),
+                    fetch_allow_http: cfg.web_fetch_allow_http.unwrap_or(false),
+                    search_provider: cfg.web_search_provider.clone(),
+                    session_id: tool_output_session_id.to_string(),
+                },
+            );
             // Only an explicitly configured parent response cap constrains a
             // separately configured child; the implicit parent default is not
             // a permanent 16K ceiling on child settings.
