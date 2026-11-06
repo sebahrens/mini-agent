@@ -41,6 +41,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - New parent tool `task_send {id, message, task?}` delivers a follow-up message to the running
   children of a background task as user input at their next model-call boundary; terminal tasks
   are refused and the message grants no permission.
+- When a child's 4 MiB history image ceiling omits images, its report now carries an explicit host
+  note; the fixed subagent image limits and their source constants are documented.
 
 **Fork release 1.14.2 (2026-10-28)**
 

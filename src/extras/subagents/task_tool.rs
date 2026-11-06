@@ -1937,6 +1937,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                 // Host-minted evidence comes from the child's actual tool
                 // results, in call order; the report contract can only cite it.
                 let mut evidence = super::evidence::ChildEvidence::with_limits(evidence_limits);
+                #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+                let mut omitted_images = super::image_cost::omitted_images(&run.history);
                 if evidence_enabled {
                     evidence.record_history(&run.history);
                 }
@@ -1966,6 +1968,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     if evidence_enabled {
                         evidence.record_history(&retried.history);
                     }
+                    omitted_images += super::image_cost::omitted_images(&retried.history);
                     run = merge_forced_continuation_run(run, retried);
                 }
 
@@ -2094,6 +2097,18 @@ editing in a known location, grepping for a literal you will act on immediately.
                     .is_ok()
                     .then(|| resume_store.insert(resume_agent_type, conversation))
                     .flatten();
+                // Host-authored: images the child's history ceiling dropped.
+                let host_suffix = match (omitted_images, host_suffix) {
+                    (0, suffix) => suffix,
+                    (count, Some(suffix)) => Some(format!(
+                        "{}{suffix}",
+                        super::image_cost::omission_note(count)
+                    )),
+                    (count, None) if output.is_ok() => {
+                        Some(super::image_cost::omission_note(count))
+                    }
+                    (_, None) => None,
+                };
                 let host_suffix = match (resume_id, host_suffix) {
                     (Some(id), Some(evidence)) => {
                         Some(format!("{}{evidence}", super::resume::resume_line(&id)))

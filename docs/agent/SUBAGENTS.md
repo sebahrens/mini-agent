@@ -847,7 +847,25 @@ record and in attachment order:
   remaining budget cannot cover is omitted.
 
 Every attached record is listed in the Evidence table, and an `Inline images`
-block there states what was attached or why not. If at least one image was
+block there states what was attached or why not.
+
+The image limits are fixed constants, not configuration (only the count,
+`task_inline_images` ≤ 3, is configurable):
+
+| Limit | Value | Source constant |
+|---|---:|---|
+| Images one child may inline | 3 | `inline_images.rs` `MAX_PER_CHILD` |
+| Images one call may inline (all children) | 5 | `inline_images.rs` `MAX_PER_CALL` |
+| Longest side of an inlined image | 1,568 px | `inline_images.rs` `MAX_LONG_EDGE_PX` |
+| Base64 bytes one call may inline | 1.5 MiB | `inline_images.rs` `MAX_ENCODED_BYTES_PER_CALL` |
+| Base64 image bytes in one child's history | 4 MiB | `image_cost.rs` `MAX_CHILD_IMAGE_ENCODED_BYTES` |
+| Token charge per image | ≤ 4,784 | `image_cost.rs` `MAX_IMAGE_TOKENS` |
+
+Attachments beyond the per-child or per-call caps are listed in the Evidence
+table with a note instead of inlined. When the 4 MiB history ceiling drops a
+child's image tool result, the child is told in that result, and the parent's
+report carries a host line after the child's output:
+`[host note: N image result(s) were omitted from this child's history at its 4 MiB image ceiling ...]`. If at least one image was
 admitted, the `task` output is the same `{"response": …, "parts": [...]}`
 envelope `read` uses: `response` is the complete quoted text report and the
 images follow it at the end of `parts`, so earlier prompt-cache prefixes are

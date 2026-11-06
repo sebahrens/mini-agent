@@ -4000,7 +4000,10 @@ up to `N` of its recorded image results (`[attach: E5]`) inline to the `task`
 result when the parent model accepts images; at most 5 images and 1.5 MiB of
 base64 per call, each image no larger than 1,568 px on its longer side and
 charged to `task_max_cost_units`. It needs `task_evidence = true`. A persona's
-`inline_images` frontmatter can only narrow it. See
+`inline_images` frontmatter can only narrow it. The other image limits are
+fixed constants (`inline_images.rs` `MAX_PER_CHILD` 3, `MAX_PER_CALL` 5,
+`MAX_LONG_EDGE_PX` 1568, `MAX_ENCODED_BYTES_PER_CALL` 1.5 MiB; `image_cost.rs`
+`MAX_CHILD_IMAGE_ENCODED_BYTES` 4 MiB per child history). See
 [Inline image lane](SUBAGENTS.md#inline-image-lane).
 
 `[subagents] task_fail_fast = true` (default false) makes the first failed
