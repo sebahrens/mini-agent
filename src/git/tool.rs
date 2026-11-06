@@ -66,6 +66,8 @@ pub(crate) enum GitOperation {
 }
 
 impl GitOperation {
+    // The native /diff and /commit actors (git-worktree) report the name.
+    #[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Status => "status",
