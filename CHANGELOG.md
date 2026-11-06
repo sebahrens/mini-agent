@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Agent Skills frontmatter keys `context`, `agent`, `model`, `effort`, `paths` and `hooks` (recognised from Claude Code but not applied) now produce one note per skill in `/skills` and the `--import-agent-skill` report (for example `context: fork not applied; skill runs inline`), and `argument-hint` is shown in the `/skills` listing; unknown non-Claude keys stay quiet (mini-agent-4dqan).
 - The sandbox HTTP proxy replaces the client's `Host` header with the allowlisted request-URI authority before
   forwarding, so a contained command cannot reach another virtual host behind an allowed address (mini-agent-9svy4).
 - The built-in `jdtls`, `csharp-ls`, `ruby-lsp`, `kotlin-language-server`, `sourcekit-lsp` and `zls` servers evaluate

@@ -22,6 +22,12 @@ pub struct AgentSkillManifest {
     /// Claude Code `user-invocable: false`: hidden from the `/` picker and the
     /// `/skills` list and not pinnable by the user. Defaults to true.
     pub user_invocable: bool,
+    /// Claude Code `argument-hint`, shown in the `/skills` listing only.
+    pub argument_hint: Option<String>,
+    /// One diagnostic per recognised-but-unsupported Claude Code key (for
+    /// example `context: fork not applied; skill runs inline`). Unknown
+    /// non-Claude keys stay quiet. Display only; never grants anything.
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +72,80 @@ struct RawManifest {
     disable_model_invocation: Option<bool>,
     #[serde(default, rename = "user-invocable", deserialize_with = "lenient_bool")]
     user_invocable: Option<bool>,
+    #[serde(default, rename = "argument-hint", deserialize_with = "lenient_hint")]
+    argument_hint: Option<String>,
+    /// Filled by `unsupported_diagnostics`, never read from YAML directly.
+    #[serde(skip)]
+    diagnostics: Vec<String>,
+}
+
+const MAX_HINT_CHARS: usize = 80;
+
+fn clean_hint(text: &str) -> Option<String> {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_HINT_CHARS)
+        .collect();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_owned())
+}
+
+fn lenient_hint<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<serde_yaml_ng::Value> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .as_ref()
+        .and_then(scalar_to_string)
+        .and_then(|text| clean_hint(&text)))
+}
+
+/// Claude Code skill keys that are recognised but have no effect here.
+fn unsupported_message(key: &str, value: Option<&str>) -> Option<String> {
+    Some(match key {
+        "context" => match value {
+            Some("fork") => "context: fork not applied; skill runs inline".to_owned(),
+            _ => "context not applied; skill runs inline".to_owned(),
+        },
+        "agent" => "agent not applied; skill runs inline with the current agent".to_owned(),
+        "model" => "model not applied; skill uses the session model".to_owned(),
+        "effort" => "effort not applied; skill uses the session effort".to_owned(),
+        "paths" => "paths not applied; skill is not limited to matching files".to_owned(),
+        "hooks" => "hooks not applied; skill hooks never run".to_owned(),
+        _ => return None,
+    })
+}
+
+/// Diagnostics for the recognised-but-unsupported keys, once per key, in
+/// stable order. Takes `(key, scalar value)` pairs from the top level only.
+fn unsupported_diagnostics<'a>(
+    keys: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (key, value) in keys {
+        if let Some(message) = unsupported_message(key.trim(), value.map(str::trim))
+            && !out.contains(&message)
+        {
+            out.push(message);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn yaml_diagnostics(yaml: &str) -> Vec<String> {
+    match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml) {
+        Ok(serde_yaml_ng::Value::Mapping(map)) => {
+            let pairs: Vec<(String, Option<String>)> = map
+                .iter()
+                .filter_map(|(k, v)| Some((k.as_str()?.to_owned(), scalar_to_string(v))))
+                .collect();
+            unsupported_diagnostics(pairs.iter().map(|(k, v)| (k.as_str(), v.as_deref())))
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Claude Code flags accept YAML booleans or the strings `true`/`false`; any
@@ -137,7 +217,8 @@ where
 pub(super) fn parse_skill_markdown(bytes: &[u8]) -> Result<AgentSkillManifest, ManifestError> {
     let text = std::str::from_utf8(bytes).map_err(|_| ManifestError::NonUtf8)?;
     let yaml = frontmatter(text)?;
-    let raw: RawManifest = serde_yaml_ng::from_str(yaml)?;
+    let mut raw: RawManifest = serde_yaml_ng::from_str(yaml)?;
+    raw.diagnostics = yaml_diagnostics(yaml);
     let name = raw.name.clone().ok_or(ManifestError::InvalidName)?;
     let description = raw
         .description
@@ -173,7 +254,13 @@ pub(super) fn parse_skill_markdown_lenient(
     let mut raw: RawManifest = if yaml.trim().is_empty() {
         empty_raw()
     } else {
-        serde_yaml_ng::from_str(yaml).unwrap_or_else(|_| scan_simple_keys(yaml))
+        match serde_yaml_ng::from_str::<RawManifest>(yaml) {
+            Ok(mut parsed) => {
+                parsed.diagnostics = yaml_diagnostics(yaml);
+                parsed
+            }
+            Err(_) => scan_simple_keys(yaml),
+        }
     };
     if raw
         .compatibility
@@ -216,6 +303,8 @@ fn empty_raw() -> RawManifest {
         learned_js: Vec::new(),
         disable_model_invocation: None,
         user_invocable: None,
+        argument_hint: None,
+        diagnostics: Vec::new(),
     }
 }
 
@@ -223,6 +312,7 @@ fn empty_raw() -> RawManifest {
 /// YAML (an unquoted colon, a stray tab): top-level `key: value` lines only.
 fn scan_simple_keys(yaml: &str) -> RawManifest {
     let mut raw = empty_raw();
+    let mut pairs: Vec<(String, String)> = Vec::new();
     for line in yaml.lines() {
         if line.starts_with(char::is_whitespace) {
             continue;
@@ -248,9 +338,12 @@ fn scan_simple_keys(yaml: &str) -> RawManifest {
             "allowed-tools" if !value.is_empty() => raw.allowed_tools = Some(value.to_owned()),
             "disable-model-invocation" => raw.disable_model_invocation = flag(),
             "user-invocable" => raw.user_invocable = flag(),
-            _ => {}
+            "argument-hint" => raw.argument_hint = clean_hint(value),
+            other => pairs.push((other.to_owned(), value.to_owned())),
         }
     }
+    raw.diagnostics =
+        unsupported_diagnostics(pairs.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))));
     raw
 }
 
@@ -295,6 +388,8 @@ fn finish_manifest(
         learned_js: raw.learned_js,
         disable_model_invocation: raw.disable_model_invocation.unwrap_or(false),
         user_invocable: raw.user_invocable.unwrap_or(true),
+        argument_hint: raw.argument_hint,
+        diagnostics: raw.diagnostics,
     })
 }
 
@@ -444,6 +539,40 @@ mod tests {
         )
         .unwrap();
         assert!(stringy.disable_model_invocation && stringy.user_invocable);
+    }
+
+    #[test]
+    fn unsupported_claude_keys_produce_one_diagnostic_each_and_unknown_keys_stay_quiet() {
+        let markdown = b"---\nname: s\ndescription: d\ncontext: fork\nagent: Explore\nmodel: opus\neffort: high\npaths:\n  - src/**\nhooks:\n  PreToolUse: []\nargument-hint: \"[issue]\"\nvendor-thing: 1\n---\n";
+        let manifest = parse_skill_markdown(markdown).unwrap();
+        assert_eq!(manifest.argument_hint.as_deref(), Some("[issue]"));
+        assert_eq!(manifest.diagnostics.len(), 6);
+        assert!(
+            manifest
+                .diagnostics
+                .contains(&"context: fork not applied; skill runs inline".to_owned())
+        );
+        assert!(manifest.diagnostics.iter().all(|d| !d.contains("vendor")));
+        // Malformed YAML falls back to the line scan and still reports.
+        let lenient = parse_skill_markdown_lenient(
+            b"---\nname: s\ndescription: a: b: c\ncontext: fork\nmodel: opus\n\targument-hint: x\n---\n",
+            "s",
+        )
+        .unwrap();
+        assert_eq!(lenient.diagnostics.len(), 2);
+        let plain = parse_skill_markdown(b"---\nname: p\ndescription: d\n---\n").unwrap();
+        assert!(plain.diagnostics.is_empty() && plain.argument_hint.is_none());
+        // Control characters and length are neutralised in the hint.
+        let hint = parse_skill_markdown(
+            format!(
+                "---\nname: p\ndescription: d\nargument-hint: \"a\\u001b[2Jb{}\"\n---\n",
+                "x".repeat(200)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let hint = hint.argument_hint.unwrap();
+        assert!(hint.chars().count() <= 80 && !hint.chars().any(char::is_control));
     }
 
     #[test]

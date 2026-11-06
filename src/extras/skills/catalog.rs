@@ -396,6 +396,8 @@ fn scan_record(
         learned_js: manifest.learned_js,
         disable_model_invocation: manifest.disable_model_invocation,
         user_invocable: manifest.user_invocable,
+        argument_hint: manifest.argument_hint,
+        diagnostics: manifest.diagnostics,
         embedding: Vec::new(),
     }))
 }
