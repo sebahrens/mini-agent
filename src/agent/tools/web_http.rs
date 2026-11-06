@@ -813,13 +813,65 @@ pub(crate) fn resolve_os_addresses(host: &str, port: u16) -> Result<Vec<SocketAd
 const POOL_MAX_IDLE_PER_HOST: usize = 2;
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-client bounds for the native (`web_fetch` / `web_search`) exchange.
+/// The defaults are the historical strict contract: a body over the cap fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeFetchLimits {
+    /// Maximum response body bytes retained.
+    pub(crate) body_max_bytes: usize,
+    /// Keep the first `body_max_bytes` of a larger body and mark the result
+    /// truncated instead of failing the exchange.
+    pub(crate) truncate_body: bool,
+}
+
+impl Default for NativeFetchLimits {
+    fn default() -> Self {
+        Self {
+            body_max_bytes: FETCH_RESPONSE_BODY_MAX_BYTES,
+            truncate_body: false,
+        }
+    }
+}
+
+/// Default `web_fetch` raw body cap. HTML shrinks substantially during text
+/// conversion, so the cap is larger than the strict shared 1 MiB JS/search cap.
+pub(crate) const WEB_FETCH_DEFAULT_BODY_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// A completed native exchange. `truncated_at` is set when the body exceeded
+/// a truncating cap; `text` then holds only the retained prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeFetchResult {
+    pub status: u16,
+    pub text: String,
+    pub truncated_at: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeTransportOutcome {
+    Complete(NativeFetchResult),
+    Redirect(Url),
+}
+
+/// Strict UTF-8 conversion of a retained body prefix. A truncated prefix may
+/// end inside a multi-byte sequence; that incomplete tail is dropped.
+fn native_body_text(mut body: Vec<u8>, truncated: bool) -> Result<String, FetchError> {
+    if truncated
+        && let Err(error) = std::str::from_utf8(&body)
+        && error.error_len().is_none()
+    {
+        body.truncate(error.valid_up_to());
+    }
+    String::from_utf8(body).map_err(|_| FetchError::InvalidUtf8)
+}
+
 /// One pinned, redirect-disabled asynchronous HTTP exchange. The caller owns
 /// the absolute deadline spanning DNS, approval, every redirect and body read.
 pub(crate) async fn send_async(
     url: Url,
     request: &FetchRequest,
     addresses: &[SocketAddr],
-) -> Result<FetchTransportOutcome, FetchError> {
+    native: &NativeFetchLimits,
+) -> Result<NativeTransportOutcome, FetchError> {
     let limits = FetchLimits::default();
     validate_header_limits(
         &request.headers,
@@ -891,33 +943,42 @@ pub(crate) async fn send_async(
             .ok_or(FetchError::InvalidRedirect)?
             .to_str()
             .map_err(|_| FetchError::InvalidRedirect)?;
-        return Ok(FetchTransportOutcome::Redirect(
+        return Ok(NativeTransportOutcome::Redirect(
             url.join(location)
                 .map_err(|_| FetchError::InvalidRedirect)?,
         ));
     }
-    if response
-        .content_length()
-        .is_some_and(|n| n > limits.response_body_max_bytes as u64)
-    {
+    let cap = native.body_max_bytes;
+    if !native.truncate_body && response.content_length().is_some_and(|n| n > cap as u64) {
         return Err(FetchError::ResponseBodyTooLarge);
     }
+    let status = response.status().as_u16();
     let mut body = Vec::new();
+    let mut truncated = false;
     while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
-        if body.len().saturating_add(chunk.len()) > limits.response_body_max_bytes {
-            return Err(FetchError::ResponseBodyTooLarge);
+        if body.len().saturating_add(chunk.len()) > cap {
+            if !native.truncate_body {
+                return Err(FetchError::ResponseBodyTooLarge);
+            }
+            // Retain exactly the cap and stop reading; the rest is never
+            // buffered. Dropping the response closes the connection.
+            body.extend_from_slice(&chunk[..cap - body.len()]);
+            truncated = true;
+            break;
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(FetchTransportOutcome::Complete(FetchResult {
-        status: response.status().as_u16(),
-        text: String::from_utf8(body).map_err(|_| FetchError::InvalidUtf8)?,
+    Ok(NativeTransportOutcome::Complete(NativeFetchResult {
+        status,
+        text: native_body_text(body, truncated)?,
+        truncated_at: truncated.then_some(cap),
     }))
 }
 
 #[derive(Clone)]
 pub(crate) struct NativeWebClient {
     policy: FetchPolicy,
+    limits: NativeFetchLimits,
     permission: Option<super::PermCheck>,
     ask_tx: Option<super::AskSender>,
     #[cfg(test)]
@@ -936,6 +997,7 @@ impl NativeWebClient {
     ) -> Self {
         Self {
             policy,
+            limits: NativeFetchLimits::default(),
             permission,
             ask_tx,
             #[cfg(test)]
@@ -945,6 +1007,12 @@ impl NativeWebClient {
             #[cfg(test)]
             test_total_timeout: FETCH_TOTAL_TIMEOUT,
         }
+    }
+
+    /// Replace the native body/timeout bounds for this client.
+    pub(crate) fn with_limits(mut self, limits: NativeFetchLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     #[cfg(all(test, feature = "acp"))]
@@ -999,7 +1067,7 @@ impl NativeWebClient {
         request: &FetchRequest,
         tool: &str,
         follow: bool,
-    ) -> Result<(Url, FetchResult), super::ToolError> {
+    ) -> Result<(Url, NativeFetchResult), super::ToolError> {
         let work = async {
             let mut url = self.policy.authorize(raw_url).map_err(native_error)?;
             for redirects in 0..=FETCH_MAX_REDIRECTS {
@@ -1051,12 +1119,12 @@ impl NativeWebClient {
                 } else {
                     send_url
                 };
-                match send_async(send_url, request, &addresses)
+                match send_async(send_url, request, &addresses, &self.limits)
                     .await
                     .map_err(native_error)?
                 {
-                    FetchTransportOutcome::Complete(result) => return Ok((url, result)),
-                    FetchTransportOutcome::Redirect(next) => {
+                    NativeTransportOutcome::Complete(result) => return Ok((url, result)),
+                    NativeTransportOutcome::Redirect(next) => {
                         if !follow || request.method != reqwest::Method::GET {
                             return Err(native_error(FetchError::RedirectReplayDenied));
                         }
@@ -1987,6 +2055,7 @@ mod web_stream_body_tests {
             .unwrap(),
             &FetchRequest::get(),
             &[peer.address],
+            &NativeFetchLimits::default(),
         )
         .await
         .unwrap_err();
@@ -2008,6 +2077,7 @@ mod web_stream_body_tests {
             .unwrap(),
             &FetchRequest::get(),
             &[peer.address],
+            &NativeFetchLimits::default(),
         )
         .await
         .unwrap_err();

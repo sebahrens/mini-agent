@@ -15,6 +15,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `web_fetch` no longer fails on a response body over its byte cap: it reads the first 10 MiB
+  (raised from 1 MiB), converts that prefix and states `Response body truncated at N bytes`; the
+  cap is named in the tool description (mini-agent-8qfag).
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

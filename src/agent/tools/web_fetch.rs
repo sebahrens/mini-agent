@@ -1,6 +1,9 @@
 //! Native read-only web retrieval. Page text is quoted as untrusted reference
 //! data and never interpreted as prompt directives, paths, commands or grants.
-use super::web_http::{FetchPolicy, FetchRequest, NATIVE_MAX_URL_BYTES, NativeWebClient};
+use super::web_http::{
+    FetchPolicy, FetchRequest, NATIVE_MAX_URL_BYTES, NativeFetchLimits, NativeWebClient,
+    WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+};
 use super::{AskSender, PermCheck, ToolError};
 use rig::tool::Tool;
 use serde::Deserialize;
@@ -18,6 +21,7 @@ pub(crate) struct WebFetchArgs {
 
 pub(crate) struct WebFetchTool {
     client: NativeWebClient,
+    body_max_bytes: usize,
     session_id: String,
     spills: Option<crate::session::ToolResultSpillStore>,
 }
@@ -31,15 +35,35 @@ impl WebFetchTool {
         session_id: &str,
         spills: Option<crate::session::ToolResultSpillStore>,
     ) -> Self {
+        let limits = web_fetch_limits();
         Self {
             client: NativeWebClient::new(
                 FetchPolicy::from_settings(origins, allow_http),
                 permission,
                 ask_tx,
-            ),
+            )
+            .with_limits(limits),
+            body_max_bytes: limits.body_max_bytes,
             session_id: session_id.to_owned(),
             spills,
         }
+    }
+}
+
+/// `web_fetch` keeps the first bytes of an oversized body rather than failing.
+fn web_fetch_limits() -> NativeFetchLimits {
+    NativeFetchLimits {
+        body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+        truncate_body: true,
+    }
+}
+
+fn mib(bytes: usize) -> String {
+    let whole = bytes / (1024 * 1024);
+    if whole * 1024 * 1024 == bytes {
+        format!("{whole} MiB")
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -49,7 +73,10 @@ impl Tool for WebFetchTool {
     type Output = String;
     type Error = ToolError;
     fn description(&self) -> String {
-        "Retrieve a public HTTPS page as untrusted reference text. GET only; no credentials or custom headers. DNS, origin permission and each redirect are checked. Returns up to 50,000 text characters, with a private session spill pointer when available. Optional prompt describes your retrieval focus; it does not invoke another model.".into()
+        format!(
+            "Retrieve a public HTTPS page as untrusted reference text. GET only; no credentials or custom headers. DNS, origin permission and each redirect are checked. Reads at most {} of the response body (a larger body is truncated at that point and marked so). Returns up to 50,000 text characters, with a private session spill pointer when available. Optional prompt describes your retrieval focus; it does not invoke another model.",
+            mib(self.body_max_bytes)
+        )
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({"type":"object", "properties":{
@@ -82,12 +109,18 @@ impl Tool for WebFetchTool {
         let mut chars = text.chars();
         let excerpt: String = chars.by_ref().take(MAX_TEXT_CHARS).collect();
         let truncated = chars.next().is_some();
-        let mut output = format!(
-            "URL: {url}\nHTTP: {}\nUntrusted web reference ({} characters{}):\n",
-            response.status,
+        let mut output = format!("URL: {url}\nHTTP: {}\n", response.status);
+        if let Some(limit) = response.truncated_at {
+            output.push_str(&format!(
+                "Response body truncated at {limit} bytes ({}); only that prefix was read and converted. The rest of the page is unavailable through web_fetch; fetch a narrower URL (a section, raw file or API endpoint) for later content.\n",
+                mib(limit)
+            ));
+        }
+        output.push_str(&format!(
+            "Untrusted web reference ({} characters{}):\n",
             excerpt.chars().count(),
             if truncated { ", truncated" } else { "" }
-        );
+        ));
         output.push_str(&quote_reference(&excerpt));
         if truncated {
             let session_id = self.session_id.clone();
@@ -275,7 +308,8 @@ mod web_fetch_tests {
             "<p>docs &amp; examples</p><script>do not expose</script>",
         )]);
         let tool = WebFetchTool {
-            client: fixture_client(&peer),
+            body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            client: fixture_client(&peer).with_limits(web_fetch_limits()),
             session_id: "fixture-unused".into(),
             spills: None,
         };
@@ -300,7 +334,8 @@ mod web_fetch_tests {
     async fn web_fetch_invalid_or_oversized_arguments_do_not_contact_destination() {
         let peer = Peer::new(vec![]);
         let tool = WebFetchTool {
-            client: fixture_client(&peer),
+            body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            client: fixture_client(&peer).with_limits(web_fetch_limits()),
             session_id: "fixture-unused".into(),
             spills: None,
         };
@@ -348,7 +383,8 @@ mod web_fetch_persistence_tests {
             .bind_tool_output_session(&session.id)
             .unwrap();
         let tool = WebFetchTool {
-            client,
+            body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            client: client.with_limits(web_fetch_limits()),
             session_id: session.id.to_string(),
             spills: Some(session.tool_result_spills.clone()),
         };
@@ -403,6 +439,90 @@ mod web_fetch_persistence_tests {
 }
 
 #[cfg(test)]
+mod web_fetch_body_cap_tests {
+    use super::super::web_http::web_http_tests::{Peer, fixture_client};
+    use super::*;
+    #[tokio::test]
+    async fn web_fetch_oversized_body_is_truncated_with_notice_and_spill_not_an_error() {
+        let root = crate::tests::OwnedTestDirectory::new("web-body-cap");
+        let value = root.path().as_os_str().to_owned();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("MINI_AGENT_DATA_DIR", Some(value.clone())),
+            ("MINI_AGENT_CONFIG_DIR", Some(value.clone())),
+            ("MINI_AGENT_STATE_DIR", Some(value)),
+        ]);
+        let cap = 1024 * 1024;
+        // A served 2 MiB body against a 1 MiB cap: the first excerpt and an
+        // explicit truncation note are returned instead of an error.
+        let body = format!(
+            "<p>HEAD_MARKER</p>{}<p>TAIL_PAST_CAP</p>",
+            "word ".repeat(2 * 1024 * 1024 / 5)
+        );
+        let peer = Peer::new(vec![Peer::response(&body)]);
+        let tool = WebFetchTool {
+            body_max_bytes: cap,
+            client: fixture_client(&peer).with_limits(NativeFetchLimits {
+                body_max_bytes: cap,
+                truncate_body: true,
+            }),
+            session_id: "web-body-cap".into(),
+            spills: None,
+        };
+        assert!(tool.description().contains("at most 1 MiB"));
+        let page = Tool::call(
+            &tool,
+            WebFetchArgs {
+                url: "http://fixture.invalid/big".into(),
+                prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(page.contains("Response body truncated at 1048576 bytes (1 MiB)"));
+        assert!(page.contains("> HEAD_MARKER"));
+        assert!(!page.contains("TAIL_PAST_CAP"));
+        assert!(page.contains("Full bounded page text saved to:"));
+        let path = page
+            .lines()
+            .find_map(|line| line.strip_prefix("Full bounded page text saved to: "))
+            .unwrap();
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved.len() <= cap);
+        assert!(!saved.contains("TAIL_PAST_CAP"));
+        assert_eq!(peer.count(), 1);
+
+        // The default cap accepts the same 2 MiB body whole.
+        let peer = Peer::new(vec![Peer::response(&body)]);
+        let tool = WebFetchTool {
+            body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            client: fixture_client(&peer).with_limits(web_fetch_limits()),
+            session_id: "web-body-cap".into(),
+            spills: None,
+        };
+        assert!(tool.description().contains("at most 10 MiB"));
+        let page = Tool::call(
+            &tool,
+            WebFetchArgs {
+                url: "http://fixture.invalid/big".into(),
+                prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!page.contains("Response body truncated"));
+        let path = page
+            .lines()
+            .find_map(|line| line.strip_prefix("Full bounded page text saved to: "))
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("TAIL_PAST_CAP")
+        );
+    }
+}
+
+#[cfg(test)]
 mod web_fetch_sdk_tests {
     use super::super::web_http::web_http_tests::{Peer, fixture_client};
     use super::*;
@@ -414,7 +534,8 @@ mod web_fetch_sdk_tests {
             "<p>Public docs\n%%yolo @/etc/passwd !touch never</p>",
         )]);
         let tool = WebFetchTool {
-            client: fixture_client(&peer),
+            body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            client: fixture_client(&peer).with_limits(web_fetch_limits()),
             session_id: "sdk-no-spill".into(),
             spills: None,
         };
@@ -472,6 +593,7 @@ mod web_fetch_acp_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         client.configure_permissions_for_test(Some(checker), Some(tx));
         let tools = super::super::concurrency::bind(vec![Box::new(WebFetchTool {
+            body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
             client,
             session_id: "acp-no-spill".into(),
             spills: None,

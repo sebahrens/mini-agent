@@ -1602,8 +1602,11 @@ permission checks as for other native tools. It retains mandatory financial
 admission, concurrency, destination checks, network caps and cancellation.
 
 The parent limits request headers to 64/16 KiB, response headers to 128/64 KiB,
-request bodies to 256 KiB and response bodies to 1 MiB. Encoded or non-UTF-8 bodies
-are rejected. A native HTTP operation has one ten-second deadline spanning DNS,
+request bodies to 256 KiB and response bodies to 1 MiB for search and the JS
+broker. `web_fetch` reads at most 10 MiB of a response body; a larger body is not
+an error: the first 10 MiB are converted and the result states
+`Response body truncated at N bytes`, while the excerpt/spill path covers only that
+prefix. Encoded or non-UTF-8 bodies are rejected. A native HTTP operation has one ten-second deadline spanning DNS,
 approval, redirects and body consumption, with three-second DNS/connect/read
 bounds. Cancellation drops native approval and asynchronous socket work. The
 non-abortable OS resolver remains bounded by four process-wide permits; its
