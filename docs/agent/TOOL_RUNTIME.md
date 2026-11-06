@@ -318,7 +318,13 @@ searched: M larger than the 10 MiB per-file search limit, K binary ...]`, also a
 `No matches found.`, so absence of a match is never claimed for them. Naming such a
 file explicitly as `path` returns an error naming the limit instead of an empty result. Binary sniffing consumes the same byte
 budget. Work limits produce a partial-result notice, including when no matches
-were found; narrow the path or pattern to continue. These bounds leave path,
+were found. The notice states the budgets in force and names the first unsearched
+path (the entry at which the entry budget ran out, the first directory beyond the
+depth limit, or the file at which grep's byte budget ran out), so the model can
+search that path and the ones after it separately or narrow the path or pattern.
+The entry, depth and byte budgets are `[tool_limits] search_max_entries`
+(default 100,000), `search_max_depth` (256) and `search_max_bytes` (100 MiB); both
+tool descriptions state them. These bounds leave path,
 read-deny, external-directory approval, ignore, and no-follow traversal policy
 unchanged.
 `list_dir` keeps only actual directories in its directory-first sort group and

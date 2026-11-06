@@ -1152,9 +1152,6 @@ impl SkippedDirectories {
     }
 }
 
-pub(super) const SEARCH_ENTRY_BUDGET: usize = 100_000;
-pub(super) const SEARCH_MAX_DIRECTORY_DEPTH: usize = 256;
-
 pub(crate) struct BoundWalker {
     approved_root: PathBuf,
     stack: Vec<DirectoryFrame>,
@@ -1174,6 +1171,8 @@ pub(crate) struct BoundWalker {
     scratch_relative: PathBuf,
     scratch_approved: PathBuf,
     skipped_directories: SkippedDirectories,
+    /// First path left unvisited when a search limit stopped the walk.
+    stop_path: Option<PathBuf>,
 }
 
 /// Called with the entry's path relative to the walk root and its file name.
@@ -1205,7 +1204,14 @@ impl BoundWalker {
             scratch_relative: PathBuf::new(),
             scratch_approved: PathBuf::new(),
             skipped_directories: SkippedDirectories::default(),
+            stop_path: None,
         })
+    }
+
+    /// First path a search limit left unvisited (the entry at which the
+    /// entry budget ran out, or the first directory beyond the depth limit).
+    pub(super) fn stop_path(&self) -> Option<&Path> {
+        self.stop_path.as_deref()
     }
 
     /// Directories this walk skipped as dependency/build output.
@@ -1273,6 +1279,10 @@ impl Iterator for BoundWalker {
             if let Some(remaining) = self.remaining_entries.as_mut() {
                 if *remaining == 0 {
                     self.work_limit_hit = true;
+                    if self.stop_path.is_none() {
+                        self.stop_path =
+                            Some(self.approved_root.join(&frame.relative_path).join(&name));
+                    }
                     self.stack.clear();
                     return None;
                 }
@@ -1357,6 +1367,9 @@ impl Iterator for BoundWalker {
             if is_directory {
                 if self.remaining_entries.is_some() && depth >= self.max_depth {
                     self.work_limit_hit = true;
+                    if self.stop_path.is_none() {
+                        self.stop_path = Some(approved_path.clone());
+                    }
                     continue;
                 }
                 let matchers = frame.matchers.clone();
@@ -1815,7 +1828,11 @@ impl Tool for FindFilesTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore. Sorts by name by default, or newest modification time with sort `mtime`; ties use path order, unavailable times sort last. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it.".to_string()
+        format!(
+            "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore. Sorts by name by default, or newest modification time with sort `mtime`; ties use path order, unavailable times sort last. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. A call visits at most {} directory entries and depth {}; a partial result names the first unsearched path.",
+            super::limits::current().search_max_entries,
+            super::limits::current().search_max_depth
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1934,13 +1951,14 @@ impl Tool for FindFilesTool {
         let max_results = usize::try_from(self.max_results).unwrap_or(usize::MAX);
         let sort = args.sort;
         let cancellation = crate::agent::runner::current_work_cancellation();
-        let (first_results, total_matches, work_limit_hit, skipped_notice) =
+        let limits = super::limits::current();
+        let (first_results, total_matches, work_limit_hit, skipped_notice, stop_path) =
             crate::agent::runner::spawn_blocking_scoped(move || -> Result<_, ToolError> {
                 // The pattern is evaluated on the name before a file is
                 // opened, so only matching files cost an open and fstat.
                 let mut walker = bound_directory
                     .walker()?
-                    .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH)
+                    .with_search_limits(limits.search_max_entries, limits.search_max_depth)
                     .with_cancellation(cancellation)
                     .with_file_filter(Box::new(move |relative_path, file_name| {
                         pattern.is_match(&file_name.to_string_lossy(), relative_path)
@@ -1977,6 +1995,7 @@ impl Tool for FindFilesTool {
                     total_matches,
                     walker.work_limit_hit(),
                     walker.skipped_directories().notice(),
+                    walker.stop_path().map(Path::to_path_buf),
                 ))
             })
             .await
@@ -1984,9 +2003,19 @@ impl Tool for FindFilesTool {
                 ToolError::Msg(format!("find_files directory walker failed: {error}"))
             })??;
         let work_notice = if work_limit_hit {
-            "\n[search traversal limit reached (100000 directory entries or depth 256); results cover only the visited entries — narrow the path]"
+            format!(
+                "\n[search traversal limit reached ({} directory entries or depth {}; [tool_limits] search_max_entries/search_max_depth); results cover only the visited entries{} — narrow the path]",
+                limits.search_max_entries,
+                limits.search_max_depth,
+                stop_path
+                    .map(|path| format!(
+                        "; first unsearched path: {} (search it and the paths after it separately)",
+                        path.display()
+                    ))
+                    .unwrap_or_default()
+            )
         } else {
-            ""
+            String::new()
         };
         let work_notice = format!("{skipped_notice}{work_notice}");
         if total_matches == 0 {
@@ -2796,9 +2825,16 @@ mod tests {
         let mut walker = bound
             .walker()
             .unwrap()
-            .with_search_limits(2, SEARCH_MAX_DIRECTORY_DEPTH);
+            .with_search_limits(2, crate::agent::tools::limits::DEFAULT_SEARCH_MAX_DEPTH);
         assert_eq!(walker.by_ref().count(), 2);
         assert!(walker.work_limit_hit());
+        // mini-agent-5efke: the partial result names the next unvisited entry.
+        let stop = walker.stop_path().expect("first unsearched path");
+        assert_eq!(stop.parent(), Some(directory.path()));
+        assert!(
+            stop.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".txt"))
+        );
         assert!(
             walker.stack.is_empty(),
             "work exhaustion releases directory descriptors"
@@ -2809,7 +2845,7 @@ mod tests {
         let mut walker = bound
             .walker()
             .unwrap()
-            .with_search_limits(2, SEARCH_MAX_DIRECTORY_DEPTH);
+            .with_search_limits(2, crate::agent::tools::limits::DEFAULT_SEARCH_MAX_DEPTH);
         assert_eq!(walker.by_ref().count(), 0);
         assert!(
             walker.work_limit_hit(),
@@ -2924,6 +2960,10 @@ mod tests {
             [OsString::from("root.txt"), OsString::from("visible.txt")]
         );
         assert!(walker.work_limit_hit());
+        assert_eq!(
+            walker.stop_path(),
+            Some(directory.path().join("one/two").as_path())
+        );
         assert!(walker.stack.is_empty());
     }
 

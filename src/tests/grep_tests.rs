@@ -329,6 +329,11 @@ async fn grep_multiline_zero_width_and_match_budget_are_bounded() {
         "{output}"
     );
     assert!(output.contains("search work limit reached"), "{output}");
+    // mini-agent-5efke: the notice states the configured budgets.
+    assert!(
+        output.contains("(100000 directory entries, depth 256, 100 MiB read bytes ([tool_limits] search_max_entries/search_max_depth/search_max_bytes)"),
+        "{output}"
+    );
 }
 
 #[tokio::test]
@@ -396,6 +401,16 @@ async fn grep_aggregate_read_budget_reports_incomplete_search_instead_of_no_matc
     assert!(output.starts_with("No matches found."), "{output}");
     assert!(output.contains("search work limit reached"), "{output}");
     assert!(output.contains("100 MiB read bytes"), "{output}");
+    // The file at which the byte budget ran out is the first unsearched path.
+    let stop = output
+        .split("first unsearched path: ")
+        .nth(1)
+        .and_then(|rest| rest.split(" (search it").next())
+        .expect("first unsearched path");
+    assert!(
+        stop.ends_with(".txt") && std::path::Path::new(stop).exists(),
+        "{output}"
+    );
 }
 
 #[tokio::test]

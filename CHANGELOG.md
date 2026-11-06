@@ -45,6 +45,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   (up to 64 MiB input) to a 2000 px long edge and reports the new size, and `/add` and clipboard
   images over 2 MiB are shrunk to fit the per-image limit (multimodal; `image` is the version
   fastembed already resolves).
+- `grep` and `find_files` search budgets are configurable (`[tool_limits] search_max_entries`,
+  `search_max_depth`, `search_max_bytes`), stated in the tool descriptions, and a partial result
+  names the first unsearched path.
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

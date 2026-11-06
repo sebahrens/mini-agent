@@ -6,9 +6,7 @@ use std::path::Path;
 use regex::{Regex, RegexBuilder};
 use rig::tool::Tool;
 
-use super::find_files::{
-    BoundDirectory, BoundFile, SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH,
-};
+use super::find_files::{BoundDirectory, BoundFile};
 use crate::agent::tools::{
     AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_bound_path, check_perm_path,
     combine_coaching,
@@ -16,13 +14,14 @@ use crate::agent::tools::{
 const MAX_OUTPUT_LINE_CHARS: usize = 500;
 const MAX_SEARCH_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: u64 = 8 * 1024;
-const MAX_SEARCH_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_MULTILINE_MATCHES: usize = 100_000;
 
 struct GrepSearchResult {
     file_count: usize,
     skipped: SkippedFiles,
     skipped_directories: String,
+    /// First path a work limit left unsearched.
+    stop_path: Option<std::path::PathBuf>,
     files_with_matches: usize,
     results: Vec<String>,
     emitted_results: usize,
@@ -386,6 +385,7 @@ struct GrepSearch {
     limit_hit: bool,
     work_limit_hit: bool,
     remaining_bytes: u64,
+    stop_path: Option<std::path::PathBuf>,
     /// Reused across files so each read reuses one allocation.
     read_buffer: Vec<u8>,
 }
@@ -404,7 +404,8 @@ impl GrepSearch {
             seen_results: 0,
             limit_hit: false,
             work_limit_hit: false,
-            remaining_bytes: MAX_SEARCH_TOTAL_BYTES,
+            remaining_bytes: super::limits::current().search_max_bytes,
+            stop_path: None,
             read_buffer: Vec::with_capacity(64 * 1024),
         }
     }
@@ -460,6 +461,7 @@ impl GrepSearch {
         if self.remaining_bytes == 0 {
             self.work_limit_hit = true;
             // The final file may be only a prefix; never search that prefix.
+            self.stop_path.get_or_insert_with(|| entry.path.clone());
             return ControlFlow::Break(());
         }
         match read {
@@ -601,11 +603,17 @@ impl GrepSearch {
         }
     }
 
-    fn finish(self, walker_work_limit_hit: bool, skipped_directories: String) -> GrepSearchResult {
+    fn finish(
+        self,
+        walker_work_limit_hit: bool,
+        skipped_directories: String,
+        walker_stop_path: Option<std::path::PathBuf>,
+    ) -> GrepSearchResult {
         GrepSearchResult {
             file_count: self.file_count,
             skipped: self.skipped,
             skipped_directories,
+            stop_path: self.stop_path.or(walker_stop_path),
             files_with_matches: self.files_with_matches,
             results: self.results,
             emitted_results: self.emitted_results,
@@ -628,13 +636,14 @@ fn search_target(
     // (needed for an explicitly named single-file target, which never goes
     // through the walker).
     let walker_include_re = include_re.clone();
+    let limits = super::limits::current();
     let mut search = GrepSearch::new(re, include_re, options);
     match target {
         SearchTarget::Directory(bound_directory) => {
             let include_root = bound_directory.approved_root().to_path_buf();
             let mut walker = bound_directory
                 .walker()?
-                .with_search_limits(SEARCH_ENTRY_BUDGET, SEARCH_MAX_DIRECTORY_DEPTH)
+                .with_search_limits(limits.search_max_entries, limits.search_max_depth)
                 .with_cancellation(cancellation);
             // The include glob is evaluated on the name before a file is
             // opened, so excluded files cost no open, fstat or read.
@@ -658,6 +667,7 @@ fn search_target(
             Ok(search.finish(
                 walker.work_limit_hit(),
                 walker.skipped_directories().notice(),
+                walker.stop_path().map(Path::to_path_buf),
             ))
         }
         SearchTarget::File(entry) => {
@@ -682,7 +692,7 @@ fn search_target(
             if let Some(error) = search.skipped.explicit_file_error(&path, len) {
                 return Err(error);
             }
-            Ok(search.finish(false, String::new()))
+            Ok(search.finish(false, String::new(), None))
         }
     }
 }
@@ -741,8 +751,12 @@ impl Tool for GrepTool {
 
     fn description(&self) -> String {
         format!(
-            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. Respects .gitignore. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. `path` may name a single file to search only that file.",
-            self.max_results, MAX_OUTPUT_LINE_CHARS
+            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. A call visits at most {} directory entries, depth {} and {} MiB of file bytes; a partial result names the first unsearched path. Respects .gitignore. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. `path` may name a single file to search only that file.",
+            self.max_results,
+            MAX_OUTPUT_LINE_CHARS,
+            super::limits::current().search_max_entries,
+            super::limits::current().search_max_depth,
+            super::limits::current().search_max_bytes / (1024 * 1024)
         )
     }
 
@@ -948,6 +962,7 @@ impl Tool for GrepTool {
             file_count,
             skipped,
             skipped_directories,
+            stop_path,
             files_with_matches,
             results: all_results,
             emitted_results,
@@ -956,9 +971,21 @@ impl Tool for GrepTool {
             work_limit_hit,
         } = search;
         let work_notice = if work_limit_hit {
-            "\n[search work limit reached (100000 directory entries, depth 256, 100 MiB read bytes, or 100000 multiline matches/touched lines per file); results cover only visited complete files and inspected matches — narrow the path or pattern]"
+            let limits = super::limits::current();
+            format!(
+                "\n[search work limit reached ({} directory entries, depth {}, {} MiB read bytes ([tool_limits] search_max_entries/search_max_depth/search_max_bytes), or 100000 multiline matches/touched lines per file); results cover only visited complete files and inspected matches{} — narrow the path or pattern]",
+                limits.search_max_entries,
+                limits.search_max_depth,
+                limits.search_max_bytes / (1024 * 1024),
+                stop_path
+                    .map(|path| format!(
+                        "; first unsearched path: {} (search it and the paths after it separately)",
+                        path.display()
+                    ))
+                    .unwrap_or_default()
+            )
         } else {
-            ""
+            String::new()
         };
         let skipped_notice = skipped.notice();
         let work_notice = format!("{skipped_notice}{skipped_directories}{work_notice}");

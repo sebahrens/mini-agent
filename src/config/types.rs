@@ -1064,4 +1064,13 @@ pub struct ToolLimitsConfig {
     /// Unset keeps the built-in rule; `[]` skips only VCS metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_dirs: Option<Vec<String>>,
+    /// Directory entries one recursive `grep`/`find_files` call visits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_entries: Option<u64>,
+    /// Directory depth one recursive search descends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_depth: Option<u64>,
+    /// File bytes one `grep` call reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_bytes: Option<u64>,
 }

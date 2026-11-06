@@ -22,6 +22,16 @@ pub const MIN_MAX_READ_LINE_CHARS: usize = 80;
 /// Default raw-size limit for notebook views and edits, independent of
 /// `max_text_file_size` (image outputs make executed notebooks large).
 pub const DEFAULT_NOTEBOOK_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Default directory entries one recursive `grep`/`find_files` call visits.
+pub const DEFAULT_SEARCH_MAX_ENTRIES: usize = 100_000;
+/// Default directory depth a recursive search descends.
+pub const DEFAULT_SEARCH_MAX_DEPTH: usize = 256;
+/// Default file bytes one `grep` call reads.
+pub const DEFAULT_SEARCH_MAX_BYTES: u64 = 100 * 1024 * 1024;
+/// Hard ceilings for the configurable search budgets.
+const MAX_SEARCH_MAX_ENTRIES: usize = 10_000_000;
+const MAX_SEARCH_MAX_DEPTH: usize = 4_096;
+const MAX_SEARCH_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolLimits {
@@ -32,6 +42,12 @@ pub struct ToolLimits {
     /// Raw notebook size accepted by the cell view and `notebook_edit`
     /// (never above the 64 MiB hard ceiling).
     pub notebook_max_bytes: u64,
+    /// Directory entries one recursive search visits.
+    pub search_max_entries: usize,
+    /// Directory depth one recursive search descends.
+    pub search_max_depth: usize,
+    /// File bytes one `grep` call reads.
+    pub search_max_bytes: u64,
 }
 
 impl Default for ToolLimits {
@@ -40,6 +56,9 @@ impl Default for ToolLimits {
             max_result_chars: DEFAULT_MAX_RESULT_CHARS,
             max_read_line_chars: DEFAULT_MAX_READ_LINE_CHARS,
             notebook_max_bytes: DEFAULT_NOTEBOOK_MAX_BYTES,
+            search_max_entries: DEFAULT_SEARCH_MAX_ENTRIES,
+            search_max_depth: DEFAULT_SEARCH_MAX_DEPTH,
+            search_max_bytes: DEFAULT_SEARCH_MAX_BYTES,
         }
     }
 }
@@ -67,6 +86,18 @@ impl ToolLimits {
                 .notebook_max_bytes
                 .unwrap_or(defaults.notebook_max_bytes)
                 .min(super::notebook::MAX_NOTEBOOK_BYTES),
+            search_max_entries: table
+                .search_max_entries
+                .map_or(defaults.search_max_entries, to_usize)
+                .clamp(1, MAX_SEARCH_MAX_ENTRIES),
+            search_max_depth: table
+                .search_max_depth
+                .map_or(defaults.search_max_depth, to_usize)
+                .clamp(1, MAX_SEARCH_MAX_DEPTH),
+            search_max_bytes: table
+                .search_max_bytes
+                .unwrap_or(defaults.search_max_bytes)
+                .clamp(1, MAX_SEARCH_MAX_BYTES),
         }
     }
 
@@ -86,6 +117,9 @@ static CURRENT: RwLock<ToolLimits> = RwLock::new(ToolLimits {
     max_result_chars: DEFAULT_MAX_RESULT_CHARS,
     max_read_line_chars: DEFAULT_MAX_READ_LINE_CHARS,
     notebook_max_bytes: DEFAULT_NOTEBOOK_MAX_BYTES,
+    search_max_entries: DEFAULT_SEARCH_MAX_ENTRIES,
+    search_max_depth: DEFAULT_SEARCH_MAX_DEPTH,
+    search_max_bytes: DEFAULT_SEARCH_MAX_BYTES,
 });
 
 /// `[tool_limits] skip_dirs`: when set, exactly these directory names are
@@ -135,6 +169,19 @@ mod tests {
             MIN_MAX_RESULT_CHARS
         );
         assert!(toml::from_str::<Config>("[tool_limits]\nunknown = 1\n").is_err());
+        let search: Config = toml::from_str(
+            "[tool_limits]\nsearch_max_entries = 5\nsearch_max_depth = 0\nsearch_max_bytes = 2048\n",
+        )
+        .unwrap();
+        let search = ToolLimits::from_config(&search);
+        assert_eq!(
+            (
+                search.search_max_entries,
+                search.search_max_depth,
+                search.search_max_bytes
+            ),
+            (5, 1, 2048)
+        );
         let skip: Config = toml::from_str("[tool_limits]\nskip_dirs = [\"dist\"]\n").unwrap();
         assert_eq!(
             skip.tool_limits.unwrap().skip_dirs,
