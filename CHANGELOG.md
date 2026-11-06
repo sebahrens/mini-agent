@@ -33,6 +33,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Compaction summaries scale with the context window: up to `window / 32` response tokens
   (4,096–20,000) and a matching stored rolling summary (at least 16 KiB), so large-window sessions
   no longer squeeze all state into 4,096 tokens (mini-agent-wu3uc).
+- After a compaction the summary re-attaches the newest file windows read in the compacted history
+  (up to 5, quoted as untrusted, possibly stale content) within `compact_restore_read_tokens`
+  (default `window / 20`, at most 25,000; `0` disables), so the model need not re-read them
+  (mini-agent-xzt6g).
 
 ### Security
 

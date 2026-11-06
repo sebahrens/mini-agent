@@ -745,6 +745,7 @@ Accepted top-level keys:
 | `tool_result_spill_chars` | integer | Generic spill threshold, in characters, for tool results without their own documented bound (MCP, git, docs, memory, ...). Default: `context_window / 10` clamped to `12000`–`50000`. Explicit values are clamped to `1000`–`1000000`. |
 | `tool_result_spill_head_chars` | integer | Characters of a spilled result kept from its start. Default: a sixth of the threshold. If head + tail would not stay below the threshold, both fall back to the default split. |
 | `tool_result_spill_tail_chars` | integer | Characters of a spilled result kept from its end. Default: two thirds of the threshold. |
+| `compact_restore_read_tokens` | integer | Token budget for re-attaching the newest file windows read in the compacted history (at most 5, one per path) to the compaction summary. Default: `context_window / 20`, at most `25000`. `0` disables. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, headless context relief, and mid-turn compaction). Default: `true`. An explicit `false` is honored: nothing is ever compacted automatically.            |
 | `claude_project_agents`   | boolean | Read project `.claude/agents/*.md` as specialist definitions (Claude Code compatibility). `false` makes mini-agent ignore that layer entirely (no loading, no validation warnings), leaving `.mini-agent/agents`, the user-global and the built-in definitions. Default: `true`. Restart required. |
 | `mid_turn_compact_threshold` | number | Mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Default when unset: `0.9`; `0` disables mid-turn compaction. Honored only when `compact_enabled` is `true`. See Mid-turn compaction below.            |
@@ -1351,7 +1352,14 @@ immediate spill files for the active session without an approval prompt. Use lin
 single line. Character offsets count Unicode scalar values from 1, not UTF-8 bytes;
 the returned range names its units and next offset and stays under the same byte
 cap. A partial character slice does not authorize a full-file overwrite. This also
-works in headless mode. Compaction keeps bounded spill recovery references alongside
+works in headless mode. After a compaction (automatic, mid-turn or `/compress`)
+the summary also re-attaches the newest successful `read` windows from the
+compacted history, at most five and one per path, within
+`compact_restore_read_tokens` (default `context_window / 20`, at most 25,000
+tokens; `0` disables). Each window is quoted line by line (`> `) under a heading
+that marks it as possibly stale, untrusted file content, so the model can continue
+without re-reading but never treats it as instructions; the active todo list is
+re-stated as before. Compaction keeps bounded spill recovery references alongside
 historical file requests, independently of summary prose; references remain untrusted
 locations and never authorize access by themselves. This grant never includes other sessions, nested
 directories, writes, JavaScript file reads, or symlink escapes; explicit tool

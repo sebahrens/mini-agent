@@ -2752,7 +2752,7 @@ impl Session {
     }
 
     pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
-        self.apply_compaction(summary, first_kept_index, token_savings, 16 * 1024);
+        self.apply_compaction(summary, first_kept_index, token_savings, 16 * 1024, 0);
     }
 
     pub(crate) fn compress_with_budget(
@@ -2762,6 +2762,26 @@ impl Session {
         token_savings: u64,
         summary_byte_budget: usize,
     ) {
+        self.compress_with_budget_restoring(
+            summary,
+            first_kept_index,
+            token_savings,
+            summary_byte_budget,
+            0,
+        );
+    }
+
+    /// As [`compress_with_budget`](Self::compress_with_budget), re-attaching
+    /// the newest file windows read in the compacted prefix within
+    /// `restore_read_tokens` (mini-agent-xzt6g; `0` restores none).
+    pub(crate) fn compress_with_budget_restoring(
+        &mut self,
+        summary: String,
+        first_kept_index: usize,
+        token_savings: u64,
+        summary_byte_budget: usize,
+        restore_read_tokens: u64,
+    ) {
         // The budget is already bounded by the window-scaled rolling-summary
         // cap (mini-agent-wu3uc), so a large-window session keeps more.
         self.apply_compaction(
@@ -2769,6 +2789,7 @@ impl Session {
             first_kept_index,
             token_savings,
             summary_byte_budget,
+            restore_read_tokens,
         );
     }
 
@@ -2778,8 +2799,13 @@ impl Session {
         first_kept_index: usize,
         token_savings: u64,
         summary_byte_budget: usize,
+        restore_read_tokens: u64,
     ) {
         let memory_ref = CompactString::new(compaction_ref(&summary));
+        let restored_reads = compaction::restored_read_windows(
+            &self.messages[..first_kept_index.min(self.messages.len())],
+            restore_read_tokens,
+        );
         let mut file_requests = self
             .compactions
             .last()
@@ -2809,6 +2835,10 @@ impl Session {
         if let Some(goal_context) = self.goal_store.critical_context() {
             summary.push_str("\n\n");
             summary.push_str(&goal_context);
+        }
+        if let Some(restored) = restored_reads {
+            summary.push_str("\n\n");
+            summary.push_str(&restored);
         }
         let summarized_count = first_kept_index;
         let summary_tokens = Self::estimate_tokens(&summary);

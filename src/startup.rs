@@ -1016,11 +1016,13 @@ where
             .map(|message| message.estimated_tokens)
             .sum()
     };
-    session.compress_with_budget(
+    let restore_read_tokens = cfg.resolve_compact_restore_read_tokens(session.context_window);
+    session.compress_with_budget_restoring(
         summary.clone(),
         first_kept_index,
         tokens_before,
         summary_byte_budget,
+        restore_read_tokens,
     );
     Ok(Some(HeadlessCompaction {
         summary,

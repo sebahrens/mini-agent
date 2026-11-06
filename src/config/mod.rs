@@ -760,6 +760,11 @@ pub struct Config {
     /// Characters kept from the end of a spilled tool result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result_spill_tail_chars: Option<u64>,
+    /// Token budget for re-attaching the newest file windows read before a
+    /// compaction (mini-agent-xzt6g). `0` disables; unset scales with the
+    /// context window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_restore_read_tokens: Option<u64>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///
@@ -1171,6 +1176,14 @@ impl Config {
             self.tool_result_spill_head_chars,
             self.tool_result_spill_tail_chars,
         )
+    }
+
+    /// Budget for file windows restored after compaction: explicit
+    /// `compact_restore_read_tokens`, else a twentieth of the window capped
+    /// at 25,000 tokens.
+    pub fn resolve_compact_restore_read_tokens(&self, context_window: u64) -> u64 {
+        self.compact_restore_read_tokens
+            .unwrap_or_else(|| (context_window / 20).min(25_000))
     }
 
     pub fn resolve_max_read_lines(&self) -> u64 {

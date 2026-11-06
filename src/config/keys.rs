@@ -192,6 +192,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("compact_enabled").shaped(ConfigShape::Bool),
     key("tool_result_spill_chars").described("Generic spill threshold (characters) for tool results without their own bound, e.g. MCP. Default: context window/10, clamped to 12000..50000.").shaped(ConfigShape::Integer),
     key("tool_result_spill_head_chars").described("Characters kept from the start of a spilled tool result. Default: threshold/6.").shaped(ConfigShape::Integer),
+    key("compact_restore_read_tokens").described("Token budget for re-attaching the newest file windows (up to 5) read before a compaction. Default: window/20 capped at 25000; 0 disables.").shaped(ConfigShape::Integer),
     key("tool_result_spill_tail_chars").described("Characters kept from the end of a spilled tool result. Default: threshold*2/3.").shaped(ConfigShape::Integer),
     key("claude_project_agents").shaped(ConfigShape::Bool),
     key("mid_turn_compact_threshold").described("Mid-turn compaction threshold, as a fraction of the context window (0.0–1.0) of real provider prompt pressure. Default 0.9; 0 disables.").shaped(ConfigShape::Number),
