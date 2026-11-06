@@ -2196,6 +2196,8 @@ fn language_id(path: &Path) -> &'static str {
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
         "sh" | "bash" | "zsh" => "shellscript",
         "lua" => "lua",
+        "rake" | "gemspec" => "ruby",
+        "zig" => "zig",
         other => match other {
             "java" => "java",
             "rb" => "ruby",

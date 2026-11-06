@@ -4189,7 +4189,12 @@ lsp:
 
 Built-in server defaults (used only when the binary is on PATH):
 rust-analyzer, gopls, typescript-language-server, pyright-langserver,
-clangd, bash-language-server, lua-language-server.
+clangd, bash-language-server, lua-language-server, jdtls (`.java`),
+csharp-ls (`.cs`), ruby-lsp (`.rb`, `.rake`, `.gemspec`), intelephense
+(`.php`), kotlin-language-server (`.kt`, `.kts`), sourcekit-lsp (`.swift`) and
+zls (`.zig`). Each is skipped silently when its binary is not on PATH; the
+built-in names `java`, `csharp`, `ruby`, `php`, `kotlin`, `swift` and `zig` can
+be overridden or set `disabled = true` like the others.
 
 Behavior notes:
 
