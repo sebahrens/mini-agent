@@ -1142,6 +1142,7 @@ max_profile = "workspace"                             # ceiling: workspace | hos
 max_network = "allowlist"                             # ceiling: deny | allowlist | allow
 allowed_hosts = ["registry.npmjs.org", "*.github.com"] # pin sandbox-network-hosts; absent = no pin
 forbid_home_mounts = true                             # ignore sandbox-home-mounts
+allowed_roots = ["/opt/toolchains"]                   # with max_profile: extra explicit roots permitted; absent = none
 
 [mcp]
 disabled = false                                      # true refuses every MCP server
@@ -1150,6 +1151,10 @@ denied_servers = ["scratch"]
 # Entries may be tables that also pin what runs; every present field must match:
 #   { name = "gh", command = "npx", args = ["-y", "gh-mcp"] }   # stdio: exact command and args
 #   { name = "docs", url = "https://docs.example/mcp" }          # URL: exact url (trailing / ignored)
+# A stdio pin also compares what shapes the launch: `env`, `cwd` and `inherit_env` must be absent
+# unless the entry lists the exact value (`env = { A = "1" }`, `cwd = "/srv"`, `inherit_env = ["PATH"]`);
+# `sandbox = "bwrap"` requires that backend (omitted allows any, including none). A URL pin refuses a
+# `headers_helper` and compares `headers` only when the entry lists them.
 
 [providers]
 allowed = ["anthropic", "openai"]                     # absent = no allowlist
@@ -1168,11 +1173,19 @@ provider outside the policy is refused wherever it is resolved. `/doctor` (`--do
 command or URL, so pin `command`/`args` or `url` where the administrator must vet what executes. An
 allow entry that pins `command` without `args` permits only an argument-free launch; a deny entry
 without `args` matches any arguments, and a deny entry may omit `name` to block a command or URL
-under any name. `env`, `cwd` and headers are not compared.
+under any name. Deny entries still match on identity alone (command/args/url) plus any field they list.
 
-Sandbox pins only matter while the sandbox
-is on, so combine them with `required = true`. `max_profile` refuses `--sandbox-profile` above the
-ceiling and lowers a configured `sandbox-profile`; `max_network` lowers `sandbox-network`;
+Any sandbox pin (`max_profile`, `max_network`, `allowed_hosts`, `forbid_home_mounts`, `allowed_roots`)
+implies `required = true`: the sandbox is forced on and `--no-sandbox` / `sandbox = false` are refused, since a
+pin on a disabled sandbox would constrain nothing (`/doctor` reports `true (implied by sandbox pins)`).
+`max_profile` refuses `--sandbox-profile` above the
+ceiling, lowers a configured `sandbox-profile`, and refuses the run-time `/sandbox <profile>` switch above it
+(the message names the managed file); while it is set, explicit `sandbox-read-roots`, `sandbox-write-roots`,
+`sandbox-toolchain-roots` and the Windows AppContainer read/write roots are cleared with a load warning unless
+they fall inside an absolute `allowed_roots` entry (symlinks are resolved first, `..` is refused), and the CLI
+`--sandbox-toolchain-root` / `--windows-appcontainer-*-root` flags are refused likewise; the built-in default
+toolchain roots stay. `allowed_roots` needs `max_profile`. `allowed_hosts` also caps `sandbox-network` at
+`allowlist` when no `max_network` is set; `max_network` lowers `sandbox-network`;
 `allowed_hosts` drops `sandbox-network-hosts` entries that are not covered by a pinned entry (a
 pinned `*.github.com` covers `api.github.com`, an entry's port must fit the pinned one) and turns
 off run-time approval of unlisted hosts, so pinned hosts are the only ones a user can list;

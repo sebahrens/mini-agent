@@ -19,6 +19,8 @@
 //! max_network = "allowlist"                             # ceiling: deny | allowlist | allow
 //! allowed_hosts = ["registry.npmjs.org"]                # pin sandbox-network-hosts; no run-time approvals
 //! forbid_home_mounts = true                             # ignore sandbox-home-mounts
+//! allowed_roots = ["/opt/toolchains"]                   # with max_profile: extra read/write/toolchain roots permitted
+//! # Any sandbox pin implies `required = true`.
 //!
 //! [mcp]
 //! disabled = false
@@ -69,6 +71,11 @@ struct SandboxPolicy {
     allowed_hosts: Option<Vec<String>>,
     /// Drop every `sandbox-home-mounts` entry.
     forbid_home_mounts: bool,
+    /// With `max_profile`: absolute directories the explicit
+    /// `sandbox-read-roots`, `sandbox-write-roots`, `sandbox-toolchain-roots`
+    /// and Windows AppContainer roots may fall inside. Without this key, or
+    /// for roots outside it, those user grants are cleared.
+    allowed_roots: Option<Vec<String>>,
 }
 
 /// One `allowed_servers` / `denied_servers` entry: a bare name (matches the
@@ -77,7 +84,7 @@ struct SandboxPolicy {
 #[serde(untagged)]
 enum McpEntry {
     Name(String),
-    Spec(McpEntrySpec),
+    Spec(Box<McpEntrySpec>),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -91,6 +98,19 @@ struct McpEntrySpec {
     args: Option<Vec<String>>,
     /// URL servers: the exact `url` (a trailing `/` is ignored).
     url: Option<String>,
+    /// With `command`: the exact `env` table. Omitted means no `env` for an
+    /// allow entry (a user `env` such as `NODE_OPTIONS` would change what runs).
+    env: Option<BTreeMap<String, String>>,
+    /// With `command`: the exact working directory. Omitted means none.
+    cwd: Option<String>,
+    /// With `command`: the exact `inherit_env` names. Omitted means none.
+    inherit_env: Option<Vec<String>>,
+    /// With `command`: the required `sandbox` backend. Omitted allows any
+    /// value, including none (an unsandboxed launch): pin it to forbid that.
+    sandbox: Option<String>,
+    /// With `url`: the exact `headers` table. Omitted allows any headers (they
+    /// only reach the pinned URL); a `headers_helper` is refused either way.
+    headers: Option<BTreeMap<String, String>>,
 }
 
 impl McpEntry {
@@ -103,6 +123,11 @@ impl McpEntry {
                 .chain(&spec.command)
                 .chain(&spec.url)
                 .chain(spec.args.iter().flatten())
+                .chain(&spec.cwd)
+                .chain(&spec.sandbox)
+                .chain(spec.inherit_env.iter().flatten())
+                .chain(spec.env.iter().flatten().flat_map(|(k, v)| [k, v]))
+                .chain(spec.headers.iter().flatten().flat_map(|(k, v)| [k, v]))
                 .map(String::as_str)
                 .collect(),
         }
@@ -121,7 +146,58 @@ impl McpEntry {
         if spec.args.is_some() && spec.command.is_none() {
             return Err("an MCP entry sets args without command".into());
         }
+        if spec.command.is_none()
+            && (spec.env.is_some()
+                || spec.cwd.is_some()
+                || spec.inherit_env.is_some()
+                || spec.sandbox.is_some())
+        {
+            return Err(
+                "an MCP entry sets env, cwd, inherit_env or sandbox without command".into(),
+            );
+        }
+        if spec.url.is_none() && spec.headers.is_some() {
+            return Err("an MCP entry sets headers without url".into());
+        }
         Ok(())
+    }
+
+    /// The launch-shaping fields of a pinned stdio entry. `strict` (allow
+    /// entries) makes an omitted field mean "empty / unset"; a deny entry only
+    /// compares the fields it lists.
+    #[cfg(feature = "mcp")]
+    fn launch_matches(
+        spec: &McpEntrySpec,
+        strict: bool,
+        cwd: Option<&Path>,
+        env: &std::collections::HashMap<String, String>,
+        inherit_env: &[String],
+        sandbox: Option<&str>,
+    ) -> bool {
+        if spec.command.is_none() {
+            return true;
+        }
+        let env_ok = match &spec.env {
+            Some(pinned) => {
+                pinned.len() == env.len() && pinned.iter().all(|(k, v)| env.get(k) == Some(v))
+            }
+            None => !strict || env.is_empty(),
+        };
+        let cwd_ok = match &spec.cwd {
+            Some(pinned) => cwd == Some(Path::new(pinned)),
+            None => !strict || cwd.is_none(),
+        };
+        let inherit_ok = match &spec.inherit_env {
+            Some(pinned) => pinned.as_slice() == inherit_env,
+            None => !strict || inherit_env.is_empty(),
+        };
+        env_ok
+            && cwd_ok
+            && inherit_ok
+            && spec
+                .sandbox
+                .as_deref()
+                .is_none_or(|pinned| sandbox == Some(pinned))
     }
 
     /// Whether this entry matches the server `name` defined as `config`.
@@ -144,8 +220,25 @@ impl McpEntry {
         match config {
             // Built-in registrations carry a fixed, trusted identity.
             McpServerConfig::BuiltIn { .. } => spec.command.is_none() && spec.url.is_none(),
-            McpServerConfig::Command { command, args, .. } => {
+            McpServerConfig::Command {
+                command,
+                args,
+                cwd,
+                env,
+                inherit_env,
+                sandbox,
+                ..
+            } => {
                 spec.url.is_none()
+                    && spec.headers.is_none()
+                    && Self::launch_matches(
+                        spec,
+                        strict_args,
+                        cwd.as_deref(),
+                        env,
+                        inherit_env,
+                        sandbox.as_deref(),
+                    )
                     && spec.command.as_deref().is_none_or(|entry| entry == command)
                     && match (&spec.command, &spec.args) {
                         (Some(_), Some(entry)) => entry == args,
@@ -153,8 +246,18 @@ impl McpEntry {
                         _ => true,
                     }
             }
-            McpServerConfig::Url { url, .. } => {
+            McpServerConfig::Url {
+                url,
+                headers,
+                options,
+                ..
+            } => {
                 spec.command.is_none()
+                    && !(strict_args && spec.url.is_some() && options.headers_helper.is_some())
+                    && spec.headers.as_ref().is_none_or(|pinned| {
+                        pinned.len() == headers.len()
+                            && pinned.iter().all(|(k, v)| headers.get(k) == Some(v))
+                    })
                     && spec.url.as_deref().is_none_or(|entry| {
                         entry.trim_end_matches('/') == url.trim_end_matches('/')
                     })
@@ -257,6 +360,26 @@ pub(crate) fn check_provider(name: &str) -> Result<(), String> {
     }
 }
 
+/// Canonical form of the longest existing ancestor plus the remaining
+/// components, so a symlink inside an allowed root cannot name a target
+/// outside it while not-yet-created paths still compare.
+fn normalized_root(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut base = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                base = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 fn bounded_list(what: &str, list: &[String]) -> Result<(), String> {
     if list.len() > MAX_ENTRIES || list.iter().any(|item| item.len() > MAX_PATTERN_BYTES) {
         return Err(format!("{what} exceeds the size limit"));
@@ -355,6 +478,7 @@ impl ManagedPolicy {
             ("providers.allowed", file.providers.allowed.as_ref()),
             ("providers.denied", Some(&file.providers.denied)),
             ("sandbox.allowed_hosts", file.sandbox.allowed_hosts.as_ref()),
+            ("sandbox.allowed_roots", file.sandbox.allowed_roots.as_ref()),
         ] {
             if let Some(list) = list {
                 bounded_list(what, list).map_err(|e| format!("managed policy {shown}: {e}"))?;
@@ -363,6 +487,18 @@ impl ManagedPolicy {
         if let Some(hosts) = &file.sandbox.allowed_hosts {
             crate::sandbox::net_proxy::parse_rules(hosts)
                 .map_err(|e| format!("managed policy {shown}: sandbox.allowed_hosts: {e}"))?;
+        }
+        if let Some(roots) = &file.sandbox.allowed_roots {
+            if file.sandbox.max_profile.is_none() {
+                return Err(format!(
+                    "managed policy {shown}: sandbox.allowed_roots needs sandbox.max_profile"
+                ));
+            }
+            if let Some(bad) = roots.iter().find(|root| !Path::new(root).is_absolute()) {
+                return Err(format!(
+                    "managed policy {shown}: sandbox.allowed_roots entry `{bad}` must be an absolute path"
+                ));
+            }
         }
         let mut allowed: Vec<SecurityMode> = match &permissions.allowed_modes {
             None => SecurityMode::all().collect(),
@@ -451,8 +587,53 @@ impl ManagedPolicy {
         &self.allowed_modes
     }
 
+    /// True when the sandbox cannot be turned off: asked for explicitly, or
+    /// implied by any pin (a pin on a disabled sandbox would constrain nothing).
     pub(crate) fn sandbox_required(&self) -> bool {
-        self.file.sandbox.required
+        self.file.sandbox.required || self.sandbox_pinned()
+    }
+
+    fn sandbox_pinned(&self) -> bool {
+        let sandbox = &self.file.sandbox;
+        sandbox.max_profile.is_some()
+            || sandbox.max_network.is_some()
+            || sandbox.allowed_hosts.is_some()
+            || sandbox.forbid_home_mounts
+            || sandbox.allowed_roots.is_some()
+    }
+
+    /// Whether an explicit read/write/toolchain root is permitted. Without a
+    /// `max_profile` ceiling roots are unmanaged; with one, only roots inside
+    /// `allowed_roots` pass.
+    pub(crate) fn sandbox_root_allowed(&self, root: &Path) -> bool {
+        let sandbox = &self.file.sandbox;
+        if sandbox.max_profile.is_none() {
+            return true;
+        }
+        let Some(allowed) = &sandbox.allowed_roots else {
+            return false;
+        };
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        let root = normalized_root(root);
+        allowed
+            .iter()
+            .any(|entry| root.starts_with(normalized_root(Path::new(entry))))
+    }
+
+    /// Refusal when a CLI-supplied sandbox root falls outside the ceiling.
+    pub(crate) fn sandbox_root_violation(&self, flag: &str, root: &Path) -> Option<String> {
+        (!self.sandbox_root_allowed(root)).then(|| {
+            self.refusal(&format!(
+                "{flag} `{}` (explicit sandbox roots must sit inside sandbox.allowed_roots while max_profile is set)",
+                crate::ui::events::sanitize_for_review(&root.display().to_string())
+            ))
+        })
     }
 
     /// True when `--dangerously-skip-permissions` must be refused: either the
@@ -571,6 +752,9 @@ impl ManagedPolicy {
         if sandbox.forbid_home_mounts {
             pins.push("no home mounts".to_string());
         }
+        if let Some(roots) = &sandbox.allowed_roots {
+            pins.push(format!("{} allowed root(s)", roots.len()));
+        }
         if pins.is_empty() {
             "none".to_string()
         } else {
@@ -594,7 +778,13 @@ impl ManagedPolicy {
                 .map(|mode| mode.as_str())
                 .collect::<Vec<_>>()
                 .join(","),
-            self.file.sandbox.required,
+            if self.file.sandbox.required {
+                "true".to_string()
+            } else if self.sandbox_pinned() {
+                "true (implied by sandbox pins)".to_string()
+            } else {
+                "false".to_string()
+            },
             self.permission_checks_required(),
             self.sandbox_pins_summary(),
             if self.file.mcp.disabled {
@@ -612,6 +802,47 @@ impl ManagedPolicy {
         )
     }
 
+    /// Drop explicit read/write/toolchain/Windows roots outside the allowance.
+    fn clamp_roots(&self, cfg: &mut super::Config) {
+        let file = self.path.display();
+        let mut dropped = Vec::new();
+        for (key, roots) in [
+            ("sandbox-read-roots", &mut cfg.sandbox_read_roots),
+            ("sandbox-write-roots", &mut cfg.sandbox_write_roots),
+            (
+                "windows-appcontainer-read-roots",
+                &mut cfg.windows_appcontainer_read_roots,
+            ),
+            (
+                "windows-appcontainer-write-roots",
+                &mut cfg.windows_appcontainer_write_roots,
+            ),
+        ] {
+            let before = roots.len();
+            roots.retain(|root| self.sandbox_root_allowed(root));
+            if roots.len() != before {
+                dropped.push(key);
+            }
+        }
+        if let Some(roots) = cfg.sandbox_toolchain_roots.as_mut() {
+            let before = roots.len();
+            roots.retain(|root| self.sandbox_root_allowed(root));
+            if roots.len() != before {
+                dropped.push("sandbox-toolchain-roots");
+                // Everything removed: fall back to the built-in defaults
+                // rather than an empty list the user never asked for.
+                if roots.is_empty() {
+                    cfg.sandbox_toolchain_roots = None;
+                }
+            }
+        }
+        for key in dropped {
+            cfg.load_warnings.push(format!(
+                "{key} entries outside sandbox.allowed_roots were removed by the managed policy {file} (max_profile is set)"
+            ));
+        }
+    }
+
     /// Clamp the sandbox settings of `cfg` to the managed pins, warning for
     /// each value that was lowered or dropped.
     fn apply_sandbox_pins(&self, cfg: &mut super::Config) {
@@ -625,7 +856,16 @@ impl ManagedPolicy {
                 "sandbox-profile was lowered to `{max}` by the managed policy {file}"
             ));
         }
-        if let Some(max) = sandbox.max_network
+        // A host pin is meaningless under `allow`: it caps the network at
+        // `allowlist` even when no `max_network` is set.
+        let max_network = match (sandbox.max_network, sandbox.allowed_hosts.is_some()) {
+            (Some(max), true) if max.rank() > crate::sandbox::SandboxNetwork::Allowlist.rank() => {
+                Some(crate::sandbox::SandboxNetwork::Allowlist)
+            }
+            (None, true) => Some(crate::sandbox::SandboxNetwork::Allowlist),
+            (max, _) => max,
+        };
+        if let Some(max) = max_network
             && cfg.sandbox_network.is_some_and(|n| n.rank() > max.rank())
         {
             cfg.sandbox_network = Some(max);
@@ -642,6 +882,9 @@ impl ManagedPolicy {
                     "sandbox-network-hosts entries outside the managed allowed_hosts were removed by the managed policy {file}"
                 ));
             }
+        }
+        if sandbox.max_profile.is_some() {
+            self.clamp_roots(cfg);
         }
         if sandbox.forbid_home_mounts && !cfg.sandbox_home_mounts.is_empty() {
             cfg.sandbox_home_mounts.clear();
@@ -663,7 +906,7 @@ impl ManagedPolicy {
                 }
             }
         }
-        if self.file.sandbox.required {
+        if self.sandbox_required() {
             cfg.sandbox = Some(true);
             cfg.sandbox_required = Some(true);
         }
@@ -1138,5 +1381,225 @@ mod tests {
             checker.check("shell", "npm test"),
             crate::permission::checker::CheckResult::Allowed
         ));
+    }
+
+    #[test]
+    fn runtime_profile_switch_refuses_above_max_profile_naming_the_file() {
+        let policy = policy("[sandbox]\nmax_profile = \"workspace\"\n");
+        let mut sandbox = crate::sandbox::Sandbox::new(false, "bwrap");
+        for profile in [
+            crate::sandbox::SandboxProfile::HostRead,
+            crate::sandbox::SandboxProfile::HostFull,
+        ] {
+            let error = sandbox
+                .set_profile_under(Some(&policy), profile)
+                .unwrap_err();
+            assert!(error.contains("managed-config.toml"), "{error}");
+            assert_eq!(sandbox.profile(), crate::sandbox::SandboxProfile::Workspace);
+        }
+        // Default closed: without a policy the managed check never fires.
+        let unmanaged = sandbox.set_profile_under(None, crate::sandbox::SandboxProfile::HostRead);
+        assert!(
+            unmanaged
+                .err()
+                .is_none_or(|e| !e.contains("managed-config.toml"))
+        );
+    }
+
+    #[test]
+    fn max_profile_clears_roots_outside_the_allowance() {
+        let dir = crate::tests::support::temp::TempDir::new("managed-roots");
+        let allowed = dir.path().join("tools");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let outside = crate::tests::support::temp::TempDir::new("managed-outside");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), allowed.join("escape")).unwrap();
+        let pinned = policy(&format!(
+            "[sandbox]\nmax_profile = \"workspace\"\nallowed_roots = [{:?}]\n",
+            allowed.display().to_string()
+        ));
+        let mut cfg: super::super::Config = toml::from_str(&format!(
+            "sandbox_write_roots = [\"/etc\", {ok:?}, {sneak:?}]\nsandbox_read_roots = [\"/home/x\", \"relative\"]\nsandbox_toolchain_roots = [\"/opt/evil\"]\nwindows_appcontainer_write_roots = [\"C:/x\"]\n",
+            ok = allowed.join("sub").display().to_string(),
+            sneak = allowed.join("../outside").display().to_string(),
+        ))
+        .unwrap();
+        pinned.apply(&mut cfg);
+        assert_eq!(cfg.sandbox_write_roots, vec![allowed.join("sub")]);
+        assert!(cfg.sandbox_read_roots.is_empty());
+        assert_eq!(cfg.sandbox_toolchain_roots, None);
+        assert!(cfg.windows_appcontainer_write_roots.is_empty());
+        #[cfg(unix)]
+        assert!(!pinned.sandbox_root_allowed(&allowed.join("escape")));
+        assert!(
+            cfg.load_warnings
+                .iter()
+                .any(|w| w.contains("sandbox-write-roots") && w.contains("managed-config.toml"))
+        );
+
+        // No allowance key: every explicit root is cleared.
+        let strict = policy("[sandbox]\nmax_profile = \"host-read\"\n");
+        let mut cfg: super::super::Config =
+            toml::from_str("sandbox_write_roots = [\"/tmp/x\"]\n").unwrap();
+        strict.apply(&mut cfg);
+        assert!(cfg.sandbox_write_roots.is_empty());
+        // No max_profile: roots are untouched (default closed for the new key).
+        let open = policy("[sandbox]\nrequired = true\n");
+        let mut cfg: super::super::Config =
+            toml::from_str("sandbox_write_roots = [\"/tmp/x\"]\n").unwrap();
+        open.apply(&mut cfg);
+        assert_eq!(cfg.sandbox_write_roots.len(), 1);
+        // CLI toolchain roots are refused naming the file.
+        let cli_cfg: super::super::Config = toml::from_str("").unwrap();
+        let error = authority(
+            &strict,
+            &["--sandbox-toolchain-root", "/opt/evil"],
+            &cli_cfg,
+        )
+        .unwrap_err();
+        assert!(error.contains("--sandbox-toolchain-root"), "{error}");
+        assert!(error.contains("managed-config.toml"), "{error}");
+    }
+
+    #[test]
+    fn allowed_roots_need_max_profile_and_absolute_paths() {
+        for bad in [
+            "[sandbox]\nallowed_roots = [\"/opt\"]\n",
+            "[sandbox]\nmax_profile = \"workspace\"\nallowed_roots = [\"rel\"]\n",
+        ] {
+            assert!(
+                ManagedPolicy::from_file(PathBuf::from("/m.toml"), toml::from_str(bad).unwrap())
+                    .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_caps_network_at_allowlist() {
+        let policy = policy("[sandbox]\nallowed_hosts = [\"registry.npmjs.org\"]\n");
+        let mut cfg: super::super::Config =
+            toml::from_str("sandbox_network = \"allow\"\n").unwrap();
+        policy.apply(&mut cfg);
+        assert_eq!(
+            cfg.sandbox_network,
+            Some(crate::sandbox::SandboxNetwork::Allowlist)
+        );
+    }
+
+    #[test]
+    fn any_sandbox_pin_implies_required_and_refuses_no_sandbox() {
+        for pin in [
+            "max_profile = \"workspace\"",
+            "max_network = \"deny\"",
+            "allowed_hosts = [\"a.example\"]",
+            "forbid_home_mounts = true",
+        ] {
+            let policy = policy(&format!("[sandbox]\n{pin}\n"));
+            assert!(policy.sandbox_required(), "{pin}");
+            assert!(policy.summary().contains("implied by sandbox pins"));
+            let cfg: super::super::Config = toml::from_str("").unwrap();
+            let error = authority(&policy, &["--no-sandbox"], &cfg).unwrap_err();
+            assert!(error.contains("--no-sandbox"), "{error}");
+            assert!(error.contains("managed-config.toml"), "{error}");
+            let off: super::super::Config = toml::from_str("sandbox = false\n").unwrap();
+            assert!(authority(&policy, &[], &off).is_err(), "{pin}");
+            let mut applied: super::super::Config = toml::from_str("sandbox = false\n").unwrap();
+            policy.apply(&mut applied);
+            assert_eq!(applied.sandbox, Some(true));
+            assert_eq!(applied.sandbox_required, Some(true));
+        }
+        // No pins: nothing is implied (default closed).
+        let none = policy("[permissions]\ndisable_yolo = true\n");
+        assert!(!none.sandbox_required());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn pinned_mcp_launch_rejects_env_cwd_inherit_env_and_unpinned_sandbox() {
+        let policy = policy(
+            "[mcp]\nallowed_servers = [{ name = \"gh\", command = \"npx\", args = [\"-y\", \"gh-mcp\"] }, { name = \"box\", command = \"srv\", sandbox = \"bwrap\", env = { A = \"1\" } }, { name = \"docs\", url = \"https://docs.example/mcp\" }, { name = \"hdr\", url = \"https://h.example\", headers = { X = \"y\" } }]\n",
+        );
+        let ok = |name: &str, text: &str| policy.check_mcp_server(name, &server(text));
+        let base = "command = \"npx\"\nargs = [\"-y\", \"gh-mcp\"]\n";
+        assert!(ok("gh", base).is_ok());
+        for extra in [
+            "env = { NODE_OPTIONS = \"--require /tmp/x.js\" }\n",
+            "env = { LD_PRELOAD = \"/tmp/x.so\" }\n",
+            "cwd = \"/tmp/planted\"\n",
+            "inherit_env = [\"PATH\"]\n",
+        ] {
+            let error = ok("gh", &format!("{base}{extra}")).unwrap_err();
+            assert!(error.contains("managed-config.toml"), "{extra}: {error}");
+        }
+        // Pinned sandbox and env: exact match required.
+        assert!(
+            ok(
+                "box",
+                "command = \"srv\"\nsandbox = \"bwrap\"\nenv = { A = \"1\" }\n"
+            )
+            .is_ok()
+        );
+        assert!(ok("box", "command = \"srv\"\nenv = { A = \"1\" }\n").is_err());
+        assert!(
+            ok(
+                "box",
+                "command = \"srv\"\nsandbox = \"none\"\nenv = { A = \"1\" }\n"
+            )
+            .is_err()
+        );
+        assert!(
+            ok(
+                "box",
+                "command = \"srv\"\nsandbox = \"bwrap\"\nenv = { A = \"2\" }\n"
+            )
+            .is_err()
+        );
+        assert!(
+            ok(
+                "box",
+                "command = \"srv\"\nsandbox = \"bwrap\"\nenv = { A = \"1\", B = \"2\" }\n"
+            )
+            .is_err()
+        );
+        // URL entries: headers_helper (a spawned command) is refused; pinned headers are exact.
+        assert!(
+            ok(
+                "docs",
+                "url = \"https://docs.example/mcp\"\nheaders = { Authorization = \"t\" }\n"
+            )
+            .is_ok()
+        );
+        assert!(
+            ok(
+                "docs",
+                "url = \"https://docs.example/mcp\"\nheaders_helper = [\"/tmp/x\"]\n"
+            )
+            .is_err()
+        );
+        assert!(
+            ok(
+                "hdr",
+                "url = \"https://h.example\"\nheaders = { X = \"y\" }\n"
+            )
+            .is_ok()
+        );
+        assert!(
+            ok(
+                "hdr",
+                "url = \"https://h.example\"\nheaders = { X = \"z\" }\n"
+            )
+            .is_err()
+        );
+        // Deny entries still match on identity alone.
+        let deny = ManagedPolicy::from_file(
+            PathBuf::from("/m.toml"),
+            toml::from_str("[mcp]\ndenied_servers = [{ command = \"sh\" }]\n").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            deny.check_mcp_server("x", &server("command = \"sh\"\nenv = { A = \"1\" }\n"))
+                .is_err()
+        );
     }
 }

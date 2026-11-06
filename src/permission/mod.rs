@@ -280,6 +280,25 @@ pub(crate) fn resolve_execution_authority_under(
         {
             return Err(ExecutionAuthorityError::ManagedPolicy(message));
         }
+        let flag_roots = cli
+            .sandbox_toolchain_roots
+            .iter()
+            .map(|root| ("--sandbox-toolchain-root", root))
+            .chain(
+                cli.windows_appcontainer_read_roots
+                    .iter()
+                    .map(|root| ("--windows-appcontainer-read-root", root)),
+            )
+            .chain(
+                cli.windows_appcontainer_write_roots
+                    .iter()
+                    .map(|root| ("--windows-appcontainer-write-root", root)),
+            );
+        for (flag, root) in flag_roots {
+            if let Some(message) = policy.sandbox_root_violation(flag, root) {
+                return Err(ExecutionAuthorityError::ManagedPolicy(message));
+            }
+        }
         let (provider, _) = cli.resolve_provider_and_model(cfg);
         policy
             .check_provider(&provider)

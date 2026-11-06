@@ -8,6 +8,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Managed policy: `/sandbox <profile>` (the only run-time profile switch) now refuses a profile above `max_profile`
+  naming the managed file (mini-agent-el299); `max_profile` also clears explicit sandbox read/write/toolchain/Windows
+  roots outside a new `sandbox.allowed_roots` allowance, and `allowed_hosts` caps `sandbox-network` at `allowlist`
+  (mini-agent-dusi2); any sandbox pin now implies `sandbox.required`, so `--no-sandbox` / `sandbox = false` cannot void
+  it (mini-agent-otcrm); pinned MCP stdio entries now reject unpinned `env`, `cwd`, `inherit_env`, can pin `sandbox`,
+  and URL pins refuse `headers_helper` (mini-agent-cxfmb).
 - The sandbox HTTP proxy replaces the client's `Host` header with the allowlisted request-URI authority before
   forwarding, so a contained command cannot reach another virtual host behind an allowed address (mini-agent-9svy4).
 - The built-in `jdtls`, `csharp-ls`, `ruby-lsp`, `kotlin-language-server`, `sourcekit-lsp` and `zls` servers evaluate

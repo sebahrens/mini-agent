@@ -2676,6 +2676,19 @@ impl Sandbox {
     }
 
     pub(crate) fn set_profile(&mut self, profile: SandboxProfile) -> Result<(), String> {
+        self.set_profile_under(crate::config::managed::active(), profile)
+    }
+
+    /// [`Self::set_profile`] against an explicit managed policy: the single
+    /// run-time profile switch refuses anything above `max_profile`.
+    pub(crate) fn set_profile_under(
+        &mut self,
+        policy: Option<&crate::config::managed::ManagedPolicy>,
+        profile: SandboxProfile,
+    ) -> Result<(), String> {
+        if let Some(message) = policy.and_then(|policy| policy.profile_violation(profile)) {
+            return Err(message);
+        }
         if self.running_background_job_count() != 0
             || !self
                 .active_groups
