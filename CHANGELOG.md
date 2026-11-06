@@ -8,6 +8,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Sessions
 
+- The session catalogue (`/sessions`, `--resume`) writes a small `<id>.index` metadata sidecar for
+  every session it reads in full; a session with a current sidecar is listed without reading its
+  transcript and is no longer charged against the 256 MiB scan budget, so repeated listings reach
+  older sessions. When the listing is limited it now says that older sessions exist and that
+  `--session <id-or-name>` loads any of them. Sidecars are hints only (selecting a session still
+  reloads and re-validates the real file) and are removed with the session.
+
 - `/btw` tool results now truncate at the configured `tool_result_spill_*` limits, like the main agent.
 
 - Deleting a session (`/sessions delete`, `session_retention_days`) now also removes its private

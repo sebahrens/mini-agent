@@ -476,6 +476,7 @@ async fn show_busy_sessions(ctx: &mut SlashCtx<'_>, all: bool) -> anyhow::Result
         ctx.renderer,
         "saved sessions (read-only while a turn runs):",
     );
+    let notice = catalogue.notice();
     for row in catalogue.rows {
         write_result(
             ctx.renderer,
@@ -488,14 +489,8 @@ async fn show_busy_sessions(ctx: &mut SlashCtx<'_>, all: bool) -> anyhow::Result
             )),
         );
     }
-    if catalogue.truncated || catalogue.skipped > 0 {
-        write_result(
-            ctx.renderer,
-            format!(
-                "catalogue: skipped {}, truncated {}",
-                catalogue.skipped, catalogue.truncated
-            ),
-        );
+    if let Some(notice) = notice {
+        write_result(ctx.renderer, format!("catalogue: {notice}"));
     }
     Ok(())
 }

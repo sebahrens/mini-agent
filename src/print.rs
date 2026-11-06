@@ -2208,11 +2208,8 @@ pub(crate) fn print_sessions(
             "Use --session <id-or-name> to load a session; --resume-all includes other workspaces."
         );
     }
-    if catalogue.truncated || catalogue.skipped > 0 {
-        eprintln!(
-            "session catalogue limited; {} unsafe/invalid/oversized entries skipped",
-            catalogue.skipped
-        );
+    if let Some(notice) = catalogue.notice() {
+        eprintln!("session catalogue limited: {notice}");
     }
     Ok(())
 }

@@ -969,6 +969,8 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
+    // The catalogue's metadata sidecar goes with its session.
+    let _ = std::fs::remove_file(dir.join(format!("{id}.index")));
     remove_tool_output_dir(id);
     Ok(())
 }

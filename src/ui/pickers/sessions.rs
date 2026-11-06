@@ -327,7 +327,7 @@ impl SessionsPicker {
             "{} shown{}{}",
             self.matches.len(),
             if self.catalogue.truncated {
-                "; catalogue limit reached"
+                "; older sessions not listed, load one with --session <id>"
             } else {
                 ""
             },
