@@ -36,6 +36,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Subagent evidence limits are configurable (`[subagents] evidence_max_records`,
   `evidence_max_record_bytes`, `evidence_max_child_bytes`, `evidence_max_children`) and documented;
   `task_evidence` for an evicted or pre-restart handle now reports it as expired.
+- `task` accepts `"isolation": "worktree"` for a write persona without editing its frontmatter,
+  and `"base_ref"` to branch isolated children from a chosen commit instead of the parent `HEAD`.
 
 **Fork release 1.14.2 (2026-10-28)**
 

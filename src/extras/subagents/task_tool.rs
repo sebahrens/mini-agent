@@ -75,6 +75,11 @@ pub struct TaskCallOptions {
     pub timeout_secs: Option<u64>,
     /// Continue the stored conversation of an earlier child (its child id).
     pub resume: Option<String>,
+    /// `"worktree"` runs a write persona's children in private worktrees
+    /// even when the persona does not set `isolation: worktree`.
+    pub isolation: Option<String>,
+    /// Commit-ish isolated children branch from (default: parent `HEAD`).
+    pub base_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -242,6 +247,10 @@ impl<'de> Deserialize<'de> for TaskArgs {
             timeout_secs: Option<u64>,
             #[serde(default)]
             resume: Option<String>,
+            #[serde(default)]
+            isolation: Option<String>,
+            #[serde(default)]
+            base_ref: Option<String>,
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
@@ -249,6 +258,8 @@ impl<'de> Deserialize<'de> for TaskArgs {
             max_turns: raw.max_turns,
             timeout_secs: raw.timeout_secs,
             resume: raw.resume,
+            isolation: raw.isolation,
+            base_ref: raw.base_ref,
         };
         let mut raw_briefs = raw.briefs.map(|briefs| briefs.0);
         let mut agent_type = raw.agent_type;
@@ -1229,6 +1240,15 @@ editing in a known location, grepping for a literal you will act on immediately.
                     "maximum": timeout_ceiling,
                     "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs 300 in the foreground or task_background_timeout_secs 3600 in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
                 },
+                "isolation": {
+                    "type": "string",
+                    "enum": ["none", "worktree"],
+                    "description": "Optional. \"worktree\" runs each child of a mode: write persona in its own git worktree and branch (parallel; the parent workspace is never written; branches are returned for an explicit merge), as the persona frontmatter isolation: worktree does. Rejected for read-only children."
+                },
+                "base_ref": {
+                    "type": "string",
+                    "description": "Optional commit-ish (branch, tag or commit id) that worktree-isolated children branch from instead of the parent's HEAD. Requires isolation. Uncommitted parent changes are never visible to the child."
+                },
                 "resume": {
                     "type": "string",
                     "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids are in memory only and expire after the 16 most recent children or a restart."
@@ -1354,6 +1374,25 @@ editing in a known location, grepping for a literal you will act on immediately.
         let write_mode = specialization
             .as_ref()
             .is_some_and(|persona| persona.write_mode);
+        // Per-call isolation only ever adds the worktree boundary to a write
+        // persona; it never turns a read child into a write child.
+        let call_isolation = match args.options.isolation.as_deref() {
+            None | Some("none") => false,
+            Some("worktree") => true,
+            Some(other) => {
+                return Err(ToolError::Msg(format!(
+                    "task: isolation must be \"worktree\" or \"none\", got {other:?}"
+                )));
+            }
+        };
+        if call_isolation && !write_mode {
+            return Err(ToolError::Msg(
+                "task: isolation \"worktree\" applies only to a mode: write persona (agent_type); read-only children never write the workspace".into(),
+            ));
+        }
+        if let Some(base) = args.options.base_ref.as_deref() {
+            super::isolation::validate_base_ref(base).map_err(ToolError::Msg)?;
+        }
         let mut isolated = false;
         if write_mode {
             if !config
@@ -1369,9 +1408,10 @@ editing in a known location, grepping for a literal you will act on immediately.
             if self.write_tools.is_none() || self.workspace.is_none() {
                 return Err(ToolError::Msg("task: write persona requires the parent's captured workspace and tool environment".into()));
             }
-            isolated = specialization
-                .as_ref()
-                .is_some_and(|persona| persona.isolation_worktree);
+            isolated = call_isolation
+                || specialization
+                    .as_ref()
+                    .is_some_and(|persona| persona.isolation_worktree);
             if isolated && resumed.is_some() {
                 return Err(ToolError::Msg(
                     "task: a worktree-isolated child cannot be resumed: its worktree ended with it; merge its branch and start a new task".into(),
@@ -1396,6 +1436,11 @@ editing in a known location, grepping for a literal you will act on immediately.
             if uses_shared_write_lane(write_mode, isolated) {
                 limits.max_concurrency = 1;
             }
+        }
+        if args.options.base_ref.is_some() && !isolated {
+            return Err(ToolError::Msg(
+                "task: base_ref applies only to worktree-isolated children; add \"isolation\": \"worktree\" (write personas)".into(),
+            ));
         }
         self.preflight_persona_tools(specialization.as_ref(), &config)?;
         #[cfg(feature = "hooks")]
@@ -1593,6 +1638,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         )
                     })?,
                 base_dir: self.isolation_base_dir.clone(),
+                base_ref: args.options.base_ref.clone(),
                 #[cfg(test)]
                 create_gate: None,
             })
@@ -5968,6 +6014,59 @@ mod tests {
                 .any(|name| matches!(*name, "shell" | "web_fetch" | "web_search")),
             "{default_names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn per_call_isolation_is_only_for_write_personas_and_base_ref_needs_it() {
+        let root = crate::tests::OwnedTestDirectory::new("call-isolation");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let tool = TaskTool::new(None, None, false).with_workspace_binding(workspace);
+        let config = crate::extras::subagents::SubagentConfig {
+            client: crate::provider::create_client(
+                "openrouter",
+                Some("unused-local-test-key"),
+                &Default::default(),
+                None,
+            )
+            .unwrap(),
+            provider_name: "openrouter".into(),
+            session_provider: "openrouter".into(),
+            model_name: "fixture".into(),
+            fallback_notice: None,
+            api_key: None,
+            max_turns: 2,
+            config: Default::default(),
+        };
+        for (options, expected) in [
+            (
+                serde_json::json!({"isolation": "worktree"}),
+                "applies only to a mode: write persona",
+            ),
+            (
+                serde_json::json!({"isolation": "sometimes"}),
+                "isolation must be",
+            ),
+            (
+                serde_json::json!({"base_ref": "main"}),
+                "base_ref applies only",
+            ),
+            (
+                serde_json::json!({"base_ref": "--evil"}),
+                "base_ref must name one commit",
+            ),
+        ] {
+            let mut args = serde_json::json!({"prompts": ["q"]});
+            args.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            let args: TaskArgs = serde_json::from_value(args).unwrap();
+            let error =
+                crate::extras::subagents::scope_test_config(config.clone(), tool.call(args))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
     }
 
     #[test]

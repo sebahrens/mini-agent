@@ -544,6 +544,27 @@ pub async fn create(
         repo_path,
         name,
         base_dir,
+        None,
+        LOCAL_MUTATION_LIMITS,
+        LOCAL_MUTATION_LIMITS,
+    )
+    .await
+}
+
+/// As [`create`], with the new branch starting at `base_revision` (resolved
+/// to one commit) instead of `HEAD`. The revision must not look like an
+/// option; it is passed after `--end-of-options`.
+pub async fn create_at(
+    repo_path: &Path,
+    name: &str,
+    base_dir: Option<&Path>,
+    base_revision: &str,
+) -> Result<(PathBuf, WorktreeInfo), String> {
+    create_with_limits(
+        repo_path,
+        name,
+        base_dir,
+        Some(base_revision),
         LOCAL_MUTATION_LIMITS,
         LOCAL_MUTATION_LIMITS,
     )
@@ -607,6 +628,7 @@ async fn create_with_limits(
     repo_path: &Path,
     name: &str,
     base_dir: Option<&Path>,
+    base_revision: Option<&str>,
     ref_limits: CommandLimits,
     add_limits: CommandLimits,
 ) -> Result<(PathBuf, WorktreeInfo), String> {
@@ -625,7 +647,30 @@ async fn create_with_limits(
     if optional_ref_oid(&repo_path, &source_ref).await?.is_some() {
         return Err(format!("branch already exists: {name}"));
     }
-    let expected_branch_oid = revision_oid(&repo_path, "HEAD").await?;
+    let expected_branch_oid = match base_revision {
+        None => revision_oid(&repo_path, "HEAD").await?,
+        Some(revision) => {
+            if revision.is_empty()
+                || revision.starts_with('-')
+                || !revision.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(format!("invalid base revision: {revision:?}"));
+            }
+            run_query(
+                &repo_path,
+                "resolve-base-revision",
+                [
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{revision}^{{commit}}"),
+                ],
+            )
+            .await
+            .map(|output| String::from_utf8_lossy(trim_line(&output.stdout)).into_owned())
+            .map_err(|error| format!("base revision {revision} is not a commit: {error}"))?
+        }
+    };
     let state = CreateState {
         repo_path,
         common_dir,
@@ -2810,7 +2855,15 @@ pub(crate) async fn create_with_limits_for_test(
     base_dir: Option<&Path>,
     limits: CommandLimits,
 ) -> Result<(PathBuf, WorktreeInfo), String> {
-    create_with_limits(repo_path, name, base_dir, LOCAL_MUTATION_LIMITS, limits).await
+    create_with_limits(
+        repo_path,
+        name,
+        base_dir,
+        None,
+        LOCAL_MUTATION_LIMITS,
+        limits,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2820,7 +2873,15 @@ pub(crate) async fn create_with_ref_limits_for_test(
     base_dir: Option<&Path>,
     limits: CommandLimits,
 ) -> Result<(PathBuf, WorktreeInfo), String> {
-    create_with_limits(repo_path, name, base_dir, limits, LOCAL_MUTATION_LIMITS).await
+    create_with_limits(
+        repo_path,
+        name,
+        base_dir,
+        None,
+        limits,
+        LOCAL_MUTATION_LIMITS,
+    )
+    .await
 }
 
 #[cfg(test)]

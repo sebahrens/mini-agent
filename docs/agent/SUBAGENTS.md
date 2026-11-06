@@ -381,6 +381,19 @@ tools: Read, Grep, Edit, Write, Shell
 Implement the delegated change in your worktree and report the result.
 ```
 
+The same isolation can be requested per call, without editing the persona,
+by adding `"isolation": "worktree"` to a `task` call whose `agent_type` is a
+`mode: write` persona; it is rejected for read-only children (and
+`"isolation": "none"` is the default, leaving the persona's setting in
+effect). An optional `"base_ref"` (a branch, tag or commit id, resolved to
+one commit; no options, ranges or whitespace) makes isolated children branch
+from that commit instead of the parent's `HEAD`; it requires isolation:
+
+```json
+{"agent_type": "implementer", "isolation": "worktree", "base_ref": "release/1.4",
+ "briefs": [{"objective": "Backport the fix to the release branch"}]}
+```
+
 Requires the `git-worktree` and `subagents` features (both default), a parent
 workspace that is a git repository, `[subagents] allow_write = true`, and active
 permission checks (without a permission checker the parent-tree denial below
@@ -391,7 +404,8 @@ run.
 For each isolated child the host:
 
 1. Creates a worktree and branch `subagent-<id>` from the parent's current
-   `HEAD` through the same `git_worktree::create` path as `/worktree`, next to
+   `HEAD` (or the call's `base_ref`) through the same `git_worktree::create`
+   path as `/worktree`, next to
    the repository or under `wt_base_dir` / `--wt-base-dir`. Uncommitted parent
    changes are not visible to the child.
 2. Binds the child's workspace capability, file tools, sandbox and permission
