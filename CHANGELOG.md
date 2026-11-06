@@ -8,6 +8,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- The built-in `jdtls`, `csharp-ls`, `ruby-lsp`, `kotlin-language-server`, `sourcekit-lsp` and `zls` servers evaluate
+  repository build files, so they now start only in a workspace whose project config is trusted; a same-named
+  `[lsp.servers.<name>]` entry in user config still opts in explicitly (mini-agent-xb0h3).
 - A managed policy that sets `permissions.deny`, `allowed_modes` or `disable_yolo` now also refuses
   `--dangerously-skip-permissions`, since skipping checks would void those rules (mini-agent-khizh).
 - Relative `--add-dir`, `--image`, `--output-schema`, `--loop-plan` and `--log-file` paths keep

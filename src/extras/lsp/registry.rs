@@ -108,6 +108,40 @@ pub fn builtin_servers() -> Vec<(&'static str, LspServerConfig)> {
     ]
 }
 
+/// Built-ins whose servers evaluate repository build definitions (Gradle,
+/// MSBuild, Bundler, SwiftPM, `build.zig`) to resolve a project, so opening an
+/// untrusted repository and editing one file would run repository code outside
+/// the shell sandbox. They start only in a project whose config is trusted; a
+/// same-named `[lsp.servers.<name>]` entry is the user's explicit choice and
+/// is never withheld.
+pub const BUILD_EVALUATING_BUILTINS: &[&str] =
+    &["java", "csharp", "ruby", "kotlin", "swift", "zig"];
+
+/// Drops the build-evaluating built-ins of `servers` unless `trusted()` says
+/// the project is trusted. `trusted` runs only when one of them is present.
+pub(crate) fn withhold_untrusted_builtins(
+    servers: Vec<(String, LspServerConfig)>,
+    user: &HashMap<String, LspServerConfig>,
+    trusted: impl FnOnce() -> bool,
+) -> Vec<(String, LspServerConfig)> {
+    let gated = |name: &str| BUILD_EVALUATING_BUILTINS.contains(&name) && !user.contains_key(name);
+    if !servers.iter().any(|(name, _)| gated(name)) || trusted() {
+        return servers;
+    }
+    servers
+        .into_iter()
+        .filter(|(name, _)| {
+            let keep = !gated(name);
+            if !keep {
+                tracing::warn!(
+                    "lsp[{name}]: built-in server not started because it evaluates project build files and this project's config is not trusted; trust the project config or define [lsp.servers.{name}] yourself"
+                );
+            }
+            keep
+        })
+        .collect()
+}
+
 /// Merges user config over the built-ins: a same-named entry replaces the
 /// built-in, `disabled = true` removes it, new names add custom servers.
 /// Entries without a command are dropped (they can only ever disable).
@@ -195,6 +229,85 @@ mod language_coverage_tests {
             let (_, server) = server_for_path(&servers, std::path::Path::new(file))
                 .unwrap_or_else(|| panic!("no server for {file}"));
             assert_eq!(server.command, expected, "{file}");
+        }
+    }
+
+    fn fixture(name: &str, extension: &str) -> (String, LspServerConfig) {
+        (name.to_string(), server(name, &[], &[extension]))
+    }
+
+    #[test]
+    fn build_evaluating_builtins_are_withheld_unless_trusted_or_user_defined() {
+        let all = resolve_servers(&HashMap::new());
+        let kept = |servers: Vec<(String, LspServerConfig)>| {
+            servers
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        };
+        let untrusted = kept(withhold_untrusted_builtins(
+            all.clone(),
+            &HashMap::new(),
+            || false,
+        ));
+        for gated in BUILD_EVALUATING_BUILTINS {
+            assert!(
+                !untrusted.iter().any(|n| n == gated),
+                "{gated} must be withheld"
+            );
+        }
+        for plain in [
+            "rust",
+            "go",
+            "typescript",
+            "python",
+            "clangd",
+            "bash",
+            "lua",
+            "php",
+        ] {
+            assert!(untrusted.iter().any(|n| n == plain), "{plain} stays");
+        }
+        let trusted = kept(withhold_untrusted_builtins(
+            all.clone(),
+            &HashMap::new(),
+            || true,
+        ));
+        assert_eq!(trusted.len(), all.len());
+        // A user-defined entry of the same name is explicit and never withheld.
+        let mut user = HashMap::new();
+        user.insert(
+            "kotlin".to_string(),
+            server("my-kotlin-ls", &[], &[".kt"]).clone(),
+        );
+        let resolved = resolve_servers(&user);
+        let with_override = kept(withhold_untrusted_builtins(resolved, &user, || false));
+        assert!(with_override.iter().any(|n| n == "kotlin"));
+        assert!(!with_override.iter().any(|n| n == "java"));
+        // Trust is not even evaluated when no gated server is present.
+        let only_plain = vec![fixture("rust", ".rs")];
+        let out = withhold_untrusted_builtins(only_plain, &HashMap::new(), || {
+            panic!("trust must not be consulted")
+        });
+        assert_eq!(out.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_planted_binaries_are_not_resolved_for_the_new_builtins() {
+        use crate::extras::executable_search::PlantedExecutables;
+        let fixture = PlantedExecutables::new("lsp-builtins");
+        for name in ["jdtls", "zls", "kotlin-language-server", "sourcekit-lsp"] {
+            PlantedExecutables::plant(&fixture.workspace, name);
+        }
+        for search in fixture.hostile_search_paths() {
+            let found = available_servers(&HashMap::new(), Some(search.as_os_str()));
+            for gated in BUILD_EVALUATING_BUILTINS {
+                assert!(
+                    found.iter().all(|(n, _)| n != gated),
+                    "{gated} resolved from a relative PATH entry"
+                );
+            }
         }
     }
 

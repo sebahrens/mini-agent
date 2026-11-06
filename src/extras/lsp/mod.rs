@@ -288,6 +288,16 @@ impl SessionLsp {
     }
 }
 
+/// Whether the workspace's project config is trusted in the private trust
+/// store, the gate for built-in servers that evaluate repository build files.
+/// No project config, no trust store or an unknown config location is
+/// untrusted.
+fn workspace_is_trusted(workspace: &crate::paths::WorkspaceBinding) -> bool {
+    crate::paths::process_paths_ref().is_ok_and(|paths| {
+        crate::config::load::project_config_is_trusted_in_workspace_readonly(paths, workspace)
+    })
+}
+
 /// A diagnostic-cache entry bound to the exact regular file that produced it.
 /// The open handle keeps that object alive across an interactive permission
 /// wait; formatting later compares the cache identity to this handle rather
@@ -395,7 +405,11 @@ impl LspManager {
                     .expect("LSP workspace must be a stable directory"),
             ),
         };
-        let servers = registry::resolve_servers(&cfg.servers);
+        let servers = registry::withhold_untrusted_builtins(
+            registry::resolve_servers(&cfg.servers),
+            &cfg.servers,
+            || workspace_is_trusted(&workspace),
+        );
         let manager = Self::with_servers(servers, workspace);
         manager.apply_idle_timeout(cfg);
         manager
@@ -463,6 +477,7 @@ impl LspManager {
         scope: Arc<crate::agent::runner::AgentWorkScope>,
     ) -> Option<Self> {
         let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        let user = configured.clone();
         let result = scope
             .run(async move {
                 // Spawn only after run installs this exact owner, never while
@@ -476,6 +491,9 @@ impl LspManager {
         let cancelled = scope.is_cancelled();
         cleanup.settle().await;
         let servers = result.ok()?;
+        let servers = registry::withhold_untrusted_builtins(servers, &user, || {
+            workspace_is_trusted(&workspace)
+        });
         if cancelled || servers.is_empty() || workspace.validate().is_err() {
             return None;
         }
@@ -1660,5 +1678,61 @@ mod default44_ownership_tests {
             .unwrap();
         assert_eq!(scope.active_children(), 0);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod untrusted_builtin_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn untrusted_workspace_does_not_register_build_evaluating_builtins() {
+        use crate::extras::executable_search::PlantedExecutables;
+        let fixture = PlantedExecutables::new("lsp-untrusted");
+        for name in ["kotlin-language-server", "jdtls", "zls", "rust-analyzer"] {
+            PlantedExecutables::plant(&fixture.bin, name);
+        }
+        let workspace =
+            Arc::new(crate::paths::WorkspaceBinding::capture(&fixture.workspace).unwrap());
+        // A .kt file is present, but the project has no trusted config.
+        std::fs::write(fixture.workspace.join("A.kt"), "fun main() {}\n").unwrap();
+        let manager = LspManager::prepare_automatic(
+            HashMap::new(),
+            Some(fixture.bin.clone().into_os_string()),
+            workspace.clone(),
+            crate::agent::runner::AgentWorkScope::new(),
+        )
+        .await
+        .expect("rust-analyzer is available");
+        assert_eq!(manager.diagnostic_snapshot().configured_names, ["rust"]);
+
+        // Explicit mode applies the same gate.
+        let explicit = LspManager::new(&LspConfig::default(), workspace.clone());
+        let names = explicit.diagnostic_snapshot().configured_names;
+        for gated in registry::BUILD_EVALUATING_BUILTINS {
+            assert!(!names.iter().any(|n| n == gated), "{gated} in {names:?}");
+        }
+        assert!(names.iter().any(|n| n == "rust"));
+
+        // The user's own entry for the language is explicit and stays.
+        let mut cfg = LspConfig::default();
+        cfg.servers.insert(
+            "kotlin".into(),
+            crate::config::types::LspServerConfig {
+                command: fixture
+                    .bin
+                    .join("kotlin-language-server")
+                    .to_str()
+                    .unwrap()
+                    .into(),
+                extensions: vec![".kt".into()],
+                ..Default::default()
+            },
+        );
+        let configured = LspManager::new(&cfg, workspace)
+            .diagnostic_snapshot()
+            .configured_names;
+        assert!(configured.iter().any(|n| n == "kotlin"));
+        assert!(!configured.iter().any(|n| n == "java"));
     }
 }
