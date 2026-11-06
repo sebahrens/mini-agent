@@ -91,6 +91,11 @@ impl ToolResultSpillHook {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn limits(&self) -> crate::session::ToolResultSpillLimits {
+        self.limits
+    }
+
     /// Spill at configured limits instead of the historical defaults.
     pub(crate) fn with_limits(mut self, limits: crate::session::ToolResultSpillLimits) -> Self {
         self.limits = limits;

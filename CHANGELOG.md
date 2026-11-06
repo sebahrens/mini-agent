@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Sessions
 
+- `/btw` tool results now truncate at the configured `tool_result_spill_*` limits, like the main agent.
+
 - Deleting a session (`/sessions delete`, `session_retention_days`) now also removes its private
   tool-output directory (spills, full command logs, `/rewind` preimages), and startup sweeps
   tool-output directories that match no saved session and have been idle for 14 days.

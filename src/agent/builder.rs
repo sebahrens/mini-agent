@@ -1717,21 +1717,18 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         goal_store.clone(),
     ));
     let mut builder = builder;
-    let spill_window = cfg.resolve_context_window(
-        &cli.resolve_provider(cfg),
-        &cli.resolve_model(cfg),
-        crate::config::quick_models_map(cfg),
-    );
     // The session shares this store, so transcript persistence and resume
     // replay bound results with the same limits as the live hook.
-    let spill_limits = cfg.resolve_tool_result_spill_limits(spill_window);
+    let spill_limits = configured_spill_limits(cli, cfg);
     if let Some(spills) = &tool_result_spills {
         spills.set_limits(spill_limits);
     }
-    builder = builder.add_hook(
-        crate::agent::runner::ToolResultSpillHook::new(tool_output_session_id, tool_result_spills)
-            .with_limits(spill_limits),
-    );
+    builder = builder.add_hook(spill_hook(
+        cli,
+        cfg,
+        tool_output_session_id,
+        tool_result_spills,
+    ));
     #[cfg(feature = "advisor")]
     if registered_tools.contains(&"advisor") {
         builder = builder.add_hook(crate::extras::advisor::AdvisorContextHook);
@@ -1793,6 +1790,33 @@ const BTW_MAX_TURNS: usize = 8;
 /// project context for reference, NO tools, and a single turn. Never mutates the
 /// session.
 #[allow(clippy::too_many_arguments)]
+/// The generic tool-result spill limits (`tool_result_spill_*`, scaled to the
+/// active context window) that the main agent and the `/btw` side agent share,
+/// so their results truncate identically.
+pub(crate) fn configured_spill_limits(
+    cli: &Cli,
+    cfg: &Config,
+) -> crate::session::ToolResultSpillLimits {
+    let window = cfg.resolve_context_window(
+        &cli.resolve_provider(cfg),
+        &cli.resolve_model(cfg),
+        crate::config::quick_models_map(cfg),
+    );
+    cfg.resolve_tool_result_spill_limits(window)
+}
+
+/// The tool-result spill hook of the main agent and of `/btw`: one
+/// constructor, so both use the configured limits.
+fn spill_hook(
+    cli: &Cli,
+    cfg: &Config,
+    session_id: &str,
+    spills: Option<crate::session::ToolResultSpillStore>,
+) -> crate::agent::runner::ToolResultSpillHook {
+    crate::agent::runner::ToolResultSpillHook::new(session_id, spills)
+        .with_limits(configured_spill_limits(cli, cfg))
+}
+
 pub async fn build_btw_agent_inner<M: CompletionModel + 'static>(
     model: M,
     instruction_protocol: crate::context::instructions::InstructionProtocol,
@@ -1962,7 +1986,9 @@ pub async fn build_btw_agent_inner<M: CompletionModel + 'static>(
         .max_tokens(max_tokens)
         .tools(read_tools)
         .add_hook(crate::agent::runner::ToolLoopGuard)
-        .add_hook(crate::agent::runner::ToolResultSpillHook::new(
+        .add_hook(spill_hook(
+            cli,
+            cfg,
             tool_output_session_id,
             Some(tool_result_spills),
         ));
@@ -2644,6 +2670,23 @@ mod extra_file_tests {
                 assert!(model.requests().is_empty());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spill_hook_tests {
+    use super::*;
+    #[test]
+    fn main_and_btw_spill_hooks_honor_the_configured_limits() {
+        let cli = crate::cli::Cli::default();
+        let cfg: Config = toml::from_str("tool_result_spill_chars = 4321").unwrap();
+        let configured = configured_spill_limits(&cli, &cfg);
+        assert_eq!(configured.threshold, 4321);
+        assert_ne!(configured, Default::default());
+        let main = spill_hook(&cli, &cfg, "main", None);
+        let btw = spill_hook(&cli, &cfg, "btw", None);
+        assert_eq!(main.limits(), configured);
+        assert_eq!(btw.limits(), main.limits(), "/btw truncates like the main agent");
     }
 }
 
