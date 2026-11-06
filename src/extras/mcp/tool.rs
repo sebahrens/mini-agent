@@ -443,11 +443,18 @@ impl ToolDyn for McpTool {
                 .await
                 .map_err(|e| {
                     let message = match e {
+                        ServiceError::Timeout { timeout } if timeout > call_timeout => format!(
+                            "MCP tool '{tool_name}' on server '{server_name}' was stopped after \
+                             reaching the {} s absolute limit for calls that report progress; \
+                             retry with a narrower request.",
+                            timeout.as_secs()
+                        ),
                         ServiceError::Timeout { .. } => format!(
-                            "MCP tool '{tool_name}' on server '{server_name}' timed out after {} ms; \
-                             the server may be hung or the request too large. Retry with a \
-                             narrower request, or raise `mcp_tool_timeout_secs` (or this server's \
-                             `tool_timeout_sec`) in the config.",
+                            "MCP tool '{tool_name}' on server '{server_name}' timed out after {} ms \
+                             with no response or progress notification; the server may be hung or \
+                             the request too large. Retry with a narrower request, or raise \
+                             `mcp_tool_timeout_secs` (or this server's `tool_timeout_sec`) in the \
+                             config.",
                             call_timeout.as_millis()
                         ),
                         other => format!("MCP tool error: {other}"),

@@ -300,6 +300,16 @@ fn main() {
                 );
             }
             let id = request_id(&compact);
+            if mode == "progress-call" {
+                let token = compact
+                    .split_once("\"progressToken\":")
+                    .map(|(_, rest)| request_id(&format!("\"id\":{rest}")))
+                    .unwrap_or_else(|| "null".to_string());
+                for step in 1..=4 {
+                    thread::sleep(Duration::from_millis(250));
+                    write_response(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":{token},\"progress\":{step}}}}}"));
+                }
+            }
             if mode == "aux-roots" {
                 pending_aux = Some(id);
                 write_response(
@@ -1623,6 +1633,53 @@ async fn mcp_tools_list_error_produces_notice() {
     let pid = wait_for_pid(&lease).await;
     shutdown(manager).await;
     assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_tool_call_with_progress_outlives_the_idle_timeout_but_not_the_ceiling() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("progress-call");
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "progress-call",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let params =
+        || rmcp::model::CallToolRequestParams::new("probe").with_arguments(serde_json::Map::new());
+    // 4 x 250 ms of progress: well past the 600 ms idle timeout in total.
+    let started = std::time::Instant::now();
+    crate::extras::mcp::client::call_tool_with_ceiling(
+        &handle.peer(),
+        params(),
+        Duration::from_millis(600),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("progress notifications must keep the call alive");
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    // The absolute ceiling still applies to a call that keeps reporting progress.
+    let error = crate::extras::mcp::client::call_tool_with_ceiling(
+        &handle.peer(),
+        params(),
+        Duration::from_millis(600),
+        Duration::from_millis(500),
+    )
+    .await
+    .expect_err("the ceiling must stop a call that is still reporting progress");
+    assert!(
+        matches!(error, rmcp::ServiceError::Timeout { timeout } if timeout == Duration::from_millis(500)),
+        "{error}"
+    );
+    McpClientManager::from_handles(vec![handle])
+        .shutdown()
+        .await;
     fixture.cleanup();
 }
 

@@ -850,7 +850,7 @@ Accepted top-level keys:
 | `enable-context7-mcp`     | boolean | Auto-configure the Context7 MCP server. Default: `false`.                                                                                                              |
 | `enable-grepapp-mcp`      | boolean | Auto-configure the Grep.app MCP server. Default: `false`.                                                                                                              |
 | `allow_all_mcp_calls`     | boolean | When `true`, permission checks are skipped for all MCP tool calls. Default: `false`.                                                                                   |
-| `mcp_tool_timeout_secs`   | integer | Bound on one MCP `tools/call` round trip, in seconds. A call that exceeds it is cancelled and reported to the model as a tool error. Default: `120` (minimum `1`). A server entry's `tool_timeout_sec` overrides it; `startup_timeout_sec` overrides the 10 s initialize / 30 s `tools/list` bounds (see MCP_CONFIGURATION.md). |
+| `mcp_tool_timeout_secs`   | integer | Idle bound on one MCP `tools/call`, in seconds: a call with no response or `notifications/progress` for this long is cancelled (each progress notification restarts the clock, up to an absolute 30 minute ceiling) and reported to the model as a tool error. Default: `120` (minimum `1`). A server entry's `tool_timeout_sec` overrides it; `startup_timeout_sec` overrides the 10 s initialize / 30 s `tools/list` bounds (see MCP_CONFIGURATION.md). |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 | `acp_host`                | string  | TCP bind host for ACP server mode (equivalent to `--acp-host`).                                                                                                              |
 | `acp_port`                | integer | TCP bind port for ACP server mode (equivalent to `--acp-port`, default: 7243).                                                                                               |
@@ -2746,7 +2746,7 @@ than dropping the tool. Startup notices report each applied bound and name the
 tools a tool-count cap omitted.
 A server that exceeds the time or page budget is skipped without delaying the
 others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
-(default 120); on expiry mini-agent cancels the request and returns a tool error
+(default 120) as an idle timeout that matching `notifications/progress` restart, under an absolute ceiling of 30 minutes; on expiry mini-agent cancels the request and returns a tool error
 the model can act on instead of stalling the turn. A stdio server's protocol
 messages are newline-delimited; one line may be at most 16 MiB, and a server
 that writes more without a newline is disconnected and its process tree

@@ -1043,17 +1043,41 @@ pub(crate) async fn list_all_tools_selected(
     })
 }
 
-/// `tools/call` bounded by `timeout`. On expiry rmcp notifies the server that
-/// the request was cancelled and the error is [`ServiceError::Timeout`].
+/// Absolute ceiling for one `tools/call` that keeps sending progress
+/// notifications (the call is otherwise bounded by its idle timeout).
+pub(crate) const MCP_TOOL_PROGRESS_CEILING: Duration = Duration::from_secs(30 * 60);
+
+/// `tools/call` with an idle timeout of `timeout` that every matching
+/// `notifications/progress` restarts, under an absolute ceiling of
+/// `max(timeout, MCP_TOOL_PROGRESS_CEILING)`. rmcp attaches a progress token
+/// to every request, so a server that streams progress keeps a long call
+/// alive while a silent one is still cut off after `timeout`. On expiry rmcp
+/// notifies the server that the request was cancelled and the error is
+/// [`ServiceError::Timeout`] carrying whichever bound fired.
 pub(crate) async fn call_tool_bounded(
     peer: &Peer<RoleClient>,
     params: CallToolRequestParams,
     timeout: Duration,
 ) -> Result<CallToolResult, ServiceError> {
+    call_tool_with_ceiling(
+        peer,
+        params,
+        timeout,
+        timeout.max(MCP_TOOL_PROGRESS_CEILING),
+    )
+    .await
+}
+
+pub(crate) async fn call_tool_with_ceiling(
+    peer: &Peer<RoleClient>,
+    params: CallToolRequestParams,
+    idle_timeout: Duration,
+    ceiling: Duration,
+) -> Result<CallToolResult, ServiceError> {
     let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
-    let handle = peer
-        .send_cancellable_request(request, PeerRequestOptions::with_timeout(timeout))
-        .await?;
+    let mut options = PeerRequestOptions::with_timeout(idle_timeout).reset_timeout_on_progress();
+    options.max_total_timeout = Some(ceiling);
+    let handle = peer.send_cancellable_request(request, options).await?;
     match handle.await_response().await? {
         ServerResult::CallToolResult(result) => Ok(result),
         _ => Err(ServiceError::UnexpectedResponse),
