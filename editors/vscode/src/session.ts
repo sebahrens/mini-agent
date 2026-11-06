@@ -46,6 +46,42 @@ function extensionVersion(context: vscode.ExtensionContext): string {
 /** Matches the Rust session catalogue cap (MAX_ROWS). */
 const MAX_RESUME_ROWS = 100;
 
+type ResumeItem = vscode.QuickPickItem & { sessionId?: string; enterSessionId?: boolean };
+const ENTER_SESSION_ID_LABEL = 'Enter session id\u2026';
+
+/** What `session/list` reports about the part of the catalogue it did not return. */
+export interface CatalogueMeta { truncated: boolean; skipped: number }
+
+/** Fold one page's `_meta` (`catalogue_truncated`, `skipped_entries`) into the running total. */
+export function mergeCatalogueMeta(
+  into: CatalogueMeta,
+  meta: { [key: string]: unknown } | null | undefined,
+): CatalogueMeta {
+  const skipped = meta?.['skipped_entries'];
+  return {
+    truncated: into.truncated || meta?.['catalogue_truncated'] === true,
+    skipped: typeof skipped === 'number' && Number.isFinite(skipped) && skipped > into.skipped ? Math.floor(skipped) : into.skipped,
+  };
+}
+
+/** The same wording as the Rust `Catalogue::notice`, minus the CLI-only `--session` hint. */
+export function catalogueNotice(meta: CatalogueMeta): string | undefined {
+  if (!meta.truncated && meta.skipped <= 0) { return undefined; }
+  const parts: string[] = [];
+  if (meta.truncated) {
+    parts.push(`Older saved sessions exist but are not listed: the listing shows at most ${MAX_RESUME_ROWS} of the newest sessions within a bounded scan budget. Choose "${ENTER_SESSION_ID_LABEL}" to load any session directly by its id; sessions are indexed as they are listed, so repeated listings reach further back.`);
+  }
+  if (meta.skipped > 0) { parts.push(`${meta.skipped} unsafe, invalid or oversized entries were skipped.`); }
+  return parts.join(' ');
+}
+
+function validateSessionId(value: string): string | undefined {
+  const id = value.trim();
+  if (!id) { return 'Enter a session id.'; }
+  if (id.length > 200 || [...id].some(ch => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f)) { return 'Not a valid session id.'; }
+  return undefined;
+}
+
 export class AgentSession {
   private proc: cp.ChildProcessWithoutNullStreams | undefined;
   private connection: acp.ClientConnection | undefined;
@@ -288,40 +324,68 @@ export class AgentSession {
       const rows: { sessionId: string; title?: string | null }[] = [];
       const seenCursors = new Set<string>();
       let cursor: string | null | undefined;
+      let listMeta: CatalogueMeta = { truncated: false, skipped: 0 };
       // Follow nextCursor until exhausted, bounded by the catalogue's 100-row cap and a page limit.
       for (let page = 0; page < 50 && rows.length < MAX_RESUME_ROWS; page += 1) {
         const response = await client.request(acp.methods.agent.session.list,
           cursor ? { cwd: this.folder.uri.fsPath, cursor } : { cwd: this.folder.uri.fsPath },
           { cancellationSignal: AbortSignal.timeout(10_000) });
         rows.push(...response.sessions);
+        listMeta = mergeCatalogueMeta(listMeta, response._meta);
         cursor = response.nextCursor;
         if (!cursor || seenCursors.has(cursor)) { break; }
         seenCursors.add(cursor);
       }
-      const items = rows.slice(0, MAX_RESUME_ROWS).map(row => ({
+      // The agent caps the catalogue and skips unreadable entries; say so instead of
+      // presenting a complete-looking list, and offer a way to load any session by id.
+      const notice = catalogueNotice(listMeta);
+      const items: ResumeItem[] = rows.slice(0, MAX_RESUME_ROWS).map(row => ({
         label: safeSessionLabel(row.title ?? row.sessionId),
         description: row.sessionId,
         sessionId: row.sessionId,
       }));
-      if (items.length === 0) { void vscode.window.showInformationMessage('No saved Mini Agent sessions exist for this workspace.'); return; }
-      const selected = await vscode.window.showQuickPick(items, { placeHolder: 'Resume a saved Mini Agent session in this workspace' });
+      if (notice) {
+        items.push({
+          label: ENTER_SESSION_ID_LABEL,
+          detail: notice,
+          alwaysShow: true,
+          enterSessionId: true,
+        });
+      } else if (items.length === 0) { void vscode.window.showInformationMessage('No saved Mini Agent sessions exist for this workspace.'); return; }
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: notice
+          ? 'Resume a saved Mini Agent session (older sessions exist that are not listed)'
+          : 'Resume a saved Mini Agent session in this workspace',
+      });
       if (!selected) { return; }
+      let sessionId = selected.sessionId;
+      if (selected.enterSessionId) {
+        const entered = await vscode.window.showInputBox({
+          prompt: 'Saved Mini Agent session id (listed sessions are the newest only)',
+          placeHolder: 'session id',
+          validateInput: value => validateSessionId(value),
+        });
+        const id = entered?.trim();
+        if (!id || validateSessionId(id)) { return; }
+        sessionId = id;
+      }
+      if (!sessionId) { return; }
       requireTrustedWorkspace();
       if (this.conversation.isPrompting) { throw new Error('The current prompt is still active; saved session was not loaded.'); }
       await this.conversation.close();
-      this.updates.begin(selected.sessionId);
+      this.updates.begin(sessionId);
       let attached: PublicProtocolSession | undefined;
       try {
-        const loaded = await client.request(acp.methods.agent.session.load, { sessionId: selected.sessionId, cwd: this.folder.uri.fsPath, mcpServers: [] },
+        const loaded = await client.request(acp.methods.agent.session.load, { sessionId: sessionId, cwd: this.folder.uri.fsPath, mcpServers: [] },
           { cancellationSignal: AbortSignal.timeout(10_000) });
         requireTrustedWorkspace();
-        attached = this.updates.finish(client, selected.sessionId, loaded.configOptions ?? [], loaded.modes);
+        attached = this.updates.finish(client, sessionId, loaded.configOptions ?? [], loaded.modes);
         await this.conversation.adopt(attached);
-        log.info(`ACP saved session resumed: ${selected.sessionId}`);
+        log.info(`ACP saved session resumed: ${sessionId}`);
       } catch (error) {
         this.updates.reset();
         if (attached) { await attached.close().catch(() => undefined); }
-        else { await client.request(acp.methods.agent.session.close, { sessionId: selected.sessionId }, { cancellationSignal: AbortSignal.timeout(5000) }).catch(() => undefined); }
+        else { await client.request(acp.methods.agent.session.close, { sessionId: sessionId }, { cancellationSignal: AbortSignal.timeout(5000) }).catch(() => undefined); }
         throw error;
       }
     });

@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- VS Code `Mini Agent: Resume` reads the `session/list` `catalogue_truncated` / `skipped_entries` flags, says when older
+  or unreadable sessions are not listed, and offers "Enter session id" to load one directly (mini-agent-bftfm).
 - A session entered with `/resume`, `/fork` or `/import` gets the same "child ids are no longer
   resumable" and environment-change notices as a `--resume` launch, once (mini-agent-ji9iy).
 - `memory_search` also searches the project `SCRATCHPAD.md` (closed `- [x]` items included, labelled as the
