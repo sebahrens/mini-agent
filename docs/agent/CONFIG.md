@@ -1712,12 +1712,12 @@ task continues with a short continuation prompt, for as long as each compaction 
 nothing older than the kept recent history is left to compact, a compaction freed no space or
 failed, or two consecutive reliefs occur with no tool progress between them). A
 boundary at which nothing older than the kept recent history exists continues
-without the mid-turn trigger. ACP turns do not compact mid-turn yet. A native Anthropic replay session
+without the mid-turn trigger. ACP prompts relieve the same way and continue the same prompt (non-native sessions stop at most three times per prompt; native sessions follow the headless stop rules below). A native Anthropic replay session
 cannot be summarized in place (its signed thinking blocks and tool pairing replay
 verbatim), so on one the relief closes the native epoch at the tool-batch boundary (every
 completed tool result is saved), compacts the saved transcript, restarts the thinking chain from
 it as a new epoch (earlier thinking blocks are dropped, with a one-line notice) and resumes the
-task with the continuation prompt, in headless `-p`/`--loop` and goal rounds. The interactive UI
+task with the continuation prompt, in headless `-p`/`--loop`, goal rounds and ACP prompts (an ACP relief stops, with an error naming the reason, when the segment since the last one ran no tools or its compaction found nothing to compact). The interactive UI
 closes the epoch and compacts there too, then restores your prompt so Enter continues on the
 compacted context. When nothing can be compacted, headless stops with an explicit "context is N%
 full ... follow-up prompt ... or start a fresh context" error and the completed tool results

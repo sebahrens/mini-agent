@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- ACP prompts on a provider-native Anthropic session now relieve context mid-turn: at a tool-batch boundary under pressure the native epoch is closed, the saved transcript is compacted, the thinking chain restarts as a new epoch and the same prompt continues, instead of ending in a provider context error; relief stops with a named reason when a segment ran no tools or nothing could be compacted (mini-agent-wkzav).
 - Headless context relief carries the turns and `turn_token_budget` tokens spent by earlier segments into later ones, so `max_agent_turns` / `--max-agent-turns` bounds the whole prompt instead of resetting per relief segment (mini-agent-djjua).
 - The sandbox HTTP proxy replaces the client's `Host` header with the allowlisted request-URI authority before
   forwarding, so a contained command cannot reach another virtual host behind an allowed address (mini-agent-9svy4).
