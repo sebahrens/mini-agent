@@ -40,6 +40,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Hook handlers without a `timeout` now default to 600 s except on the gating events
+  `UserPromptSubmit`, `PreToolUse` and `PermissionRequest`, which keep 60 s (was 60 s everywhere).
 - The project-notes memory index lists the newest notes first (by mtime) with an "N more" count and
   keeps working with hundreds of notes, instead of 16 alphabetical rows that disappeared above 64
   `.md` files or 256 entries.

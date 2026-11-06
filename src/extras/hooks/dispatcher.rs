@@ -15,8 +15,22 @@ use super::subprocess::{
 };
 use super::{Decision, HookCtx, PreDecision, Verdict};
 
-/// Default per-hook timeout when a handler doesn't declare one.
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
+/// Default timeout for events that gate the user's next step
+/// (`UserPromptSubmit`, `PreToolUse`, `PermissionRequest`): a stuck gate
+/// should fail fast.
+const GATING_TIMEOUT_SECS: u64 = 60;
+/// Default for every other event, matching Claude Code's 600 s command-hook
+/// default so long test/lint hooks on `Stop` or `PostToolUse` are not killed.
+const DEFAULT_TIMEOUT_SECS: u64 = 600;
+
+/// Per-event default timeout (seconds) when a handler declares none; it also
+/// bounds the handler's `if` condition.
+pub(crate) fn default_timeout_secs(event: &str) -> u64 {
+    match event {
+        "UserPromptSubmit" | "PreToolUse" | "PermissionRequest" => GATING_TIMEOUT_SECS,
+        _ => DEFAULT_TIMEOUT_SECS,
+    }
+}
 const REDACTION_MARKER: &str = "[REDACTED]";
 
 enum CompiledMatcher {
@@ -866,8 +880,9 @@ impl HookDispatcher {
                 else {
                     continue;
                 };
-                let timeout =
-                    std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
+                let timeout = std::time::Duration::from_secs(
+                    handler.timeout.unwrap_or(default_timeout_secs(event)),
+                );
                 let headers = handler.env.clone();
                 let body = stdin.clone();
                 let request = async move {
@@ -902,7 +917,7 @@ impl HookDispatcher {
                             .with_project_dir_memo(dir_memo);
                     if let Some(condition) = &handler.condition {
                         let cond_timeout = std::time::Duration::from_secs(
-                            handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
+                            handler.timeout.unwrap_or(default_timeout_secs(&event)),
                         );
                         let cond_output = run_shell_condition_at_root(
                             condition,
@@ -955,7 +970,7 @@ impl HookDispatcher {
                         "hooks: applying subprocess policy"
                     );
                     let timeout = std::time::Duration::from_secs(
-                        handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
+                        handler.timeout.unwrap_or(default_timeout_secs(&event)),
                     );
                     let output = run_hook_with_policy_at_root(
                         &command,
@@ -980,8 +995,9 @@ impl HookDispatcher {
                 .with_content_pins(self.content_pins_for(handler))
                 .with_project_dir_memo(Arc::clone(&dir_memo));
             if let Some(condition) = &handler.condition {
-                let cond_timeout =
-                    std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
+                let cond_timeout = std::time::Duration::from_secs(
+                    handler.timeout.unwrap_or(default_timeout_secs(event)),
+                );
                 let cond_output = crate::startup::heap_future(|| {
                     run_shell_condition_at_root(
                         condition,
@@ -1031,8 +1047,9 @@ impl HookDispatcher {
                 continue;
             };
 
-            let timeout =
-                std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
+            let timeout = std::time::Duration::from_secs(
+                handler.timeout.unwrap_or(default_timeout_secs(event)),
+            );
             let stdin = stdin.clone();
             let project_dir = project_dir.to_string();
             let execution_root = execution_root.clone();
@@ -1644,6 +1661,22 @@ mod tests {
             super::merge_post_tool_use_decisions(&[json_output(serde_json::json!({}))], "r"),
             super::Decision::Continue
         );
+    }
+
+    #[test]
+    fn i6t6i0_gating_events_default_to_60s_and_others_to_600s() {
+        for event in ["UserPromptSubmit", "PreToolUse", "PermissionRequest"] {
+            assert_eq!(super::default_timeout_secs(event), 60, "{event}");
+        }
+        for event in [
+            "Stop",
+            "PostToolUse",
+            "SessionStart",
+            "PostCompact",
+            "FileChanged",
+        ] {
+            assert_eq!(super::default_timeout_secs(event), 600, "{event}");
+        }
     }
 
     #[test]
