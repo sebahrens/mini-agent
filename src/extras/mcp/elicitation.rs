@@ -50,6 +50,8 @@ pub struct Handler {
     /// Set by `notifications/tools/list_changed`; consumed by the
     /// connection's `ToolListCache` at the next tool collection.
     pub(crate) tools_changed: Arc<AtomicBool>,
+    /// In-flight calls whose `notifications/progress` feed the live preview.
+    pub(crate) progress: super::progress::ProgressRegistry,
     /// Workspace root advertised through `roots/list`. Only set for stdio
     /// servers, which already run in that workspace; remote (HTTP) servers
     /// are not told local paths and get no roots capability.
@@ -257,6 +259,13 @@ impl rmcp::ClientHandler for Handler {
     async fn on_tool_list_changed(&self, _context: rmcp::service::NotificationContext<RoleClient>) {
         tracing::debug!("MCP server announced tools/list_changed");
         self.tools_changed.store(true, Ordering::Release);
+    }
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        self.progress.deliver(&params);
     }
     async fn create_elicitation(
         &self,

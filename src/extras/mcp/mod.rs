@@ -8,6 +8,7 @@ pub(crate) mod elicitation;
 pub(crate) mod forms;
 pub(crate) mod health;
 pub mod oauth;
+pub(crate) mod progress;
 pub(crate) mod project;
 pub(crate) mod resource_tools;
 pub(crate) mod server;

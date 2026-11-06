@@ -188,8 +188,10 @@ struct ConcurrencyBoundTool {
     lane: Arc<RwLock<()>>,
     access: ToolAccess,
     /// Foreground `shell` calls claim their announced internal call id so
-    /// their live output preview is labelled like the transcript.
+    /// their live output preview is labelled like the transcript; other
+    /// tools (MCP progress previews) find it through `TOOL_CALL_ID`.
     is_shell: bool,
+    name: String,
 }
 
 impl ConcurrencyBoundTool {
@@ -209,6 +211,7 @@ impl ConcurrencyBoundTool {
             lane,
             access,
             is_shell: name == "shell",
+            name,
         }
     }
 
@@ -306,11 +309,7 @@ impl ToolDyn for ConcurrencyBoundTool {
             .cloned()
             .or_else(crate::spend::run::Run::current);
         // Claimed synchronously, right after the SDK announced this call.
-        let call_id = if self.is_shell {
-            crate::agent::tools::bash::claim_shell_call_id(extensions, &args)
-        } else {
-            None
-        };
+        let call_id = crate::agent::tools::bash::claim_call_id(extensions, &self.name, &args);
         let future = async move {
             let slot = self.lease(&args).await;
             LANE.scope(slot, async {
@@ -324,7 +323,15 @@ impl ToolDyn for ConcurrencyBoundTool {
             })
             .await
         };
-        let future = crate::agent::tools::bash::scope_shell_call_id(call_id, future);
+        let future = if self.is_shell {
+            futures::future::Either::Left(crate::agent::tools::bash::scope_shell_call_id(
+                call_id, future,
+            ))
+        } else {
+            futures::future::Either::Right(crate::agent::tools::bash::scope_tool_call_id(
+                call_id, future,
+            ))
+        };
         let future = crate::spend::run::scope(spend, future);
         let future = crate::question::scope_extensions(extensions, future);
         #[cfg(feature = "acp")]

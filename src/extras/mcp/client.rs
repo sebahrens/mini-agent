@@ -1059,11 +1059,31 @@ pub(crate) async fn call_tool_bounded(
     params: CallToolRequestParams,
     timeout: Duration,
 ) -> Result<CallToolResult, ServiceError> {
-    call_tool_with_ceiling(
+    call_tool_observed(peer, params, timeout, None).await
+}
+
+/// Where a call's progress notifications are shown: the connection's
+/// registry plus the transcript id and event channel of the call.
+pub(crate) type ProgressDisplay = (
+    super::progress::ProgressRegistry,
+    compact_str::CompactString,
+    tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
+);
+
+/// [`call_tool_bounded`] that also shows the call's progress notifications as
+/// a live preview when `display` is given.
+pub(crate) async fn call_tool_observed(
+    peer: &Peer<RoleClient>,
+    params: CallToolRequestParams,
+    timeout: Duration,
+    display: Option<ProgressDisplay>,
+) -> Result<CallToolResult, ServiceError> {
+    call_tool_with_display(
         peer,
         params,
         timeout,
         timeout.max(MCP_TOOL_PROGRESS_CEILING),
+        display,
     )
     .await
 }
@@ -1074,10 +1094,25 @@ pub(crate) async fn call_tool_with_ceiling(
     idle_timeout: Duration,
     ceiling: Duration,
 ) -> Result<CallToolResult, ServiceError> {
+    call_tool_with_display(peer, params, idle_timeout, ceiling, None).await
+}
+
+async fn call_tool_with_display(
+    peer: &Peer<RoleClient>,
+    params: CallToolRequestParams,
+    idle_timeout: Duration,
+    ceiling: Duration,
+    display: Option<ProgressDisplay>,
+) -> Result<CallToolResult, ServiceError> {
     let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
     let mut options = PeerRequestOptions::with_timeout(idle_timeout).reset_timeout_on_progress();
     options.max_total_timeout = Some(ceiling);
     let handle = peer.send_cancellable_request(request, options).await?;
+    // Registered right after the send with nothing awaited in between; held
+    // until the response (or an error) so the token never outlives the call.
+    let _display = display.and_then(|(registry, id, events)| {
+        registry.register(handle.progress_token.clone(), id, events)
+    });
     match handle.await_response().await? {
         ServerResult::CallToolResult(result) => Ok(result),
         _ => Err(ServiceError::UnexpectedResponse),

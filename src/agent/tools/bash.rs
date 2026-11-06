@@ -32,8 +32,28 @@ pub(crate) async fn scope_shell_call_id<F: std::future::Future>(
     SHELL_CALL_ID.scope(id, future).await
 }
 
-/// Shell calls announced by [`ShellCallIdHook`] whose execution has not yet
-/// claimed their id, keyed by their exact argument text. This only labels a
+tokio::task_local! {
+    /// Internal id of the non-shell tool call executing in this task (MCP
+    /// calls use it to label their live progress preview).
+    static TOOL_CALL_ID: Option<CompactString>;
+}
+
+/// Run one non-shell tool invocation with the internal call id it was
+/// announced under.
+pub(crate) async fn scope_tool_call_id<F: std::future::Future>(
+    id: Option<CompactString>,
+    future: F,
+) -> F::Output {
+    TOOL_CALL_ID.scope(id, future).await
+}
+
+/// The internal call id of the tool call running in this task, if known.
+pub(crate) fn current_tool_call_id() -> Option<CompactString> {
+    TOOL_CALL_ID.try_with(Clone::clone).ok().flatten()
+}
+
+/// Calls announced by [`ShellCallIdHook`] whose execution has not yet
+/// claimed their id, keyed by tool name and exact argument text. This only labels a
 /// display-only preview; identical concurrent commands may swap previews.
 #[derive(Clone, Default)]
 struct PendingShellCalls(
@@ -74,20 +94,26 @@ impl PendingShellCalls {
     }
 }
 
-/// Claim the internal id announced for the shell call about to run with the
-/// exact argument text `args`.
-pub(crate) fn claim_shell_call_id(
-    extensions: &rig::tool::ToolCallExtensions,
-    args: &str,
-) -> Option<CompactString> {
-    extensions
-        .get::<rig::agent::Scratchpad>()?
-        .update(|pending: &mut PendingShellCalls| pending.take(args))
+fn pending_key(tool: &str, args: &str) -> String {
+    format!("{tool}\0{args}")
 }
 
-/// Records each `shell` call's internal id in the run scratchpad so the tool
-/// can label its live progress with the id the transcript uses. Calls that
-/// never execute (skipped by another hook) are forgotten on their result.
+/// Claim the internal id announced for the call to tool `tool` about to run
+/// with the exact argument text `args`.
+pub(crate) fn claim_call_id(
+    extensions: &rig::tool::ToolCallExtensions,
+    tool: &str,
+    args: &str,
+) -> Option<CompactString> {
+    let key = pending_key(tool, args);
+    extensions
+        .get::<rig::agent::Scratchpad>()?
+        .update(|pending: &mut PendingShellCalls| pending.take(&key))
+}
+
+/// Records each call's internal id in the run scratchpad so `shell` and MCP
+/// tools can label their live progress with the id the transcript uses. Calls
+/// that never execute (skipped by another hook) are forgotten on their result.
 #[derive(Clone, Copy)]
 pub(crate) struct ShellCallIdHook;
 
@@ -99,21 +125,29 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for ShellCall
     ) -> rig::agent::Flow {
         match event {
             rig::agent::StepEvent::ToolCall {
-                tool_name: "shell",
+                tool_name,
                 internal_call_id,
                 args,
                 ..
-            } => context
-                .scratchpad()
-                .update(|pending: &mut PendingShellCalls| pending.push(args, internal_call_id)),
+            } => {
+                let key = pending_key(tool_name, args);
+                context
+                    .scratchpad()
+                    .update(|pending: &mut PendingShellCalls| pending.push(&key, internal_call_id));
+            }
             rig::agent::StepEvent::ToolResult {
-                tool_name: "shell",
+                tool_name,
                 internal_call_id,
                 args,
                 ..
-            } => context
-                .scratchpad()
-                .update(|pending: &mut PendingShellCalls| pending.forget(args, internal_call_id)),
+            } => {
+                let key = pending_key(tool_name, args);
+                context
+                    .scratchpad()
+                    .update(|pending: &mut PendingShellCalls| {
+                        pending.forget(&key, internal_call_id)
+                    });
+            }
             _ => {}
         }
         rig::agent::Flow::cont()
@@ -1371,21 +1405,26 @@ mod tests {
     async fn shell_call_ids_are_claimed_by_exact_arguments_in_announcement_order() {
         let pad = rig::agent::Scratchpad::default();
         pad.update(|pending: &mut PendingShellCalls| {
-            pending.push(r#"{"command":"ls"}"#, "first");
-            pending.push(r#"{"command":"pwd"}"#, "other");
-            pending.push(r#"{"command":"ls"}"#, "second");
-            pending.push(r#"{"command":"ls"}"#, "skipped");
-            pending.forget(r#"{"command":"ls"}"#, "skipped");
+            pending.push(&pending_key("shell", r#"{"command":"ls"}"#), "first");
+            pending.push(&pending_key("shell", r#"{"command":"pwd"}"#), "other");
+            pending.push(&pending_key("shell", r#"{"command":"ls"}"#), "second");
+            pending.push(&pending_key("mcp_tool", r#"{"command":"ls"}"#), "mcp");
+            pending.push(&pending_key("shell", r#"{"command":"ls"}"#), "skipped");
+            pending.forget(&pending_key("shell", r#"{"command":"ls"}"#), "skipped");
         });
         let mut extensions = rig::tool::ToolCallExtensions::new();
         extensions.insert(pad);
-        let claim = |args| claim_shell_call_id(&extensions, args);
+        let claim = |args| claim_call_id(&extensions, "shell", args);
+        assert_eq!(
+            claim_call_id(&extensions, "mcp_tool", r#"{"command":"ls"}"#).as_deref(),
+            Some("mcp")
+        );
         assert_eq!(claim(r#"{"command":"ls"}"#).as_deref(), Some("first"));
         assert_eq!(claim(r#"{"command":"ls"}"#).as_deref(), Some("second"));
         assert_eq!(claim(r#"{"command":"ls"}"#), None);
         assert_eq!(claim(r#"{"command":"pwd"}"#).as_deref(), Some("other"));
         assert_eq!(
-            claim_shell_call_id(&rig::tool::ToolCallExtensions::new(), "{}"),
+            claim_call_id(&rig::tool::ToolCallExtensions::new(), "shell", "{}"),
             None
         );
     }

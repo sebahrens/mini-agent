@@ -1684,6 +1684,52 @@ async fn mcp_tool_call_with_progress_outlives_the_idle_timeout_but_not_the_ceili
 }
 
 #[tokio::test]
+async fn mcp_progress_notifications_become_live_previews_for_the_call() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("progress-call");
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "progress-call",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let (events, mut shown) = tokio::sync::mpsc::channel(64);
+    let params =
+        rmcp::model::CallToolRequestParams::new("probe").with_arguments(serde_json::Map::new());
+    crate::extras::mcp::client::call_tool_observed(
+        &handle.peer(),
+        params,
+        Duration::from_secs(10),
+        Some((
+            handle.elicitation.progress.clone(),
+            CompactString::new("call-7"),
+            events,
+        )),
+    )
+    .await
+    .expect("call completes");
+    let mut previews = 0;
+    while let Ok(event) = shown.try_recv() {
+        let crate::event::AgentEvent::ToolProgress { id, text } = event else {
+            panic!("only progress previews expected");
+        };
+        assert_eq!(id, "call-7");
+        assert!(text.starts_with("progress "), "{text}");
+        previews += 1;
+    }
+    assert!(previews >= 1, "the fixture's progress must be shown");
+    McpClientManager::from_handles(vec![handle])
+        .shutdown()
+        .await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
 async fn mcp_tool_call_hang_times_out_with_tool_error() {
     let fixture = FixtureBuild::compile();
     let lease = fixture.lease("hang-tools-call");

@@ -171,7 +171,7 @@ clamped to 1..=3600). Built-in registrations use the defaults.
 | Field | Default | Bounds |
 | --- | --- | --- |
 | `startup_timeout_sec` | 10 s | Connect, OAuth restore/refresh and the `initialize` handshake. It also raises (never lowers) the server's `tools/list` budget, default 30 s. |
-| `tool_timeout_sec` | `mcp_tool_timeout_secs` (120 s) | One `tools/call` on this server. |
+| `tool_timeout_sec` | `mcp_tool_timeout_secs` (120 s) | Idle timeout for one `tools/call` on this server; progress notifications restart it, up to an absolute 30 minute ceiling. In the interactive UI, progress is shown as a live preview (`progress p/total: message`, throttled to 10 per second, control characters removed, display-only) under the running call. |
 
 ```json
 {"mcp_servers": {"slow": {"command": "npx", "args": ["-y", "some-mcp"],

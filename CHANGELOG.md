@@ -95,8 +95,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `mcp_tool_timeout_secs` / `tool_timeout_sec` are now idle timeouts for MCP tool calls: every
   `notifications/progress` from the server restarts the clock, so long-running tools that report
   progress are no longer killed at 120 s. An absolute 30 minute ceiling still applies, and the
-  timeout error says whether the idle or the absolute limit fired. (Progress is not yet shown in
-  the TUI.)
+  timeout error says whether the idle or the absolute limit fired. In the interactive UI the
+  server's progress (`progress[/total]: message`) is shown as a live, throttled, display-only
+  preview under the running tool call; the message is reduced to one printable line and never
+  reaches the session or the model.
 - MCP tools whose input schema exceeds 16 KiB are no longer dropped: examples and then prose are
   stripped, and a schema that is still too large becomes a permissive object schema (the server
   validates), with a startup notice. Servers using `defer = true`/`auto` may list up to 1024 tools

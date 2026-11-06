@@ -11,7 +11,7 @@ use rmcp::model::{CallToolRequestParams, ContentBlock, JsonObject};
 use rmcp::service::{Peer, RoleClient, ServiceError};
 
 use crate::agent::tools::check_mcp_perm;
-use crate::extras::mcp::client::call_tool_bounded;
+use crate::extras::mcp::client::call_tool_observed;
 use crate::extras::mcp::config::TrustedMcpServer;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
@@ -439,7 +439,12 @@ impl ToolDyn for McpTool {
                 }),
                 None,
             );
-            let result = call_tool_bounded(&peer, params, call_timeout)
+            // Display-only: progress notifications become a live preview under
+            // this call's transcript row when an interactive stream exists.
+            let display = crate::agent::tools::bash::current_tool_call_id()
+                .zip(crate::agent::tools::mutation_diff::scoped_event_sender())
+                .map(|(id, events)| (elicitation.progress.clone(), id, events));
+            let result = call_tool_observed(&peer, params, call_timeout, display)
                 .await
                 .map_err(|e| {
                     let message = match e {
