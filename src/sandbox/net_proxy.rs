@@ -11,6 +11,13 @@
 //! listed name cannot be pointed back at the machine or its metadata service.
 //! Every request must carry a per-process token, so another local process
 //! cannot borrow the proxy.
+//!
+//! Linux `bwrap` cannot reach a host loopback port (the command runs in an
+//! empty network namespace), so on that backend the proxy also listens on a
+//! private Unix socket. The socket is bind-mounted into the namespace, where
+//! `net_forwarder` re-exposes it as `127.0.0.1:FORWARDER_PORT` for the
+//! command's proxy variables. Filtering, prompting and the token check are the
+//! same single code path; the namespace has no other route out.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -18,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::permission::ask::{AskRequest, AskSender, UserDecision, UserRequest};
@@ -158,7 +165,52 @@ struct Shared {
 pub struct NetworkProxy {
     port: u16,
     token: String,
+    /// Private Unix socket for namespaces without host loopback (Linux bwrap).
+    #[cfg(unix)]
+    socket: Option<UnixSocket>,
 }
+
+/// A 0700 directory holding the proxy's Unix socket, removed on drop.
+#[cfg(unix)]
+struct UnixSocket {
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+#[cfg(unix)]
+fn bind_private_socket() -> std::io::Result<(UnixSocket, std::os::unix::net::UnixListener)> {
+    use std::os::unix::fs::DirBuilderExt;
+    // `sun_path` holds about 100 bytes; a long TMPDIR falls back to /tmp.
+    let name = format!(
+        "mini-agent-net-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..16]
+    );
+    let mut dir = std::env::temp_dir().join(&name);
+    if dir.as_os_str().len() > 80 {
+        dir = std::path::PathBuf::from("/tmp").join(&name);
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let path = dir.join("proxy.sock");
+    let guard = UnixSocket {
+        dir,
+        path: path.clone(),
+    };
+    let listener = std::os::unix::net::UnixListener::bind(&path)?;
+    listener.set_nonblocking(true)?;
+    Ok((guard, listener))
+}
+
+/// Loopback port the in-namespace forwarder listens on (private namespace).
+#[cfg(unix)]
+pub const FORWARDER_PORT: u16 = 3128;
 
 impl std::fmt::Debug for NetworkProxy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -176,6 +228,33 @@ impl NetworkProxy {
         rules: Vec<HostRule>,
         prompt: Arc<Mutex<Option<AskSender>>>,
     ) -> std::io::Result<Arc<Self>> {
+        Self::start_inner(rules, prompt, false)
+    }
+
+    /// As [`Self::start`], and also listen on a private Unix socket for
+    /// network namespaces that cannot reach host loopback.
+    #[cfg(unix)]
+    pub fn start_with_socket(
+        rules: Vec<HostRule>,
+        prompt: Arc<Mutex<Option<AskSender>>>,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::start_inner(rules, prompt, true)
+    }
+
+    fn start_inner(
+        rules: Vec<HostRule>,
+        prompt: Arc<Mutex<Option<AskSender>>>,
+        with_socket: bool,
+    ) -> std::io::Result<Arc<Self>> {
+        #[cfg(not(unix))]
+        let _ = with_socket;
+        #[cfg(unix)]
+        let (socket, unix_listener) = if with_socket {
+            let (guard, listener) = bind_private_socket()?;
+            (Some(guard), Some(listener))
+        } else {
+            (None, None)
+        };
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -198,6 +277,20 @@ impl NetworkProxy {
             .name("sandbox-net-proxy".into())
             .spawn(move || {
                 runtime.block_on(async move {
+                    #[cfg(unix)]
+                    if let Some(unix_listener) = unix_listener
+                        && let Ok(unix_listener) = tokio::net::UnixListener::from_std(unix_listener)
+                    {
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let Ok((client, _)) = unix_listener.accept().await else {
+                                    continue;
+                                };
+                                tokio::spawn(handle(client, shared.clone()));
+                            }
+                        });
+                    }
                     let Ok(listener) = TcpListener::from_std(listener) else {
                         return;
                     };
@@ -209,7 +302,25 @@ impl NetworkProxy {
                     }
                 });
             })?;
-        Ok(Arc::new(Self { port, token }))
+        Ok(Arc::new(Self {
+            port,
+            token,
+            #[cfg(unix)]
+            socket,
+        }))
+    }
+
+    /// Host path of the Unix socket, when started with one.
+    #[cfg(unix)]
+    pub fn socket_path(&self) -> Option<&std::path::Path> {
+        self.socket.as_ref().map(|socket| socket.path.as_path())
+    }
+
+    /// Proxy variables for a command whose namespace reaches the proxy only
+    /// through the forwarder on `127.0.0.1:FORWARDER_PORT`.
+    #[cfg(unix)]
+    pub fn env_for_forwarder(&self) -> Vec<(String, String)> {
+        self.env_at(FORWARDER_PORT)
     }
 
     #[cfg(test)]
@@ -227,7 +338,11 @@ impl NetworkProxy {
 
     /// Proxy variables for the command environment.
     pub fn env(&self) -> Vec<(String, String)> {
-        let url = format!("http://mini-agent:{}@127.0.0.1:{}", self.token, self.port);
+        self.env_at(self.port)
+    }
+
+    fn env_at(&self, port: u16) -> Vec<(String, String)> {
+        let url = format!("http://mini-agent:{}@127.0.0.1:{port}", self.token);
         let mut vars = Vec::new();
         for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
             vars.push((name.to_string(), url.clone()));
@@ -340,7 +455,7 @@ fn split_authority(authority: &str, default_port: u16) -> Result<(String, u16), 
     Ok((host, port))
 }
 
-async fn read_head(client: &mut TcpStream) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+async fn read_head<S: AsyncRead + Unpin>(client: &mut S) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 2048];
     loop {
@@ -359,7 +474,7 @@ async fn read_head(client: &mut TcpStream) -> std::io::Result<(Vec<u8>, Vec<u8>)
     }
 }
 
-async fn respond(client: &mut TcpStream, status: &str, body: &str, extra: &str) {
+async fn respond<S: AsyncWrite + Unpin>(client: &mut S, status: &str, body: &str, extra: &str) {
     let message = format!(
         "HTTP/1.1 {status}\r\n{extra}Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}\n",
         body.len() + 1
@@ -377,7 +492,7 @@ fn tokens_equal(left: &str, right: &str) -> bool {
             == 0
 }
 
-async fn handle(mut client: TcpStream, shared: Arc<Shared>) {
+async fn handle<S: AsyncRead + AsyncWrite + Unpin>(mut client: S, shared: Arc<Shared>) {
     let Ok(Ok((head, leftover))) = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client)).await
     else {
         return;

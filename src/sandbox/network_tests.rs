@@ -210,12 +210,12 @@ fn sandbox_network_allowlist_parses_and_is_not_full_network() {
     assert_eq!(cfg.sandbox_network, Some(SandboxNetwork::Allowlist));
     assert_eq!(cfg.sandbox_network_hosts.len(), 2);
     assert!(!SandboxNetwork::Allowlist.allows());
-    // bwrap cannot enforce the proxy: network stays unshared and the mode is
-    // not reported as effective.
+    // bwrap enforces the allowlist through a private proxy socket; the
+    // namespace stays unshared and this is not full network access.
     let sandbox = Sandbox::new(true, "bwrap")
         .with_network(SandboxNetwork::Allowlist)
         .with_network_hosts(cfg.sandbox_network_hosts);
-    assert!(!sandbox.shell_network_proxied() && !sandbox.shell_network_effective());
+    assert!(sandbox.shell_network_proxied() && !sandbox.shell_network_effective());
     assert!(
         bwrap_shell_args(&sandbox)
             .iter()
@@ -297,4 +297,173 @@ async fn sandbox_network_allowlist_seatbelt_live_only_the_proxy_is_reachable() {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "200");
     }
+}
+
+#[cfg(unix)]
+fn allowlist_bwrap_args(hosts: &[&str]) -> Vec<String> {
+    let sandbox = Sandbox::new(true, "bwrap")
+        .with_network(SandboxNetwork::Allowlist)
+        .with_network_hosts(hosts.iter().map(|host| host.to_string()).collect());
+    bwrap_shell_args(&sandbox)
+}
+
+/// The bwrap allowlist keeps the empty network namespace and adds exactly two
+/// things: the proxy's private Unix socket and the forwarder that relays it to
+/// the namespace's own loopback. The command runs behind the forwarder.
+#[cfg(unix)]
+#[test]
+fn sandbox_network_allowlist_bwrap_keeps_the_empty_namespace_and_only_adds_the_proxy_socket() {
+    let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+    let args = allowlist_bwrap_args(&["registry.npmjs.org"]);
+    assert!(args.iter().any(|arg| arg == "--unshare-net"));
+    assert!(!args.iter().any(|arg| arg == "--share-net"));
+    // Namespace bind of the proxy socket (a socket, nothing else from the
+    // host's /tmp) and the read-only helper executable.
+    let socket_bind = args
+        .windows(3)
+        .find(|w| w[0] == "--bind" && w[2] == BWRAP_FORWARDER_SOCKET)
+        .expect("proxy socket is bound into the namespace");
+    assert!(
+        socket_bind[1].ends_with("/proxy.sock") && socket_bind[1].contains("mini-agent-net-"),
+        "{socket_bind:?}"
+    );
+    assert!(
+        args.windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[2] == BWRAP_FORWARDER_EXECUTABLE)
+    );
+    // Proxy variables point at the in-namespace forwarder, with a credential.
+    let proxy_setenv = args
+        .windows(3)
+        .find(|w| w[0] == "--setenv" && w[1] == "HTTPS_PROXY")
+        .expect("proxy variable is exported");
+    assert!(
+        proxy_setenv[2].starts_with("http://mini-agent:")
+            && proxy_setenv[2].ends_with(&format!("@127.0.0.1:{}", net_proxy::FORWARDER_PORT)),
+        "{proxy_setenv:?}"
+    );
+    // The command runs behind the forwarder, after the bwrap options.
+    let separator = args.iter().position(|arg| arg == "--").unwrap();
+    assert_eq!(args[separator + 1], BWRAP_FORWARDER_EXECUTABLE);
+    assert_eq!(args[separator + 2], net_forwarder::FORWARDER_ARG);
+    assert_eq!(args[separator + 3], BWRAP_FORWARDER_SOCKET);
+    assert_eq!(args[separator + 5], "--");
+    assert!(args.last().unwrap().contains("printf sandboxed"));
+    // CA/resolver config is visible for TLS verification inside the sandbox.
+    assert!(
+        args.windows(3)
+            .any(|w| w[0] == "--ro-bind-try" && w[1] == "/etc/ssl")
+    );
+}
+
+/// Default closed: neither `deny` nor `allow` nor an unset mode with a host
+/// list ever mounts the proxy socket or routes the command through the
+/// forwarder.
+#[cfg(unix)]
+#[test]
+fn sandbox_network_allowlist_bwrap_is_default_closed() {
+    let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+    let hosts = vec!["registry.npmjs.org".to_string()];
+    for network in [SandboxNetwork::Deny, SandboxNetwork::Allow] {
+        let sandbox = Sandbox::new(true, "bwrap")
+            .with_network(network)
+            .with_network_hosts(hosts.clone());
+        assert!(!sandbox.shell_network_proxied());
+        let args = bwrap_shell_args(&sandbox);
+        assert!(!args.iter().any(|arg| arg.contains("mini-agent-net")));
+        assert!(!args.iter().any(|arg| arg == net_forwarder::FORWARDER_ARG));
+        assert!(!args.iter().any(|arg| arg.ends_with("_PROXY")));
+    }
+    // A disabled sandbox never starts a proxy either.
+    let off = Sandbox::new(false, "bwrap")
+        .with_network(SandboxNetwork::Allowlist)
+        .with_network_hosts(hosts);
+    assert!(!off.shell_network_proxied());
+    assert!(off.network_proxy().unwrap().is_none());
+}
+
+/// Hooks, workspace services and brokered JS spawn never get the proxy: the
+/// snapshot (JS spawn) builder has no forwarder and keeps `--unshare-net`.
+#[cfg(unix)]
+#[test]
+fn sandbox_network_allowlist_bwrap_does_not_reach_hooks_or_js_spawn() {
+    let source = include_str!("../sandbox.rs");
+    let hook = source
+        .split("fn build_hook_bwrap_command(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    fn ").next())
+        .unwrap();
+    assert!(!hook.contains("network_proxy") && !hook.contains("bwrap_forwarder_launcher"));
+    let snapshot = source
+        .split("fn build_bwrap_snapshot_command(")
+        .nth(1)
+        .and_then(|rest| rest.split("fn build_bwrap_base_command(").next())
+        .unwrap();
+    assert!(!snapshot.contains("network_proxy") && !snapshot.contains("bwrap_forwarder_launcher"));
+}
+
+/// Native Linux control: inside a real bubblewrap namespace the command has
+/// no route except the filtering proxy. Needs a built `mini-agent` binary next
+/// to the test binary (it acts as the forwarder helper); run on a suitable
+/// Linux runner like the other native controls.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires native Linux namespaces, bubblewrap and a built mini-agent binary"]
+async fn sandbox_network_allowlist_bwrap_native_only_the_proxy_is_reachable() {
+    let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+    super::linux_workspace_tests::required_backend();
+    let forwarder = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("mini-agent");
+    assert!(
+        forwarder.exists(),
+        "native control requires the built binary at {}",
+        forwarder.display()
+    );
+    let root = std::env::temp_dir().join(format!("mini-agent-net-native-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("ws")).unwrap();
+    let cache = root.join("cache");
+    crate::fs::ensure_private_directory(&cache).unwrap();
+    let sandbox = super::linux_workspace_tests::bound(&root.join("ws"), &cache)
+        .with_network(SandboxNetwork::Allowlist)
+        .with_network_hosts(vec!["allowed.example.com".into()])
+        .with_net_forwarder_exe(forwarder);
+    let run = |script: String| {
+        let sandbox = sandbox.clone();
+        async move {
+            let output = sandbox
+                .output_command_with_limits(&script, DEFAULT_COMMAND_LIMITS)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+    };
+    // Raw talk to the forwarder: no credential -> the proxy answers 407, a
+    // listed name that resolves to loopback -> 403, an unlisted name -> 403.
+    // Everything else (a direct route to the Internet) must not exist.
+    let probe = |request: &str| {
+        format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{port} || {{ echo NOFORWARDER; exit 0; }}; printf '{request}' >&3; head -n1 <&3",
+            port = net_proxy::FORWARDER_PORT
+        )
+    };
+    let bash = |script: String| format!("bash -c '{}'", script.replace('\'', "'\\''"));
+    let out = run(bash(probe(
+        "CONNECT allowed.example.com:443 HTTP/1.1\\r\\n\\r\\n",
+    )))
+    .await;
+    assert!(
+        out.contains(" 407 "),
+        "forwarder must reach the proxy: {out}"
+    );
+    let out = run(bash(
+        "exec 3<>/dev/tcp/93.184.216.34/80 && echo DIRECT || echo NOROUTE".into(),
+    ))
+    .await;
+    assert!(out.contains("NOROUTE"), "no direct route may exist: {out}");
+    let out = run("printf '%s' \"$HTTPS_PROXY\"".into()).await;
+    assert!(out.contains("@127.0.0.1:3128"), "{out}");
+    let _ = std::fs::remove_dir_all(root);
 }

@@ -49,6 +49,12 @@ use std::process::ExitCode;
 const ASYNC_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 fn main() -> anyhow::Result<ExitCode> {
+    // Linux bwrap network allowlist: relay helper, runs before anything else.
+    #[cfg(unix)]
+    if let Some(exit_code) = sandbox::net_forwarder::maybe_run_from_args() {
+        return Ok(exit_code);
+    }
+
     #[cfg(target_os = "windows")]
     if let Some(exit_code) = sandbox::windows::maybe_run_from_args() {
         std::process::exit(exit_code);

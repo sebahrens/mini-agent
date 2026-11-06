@@ -306,3 +306,86 @@ async fn unlisted_hosts_prompt_and_always_is_remembered_for_the_session() {
             .contains("sandbox-network-hosts")
     );
 }
+
+#[cfg(unix)]
+async fn exchange_socket(path: &std::path::Path, request: &str) -> String {
+    let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    let _ =
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response)).await;
+    response
+}
+
+/// The Unix socket (Linux bwrap route) is the same filtering proxy: it needs
+/// the token, refuses unlisted and non-public destinations, is private to the
+/// owner, and disappears with the proxy.
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_socket_route_applies_the_same_token_and_destination_rules() {
+    use std::os::unix::fs::PermissionsExt;
+    let proxy =
+        NetworkProxy::start_with_socket(rules(&["localhost", "169.254.169.254"]), Arc::default())
+            .unwrap();
+    let path = proxy.socket_path().unwrap().to_path_buf();
+    let dir_mode = std::fs::metadata(path.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(dir_mode & 0o777, 0o700, "socket directory must be private");
+    assert!(
+        NetworkProxy::start(rules(&[]), Arc::default())
+            .unwrap()
+            .socket_path()
+            .is_none()
+    );
+
+    let no_auth = exchange_socket(&path, "CONNECT localhost:443 HTTP/1.1\r\n\r\n").await;
+    assert!(no_auth.starts_with("HTTP/1.1 407"), "{no_auth}");
+    let wrong = exchange_socket(
+        &path,
+        "CONNECT localhost:443 HTTP/1.1\r\nProxy-Authorization: Basic bm9wZTpub3Bl\r\n\r\n",
+    )
+    .await;
+    assert!(wrong.starts_with("HTTP/1.1 407"), "{wrong}");
+    // The forwarder-side environment carries the same credential.
+    let forwarder_env = proxy.env_for_forwarder();
+    let url = &forwarder_env
+        .iter()
+        .find(|(k, _)| k == "https_proxy")
+        .unwrap()
+        .1;
+    assert!(
+        url.ends_with(&format!("@127.0.0.1:{FORWARDER_PORT}")),
+        "{url}"
+    );
+
+    let header = auth(&proxy);
+    let loopback = exchange_socket(
+        &path,
+        &format!("CONNECT localhost:443 HTTP/1.1\r\n{header}\r\n"),
+    )
+    .await;
+    assert!(loopback.starts_with("HTTP/1.1 403"), "{loopback}");
+    let metadata = exchange_socket(
+        &path,
+        &format!("CONNECT 169.254.169.254:80 HTTP/1.1\r\n{header}\r\n"),
+    )
+    .await;
+    assert!(metadata.starts_with("HTTP/1.1 403"), "{metadata}");
+    let unlisted = exchange_socket(
+        &path,
+        &format!("CONNECT unlisted.example.net:443 HTTP/1.1\r\n{header}\r\n"),
+    )
+    .await;
+    assert!(unlisted.starts_with("HTTP/1.1 403"), "{unlisted}");
+    assert!(
+        unlisted.contains("not in sandbox-network-hosts"),
+        "{unlisted}"
+    );
+
+    drop(proxy);
+    // The listener thread keeps its Arc-free state; the guard is gone with the
+    // last handle, so the directory must be removed.
+    assert!(!path.exists());
+}
