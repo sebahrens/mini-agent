@@ -1023,6 +1023,49 @@ pub(crate) async fn with_headless_mid_turn<F: std::future::Future>(
     }
 }
 
+/// Turns and tokens already spent by earlier context-relief segments of the
+/// same headless prompt (mini-agent-djjua). Each relief segment is a fresh
+/// agent stream, so without this carry `max_agent_turns` ("per user prompt")
+/// and `turn_token_budget` would be multiplied by the number of reliefs. The
+/// driver creates one per prompt/round and installs it around every segment;
+/// a segment that ends in a failure records what it spent, and the next one
+/// starts with only the remainder.
+#[derive(Debug, Default)]
+pub(crate) struct HeadlessBudgetCarry {
+    turns: std::sync::atomic::AtomicUsize,
+    tokens: std::sync::atomic::AtomicU64,
+}
+
+impl HeadlessBudgetCarry {
+    fn spent(&self) -> (usize, u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (self.turns.load(SeqCst), self.tokens.load(SeqCst))
+    }
+
+    fn add(&self, turns: usize, tokens: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // The carry is read only between segments, so a plain add is enough.
+        let _ = self
+            .turns
+            .fetch_update(SeqCst, SeqCst, |v| Some(v.saturating_add(turns)));
+        let _ = self
+            .tokens
+            .fetch_update(SeqCst, SeqCst, |v| Some(v.saturating_add(tokens)));
+    }
+}
+
+tokio::task_local! {
+    static HEADLESS_BUDGET_CARRY: std::sync::Arc<HeadlessBudgetCarry>;
+}
+
+/// Run `work` (one headless segment) charging its turns and tokens to `carry`.
+pub(crate) async fn with_headless_budget_carry<F: std::future::Future>(
+    carry: std::sync::Arc<HeadlessBudgetCarry>,
+    work: F,
+) -> F::Output {
+    HEADLESS_BUDGET_CARRY.scope(carry, work).await
+}
+
 /// The headless turn stopped at a tool-batch boundary because real prompt
 /// pressure crossed the mid-turn threshold. Every tool call of the batch has
 /// its result in the returned interactions; nothing was aborted.
@@ -5207,12 +5250,32 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
-    let max_turns = agent.default_max_turns.unwrap_or(1);
-    if max_turns == 0 {
+    let max_turns_total = agent.default_max_turns.unwrap_or(1);
+    if max_turns_total == 0 {
         return HeadlessTurn::failed_before_start(anyhow::anyhow!(
             "Agent exhausted its maximum turn budget (0) before starting."
         ));
     }
+    // A relief segment continues the same prompt: only the remainder of the
+    // per-prompt turn and token budgets is available (mini-agent-djjua).
+    let budget_carry = HEADLESS_BUDGET_CARRY.try_with(Arc::clone).ok();
+    let (prior_turns, prior_tokens) = budget_carry.as_ref().map_or((0, 0), |c| c.spent());
+    let max_turns = max_turns_total.saturating_sub(prior_turns);
+    if max_turns == 0 {
+        return HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            "Agent exhausted its maximum turn budget ({max_turns_total}) before completing.{}",
+            crate::cli::MAX_AGENT_TURNS_HINT
+        ));
+    }
+    if let Some(budget) = turn_token_budget
+        && prior_tokens >= budget
+    {
+        return HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            "Agent exhausted its cumulative token budget ({prior_tokens}/{budget}) before \
+             completing. Compact the session or raise turn_token_budget before retrying."
+        ));
+    }
+    let turn_token_budget = turn_token_budget.map(|budget| budget.saturating_sub(prior_tokens));
 
     let retry_config = &retry_config.bounded();
     let mut first_attempt_history = Some(history.to_vec());
@@ -5288,6 +5351,9 @@ where
         ($($arg:tt)*) => {{
             tool_calls.finalize_unresolved(&mut interactions);
             committed_interactions.append(&mut interactions);
+            if let Some(carry) = &budget_carry {
+                carry.add(turns_used, observed_tokens(usage_ledger.total));
+            }
             HeadlessTurn {
                 response: std::mem::take(&mut full_response),
                 usage: usage_ledger.total,
@@ -6324,6 +6390,135 @@ mod tests {
             "tool results are retained: {:?}",
             turn.interactions
         );
+    }
+
+    // mini-agent-djjua: a relief segment continues the same prompt, so the
+    // turns and tokens the first segment spent are not available again.
+    #[tokio::test]
+    async fn headless_relief_segments_share_the_turn_and_token_budget() {
+        #[cfg(feature = "hooks")]
+        let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "carry-first",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response(usage(950, 8, 0, 0)),
+            ],
+            vec![
+                MockStreamEvent::tool_call(
+                    "carry-second",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response(usage(40, 4, 0, 0)),
+            ],
+            vec![
+                MockStreamEvent::text("never reached"),
+                MockStreamEvent::final_response(usage(40, 4, 0, 0)),
+            ],
+        ]);
+        // Two turns per prompt in total, whatever the number of segments.
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(2)
+            .build();
+        let carry = Arc::new(super::HeadlessBudgetCarry::default());
+        let run = |policy: Option<super::HeadlessMidTurnPolicy>, budget: Option<u64>| {
+            let agent = agent.clone();
+            let carry = carry.clone();
+            async move {
+                super::with_headless_budget_carry(
+                    carry,
+                    super::with_headless_mid_turn(
+                        policy,
+                        super::run_print_with_stream_policy_and_verification(
+                            &agent,
+                            &crate::agent::input::PromptInput::text("work".to_owned()),
+                            crate::print::HeadlessOutputPolicy::legacy(false, true),
+                            None,
+                            &crate::retry::RetryConfig::default(),
+                            budget,
+                            Arc::from(Vec::new()),
+                            super::RunnerStreamPolicy::default(),
+                            None,
+                            crate::agent::native_capture::NativeCaptureHook::default(),
+                            #[cfg(feature = "hooks")]
+                            None,
+                        ),
+                    ),
+                )
+                .await
+            }
+        };
+        let policy = Some(super::HeadlessMidTurnPolicy {
+            window: 1000,
+            threshold: 0.9,
+            anthropic_native: false,
+        });
+        let first = run(policy, None).await;
+        assert!(
+            first.failure.as_ref().is_some_and(|e| e
+                .downcast_ref::<super::MidTurnCompactionBoundary>()
+                .is_some()),
+            "{:?}",
+            first.failure
+        );
+        assert_eq!(carry.spent(), (1, 958));
+        // The second segment has one turn left: its tool-bearing completion
+        // uses it and the loop may not start a third request.
+        let second = run(None, None).await;
+        let error = format!(
+            "{:#}",
+            second.failure.expect("turn cap must stop the prompt")
+        );
+        assert!(
+            error.contains("max turns limit: 1") || error.contains("maximum turn budget"),
+            "{error}"
+        );
+        assert_eq!(model.requests().len(), 2, "no third round trip");
+        // Everything is spent: a further segment cannot even start.
+        let third = run(None, None).await;
+        let error = format!("{:#}", third.failure.expect("no turns remain"));
+        assert!(error.contains("maximum turn budget (2)"), "{error}");
+        assert_eq!(model.requests().len(), 2);
+        // Tokens are carried the same way.
+        let tokens = Arc::new(super::HeadlessBudgetCarry::default());
+        tokens.add(0, 500);
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("never"),
+            MockStreamEvent::final_response(usage(10, 1, 0, 0)),
+        ]]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(5)
+            .build();
+        let turn = super::with_headless_budget_carry(
+            tokens,
+            super::run_print_with_stream_policy_and_verification(
+                &agent,
+                &crate::agent::input::PromptInput::text("work".to_owned()),
+                crate::print::HeadlessOutputPolicy::legacy(false, true),
+                None,
+                &crate::retry::RetryConfig::default(),
+                Some(500),
+                Arc::from(Vec::new()),
+                super::RunnerStreamPolicy::default(),
+                None,
+                crate::agent::native_capture::NativeCaptureHook::default(),
+                #[cfg(feature = "hooks")]
+                None,
+            ),
+        )
+        .await;
+        let error = format!("{:#}", turn.failure.expect("token budget spent"));
+        assert!(
+            error.contains("cumulative token budget (500/500)"),
+            "{error}"
+        );
+        assert!(model.requests().is_empty());
     }
 
     #[tokio::test]

@@ -3992,25 +3992,31 @@ async fn run_bound_headless_round(
     let mut history = history;
     let mut reliefs = 0usize;
     let mut last_freed_nothing = false;
+    // Turns and tokens spent by earlier segments of this prompt count against
+    // the later ones (mini-agent-djjua).
+    let budget_carry = std::sync::Arc::new(crate::agent::runner::HeadlessBudgetCarry::default());
     loop {
-        let (mut turn, persisted) = run_bound_headless_segment(
-            agent,
-            session,
-            cli,
-            cfg,
-            &prompt,
-            history.clone(),
-            output,
-            question_turn.clone(),
-            native_ticket,
-            native_owner,
-            true,
-            #[cfg(feature = "hooks")]
-            startup_context,
-            #[cfg(feature = "agent-skills")]
-            instruction_turn.clone(),
-            #[cfg(feature = "hooks")]
-            loop_info,
+        let (mut turn, persisted) = crate::agent::runner::with_headless_budget_carry(
+            budget_carry.clone(),
+            run_bound_headless_segment(
+                agent,
+                session,
+                cli,
+                cfg,
+                &prompt,
+                history.clone(),
+                output,
+                question_turn.clone(),
+                native_ticket,
+                native_owner,
+                true,
+                #[cfg(feature = "hooks")]
+                startup_context,
+                #[cfg(feature = "agent-skills")]
+                instruction_turn.clone(),
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
         )
         .await;
         let Some(full) = turn
@@ -4879,6 +4885,9 @@ async fn relieve_headless_turn(
     let mut reliefs = 0usize;
     let mut reactive_used = false;
     let mut mid_turn_available = true;
+    // Turns and tokens spent by earlier segments of this prompt count against
+    // the later ones (mini-agent-djjua).
+    let budget_carry = std::sync::Arc::new(crate::agent::runner::HeadlessBudgetCarry::default());
     loop {
         let mid_turn =
             (mid_turn_available && cfg.resolve_compact_enabled() && session.context_window > 0)
@@ -4889,7 +4898,11 @@ async fn relieve_headless_turn(
                     threshold,
                     anthropic_native: cfg.is_anthropic_native(&session.provider),
                 });
-        let turn = run_segment(session, &prompt, history.clone(), mid_turn).await;
+        let turn = crate::agent::runner::with_headless_budget_carry(
+            budget_carry.clone(),
+            run_segment(session, &prompt, history.clone(), mid_turn),
+        )
+        .await;
         let cause = if cfg.resolve_compact_enabled() {
             headless_relief_cause(&turn, reactive_used)
         } else {

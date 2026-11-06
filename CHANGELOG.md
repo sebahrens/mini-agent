@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Headless context relief carries the turns and `turn_token_budget` tokens spent by earlier segments into later ones, so `max_agent_turns` / `--max-agent-turns` bounds the whole prompt instead of resetting per relief segment (mini-agent-djjua).
 - The sandbox HTTP proxy replaces the client's `Host` header with the allowlisted request-URI authority before
   forwarding, so a contained command cannot reach another virtual host behind an allowed address (mini-agent-9svy4).
 - The built-in `jdtls`, `csharp-ls`, `ruby-lsp`, `kotlin-language-server`, `sourcekit-lsp` and `zls` servers evaluate
