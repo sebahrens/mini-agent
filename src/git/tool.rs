@@ -1480,7 +1480,13 @@ fn render_paged_text_result(
     output: CommandOutput,
     offset: Option<u64>,
 ) -> Result<serde_json::Value, ToolError> {
-    let stdout = &output.stdout;
+    let CommandOutput {
+        exit_status,
+        stdout,
+        stderr,
+        status: command_status,
+        ..
+    } = output;
     let total = stdout.len();
     let start = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
     if start > total {
@@ -1498,16 +1504,20 @@ fn render_paged_text_result(
         }
     }
     let next_offset = (end < total).then_some(end);
+    let page = String::from_utf8_lossy(&stdout[start..end]);
+    let stderr = String::from_utf8_lossy(&stderr);
+    // Output beyond the 16 MiB run ceiling was not captured at all.
+    let truncated = matches!(command_status, CommandStatus::OutputLimitExceeded(_));
+    let exit_code = exit_status.and_then(|exit| exit.code());
     Ok(serde_json::json!({
         "operation": operation,
-        "text": String::from_utf8_lossy(&stdout[start..end]),
-        "stderr": String::from_utf8_lossy(&output.stderr),
+        "text": page,
+        "stderr": stderr,
         "offset": start,
         "next_offset": next_offset,
         "total_bytes": total,
-        // Output beyond the 16 MiB run ceiling was not captured at all.
-        "truncated": matches!(output.status, CommandStatus::OutputLimitExceeded(_)),
-        "exit_code": output.exit_status.and_then(|status| status.code()),
+        "truncated": truncated,
+        "exit_code": exit_code,
         "coaching": coaching,
     }))
 }
@@ -1521,14 +1531,14 @@ fn render_ref_result(
         exit_status,
         stdout,
         stderr,
-        status,
+        status: command_status,
         ..
     } = output;
     serde_json::json!({
         "operation": operation,
         "stdout": String::from_utf8_lossy(&stdout),
         "stderr": String::from_utf8_lossy(&stderr),
-        "status": mutation_status(status, exit_status),
+        "status": mutation_status(command_status, exit_status),
         "exit_code": exit_status.and_then(|exit| exit.code()),
         "coaching": coaching,
     })

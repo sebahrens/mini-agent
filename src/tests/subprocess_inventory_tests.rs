@@ -3658,24 +3658,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/git/tool.rs",
         "\"truncated\": matches!(output.status, CommandStatus::OutputLimitExceeded(_)),",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/tool.rs",
-        "\"text\": String::from_utf8_lossy(&output.stdout),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/tool.rs",
-        "\"stderr\": String::from_utf8_lossy(&output.stderr),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/tool.rs",
-        "\"exit_code\": output.exit_status.and_then(|status| status.code()),",
         1,
         "NON-PROCESS",
     ),
@@ -5187,20 +5169,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/git/tool.rs",
-        &[
-            (
-                "a8b477f08aa5c038c7d3892b7bda9395807cacfdcb17158cba72ecaecf0ae1a2",
-                1,
-            ),
-            (
-                "8977c81253878389e36cb016b24448143669f556688aa5aa9cd327c48c048604",
-                1,
-            ),
-            (
-                "b7d3a343dd8cc9b7c5fd729f36f1f77cff90127a7634b70d129a1e15b9a3063d",
-                1,
-            ),
-        ],
+        &[(
+            "a8b477f08aa5c038c7d3892b7bda9395807cacfdcb17158cba72ecaecf0ae1a2",
+            1,
+        )],
     ),
     (
         "src/docs.rs",
