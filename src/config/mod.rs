@@ -695,6 +695,16 @@ pub struct Config {
         alias = "hosted_web_search_max_uses"
     )]
     pub hosted_web_search_max_uses: Option<u32>,
+    /// USD per 1,000 provider-hosted web searches counted into cost and
+    /// `--max-budget-usd` (default 10, Anthropic's published price). Authority
+    /// -sensitive: a project could otherwise zero the fee to hide spend.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "hosted-web-search-cost-per-1k",
+        alias = "hosted_web_search_cost_per_1k"
+    )]
+    pub hosted_web_search_cost_per_1k: Option<f64>,
     /// Total `web_fetch` deadline in seconds (DNS, approval, redirects and
     /// body). Default 30; clamped to 1..=300.
     #[serde(

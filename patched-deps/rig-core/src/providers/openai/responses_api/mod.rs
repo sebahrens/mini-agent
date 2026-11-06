@@ -982,6 +982,7 @@ impl GetTokenUsage for ResponsesUsage {
                 .unwrap_or(0),
             cache_creation: None,
             tool_use_prompt_tokens: 0,
+            hosted_search_requests: 0,
             reasoning_tokens: self
                 .output_tokens_details
                 .as_ref()

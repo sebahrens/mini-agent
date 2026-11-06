@@ -215,6 +215,9 @@ pub(crate) fn validate_responses_extra_body(
 pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, String> {
     cfg.shell_env_policy().validate()?;
     crate::provider::validate_hosted_search_config(cfg)?;
+    // Every cost path (session totals, ledger receipts, budget admission)
+    // charges hosted searches at this one price.
+    crate::pricing::set_hosted_search_usd_per_1k(cfg.hosted_web_search_cost_per_1k);
     crate::sandbox::net_proxy::parse_rules(&cfg.sandbox_network_hosts)?;
     if let Some(max) = cfg.shell_max_background_jobs
         && !(1..=crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT).contains(&max)
@@ -4429,6 +4432,8 @@ mod project_config_trust_tests {
             "hosted-web-search-allowed-domains",
             "hosted-web-search-blocked-domains",
             "hosted-web-search-max-uses",
+            "hosted-web-search-cost-per-1k",
+            "hosted_web_search_cost_per_1k",
         ] {
             assert!(
                 !super::BENIGN_PROJECT_CONFIG_KEYS.contains(&key),

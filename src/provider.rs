@@ -513,6 +513,15 @@ fn hosted_search_options(cfg: &Config) -> Result<HostedSearchOptions, String> {
 /// same error the agent build would otherwise only log at `warn` level (which
 /// silently removed hosted search), so a bad value is reported at startup.
 pub(crate) fn validate_hosted_search_config(cfg: &Config) -> Result<(), String> {
+    if let Some(rate) = cfg.hosted_web_search_cost_per_1k
+        && !(rate.is_finite()
+            && (0.0..=crate::pricing::MAX_HOSTED_SEARCH_USD_PER_1K).contains(&rate))
+    {
+        return Err(format!(
+            "hosted-web-search-cost-per-1k must be between 0 and {}",
+            crate::pricing::MAX_HOSTED_SEARCH_USD_PER_1K
+        ));
+    }
     if cfg.hosted_web_search_allowed_domains.is_none()
         && cfg.hosted_web_search_blocked_domains.is_none()
         && cfg.hosted_web_search_max_uses.is_none()

@@ -1300,6 +1300,7 @@ fn normalized_usage_charges_gemini_thinking_as_output() {
         cache_creation_input_tokens: 0,
         cache_creation: None,
         tool_use_prompt_tokens: 0,
+        hosted_search_requests: 0,
         reasoning_tokens: 300,
     };
     let normalized = cfg.normalize_usage("gemini", gemini_report);

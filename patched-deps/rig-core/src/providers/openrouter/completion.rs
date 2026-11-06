@@ -724,6 +724,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                     cache_creation_input_tokens: cache_creation,
                     cache_creation: None,
                     tool_use_prompt_tokens: 0,
+                    hosted_search_requests: 0,
                     reasoning_tokens: 0,
                 }
             })

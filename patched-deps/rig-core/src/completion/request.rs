@@ -652,6 +652,12 @@ pub struct Usage {
     /// The number of tool-use prompt tokens used in a given request.
     #[serde(default)]
     pub tool_use_prompt_tokens: u64,
+    /// Provider-hosted web searches the provider billed for this response
+    /// (Anthropic `usage.server_tool_use.web_search_requests`, OpenAI Responses
+    /// `web_search_call` items). They are billed per call on top of tokens.
+    /// (mini-agent patch)
+    #[serde(default)]
+    pub hosted_search_requests: u64,
     /// The number of tokens spent on internal reasoning / "thoughts" by reasoning-capable
     /// models (e.g. Gemini thinking, Anthropic extended thinking, OpenAI o-series).
     pub reasoning_tokens: u64,
@@ -668,6 +674,7 @@ impl Usage {
             cache_creation_input_tokens: 0,
             cache_creation: None,
             tool_use_prompt_tokens: 0,
+            hosted_search_requests: 0,
             reasoning_tokens: 0,
         }
     }
@@ -684,6 +691,7 @@ impl Usage {
             self.cached_input_tokens,
             self.cache_creation_input_tokens,
             self.tool_use_prompt_tokens,
+            self.hosted_search_requests,
             self.reasoning_tokens,
         ]
         .into_iter()
@@ -715,6 +723,7 @@ impl Add for Usage {
                 other.cache_creation,
             ),
             tool_use_prompt_tokens: self.tool_use_prompt_tokens + other.tool_use_prompt_tokens,
+            hosted_search_requests: self.hosted_search_requests + other.hosted_search_requests,
             reasoning_tokens: self.reasoning_tokens + other.reasoning_tokens,
         }
     }
@@ -734,6 +743,7 @@ impl AddAssign for Usage {
         );
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.tool_use_prompt_tokens += other.tool_use_prompt_tokens;
+        self.hosted_search_requests += other.hosted_search_requests;
         self.reasoning_tokens += other.reasoning_tokens;
     }
 }

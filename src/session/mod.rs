@@ -986,6 +986,10 @@ pub struct Session {
     /// Provider-normalized prompt tokens, including cached tiers exactly once.
     #[serde(default)]
     pub total_real_input_tokens: u64,
+    /// Provider-hosted web searches billed this session (per request, on top of
+    /// tokens; already included in `total_cost`).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub total_hosted_search_requests: u64,
     pub total_cost: f64,
     /// Goal completion-judge tokens charged to the totals above without a
     /// cost, because the judge model's price is unknown (mini-agent-kfsup).
@@ -1521,6 +1525,7 @@ impl Session {
             total_cache_creation_input_tokens: 0,
             total_cache_creation: None,
             total_real_input_tokens: 0,
+            total_hosted_search_requests: 0,
             total_cost: 0.0,
             unpriced_judge_tokens: 0,
             total_estimated_tokens: 0,
@@ -1987,6 +1992,7 @@ impl Session {
             || self.total_real_input_tokens > 0
             || self.total_cached_input_tokens > 0
             || self.total_cache_creation_input_tokens > 0
+            || self.total_hosted_search_requests > 0
             || self.total_cost > 0.0
             || self.unpriced_judge_tokens > 0
             || !self.compactions.is_empty()
@@ -2185,6 +2191,9 @@ impl Session {
         self.total_cached_input_tokens = self
             .total_cached_input_tokens
             .saturating_add(usage.cached_input_tokens);
+        self.total_hosted_search_requests = self
+            .total_hosted_search_requests
+            .saturating_add(usage.hosted_search_requests);
         self.total_cache_creation = rig::completion::CacheCreationUsage::add_optional(
             self.total_cache_creation_input_tokens,
             self.total_cache_creation,

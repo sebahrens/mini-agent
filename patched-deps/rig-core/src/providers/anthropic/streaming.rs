@@ -157,6 +157,16 @@ pub struct PartialUsage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<CacheCreation>,
+    /// Cumulative provider-hosted tool usage (`server_tool_use`). (mini-agent patch)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_use: Option<ServerToolUseUsage>,
+}
+
+/// `usage.server_tool_use`: hosted tool calls billed per request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ServerToolUseUsage {
+    #[serde(default)]
+    pub web_search_requests: u64,
 }
 
 impl PartialUsage {
@@ -178,6 +188,7 @@ impl PartialUsage {
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
             cache_read_input_tokens: usage.cache_read_input_tokens,
             cache_creation: usage.cache_creation,
+            server_tool_use: None,
         })
     }
 
@@ -202,6 +213,9 @@ impl PartialUsage {
         if let Some(breakdown) = delta.cache_creation {
             self.cache_creation = Some(breakdown);
         }
+        if let Some(tools) = delta.server_tool_use {
+            self.server_tool_use = Some(tools);
+        }
         validate_cache_creation(self.cache_creation_input_tokens, self.cache_creation)?;
         validate_usage_counts(
             self.input_tokens.unwrap_or_default() as u64,
@@ -220,6 +234,9 @@ impl GetTokenUsage for PartialUsage {
         usage.output_tokens = self.output_tokens as u64;
         usage.cached_input_tokens = self.cache_read_input_tokens.unwrap_or(0);
         usage.cache_creation_input_tokens = self.cache_creation_input_tokens.unwrap_or(0);
+        usage.hosted_search_requests = self
+            .server_tool_use
+            .map_or(0, |tools| tools.web_search_requests);
         usage.total_tokens = usage.input_tokens
             + usage.cached_input_tokens
             + usage.cache_creation_input_tokens
@@ -276,6 +293,10 @@ impl GetTokenUsage for StreamingCompletionResponse {
         usage.output_tokens = self.usage.output_tokens as u64;
         usage.cached_input_tokens = self.usage.cache_read_input_tokens.unwrap_or(0);
         usage.cache_creation_input_tokens = self.usage.cache_creation_input_tokens.unwrap_or(0);
+        usage.hosted_search_requests = self
+            .usage
+            .server_tool_use
+            .map_or(0, |tools| tools.web_search_requests);
         usage.cache_creation =
             self.usage
                 .cache_creation

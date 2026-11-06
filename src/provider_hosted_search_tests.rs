@@ -292,3 +292,30 @@ fn openai_responses_block_list_is_a_visible_startup_warning() {
     .unwrap();
     assert!(validate_extra_body(&mut anthropic).unwrap().is_empty());
 }
+
+// mini-agent-zoea5: the per-1,000 search price is validated at config load and
+// is authority-sensitive (a project must not be able to zero the fee).
+#[test]
+fn hosted_search_cost_rate_is_validated_and_needs_project_trust() {
+    use crate::config::load::validate_extra_body;
+    for rate in [-1.0, f64::NAN, f64::INFINITY, 100_000.5] {
+        let mut c = cfg(Some(true));
+        c.hosted_web_search_cost_per_1k = Some(rate);
+        let error = validate_extra_body(&mut c).unwrap_err();
+        assert!(error.contains("hosted-web-search-cost-per-1k"), "{error}");
+    }
+    for rate in [0.0, 10.0, 25.5, 100_000.0] {
+        let mut c = cfg(Some(true));
+        c.hosted_web_search_cost_per_1k = Some(rate);
+        validate_extra_body(&mut c).unwrap();
+    }
+    // Back to the default so concurrent cost tests keep the documented price.
+    validate_extra_body(&mut cfg(None)).unwrap();
+    assert_eq!(crate::pricing::hosted_search_usd_per_1k(), 10.0);
+    let parsed: Config =
+        serde_json::from_value(json!({"hosted-web-search-cost-per-1k": 7.5})).unwrap();
+    assert_eq!(parsed.hosted_web_search_cost_per_1k, Some(7.5));
+    let snake: Config =
+        serde_json::from_value(json!({"hosted_web_search_cost_per_1k": 2.0})).unwrap();
+    assert_eq!(snake.hosted_web_search_cost_per_1k, Some(2.0));
+}

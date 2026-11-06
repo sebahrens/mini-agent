@@ -190,6 +190,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Cost tracking
 
+- Provider-hosted web search fees are counted: Anthropic `usage.server_tool_use.web_search_requests`
+  and OpenAI Responses `web_search_call` items become `hosted_search_requests` on usage reports and
+  ledger receipts, priced at `hosted-web-search-cost-per-1k` (default $10 per 1,000, needs project
+  trust) into the session cost, `/cost`, the ledger and `--max-budget-usd` (mini-agent-zoea5).
+- Invalid `hosted-web-search-allowed-domains` / `-blocked-domains` / `-max-uses` values are now a
+  config-load error (and the OpenAI Responses block-list limitation a visible startup warning)
+  instead of silently removing hosted search (mini-agent-cq3om).
+
 - The global usage ledger no longer has a permanent 65,536-record / 64 MiB wall: a full
   `usage.jsonl` is archived as `usage.<seq>.archive.jsonl` and folded into `usage.rollup`, so
   `/cost` and session budgets keep exact all-time totals. A capped run that stops because spend

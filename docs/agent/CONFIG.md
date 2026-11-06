@@ -4585,6 +4585,7 @@ untrusted project config cannot enable it.
 | `web-search-provider` (`web_search_provider`) | `"exa"` | Fixed-endpoint Exa search, or `"off"` to omit the tool. Other provider names fail visibly before I/O. |
 | `hosted-web-search` (`hosted_web_search`) | `false` | Opt in to the Anthropic or OpenAI Responses provider-hosted web search instead of native Exa. Bypasses per-call `web_search` permission; see above. |
 | `hosted-web-search-allowed-domains` / `-blocked-domains` / `-max-uses` | omitted / omitted / `5` | Domain filters and the Anthropic `max_uses` cap for hosted search (see above). Authority-sensitive: need project trust. |
+| `hosted-web-search-cost-per-1k` (`hosted_web_search_cost_per_1k`) | `10` | USD per 1,000 provider-hosted searches, counted into the session cost, `/cost`, the spend ledger and `--max-budget-usd` (0..=100000). Anthropic's published price is $10 per 1,000; OpenAI bills `web_search` per call. Authority-sensitive: needs project trust, so a project cannot zero the fee. |
 | `web-fetch-timeout-secs` (`web_fetch_timeout_secs`) | `30` | Total `web_fetch` deadline in seconds, spanning DNS, approval, redirects and body. Clamped to 1..=300. The idle gap allowed between body reads is half of it (at least 3 s). `web_search` keeps its fixed 10 s deadline. |
 
 These are authority-sensitive project config keys and require existing project

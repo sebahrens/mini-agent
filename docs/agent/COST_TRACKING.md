@@ -88,6 +88,22 @@ never replaced. `/cost` names the active model's premium (`Long-context premium:
 requests with prompts over N tokens are priced at ...`), and the USD ceiling sees the
 premium cost.
 
+## Provider-hosted web search
+
+With `hosted-web-search = true`, Anthropic (`web_search_20250305`) and OpenAI
+Responses (`web_search`) run searches on the provider side and bill each one on
+top of tokens. mini-agent reads the count from Anthropic
+`usage.server_tool_use.web_search_requests` and from completed OpenAI
+`web_search_call` output items, carries it as `hosted_search_requests` on every
+usage report and ledger receipt, and charges `requests x hosted-web-search-cost-per-1k
+/ 1000` (default $10 per 1,000). The fee is part of the session total, the
+`--max-budget-usd` admission and stop checks, the daily/all-time ledger and the
+headless JSON cost; `/cost` shows `Hosted web searches: N` for the session. A
+receipt that carries searches also records the rate it was priced at, so it stays
+valid if the configured rate changes later. A model with no known token price
+still counts the fee in the session total, but its ledger receipt cost stays
+unknown. Other providers have no hosted search bridge.
+
 Not modelled, so `/cost` and the USD ceiling can undercount them:
 
 - long-context premiums the catalog does not list (the Anthropic 1M-context beta

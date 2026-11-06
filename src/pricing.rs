@@ -103,6 +103,41 @@ fn valid_price(price: f64) -> bool {
     price.is_finite() && price >= 0.0
 }
 
+/// Provider-hosted web search is billed per call on top of tokens. Anthropic
+/// publishes $10 per 1,000 searches and OpenAI's Responses `web_search` tool is
+/// priced per call at a comparable rate; `hosted-web-search-cost-per-1k`
+/// overrides it. The rate is process-wide because every cost path (session
+/// totals, the spend ledger, budget admission) must charge the same amount.
+pub const DEFAULT_HOSTED_SEARCH_USD_PER_1K: f64 = 10.0;
+/// Largest accepted `hosted-web-search-cost-per-1k` (USD).
+pub const MAX_HOSTED_SEARCH_USD_PER_1K: f64 = 100_000.0;
+
+static HOSTED_SEARCH_USD_PER_1K_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_HOSTED_SEARCH_USD_PER_1K.to_bits());
+
+/// The configured per-1,000-request hosted search price (USD).
+pub fn hosted_search_usd_per_1k() -> f64 {
+    f64::from_bits(HOSTED_SEARCH_USD_PER_1K_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Install the configured price; `None` or an invalid value restores the default.
+pub fn set_hosted_search_usd_per_1k(rate: Option<f64>) {
+    let rate = rate
+        .filter(|rate| rate.is_finite() && (0.0..=MAX_HOSTED_SEARCH_USD_PER_1K).contains(rate))
+        .unwrap_or(DEFAULT_HOSTED_SEARCH_USD_PER_1K);
+    HOSTED_SEARCH_USD_PER_1K_BITS.store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// USD for `requests` hosted searches at `usd_per_1k`.
+pub(crate) fn hosted_search_fee_at(requests: u64, usd_per_1k: f64) -> f64 {
+    requests as f64 * usd_per_1k / 1_000.0
+}
+
+/// USD for `requests` hosted searches at the configured price.
+pub(crate) fn hosted_search_fee(requests: u64) -> f64 {
+    hosted_search_fee_at(requests, hosted_search_usd_per_1k())
+}
+
 impl CachePrices {
     #[cfg(feature = "goal")]
     pub(crate) fn has_valid_tier(self) -> bool {
@@ -142,15 +177,15 @@ impl CachePrices {
         {
             return None;
         }
+        let fee = hosted_search_fee(usage.hosted_search_requests);
         if anthropic_native && usage.cache_creation.is_some() {
-            return self.effective_at(input_price).native_split_cost(
-                usage,
-                input_price,
-                output_price,
-            );
+            return self
+                .effective_at(input_price)
+                .native_split_cost(usage, input_price, output_price)
+                .map(|tokens| tokens + fee);
         }
         let cost = self.estimate_cost_legacy(anthropic_native, usage, input_price, output_price);
-        valid_price(cost).then_some(cost)
+        valid_price(cost).then_some(cost + fee)
     }
 
     /// Version-one rows retain the original total-write estimate exactly.

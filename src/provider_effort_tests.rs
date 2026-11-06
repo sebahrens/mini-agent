@@ -9,6 +9,9 @@ mod instruction_wire_tests;
 #[path = "provider_native_restart_tests.rs"]
 mod native_restart_tests;
 
+#[path = "provider_hosted_search_cost_tests.rs"]
+mod hosted_search_cost_tests;
+
 #[path = "provider_cache_tests.rs"]
 mod cache_tests;
 
