@@ -2279,6 +2279,47 @@ pub enum AnyAgentInner {
     Ollama(Agent<ollama::CompletionModel<ProviderHttpClient>>),
 }
 
+impl AnyAgentInner {
+    /// The model id this agent sends.
+    pub(crate) fn model_id(&self) -> String {
+        match self {
+            AnyAgentInner::OpenRouter(a) => a.model.model.clone(),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => a.model.model.clone(),
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => a.model.model.clone(),
+            AnyAgentInner::Anthropic(a) => a.model.model.clone(),
+            AnyAgentInner::Gemini(a) => a.model.model.clone(),
+            AnyAgentInner::Copilot(a) => a.model.model.clone(),
+            AnyAgentInner::Ollama(a) => a.model.model.clone(),
+        }
+    }
+
+    /// The same agent (tools, preamble, hooks, parameters) sending `model`
+    /// instead, with its response cap clamped to that model's ceiling.
+    pub(crate) fn with_model_id(&self, provider: &str, model: &str) -> AnyAgentInner {
+        let mut inner = self.clone();
+        macro_rules! swap {
+            ($agent:expr) => {{
+                let mut completion = (*$agent.model).clone();
+                completion.model = model.to_string();
+                $agent.model = std::sync::Arc::new(completion);
+                $agent.max_tokens = $agent.max_tokens.map(|tokens| {
+                    crate::cli::resolve_response_max_tokens(Some(tokens), provider, model)
+                });
+            }};
+        }
+        match &mut inner {
+            AnyAgentInner::OpenRouter(a) => swap!(a),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => swap!(a),
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => swap!(a),
+            AnyAgentInner::Anthropic(a) => swap!(a),
+            AnyAgentInner::Gemini(a) => swap!(a),
+            AnyAgentInner::Copilot(a) => swap!(a),
+            AnyAgentInner::Ollama(a) => swap!(a),
+        }
+        inner
+    }
+}
+
 #[cfg(feature = "subagents")]
 impl AnyAgentInner {
     /// Why this provider path cannot honour a forced `tool_choice` on its
@@ -2555,6 +2596,119 @@ impl NativeHostGuard {
     }
 }
 
+/// A resolved `fallback_model` / `--fallback-model` for the main session.
+pub(crate) struct FallbackRoute {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    /// The quick-model alias it was selected through, for its prices.
+    pub(crate) alias: Option<String>,
+    pub(crate) cfg: std::sync::Arc<Config>,
+    pub(crate) controls: effort::SessionReasoning,
+}
+
+impl FallbackRoute {
+    fn notice(&self, primary: &str, turn: &runner::HeadlessTurn) -> String {
+        let reason = turn
+            .failure
+            .as_ref()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        let reason = reason.lines().next().unwrap_or_default();
+        let reason: String = reason.chars().take(200).collect();
+        format!(
+            "notice: model {primary} failed after retries ({reason}); falling back to {} for this turn",
+            self.model
+        )
+    }
+}
+
+static CLI_FALLBACK_MODEL: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Record `--fallback-model`, which takes precedence over `fallback_model`.
+pub(crate) fn set_cli_fallback_model(model: Option<String>) {
+    *CLI_FALLBACK_MODEL
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = model;
+}
+
+/// Resolve the fallback for `session`: `--fallback-model`, else
+/// `fallback_model`; a quick-model alias or a model id on the session's
+/// provider. A fallback on another provider is refused with a warning (the
+/// turn's client, credentials and history protocol belong to the primary).
+pub(crate) fn resolve_fallback_route(
+    cfg: &Config,
+    session: &crate::session::Session,
+) -> Option<std::sync::Arc<FallbackRoute>> {
+    let cli = CLI_FALLBACK_MODEL
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let name = cli.or_else(|| cfg.fallback_model.as_ref().map(|name| name.to_string()))?;
+    resolve_fallback_route_named(cfg, session, &name)
+}
+
+fn resolve_fallback_route_named(
+    cfg: &Config,
+    session: &crate::session::Session,
+    name: &str,
+) -> Option<std::sync::Arc<FallbackRoute>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let (provider, model, alias) = match crate::config::quick_models_map(cfg).get(name) {
+        Some(quick) => (
+            quick.provider.to_string(),
+            quick.model.to_string(),
+            Some(name.to_string()),
+        ),
+        None => (session.provider.to_string(), name.to_string(), None),
+    };
+    if provider != session.provider.as_str() {
+        tracing::warn!(
+            fallback = name,
+            provider,
+            "fallback model ignored: it must use the session's provider ({})",
+            session.provider
+        );
+        return None;
+    }
+    if model == session.model.as_str() {
+        return None;
+    }
+    Some(std::sync::Arc::new(FallbackRoute {
+        provider,
+        model,
+        alias,
+        cfg: std::sync::Arc::new(cfg.clone()),
+        controls: session.reasoning_controls,
+    }))
+}
+
+/// A headless turn may move to the fallback model only when the primary
+/// failed before any progress (no streamed text, no tool effect, nothing to
+/// replay) with an error that retrying could have fixed: overload, rate
+/// limit, server or transport failure. Context-window, authentication,
+/// budget and other client errors never fall back.
+pub(crate) fn fallback_eligible(turn: &runner::HeadlessTurn) -> bool {
+    let Some(error) = turn.failure.as_ref() else {
+        return false;
+    };
+    if !turn.response.is_empty()
+        || !turn.interactions.is_empty()
+        || error
+            .downcast_ref::<crate::question::QuestionRequired>()
+            .is_some()
+        || error
+            .downcast_ref::<crate::spend::run::BudgetStopped>()
+            .is_some()
+    {
+        return false;
+    }
+    let error: &(dyn std::error::Error + 'static) = error.as_ref();
+    crate::retry::is_retryable(error)
+}
+
 #[derive(Clone)]
 pub struct AnyAgent {
     inner: AnyAgentInner,
@@ -2577,6 +2731,9 @@ pub struct AnyAgent {
     headless_turn_directive: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     completion_verification: Option<runner::CompletionVerification>,
     reasoning_controls: Option<CapturedReasoning>,
+    /// Same-provider model used for the rest of a headless turn whose
+    /// primary request failed with retries exhausted (mini-agent-5gc2c).
+    fallback: Option<std::sync::Arc<FallbackRoute>>,
     #[cfg(feature = "memory")]
     memory_context: Option<Result<std::sync::Arc<str>, &'static str>>,
     context_snapshot: Option<builder::PreambleSnapshot>,
@@ -3310,6 +3467,7 @@ impl AnyAgent {
             headless_turn_directive: None,
             completion_verification: None,
             reasoning_controls: None,
+            fallback: None,
             #[cfg(feature = "memory")]
             memory_context: None,
             context_snapshot: None,
@@ -3326,10 +3484,30 @@ impl AnyAgent {
         }
     }
 
+    /// The configured fallback as a ready agent: the primary's prepared inner
+    /// agent with the fallback model id, its output cap clamped to that
+    /// model and reasoning controls recomputed for it. `None` when the
+    /// fallback cannot honour the session's reasoning controls.
+    fn fallback_agent(&self, inner: &AnyAgentInner, route: &FallbackRoute) -> Option<AnyAgent> {
+        let mut agent = self.clone();
+        agent.inner = inner.with_model_id(&route.provider, &route.model);
+        agent.fallback = None;
+        let agent = agent.with_reasoning_controls(&route.cfg, route.controls);
+        if let Some(error) = agent.reasoning_error() {
+            tracing::warn!(
+                model = route.model,
+                "fallback model skipped: reasoning controls unsupported: {error}"
+            );
+            return None;
+        }
+        Some(agent)
+    }
+
     /// Capture main-session data before restoring a binding or starting work.
     /// Independently built auxiliary agents retain their own context policy.
     pub(crate) fn with_main_session(self, cfg: &Config, session: &crate::session::Session) -> Self {
-        let agent = self.with_reasoning_controls(cfg, session.reasoning_controls);
+        let mut agent = self.with_reasoning_controls(cfg, session.reasoning_controls);
+        agent.fallback = resolve_fallback_route(cfg, session);
         #[cfg(feature = "memory")]
         {
             agent.with_memory_placement(session.memory_placement)
@@ -3922,6 +4100,7 @@ impl AnyAgent {
             headless_turn_directive: None,
             completion_verification: None,
             reasoning_controls: None,
+            fallback: None,
             #[cfg(feature = "memory")]
             memory_context: None,
             context_snapshot: None,
@@ -4139,131 +4318,169 @@ impl AnyAgent {
             let prompt = prompt.with_turn_directive(self.take_headless_turn_directive());
             #[cfg(not(feature = "agent-skills"))]
             let inner = &self.inner;
-            let turn = match &inner {
-                AnyAgentInner::OpenRouter(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
-                AnyAgentInner::OpenAI(a) => match a {
-                    OpenAiAgent::Responses(a) => {
-                        crate::startup::heap_future(|| {
-                            runner::run_print_with_output_and_verification(
-                                a,
-                                &prompt,
-                                output,
-                                retry_config,
-                                self.turn_token_budget,
-                                history,
-                                self.completion_verification.clone(),
-                                crate::agent::native_capture::NativeCaptureHook::default(),
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                            )
-                        })
-                        .await
+            // One provider dispatch, reused for the primary attempt and, when
+            // configured, the fallback model (mini-agent-5gc2c).
+            macro_rules! dispatch {
+                ($inner:expr, $prompt:expr, $history:expr) => {
+                    match $inner {
+                        AnyAgentInner::OpenRouter(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
+                        AnyAgentInner::OpenAI(a) => {
+                            match a {
+                                OpenAiAgent::Responses(a) => crate::startup::heap_future(|| {
+                                    runner::run_print_with_output_and_verification(
+                                        a,
+                                        &$prompt,
+                                        output,
+                                        retry_config,
+                                        self.turn_token_budget,
+                                        $history,
+                                        self.completion_verification.clone(),
+                                        crate::agent::native_capture::NativeCaptureHook::default(),
+                                        #[cfg(feature = "hooks")]
+                                        loop_info,
+                                    )
+                                })
+                                .await,
+                                OpenAiAgent::Completions(a) => crate::startup::heap_future(|| {
+                                    runner::run_print_with_output_and_verification(
+                                        a,
+                                        &$prompt,
+                                        output,
+                                        retry_config,
+                                        self.turn_token_budget,
+                                        $history,
+                                        self.completion_verification.clone(),
+                                        crate::agent::native_capture::NativeCaptureHook::default(),
+                                        #[cfg(feature = "hooks")]
+                                        loop_info,
+                                    )
+                                })
+                                .await,
+                            }
+                        }
+                        AnyAgentInner::Anthropic(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::for_native(
+                                        self.native_capture.clone(),
+                                        &a.model.model,
+                                    ),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
+                        AnyAgentInner::Gemini(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
+                        AnyAgentInner::Ollama(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
+                        AnyAgentInner::Copilot(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
                     }
-                    OpenAiAgent::Completions(a) => {
-                        crate::startup::heap_future(|| {
-                            runner::run_print_with_output_and_verification(
-                                a,
-                                &prompt,
-                                output,
-                                retry_config,
-                                self.turn_token_budget,
-                                history,
-                                self.completion_verification.clone(),
-                                crate::agent::native_capture::NativeCaptureHook::default(),
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                            )
-                        })
-                        .await
+                };
+            }
+            let fallback_input = self
+                .fallback
+                .as_ref()
+                .map(|route| (route.clone(), prompt.clone(), history.clone()));
+            let turn = dispatch!(&inner, prompt, history);
+            let turn = match fallback_input {
+                Some((route, prompt, history)) if fallback_eligible(&turn) => {
+                    match self.fallback_agent(&inner, &route) {
+                        Some(fallback) => {
+                            let notice = route.notice(&self.inner.model_id(), &turn);
+                            tracing::warn!("{notice}");
+                            let _ =
+                                crate::print::headless_stderr_async(format!("{notice}\n")).await;
+                            let fallback_inner = fallback.inner;
+                            let spend = crate::spend::run::Run::current().map(|run| {
+                                run.for_model(
+                                    &route.provider,
+                                    &route.model,
+                                    &route.cfg,
+                                    route.alias.as_deref(),
+                                    None,
+                                    run.kind(),
+                                )
+                            });
+                            crate::spend::run::scope(spend, async {
+                                dispatch!(&fallback_inner, prompt, history)
+                            })
+                            .await
+                        }
+                        None => turn,
                     }
-                },
-                AnyAgentInner::Anthropic(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::for_native(
-                                self.native_capture.clone(),
-                                &a.model.model,
-                            ),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
                 }
-                AnyAgentInner::Gemini(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
-                AnyAgentInner::Ollama(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
-                AnyAgentInner::Copilot(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
+                _ => turn,
             };
             #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             let turn = {
@@ -8147,5 +8364,36 @@ mod provider_timeout_tests {
         );
         let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
         assert!(crate::retry::with_provider_error_hint(&timeout).contains("provider_timeouts"));
+    }
+}
+
+#[cfg(test)]
+mod fallback_notice_tests {
+    #[test]
+    fn fallback_notice_names_both_models_and_the_reason() {
+        let route = super::FallbackRoute {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5-5".into(),
+            alias: None,
+            cfg: std::sync::Arc::new(crate::config::Config::default()),
+            controls: Default::default(),
+        };
+        let mut turn = super::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            "HTTP 529 overloaded\nbody"
+        ));
+        assert!(super::fallback_eligible(&turn));
+        let notice = route.notice("claude-opus-5-5", &turn);
+        assert!(notice.contains("claude-opus-5-5"), "{notice}");
+        assert!(
+            notice.contains("falling back to claude-sonnet-5-5"),
+            "{notice}"
+        );
+        assert!(notice.contains("HTTP 529 overloaded") && !notice.contains("body"));
+        turn.response = "partial".into();
+        assert!(!super::fallback_eligible(&turn), "progress blocks fallback");
+        let auth = super::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            "HTTP status 401 unauthorized"
+        ));
+        assert!(!super::fallback_eligible(&auth));
     }
 }

@@ -24,6 +24,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   5.x/4.6+ ids (e.g. `claude-opus-5-9`) and Bedrock/Vertex spellings get the native effort and
   adaptive thinking, other unknown aliases drop a configured effort with a warning. Gemini 2.5/3
   now map effort to `thinkingConfig` instead of silently ignoring it.
+- `fallback_model` / `--fallback-model`: a headless turn whose primary model fails with retries
+  exhausted (overload, rate limit, 5xx) before any progress is re-sent once to a same-provider
+  fallback model; a notice names both models and spend is attributed to the fallback.
 
 **Fork release 1.14.2 (2026-10-28)**
 

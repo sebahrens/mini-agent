@@ -196,6 +196,11 @@ pub struct Config {
     /// Read at startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_timeouts: Option<crate::provider::ProviderTimeouts>,
+    /// Same-provider model (id or quick-model alias) a headless turn switches
+    /// to when the primary model fails with retries exhausted before any
+    /// progress (overload, rate limit, 5xx). `--fallback-model` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_tools: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

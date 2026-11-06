@@ -748,6 +748,13 @@ pub struct Cli {
     #[arg(long = "max-tokens", help = "Maximum tokens in response")]
     pub max_tokens: Option<u64>,
 
+    #[arg(
+        long = "fallback-model",
+        value_name = "MODEL",
+        help = "Headless: same-provider model (id or quick-model alias) to use for a turn whose primary model fails with retries exhausted (overload, rate limit, 5xx)"
+    )]
+    pub fallback_model: Option<String>,
+
     #[arg(long, value_name = "USD", value_parser = parse_usd_budget,
         help = "Stop new model requests/effects once recorded session spend reaches this USD estimate")]
     pub max_budget_usd: Option<f64>,

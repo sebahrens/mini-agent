@@ -141,6 +141,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("extra_body").described("Provider-specific JSON shallow-merged into every completion request body as a global default.").shaped(ConfigShape::Any),
     key("reasoning").described("First-class reasoning controls for the OpenAI family: `effort` and `summary` map to the Responses API's `reasoning` object (and `effort` alone to Chat Completions' `reasoning_effort`),…").shaped(ConfigShape::Object),
     key("retry").shaped(ConfigShape::Object),
+    key("fallback_model").described("Same-provider model id or quick-model alias that a headless (-p) turn switches to when the primary fails with retries exhausted before any progress (overload, rate limit, 5xx). Never used for context, auth or budget errors. --fallback-model wins.").shaped(ConfigShape::String),
     key("provider_timeouts").described("Provider HTTP deadlines in seconds for built-in and custom providers: connect_timeout_secs (default 30) and stream_idle_timeout_secs (default 300, the wait for headers and between streamed events). A custom provider's own values win. Read at startup.").shaped(ConfigShape::Object),
     key("no_tools").shaped(ConfigShape::Bool),
     aliased("web-fetch-origins", &["web_fetch_origins"]).described("Exact permitted origins for native web retrieval; independent of JS fetch grants").shaped(ConfigShape::Strings),

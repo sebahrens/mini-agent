@@ -282,12 +282,6 @@ impl Run {
         }
     }
 
-    #[cfg(any(
-        feature = "goal",
-        feature = "subagents",
-        feature = "advisor",
-        feature = "acp"
-    ))]
     pub(crate) fn for_model(
         &self,
         provider: &str,

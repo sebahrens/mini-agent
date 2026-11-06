@@ -489,6 +489,7 @@ OpenRouter models keep their provider-native caching behavior.
 | `--quick-model`     | —             | Use a named quick model from config |
 | `--api-key`         | —             | API key (visible in `ps`)           |
 | `--max-tokens`      | —             | Maximum response tokens             |
+| `--fallback-model`  | —             | Headless: same-provider model (id or quick-model alias) for a turn whose primary fails with retries exhausted; see `fallback_model` in CONFIG.md |
 | `--temperature`     | —             | Model temperature (0.0–2.0)         |
 | `--max-agent-turns` | —             | Maximum agent turns per response    |
 
