@@ -4317,6 +4317,7 @@ mod project_config_trust_tests {
             "hooks_agent_read_files",
             "skills_extra_dirs",
             "skills_plugin_dirs",
+            "claude_user_agents",
         ] {
             assert!(
                 !super::BENIGN_PROJECT_CONFIG_KEYS.contains(&key),

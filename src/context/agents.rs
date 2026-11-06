@@ -21,6 +21,36 @@ const CLAUDE_PROJECT_AGENT_LAYER: &str = ".claude/agents";
 static CLAUDE_PROJECT_AGENTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// Whether the user's `~/.claude/agents` definitions are read
+/// (`claude_user_agents`). Opt-in: default closed.
+static CLAUDE_USER_AGENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_claude_user_agents(enabled: bool) {
+    CLAUDE_USER_AGENTS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn claude_user_agents_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(enabled) = CLAUDE_USER_AGENTS_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled
+            .then(crate::paths::process_home_dir)
+            .flatten()
+            .map(|home| home.join(".claude/agents"));
+    }
+    CLAUDE_USER_AGENTS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(crate::paths::process_home_dir)
+        .flatten()
+        .map(|home| home.join(".claude/agents"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_USER_AGENTS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     static CLAUDE_PROJECT_AGENTS_OVERRIDE: std::cell::Cell<Option<bool>> =
@@ -1199,6 +1229,16 @@ fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition>
         normalize_agent_definitions(crate::context::load_embedded_files(&EMBEDDED, "md")),
         AgentDefinitionSource::Embedded,
     );
+    // Lower priority than mini-agent's own user directory, which follows.
+    if let Some(directory) = claude_user_agents_dir() {
+        merge_external_definitions(
+            &mut agents,
+            crate::context::load_dir_files_bounded_status(&directory, "md", MAX_AGENT_PROMPT_BYTES),
+            &directory,
+            AgentDefinitionSource::UserGlobal,
+            "claude-user",
+        );
+    }
     merge_external_definitions(
         &mut agents,
         crate::context::load_dir_files_bounded_status(
@@ -1365,6 +1405,7 @@ enum LayerStamp {
 struct PersonaFingerprint {
     trusted: bool,
     user: LayerStamp,
+    claude_user: Option<LayerStamp>,
     project: Vec<LayerStamp>,
 }
 
@@ -1427,6 +1468,10 @@ fn persona_fingerprint(
     trusted: bool,
 ) -> Option<PersonaFingerprint> {
     let user = user_layer_stamp(&paths.agents_dir())?;
+    let claude_user = match claude_user_agents_dir() {
+        Some(directory) => Some(user_layer_stamp(&directory)?),
+        None => None,
+    };
     let project = if trusted {
         project_agent_layers()
             .map(|layer| project_layer_stamp(workspace, layer))
@@ -1437,6 +1482,7 @@ fn persona_fingerprint(
     Some(PersonaFingerprint {
         trusted,
         user,
+        claude_user,
         project,
     })
 }
@@ -1997,6 +2043,66 @@ pub(crate) mod tests {
         std::fs::rename(root.join(".claude"), root.join("moved")).unwrap();
         std::os::unix::fs::symlink(root.join("moved"), root.join(".claude")).unwrap();
         assert!(!load_for_paths_and_workspace(&paths, &workspace).contains_key("linked"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_user_agents_layer_is_opt_in_and_below_the_mini_agent_user_dir() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                CLAUDE_USER_AGENTS_OVERRIDE.with(|cell| cell.set(None));
+            }
+        }
+        let _reset = Reset;
+        let fixture = crate::tests::OwnedTestDirectory::new("claude-user-agents");
+        let root = fixture.path();
+        let paths = isolated_paths(root);
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        let home = root.join("home");
+        let _home = crate::paths::ScopedTestHome::set(&home);
+        std::fs::create_dir_all(home.join(".claude/agents")).unwrap();
+        std::fs::create_dir_all(paths.agents_dir()).unwrap();
+        std::fs::write(home.join(".claude/agents/personal.md"), "personal persona").unwrap();
+        std::fs::write(home.join(".claude/agents/shared.md"), "claude home shared").unwrap();
+        std::fs::write(paths.agents_dir().join("shared.md"), "mini-agent shared").unwrap();
+        // Invalid file: reported, never loaded.
+        std::fs::write(
+            home.join(".claude/agents/broken.md"),
+            "---\nmode: BAD\n---\nbody",
+        )
+        .unwrap();
+        // Over-long description and a different name still load.
+        std::fs::write(
+            home.join(".claude/agents/verbose.md"),
+            format!(
+                "---\nname: Verbose\ndescription: {}\n---\nbody",
+                "y".repeat(500)
+            ),
+        )
+        .unwrap();
+
+        // Default closed.
+        let closed = load_base(&paths);
+        assert!(!closed.contains_key("personal"));
+
+        CLAUDE_USER_AGENTS_OVERRIDE.with(|cell| cell.set(Some(true)));
+        let open = load_base(&paths);
+        assert_eq!(open["personal"].prompt, "personal persona");
+        assert_eq!(open["personal"].source, AgentDefinitionSource::UserGlobal);
+        assert_eq!(open["shared"].prompt, "mini-agent shared");
+        assert!(!open.contains_key("broken"));
+        assert!(open.contains_key("verbose"));
+
+        // Edits are seen through the cached loader (the stamp covers the layer).
+        let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
+        let first = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(first.contains_key("personal"));
+        std::fs::remove_file(home.join(".claude/agents/personal.md")).unwrap();
+        let second = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(!second.contains_key("personal"));
+        CLAUDE_USER_AGENTS_OVERRIDE.with(|cell| cell.set(Some(false)));
+        assert!(!load_for_paths_and_workspace(&paths, &workspace).contains_key("verbose"));
     }
 
     #[test]

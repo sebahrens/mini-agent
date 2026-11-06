@@ -264,8 +264,14 @@ first among eligible layers:
 .mini-agent/agents/<name>.md     # trusted mini-agent project override (highest)
 .claude/agents/<name>.md         # trusted Claude-style project definition
 data_dir/agents/<name>.md        # user global
+~/.claude/agents/<name>.md       # optional Claude Code user layer (claude_user_agents = true)
 data/agents/<name>.md            # compiled-in default
 ```
+
+Set `claude_user_agents = true` to also read your personal Claude Code agents from
+`~/.claude/agents`. It is off by default (a personal agent can run in write mode), project config
+needs trust to enable it, and the layer is treated like the user-global one: same validation,
+no project trust involved, and mini-agent's own `data_dir/agents` wins on a name clash.
 
 Set `claude_project_agents = false` to skip the `.claude/agents` layer when a
 repository's Claude Code agents are not meant for mini-agent.

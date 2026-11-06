@@ -351,6 +351,11 @@ pub struct Config {
     /// and the built-in layers. Default: `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_project_agents: Option<bool>,
+    /// Read the user's `~/.claude/agents/*.md` as specialist definitions, below
+    /// mini-agent's own user directory in priority. Same validation as the
+    /// user-global layer. Default: `false` (opt-in). User/global config only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_user_agents: Option<bool>,
     /// Mid-turn compaction threshold, as a fraction of the context window
     /// (0.0–1.0) of real provider prompt pressure. `None` (default) resolves
     /// to [`DEFAULT_MID_TURN_COMPACT_THRESHOLD`]; an explicit `0` disables
@@ -1690,6 +1695,10 @@ impl Config {
             Some(quick_model) => PromptRoute::Mapped { alias, quick_model },
             None => PromptRoute::Dangling { alias },
         }
+    }
+
+    pub fn resolve_claude_user_agents(&self) -> bool {
+        self.claude_user_agents.unwrap_or(false)
     }
 
     pub fn resolve_claude_project_agents(&self) -> bool {
