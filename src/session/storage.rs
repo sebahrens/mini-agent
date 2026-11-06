@@ -984,7 +984,9 @@ fn remove_private_tree(dir: &Path) -> std::io::Result<bool> {
             std::fs::remove_dir_all(dir)?;
             Ok(true)
         }
-        Ok(_) => Err(std::io::Error::other("refusing non-directory tool-output entry")),
+        Ok(_) => Err(std::io::Error::other(
+            "refusing non-directory tool-output entry",
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
@@ -1034,7 +1036,9 @@ pub(crate) fn sweep_orphan_tool_outputs(
     if let Some(sessions) = existing_session_dir()? {
         for entry in std::fs::read_dir(&sessions)?.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|extension| extension == "json")
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
                 && let Some(id) = path.file_stem().and_then(|stem| stem.to_str())
             {
                 known.insert(tool_output_dir(id));
@@ -1065,7 +1069,10 @@ pub(crate) fn sweep_orphan_tool_outputs(
         match remove_private_tree(&path) {
             Ok(true) => removed += 1,
             Ok(false) => {}
-            Err(error) => tracing::warn!("orphan tool-output sweep skipped {}: {error}", path.display()),
+            Err(error) => tracing::warn!(
+                "orphan tool-output sweep skipped {}: {error}",
+                path.display()
+            ),
         }
     }
     if removed > 0 {

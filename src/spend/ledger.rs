@@ -942,7 +942,11 @@ impl RollupState {
         summary.model_details_capped |= self.model_details_capped;
         for (key, totals) in &self.by_model {
             if summary.by_model.contains_key(key) || summary.by_model.len() < MAX_MODEL_DETAILS {
-                summary.by_model.entry(key.clone()).or_default().merge(totals)?;
+                summary
+                    .by_model
+                    .entry(key.clone())
+                    .or_default()
+                    .merge(totals)?;
             } else {
                 summary.model_details_capped = true;
             }
@@ -967,7 +971,9 @@ impl RollupState {
                 && summary
                     .last_session_request
                     .as_ref()
-                    .is_none_or(|previous| (last.timestamp, last.id) > (previous.timestamp, previous.id))
+                    .is_none_or(|previous| {
+                        (last.timestamp, last.id) > (previous.timestamp, previous.id)
+                    })
             {
                 summary.last_session_request = Some(last.clone());
             }

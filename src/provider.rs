@@ -1372,8 +1372,8 @@ impl AnyClient {
         observed: crate::spend::run::UsageObserver,
         request_timeout: Option<Duration>,
     ) -> anyhow::Result<CompactionOutput> {
-        let request_timeout =
-            request_timeout.unwrap_or_else(|| default_compaction_request_timeout(input_token_budget));
+        let request_timeout = request_timeout
+            .unwrap_or_else(|| default_compaction_request_timeout(input_token_budget));
         let preamble = summarizer_preamble();
         // Without a provider tokenizer, one UTF-8 byte per configured token is
         // the provider-neutral conservative fallback. `input_token_budget`
@@ -2252,9 +2252,7 @@ where
         match item {
             Ok(StreamedAssistantContent::Text(text)) => {
                 if response.len().saturating_add(text.text.len()) > 64 * 1024 {
-                    return Err(
-                        anyhow::anyhow!("Compression output exceeds byte budget").into()
-                    );
+                    return Err(anyhow::anyhow!("Compression output exceeds byte budget").into());
                 }
                 response.push_str(&text.text);
             }

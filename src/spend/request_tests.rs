@@ -2163,7 +2163,9 @@ async fn capped_run_stopped_by_an_unwritable_ledger_names_the_ledger_failure() {
         ..Default::default()
     });
     run.flush().await;
-    let error = run.admit().expect_err("tracking failure stops a capped run");
+    let error = run
+        .admit()
+        .expect_err("tracking failure stops a capped run");
     assert!(error.is::<super::run::BudgetStopped>());
     let text = error.to_string();
     assert!(text.contains("cost tracking failed"), "{text}");
@@ -2235,5 +2237,8 @@ async fn compaction_timeout_is_per_request_and_the_failure_names_its_key() {
         )
         .await
         .expect_err("the held request times out");
-    assert!(error.to_string().contains("compaction_timeout_secs"), "{error}");
+    assert!(
+        error.to_string().contains("compaction_timeout_secs"),
+        "{error}"
+    );
 }

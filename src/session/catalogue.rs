@@ -467,7 +467,9 @@ fn read_index(
         return None;
     }
     let mut bytes = Vec::new();
-    file.take(MAX_INDEX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    file.take(MAX_INDEX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
     if bytes.len() as u64 > MAX_INDEX_BYTES {
         return None;
     }
@@ -1345,7 +1347,11 @@ mod tests {
         let notice = first.notice().unwrap();
         assert!(notice.contains("--session"), "{notice}");
         assert!(notice.contains("Older saved sessions"), "{notice}");
-        assert!(directory.join(format!("{}.index", first.rows[0].id)).exists());
+        assert!(
+            directory
+                .join(format!("{}.index", first.rows[0].id))
+                .exists()
+        );
         // Eight sessions are indexed now: only the ninth is charged.
         let second = list_with_limits(&binding, true, false, limits).unwrap();
         assert_eq!(second.rows.len(), 9);
@@ -1355,7 +1361,10 @@ mod tests {
         assert_eq!(second.rows[0].title, "indexed hello");
         // A read-only listing uses the sidecars too.
         assert_eq!(
-            list_with_limits(&binding, true, true, limits).unwrap().rows.len(),
+            list_with_limits(&binding, true, true, limits)
+                .unwrap()
+                .rows
+                .len(),
             9
         );
 

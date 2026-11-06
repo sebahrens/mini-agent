@@ -796,10 +796,23 @@ async fn cache_ql5pg_long_tool_turns_keep_a_breakpoint_inside_the_lookback_windo
         }
     }
     // System takes one of the four markers, leaving three for messages.
-    assert_eq!(requests[0]["system"][0]["cache_control"], json!({"type":"ephemeral"}));
-    assert_eq!(*marked.last().unwrap(), flat - 1, "tail breakpoint stays: {marked:?}");
-    assert!(marked.len() >= 2, "a second breakpoint behind the tail: {marked:?}");
-    assert!(marked.len() <= 3, "never more than the 4-marker budget: {marked:?}");
+    assert_eq!(
+        requests[0]["system"][0]["cache_control"],
+        json!({"type":"ephemeral"})
+    );
+    assert_eq!(
+        *marked.last().unwrap(),
+        flat - 1,
+        "tail breakpoint stays: {marked:?}"
+    );
+    assert!(
+        marked.len() >= 2,
+        "a second breakpoint behind the tail: {marked:?}"
+    );
+    assert!(
+        marked.len() <= 3,
+        "never more than the 4-marker budget: {marked:?}"
+    );
     assert!(
         marked.windows(2).all(|pair| pair[1] - pair[0] <= 20),
         "breakpoints are within the 20-block lookback of each other: {marked:?}"

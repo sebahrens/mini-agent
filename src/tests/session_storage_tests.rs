@@ -1869,7 +1869,10 @@ fn deleting_and_pruning_sessions_remove_their_tool_output_directories() {
         std::fs::write(checkpoints.join("preimage"), b"old file").unwrap();
     }
     delete_session(&deleted.id).unwrap();
-    assert!(!tool_output_dir(&deleted.id).exists(), "delete cleans the directory");
+    assert!(
+        !tool_output_dir(&deleted.id).exists(),
+        "delete cleans the directory"
+    );
     assert!(tool_output_dir(&kept.id).exists());
 
     std::fs::File::options()
@@ -1886,7 +1889,10 @@ fn deleting_and_pruning_sessions_remove_their_tool_output_directories() {
             .unwrap(),
         1
     );
-    assert!(!tool_output_dir(&stale.id).exists(), "retention cleans the directory");
+    assert!(
+        !tool_output_dir(&stale.id).exists(),
+        "retention cleans the directory"
+    );
     assert!(tool_output_dir(&kept.id).exists());
     drop(env);
 }
@@ -1904,7 +1910,10 @@ fn orphan_tool_output_sweep_removes_only_idle_unowned_directories() {
     let grace = std::time::Duration::from_secs(14 * 86_400);
     // Everything is fresh: nothing is removed, saved or not.
     let now = std::time::SystemTime::now();
-    assert_eq!(crate::session::storage::sweep_orphan_tool_outputs(now, grace).unwrap(), 0);
+    assert_eq!(
+        crate::session::storage::sweep_orphan_tool_outputs(now, grace).unwrap(),
+        0
+    );
     // Age only the orphan's directory.
     std::fs::File::open(tool_output_dir(&orphan))
         .unwrap()
@@ -1920,11 +1929,23 @@ fn orphan_tool_output_sweep_removes_only_idle_unowned_directories() {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         target
     };
-    assert_eq!(crate::session::storage::sweep_orphan_tool_outputs(now, grace).unwrap(), 1);
+    assert_eq!(
+        crate::session::storage::sweep_orphan_tool_outputs(now, grace).unwrap(),
+        1
+    );
     assert!(!tool_output_dir(&orphan).exists());
-    assert!(tool_output_dir(&recent).exists(), "recent unsaved session is protected");
-    assert!(tool_output_dir(&saved.id).exists(), "saved session is protected");
+    assert!(
+        tool_output_dir(&recent).exists(),
+        "recent unsaved session is protected"
+    );
+    assert!(
+        tool_output_dir(&saved.id).exists(),
+        "saved session is protected"
+    );
     #[cfg(unix)]
-    assert_eq!(std::fs::read(precious.join("data")).unwrap(), b"do not delete");
+    assert_eq!(
+        std::fs::read(precious.join("data")).unwrap(),
+        b"do not delete"
+    );
     drop(env);
 }

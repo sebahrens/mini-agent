@@ -1786,10 +1786,6 @@ they asked.";
 /// file (or grep) and then answer, but small to keep side questions quick.
 const BTW_MAX_TURNS: usize = 8;
 
-/// Builds the isolated `/btw` agent: a lightweight read-only Q&A helper with the
-/// project context for reference, NO tools, and a single turn. Never mutates the
-/// session.
-#[allow(clippy::too_many_arguments)]
 /// The generic tool-result spill limits (`tool_result_spill_*`, scaled to the
 /// active context window) that the main agent and the `/btw` side agent share,
 /// so their results truncate identically.
@@ -1817,6 +1813,10 @@ fn spill_hook(
         .with_limits(configured_spill_limits(cli, cfg))
 }
 
+/// Builds the isolated `/btw` agent: a lightweight read-only Q&A helper with the
+/// project context for reference, NO tools, and a single turn. Never mutates the
+/// session.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_btw_agent_inner<M: CompletionModel + 'static>(
     model: M,
     instruction_protocol: crate::context::instructions::InstructionProtocol,
@@ -2686,7 +2686,11 @@ mod spill_hook_tests {
         let main = spill_hook(&cli, &cfg, "main", None);
         let btw = spill_hook(&cli, &cfg, "btw", None);
         assert_eq!(main.limits(), configured);
-        assert_eq!(btw.limits(), main.limits(), "/btw truncates like the main agent");
+        assert_eq!(
+            btw.limits(),
+            main.limits(),
+            "/btw truncates like the main agent"
+        );
     }
 }
 

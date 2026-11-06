@@ -4396,10 +4396,22 @@ async fn native_replay_headless_pressure_ends_the_turn_at_the_tool_boundary() {
     let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
     let roots = crate::tests::OwnedTestDirectory::new("native-mid-turn-headless");
     let _environment = crate::tests::ScopedProcessEnv::set(&[
-        ("MINI_AGENT_CONFIG_DIR", Some(roots.path().join("config").into_os_string())),
-        ("MINI_AGENT_DATA_DIR", Some(roots.path().join("data").into_os_string())),
-        ("MINI_AGENT_STATE_DIR", Some(roots.path().join("state").into_os_string())),
-        ("MINI_AGENT_CACHE_DIR", Some(roots.path().join("cache").into_os_string())),
+        (
+            "MINI_AGENT_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
     ]);
     #[cfg(feature = "hooks")]
     let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
@@ -4413,7 +4425,10 @@ async fn native_replay_headless_pressure_ends_the_turn_at_the_tool_boundary() {
             "content_block_delta",
             json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"held.txt\"}"}}),
         )
-        + &event("content_block_stop", json!({"type":"content_block_stop","index":1}))
+        + &event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":1}),
+        )
         + &event(
             "message_delta",
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":2}}),
@@ -4449,14 +4464,26 @@ async fn native_replay_headless_pressure_ends_the_turn_at_the_tool_boundary() {
     };
     let mut startup = crate::startup::heap_future(|| async {
         Box::new(
-            crate::startup::Startup::init(cli, cfg.clone(), paths.clone(), workspace.clone(), false, false, false)
-                .await
-                .unwrap(),
+            crate::startup::Startup::init(
+                cli,
+                cfg.clone(),
+                paths.clone(),
+                workspace.clone(),
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap(),
         )
     })
     .await;
-    crate::startup::heap_future(|| startup.init_features()).await.unwrap();
-    crate::startup::heap_future(|| startup.resolve_prompts()).await.unwrap();
+    crate::startup::heap_future(|| startup.init_features())
+        .await
+        .unwrap();
+    crate::startup::heap_future(|| startup.resolve_prompts())
+        .await
+        .unwrap();
     let error = crate::startup::heap_future(|| startup.dispatch())
         .await
         .expect_err("pressure ends the native turn at the boundary");
@@ -4467,7 +4494,8 @@ async fn native_replay_headless_pressure_ends_the_turn_at_the_tool_boundary() {
     assert!(full.pressure > 0.00001);
     assert!(error.to_string().contains(&sid), "{error}");
     assert!(
-        !format!("{error:#}").contains("ProviderError") && error.to_string().contains("Start a fresh context"),
+        !format!("{error:#}").contains("ProviderError")
+            && error.to_string().contains("Start a fresh context"),
         "an explicit stop, not a provider error: {error}"
     );
     assert_eq!(wire.finish().len(), 1, "no request after the boundary");
@@ -4476,7 +4504,10 @@ async fn native_replay_headless_pressure_ends_the_turn_at_the_tool_boundary() {
         .unwrap()
         .unwrap();
     assert!(
-        saved.messages.iter().any(|row| row.content.contains("boundary read")),
+        saved
+            .messages
+            .iter()
+            .any(|row| row.content.contains("boundary read")),
         "the completed tool result is saved"
     );
 }
