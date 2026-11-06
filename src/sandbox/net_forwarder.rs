@@ -120,16 +120,50 @@ fn close_other_descriptors(keep: i32) {
     }
 }
 
+/// Most connections relayed at once; each costs two threads, so extra
+/// connections are refused (closed) instead of exhausting the namespace.
+const MAX_CONCURRENT_RELAYS: usize = 256;
+
+/// Frees a relay slot when the connection ends, however it ends.
+struct RelaySlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for RelaySlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Relay every loopback connection to the proxy socket.
 pub(crate) fn serve(listener: &TcpListener, socket: &Path) {
+    serve_capped(listener, socket, MAX_CONCURRENT_RELAYS);
+}
+
+fn serve_capped(listener: &TcpListener, socket: &Path, cap: usize) {
+    use std::sync::atomic::Ordering;
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut backoff = super::net_proxy::AcceptBackoff::default();
     for client in listener.incoming() {
         let Ok(client) = client else {
+            // EMFILE and friends fail at once, forever: sleep instead of spinning.
+            std::thread::sleep(backoff.failed().0);
             continue;
         };
+        backoff.succeeded();
+        if active.fetch_add(1, Ordering::AcqRel) >= cap {
+            active.fetch_sub(1, Ordering::AcqRel);
+            drop(client);
+            continue;
+        }
+        let slot = RelaySlot(active.clone());
         let socket = socket.to_path_buf();
-        let _ = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("net-forwarder-conn".into())
-            .spawn(move || relay(client, &socket));
+            .spawn(move || {
+                let _slot = slot;
+                relay(client, &socket);
+            });
+        // A failed spawn drops the closure, which frees the slot.
+        drop(spawned);
     }
 }
 

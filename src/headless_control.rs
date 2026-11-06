@@ -72,6 +72,9 @@ fn ask_event(id: &str, tool: &str, input: &str) -> Result<serde_json::Value, Str
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Reply {
     Allow,
+    /// An allow the driver scoped to the whole run (`"scope":"run"`). Only a
+    /// `sandbox_network` ask honours it; every other ask treats it as `Allow`.
+    AllowForRun,
     Deny(String),
 }
 
@@ -141,7 +144,12 @@ pub(crate) fn classify_line(line: &str) -> Option<ControlLine> {
             let inner = response.and_then(|r| r.get("response"));
             let behavior = inner.and_then(|inner| text(inner, "behavior"));
             let reply = match (subtype.as_deref(), behavior.as_deref()) {
-                (Some("success"), Some("allow")) => Reply::Allow,
+                (Some("success"), Some("allow")) => {
+                    match inner.and_then(|inner| text(inner, "scope")).as_deref() {
+                        Some("run" | "session") => Reply::AllowForRun,
+                        _ => Reply::Allow,
+                    }
+                }
                 (Some("success"), Some("deny")) => Reply::Deny(
                     inner
                         .and_then(|inner| text(inner, "message"))
@@ -211,6 +219,14 @@ impl ControlState {
     /// Emits a `can_use_tool` request and waits for the driver. Anything other
     /// than an explicit allow within the timeout is a denial.
     pub(crate) async fn ask(&self, tool: &str, input: &str) -> Reply {
+        match self.ask_raw(tool, input).await {
+            // A run-scoped allow means something only for network hosts.
+            Reply::AllowForRun => Reply::Allow,
+            other => other,
+        }
+    }
+
+    async fn ask_raw(&self, tool: &str, input: &str) -> Reply {
         let id = format!("perm_{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -257,9 +273,20 @@ impl ControlState {
         .await
     }
 
+    /// Request ids of the asks still waiting for the driver.
+    #[cfg(test)]
+    pub(crate) fn pending_ids(&self) -> Vec<String> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Asks the driver to let the sandbox reach one `host:port`.
     pub(crate) async fn ask_network(&self, host_port: &str) -> Reply {
-        self.ask(SANDBOX_NETWORK_TOOL, host_port).await
+        self.ask_raw(SANDBOX_NETWORK_TOOL, host_port).await
     }
 
     /// Applies one classified line and returns the acknowledgement event to
@@ -520,6 +547,48 @@ mod tests {
         );
         assert_eq!(permission.lock().unwrap().mode(), SecurityMode::ReadOnly);
         assert_eq!(set("nonsense")["response"]["subtype"], "error");
+    }
+
+    #[test]
+    fn only_an_explicit_run_scope_makes_an_allow_run_wide() {
+        let line = |inner: &str| {
+            classify_line(&format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"perm_1","response":{inner}}}}}"#
+            ))
+            .unwrap()
+        };
+        let reply = |inner: &str| match line(inner) {
+            ControlLine::Response { reply, .. } => reply,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(reply(r#"{"behavior":"allow"}"#), Reply::Allow);
+        assert_eq!(
+            reply(r#"{"behavior":"allow","scope":"once"}"#),
+            Reply::Allow
+        );
+        assert_eq!(
+            reply(r#"{"behavior":"allow","scope":"run"}"#),
+            Reply::AllowForRun
+        );
+        assert!(matches!(
+            reply(r#"{"behavior":"deny","scope":"run"}"#),
+            Reply::Deny(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_scope_is_downgraded_for_asks_other_than_the_network() {
+        let state = std::sync::Arc::new(state(Duration::from_secs(5)));
+        let waiting = std::sync::Arc::clone(&state);
+        let task = tokio::spawn(async move { waiting.ask("shell", "ls").await });
+        let id = pending_id(&state).await;
+        state.handle(
+            classify_line(&format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"behavior":"allow","scope":"run"}}}}}}"#
+            ))
+            .unwrap(),
+        );
+        assert_eq!(task.await.unwrap(), Reply::Allow);
     }
 
     async fn pending_id(state: &ControlState) -> String {

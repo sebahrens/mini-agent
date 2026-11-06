@@ -85,6 +85,39 @@ fn non_public_destinations_are_forbidden() {
 }
 
 #[test]
+fn ipv6_transition_addresses_embedding_forbidden_ipv4_are_forbidden() {
+    for ip in [
+        "64:ff9b::a9fe:a9fe", // NAT64 -> 169.254.169.254
+        "64:ff9b::7f00:1",    // NAT64 -> 127.0.0.1
+        "64:ff9b::a00:1",     // NAT64 -> 10.0.0.1
+        "64:ff9b:1::1",       // local-use NAT64
+        "64:ff9b:1:abcd::8.8.8.8",
+        "2002:7f00:1::",     // 6to4 -> 127.0.0.1
+        "2002:a9fe:a9fe::1", // 6to4 -> 169.254.169.254
+        "2002:c0a8:101::",   // 6to4 -> 192.168.1.1
+        "::127.0.0.1",       // IPv4-compatible
+        "::169.254.169.254",
+        "2001:0:a9fe:a9fe::1", // Teredo server in the metadata range
+        "2001:0:808:808::1",   // Teredo: client address is obfuscated
+        "198.18.0.1",
+        "198.19.255.255",
+        "192.0.0.8",
+        "64:ff9b::c612:1", // NAT64 -> 198.18.0.1
+    ] {
+        assert!(is_forbidden_ip(ip.parse().unwrap()), "{ip}");
+    }
+    for ip in [
+        "64:ff9b::808:808", // NAT64 -> 8.8.8.8
+        "2002:808:808::1",  // 6to4 -> 8.8.8.8
+        "198.17.255.255",
+        "198.20.0.1",
+        "192.0.1.1",
+    ] {
+        assert!(!is_forbidden_ip(ip.parse().unwrap()), "{ip}");
+    }
+}
+
+#[test]
 fn requests_parse_to_the_destination_that_is_judged() {
     let connect =
         parse_request(b"CONNECT Registry.NPMJS.org.:443 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic abc\r\n\r\n")
@@ -261,7 +294,8 @@ fn shared_with_prompt(
         rules,
         session: Mutex::default(),
         prompt,
-        prompt_lock: tokio::sync::Mutex::new(()),
+        inflight: Mutex::default(),
+        denied: Mutex::default(),
         expected_auth: String::new(),
     };
     (Arc::new(shared), asked)
@@ -388,4 +422,170 @@ async fn unix_socket_route_applies_the_same_token_and_destination_rules() {
     // The listener thread keeps its Arc-free state; the guard is gone with the
     // last handle, so the directory must be removed.
     assert!(!path.exists());
+}
+
+#[test]
+fn accept_errors_back_off_between_50_and_500_ms_and_log_once_per_streak() {
+    let mut backoff = AcceptBackoff::default();
+    let steps: Vec<(Duration, bool)> = (0..8).map(|_| backoff.failed()).collect();
+    assert_eq!(steps[0], (Duration::from_millis(50), true));
+    assert_eq!(steps[1], (Duration::from_millis(100), false));
+    assert_eq!(steps[4].0, Duration::from_millis(500));
+    assert!(steps.iter().all(|(d, _)| *d <= Duration::from_millis(500)));
+    assert_eq!(steps.iter().filter(|(_, first)| *first).count(), 1);
+    backoff.succeeded();
+    assert_eq!(backoff.failed(), (Duration::from_millis(50), true));
+    for _ in 0..100 {
+        assert!(backoff.failed().0 <= Duration::from_millis(500));
+    }
+}
+
+mod control_channel {
+    use super::*;
+    use crate::headless_control::{ControlState, classify_line};
+
+    fn control() -> ControlState {
+        ControlState::new(
+            crate::print::HeadlessOutputPolicy::legacy(false, false),
+            None,
+            Duration::from_secs(30),
+        )
+    }
+
+    fn answer(state: &ControlState, id: &str, inner: &str) {
+        let line = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{inner}}}}}"#
+        );
+        state.handle(classify_line(&line).unwrap());
+    }
+
+    async fn first_pending(state: &ControlState) -> String {
+        loop {
+            if let Some(id) = state.pending_ids().into_iter().next() {
+                return id;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn headless_shared() -> Arc<Shared> {
+        shared_with_prompt(Vec::new(), None).0
+    }
+
+    #[tokio::test]
+    async fn five_parallel_connects_to_one_host_make_one_control_request() {
+        let shared = headless_shared();
+        let state = Arc::new(control());
+        let tasks: Vec<_> = (0..5)
+            .map(|_| {
+                let (shared, state) = (shared.clone(), state.clone());
+                tokio::spawn(
+                    async move { shared.decide_with("pkg.example", 443, Some(&state)).await },
+                )
+            })
+            .collect();
+        let id = first_pending(&state).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(state.pending_ids(), vec![id.clone()], "exactly one ask");
+        answer(&state, &id, r#"{"behavior":"allow"}"#);
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_allow_is_for_the_waiting_connections_only() {
+        let shared = headless_shared();
+        let state = Arc::new(control());
+        let first = tokio::spawn({
+            let (shared, state) = (shared.clone(), state.clone());
+            async move { shared.decide_with("a.example", 443, Some(&state)).await }
+        });
+        let id = first_pending(&state).await;
+        answer(&state, &id, r#"{"behavior":"allow"}"#);
+        first.await.unwrap().unwrap();
+        // Default closed: the next connection asks again.
+        let second = tokio::spawn({
+            let (shared, state) = (shared.clone(), state.clone());
+            async move { shared.decide_with("a.example", 443, Some(&state)).await }
+        });
+        let id = first_pending(&state).await;
+        answer(&state, &id, r#"{"behavior":"deny","message":"no"}"#);
+        assert!(second.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_run_scoped_allow_is_remembered_for_that_host_port_only() {
+        let shared = headless_shared();
+        let state = Arc::new(control());
+        let task = tokio::spawn({
+            let (shared, state) = (shared.clone(), state.clone());
+            async move { shared.decide_with("a.example", 443, Some(&state)).await }
+        });
+        let id = first_pending(&state).await;
+        answer(&state, &id, r#"{"behavior":"allow","scope":"run"}"#);
+        task.await.unwrap().unwrap();
+        shared
+            .decide_with("a.example", 443, Some(&state))
+            .await
+            .unwrap();
+        assert!(state.pending_ids().is_empty(), "no second ask");
+        // Another port and another host are not covered.
+        let other = tokio::spawn({
+            let (shared, state) = (shared.clone(), state.clone());
+            async move { shared.decide_with("a.example", 8443, Some(&state)).await }
+        });
+        let id = first_pending(&state).await;
+        answer(&state, &id, r#"{"behavior":"deny"}"#);
+        assert!(other.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_denial_is_remembered_briefly_and_one_host_does_not_block_another() {
+        let shared = headless_shared();
+        let state = Arc::new(control());
+        // An unanswered ask for one host...
+        let stuck = tokio::spawn({
+            let (shared, state) = (shared.clone(), state.clone());
+            async move { shared.decide_with("slow.example", 443, Some(&state)).await }
+        });
+        let slow = first_pending(&state).await;
+        // ...does not hold up another host.
+        let other = tokio::spawn({
+            let (shared, state) = (shared.clone(), state.clone());
+            async move { shared.decide_with("fast.example", 443, Some(&state)).await }
+        });
+        let fast = loop {
+            if let Some(id) = state.pending_ids().into_iter().find(|id| *id != slow) {
+                break id;
+            }
+            tokio::task::yield_now().await;
+        };
+        answer(&state, &fast, r#"{"behavior":"deny"}"#);
+        assert!(other.await.unwrap().is_err());
+        // The denial is remembered: no new ask for fast.example.
+        assert!(
+            shared
+                .decide_with("fast.example", 443, Some(&state))
+                .await
+                .is_err()
+        );
+        assert_eq!(state.pending_ids(), vec![slow.clone()]);
+        answer(&state, &slow, r#"{"behavior":"allow"}"#);
+        stuck.await.unwrap().unwrap();
+        // The memory expires.
+        shared.denied.lock().unwrap().insert(
+            "fast.example:443".into(),
+            std::time::Instant::now() - DENY_MEMORY,
+        );
+        let again = tokio::spawn({
+            let (shared, state) = (shared.clone(), state.clone());
+            async move { shared.decide_with("fast.example", 443, Some(&state)).await }
+        });
+        let id = first_pending(&state).await;
+        answer(&state, &id, r#"{"behavior":"allow"}"#);
+        again.await.unwrap().unwrap();
+    }
 }

@@ -19,7 +19,7 @@
 //! command's proxy variables. Filtering, prompting and the token check are the
 //! same single code path; the namespace has no other route out.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -110,6 +110,34 @@ impl HostRule {
     }
 }
 
+/// Backoff for a listener whose `accept` keeps failing (EMFILE, ENFILE,
+/// ENOMEM): sleep 50 ms doubling to 500 ms instead of spinning a core, and
+/// report only the first failure of a streak so it can be logged once.
+#[derive(Debug, Default)]
+pub(crate) struct AcceptBackoff {
+    failures: u32,
+}
+
+impl AcceptBackoff {
+    const MIN: Duration = Duration::from_millis(50);
+    const MAX: Duration = Duration::from_millis(500);
+
+    /// Records a failure; returns how long to sleep and whether this is the
+    /// first failure since the last success.
+    pub(crate) fn failed(&mut self) -> (Duration, bool) {
+        let first = self.failures == 0;
+        let delay = Self::MIN
+            .saturating_mul(1u32 << self.failures.min(10))
+            .min(Self::MAX);
+        self.failures = self.failures.saturating_add(1);
+        (delay, first)
+    }
+
+    pub(crate) fn succeeded(&mut self) {
+        self.failures = 0;
+    }
+}
+
 /// Parse and bound the configured list.
 pub fn parse_rules(entries: &[String]) -> Result<Vec<HostRule>, String> {
     if entries.len() > MAX_RULES {
@@ -128,6 +156,12 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return forbidden_v4(mapped);
             }
+            if embedded_prefix_always_forbidden(v6) {
+                return true;
+            }
+            if let Some(embedded) = embedded_v4(v6) {
+                return forbidden_v4(embedded);
+            }
             let first = v6.segments()[0];
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -137,6 +171,40 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || v6 == Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)
         }
     }
+}
+
+/// The IPv4 address an IPv6 transition address carries: NAT64
+/// (`64:ff9b::/96`), 6to4 (`2002::/16`), Teredo's server (`2001::/32`) and the
+/// deprecated IPv4-compatible `::a.b.c.d`. A host with such a route would
+/// deliver the connection to the embedded IPv4 destination.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = v6.segments();
+    let v4 = |hi: u16, lo: u16| {
+        let [a, b] = hi.to_be_bytes();
+        let [c, d] = lo.to_be_bytes();
+        Ipv4Addr::new(a, b, c, d)
+    };
+    if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+        return Some(v4(s[6], s[7]));
+    }
+    if s[0] == 0x2002 {
+        return Some(v4(s[1], s[2]));
+    }
+    if s[0] == 0x2001 && s[1] == 0 {
+        return Some(v4(s[2], s[3]));
+    }
+    if s[..6] == [0; 6] {
+        return Some(v4(s[6], s[7]));
+    }
+    None
+}
+
+/// Transition prefixes refused whatever they embed: local-use NAT64
+/// (`64:ff9b:1::/48`, embedding is prefix-length dependent) and Teredo, whose
+/// client address is obfuscated.
+fn embedded_prefix_always_forbidden(v6: Ipv6Addr) -> bool {
+    let s = v6.segments();
+    (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1) || (s[0] == 0x2001 && s[1] == 0)
 }
 
 fn forbidden_v4(ip: Ipv4Addr) -> bool {
@@ -150,6 +218,8 @@ fn forbidden_v4(ip: Ipv4Addr) -> bool {
         || ip.is_documentation()
         || a == 0
         || (a == 100 && (64..=127).contains(&b)) // carrier-grade NAT
+        || (a == 198 && (b == 18 || b == 19)) // benchmarking 198.18.0.0/15
+        || ip.octets()[..3] == [192, 0, 0] // IETF protocol assignments 192.0.0.0/24
         || a >= 240
 }
 
@@ -157,7 +227,10 @@ struct Shared {
     rules: Vec<HostRule>,
     session: Mutex<HashSet<String>>,
     prompt: Arc<Mutex<Option<AskSender>>>,
-    prompt_lock: tokio::sync::Mutex<()>,
+    /// Asks in progress, by `host:port`; later connections wait on the answer.
+    inflight: Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Verdict>>>>,
+    /// Refusals remembered for `DENY_MEMORY`.
+    denied: Mutex<HashMap<String, std::time::Instant>>,
     expected_auth: String,
 }
 
@@ -267,7 +340,8 @@ impl NetworkProxy {
             rules,
             session: Mutex::new(HashSet::new()),
             prompt,
-            prompt_lock: tokio::sync::Mutex::new(()),
+            inflight: Mutex::default(),
+            denied: Mutex::default(),
             expected_auth,
         });
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -283,10 +357,19 @@ impl NetworkProxy {
                     {
                         let shared = shared.clone();
                         tokio::spawn(async move {
+                            let mut backoff = AcceptBackoff::default();
                             loop {
                                 let Ok((client, _)) = unix_listener.accept().await else {
+                                    let (delay, first) = backoff.failed();
+                                    if first {
+                                        tracing::warn!(
+                                            "sandbox network proxy: unix accept failed; backing off"
+                                        );
+                                    }
+                                    tokio::time::sleep(delay).await;
                                     continue;
                                 };
+                                backoff.succeeded();
                                 tokio::spawn(handle(client, shared.clone()));
                             }
                         });
@@ -294,10 +377,17 @@ impl NetworkProxy {
                     let Ok(listener) = TcpListener::from_std(listener) else {
                         return;
                     };
+                    let mut backoff = AcceptBackoff::default();
                     loop {
                         let Ok((client, _)) = listener.accept().await else {
+                            let (delay, first) = backoff.failed();
+                            if first {
+                                tracing::warn!("sandbox network proxy: accept failed; backing off");
+                            }
+                            tokio::time::sleep(delay).await;
                             continue;
                         };
+                        backoff.succeeded();
                         tokio::spawn(handle(client, shared.clone()));
                     }
                 });
@@ -565,46 +655,152 @@ async fn connect_public(host: &str, port: u16) -> Result<TcpStream, String> {
     Err(format!("could not connect to {host}:{port}"))
 }
 
+/// How long a refused or unanswered `host:port` stays refused without asking
+/// again, so a retry loop does not re-prompt the driver or user per attempt.
+const DENY_MEMORY: Duration = Duration::from_secs(30);
+
+type Verdict = Result<(), String>;
+
+/// Removes an in-flight ask when its leader finishes or is cancelled.
+struct InflightGuard<'a> {
+    shared: &'a Shared,
+    key: &'a str,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .inflight
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(self.key);
+    }
+}
+
 impl Shared {
     async fn decide(&self, host: &str, port: u16) -> Result<(), String> {
+        self.decide_with(host, port, crate::headless_control::state())
+            .await
+    }
+
+    fn remembered(&self, key: &str) -> Option<Verdict> {
+        if self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(key)
+        {
+            return Some(Ok(()));
+        }
+        let mut denied = self
+            .denied
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match denied.get(key) {
+            Some(at) if at.elapsed() < DENY_MEMORY => Some(Err(denied_message(key))),
+            Some(_) => {
+                denied.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn decide_with(
+        &self,
+        host: &str,
+        port: u16,
+        control: Option<&crate::headless_control::ControlState>,
+    ) -> Result<(), String> {
         if self.rules.iter().any(|rule| rule.matches(host, port)) {
             return Ok(());
         }
         let key = format!("{host}:{port}");
-        let approved = |this: &Self| {
-            this.session
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .contains(&key)
-        };
-        if approved(self) {
-            return Ok(());
+        loop {
+            if let Some(verdict) = self.remembered(&key) {
+                return verdict;
+            }
+            // One ask per host:port at a time; other hosts are not held up.
+            // Connections that arrive while it is pending share its answer.
+            let role = {
+                let mut inflight = self
+                    .inflight
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                match inflight.get(&key) {
+                    Some(existing) => Err(existing.clone()),
+                    None => {
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        inflight.insert(key.clone(), rx);
+                        Ok(tx)
+                    }
+                }
+            };
+            let tx = match role {
+                Ok(tx) => tx,
+                Err(mut follower) => {
+                    let answer = follower.wait_for(Option::is_some).await;
+                    match answer {
+                        Ok(verdict) => {
+                            let verdict = verdict.clone();
+                            return verdict.unwrap_or_else(|| Err(denied_message(&key)));
+                        }
+                        // The leader was cancelled (its client went away): ask again.
+                        Err(_) => continue,
+                    }
+                }
+            };
+            let _guard = InflightGuard {
+                shared: self,
+                key: &key,
+            };
+            let verdict = self.ask_once(&key, control).await;
+            let _ = tx.send(Some(verdict.clone()));
+            return verdict;
         }
-        // One prompt at a time, so parallel connections to one host ask once.
-        let _turn = self.prompt_lock.lock().await;
-        if approved(self) {
-            return Ok(());
-        }
+    }
+
+    /// Asks the driver or user about `key`, remembering the answer as far as
+    /// the reply allows: an always-allow (TUI) or a run-scoped allow (driver)
+    /// lasts for the session; a refusal for `DENY_MEMORY`.
+    async fn ask_once(
+        &self,
+        key: &str,
+        control: Option<&crate::headless_control::ControlState>,
+    ) -> Verdict {
         let sender = self
             .prompt
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        let denied = || {
-            format!(
-                "{key} is not in sandbox-network-hosts and was not approved; add it to sandbox-network-hosts to allow it"
-            )
+        let remember_allow = |this: &Self| {
+            this.session
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(key.to_owned());
+        };
+        let deny = |this: &Self| {
+            this.denied
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(key.to_owned(), std::time::Instant::now());
+            Err(denied_message(key))
         };
         let Some(sender) = sender else {
-            // Headless with `--stream-json-control`: the driver answers; an
-            // allow is for this connection only.
-            if let Some(control) = crate::headless_control::state() {
-                return match control.ask_network(&key).await {
+            // Headless with `--stream-json-control`: the driver answers. A
+            // plain allow is for the connections waiting now; only a reply
+            // that says `"scope":"run"` is remembered for the rest of the run.
+            if let Some(control) = control {
+                return match control.ask_network(key).await {
                     crate::headless_control::Reply::Allow => Ok(()),
-                    crate::headless_control::Reply::Deny(_) => Err(denied()),
+                    crate::headless_control::Reply::AllowForRun => {
+                        remember_allow(self);
+                        Ok(())
+                    }
+                    crate::headless_control::Reply::Deny(_) => deny(self),
                 };
             }
-            return Err(denied());
+            return Err(denied_message(key));
         };
         let (reply, answer) = tokio::sync::oneshot::channel();
         let request = AskRequest {
@@ -613,7 +809,7 @@ impl Shared {
             background: None,
             agent_name: None,
             tool: compact_str::CompactString::new("sandbox_network"),
-            input: key.clone(),
+            input: key.to_owned(),
             #[cfg(feature = "acp")]
             tool_call_id: None,
             suggested_pattern: None,
@@ -621,20 +817,23 @@ impl Shared {
             reply,
         };
         if sender.send(UserRequest::Permission(request)).await.is_err() {
-            return Err(denied());
+            return Err(denied_message(key));
         }
         match tokio::time::timeout(PROMPT_TIMEOUT, answer).await {
             Ok(Ok(UserDecision::AllowOnce)) => Ok(()),
             Ok(Ok(UserDecision::AllowAlways(_))) => {
-                self.session
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .insert(key);
+                remember_allow(self);
                 Ok(())
             }
-            _ => Err(denied()),
+            _ => deny(self),
         }
     }
+}
+
+fn denied_message(key: &str) -> String {
+    format!(
+        "{key} is not in sandbox-network-hosts and was not approved; add it to sandbox-network-hosts to allow it"
+    )
 }
 
 #[cfg(test)]

@@ -6,6 +6,17 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Relative `--add-dir`, `--image`, `--output-schema`, `--loop-plan` and `--log-file` paths keep
+  resolving against the launch directory under `project_root_discovery` (mini-agent-k8w51). The
+  `--stream-json-control` sandbox network ask is per `host:port` (concurrent connections share one
+  ask), accepts `"scope":"run"` to keep an allow for the run (default still once) and remembers a
+  deny for 30 seconds (mini-agent-01l6q). The sandbox proxy refuses NAT64, 6to4, Teredo and
+  IPv4-compatible addresses embedding forbidden IPv4, plus `198.18.0.0/15` and `192.0.0.0/24`
+  (mini-agent-pges4). Proxy and bwrap-forwarder accept loops back off on errors and the forwarder
+  caps concurrent relays at 256 (mini-agent-y42nd).
+
 ### Added
 
 - Agent hook file reads (`hooks_agent_read_files`) now obey `read` permission rules (deny and ask

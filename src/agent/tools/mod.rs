@@ -953,7 +953,8 @@ async fn settle_check(
                 // Headless with `--stream-json-control`: the driver answers.
                 if let Some(control) = crate::headless_control::state() {
                     return match control.ask(tool, input).await {
-                        crate::headless_control::Reply::Allow => Ok(None),
+                        crate::headless_control::Reply::Allow
+                        | crate::headless_control::Reply::AllowForRun => Ok(None),
                         crate::headless_control::Reply::Deny(reason) => {
                             Err(ToolError::Msg(format!(
                                 "Permission denied by the stream-json control channel: {reason}"
@@ -1099,7 +1100,8 @@ pub(crate) async fn request_sandbox_escalation_approval(
         // Headless with `--stream-json-control`: the driver answers (once-only).
         if let Some(control) = crate::headless_control::state() {
             return match control.ask_escalation(command, justification).await {
-                crate::headless_control::Reply::Allow => Ok(()),
+                crate::headless_control::Reply::Allow
+                | crate::headless_control::Reply::AllowForRun => Ok(()),
                 crate::headless_control::Reply::Deny(reason) => Err(ToolError::Msg(format!(
                     "Sandbox escalation denied by the stream-json control channel: {reason}; the command was not run"
                 ))),

@@ -443,8 +443,11 @@ With `--stream-json-control`, stdin is read while a turn runs and these lines ac
   overrides etc.) shown as visible `<U+XXXX>` markers; `input_bytes` is its length and `truncated` is always
   `false`. An input over 1 MiB is denied as too large to review without being asked. Sandbox escalation
   (`tool_name` `sandbox_escalation`, input = reason and full command) and an unlisted sandbox network
-  `host:port` (`sandbox_network`) are asked the same way; those allows are once-only too.
-  Only an explicit `allow` approves (once; never an allow-always grant). A `deny`, an `error` reply, the
+  `host:port` (`sandbox_network`) are asked the same way; an escalation allow is once-only. Connections to one
+  `host:port` share a single ask (other hosts are not held up); a network `allow` covers the connections waiting
+  on it, and only `"response":{"behavior":"allow","scope":"run"}` keeps it for the rest of the run (default: asks
+  again next time). A network `deny` or timeout is remembered for 30 seconds.
+  Only an explicit `allow` approves (never an allow-always grant for tools or escalation). A `deny`, an `error` reply, the
   timeout, a closed stdin or an interrupted turn all deny, and a reply with an unknown id is an `input_error`.
 
 User messages that arrive during a turn are queued in order (up to 64) and run after its `result`.
