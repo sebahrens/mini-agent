@@ -2142,7 +2142,11 @@ mod tests {
                         .wrapping_mul(6364136223846793005)
                         .wrapping_add(1442695040888963407);
                     line.push_str(WORDS[(state >> 33) as usize % WORDS.len()]);
-                    line.push(if (state >> 20) % 3 == 0 { '.' } else { ' ' });
+                    line.push(if (state >> 20).is_multiple_of(3) {
+                        '.'
+                    } else {
+                        ' '
+                    });
                 }
                 line.push(';');
                 line
