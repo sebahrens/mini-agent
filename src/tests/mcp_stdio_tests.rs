@@ -3128,7 +3128,7 @@ async fn mcp_prompts_and_resources_list_changed_refresh_the_catalogue_without_re
     assert!(!handle.auxiliary.is_stale());
     let (commands, resources) = catalogue::cached_choices(&handle);
     assert_eq!((commands.len(), resources.len()), (1, 1));
-    let mut manager = McpClientManager::from_handles(vec![handle]);
+    let manager = McpClientManager::from_handles(vec![handle]);
     let permission = Some(permission_for(Action::Allow));
     let tools = manager
         .collect_tools_with_timeouts(permission, None, McpToolTimeouts::default())

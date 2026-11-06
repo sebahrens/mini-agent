@@ -268,7 +268,7 @@ impl ResumeStore {
         out.extend_from_slice(b"]}");
         let result = path
             .parent()
-            .map_or(Ok(()), |dir| crate::paths::ensure_private_directory(dir))
+            .map_or(Ok(()), crate::paths::ensure_private_directory)
             .map_err(anyhow::Error::from)
             .and_then(|()| {
                 crate::fs::private_atomic_write_sync(path, &out).map_err(anyhow::Error::from)

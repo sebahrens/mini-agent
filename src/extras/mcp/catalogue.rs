@@ -372,17 +372,6 @@ async fn request(
     Ok(reply)
 }
 
-/// One bounded enumeration per accepted connection generation. A failed
-/// auxiliary catalogue does not discard the already connected tool service.
-#[cfg(test)]
-pub(crate) async fn discover(client: &McpClientHandle, timeout: Duration) -> Catalogue {
-    let capabilities = client
-        .peer()
-        .peer_info()
-        .map(|info| info.capabilities.clone());
-    discover_captured(&RpcClient::capture(client), capabilities, timeout).await
-}
-
 /// `discover` over an owned capture, for a detached task that must not
 /// borrow (or prolong) the connection handle.
 pub(crate) async fn discover_captured(

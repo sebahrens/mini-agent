@@ -2044,6 +2044,7 @@ mod discovery_tests {
         assert!(!snapshot.packages.contains_key("strict-bare"), "{text}");
     }
 
+    #[cfg(feature = "subagents")]
     #[tokio::test]
     async fn persona_skill_preload_renders_authorized_skills_and_notices_the_rest() {
         let fixture = Fixture::new(false);
