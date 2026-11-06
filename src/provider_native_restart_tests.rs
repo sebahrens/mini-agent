@@ -431,6 +431,8 @@ fn image_blocks(body: &Value) -> usize {
 }
 
 struct Headless {
+    /// Owns the temporary roots for the fixture's lifetime.
+    #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
     roots: crate::tests::OwnedTestDirectory,
     wire: Wire,
     cfg: crate::config::Config,
@@ -539,6 +541,7 @@ fn headless_fixture(
 
 // `-p -i shot.png` on a persisted Anthropic session sends the image with the
 // prompt, saves it in the native feed, and `--continue` replays it exactly once.
+#[cfg(feature = "multimodal")]
 #[tokio::test]
 async fn headless_image_turn_on_a_persisted_native_session_resumes() {
     #[cfg(feature = "hooks")]
@@ -637,6 +640,7 @@ async fn headless_multi_turn_input_on_a_persisted_native_session() {
     startup.dispatch_print().await.unwrap();
     // Turn two arrives as a stream-json line with an image block.
     startup.cli.message = vec!["turn two".into()];
+    #[cfg(feature = "multimodal")]
     startup.session.pending_media.extend(
         crate::headless_media::resolve_images(
             fixture.roots.path(),
@@ -671,7 +675,11 @@ async fn headless_multi_turn_input_on_a_persisted_native_session() {
     assert_eq!(bodies.len(), 4);
     assert_eq!(
         bodies.iter().map(image_blocks).collect::<Vec<_>>(),
-        [0, 1, 1, 1],
+        if cfg!(feature = "multimodal") {
+            [0, 1, 1, 1]
+        } else {
+            [0, 0, 0, 0]
+        },
         "the image of turn two is replayed, never duplicated"
     );
     assert_eq!(
