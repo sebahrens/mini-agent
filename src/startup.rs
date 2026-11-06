@@ -1825,6 +1825,7 @@ impl Startup {
                 provider: self.provider.to_string(),
                 model: self.model.to_string(),
                 cfg: std::sync::Arc::new(self.cfg.clone()),
+                permission: self.permission.clone(),
             },
         );
         #[cfg(feature = "advisor")]

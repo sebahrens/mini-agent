@@ -310,6 +310,10 @@ pub(crate) struct ModelRunner {
     pub(crate) provider: String,
     pub(crate) model: String,
     pub(crate) cfg: Arc<crate::config::Config>,
+    /// The session permission checker; `agent` hook file reads are evaluated
+    /// against its `read` rules (deny and ask both refuse). `None` when the
+    /// session runs without permission checks.
+    pub(crate) permission: Option<crate::permission::checker::PermCheck>,
 }
 
 static MODEL_RUNNER: Mutex<Option<Arc<ModelRunner>>> = Mutex::new(None);
@@ -435,7 +439,7 @@ async fn run_model(
         let result = if reads_used > AGENT_MAX_READS {
             Err("read limit reached: answer with the verdict now".to_owned())
         } else {
-            read_hook_file(binding, &path)
+            read_hook_file(binding, &path, runner.permission.as_ref())
         };
         let body = match result {
             Ok(text) => text.replace("</file>", "<\u{2060}/file>"),
@@ -485,7 +489,85 @@ pub(crate) fn is_secret_path(path: &std::path::Path) -> bool {
             || name.ends_with(".key")
             || name.contains("secret")
             || name.contains("credential")
+            || SENSITIVE_NAMES.contains(&name.as_str())
+            || SENSITIVE_SUFFIXES
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+            || name.starts_with("service-account")
+            || name.starts_with("kubeconfig")
     })
+}
+
+/// Exact file names that hold credentials or state with credentials.
+const SENSITIVE_NAMES: &[&str] = &[
+    ".kube",
+    ".docker",
+    ".pgpass",
+    ".htpasswd",
+    ".git-credentials",
+    ".boto",
+    ".s3cfg",
+    ".terraform",
+    ".vault-token",
+    ".my.cnf",
+    "terraform.tfstate",
+    "terraform.tfstate.backup",
+    "kubeconfig",
+];
+
+const SENSITIVE_SUFFIXES: &[&str] = &[
+    ".tfvars",
+    ".tfstate",
+    ".p12",
+    ".pfx",
+    ".keystore",
+    ".jks",
+    ".kdbx",
+    ".ovpn",
+    ".tfvars.json",
+];
+
+/// Whether `.gitignore`/`.ignore`/`.git/info/exclude` rules between the
+/// workspace root and `relative` hide the path (including through an ignored
+/// parent directory). The deepest matching rule wins, as in git.
+pub(crate) fn is_vcs_ignored(root: &std::path::Path, relative: &std::path::Path) -> bool {
+    use ignore::gitignore::GitignoreBuilder;
+    let full = root.join(relative);
+    let mut dirs = vec![root.to_path_buf()];
+    let mut current = root.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        for part in parent.components() {
+            current.push(part);
+            dirs.push(current.clone());
+        }
+    }
+    let mut ignored = false;
+    for (index, dir) in dirs.iter().enumerate() {
+        let mut builder = GitignoreBuilder::new(dir);
+        let mut any = false;
+        let mut files = vec![dir.join(".gitignore"), dir.join(".ignore")];
+        if index == 0 {
+            files.push(dir.join(".git/info/exclude"));
+        }
+        for file in files {
+            if file.is_file() {
+                any |= builder.add(&file).is_none();
+            }
+        }
+        if !any {
+            continue;
+        }
+        let Ok(matcher) = builder.build() else {
+            continue;
+        };
+        let verdict = matcher.matched_path_or_any_parents(&full, false);
+        if verdict.is_ignore() {
+            ignored = true;
+        } else if verdict.is_whitelist() {
+            ignored = false;
+        }
+    }
+    ignored
 }
 
 /// Reads one workspace file for an `agent` hook: contained relative path, no
@@ -493,6 +575,7 @@ pub(crate) fn is_secret_path(path: &std::path::Path) -> bool {
 pub(crate) fn read_hook_file(
     binding: &crate::paths::WorkspaceBinding,
     path: &str,
+    permission: Option<&crate::permission::checker::PermCheck>,
 ) -> Result<String, String> {
     let path = std::path::Path::new(path);
     if path.is_absolute()
@@ -507,6 +590,24 @@ pub(crate) fn read_hook_file(
     }
     if is_secret_path(path) {
         return Err("path looks like a secret or VCS state".into());
+    }
+    if is_vcs_ignored(binding.root(), path) {
+        return Err("path is excluded by .gitignore/.ignore".into());
+    }
+    if let Some(permission) = permission {
+        use crate::permission::checker::CheckResult;
+        let absolute = binding.root().join(path);
+        let verdict = permission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .check_path("read", &absolute.to_string_lossy());
+        match verdict {
+            CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => {}
+            CheckResult::Denied(_) => return Err("denied by a read permission rule".into()),
+            CheckResult::Ask => {
+                return Err("read needs approval, which a hook cannot request".into());
+            }
+        }
     }
     let file = binding
         .open_regular_relative(path)
@@ -618,8 +719,14 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("outside.txt"), ws.join("link.txt")).unwrap();
         std::fs::write(ws.join("bin.dat"), [0xff, 0xfe, 0x00]).unwrap();
         let binding = crate::paths::WorkspaceBinding::capture(&ws).unwrap();
-        assert_eq!(read_hook_file(&binding, "src/a.rs").unwrap(), "fn a() {}");
-        assert_eq!(read_hook_file(&binding, "./src/a.rs").unwrap(), "fn a() {}");
+        assert_eq!(
+            read_hook_file(&binding, "src/a.rs", None).unwrap(),
+            "fn a() {}"
+        );
+        assert_eq!(
+            read_hook_file(&binding, "./src/a.rs", None).unwrap(),
+            "fn a() {}"
+        );
         for bad in [
             "../outside.txt",
             "src/../../outside.txt",
@@ -633,8 +740,98 @@ mod tests {
             "config/secrets.toml",
             "a/.env.local",
         ] {
-            assert!(read_hook_file(&binding, bad).is_err(), "{bad}");
+            assert!(read_hook_file(&binding, bad, None).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn agent_file_reads_refuse_gitignored_and_unlisted_credential_files() {
+        let dir = crate::tests::OwnedTestDirectory::new("hookagentignore");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("sub/gen")).unwrap();
+        std::fs::write(ws.join(".gitignore"), "build/\n*.log\n").unwrap();
+        std::fs::write(ws.join("sub/.gitignore"), "gen/\n!keep.log\n").unwrap();
+        std::fs::create_dir_all(ws.join("build")).unwrap();
+        std::fs::write(ws.join("build/out.txt"), "o").unwrap();
+        std::fs::write(ws.join("a.log"), "l").unwrap();
+        std::fs::write(ws.join("sub/keep.log"), "k").unwrap();
+        std::fs::write(ws.join("sub/gen/x.txt"), "g").unwrap();
+        std::fs::write(ws.join("ok.txt"), "fine").unwrap();
+        for name in [
+            "prod.tfvars",
+            "terraform.tfstate",
+            "kubeconfig",
+            "keys.p12",
+            "a/b.keystore",
+            ".docker/config.json",
+            ".kube/config",
+            ".pgpass",
+            "service-account-prod.json",
+        ] {
+            let path = ws.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+        }
+        let binding = crate::paths::WorkspaceBinding::capture(&ws).unwrap();
+        for bad in [
+            "build/out.txt",
+            "a.log",
+            "sub/gen/x.txt",
+            "prod.tfvars",
+            "terraform.tfstate",
+            "kubeconfig",
+            "keys.p12",
+            "a/b.keystore",
+            ".docker/config.json",
+            ".kube/config",
+            ".pgpass",
+            "service-account-prod.json",
+        ] {
+            assert!(read_hook_file(&binding, bad, None).is_err(), "{bad}");
+        }
+        assert_eq!(read_hook_file(&binding, "ok.txt", None).unwrap(), "fine");
+        assert_eq!(read_hook_file(&binding, "sub/keep.log", None).unwrap(), "k");
+    }
+
+    #[test]
+    fn agent_file_reads_honour_user_read_deny_rules_and_refuse_on_ask() {
+        use crate::permission::checker::PermissionChecker;
+        let dir = crate::tests::OwnedTestDirectory::new("hookagentdeny");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("prod")).unwrap();
+        std::fs::write(ws.join("prod/plan.txt"), "P").unwrap();
+        std::fs::write(ws.join("notes.txt"), "N").unwrap();
+        std::fs::write(ws.join("review.txt"), "R").unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&ws).unwrap();
+        let cfg = crate::config::Config {
+            permission: Some(serde_json::json!({
+                "read": {"**/prod/**": "deny", "**/review.txt": "ask", "*": "allow"}
+            })),
+            ..Default::default()
+        };
+        let configs = cfg.build_permission_config().unwrap();
+        let checker = PermissionChecker::new(
+            &configs,
+            crate::permission::SecurityMode::Standard,
+            Some(ws.clone()),
+            None,
+        )
+        .unwrap();
+        let permission = std::sync::Arc::new(std::sync::Mutex::new(checker));
+        // Not in the built-in secret list, yet refused by the user's rule.
+        let denied = read_hook_file(&binding, "prod/plan.txt", Some(&permission)).unwrap_err();
+        assert!(denied.contains("denied"), "{denied}");
+        let asked = read_hook_file(&binding, "review.txt", Some(&permission)).unwrap_err();
+        assert!(asked.contains("approval"), "{asked}");
+        assert_eq!(
+            read_hook_file(&binding, "notes.txt", Some(&permission)).unwrap(),
+            "N"
+        );
+        // Without the rule the same file is readable: the refusal is the rule's.
+        assert_eq!(
+            read_hook_file(&binding, "prod/plan.txt", None).unwrap(),
+            "P"
+        );
     }
 
     #[test]

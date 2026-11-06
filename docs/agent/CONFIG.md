@@ -1288,8 +1288,11 @@ prompt and model are shown in the project-hook approval prompt; `command`, `args
   `hooks_agent_read_files = true` it becomes a read-only investigator: it may answer
   `{"read": "relative/path"}` up to 5 times (32 KiB per file, UTF-8 text) before giving its verdict.
   Reads go through the workspace capability (no `..`, absolute paths or symlinks, regular files only)
-  and refuse `.git`, `.env*`, `.ssh`, `.aws`, key/pem files and names containing `secret` or
-  `credential`. File text is sent to the model as untrusted data. It has no write, shell or network
+  and refuse `.git`, `.env*`, `.ssh`, `.aws`, key/pem files, names containing `secret` or
+  `credential`, common infrastructure secrets (`*.tfvars`, `*.tfstate`, kubeconfig, `.docker`,
+  `.kube`, `.pgpass`, `.htpasswd`, `*.p12`/`*.pfx`/`*.keystore`, `service-account*`), anything hidden
+  by `.gitignore`/`.ignore`, and every path your `read` permission rules deny (a rule that would
+  ask also refuses, since a hook cannot prompt). File text is sent to the model as untrusted data. It has no write, shell or network
   tools. The model is still the startup model, not live `/model` switches.
 
 ### Events
