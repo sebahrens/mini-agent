@@ -1601,8 +1601,8 @@ impl Cli {
     /// `project_root_discovery` changes the process directory, so `--add-dir
     /// ./x`, `--image a.png`, `--output-schema`, `--loop-plan`, `--log-file`,
     /// `--import-agent-skill`, `--import-learned-skill`,
-    /// `--distill-learned-skill-out` and `--sandbox-toolchain-root`
-    /// keep meaning "relative to where I typed the command". `~`-prefixed
+    /// `--distill-learned-skill-out`, `--sandbox-toolchain-root` and
+    /// `--wt-base-dir` keep meaning "relative to where I typed the command". `~`-prefixed
     /// entries are left for their own home expansion.
     pub fn absolutize_launch_paths(&mut self, base: &std::path::Path) {
         fn fix(path: &mut std::path::PathBuf, base: &std::path::Path) {
@@ -1631,6 +1631,15 @@ impl Cli {
             .for_each(|p| fix(p, base));
         #[cfg(feature = "loop")]
         self.loop_plan.iter_mut().for_each(|p| fix(p, base));
+        // CLI value only: the config `wt-base-dir` stays config-relative.
+        #[cfg(feature = "git-worktree")]
+        if let Some(dir) = self.wt_base_dir.as_mut() {
+            if !dir.starts_with('~') {
+                let mut path = std::path::PathBuf::from(&*dir);
+                fix(&mut path, base);
+                *dir = path.to_string_lossy().into_owned();
+            }
+        }
     }
 
     /// Effective `sandbox-toolchain-roots`: CLI entries replace the
@@ -1813,6 +1822,24 @@ mod tests {
         let base = std::path::Path::new("/launch/sub");
         cli.absolutize_launch_paths(base);
         assert_eq!(cli.import_agent_skill, Some(base.join("./my-skill")));
+    }
+
+    #[cfg(feature = "git-worktree")]
+    #[test]
+    fn launch_paths_cover_wt_base_dir() {
+        let base = std::path::Path::new("/launch/sub");
+        let mut cli = Cli::try_parse_from(["mini-agent", "--wt-base-dir", "../wt"]).unwrap();
+        cli.absolutize_launch_paths(base);
+        assert_eq!(
+            cli.wt_base_dir.as_deref(),
+            Some(base.join("../wt").to_str().unwrap())
+        );
+        let mut cli = Cli::try_parse_from(["mini-agent", "--wt-base-dir", "~/wt"]).unwrap();
+        cli.absolutize_launch_paths(base);
+        assert_eq!(cli.wt_base_dir.as_deref(), Some("~/wt"));
+        let mut cli = Cli::try_parse_from(["mini-agent", "--wt-base-dir", "/abs/wt"]).unwrap();
+        cli.absolutize_launch_paths(base);
+        assert_eq!(cli.wt_base_dir.as_deref(), Some("/abs/wt"));
     }
 
     #[cfg(feature = "skills")]
