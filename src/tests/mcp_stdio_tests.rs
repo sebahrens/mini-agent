@@ -164,6 +164,7 @@ fn main() {
     let mut concurrent_ids = Vec::<String>::new();
     let mut concurrent_answers = Vec::<String>::new();
     let mut list_calls = 0_u32;
+    let mut aux_changed = false;
     for line in stdin.lock().lines() {
         let line = line.unwrap();
         let compact = line.replace(' ', "").replace('\t', "");
@@ -229,6 +230,10 @@ fn main() {
             );
         } else if compact.contains("\"method\":\"prompts/list\"") {
             let id=request_id(&compact);
+            if aux_changed {
+                write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"prompts\":[{{\"name\":\"audit\"}},{{\"name\":\"triage\"}}]}}}}"));
+                continue;
+            }
             write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"prompts\":[{{\"name\":\"review\",\"arguments\":[{{\"name\":\"topic\",\"required\":true}}]}}]}}}}"));
         } else if compact.contains("\"method\":\"resources/list\"") {
             let id=request_id(&compact);
@@ -240,6 +245,10 @@ fn main() {
                 items.push("{\"uri\":\"urn:bad:noname\",\"name\":\"\"}".to_string());
                 items.push("{\"uri\":\"urn:ok:3\",\"name\":\"duplicate\"}".to_string());
                 write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[{}]}}}}", items.join(",")));
+                continue;
+            }
+            if aux_changed {
+                write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[]}}}}"));
                 continue;
             }
             write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[{{\"uri\":\"urn:owned:notes\",\"name\":\"notes\",\"mimeType\":\"text/plain\"}}]}}}}"));
@@ -307,6 +316,17 @@ fn main() {
                 write_response(
                     &mut stdout,
                     "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}",
+                );
+            }
+            if mode == "aux-list-changed" {
+                aux_changed = true;
+                write_response(
+                    &mut stdout,
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}",
+                );
+                write_response(
+                    &mut stdout,
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}",
                 );
             }
             let id = request_id(&compact);
@@ -3081,6 +3101,81 @@ async fn mcp_manager_connect_fills_the_auxiliary_catalogue_off_the_connect_path(
     // The binding holds an open handle on the fixture root, which Windows
     // refuses to delete while it is open.
     drop(workspace);
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_prompts_and_resources_list_changed_refresh_the_catalogue_without_reconnecting() {
+    use crate::extras::mcp::catalogue;
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("aux-list-changed");
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "aux-list-changed",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    handle.discover_auxiliary().await;
+    let before = handle.auxiliary.get().unwrap();
+    assert_eq!(before.prompts.len(), 1);
+    assert_eq!(before.prompts[0].name, "review");
+    assert_eq!(before.resources.len(), 1);
+    assert!(!handle.auxiliary.is_stale());
+    let (commands, resources) = catalogue::cached_choices(&handle);
+    assert_eq!((commands.len(), resources.len()), (1, 1));
+    let mut manager = McpClientManager::from_handles(vec![handle]);
+    let permission = Some(permission_for(Action::Allow));
+    let tools = manager
+        .collect_tools_with_timeouts(permission, None, McpToolTimeouts::default())
+        .await;
+    // The call makes the server change its lists and announce both changes.
+    tools[0].call("{}".to_string()).await.unwrap();
+    let handle = &manager.handles[0];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !handle.auxiliary.is_stale() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the notifications mark the catalogue stale");
+    // The previous snapshot is untouched until a use refreshes it.
+    assert_eq!(handle.auxiliary.get().unwrap().prompts[0].name, "review");
+    // The next picker refresh kicks off the bounded rediscovery.
+    let _ = catalogue::cached_choices(handle);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = handle.auxiliary.get().unwrap();
+            if !handle.auxiliary.is_stale() && current.prompts.len() == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the catalogue is rediscovered after list_changed");
+    let after = handle.auxiliary.get().unwrap();
+    let names: Vec<_> = after.prompts.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["audit", "triage"], "removed prompt is gone");
+    assert!(after.resources.is_empty(), "removed resource is gone");
+    let (commands, resources) = catalogue::cached_choices(handle);
+    assert_eq!(commands.len(), 2);
+    assert!(resources.is_empty());
+    assert!(
+        commands.iter().all(|(name, _)| !name.contains("review")),
+        "{commands:?}"
+    );
+    // A lookup that finds the cache stale refreshes before answering.
+    handle.auxiliary_mark_stale_for_test();
+    handle.refresh_auxiliary_if_stale().await;
+    assert!(!handle.auxiliary.is_stale());
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
     fixture.cleanup();
 }
 

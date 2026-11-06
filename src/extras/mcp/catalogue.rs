@@ -129,6 +129,75 @@ pub(crate) struct Catalogue {
     pub resources_omitted: Omitted,
 }
 
+/// The connection's prompt/resource catalogue. Filled once after connect and
+/// again, without reconnecting, after the server announces
+/// `notifications/prompts/list_changed` or `notifications/resources/list_changed`:
+/// the notification only marks the cache stale; the next use (picker refresh,
+/// prompt or resource lookup, resource listing tool) re-runs the same bounded
+/// discovery and replaces the catalogue. Discovery is single-flight.
+#[derive(Default)]
+pub(crate) struct AuxiliaryCache {
+    current: std::sync::RwLock<Option<std::sync::Arc<Catalogue>>>,
+    stale: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    gate: tokio::sync::Mutex<()>,
+}
+
+impl AuxiliaryCache {
+    /// A cache whose staleness flag is shared with the connection's client
+    /// handler, which sets it when a list-changed notification arrives.
+    pub(crate) fn with_flag(stale: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            stale,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<std::sync::Arc<Catalogue>> {
+        self.current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn initialized(&self) -> bool {
+        self.get().is_some()
+    }
+
+    /// Whether the server announced a changed prompt or resource list since
+    /// the catalogue was last discovered.
+    pub(crate) fn is_stale(&self) -> bool {
+        self.stale.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Discovers on first use or after a list-changed notification. A failed
+    /// relist keeps the previous entries of the failed kind (marked
+    /// incomplete) instead of emptying the catalogue.
+    pub(crate) async fn ensure(&self, client: &RpcClient, timeout: Duration) {
+        if self.initialized() && !self.is_stale() {
+            return;
+        }
+        let _gate = self.gate.lock().await;
+        let refreshing = self.stale.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if self.initialized() && !refreshing {
+            return;
+        }
+        let capabilities = client
+            .peer
+            .peer_info()
+            .map(|info| info.capabilities.clone());
+        let mut fresh = discover_captured(client, capabilities, timeout).await;
+        if let Some(previous) = self.get() {
+            if fresh.prompts_incomplete && fresh.prompts.is_empty() {
+                fresh.prompts = previous.prompts.clone();
+            }
+            if fresh.resources_incomplete && fresh.resources.is_empty() {
+                fresh.resources = previous.resources.clone();
+            }
+        }
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(fresh));
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Attachment {
     pub client: RpcClient,
@@ -241,6 +310,12 @@ pub(crate) fn cached_choices(client: &McpClientHandle) -> (Vec<(String, String)>
     // Check the cached catalogue first: a server without prompts/resources
     // (or whose discovery is still pending) never pays for source currency.
     // Each later use revalidates the source again at RPC.
+    // A list-changed notification marked the catalogue stale: refresh it in
+    // the background (the picker re-reads on its next open) and offer the
+    // previous entries until then; selecting a removed one is refused at use.
+    if client.auxiliary.is_stale() {
+        client.spawn_auxiliary_discovery();
+    }
     let Some(catalogue) = client
         .auxiliary
         .get()

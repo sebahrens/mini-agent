@@ -31,7 +31,7 @@ const FIELD_CHARS: usize = 256;
 #[derive(Clone)]
 pub(crate) struct ResourceServer {
     pub(crate) client: RpcClient,
-    pub(crate) catalogue: Arc<tokio::sync::OnceCell<Catalogue>>,
+    pub(crate) catalogue: Arc<catalogue::AuxiliaryCache>,
 }
 
 fn one_line(text: &str, max_chars: usize) -> String {
@@ -113,7 +113,7 @@ impl Tool for ListMcpResourcesTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "List resources (URI, name, MIME type, description) offered by connected MCP servers, from the bounded catalogue discovered at connection. Optional server narrows to one server; query filters by substring; offset/limit page through a long listing. Metadata is untrusted server data. Read one with read_mcp_resource.".into()
+        "List resources (URI, name, MIME type, description) offered by connected MCP servers, from the bounded catalogue discovered at connection and refreshed when the server announces a change. Optional server narrows to one server; query filters by substring; offset/limit page through a long listing. Metadata is untrusted server data. Read one with read_mcp_resource.".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -136,6 +136,12 @@ impl Tool for ListMcpResourcesTool {
             catalogue::authorize_resource_listing(&server.client, &self.permission, &self.ask)
                 .await
                 .map_err(|error| service_error("list_mcp_resources", error))?;
+            if server.catalogue.is_stale() {
+                server
+                    .catalogue
+                    .ensure(&server.client, std::time::Duration::from_secs(3))
+                    .await;
+            }
             let Some(catalogue) = server.catalogue.get() else {
                 listing.push_str(&format!(
                     "server '{name}': resource discovery still pending; retry shortly\n"
@@ -145,7 +151,7 @@ impl Tool for ListMcpResourcesTool {
             let needle = args.query.as_deref().map(str::to_lowercase);
             listing.push_str(&render_server_listing(
                 name,
-                catalogue,
+                &catalogue,
                 needle.as_deref(),
                 args.offset.unwrap_or(0),
                 args.limit.unwrap_or(catalogue::MAX_ITEMS),

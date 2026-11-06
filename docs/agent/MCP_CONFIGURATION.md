@@ -313,8 +313,16 @@ listing stale: the next tool collection lists it again, and the interactive
 session rebuilds the agent before the next turn so its first model request
 advertises the new set (deferred schemas, source-proof checks, tool selection
 and the tool cap apply as for the first listing). If that relist fails, the
-previous set is kept and a notice says so. Prompt and resource catalogues are
-still discovered once per connection. Shutdown closes all servers concurrently, and a worktree
+previous set is kept and a notice says so. The prompt and resource catalogue
+(`/mcp:` commands, `@` resources, `list_mcp_resources`) is discovered after
+connecting and again, without reconnecting, after the server's
+`notifications/prompts/list_changed` or `notifications/resources/list_changed`:
+the notification only marks it stale, and the next use (typing `/` or `@`, running an
+`/mcp:` prompt, selecting a resource, or listing resources) re-runs the same bounded
+discovery (same item and metadata limits) and replaces the catalogue. Until that refresh
+finishes the previous entries are still offered, and picking one the server has removed is
+refused. A failed relist keeps the previous entries of the failed kind and marks them
+incomplete. Shutdown closes all servers concurrently, and a worktree
 switch closes the previous binding's servers while the new binding connects.
 
 ## Deferred tool schemas

@@ -1167,12 +1167,14 @@ impl App<'_> {
                 .write_line("MCP server is not connected", C_ERROR)?;
             return Ok(true);
         };
-        let Some(prompt) = client
-            .auxiliary
-            .get()
-            .and_then(|catalogue| catalogue.prompts.iter().find(|prompt| prompt.name == name))
-            .cloned()
-        else {
+        client.refresh_auxiliary_if_stale().await;
+        let Some(prompt) = client.auxiliary.get().and_then(|catalogue| {
+            catalogue
+                .prompts
+                .iter()
+                .find(|prompt| prompt.name == name)
+                .cloned()
+        }) else {
             self.renderer
                 .write_line("MCP prompt is not in this connection's catalogue", C_ERROR)?;
             return Ok(true);
@@ -1283,17 +1285,14 @@ impl App<'_> {
                     .write_line("MCP server is not connected", C_ERROR)?;
                 return Ok(());
             };
-            let Some(resource) = client
-                .auxiliary
-                .get()
-                .and_then(|catalogue| {
-                    catalogue
-                        .resources
-                        .iter()
-                        .find(|resource| resource.uri == uri)
-                })
-                .cloned()
-            else {
+            client.refresh_auxiliary_if_stale().await;
+            let Some(resource) = client.auxiliary.get().and_then(|catalogue| {
+                catalogue
+                    .resources
+                    .iter()
+                    .find(|resource| resource.uri == uri)
+                    .cloned()
+            }) else {
                 self.renderer.write_line(
                     "MCP resource is not in this connection's catalogue",
                     C_ERROR,

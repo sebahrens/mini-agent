@@ -50,6 +50,10 @@ pub struct Handler {
     /// Set by `notifications/tools/list_changed`; consumed by the
     /// connection's `ToolListCache` at the next tool collection.
     pub(crate) tools_changed: Arc<AtomicBool>,
+    /// Set by `notifications/prompts/list_changed` and
+    /// `notifications/resources/list_changed`; consumed by the connection's
+    /// [`AuxiliaryCache`](super::catalogue::AuxiliaryCache) at its next use.
+    pub(crate) auxiliary_changed: Arc<AtomicBool>,
     /// In-flight calls whose `notifications/progress` feed the live preview.
     pub(crate) progress: super::progress::ProgressRegistry,
     /// Workspace root advertised through `roots/list`. Only set for stdio
@@ -259,6 +263,20 @@ impl rmcp::ClientHandler for Handler {
     async fn on_tool_list_changed(&self, _context: rmcp::service::NotificationContext<RoleClient>) {
         tracing::debug!("MCP server announced tools/list_changed");
         self.tools_changed.store(true, Ordering::Release);
+    }
+    async fn on_prompt_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        tracing::debug!("MCP server announced prompts/list_changed");
+        self.auxiliary_changed.store(true, Ordering::Release);
+    }
+    async fn on_resource_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        tracing::debug!("MCP server announced resources/list_changed");
+        self.auxiliary_changed.store(true, Ordering::Release);
     }
     async fn on_progress(
         &self,
