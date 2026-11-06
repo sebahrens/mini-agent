@@ -51,6 +51,9 @@ pub(crate) mod retrieval;
 pub(crate) mod discovery;
 
 #[cfg(feature = "agent-skills")]
+pub(crate) mod preload;
+
+#[cfg(feature = "agent-skills")]
 pub(crate) mod selection;
 
 #[cfg(feature = "agent-skills")]

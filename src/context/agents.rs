@@ -237,6 +237,8 @@ struct AgentMetadata {
     #[cfg(feature = "mcp")]
     mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
     unknown_keys: Vec<String>,
+    /// `skills:` names whose SKILL.md is injected into the child at start.
+    skills: Vec<String>,
     /// Claude Code compatibility adjustments (name mismatch, shortened
     /// description) surfaced as `[specialist metadata: ...]` notices.
     compat_notices: Vec<String>,
@@ -508,6 +510,17 @@ fn normalize_agent_definition(
                 .into(),
         );
     }
+    let skills = match mapping.get(serde_yaml_ng::Value::String("skills".into())) {
+        Some(value) => parse_agent_skills(value, &mut compat_notices),
+        None => Vec::new(),
+    };
+    #[cfg(not(feature = "agent-skills"))]
+    if !skills.is_empty() {
+        compat_notices.push(
+            "[specialist metadata: skills not applied: Agent Skills support is not compiled into this build]"
+                .into(),
+        );
+    }
     // Claude Code keys with no mini-agent equivalent: say what is not applied
     // rather than only listing them as unknown.
     for (key, behaviour) in UNSUPPORTED_CLAUDE_KEYS {
@@ -597,6 +610,7 @@ fn normalize_agent_definition(
                     #[cfg(feature = "mcp")]
                     mcp_servers,
                     unknown_keys,
+                    skills,
                     compat_notices,
                 },
             )
@@ -604,13 +618,47 @@ fn normalize_agent_definition(
         .ok_or("prompt body is empty")
 }
 
+/// Most skills one persona may preload.
+pub(crate) const MAX_PERSONA_SKILLS: usize = 16;
+
+/// `skills:` as a YAML list or a comma/space separated string. Invalid or
+/// surplus names are dropped with a notice; duplicates collapse.
+fn parse_agent_skills(value: &serde_yaml_ng::Value, notices: &mut Vec<String>) -> Vec<String> {
+    let raw: Vec<String> = match value {
+        serde_yaml_ng::Value::Sequence(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect(),
+        serde_yaml_ng::Value::String(text) => text
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut dropped = Vec::new();
+    for name in raw {
+        if !valid_agent_name(&name) {
+            dropped.push(name.chars().take(64).collect::<String>());
+        } else if names.len() >= MAX_PERSONA_SKILLS {
+            dropped.push(name);
+        } else if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if !dropped.is_empty() {
+        notices.push(format!(
+            "[specialist metadata: skills not preloaded (invalid name or more than {MAX_PERSONA_SKILLS}): {}]",
+            dropped.join(", ")
+        ));
+    }
+    names
+}
+
 /// Claude Code frontmatter keys that are recognised but have no effect here,
 /// with the behaviour that is not applied.
 const UNSUPPORTED_CLAUDE_KEYS: &[(&str, &str)] = &[
-    (
-        "skills",
-        "skills are not preloaded into the child; it can still call skills_search when granted",
-    ),
     (
         "permissionMode",
         "the child always uses the parent's permission rules and prompts",
@@ -1028,6 +1076,9 @@ pub struct AgentDefinition {
     pub(crate) inline_images: Option<u8>,
     /// `max_turns` / `timeout_secs` child run settings.
     pub(crate) run: AgentRunSettings,
+    /// `skills:` names preloaded into the child's system prompt.
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
+    pub(crate) skills: Vec<String>,
     pub source: AgentDefinitionSource,
     project_notes_path: Option<PathBuf>,
     ignored_definition_notices: Vec<String>,
@@ -1056,6 +1107,7 @@ fn merge_definitions(
                 isolation_worktree: metadata.isolation_worktree,
                 inline_images: metadata.inline_images,
                 run: metadata.run,
+                skills: metadata.skills,
                 source: source.clone(),
                 project_notes_path: None,
                 ignored_definition_notices: notices,
@@ -1100,6 +1152,7 @@ impl AgentDefinition {
             isolation_worktree: false,
             inline_images: None,
             run: AgentRunSettings::default(),
+            skills: Vec::new(),
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -1478,6 +1531,7 @@ fn merge_external_definitions(
                         isolation_worktree: metadata.isolation_worktree,
                         inline_images: metadata.inline_images,
                         run: metadata.run,
+                        skills: metadata.skills,
                         source: source.clone(),
                         project_notes_path: None,
                         ignored_definition_notices: notices,
@@ -3025,7 +3079,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .2;
         assert!(parsed.unknown_keys.is_empty());
-        for key in ["skills", "permissionMode", "background", "memory"] {
+        assert_eq!(parsed.skills, vec!["a".to_string()]);
+        for key in ["permissionMode", "background", "memory"] {
             assert!(
                 parsed
                     .compat_notices
@@ -3035,6 +3090,32 @@ pub(crate) mod tests {
                 parsed.compat_notices
             );
         }
+    }
+
+    #[test]
+    fn persona_skills_frontmatter_accepts_lists_and_strings_and_reports_invalid_names() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition("cc".into(), format!("---\n{frontmatter}\n---\nbody"))
+                .unwrap()
+                .2
+        };
+        assert_eq!(parse("skills: [a, b, a]").skills, vec!["a", "b"]);
+        assert_eq!(parse("skills: a, b c").skills, vec!["a", "b", "c"]);
+        let bad = parse("skills: [ok, '../etc', 'Bad Name']");
+        assert_eq!(bad.skills, vec!["ok"]);
+        assert!(
+            bad.compat_notices
+                .iter()
+                .any(|n| n.contains("skills not preloaded") && n.contains("../etc"))
+        );
+        let many = (0..20)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let capped = parse(&format!("skills: [{many}]"));
+        assert_eq!(capped.skills.len(), MAX_PERSONA_SKILLS);
+        assert!(capped.compat_notices.iter().any(|n| n.contains("s19")));
+        assert!(parse("name: cc").skills.is_empty());
     }
 
     #[cfg(feature = "mcp")]
@@ -3341,6 +3422,7 @@ pub(crate) mod tests {
     #[test]
     fn permission_source_descriptions_cover_non_project_layers() {
         let embedded = AgentDefinition {
+            skills: Vec::new(),
             prompt: "embedded".into(),
             mode: None,
             description: None,
@@ -3358,6 +3440,7 @@ pub(crate) mod tests {
             ignored_definition_notices: Vec::new(),
         };
         let user = AgentDefinition {
+            skills: Vec::new(),
             prompt: "user".into(),
             mode: None,
             description: None,
@@ -3381,6 +3464,7 @@ pub(crate) mod tests {
             "user-global configuration"
         );
         let long = AgentDefinition {
+            skills: Vec::new(),
             prompt: format!("You are a specialist with {}", "detail ".repeat(80)),
             mode: None,
             description: None,

@@ -215,6 +215,10 @@ pub(crate) struct PersonaExecution {
     /// Provider request parameters resolved from the persona's quick-model
     /// alias. These win over every inherited provider parameter.
     pub(crate) additional_params: Option<serde_json::Value>,
+    /// Persona `skills:` names preloaded into the child's system prompt from
+    /// the authorized skill catalogue.
+    #[cfg_attr(not(feature = "agent-skills"), allow(dead_code))]
+    pub(crate) skills: Vec<String>,
     /// Exact server -> wire-level tool names granted to this persona. `None`
     /// means no MCP authority; outer-agent connections are never inherited.
     #[cfg(feature = "mcp")]
@@ -1290,6 +1294,37 @@ pub(crate) async fn build_explore_agent_with_suffix(
             )
         })
     });
+    #[cfg(feature = "agent-skills")]
+    let preloaded_specialization = match (&instructions, persona.skills.is_empty()) {
+        (Some(services), false) => {
+            let block = match services.refresh(false).await {
+                Ok(discovery) => {
+                    let budget = crate::extras::skills::index::AgentSkillSearchPolicy::configured()
+                        .instruction_byte_budget;
+                    let (block, notices) = crate::extras::skills::preload::render_preloaded(
+                        &discovery,
+                        &persona.skills,
+                        budget,
+                    );
+                    for notice in notices {
+                        tracing::warn!(notice = %notice, "persona skill preload");
+                    }
+                    block
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "persona skill preload: catalogue unavailable");
+                    format!(
+                        "\n[skill preload: skills not preloaded: catalogue unavailable ({})]\n",
+                        error.replace('\n', " ")
+                    )
+                }
+            };
+            Some(format!("{}{block}", spec_ref.unwrap_or_default()))
+        }
+        _ => None,
+    };
+    #[cfg(feature = "agent-skills")]
+    let spec_ref = preloaded_specialization.as_deref().or(spec_ref);
     let inner = match model {
         AnyModel::OpenRouter(m, _) => {
             AnyAgentInner::OpenRouter(build_explore_agent_inner_with_suffix(
@@ -2902,6 +2937,7 @@ mod provider_param_tests {
     fn persona() -> PersonaExecution {
         let config = zdr_config();
         PersonaExecution {
+            skills: Vec::new(),
             write_mode: false,
             free_form: false,
             inbox: None,

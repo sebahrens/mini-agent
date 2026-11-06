@@ -592,7 +592,14 @@ mode: review
   `mcp_servers`), within the same 8-server limit, still child-only, trust-gated like any project
   persona and permission-checked per call. A server that is not configured in mini-agent fails the
   child, and an inline server definition is never started (it is reported as not applied).
-  `skills`, `permissionMode`, `background`, `memory` and `hooks` are recognised but have no effect;
+  `skills` lists skill names: each is resolved against the current authorized skills catalogue
+  when the child starts and its `SKILL.md` instructions are placed in the child's system prompt
+  (resources are not inlined), within the instruction byte budget of `[skills]` selection (48 KiB
+  by default) across all listed skills and at most 16 names. A name that is unknown, not
+  authorized, invalid, or does not fit the budget is skipped with a
+  `[skill preload: ...]` notice in the child's prompt (and a log warning); the child can still call
+  `skills_search` when granted. Preloaded text never grants permissions.
+  `permissionMode`, `background`, `memory` and `hooks` are recognised but have no effect;
   each produces a `[specialist metadata: <key> not applied: ...]` notice naming the behaviour that
   is missing.
 - `model` is first resolved as a configured quick-model alias, including its

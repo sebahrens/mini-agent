@@ -673,6 +673,7 @@ struct ResolvedSpecialization {
     inline_images: Option<u8>,
     /// Frontmatter `max_turns` / `timeout_secs`.
     run: crate::context::agents::AgentRunSettings,
+    skills: Vec<String>,
     #[cfg(feature = "mcp")]
     mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
@@ -811,6 +812,7 @@ fn resolve_persona_runtime_with(
             // would send for this model; persona params are merged on top.
             provider_extra_body: crate::config::resolve_extra_body(config, &model_name),
             additional_params,
+            skills: specialization.skills.clone(),
             #[cfg(feature = "mcp")]
             mcp_servers: specialization.mcp_servers.clone(),
         },
@@ -870,6 +872,7 @@ fn resolve_specialization(
         turn_budget: definition.turn_budget,
         inline_images: definition.inline_images,
         run: definition.run,
+        skills: definition.skills,
         #[cfg(feature = "mcp")]
         mcp_servers: definition.mcp_servers,
     }))
@@ -5278,6 +5281,7 @@ mod tests {
     #[test]
     fn hook_identity_uses_the_resolved_specialist_and_source() {
         let specialization = ResolvedSpecialization {
+            skills: Vec::new(),
             write_mode: false,
             isolation_worktree: false,
             prompt: "review carefully".into(),
@@ -5316,6 +5320,7 @@ mod tests {
 
     fn runtime_specialization() -> ResolvedSpecialization {
         ResolvedSpecialization {
+            skills: Vec::new(),
             write_mode: false,
             isolation_worktree: false,
             prompt: "review carefully".into(),
@@ -6222,6 +6227,7 @@ mod tests {
                 ..Default::default()
             });
         let persona = |write_mode: bool| ResolvedSpecialization {
+            skills: Vec::new(),
             write_mode,
             isolation_worktree: false,
             prompt: "p".into(),
