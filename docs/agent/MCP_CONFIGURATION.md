@@ -181,6 +181,25 @@ the cap counts only admitted tools and a selected tool past index 128 is still
 reached. `/mcp <server>` shows how many listed tools the selection excluded.
 Selection only narrows the registered set; it grants no permission.
 
+## Resource tools (`list_mcp_resources`, `read_mcp_resource`)
+
+Servers that advertise resources get two model tools. The catalogue is
+discovered at connection and bounded to 128 entries / 256 KiB of metadata. A
+malformed, over-long or duplicate entry is skipped individually (the listing
+reports how many were skipped and how many fell beyond the bound) rather than
+discarding the whole catalogue. `list_mcp_resources` takes `server`, a
+case-insensitive `query` over URI, name and description, and `offset`/`limit`
+paging; a truncated listing names the `offset` that continues it.
+`read_mcp_resource` returns up to 256 KiB per call for any textual MIME type
+(the `web_fetch` set: `text/*`, JSON, XML, YAML, TOML, JavaScript, `+json`,
+`+xml`, with parameters ignored). Longer text is cut at a character boundary
+with a marker naming the `offset` to pass back (`length` is optional); at most
+4 MiB of a resource is retained, and a server that sends more is flagged.
+Binary parts and non-text MIME types are omitted with a note stating the part
+size and MIME type, and a resource with nothing readable is refused with that
+reason. Operator `@mcp:` attachments stay strict: text over 256 KiB is refused
+with its size and the limit, since it must fit the prompt snapshot.
+
 ## MCP server mode (`--mcp-server`)
 
 `mini-agent --mcp-server [flags]` serves mini-agent itself to another agent or

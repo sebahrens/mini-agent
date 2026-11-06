@@ -8,6 +8,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### MCP
 
+- `list_mcp_resources` skips malformed or duplicate entries individually instead of dropping a
+  server's whole resource catalogue, reports how many were skipped or fell past the 128-entry /
+  256 KiB bound, and accepts `query`, `offset` and `limit`. `read_mcp_resource` pages long text
+  (`offset`/`length`, with a continue marker) instead of refusing above 256 KiB, accepts the same
+  textual MIME types as `web_fetch` (YAML, TOML, JavaScript, `+json`, ...), and names the specific
+  reason (binary part, non-text MIME type, size limit) when it cannot return a resource.
 - `--mcp-server` handles requests while a `run` executes: `ping` is answered, `notifications/cancelled`
   kills the run's child process group and sends no reply, a client `progressToken` receives
   `notifications/progress` heartbeats every 15 s, and up to 4 runs may overlap (a fifth is refused,

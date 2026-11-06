@@ -227,6 +227,16 @@ fn main() {
             write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"prompts\":[{{\"name\":\"review\",\"arguments\":[{{\"name\":\"topic\",\"required\":true}}]}}]}}}}"));
         } else if compact.contains("\"method\":\"resources/list\"") {
             let id=request_id(&compact);
+            if mode == "aux-messy" {
+                let mut items = Vec::new();
+                for n in 0..140 {
+                    items.push(format!("{{\"uri\":\"urn:ok:{n}\",\"name\":\"ok{n}\"}}"));
+                }
+                items.push("{\"uri\":\"urn:bad:noname\",\"name\":\"\"}".to_string());
+                items.push("{\"uri\":\"urn:ok:3\",\"name\":\"duplicate\"}".to_string());
+                write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[{}]}}}}", items.join(",")));
+                continue;
+            }
             write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[{{\"uri\":\"urn:owned:notes\",\"name\":\"notes\",\"mimeType\":\"text/plain\"}}]}}}}"));
         } else if compact.contains("\"method\":\"prompts/get\"") {
             let id=request_id(&compact);
@@ -2680,6 +2690,32 @@ async fn mcp_auxiliary_stdio_catalogue_and_selected_literal_reads_are_bounded_an
     let (prompt, resource) = result.unwrap();
     assert!(prompt.contains("Prompt BODY 雪") && prompt.contains("/commit %%next code"));
     assert_eq!(resource, "Resource BODY 雪");
+}
+
+#[tokio::test]
+async fn mcp_resource_listing_skips_bad_entries_individually_and_counts_the_bound_overflow() {
+    let fixture = FixtureBuild::compile();
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux-messy",
+        &fixture.lease("auxiliary-messy"),
+    );
+    let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+        .await
+        .unwrap();
+    handle.discover_auxiliary().await;
+    let captured = handle.auxiliary.get().unwrap().clone();
+    McpClientManager::from_handles(vec![handle])
+        .shutdown()
+        .await;
+    fixture.cleanup();
+    // 128 kept; 140 valid unique entries minus 128 are over the bound; the
+    // empty-name entry and the duplicate URI are skipped individually.
+    assert_eq!(captured.resources.len(), 128);
+    assert_eq!(captured.resources_omitted.invalid, 2);
+    assert_eq!(captured.resources_omitted.over_bound, 12);
+    assert!(captured.resources_incomplete);
 }
 
 #[tokio::test]

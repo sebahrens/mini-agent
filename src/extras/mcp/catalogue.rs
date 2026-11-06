@@ -98,11 +98,26 @@ impl RpcClient {
 
 pub(crate) const MAX_ITEMS: usize = 128;
 const MAX_PAGES: usize = 32;
-const MAX_METADATA_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_METADATA_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_TEXT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_ATTACHMENTS: usize = 20;
 pub(crate) const MAX_ATTACHMENT_BYTES: usize = 1024 * 1024;
 const MAX_ARGUMENTS: usize = 16;
+
+/// Entries a listing did not keep, by cause.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Omitted {
+    /// Malformed, over-long or duplicate entries skipped individually.
+    pub invalid: usize,
+    /// Well-formed entries beyond the item-count or metadata-size bound.
+    pub over_bound: usize,
+}
+
+impl Omitted {
+    pub(crate) fn total(self) -> usize {
+        self.invalid + self.over_bound
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Catalogue {
@@ -110,6 +125,8 @@ pub(crate) struct Catalogue {
     pub resources: Vec<Resource>,
     pub prompts_incomplete: bool,
     pub resources_incomplete: bool,
+    pub prompts_omitted: Omitted,
+    pub resources_omitted: Omitted,
 }
 
 #[derive(Clone)]
@@ -304,9 +321,10 @@ pub(crate) async fn discover_captured(
         .is_some_and(|caps| caps.prompts.is_some())
     {
         match list(client, true, timeout).await {
-            Ok((prompts, _, incomplete)) => {
-                catalogue.prompts = prompts;
-                catalogue.prompts_incomplete = incomplete;
+            Ok(listed) => {
+                catalogue.prompts_incomplete = listed.incomplete();
+                catalogue.prompts_omitted = listed.omitted;
+                catalogue.prompts = listed.prompts;
             }
             Err(_) => catalogue.prompts_incomplete = true,
         }
@@ -316,9 +334,10 @@ pub(crate) async fn discover_captured(
         .is_some_and(|caps| caps.resources.is_some())
     {
         match list(client, false, timeout).await {
-            Ok((_, resources, incomplete)) => {
-                catalogue.resources = resources;
-                catalogue.resources_incomplete = incomplete;
+            Ok(listed) => {
+                catalogue.resources_incomplete = listed.incomplete();
+                catalogue.resources_omitted = listed.omitted;
+                catalogue.resources = listed.resources;
             }
             Err(_) => catalogue.resources_incomplete = true,
         }
@@ -328,18 +347,41 @@ pub(crate) async fn discover_captured(
     catalogue
 }
 
+/// One server listing: the kept entries plus what was left out and why.
+struct Listed {
+    prompts: Vec<Prompt>,
+    resources: Vec<Resource>,
+    omitted: Omitted,
+    /// Pagination stopped early (page limit); more entries may exist.
+    truncated: bool,
+}
+
+impl Listed {
+    fn incomplete(&self) -> bool {
+        self.truncated || self.omitted.total() > 0
+    }
+}
+
+/// Enumerate one catalogue. A malformed or duplicate entry is skipped and
+/// counted instead of discarding the listing; entries beyond the item or
+/// metadata bound are counted (not stored) so the notice can say how many.
 async fn list(
     client: &RpcClient,
     prompts: bool,
     timeout: Duration,
-) -> Result<(Vec<Prompt>, Vec<Resource>, bool), ServiceError> {
+) -> Result<Listed, ServiceError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut cursor = None;
     let mut seen_cursors = BTreeSet::new();
     let mut names = BTreeSet::new();
-    let mut prompt_entries = Vec::new();
-    let mut resource_entries = Vec::new();
+    let mut listed = Listed {
+        prompts: Vec::new(),
+        resources: Vec::new(),
+        omitted: Omitted::default(),
+        truncated: false,
+    };
     let mut bytes = 0_usize;
+    let mut full = false;
     for _ in 0..MAX_PAGES {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -355,39 +397,44 @@ async fn list(
         let next = match response {
             ServerResult::ListPromptsResult(page) if prompts => {
                 for entry in page.prompts {
-                    if prompt_entries.len() == MAX_ITEMS {
-                        return Ok((prompt_entries, resource_entries, true));
+                    if validate_prompt(&entry).is_err() || !names.insert(entry.name.clone()) {
+                        listed.omitted.invalid += 1;
+                        continue;
                     }
-                    validate_prompt(&entry)?;
-                    if !names.insert(entry.name.clone()) {
-                        return Err(invalid());
+                    let size = serde_json::to_vec(&entry).map_or(usize::MAX, |v| v.len());
+                    if full
+                        || listed.prompts.len() >= MAX_ITEMS
+                        || bytes.saturating_add(size) > MAX_METADATA_BYTES
+                    {
+                        full = true;
+                        listed.omitted.over_bound += 1;
+                        continue;
                     }
-                    bytes = bytes
-                        .saturating_add(serde_json::to_vec(&entry).map_err(|_| invalid())?.len());
-                    if bytes > MAX_METADATA_BYTES {
-                        return Ok((prompt_entries, resource_entries, true));
-                    }
-                    prompt_entries.push(entry);
+                    bytes += size;
+                    listed.prompts.push(entry);
                 }
                 page.next_cursor
             }
             ServerResult::ListResourcesResult(page) if !prompts => {
                 for entry in page.resources {
-                    if resource_entries.len() == MAX_ITEMS {
-                        return Ok((prompt_entries, resource_entries, true));
+                    if !identifier(&entry.uri, 2048)
+                        || !identifier(&entry.name, 256)
+                        || !names.insert(entry.uri.clone())
+                    {
+                        listed.omitted.invalid += 1;
+                        continue;
                     }
-                    if !identifier(&entry.uri, 2048) || !identifier(&entry.name, 256) {
-                        return Err(invalid());
+                    let size = serde_json::to_vec(&entry).map_or(usize::MAX, |v| v.len());
+                    if full
+                        || listed.resources.len() >= MAX_ITEMS
+                        || bytes.saturating_add(size) > MAX_METADATA_BYTES
+                    {
+                        full = true;
+                        listed.omitted.over_bound += 1;
+                        continue;
                     }
-                    if !names.insert(entry.uri.clone()) {
-                        return Err(invalid());
-                    }
-                    bytes = bytes
-                        .saturating_add(serde_json::to_vec(&entry).map_err(|_| invalid())?.len());
-                    if bytes > MAX_METADATA_BYTES {
-                        return Ok((prompt_entries, resource_entries, true));
-                    }
-                    resource_entries.push(entry);
+                    bytes += size;
+                    listed.resources.push(entry);
                 }
                 page.next_cursor
             }
@@ -395,17 +442,24 @@ async fn list(
         };
         match next {
             None => {
-                prompt_entries.sort_by(|a, b| a.name.cmp(&b.name));
-                resource_entries.sort_by(|a, b| a.uri.cmp(&b.uri));
-                return Ok((prompt_entries, resource_entries, false));
+                listed.prompts.sort_by(|a, b| a.name.cmp(&b.name));
+                listed.resources.sort_by(|a, b| a.uri.cmp(&b.uri));
+                return Ok(listed);
             }
             Some(next) if identifier(&next, 2048) && seen_cursors.insert(next.clone()) => {
                 cursor = Some(next)
             }
-            Some(_) => return Err(invalid()),
+            // A bad or repeated cursor ends enumeration; keep what we have.
+            Some(_) => {
+                listed.truncated = true;
+                break;
+            }
         }
     }
-    Ok((prompt_entries, resource_entries, true))
+    listed.truncated = true;
+    listed.prompts.sort_by(|a, b| a.name.cmp(&b.name));
+    listed.resources.sort_by(|a, b| a.uri.cmp(&b.uri));
+    Ok(listed)
 }
 
 fn validate_prompt(prompt: &Prompt) -> Result<(), ServiceError> {
@@ -499,6 +553,27 @@ fn prompt_text(server: &str, name: &str, result: GetPromptResult) -> Result<Stri
     ))
 }
 
+/// A size/type/shape refusal that names its reason and limit.
+fn refused(reason: impl Into<String>) -> ServiceError {
+    ServiceError::McpError(rmcp::ErrorData::invalid_params(reason.into(), None))
+}
+
+/// Most resource text kept from one `resources/read`, before paging.
+pub(crate) const MAX_FETCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONTENT_PARTS: usize = 32;
+
+/// Text of one resource read, bounded, with what was left out.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResourceText {
+    pub text: String,
+    /// The server sent more text than `MAX_FETCH_BYTES`; the tail is unreachable.
+    pub fetch_truncated: bool,
+    /// Notes about parts that were not text (binary, unsupported MIME, extra parts).
+    pub notes: Vec<String>,
+}
+
+/// Strict read used where the whole text must fit a prompt budget
+/// (`@mcp:` attachments): over `MAX_TEXT_BYTES` is refused with the reason.
 pub(crate) async fn read_resource(
     client: &RpcClient,
     resource: &Resource,
@@ -507,8 +582,29 @@ pub(crate) async fn read_resource(
     ask: &Option<crate::permission::ask::AskSender>,
     owner: Option<super::elicitation::FrontendOwner>,
 ) -> Result<String, ServiceError> {
+    let read = read_resource_text(client, resource, timeout, permission, ask, owner).await?;
+    if read.text.len() > MAX_TEXT_BYTES {
+        return Err(refused(format!(
+            "MCP resource is {} bytes, over the {MAX_TEXT_BYTES}-byte limit for attached context; read it with read_mcp_resource, which pages",
+            read.text.len()
+        )));
+    }
+    Ok(read.text)
+}
+
+/// Read a resource's text (up to `MAX_FETCH_BYTES`) for paging callers.
+pub(crate) async fn read_resource_text(
+    client: &RpcClient,
+    resource: &Resource,
+    timeout: Duration,
+    permission: &Option<crate::permission::checker::PermCheck>,
+    ask: &Option<crate::permission::ask::AskSender>,
+    owner: Option<super::elicitation::FrontendOwner>,
+) -> Result<ResourceText, ServiceError> {
     if !identifier(&resource.uri, 2048) {
-        return Err(invalid());
+        return Err(refused(
+            "MCP resource URI is empty, longer than 2048 bytes or contains control characters",
+        ));
     }
     client
         .authorize(
@@ -535,34 +631,88 @@ pub(crate) async fn read_resource(
     }
 }
 
-fn resource_text(result: ReadResourceResult) -> Result<String, ServiceError> {
-    if result.contents.is_empty() || result.contents.len() > 32 {
-        return Err(invalid());
+fn notice_text(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
+fn textual_mime(mime: &str) -> bool {
+    let essence = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    crate::agent::tools::web_http::is_textual_content_type(Some(&essence))
+}
+
+fn resource_text(result: ReadResourceResult) -> Result<ResourceText, ServiceError> {
+    if result.contents.is_empty() {
+        return Err(refused("MCP server returned a resource with no contents"));
     }
-    let mut text = String::new();
-    for content in result.contents {
-        let ResourceContents::TextResourceContents {
-            text: next,
-            mime_type,
-            ..
-        } = content
-        else {
-            return Err(invalid());
-        };
-        if mime_type.as_deref().is_some_and(|mime| {
-            !(mime.starts_with("text/") || matches!(mime, "application/json" | "application/xml"))
-        }) {
-            return Err(invalid());
+    let mut out = ResourceText {
+        text: String::new(),
+        fetch_truncated: false,
+        notes: Vec::new(),
+    };
+    let total_parts = result.contents.len();
+    for content in result.contents.into_iter().take(MAX_CONTENT_PARTS) {
+        match content {
+            ResourceContents::TextResourceContents {
+                text, mime_type, ..
+            } => {
+                if let Some(mime) = mime_type.as_deref().filter(|mime| !textual_mime(mime)) {
+                    out.notes.push(format!(
+                        "omitted a {} byte part with non-text MIME type {}",
+                        text.len(),
+                        notice_text(mime)
+                    ));
+                    continue;
+                }
+                if out.fetch_truncated {
+                    continue;
+                }
+                let room = MAX_FETCH_BYTES.saturating_sub(out.text.len() + 1);
+                if !out.text.is_empty() {
+                    out.text.push('\n');
+                }
+                if text.len() > room {
+                    let mut end = room;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    out.text.push_str(&text[..end]);
+                    out.fetch_truncated = true;
+                } else {
+                    out.text.push_str(&text);
+                }
+            }
+            ResourceContents::BlobResourceContents {
+                blob, mime_type, ..
+            } => out.notes.push(format!(
+                "omitted a binary part ({} base64 bytes, MIME type {}); binary resources are not returned",
+                blob.len(),
+                mime_type
+                    .as_deref()
+                    .map_or("unspecified".to_owned(), notice_text)
+            )),
+            _ => out
+                .notes
+                .push("omitted a part of an unsupported kind".to_owned()),
         }
-        if text.len().saturating_add(next.len()).saturating_add(1) > MAX_TEXT_BYTES {
-            return Err(invalid());
-        }
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&next);
     }
-    Ok(text)
+    if total_parts > MAX_CONTENT_PARTS {
+        out.notes.push(format!(
+            "omitted {} content parts beyond the {MAX_CONTENT_PARTS}-part limit",
+            total_parts - MAX_CONTENT_PARTS
+        ));
+    }
+    if out.text.is_empty() && !out.notes.is_empty() {
+        return Err(refused(format!(
+            "MCP resource has no readable text: {}",
+            out.notes.join("; ")
+        )));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -699,27 +849,75 @@ mod tests {
         );
     }
     #[test]
-    fn resources_accept_only_bounded_text_without_uri_fetch_or_blob_decoding() {
-        let result = resource_text(ReadResourceResult::new(vec![ResourceContents::text(
+    fn resources_return_text_with_specific_reasons_for_what_is_not_text() {
+        let text = |t: &str, uri: &str| ResourceContents::text(t, uri);
+        let ok = resource_text(ReadResourceResult::new(vec![text(
             "雪",
             "file:///not-a-local-read",
         )]))
         .unwrap();
-        assert_eq!(result, "雪");
+        assert_eq!(ok.text, "雪");
+        // A blob alone is refused naming the reason; beside text it is noted.
+        let err = resource_text(ReadResourceResult::new(vec![ResourceContents::blob(
+            "YWJj",
+            "urn:opaque",
+        )]))
+        .unwrap_err()
+        .to_string();
         assert!(
-            resource_text(ReadResourceResult::new(vec![ResourceContents::blob(
-                "YWJj",
-                "urn:opaque"
-            )]))
-            .is_err()
+            err.contains("binary part") && err.contains("not returned"),
+            "{err}"
         );
-        assert!(
-            resource_text(ReadResourceResult::new(vec![ResourceContents::text(
-                "x".repeat(MAX_TEXT_BYTES + 1),
-                "urn:opaque"
-            )]))
-            .is_err()
-        );
+        let mixed = resource_text(ReadResourceResult::new(vec![
+            text("body", "urn:a"),
+            ResourceContents::blob("YWJj", "urn:b"),
+        ]))
+        .unwrap();
+        assert_eq!(mixed.text, "body");
+        assert!(mixed.notes[0].contains("binary part"));
         assert!(resource_text(ReadResourceResult::new(vec![])).is_err());
+        // Common text types beyond text/*, json, xml are accepted, with parameters.
+        for mime in [
+            "application/yaml",
+            "application/javascript",
+            "application/toml",
+            "application/vnd.api+json",
+            "text/markdown; charset=utf-8",
+            "Application/JSON; charset=UTF-8",
+        ] {
+            let mut part = text("a", "urn:a");
+            if let ResourceContents::TextResourceContents { mime_type, .. } = &mut part {
+                *mime_type = Some(mime.into());
+            }
+            assert!(
+                resource_text(ReadResourceResult::new(vec![part])).is_ok(),
+                "{mime}"
+            );
+        }
+        let mut image = text("a", "urn:a");
+        if let ResourceContents::TextResourceContents { mime_type, .. } = &mut image {
+            *mime_type = Some("image/png".into());
+        }
+        let err = resource_text(ReadResourceResult::new(vec![image]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-text MIME type image/png"), "{err}");
+    }
+
+    #[test]
+    fn oversized_resource_text_is_capped_at_the_fetch_bound_on_a_char_boundary() {
+        let huge = "é".repeat(MAX_FETCH_BYTES);
+        let read = resource_text(ReadResourceResult::new(vec![ResourceContents::text(
+            huge, "urn:big",
+        )]))
+        .unwrap();
+        assert!(read.fetch_truncated && read.text.len() <= MAX_FETCH_BYTES);
+        assert!(read.text.chars().all(|c| c == 'é'));
+        // Many parts are limited and the omission is noted.
+        let parts = (0..40)
+            .map(|i| ResourceContents::text("x", format!("urn:{i}")))
+            .collect();
+        let read = resource_text(ReadResourceResult::new(parts)).unwrap();
+        assert!(read.notes.iter().any(|n| n.contains("8 content parts")));
     }
 }
