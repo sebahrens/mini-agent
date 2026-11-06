@@ -3229,7 +3229,7 @@ labelled emergency recap; original durable rows remain archived. The process
 retains at most `acp_max_sessions` (default 64) ACP sessions, counting pending
 loads and retiring owners, and each session accepts at most
 `acp_max_client_mcp_servers` (default 8) client-supplied MCP servers. A prompt
-is limited to 2 MiB of rendered text (it must fit the 4 MiB frame).
+is limited to 2 MiB of rendered text (it must fit the 12 MiB frame, which also holds 6 MiB of encoded images).
 Creating a session beyond the cap is rejected rather than silently invalidating a live session. Each
 session accepts one active prompt; a concurrent prompt for the same session is
 rejected instead of queued. Protocol dispatch and work in other sessions remain

@@ -5,6 +5,9 @@ import type * as acp from '@agentclientprotocol/sdk';
 export const MAX_REFERENCES = 20;
 /** Same cap as the CLI `-i` flag and the agent's MAX_USER_IMAGE_BYTES. */
 export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+/** Agent limits (MAX_USER_IMAGES, MAX_USER_IMAGE_TOTAL): more are refused by the server. */
+export const MAX_IMAGES = 8;
+export const MAX_TOTAL_IMAGE_BYTES = 4 * 1024 * 1024;
 const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 export const MAX_SNIPPET_BYTES = 64 * 1024;
 export const MAX_TOTAL_REFERENCE_BYTES = 256 * 1024;
@@ -91,6 +94,8 @@ export async function buildPromptBlocks(options: PromptBuildOptions): Promise<Pr
   }
   let total = 0;
   let accepted = 0;
+  let imageCount = 0;
+  let imageBytes = 0;
   for (const reference of options.references) {
     if (accepted >= MAX_REFERENCES) {
       notes.push(`Only the first ${MAX_REFERENCES} references were sent; ${options.references.length - accepted} more were dropped.`);
@@ -108,6 +113,13 @@ export async function buildPromptBlocks(options: PromptBuildOptions): Promise<Pr
         notes.push(`Skipped image "${name}": ${reference.bytes.length} bytes is outside the 1 byte to ${MAX_IMAGE_BYTES / 1024 / 1024} MiB limit.`);
         continue;
       }
+      if (imageCount >= MAX_IMAGES) { notes.push(`Skipped image "${name}": at most ${MAX_IMAGES} images are sent per prompt.`); continue; }
+      if (imageBytes + reference.bytes.length > MAX_TOTAL_IMAGE_BYTES) {
+        notes.push(`Skipped image "${name}": the ${MAX_TOTAL_IMAGE_BYTES / 1024 / 1024} MiB total image budget is used up (${imageBytes} bytes already attached).`);
+        continue;
+      }
+      imageCount += 1;
+      imageBytes += reference.bytes.length;
       blocks.push({ type: 'image', mimeType: reference.mimeType, data: Buffer.from(reference.bytes).toString('base64') });
       accepted += 1;
       continue;
