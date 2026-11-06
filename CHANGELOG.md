@@ -8,11 +8,19 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `--mcp-server-timeout <secs>` and `--mcp-server-max-runs <n>` (defaults 1800 and 4, shown in the
+  `run` tool description); a timed-out `run` is stopped with SIGTERM first and reports the child's
+  stderr tail and its saved session id (mini-agent-tu8q0).
 - ACP: with the new default-off `acp_client_file_access` (project-trust gated) and a client that
   advertises `fs.readTextFile`/`fs.writeTextFile`, `read`, `edit` and overwrite `write` use the
   editor's live text and publish through it, still behind the workspace and permission checks
   (mini-agent-oapz6).
 ### Security
+
+- `--mcp-server`: a `run` prompt starting with `!` is refused (it ran a raw shell command in the
+  child, bypassing permission rules), and `session_id` accepts only exact ids this server returned,
+  so other workspaces' saved sessions cannot be resumed by prefix or name (mini-agent-uibxw,
+  mini-agent-ksl5z).
 
 - `read` of a PDF parses in linear time and within node, font and ToUnicode-entry budgets, with a
   20 s deadline, so crafted unterminated objects or compressed array bombs fail fast instead of

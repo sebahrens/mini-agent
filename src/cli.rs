@@ -1014,6 +1014,28 @@ pub struct Cli {
     )]
     pub mcp_server_allow_cwd_override: bool,
 
+    /// With `--mcp-server`: bound on one `run`, in seconds.
+    #[cfg(feature = "mcp")]
+    #[arg(
+        long = "mcp-server-timeout",
+        requires = "mcp_server",
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..=86_400),
+        help = "With --mcp-server: stop a `run` after this many seconds (default 1800); a timed-out run reports its stderr tail and any saved session id"
+    )]
+    pub mcp_server_timeout: Option<u64>,
+
+    /// With `--mcp-server`: most `run` calls executing at once.
+    #[cfg(feature = "mcp")]
+    #[arg(
+        long = "mcp-server-max-runs",
+        requires = "mcp_server",
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..=64),
+        help = "With --mcp-server: most concurrent `run` calls (default 4); extra calls are refused"
+    )]
+    pub mcp_server_max_runs: Option<u32>,
+
     #[cfg(any(feature = "acp", feature = "loop"))]
     #[arg(
         long = "idle-exit",

@@ -241,14 +241,14 @@ child therefore applies exactly the provider, model, sandbox, permission and
 tool flags the server was started with, and the ordinary headless policy:
 permission asks cannot be answered over MCP and fail closed unless those flags
 allow the action. A non-zero exit returns `isError: true` with stdout and a
-bounded stderr tail; a run is stopped after 30 minutes. Requests are read while
+bounded stderr tail; a run is stopped after 30 minutes (`--mcp-server-timeout <seconds>`, 1-86400; the effective value is printed in the `run` tool description). On timeout the child gets SIGTERM and up to 12 s to save: the error then carries its stderr tail and, if it saved the session, the session id (also in `structuredContent`) so the work can be continued; a child that ignores SIGTERM is killed and reports no id. A `prompt` whose trimmed text starts with `!` is refused with `-32602`: in a headless child that prefix is the user-typed shell-command shortcut, which skips permission rules, so a remote prompt is never allowed to use it. Requests are read while
 a run executes: `ping` is answered, `notifications/cancelled` for the call's
 request id kills the child's whole process group and sends no reply (per the MCP
 cancellation utility), and a `_meta.progressToken` on the call yields
-`notifications/progress` heartbeats every 15 s. Up to 4 runs may overlap; a
-fifth is refused with error `-32000`. A persisted run reports its session id
+`notifications/progress` heartbeats every 15 s. Up to 4 runs may overlap
+(`--mcp-server-max-runs <N>`, 1-64); the next is refused with error `-32000`. A persisted run reports its session id
 (`structuredContent.session_id` and a trailing `[session_id: …]` line); pass it
-back as `session_id` to continue that conversation (`--session` on the child).
+back as `session_id` to continue that conversation (`--session` on the child). Only exact ids this server process returned are accepted (the server remembers up to 1024); a prefix, a session name, or any other session, including conversations of other workspaces, is refused with `-32602` naming the rule.
 `--mcp-server-allow-model-override` (default off) adds a per-call `model`
 argument; without it `model` is rejected. `--mcp-server-allow-cwd-override`
 (default off) adds a per-call `cwd`: a directory inside the server's workspace

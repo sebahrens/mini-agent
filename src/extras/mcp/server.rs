@@ -37,11 +37,17 @@ pub(crate) const MAX_PROMPT_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Most child stderr kept for a failure report.
 const MAX_STDERR_BYTES: usize = 8 * 1024;
-/// Bound on one headless run.
+/// Default bound on one headless run (`--mcp-server-timeout` overrides it).
 pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How long a timed-out child gets, after SIGTERM, to persist its partial
+/// transcript before the whole process group is killed.
+const STOP_GRACE: Duration = Duration::from_secs(12);
+/// Most session ids this server remembers having issued.
+const MAX_ISSUED_SESSIONS: usize = 1024;
 /// Bytes of child stdout captured before the JSON envelope is parsed.
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
-/// Most `run` calls executing at once; more are refused, not queued.
+/// Default for most `run` calls executing at once (`--mcp-server-max-runs`
+/// overrides it); more are refused, not queued.
 pub(crate) const MAX_CONCURRENT_RUNS: usize = 4;
 /// Longest accepted `session_id` / `model` argument.
 const MAX_ARG_BYTES: usize = 256;
@@ -64,6 +70,38 @@ pub(crate) struct RunCommand {
     pub(crate) allow_cwd_override: bool,
     /// The server's own workspace; a per-call `cwd` must stay inside it.
     pub(crate) workspace_root: PathBuf,
+    /// Most `run` calls executing at once.
+    pub(crate) max_runs: usize,
+    /// Grace given to a timed-out child to save its session after SIGTERM.
+    pub(crate) stop_grace: Duration,
+    /// Session ids this server process has returned; `run` resumes only these.
+    pub(crate) issued_sessions: IssuedSessions,
+}
+
+/// Session ids handed to the client by this server process (shared by clones).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IssuedSessions(Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+
+impl IssuedSessions {
+    pub(crate) fn record(&self, id: &str) {
+        let mut ids = self.0.lock().expect("issued sessions");
+        if ids.iter().any(|known| known == id) {
+            return;
+        }
+        if ids.len() >= MAX_ISSUED_SESSIONS {
+            ids.pop_front();
+        }
+        ids.push_back(id.to_owned());
+    }
+
+    /// Exact match only: never a prefix, name or foreign id.
+    fn contains(&self, id: &str) -> bool {
+        self.0
+            .lock()
+            .expect("issued sessions")
+            .iter()
+            .any(|known| known == id)
+    }
 }
 
 impl RunCommand {
@@ -74,11 +112,16 @@ impl RunCommand {
         Ok(Self {
             program: std::env::current_exe()?,
             args: forwarded_args(args.clone()),
-            timeout: RUN_TIMEOUT,
+            timeout: valued_flag(&args, "--mcp-server-timeout")
+                .map_or(RUN_TIMEOUT, Duration::from_secs),
             progress_interval: PROGRESS_INTERVAL,
             allow_model_override: has_flag(&args, "--mcp-server-allow-model-override"),
             allow_cwd_override: has_flag(&args, "--mcp-server-allow-cwd-override"),
             workspace_root: std::env::current_dir()?,
+            max_runs: valued_flag(&args, "--mcp-server-max-runs")
+                .map_or(MAX_CONCURRENT_RUNS, |runs| runs as usize),
+            stop_grace: STOP_GRACE,
+            issued_sessions: IssuedSessions::default(),
         })
     }
 
@@ -103,7 +146,7 @@ impl RunCommand {
 pub(crate) fn forwarded_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     // The server owns the child's output format (it needs the JSON envelope
     // for the session id), so a forwarded `--output` is dropped.
-    strip_valued_flag(
+    let args = strip_valued_flag(
         args.into_iter()
             .filter(|arg| {
                 arg.as_os_str() != "--mcp-server"
@@ -112,7 +155,25 @@ pub(crate) fn forwarded_args(args: impl IntoIterator<Item = OsString>) -> Vec<Os
             })
             .collect(),
         "--output",
-    )
+    );
+    let args = strip_valued_flag(args, "--mcp-server-timeout");
+    strip_valued_flag(args, "--mcp-server-max-runs")
+}
+
+/// Numeric value of `--flag N` / `--flag=N`, if present and valid.
+fn valued_flag(args: &[OsString], flag: &str) -> Option<u64> {
+    let prefix = format!("{flag}=");
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let text = arg.to_string_lossy();
+        if text == flag {
+            return iter.next()?.to_string_lossy().parse().ok();
+        }
+        if let Some(value) = text.strip_prefix(&prefix) {
+            return value.parse().ok();
+        }
+    }
+    None
 }
 
 fn has_flag(args: &[OsString], flag: &str) -> bool {
@@ -191,6 +252,15 @@ fn parse_run_request(
     if prompt.len() > MAX_PROMPT_BYTES {
         return Err("`prompt` exceeds 256 KiB".into());
     }
+    // The headless child treats a message starting with `!` as a user-typed
+    // shell command that skips permission rules. A remote prompt is model
+    // input only, so refuse it (the child trims the same way).
+    if prompt.trim().starts_with('!') {
+        return Err(
+            "`prompt` must not start with `!`: that is the interactive shell-command prefix, which bypasses the permission flags; rephrase the task as plain text"
+                .into(),
+        );
+    }
     let optional = |name: &str| -> Result<Option<String>, String> {
         match arguments.and_then(|args| args.get(name)) {
             None | Some(Value::Null) => Ok(None),
@@ -201,6 +271,14 @@ fn parse_run_request(
         }
     };
     let session_id = optional("session_id")?;
+    if let Some(id) = &session_id
+        && !command.issued_sessions.contains(id)
+    {
+        return Err(
+            "`session_id` must be an id returned by an earlier `run` call of this server process (exact value; prefixes, names and other sessions are refused)"
+                .into(),
+        );
+    }
     let model = optional("model")?;
     if model.is_some() && !command.allow_model_override {
         return Err(
@@ -229,8 +307,8 @@ fn parse_run_request(
 
 fn run_tool_definition(command: &RunCommand) -> Value {
     let mut properties = json!({
-        "prompt": {"type": "string", "description": "The task for mini-agent"},
-        "session_id": {"type": "string", "description": "Session id returned by an earlier `run`; continues that conversation instead of starting a fresh one"}
+        "prompt": {"type": "string", "description": "The task for mini-agent, as plain text (a prompt starting with `!` is refused)"},
+        "session_id": {"type": "string", "description": "Exact session id returned by an earlier `run` of this server process; continues that conversation instead of starting a fresh one"}
     });
     if command.allow_model_override {
         properties["model"] = json!({"type": "string", "description": "Model name for this call, overriding the server's"});
@@ -240,7 +318,7 @@ fn run_tool_definition(command: &RunCommand) -> Value {
     }
     json!({
         "name": "run",
-        "description": "Run one mini-agent prompt headlessly in the server's workspace with the server's configured provider, model, sandbox and permission flags, and return its final answer plus a session id that can be passed back as `session_id` to continue. Permission prompts cannot be answered: actions not allowed by those flags are refused.",
+        "description": format!("Run one mini-agent prompt headlessly in the server's workspace with the server's configured provider, model, sandbox and permission flags, and return its final answer plus a session id that can be passed back as `session_id` to continue. Permission prompts cannot be answered: actions not allowed by those flags are refused. A run is stopped after {} s (--mcp-server-timeout) and at most {} runs execute at once (--mcp-server-max-runs); a timed-out run reports its stderr tail and, when it saved one, its session id.", command.timeout.as_secs(), command.max_runs),
         "inputSchema": {
             "type": "object",
             "properties": properties,
@@ -393,7 +471,10 @@ async fn run_prompt(
     );
     enum Stop {
         Done(Captured),
-        TimedOut,
+        /// The deadline passed; the child saved what it had after SIGTERM.
+        TimedOut(Captured),
+        /// The deadline passed and the child ignored the graceful stop.
+        TimedOutKilled,
         Cancelled,
     }
     let started = tokio::time::Instant::now();
@@ -422,7 +503,21 @@ async fn run_prompt(
         loop {
             tokio::select! {
                 done = &mut work => break Stop::Done(done),
-                () = &mut deadline => break Stop::TimedOut,
+                () = &mut deadline => {
+                    // Ask the child alone to stop: its headless run then
+                    // persists the partial transcript and prints its envelope.
+                    #[cfg(unix)]
+                    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGTERM,
+                        );
+                    }
+                    break match tokio::time::timeout(command.stop_grace, &mut work).await {
+                        Ok(done) => Stop::TimedOut(done),
+                        Err(_) => Stop::TimedOutKilled,
+                    };
+                }
                 () = &mut cancelled => break Stop::Cancelled,
                 _ = tick.tick(), if progress.is_some() => {
                     beat += 1;
@@ -441,12 +536,17 @@ async fn run_prompt(
             }
         }
     };
+    let mut timed_out = false;
     let ((stdout, captured_truncated), (stderr, _), status) = match stop {
         Stop::Done(done) => done,
-        Stop::TimedOut => {
+        Stop::TimedOut(done) => {
+            timed_out = true;
+            done
+        }
+        Stop::TimedOutKilled => {
             kill_tree(&mut child, pid).await;
             return RunOutcome::failed(format!(
-                "mini-agent run timed out after {} s and was stopped",
+                "mini-agent run timed out after {} s and was stopped; it did not finish saving, so there is no session id to continue",
                 command.timeout.as_secs()
             ));
         }
@@ -473,7 +573,32 @@ async fn run_prompt(
         ));
     }
     if let Some(id) = &session_id {
+        command.issued_sessions.record(id);
         text.push_str(&format!("\n[session_id: {id}]"));
+    }
+    if timed_out {
+        let mut report = format!(
+            "mini-agent run timed out after {} s and was stopped (--mcp-server-timeout)",
+            command.timeout.as_secs()
+        );
+        match &session_id {
+            Some(id) => report.push_str(&format!(
+                "; the partial work was saved, pass session_id \"{id}\" to continue"
+            )),
+            None => report.push_str("; no session was saved"),
+        }
+        if !text.is_empty() {
+            report.push_str(&format!("\nstdout:\n{text}"));
+        }
+        let stderr = String::from_utf8_lossy(&stderr);
+        if !stderr.trim().is_empty() {
+            report.push_str(&format!("\nstderr:\n{}", stderr.trim_end()));
+        }
+        return RunOutcome::Finished {
+            text: report,
+            is_error: true,
+            session_id,
+        };
     }
     match status {
         Ok(status) if status.success() => RunOutcome::Finished {
@@ -567,7 +692,7 @@ pub(crate) async fn serve(
     });
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Value>();
     let cancels = Arc::new(std::sync::Mutex::new(Cancels::new()));
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RUNS));
+    let slots = Arc::new(tokio::sync::Semaphore::new(command.max_runs.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     let mut input_open = true;
     let outcome: anyhow::Result<()> = async {
@@ -620,7 +745,7 @@ pub(crate) async fn serve(
                         }
                     };
                     let Ok(permit) = slots.clone().try_acquire_owned() else {
-                        write_message(&mut output, &error(&id, -32000, &format!("too many concurrent `run` calls (limit {MAX_CONCURRENT_RUNS}); retry when one finishes"))).await?;
+                        write_message(&mut output, &error(&id, -32000, &format!("too many concurrent `run` calls (limit {}, --mcp-server-max-runs); retry when one finishes", command.max_runs.max(1)))).await?;
                         continue;
                     };
                     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
@@ -731,7 +856,18 @@ mod tests {
             allow_model_override: false,
             allow_cwd_override: false,
             workspace_root: std::env::temp_dir(),
+            max_runs: MAX_CONCURRENT_RUNS,
+            stop_grace: Duration::from_secs(5),
+            issued_sessions: IssuedSessions::default(),
         }
+    }
+
+    fn shell_with_session(script: &str, issued: &[&str]) -> RunCommand {
+        let command = shell(script);
+        for id in issued {
+            command.issued_sessions.record(id);
+        }
+        command
     }
 
     #[tokio::test]
@@ -898,7 +1034,10 @@ mod tests {
     #[tokio::test]
     async fn unpersisted_sessions_are_not_offered_and_session_id_is_passed_to_the_child() {
         let replies = exchange(
-            shell(r#"printf '{"result":"%s","session_id":"s","session_persisted":false}' "$*""#),
+            shell_with_session(
+                r#"printf '{"result":"%s","session_id":"s","session_persisted":false}' "$*""#,
+                &["sess-1"],
+            ),
             &[call(1, json!({"prompt":"p","session_id":"sess-1"}))],
         )
         .await;
@@ -918,6 +1057,7 @@ mod tests {
             json!({"prompt":"p","session_id":42}),
             json!({"prompt":"p","session_id":"a\nb"}),
             json!({"prompt":"p","model":"gpt"}),
+            json!({"prompt":"p","session_id":"valid-but-never-issued"}),
         ];
         let requests: Vec<Value> = bad
             .into_iter()
@@ -945,6 +1085,159 @@ mod tests {
         let replies = exchange(open, &[call(1, json!({"prompt":"p","model":"m-1"}))]).await;
         let text = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("--model m-1 --output json"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn bang_prompts_are_refused_and_never_reach_the_child() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-mcp-bang-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let marker = base.join("x");
+        // If the child ever started it would create the marker.
+        let command = shell(&format!("touch '{}'; echo ran", marker.display()));
+        let prompts = [
+            format!("!touch {}", marker.display()),
+            format!("  \n\t!touch {}", marker.display()),
+            format!("\u{a0}\u{2003}!touch {}", marker.display()),
+            "!".to_string(),
+        ];
+        let requests: Vec<Value> = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| call(i as i64 + 1, json!({"prompt": p})))
+            .collect();
+        let replies = exchange(command, &requests).await;
+        assert!(
+            replies.iter().all(|r| r["error"]["code"] == -32602
+                && r["error"]["message"].as_str().unwrap().contains('!')),
+            "{replies:?}"
+        );
+        assert!(!marker.exists(), "a `!` prompt reached the child");
+        // A bang that is not leading is ordinary model text.
+        let replies = exchange(shell("echo ok"), &[call(1, json!({"prompt":"say hi!"}))]).await;
+        assert_eq!(replies[0]["result"]["isError"], false);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn only_session_ids_this_server_issued_can_be_resumed() {
+        let command = shell_with_session(
+            r#"printf '{"result":"%s","session_id":"s","session_persisted":false}' "$*""#,
+            &["0b9f6c1e-1111-2222-3333-444455556666"],
+        );
+        let replies = exchange(
+            command,
+            &[
+                // A prefix of a (foreign or own) session id, a name, and a path.
+                call(1, json!({"prompt":"p","session_id":"0b9f"})),
+                call(2, json!({"prompt":"p","session_id":"my-interactive-session"})),
+                call(3, json!({"prompt":"p","session_id":"../other"})),
+                call(4, json!({"prompt":"p","session_id":"0b9f6c1e-1111-2222-3333-444455556666"})),
+            ],
+        )
+        .await;
+        for refused in &replies[..3] {
+            assert_eq!(refused["error"]["code"], -32602, "{refused}");
+            assert!(
+                refused["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("returned by an earlier `run`")
+            );
+        }
+        assert_eq!(replies[3]["result"]["isError"], false, "{:?}", replies[3]);
+    }
+
+    #[tokio::test]
+    async fn a_returned_session_id_is_remembered_for_the_next_call() {
+        let command = shell(
+            r#"printf '{"result":"ok","session_id":"issued-1","session_persisted":true}'"#,
+        );
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 16);
+        let (server_out, client_out) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(serve(command, server_in, server_out));
+        let mut lines = tokio::io::BufReader::new(client_out).lines();
+        for request in [
+            call(1, json!({"prompt":"p"})),
+            call(2, json!({"prompt":"p","session_id":"issued-1"})),
+            call(3, json!({"prompt":"p","session_id":"issued"})),
+        ] {
+            let mut bytes = serde_json::to_vec(&request).unwrap();
+            bytes.push(b'\n');
+            client_in.write_all(&bytes).await.unwrap();
+            let reply: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            match request["id"].as_i64().unwrap() {
+                3 => assert_eq!(reply["error"]["code"], -32602, "{reply}"),
+                _ => assert_eq!(reply["result"]["isError"], false, "{reply}"),
+            }
+        }
+        drop(client_in);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_run_reports_stderr_and_the_session_it_saved() {
+        // Like the real headless child: on SIGTERM it saves and prints its envelope.
+        let mut saves = shell(
+            r#"trap 'echo "stopped at step 3" >&2; printf "%s\n" "{\"result\":\"partial\",\"session_id\":\"saved-1\",\"session_persisted\":true}"; exit 130' TERM; sleep 30 >/dev/null 2>&1 & wait"#,
+        );
+        saves.timeout = Duration::from_millis(300);
+        let replies = exchange(
+            saves.clone(),
+            &[call(1, json!({"prompt":"x"}))],
+        )
+        .await;
+        let result = &replies[0]["result"];
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(result["isError"], true, "{text}");
+        assert!(text.contains("timed out after"), "{text}");
+        assert!(text.contains("saved-1") && text.contains("stopped at step 3"), "{text}");
+        assert_eq!(result["structuredContent"]["session_id"], "saved-1");
+        // The reported id is now resumable.
+        assert!(saves.issued_sessions.contains("saved-1"));
+
+        // A child that ignores SIGTERM is killed after the grace; no id.
+        let mut stubborn = shell(r#"trap '' TERM; while :; do sleep 1; done"#);
+        stubborn.timeout = Duration::from_millis(200);
+        stubborn.stop_grace = Duration::from_millis(300);
+        let replies = exchange(stubborn, &[call(1, json!({"prompt":"x"}))]).await;
+        let text = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(replies[0]["result"]["isError"], true);
+        assert!(text.contains("timed out") && text.contains("no session id"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn max_runs_and_timeout_are_configurable_and_advertised() {
+        let mut command = shell("sleep 1; echo ok");
+        command.max_runs = 1;
+        command.timeout = Duration::from_secs(90);
+        let replies = exchange(
+            command.clone(),
+            &[
+                json!({"jsonrpc":"2.0","id":10,"method":"tools/list"}),
+                call(1, json!({"prompt":"x"})),
+                call(2, json!({"prompt":"x"})),
+            ],
+        )
+        .await;
+        let refused = replies.iter().filter(|r| r["error"]["code"] == -32000).count();
+        assert_eq!(refused, 1, "{replies:?}");
+        let listed = replies.iter().find(|r| r["id"] == 10).unwrap();
+        let description = listed["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(description.contains("90 s") && description.contains("at most 1 runs"), "{description}");
+        let args: Vec<OsString> = ["--mcp-server", "--mcp-server-timeout", "7", "--mcp-server-max-runs=2", "--read-only"]
+            .map(OsString::from)
+            .to_vec();
+        assert_eq!(valued_flag(&args, "--mcp-server-timeout"), Some(7));
+        assert_eq!(valued_flag(&args, "--mcp-server-max-runs"), Some(2));
+        assert_eq!(forwarded_args(args), ["--read-only"].map(OsString::from));
     }
 
     #[tokio::test]
