@@ -9,7 +9,8 @@
 //! binary installed by a package manager, a build tree or the VS Code extension
 //! is left alone with the command that updates it. Build provenance is not
 //! checked by checksum alone: when an authenticated GitHub CLI is available the
-//! archive must also pass `gh attestation verify --repo <slug>` before anything is
+//! archive must also pass `gh attestation verify --repo <slug> --signer-workflow <release.yml>
+//! --source-ref refs/tags/v<version>` (the release workflow for that tag) before anything is
 //! installed (a failure aborts); without it the manual command is printed and the
 //! install needs `--allow-unattested` or an interactive confirmation.
 //! `MINI_AGENT_SKIP_ATTESTATION=1` skips the check as in `install.sh`, and an
@@ -458,7 +459,13 @@ async fn run_inner(args: UpdateArgs) -> Result<(), String> {
     let manifest = String::from_utf8(manifest).map_err(|_| "SHA256SUMS is not UTF-8")?;
     let binary = verified_binary(&manifest, &archive_name, &archive)?;
     println!("Checksum verified against SHA256SUMS.");
-    let attestation = verify_provenance(&archive_name, &archive, args.allow_unattested).await?;
+    let attestation = verify_provenance(
+        &archive_name,
+        &archive,
+        &format!("v{requested}"),
+        args.allow_unattested,
+    )
+    .await?;
     install_verified(&exe, &binary, &requested).await?;
     println!(
         "Updated mini-agent {current} -> {requested} at {}",
@@ -495,6 +502,12 @@ fn run_gh(
         .output()
 }
 
+/// The workflow that signs release attestations: only artifacts built by this
+/// workflow count, not those of a branch or pull-request workflow.
+pub(crate) fn release_signer_workflow(repo: &str) -> String {
+    format!("{repo}/.github/workflows/release.yml")
+}
+
 /// Mirrors `install.sh`'s `verify_attestation`: skip on request, report an
 /// unusable `gh` as unavailable, and treat only a rejection by a working `gh`
 /// as a failure. `program` is the GitHub CLI executable (injectable for tests).
@@ -502,6 +515,7 @@ pub(crate) fn check_attestation(
     program: &std::ffi::OsStr,
     archive: &Path,
     repo: &str,
+    tag: &str,
     skip: bool,
     no_gh: bool,
 ) -> Attestation {
@@ -547,6 +561,10 @@ pub(crate) fn check_attestation(
             archive.as_os_str(),
             OsStr::new("--repo"),
             OsStr::new(repo),
+            OsStr::new("--signer-workflow"),
+            OsStr::new(&release_signer_workflow(repo)),
+            OsStr::new("--source-ref"),
+            OsStr::new(&format!("refs/tags/{tag}")),
         ],
     ) {
         Ok(output) if output.status.success() => Attestation::Verified,
@@ -587,8 +605,10 @@ pub(crate) fn attestation_action(
 fn manual_attestation_hint(archive_name: &str) -> String {
     format!(
         "  Verify it yourself with the GitHub CLI (https://cli.github.com):\n    \
-         gh attestation verify {archive_name} --repo {}",
-        crate::product::REPOSITORY_SLUG
+         gh attestation verify {archive_name} --repo {slug} --signer-workflow {workflow} \
+         --source-ref refs/tags/<tag>",
+        slug = crate::product::REPOSITORY_SLUG,
+        workflow = release_signer_workflow(crate::product::REPOSITORY_SLUG),
     )
 }
 
@@ -620,17 +640,20 @@ fn stage_archive(name: &str, archive: &[u8]) -> Result<PathBuf, String> {
 async fn verify_provenance(
     archive_name: &str,
     archive: &[u8],
+    tag: &str,
     allow_unattested: bool,
 ) -> Result<Attestation, String> {
     let staged = stage_archive(archive_name, archive)?;
     let skip = std::env::var("MINI_AGENT_SKIP_ATTESTATION").is_ok_and(|v| v == "1");
     let no_gh = std::env::var("MINI_AGENT_INSTALL_NO_GH").is_ok_and(|v| v == "1");
     let path = staged.clone();
+    let pinned_tag = tag.to_owned();
     let outcome = tokio::task::spawn_blocking(move || {
         check_attestation(
             std::ffi::OsStr::new("gh"),
             &path,
             crate::product::REPOSITORY_SLUG,
+            &pinned_tag,
             skip,
             no_gh,
         )
@@ -643,7 +666,7 @@ async fn verify_provenance(
     let outcome = outcome?;
     match &outcome {
         Attestation::Verified => println!(
-            "Verified build provenance for {archive_name} (gh attestation verify --repo {}).",
+            "Verified build provenance for {archive_name} (gh attestation verify --repo {}, release workflow, {tag}).",
             crate::product::REPOSITORY_SLUG
         ),
         Attestation::Skipped => {
@@ -992,7 +1015,14 @@ mod tests {
         let archive = dir.join("a.tar.gz");
         let log = dir.join("calls.log");
         let run = |gh: &Path, skip: bool, no_gh: bool| {
-            check_attestation(gh.as_os_str(), &archive, "owner/repo", skip, no_gh)
+            check_attestation(
+                gh.as_os_str(),
+                &archive,
+                "owner/repo",
+                "v1.2.3",
+                skip,
+                no_gh,
+            )
         };
         // A working gh that accepts the archive: the verify call names archive and repo.
         let ok = stub_gh(&dir, &format!("echo \"$@\" >> {}\nexit 0", log.display()));
@@ -1000,7 +1030,8 @@ mod tests {
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
             calls.contains(&format!(
-                "attestation verify {} --repo owner/repo",
+                "attestation verify {} --repo owner/repo --signer-workflow \
+                 owner/repo/.github/workflows/release.yml --source-ref refs/tags/v1.2.3",
                 archive.display()
             )),
             "{calls}"
