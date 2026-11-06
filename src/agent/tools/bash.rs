@@ -751,6 +751,20 @@ pub struct JobStatusTool {
     max_output_lines: Option<u64>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    /// Per job, the typed text of the line not yet ended by Enter. Permission
+    /// is judged on this plus the next chunk, so a command split across calls
+    /// is seen whole.
+    pending_input: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+/// The first byte `job_status` input may not carry: C0 controls other than
+/// tab, LF and CR, and DEL. The terminal's line discipline and readline act
+/// on them (kill line, erase, signal), so the typed text would no longer be
+/// the command that was judged.
+fn disallowed_input_control(input: &str) -> Option<char> {
+    input
+        .chars()
+        .find(|c| (c.is_control() && !matches!(c, '\n' | '\r' | '\t')) || *c == '\u{7f}')
 }
 
 impl JobStatusTool {
@@ -760,6 +774,7 @@ impl JobStatusTool {
             max_output_lines,
             permission: None,
             ask_tx: None,
+            pending_input: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -798,6 +813,8 @@ impl JobStatusTool {
     }
 }
 
+/// Longest unterminated typed line remembered for permission judging.
+const MAX_PENDING_INPUT_LINE_BYTES: usize = 16 * 1024;
 /// Output must be silent this long after typed input before the result is
 /// returned.
 const INPUT_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
@@ -832,7 +849,7 @@ impl Tool for JobStatusTool {
                 "input": {
                     "type": "string",
                     "maxLength": 16384,
-                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
+                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command, together with any unterminated line already typed. C0 control characters other than tab, newline and carriage return (Ctrl-U, Ctrl-C, backspace, ESC, DEL) are refused. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -900,7 +917,13 @@ impl Tool for JobStatusTool {
         ))?;
         match args.action {
             JobAction::Poll => self.sandbox.background_job_snapshot(id).map(drop),
-            JobAction::Stop => self.sandbox.stop_background_job(id).await.map(drop),
+            JobAction::Stop => {
+                self.pending_input
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(id);
+                self.sandbox.stop_background_job(id).await.map(drop)
+            }
             JobAction::Wait => self
                 .sandbox
                 .wait_background_job(
@@ -911,6 +934,12 @@ impl Tool for JobStatusTool {
                 .map(drop),
             JobAction::Input => {
                 let input = args.input.as_deref().unwrap_or_default();
+                if let Some(control) = disallowed_input_control(input) {
+                    return Err(ToolError::Msg(format!(
+                        "job_status input contains the control character U+{:04X}, which the terminal would interpret (erase, kill-line, signal, escape) instead of typing it, so the command could differ from what was permission-checked. Send plain text with \\n only; stop the job to interrupt it.",
+                        control as u32
+                    )));
+                }
                 // Typed text can run anything the terminal's program accepts,
                 // so it is judged exactly like a shell script: deny rules
                 // apply, and manual mode prompts. Unknown or finished jobs are
@@ -919,13 +948,33 @@ impl Tool for JobStatusTool {
                     .background_job_input_handle(id, input.len())
                     .map(drop)
                     .map_err(ToolError::Msg)?;
+                // The line being typed spans calls: judge it with the unterminated
+                // text already sent, so `to` then `uch x\n` is `touch x`.
+                let pending = self
+                    .pending_input
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default();
+                let combined = format!("{pending}{input}");
+                let tail = combined
+                    .rsplit(['\n', '\r'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if tail.len() > MAX_PENDING_INPUT_LINE_BYTES {
+                    return Err(ToolError::Msg(
+                        "job_status input: the unterminated line is too long; end it with \\n".into(),
+                    ));
+                }
                 let (checked, _released) = super::concurrency::prompt_unlocked(check_perm(
                     &self.permission,
                     &self.ask_tx,
                     "shell",
                     // Typing Enter is not part of the command text a rule
                     // would name.
-                    input.trim_end_matches(['\n', '\r']),
+                    combined.trim_end_matches(['\n', '\r']),
                 ))
                 .await;
                 checked?;
@@ -935,6 +984,10 @@ impl Tool for JobStatusTool {
                     .await
                 {
                     Ok(()) => {
+                        self.pending_input
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert(id.to_string(), tail);
                         // Give the program time to echo and answer.
                         self.settle_after_input(id).await;
                         Ok(())
@@ -2555,6 +2608,68 @@ mod tests {
         assert!(seen.contains("allowed-input"), "{seen}");
         assert!(!marker.exists(), "denied input reached the terminal");
         job_input(&status, &id, "exit\n").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_input_refuses_control_bytes_and_judges_split_lines_whole() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        let dir = std::env::current_dir().unwrap();
+        let kill = dir.join(format!("job-input-kill-{}", std::process::id()));
+        let split = dir.join(format!("job-input-split-{}", std::process::id()));
+        let _ = std::fs::remove_file(&kill);
+        let _ = std::fs::remove_file(&split);
+        let shell = test_tool();
+        let id = start_pty_job(&shell, "sh").await;
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("touch *".to_string(), Action::Deny),
+                        ("*".to_string(), Action::Allow),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Yolo,
+        );
+        let status =
+            JobStatusTool::new(shell.sandbox.clone(), None).with_permission(Some(permission), None);
+        // `ls` + Ctrl-U + `touch ...` is judged as one allowed word without the guard.
+        for byte in ["\u{15}", "\u{8}", "\u{7f}", "\u{17}", "\u{3}", "\u{4}", "\u{1b}"] {
+            let error = job_input(
+                &status,
+                &id,
+                &format!("ls{byte}touch {}\n", kill.file_name().unwrap().to_string_lossy()),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("control character"), "{error}");
+        }
+        // The deny still holds when the command is split over two calls.
+        job_input(&status, &id, "to").await.unwrap();
+        let error = job_input(
+            &status,
+            &id,
+            &format!("uch {}\n", split.file_name().unwrap().to_string_lossy()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("denied"),
+            "{error}"
+        );
+        job_input(&status, &id, "echo alive\n").await.unwrap();
+        assert!(!kill.exists() && !split.exists(), "refused input ran");
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    #[test]
+    fn disallowed_input_control_allows_only_tab_lf_cr() {
+        assert_eq!(disallowed_input_control("a\tb\r\nc é"), None);
+        assert_eq!(disallowed_input_control("a\u{15}"), Some('\u{15}'));
+        assert_eq!(disallowed_input_control("\u{7f}"), Some('\u{7f}'));
     }
 
     /// Default closed: with an ask policy and nobody to ask, typed input is
