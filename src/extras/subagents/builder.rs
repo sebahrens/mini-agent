@@ -156,7 +156,7 @@ pub(crate) enum ReadOnlyShellState {
     /// Eligible but not yet bound: counts for tool-name preflight only and
     /// never installs a tool.
     Planned,
-    Bound(ReadOnlyShell),
+    Bound(Box<ReadOnlyShell>),
 }
 
 /// Captured from the actual parent builder, including its tool eligibility.
@@ -277,7 +277,9 @@ impl SubagentAuthorization {
     /// Install the bound read-only shell, or drop a planned one (`None`).
     #[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
     pub(crate) fn with_read_only_shell(mut self, shell: Option<ReadOnlyShell>) -> Self {
-        self.read_only_shell = shell.map_or(ReadOnlyShellState::None, ReadOnlyShellState::Bound);
+        self.read_only_shell = shell.map_or(ReadOnlyShellState::None, |shell| {
+            ReadOnlyShellState::Bound(Box::new(shell))
+        });
         self
     }
 
