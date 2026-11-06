@@ -6801,6 +6801,7 @@ mod compaction_quality_tests {
             session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path":path}));
             let output = read
                 .call(ReadArgs {
+                    pages: None,
                     raw_notebook: false,
                     character_offset: None,
                     character_limit: None,

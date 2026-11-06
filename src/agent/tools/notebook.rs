@@ -1312,6 +1312,7 @@ mod tests {
             WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(root.path());
         let view = read
             .call(ReadArgs {
+                pages: None,
                 path: "book.ipynb".into(),
                 raw_notebook: false,
                 character_offset: None,
@@ -1330,6 +1331,7 @@ mod tests {
         assert!(write.call(write_args()).await.is_err());
         let raw = read
             .call(ReadArgs {
+                pages: None,
                 path: "book.ipynb".into(),
                 raw_notebook: true,
                 character_offset: None,

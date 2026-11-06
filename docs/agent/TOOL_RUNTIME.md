@@ -741,6 +741,33 @@ an owned Unix child held before exec. Explicit unlock ends the lock's ownership
 before receipt acknowledgement; inherited descriptors cannot extend it after
 the ledger operation completes. Corrupt-tail failures retain bytes and charges.
 
+### PDF text from `read`
+
+`read` recognises a `%PDF-` header and returns the document's extracted text
+layer instead of the UTF-8 error. `src/agent/tools/pdf_text.rs` is a bounded,
+in-process extractor, not a renderer: it locates indirect objects by scanning
+(damaged cross-reference tables are tolerated), expands compressed object
+streams, walks the page tree, inflates `FlateDecode`/`ASCIIHexDecode` content
+streams and collects the strings shown by text operators, placing line breaks
+and word spaces from the text and graphics matrices. Fonts with a `ToUnicode`
+CMap decode through it; simple fonts use WinAnsi or MacRoman. Form XObjects and
+annotations are not searched. Nothing executes, renders or touches the network.
+
+Output starts with `PDF: <path> (N pages; extracted text layer of page(s) ...)`
+and marks each page with `--- page N ---`. `pages` selects 1-indexed pages
+(`"3"`, `"1-5"`, `"2,4,7-9"`, `"8-"`), at most 20 per call; a PDF over 20 pages
+without `pages` returns guidance naming the page count and the next ranges. Line
+`offset`/`limit` and character windows are refused for PDFs, and `pages` is
+refused for other files. Output shares the `[tool_limits] max_result_chars`
+budget: selection stops before the first page that would exceed it with
+`continue with pages:"N-M"`, and an oversized single page is clipped. Pages
+without text show `[no text layer on this page]`; when no selected page has a
+text layer the result says the PDF is probably scanned and suggests exporting
+the pages as PNG (for example with `pdftoppm`) and reading the images. Encrypted
+PDFs are refused. Limits: 64 MiB per file, 32 MiB decoded per stream, 256 MiB
+decoded per call, nesting depth 64. The extracted text never authorizes an
+overwrite of the PDF.
+
 ### Notebook cells
 
 `src/agent/tools/notebook.rs` implements `notebook_edit` and the cell view used

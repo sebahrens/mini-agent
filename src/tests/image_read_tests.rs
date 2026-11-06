@@ -175,6 +175,7 @@ async fn image_read64_actual_read_keeps_bytes_permissions_and_overwrite_proof_se
     let tool = ReadTool::new_with_tracker(None, None, Some(16), 100, tracker.clone())
         .with_workspace(root.path());
     let args = |path: &str| ReadArgs {
+        pages: None,
         path: path.into(),
         offset: None,
         limit: None,
@@ -883,6 +884,7 @@ async fn image_read64_existing_read_deny_and_byte_limit_precede_payload() {
         .unwrap(),
     ));
     let args = || ReadArgs {
+        pages: None,
         path: "image".into(),
         offset: None,
         limit: None,
@@ -957,6 +959,7 @@ async fn image_read64_feature_off_retains_data_but_refuses_read_and_dispatch() {
     let error = crate::agent::tools::ReadTool::new(None, None, None, 100)
         .with_workspace(root.path())
         .call(crate::agent::tools::ReadArgs {
+            pages: None,
             path: "pixel.png".into(),
             offset: None,
             limit: None,

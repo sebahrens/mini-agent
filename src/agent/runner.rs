@@ -7632,6 +7632,7 @@ mod tests {
         let repeated =
             crate::agent::tools::ReadTool::new_with_tracker(None, None, None, 2_000, tracker)
                 .call(crate::agent::tools::ReadArgs {
+                    pages: None,
                     raw_notebook: false,
                     character_offset: None,
                     character_limit: None,

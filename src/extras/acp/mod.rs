@@ -11701,6 +11701,7 @@ mod workspace_tests {
         let second_read = ReadTool::new(None, None, None, 100).with_workspace_root(second.clone());
         let (first_value, second_value) = tokio::join!(
             first_read.call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -11709,6 +11710,7 @@ mod workspace_tests {
                 limit: None,
             }),
             second_read.call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -11878,6 +11880,7 @@ mod workspace_tests {
             .join("sentinel.txt");
         let error = tool
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -11965,6 +11968,7 @@ mod workspace_tests {
         assert!(workspace.validate().is_err());
         assert!(
             read.call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -12029,6 +12033,7 @@ mod workspace_tests {
         let read = ReadTool::new(None, None, None, 100)
             .with_workspace_binding(workspace.clone())
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,

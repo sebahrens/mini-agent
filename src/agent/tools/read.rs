@@ -220,7 +220,7 @@ impl Tool for ReadTool {
             ),
         };
         format!(
-            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per cell and 16 KiB per view; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization.",
+            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per cell and 16 KiB per view; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); scanned PDFs without a text layer are reported as such.",
             super::limits::current().max_result_chars,
             super::limits::current().max_read_line_chars
         )
@@ -235,6 +235,7 @@ impl Tool for ReadTool {
                 "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines to read" },
                 "character_offset": { "type": "integer", "minimum": 1, "description": "1-indexed Unicode character offset for a bounded text slice, including inside very long lines. Cannot combine with line offset/limit." },
                 "character_limit": { "type": "integer", "minimum": 1, "description": "Maximum Unicode characters for a text slice (default 16000); output byte cap still applies. Partial slices never authorize a text overwrite." },
+                "pages": { "type": "string", "description": "PDF only: 1-indexed pages to extract, e.g. \"1-5\" or \"2,4,7-9\" (at most 20 per call; required for PDFs over 20 pages)" },
                 "raw_notebook": { "type": "boolean", "description": "For .ipynb: read raw JSON instead of virtual cell/source/output lines; required for raw hashedit or full-file overwrite authorization", "default": false }
             },
             "required": ["path"]
@@ -507,6 +508,49 @@ impl ReadTool {
             return Ok(match coaching {
                 Some(coaching) => format!("{coaching}\n\n{summary}"),
                 None => summary,
+            });
+        }
+        let pdf = super::pdf_text::is_pdf(reader.fill_buf().await?);
+        if args.pages.is_some() && !pdf {
+            return Err(ToolError::Msg(
+                "pages applies only to PDF files; use offset/limit for text files".into(),
+            ));
+        }
+        if pdf {
+            use tokio::io::AsyncReadExt;
+            if args.offset.is_some() || args.limit.is_some() || character_window {
+                return Err(ToolError::Msg(
+                    "PDF reads select pages with pages (for example \"1-5\"), not offset/limit or character_offset/character_limit".into(),
+                ));
+            }
+            let cap = super::pdf_text::MAX_PDF_BYTES;
+            if !metadata.is_file() || metadata.len() > cap {
+                return Err(ToolError::Msg(format!(
+                    "PDF reads require a regular file no larger than {} MiB",
+                    cap / (1024 * 1024)
+                )));
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            reader.take(cap + 1).read_to_end(&mut bytes).await?;
+            if bytes.len() as u64 > cap {
+                return Err(ToolError::Msg("PDF grew beyond the read limit".into()));
+            }
+            let budget = super::limits::current()
+                .max_result_chars
+                .saturating_sub(READ_RESULT_RESERVE_CHARS);
+            let render_path = path.clone();
+            let pages = args.pages.clone();
+            let text = crate::agent::runner::spawn_blocking_scoped(move || {
+                super::pdf_text::render(&bytes, &render_path, pages.as_deref(), budget)
+            })
+            .await
+            .map_err(|_| ToolError::Msg("PDF text extraction job failed".into()))?
+            .map_err(ToolError::Msg)?;
+            // Extracted text never authorizes an overwrite of the PDF.
+            self.read_tracker.untrack_read_path(&permission_path);
+            return Ok(match coaching {
+                Some(coaching) => format!("{coaching}\n\n{text}"),
+                None => text,
             });
         }
         if character_window {
@@ -1159,6 +1203,7 @@ mod tests {
         let tool = ReadTool::new(None, None, None, 100);
         let error = tool
             .call(crate::agent::tools::ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1175,6 +1220,7 @@ mod tests {
         let tool = ReadTool::new(None, None, None, 0);
         assert!(
             tool.call(crate::agent::tools::ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1226,6 +1272,7 @@ mod tests {
 
         let output = ReadTool::new(None, None, None, 100)
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1255,6 +1302,7 @@ mod tests {
 
         let output = tool
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1284,6 +1332,7 @@ mod tests {
 
         let error = tool
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1310,6 +1359,7 @@ mod tests {
 
         let error = tool
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1364,6 +1414,7 @@ mod tests {
         let tool = ReadTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None, 100);
 
         let call = tool.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -1439,6 +1490,7 @@ mod tests {
 
         let error = ReadTool::new(None, None, Some(4), 100)
             .call(ReadArgs {
+                pages: None,
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
@@ -1474,6 +1526,7 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
         let output = ReadTool::new(None, None, None, 100)
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
@@ -1491,6 +1544,7 @@ mod tests {
 
     fn read_args(path: &std::path::Path) -> ReadArgs {
         ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -1646,6 +1700,78 @@ mod tests {
         assert!(output.contains("plt.plot(x)"), "{output}");
         assert!(output.contains("[image/png output omitted]"), "{output}");
         assert!(output.len() < 4096, "{}", output.len());
+    }
+
+    /// mini-agent-yjixs: PDFs return their text layer with page markers,
+    /// large documents require pages, and scanned PDFs say so.
+    #[tokio::test]
+    async fn pdf_reads_extract_selected_pages_and_guide_large_or_scanned_documents() {
+        use crate::agent::tools::pdf_text::test_pdf::{Content, build};
+        let dir = crate::tests::support::temp::TempDir::new("read-pdf");
+        let pages: Vec<Content> = (1..=25)
+            .map(|n| Content::Deflated(format!("BT /F1 12 Tf 72 720 Td (Text of page {n}) Tj ET")))
+            .collect();
+        let path = dir.path().join("spec.pdf");
+        std::fs::write(&path, build(&pages, false)).unwrap();
+        let read = |pages: Option<&str>| {
+            let args = ReadArgs {
+                pages: pages.map(str::to_owned),
+                ..read_args(&path)
+            };
+            async move { ReadTool::new(None, None, None, 2000).call(args).await }
+        };
+
+        let selected = read(Some("1-5")).await.unwrap();
+        assert!(
+            selected.contains("(25 pages; extracted text layer of page(s) 1-5;"),
+            "{selected}"
+        );
+        assert!(
+            selected.contains("--- page 1 ---\nText of page 1"),
+            "{selected}"
+        );
+        assert!(
+            selected.contains("--- page 5 ---\nText of page 5"),
+            "{selected}"
+        );
+        assert!(!selected.contains("page 6"), "{selected}");
+
+        let guidance = read(None).await.unwrap_err().to_string();
+        assert!(guidance.contains("is a PDF with 25 pages"), "{guidance}");
+        assert!(guidance.contains("pages:\"1-20\""), "{guidance}");
+        assert!(!guidance.contains("UTF-8"), "{guidance}");
+        assert!(read(Some("1-21")).await.is_err());
+
+        let scanned = dir.path().join("scan.pdf");
+        std::fs::write(
+            &scanned,
+            build(
+                &[Content::Plain("q 612 0 0 792 0 0 cm /Im0 Do Q".into())],
+                false,
+            ),
+        )
+        .unwrap();
+        let output = ReadTool::new(None, None, None, 2000)
+            .call(read_args(&scanned))
+            .await
+            .unwrap();
+        assert!(
+            output.contains("no text layer found on page(s) 1"),
+            "{output}"
+        );
+        assert!(output.contains("pdftoppm -png"), "{output}");
+
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, "plain\n").unwrap();
+        let error = ReadTool::new(None, None, None, 2000)
+            .call(ReadArgs {
+                pages: Some("1".into()),
+                ..read_args(&text)
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pages applies only to PDF files"), "{error}");
     }
 
     #[tokio::test]

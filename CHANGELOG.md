@@ -33,6 +33,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Notebooks have their own size limit, `[tool_limits] notebook_max_bytes` (default 32 MiB, hard
   ceiling 64 MiB), so executed notebooks with image outputs read and edit under the 1 MiB text
   cap; a view window over the 64 KiB cap is truncated with the next `offset` instead of failing.
+- `read` extracts the text layer of PDF files in every build, with `--- page N ---` markers and a
+  `pages` selection (at most 20 per call, required above 20 pages), instead of the UTF-8 error;
+  scanned PDFs report that they have no text layer and suggest exporting pages as images.
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

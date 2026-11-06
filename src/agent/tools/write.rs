@@ -817,6 +817,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
 
         read.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -850,6 +851,7 @@ mod tests {
             WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(temp.path());
 
         read.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,

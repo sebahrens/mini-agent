@@ -27,8 +27,10 @@ Use a vision-capable model and one of these entrypoints:
 - ACP clients can submit inline image content blocks. The inline bytes are
   authoritative; a supplied URI is display metadata and is never fetched.
 
-A scanned PDF is a different input format. The default build does not enable
-`pdf`, and `read` does not rasterize PDF pages or perform OCR. The optional `pdf`
+`read` extracts the text layer of a PDF in every build (see the PDF section of
+[TOOL_RUNTIME.md](TOOL_RUNTIME.md#pdf-text-from-read)). A scanned PDF has no text
+layer: `read` reports `no text layer found on page(s) ...` and suggests exporting
+the pages as images. It does not rasterize PDF pages or perform OCR. The optional `pdf`
 feature enables a separate native document attachment surface, subject to the
 selected provider's document support; it does not convert a scan into images.
 Export the needed pages as PNG/JPEG to use the image paths above. No local

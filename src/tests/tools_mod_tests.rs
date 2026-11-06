@@ -249,6 +249,7 @@ async fn concurrent_read_tools_with_different_settings_do_not_share_history() {
     let denying = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(true));
     let allowing = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(false));
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -283,6 +284,7 @@ async fn repeated_read_is_allowed_after_same_length_mtime_preserving_change() {
     tokio::fs::write(&path, "before").await.unwrap();
     let tool = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(true));
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -320,6 +322,7 @@ async fn failed_read_is_not_recorded_as_successful() {
     tokio::fs::write(&path, "too large").await.unwrap();
     let tool = ReadTool::new_with_tracker(None, None, Some(1), 100, ReadTracker::new(true));
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -352,6 +355,7 @@ async fn rebuilt_read_tool_keeps_its_logical_session_history() {
     let session_tracker = ReadTracker::new(true);
     let first_build = ReadTool::new_with_tracker(None, None, None, 100, session_tracker.clone());
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -384,6 +388,7 @@ async fn loading_another_session_starts_fresh_read_history() {
     tokio::fs::write(&path, "contents").await.unwrap();
     let path = path.to_string_lossy().into_owned();
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -417,6 +422,7 @@ async fn imported_session_uses_active_allow_repeated_reads_setting() {
     tokio::fs::write(&path, "contents").await.unwrap();
     let path = path.to_string_lossy().into_owned();
     let args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -455,6 +461,7 @@ async fn canonical_path_key_blocks_dot_alias_of_same_file() {
 
     assert!(
         tool.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -467,6 +474,7 @@ async fn canonical_path_key_blocks_dot_alias_of_same_file() {
     );
     assert!(
         tool.call(ReadArgs {
+            pages: None,
             raw_notebook: false,
             character_offset: None,
             character_limit: None,
@@ -497,6 +505,7 @@ async fn edit_file_version_change_invalidates_every_session_tracker() {
     let other_read = ReadTool::new_with_tracker(None, None, None, 100, other_tracker);
     let owner_edit = EditTool::new_with_tracker(None, None, None, owner_tracker);
     let read_args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -544,6 +553,7 @@ async fn edit_of_canonical_target_invalidates_read_through_symlink_alias() {
     let read = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone());
     let edit = EditTool::new_with_tracker(None, None, None, tracker);
     let alias_args = || ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,
@@ -584,6 +594,7 @@ fn bounded_read_tool(root: &std::path::Path, cap: u64) -> ReadTool {
 
 fn read_args(path: &str, offset: Option<usize>, limit: Option<usize>) -> ReadArgs {
     ReadArgs {
+        pages: None,
         raw_notebook: false,
         character_offset: None,
         character_limit: None,

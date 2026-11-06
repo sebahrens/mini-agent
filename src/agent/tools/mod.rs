@@ -16,6 +16,7 @@ pub(crate) mod memoize;
 pub(crate) mod mutation_diff;
 pub(crate) mod normalize;
 pub(crate) mod notebook;
+pub(crate) mod pdf_text;
 pub(crate) mod read;
 pub(crate) mod read_image;
 pub(crate) mod schedule_wakeup;
@@ -680,6 +681,9 @@ pub struct ReadArgs {
     /// 1-indexed Unicode scalar value offset, independent of text lines.
     pub character_offset: Option<usize>,
     pub character_limit: Option<usize>,
+    /// 1-indexed PDF page selection such as `1-5` or `2,4`.
+    #[serde(default)]
+    pub pages: Option<String>,
 }
 
 #[derive(Deserialize)]

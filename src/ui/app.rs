@@ -9019,6 +9019,7 @@ mod interrupt_rewind_tests {
                 .recorder(&app.ui.session.id, 2, true);
             crate::session::file_checkpoints::scope(Some(recorder), async {
                 read.call(crate::agent::tools::ReadArgs {
+                    pages: None,
                     raw_notebook: false,
                     character_offset: None,
                     character_limit: None,
@@ -11971,6 +11972,7 @@ mod mutation_consumer_tests {
         ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
             .with_workspace(root.path())
             .call(ReadArgs {
+                pages: None,
                 raw_notebook: false,
                 character_offset: None,
                 character_limit: None,
