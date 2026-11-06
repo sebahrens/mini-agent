@@ -86,6 +86,8 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "skills_search"
             | "ask_user_question"
             | "mcp_search"
+            | "list_mcp_resources"
+            | "read_mcp_resource"
             | "schedule_wakeup"
     )
 }
@@ -2800,6 +2802,13 @@ mod mcp_tests {
             <crate::extras::subagents::background::ListTool as rig::tool::Tool>::NAME,
             <crate::extras::subagents::background::CancelTool as rig::tool::Tool>::NAME,
             <crate::extras::subagents::background::SendTool as rig::tool::Tool>::NAME,
+        ] {
+            assert!(is_reserved_builtin_tool_name(name), "{name}");
+        }
+        #[cfg(feature = "mcp")]
+        for name in [
+            <crate::extras::mcp::resource_tools::ListMcpResourcesTool as rig::tool::Tool>::NAME,
+            <crate::extras::mcp::resource_tools::ReadMcpResourceTool as rig::tool::Tool>::NAME,
         ] {
             assert!(is_reserved_builtin_tool_name(name), "{name}");
         }
