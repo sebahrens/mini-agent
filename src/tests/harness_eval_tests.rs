@@ -1807,6 +1807,7 @@ async fn persona_regression_eval() {
                 briefs: None,
                 agent_type: Some(case.agent_type.clone()),
                 run_in_background: false,
+                options: Default::default(),
             },
             workspace.clone(),
             vec![case.response],

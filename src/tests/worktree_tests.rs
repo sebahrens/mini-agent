@@ -5236,6 +5236,7 @@ wait
                     plan: IsolationPlan {
                         parent_root: root,
                         base_dir: Some(base),
+                        base_ref: None,
                         create_gate: None,
                     },
                     _repo: repo,
@@ -5542,6 +5543,33 @@ wait
             assert!(kinds.contains(&AgentTool::Write) && kinds.contains(&AgentTool::Edit));
             assert!(!kinds.contains(&AgentTool::Shell), "{kinds:?}");
             drop(worktree.finish().await);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_isolated_child_can_branch_from_an_explicit_base_ref() {
+            let fixture = Fixture::new("isolation-base-ref");
+            let base = git_stdout(fixture.root(), ["rev-parse", "HEAD~1"]);
+            assert_ne!(base, fixture.head);
+            let mut plan = fixture.plan.clone();
+            plan.base_ref = Some("HEAD~1".into());
+            let (worktree, _authorization) = prepare(&plan, &fixture.parent()).await.unwrap();
+            assert_eq!(git_stdout(worktree.path(), ["rev-parse", "HEAD"]), base);
+            drop(worktree.finish().await);
+
+            plan.base_ref = Some("no-such-branch".into());
+            let error = prepare(&plan, &fixture.parent()).await.err().unwrap();
+            assert!(error.contains("not a commit"), "{error}");
+            plan.base_ref = Some("--upload-pack=evil".into());
+            assert!(prepare(&plan, &fixture.parent()).await.is_err());
+            for invalid in ["--x", "a..b", "has space", ""] {
+                assert!(
+                    crate::extras::subagents::isolation::validate_base_ref(invalid).is_err(),
+                    "{invalid}"
+                );
+            }
+            assert!(crate::extras::subagents::isolation::validate_base_ref("main").is_ok());
+            fixture.assert_parent_untouched();
         }
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]

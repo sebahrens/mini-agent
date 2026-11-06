@@ -74,6 +74,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "task_result"
             | "task_list"
             | "task_cancel"
+            | "task_send"
             | "task_evidence"
             | "memory_write"
             | "memory_edit"
@@ -1245,6 +1246,18 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             .with_workspace_instructions(instructions.clone());
             #[cfg(feature = "git-worktree")]
             let task_tool = task_tool.with_isolation_base_dir(cli.resolve_wt_base_dir(cfg));
+            // Captured for `[subagents] allow_web` personas only.
+            let task_tool = task_tool.with_parent_web_tools(
+                crate::extras::subagents::builder::ParentWebTools {
+                    fetch: cli.tool_is_eligible(cfg, "web_fetch"),
+                    search: cli.tool_is_eligible(cfg, "web_search")
+                        && cfg.web_search_provider.as_deref() != Some("off"),
+                    fetch_origins: cfg.web_fetch_origins.clone(),
+                    fetch_allow_http: cfg.web_fetch_allow_http.unwrap_or(false),
+                    search_provider: cfg.web_search_provider.clone(),
+                    session_id: tool_output_session_id.to_string(),
+                },
+            );
             // Only an explicitly configured parent response cap constrains a
             // separately configured child; the implicit parent default is not
             // a permanent 16K ceiling on child settings.
@@ -1299,6 +1312,13 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             ));
             all_tools.push(Box::new(
                 crate::extras::subagents::background::CancelTool::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                    workspace.clone(),
+                ),
+            ));
+            all_tools.push(Box::new(
+                crate::extras::subagents::background::SendTool::new(
                     permission.clone(),
                     ask_tx.clone(),
                     workspace.clone(),
@@ -2622,6 +2642,7 @@ mod mcp_tests {
             <crate::extras::subagents::background::ResultTool as rig::tool::Tool>::NAME,
             <crate::extras::subagents::background::ListTool as rig::tool::Tool>::NAME,
             <crate::extras::subagents::background::CancelTool as rig::tool::Tool>::NAME,
+            <crate::extras::subagents::background::SendTool as rig::tool::Tool>::NAME,
         ] {
             assert!(is_reserved_builtin_tool_name(name), "{name}");
         }

@@ -21,6 +21,35 @@ const FALLBACK_PIXELS_PER_BYTE: u64 = 4;
 /// (`docs/agent/IMAGE_READ.md`).
 pub(crate) const MAX_CHILD_IMAGE_ENCODED_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Opening of the note that replaces an omitted child image.
+const IMAGE_OMITTED_MARKER: &str = "[image omitted: this subagent's images would total";
+
+/// Tool results in `history` whose images the ceiling omitted, so the host
+/// can say so in the parent's report.
+pub(crate) fn omitted_images(history: &[Message]) -> usize {
+    history
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => Some(content.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|item| {
+            matches!(item, UserContent::ToolResult(result) if result.content.iter().any(|part| {
+                matches!(part, ToolResultContent::Text(text) if text.text.contains(IMAGE_OMITTED_MARKER))
+            }))
+        })
+        .count()
+}
+
+/// The host line after a child's report when the ceiling omitted images.
+pub(crate) fn omission_note(count: usize) -> String {
+    format!(
+        "[host note: {count} image result(s) were omitted from this child's history at its {} MiB image ceiling (MAX_CHILD_IMAGE_ENCODED_BYTES); its findings could not use them]\n",
+        MAX_CHILD_IMAGE_ENCODED_BYTES / (1024 * 1024)
+    )
+}
+
 /// `ceil(w/28) * ceil(h/28)`, capped at [`MAX_IMAGE_TOKENS`].
 pub(crate) fn patch_tokens(width: u32, height: u32) -> u64 {
     (u64::from(width).div_ceil(PATCH_PX) * u64::from(height).div_ceil(PATCH_PX))
@@ -156,7 +185,7 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for ChildImag
             other => other.to_string(),
         };
         rig::agent::Flow::rewrite_result(format!(
-            "{response}\n[image omitted: this subagent's images would total {total} encoded bytes, over its {} byte ceiling; describe what you need from text or read a smaller image]",
+            "{response}\n{IMAGE_OMITTED_MARKER} {total} encoded bytes, over its {} byte ceiling; describe what you need from text or read a smaller image]",
             self.max_encoded_bytes
         ))
     }
@@ -179,6 +208,26 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(include_bytes!(
             "../../agent/tools/fixtures/read-image64/3x2.png"
         ))
+    }
+
+    #[test]
+    fn omitted_images_are_counted_from_the_ceiling_notes() {
+        use rig::OneOrMany;
+        let result = |text: &str| Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(rig::message::ToolResult {
+                id: "r".into(),
+                call_id: None,
+                content: OneOrMany::one(ToolResultContent::text(text)),
+            })),
+        };
+        let history = vec![
+            result("plain"),
+            result(&format!(
+                "x\n{IMAGE_OMITTED_MARKER} 5000000 encoded bytes, over ...]"
+            )),
+        ];
+        assert_eq!(omitted_images(&history), 1);
+        assert!(omission_note(1).contains("1 image result(s) were omitted"));
     }
 
     #[test]

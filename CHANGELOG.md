@@ -6,6 +6,47 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Subagents
+
+- A failed `task` child no longer cancels its siblings: the other children run to completion and
+  the failure is reported only in its own section (`[subagents] task_fail_fast = true` restores
+  fail-fast). Children cancelled by the deadline or an output/cost limit return their streamed
+  narration as a quoted `[partial: cancelled ...]` section instead of only `[cancelled: ...]`.
+- Background `task` calls get their own deadline, `[subagents] task_background_timeout_secs`
+  (default 3600 s), instead of sharing the 300 s foreground `task_timeout_secs`.
+- A full 32-entry background task history now evicts its oldest finished, delivered entry on the
+  next admission instead of refusing every later background task; `/tasks clear` forgets all
+  finished, delivered entries. Running tasks and undelivered results are never evicted.
+- Background reports longer than the 16 KiB saved-entry ceiling are kept in full in the session's
+  private tool-output directory; after a restart `task_result` and `/tasks result` return the full
+  report, and the saved copy ends with an explicit truncation notice naming its size and path.
+- `task` accepts per-call `max_turns` and `timeout_secs`, and personas accept `max_turns` and
+  `timeout_secs` frontmatter; values above `[subagents] task_max_turns_ceiling` (default 100) or
+  `task_timeout_ceiling_secs` (default 3600) are rejected instead of clamped.
+- `task {"resume": "<child id>", "prompts": ["…"]}` continues an earlier child's conversation
+  (tool results included) with a follow-up turn, re-authorized and charged like any task call. Each
+  report prints its child id; the 16 most recent conversations are kept in memory.
+- Opt-in `[subagents] allow_read_only_shell` gives read personas that name `shell` a sandboxed
+  shell that can read the workspace but write only a private scratch directory, and
+  `[subagents] allow_web` gives personas that name `web_fetch`/`web_search` the parent's web tools.
+  Both default off; default children never receive them.
+- Persona frontmatter `contract: none` returns a child's text verbatim (quoted, within the report
+  cap) without the Findings/Unverified/Coverage contract or its repair turn; the raw text kept
+  for `/tasks result` is configurable as `[subagents] task_unverified_bytes` (default 6 KiB).
+- Subagent evidence limits are configurable (`[subagents] evidence_max_records`,
+  `evidence_max_record_bytes`, `evidence_max_child_bytes`, `evidence_max_children`) and documented;
+  `task_evidence` for an evicted or pre-restart handle now reports it as expired.
+- `task` accepts `"isolation": "worktree"` for a write persona without editing its frontmatter,
+  and `"base_ref"` to branch isolated children from a chosen commit instead of the parent `HEAD`.
+- New parent tool `task_send {id, message, task?}` delivers a follow-up message to the running
+  children of a background task as user input at their next model-call boundary; terminal tasks
+  are refused and the message grants no permission.
+- When a child's 4 MiB history image ceiling omits images, its report now carries an explicit host
+  note; the fixed subagent image limits and their source constants are documented.
+- `task` rejects a prompt over 64 KiB up front with an actionable error (matching the brief
+  limit), shortened `## Task N:` labels end with `…`, and the display-only `/tasks` bounds are
+  documented.
+
 **Fork release 1.14.2 (2026-10-28)**
 
 ### Changed (context management)

@@ -11,9 +11,14 @@ pub(crate) mod builder;
 pub(crate) mod cost;
 pub(crate) mod evidence;
 pub(crate) mod image_cost;
+pub(crate) mod inbox;
 pub(crate) mod inline_images;
 pub(crate) mod isolation;
+pub(crate) mod partial;
 pub(crate) mod prompt;
+#[cfg(feature = "git-worktree")]
+pub(crate) mod read_only_shell;
+pub(crate) mod resume;
 pub(crate) mod task_tool;
 
 #[derive(Clone)]

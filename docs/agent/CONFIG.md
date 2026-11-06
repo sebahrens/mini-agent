@@ -4128,8 +4128,44 @@ up to `N` of its recorded image results (`[attach: E5]`) inline to the `task`
 result when the parent model accepts images; at most 5 images and 1.5 MiB of
 base64 per call, each image no larger than 1,568 px on its longer side and
 charged to `task_max_cost_units`. It needs `task_evidence = true`. A persona's
-`inline_images` frontmatter can only narrow it. See
+`inline_images` frontmatter can only narrow it. The other image limits are
+fixed constants (`inline_images.rs` `MAX_PER_CHILD` 3, `MAX_PER_CALL` 5,
+`MAX_LONG_EDGE_PX` 1568, `MAX_ENCODED_BYTES_PER_CALL` 1.5 MiB; `image_cost.rs`
+`MAX_CHILD_IMAGE_ENCODED_BYTES` 4 MiB per child history). See
 [Inline image lane](SUBAGENTS.md#inline-image-lane).
+
+`[subagents] task_fail_fast = true` (default false) makes the first failed
+child of a `task` call cancel its in-flight siblings and stop queued launches.
+By default a failed child is only that child's outcome. See
+[Bounded execution](SUBAGENTS.md#bounded-execution-and-partial-results).
+
+`[subagents] task_background_timeout_secs = N` (default 3600, 1 to 86400) is
+the whole-call deadline of `run_in_background` task calls; foreground calls
+keep `task_timeout_secs` (default 300). See
+[Background tasks](SUBAGENTS.md#background-tasks).
+
+`[subagents] task_max_turns_ceiling` (default 100) and
+`task_timeout_ceiling_secs` (default 3600, at most 86400) bound the per-call
+`max_turns`/`timeout_secs` task arguments and the persona `max_turns`/
+`timeout_secs` frontmatter. A larger requested value rejects the call. See
+[The task tool](SUBAGENTS.md#the-task-tool).
+
+`[subagents] allow_read_only_shell = true` (default false) gives a read-mode
+persona that names `shell`/`Bash` a sandboxed shell whose only writable
+location is a private scratch directory; the workspace stays read-only.
+`[subagents] allow_web = true` (default false) gives a persona that names
+`web_fetch`/`web_search` the parent's eligible web tools. See
+[Opt-in read-only shell and web tools](SUBAGENTS.md#opt-in-read-only-shell-and-web-tools).
+
+`[subagents] task_unverified_bytes` (default 6144, at most 16384) bounds the
+raw text of a host-replaced child report that `/tasks result <id>` shows the
+user (never the model). Persona frontmatter `contract: none` skips the report
+contract entirely and returns the child's text verbatim.
+
+`[subagents] evidence_max_records` (64), `evidence_max_record_bytes` (262144),
+`evidence_max_child_bytes` (16777216) and `evidence_max_children` (64) bound
+the host-recorded child evidence store; see
+[Evidence handles](SUBAGENTS.md#evidence-handles) for ceilings and effects.
 
 ### Hook event parity
 

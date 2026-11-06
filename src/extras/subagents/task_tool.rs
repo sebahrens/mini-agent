@@ -30,6 +30,13 @@ const DEFAULT_MAX_CONCURRENCY: usize = 4;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 131_072;
 const DEFAULT_MAX_COST_UNITS: u64 = 4_000_000;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default deadline of a `run_in_background` call (`[subagents]
+/// task_background_timeout_secs`): background work is meant to be long.
+const DEFAULT_BACKGROUND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Default `[subagents] task_max_turns_ceiling` for per-call/persona turns.
+const DEFAULT_MAX_TURNS_CEILING: usize = 100;
+/// Default `[subagents] task_timeout_ceiling_secs` for per-call/persona deadlines.
+const DEFAULT_TIMEOUT_CEILING_SECS: u64 = 60 * 60;
 const MIN_OUTPUT_BYTES: usize = 256;
 const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BRIEF_BYTES: usize = 64 * 1024;
@@ -54,6 +61,25 @@ pub struct TaskArgs {
     pub agent_type: Option<String>,
     /// Return a session-owned job ID instead of waiting for the child batch.
     pub run_in_background: bool,
+    /// Optional per-call execution settings (turns, deadline, ...).
+    pub options: TaskCallOptions,
+}
+
+/// Optional per-call settings of a `task` call. Each is bounded by a
+/// configured ceiling and rejected, never silently clamped, beyond it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskCallOptions {
+    /// Model turns per child, overriding the persona and `task_max_turns`.
+    pub max_turns: Option<usize>,
+    /// Whole-call deadline in seconds, overriding the persona and config.
+    pub timeout_secs: Option<u64>,
+    /// Continue the stored conversation of an earlier child (its child id).
+    pub resume: Option<String>,
+    /// `"worktree"` runs a write persona's children in private worktrees
+    /// even when the persona does not set `isolation: worktree`.
+    pub isolation: Option<String>,
+    /// Commit-ish isolated children branch from (default: parent `HEAD`).
+    pub base_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -215,9 +241,26 @@ impl<'de> Deserialize<'de> for TaskArgs {
             agent_type: Option<String>,
             #[serde(default)]
             run_in_background: bool,
+            #[serde(default)]
+            max_turns: Option<usize>,
+            #[serde(default)]
+            timeout_secs: Option<u64>,
+            #[serde(default)]
+            resume: Option<String>,
+            #[serde(default)]
+            isolation: Option<String>,
+            #[serde(default)]
+            base_ref: Option<String>,
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
+        let options = TaskCallOptions {
+            max_turns: raw.max_turns,
+            timeout_secs: raw.timeout_secs,
+            resume: raw.resume,
+            isolation: raw.isolation,
+            base_ref: raw.base_ref,
+        };
         let mut raw_briefs = raw.briefs.map(|briefs| briefs.0);
         let mut agent_type = raw.agent_type;
         if let Some(briefs) = raw_briefs.as_mut() {
@@ -278,12 +321,14 @@ impl<'de> Deserialize<'de> for TaskArgs {
                 briefs: None,
                 agent_type: raw.agent_type,
                 run_in_background: raw.run_in_background,
+                options,
             }),
             (false, true) => Ok(Self {
                 prompts: Vec::new(),
                 briefs: raw.briefs,
                 agent_type: raw.agent_type,
                 run_in_background: raw.run_in_background,
+                options,
             }),
             // Neither form is populated. Keep a present-but-empty field so
             // `TaskTool::call` reports the specific validation failure.
@@ -293,12 +338,14 @@ impl<'de> Deserialize<'de> for TaskArgs {
                     briefs: None,
                     agent_type: raw.agent_type,
                     run_in_background: raw.run_in_background,
+                    options,
                 }),
                 (None, Some(briefs)) => Ok(Self {
                     prompts: Vec::new(),
                     briefs: Some(briefs),
                     agent_type: raw.agent_type,
                     run_in_background: raw.run_in_background,
+                    options,
                 }),
                 _ => Err(serde::de::Error::custom(TASK_MISSING_HANDOFF_ERROR)),
             },
@@ -313,6 +360,8 @@ struct TaskLimits {
     max_output_bytes: usize,
     max_cost_units: u64,
     timeout: Duration,
+    /// Opt-in `[subagents] task_fail_fast`: a child failure stops the call.
+    fail_fast: bool,
 }
 
 impl Default for TaskLimits {
@@ -323,6 +372,7 @@ impl Default for TaskLimits {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             max_cost_units: DEFAULT_MAX_COST_UNITS,
             timeout: DEFAULT_CALL_TIMEOUT,
+            fail_fast: false,
         }
     }
 }
@@ -335,7 +385,28 @@ impl TaskLimits {
             max_output_bytes: config.resolve_task_max_output_bytes(),
             max_cost_units: config.resolve_task_max_cost_units(),
             timeout: Duration::from_secs(config.resolve_task_timeout_secs()),
+            fail_fast: config
+                .subagents
+                .as_ref()
+                .is_some_and(|policy| policy.task_fail_fast),
         }
+    }
+
+    /// Background calls use their own, longer deadline; everything else is
+    /// shared with the foreground limits.
+    fn for_background(mut self, config: &crate::config::Config) -> Result<Self, ToolError> {
+        self.timeout = config
+            .subagents
+            .as_ref()
+            .and_then(|policy| policy.task_background_timeout_secs)
+            .map_or(DEFAULT_BACKGROUND_TIMEOUT, Duration::from_secs);
+        if self.timeout.is_zero() || self.timeout > MAX_CALL_TIMEOUT {
+            return Err(ToolError::Msg(format!(
+                "task: [subagents] task_background_timeout_secs must be between 1 and {}",
+                MAX_CALL_TIMEOUT.as_secs()
+            )));
+        }
+        Ok(self)
     }
 
     fn validate(self) -> Result<Self, ToolError> {
@@ -374,6 +445,87 @@ impl TaskLimits {
     }
 }
 
+/// The configured ceilings for per-call and persona run settings.
+fn run_ceilings(config: &crate::config::Config) -> (usize, u64) {
+    let policy = config.subagents.as_ref();
+    (
+        policy
+            .and_then(|policy| policy.task_max_turns_ceiling)
+            .unwrap_or(DEFAULT_MAX_TURNS_CEILING),
+        policy
+            .and_then(|policy| policy.task_timeout_ceiling_secs)
+            .unwrap_or(DEFAULT_TIMEOUT_CEILING_SECS)
+            .min(MAX_CALL_TIMEOUT.as_secs()),
+    )
+}
+
+/// Apply per-call `max_turns`/`timeout_secs` (taking precedence) and the
+/// persona's frontmatter values. A value above its configured ceiling is
+/// rejected with the key that raises it, never clamped.
+fn apply_run_settings(
+    options: &TaskCallOptions,
+    persona: Option<crate::context::agents::AgentRunSettings>,
+    config: &crate::config::Config,
+    max_turns: &mut usize,
+    limits: &mut TaskLimits,
+) -> Result<(), ToolError> {
+    let (turns_ceiling, timeout_ceiling) = run_ceilings(config);
+    let persona = persona.unwrap_or_default();
+    let check_turns = |turns: usize, source: &str| {
+        if turns == 0 {
+            return Err(ToolError::Msg(format!(
+                "task: {source} max_turns must be at least 1"
+            )));
+        }
+        if turns > turns_ceiling {
+            return Err(ToolError::Msg(format!(
+                "task: {source} max_turns {turns} exceeds the ceiling of {turns_ceiling}; raise [subagents] task_max_turns_ceiling to allow it"
+            )));
+        }
+        Ok(turns)
+    };
+    let check_timeout = |secs: u64, source: &str| {
+        if secs == 0 {
+            return Err(ToolError::Msg(format!(
+                "task: {source} timeout_secs must be at least 1"
+            )));
+        }
+        if secs > timeout_ceiling {
+            return Err(ToolError::Msg(format!(
+                "task: {source} timeout_secs {secs} exceeds the ceiling of {timeout_ceiling}; raise [subagents] task_timeout_ceiling_secs (at most {}) to allow it",
+                MAX_CALL_TIMEOUT.as_secs()
+            )));
+        }
+        Ok(Duration::from_secs(secs))
+    };
+    if let Some(turns) = options.max_turns {
+        *max_turns = check_turns(turns, "the call's")?;
+    } else if let Some(turns) = persona.max_turns {
+        *max_turns = check_turns(turns, "the persona's")?;
+    }
+    if let Some(secs) = options.timeout_secs {
+        limits.timeout = check_timeout(secs, "the call's")?;
+    } else if let Some(secs) = persona.timeout_secs {
+        limits.timeout = check_timeout(secs, "the persona's")?;
+    }
+    Ok(())
+}
+
+/// A persona's tool narrowing with the opt-in read-only shell added, when it
+/// is eligible (the parsed narrowing of a read persona never contains it).
+fn with_read_only_shell_tool(
+    tools: Option<Vec<crate::context::agents::AgentTool>>,
+    read_only_shell: bool,
+) -> Option<Vec<crate::context::agents::AgentTool>> {
+    use crate::context::agents::AgentTool;
+    tools.map(|mut tools| {
+        if read_only_shell && !tools.contains(&AgentTool::Shell) {
+            tools.push(AgentTool::Shell);
+        }
+        tools
+    })
+}
+
 fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolError> {
     if prompts.is_empty() {
         return Err(ToolError::Msg("task: prompts must not be empty".into()));
@@ -393,6 +545,19 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
         return Err(ToolError::Msg(format!(
             "task: prompt {} must not be empty",
             index + 1
+        )));
+    }
+    // The same 64 KiB bound as a rendered brief, checked before permission
+    // prompts or child requests rather than at context admission.
+    if let Some((index, prompt)) = prompts
+        .iter()
+        .enumerate()
+        .find(|(_, prompt)| prompt.len() > MAX_BRIEF_BYTES)
+    {
+        return Err(ToolError::Msg(format!(
+            "task: prompt {} is {} bytes, over the {MAX_BRIEF_BYTES}-byte limit; put bulk content in a file and name it in the prompt (or a brief's files), or split the work into several prompts",
+            index + 1,
+            prompt.len()
         )));
     }
     Ok(())
@@ -506,6 +671,8 @@ struct ResolvedSpecialization {
     turn_budget: Option<crate::context::agents::AgentTurnBudget>,
     /// Persona narrowing of the inline image lane.
     inline_images: Option<u8>,
+    /// Frontmatter `max_turns` / `timeout_secs`.
+    run: crate::context::agents::AgentRunSettings,
     #[cfg(feature = "mcp")]
     mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
@@ -634,6 +801,8 @@ fn resolve_persona_runtime_with(
         max_turns: specialization.max_turns(max_turns),
         execution: builder::PersonaExecution {
             write_mode: specialization.write_mode,
+            free_form: specialization.run.free_form,
+            inbox: None,
             tools: specialization.tools.clone(),
             // Set per delegation from `task_evidence`.
             evidence: false,
@@ -700,6 +869,7 @@ fn resolve_specialization(
         model: definition.model,
         turn_budget: definition.turn_budget,
         inline_images: definition.inline_images,
+        run: definition.run,
         #[cfg(feature = "mcp")]
         mcp_servers: definition.mcp_servers,
     }))
@@ -749,6 +919,10 @@ pub struct TaskTool {
     /// The parent model's captured image support: decides whether attached
     /// child images are inlined or degrade to evidence rows.
     parent_image_support: super::inline_images::ParentSupport,
+    /// Resumable child conversations when no session pool owns them.
+    local_resume: Arc<super::resume::ResumeStore>,
+    /// The parent's eligible web tools, for `[subagents] allow_web` personas.
+    parent_web: Option<builder::ParentWebTools>,
 }
 
 impl TaskTool {
@@ -772,6 +946,13 @@ impl TaskTool {
         } else {
             None
         });
+        let (read_only_shell, web) = self.child_extras(Some(persona), config);
+        let authorization = if read_only_shell {
+            authorization.with_read_only_shell_planned()
+        } else {
+            authorization
+        }
+        .with_web_tools(web);
         #[cfg(feature = "js")]
         let authorization = if let Some((sandbox, status)) = &self.read_only_js {
             authorization.with_read_only_js(sandbox.clone(), status.clone(), config)
@@ -780,13 +961,11 @@ impl TaskTool {
         };
         // Same eligibility decision as the child builder, without
         // instantiating the child tool set (cttyn.46).
-        #[cfg(not(feature = "js"))]
-        let _ = config;
         let installed = builder::persona_tool_names(
             &authorization,
             &builder::PersonaExecution {
                 write_mode: persona.write_mode,
-                tools: persona.tools.clone(),
+                tools: with_read_only_shell_tool(persona.tools.clone(), read_only_shell),
                 ..Default::default()
             },
             #[cfg(feature = "skills")]
@@ -834,7 +1013,59 @@ impl TaskTool {
             #[cfg(feature = "js")]
             read_only_js: None,
             parent_image_support: None,
+            local_resume: Default::default(),
+            parent_web: None,
         }
+    }
+
+    /// The parent's eligible web tools, captured by the parent builder.
+    pub(crate) fn with_parent_web_tools(mut self, web: builder::ParentWebTools) -> Self {
+        self.parent_web = Some(web);
+        self
+    }
+
+    /// Opt-in extras of a read-mode persona that names them: whether the
+    /// read-only shell is eligible, and the parent web tools to install.
+    /// Both stay closed without their `[subagents]` opt-in.
+    fn child_extras(
+        &self,
+        specialization: Option<&ResolvedSpecialization>,
+        config: &crate::config::Config,
+    ) -> (bool, Option<builder::ParentWebTools>) {
+        use crate::context::agents::AgentTool;
+        let Some(persona) = specialization else {
+            return (false, None);
+        };
+        let named = |tool: AgentTool| {
+            persona
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.contains(&tool))
+        };
+        let policy = config.subagents.clone().unwrap_or_default();
+        let shell = cfg!(feature = "git-worktree")
+            && policy.allow_read_only_shell
+            && !persona.write_mode
+            && persona.run.read_only_shell
+            && self
+                .write_tools
+                .as_ref()
+                .is_some_and(|tools| tools.shell_enabled);
+        let web = (policy.allow_web && (named(AgentTool::WebFetch) || named(AgentTool::WebSearch)))
+            .then(|| self.parent_web.clone())
+            .flatten();
+        (shell, web)
+    }
+
+    /// The session pool's resumable conversations, or this tool's own.
+    fn resume_store(&self) -> Arc<super::resume::ResumeStore> {
+        crate::spend::run::Run::current()
+            .as_ref()
+            .and_then(crate::spend::run::Run::background_pool)
+            .map_or_else(
+                || self.local_resume.clone(),
+                |pool| pool.resumable().clone(),
+            )
     }
 
     /// The parent model's image support, as captured for its own `read`.
@@ -941,16 +1172,26 @@ directory listing, and read-only memory tools, then returns a verified summary. 
 Send exactly one of `prompts` (plain investigation strings) or `briefs` \
 (structured handoffs); omit the unused field entirely or pass it as []. \
 Multiple prompts or briefs use bounded parallelism and return in input order. \
-If a child fails or an aggregate resource limit is reached, remaining work \
-is cancelled and explicit partial statuses are returned. \
+A failed child does not cancel its siblings. If the deadline or an aggregate \
+resource limit is reached, remaining work is cancelled, in-flight children \
+return their narration so far marked [partial: cancelled ...], and explicit \
+partial statuses are returned. \
 Skip only for known-location work: reading one identified file, \
 editing in a known location, grepping for a literal you will act on immediately."
             .to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
-        let max_prompts =
-            with_config(|cfg| cfg.config.resolve_task_max_prompts()).unwrap_or(DEFAULT_MAX_PROMPTS);
+        let (max_prompts, (turns_ceiling, timeout_ceiling)) = with_config(|cfg| {
+            (
+                cfg.config.resolve_task_max_prompts(),
+                run_ceilings(&cfg.config),
+            )
+        })
+        .unwrap_or((
+            DEFAULT_MAX_PROMPTS,
+            (DEFAULT_MAX_TURNS_CEILING, DEFAULT_TIMEOUT_CEILING_SECS),
+        ));
         let specialist_entries = crate::context::agents::available_schema_entries_for_workspace(
             self.workspace.as_deref(),
         );
@@ -1000,6 +1241,31 @@ editing in a known location, grepping for a literal you will act on immediately.
                         "required": ["objective"]
                     },
                     "description": "Structured handoffs for independent subagents. Each gives an objective plus optional file scope hints, constraints, and expected content. Send either briefs or prompts, never both populated: omit this field or pass [] when using prompts."
+                },
+                "max_turns": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": turns_ceiling,
+                    "description": format!("Optional model turns per child for this call (default: the persona's max_turns, else task_max_turns, normally 20). Values above the configured ceiling ({turns_ceiling}, [subagents] task_max_turns_ceiling) are rejected.")
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": timeout_ceiling,
+                    "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs 300 in the foreground or task_background_timeout_secs 3600 in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
+                },
+                "isolation": {
+                    "type": "string",
+                    "enum": ["none", "worktree"],
+                    "description": "Optional. \"worktree\" runs each child of a mode: write persona in its own git worktree and branch (parallel; the parent workspace is never written; branches are returned for an explicit merge), as the persona frontmatter isolation: worktree does. Rejected for read-only children."
+                },
+                "base_ref": {
+                    "type": "string",
+                    "description": "Optional commit-ish (branch, tag or commit id) that worktree-isolated children branch from instead of the parent's HEAD. Requires isolation. Uncommitted parent changes are never visible to the child."
+                },
+                "resume": {
+                    "type": "string",
+                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids are in memory only and expire after the 16 most recent children or a restart."
                 },
                 "run_in_background": {
                     "type": "boolean",
@@ -1063,9 +1329,41 @@ editing in a known location, grepping for a literal you will act on immediately.
         };
 
         let mut limits = limits.validate()?;
+        if args.run_in_background {
+            limits = limits.for_background(&config)?;
+        }
         let prompts = prepare_task_prompts(&args, limits)?;
 
-        let agent_type = args.agent_type.clone();
+        // `resume` continues one stored child conversation as the same
+        // agent type; the call is otherwise an ordinary, re-authorized task.
+        let resume_store = self.resume_store();
+        let resumed = match args.options.resume.as_deref() {
+            None => None,
+            Some(id) => {
+                if prompts.len() != 1 {
+                    return Err(ToolError::Msg(
+                        "task: resume continues one child; send exactly one prompt with the follow-up message".into(),
+                    ));
+                }
+                let stored = resume_store.get(id).ok_or_else(|| {
+                    ToolError::Msg(format!(
+                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the {} most recent children of this session and do not survive a restart; start a new task instead",
+                        super::resume::MAX_RESUMABLE_CHILDREN
+                    ))
+                })?;
+                if args.agent_type.is_some() && args.agent_type != stored.agent_type {
+                    return Err(ToolError::Msg(format!(
+                        "task: resume id '{id}' belongs to agent_type {}; omit agent_type or pass the same one",
+                        stored.agent_type.as_deref().unwrap_or("(default explorer)")
+                    )));
+                }
+                Some(stored)
+            }
+        };
+        let agent_type = match &resumed {
+            Some(stored) => stored.agent_type.clone(),
+            None => args.agent_type.clone(),
+        };
         let permission_source = agent_type.as_deref().map(|agent_type| {
             crate::context::agents::source_hint_for_workspace(agent_type, self.workspace.as_deref())
         });
@@ -1090,6 +1388,25 @@ editing in a known location, grepping for a literal you will act on immediately.
         let write_mode = specialization
             .as_ref()
             .is_some_and(|persona| persona.write_mode);
+        // Per-call isolation only ever adds the worktree boundary to a write
+        // persona; it never turns a read child into a write child.
+        let call_isolation = match args.options.isolation.as_deref() {
+            None | Some("none") => false,
+            Some("worktree") => true,
+            Some(other) => {
+                return Err(ToolError::Msg(format!(
+                    "task: isolation must be \"worktree\" or \"none\", got {other:?}"
+                )));
+            }
+        };
+        if call_isolation && !write_mode {
+            return Err(ToolError::Msg(
+                "task: isolation \"worktree\" applies only to a mode: write persona (agent_type); read-only children never write the workspace".into(),
+            ));
+        }
+        if let Some(base) = args.options.base_ref.as_deref() {
+            super::isolation::validate_base_ref(base).map_err(ToolError::Msg)?;
+        }
         let mut isolated = false;
         if write_mode {
             if !config
@@ -1105,9 +1422,15 @@ editing in a known location, grepping for a literal you will act on immediately.
             if self.write_tools.is_none() || self.workspace.is_none() {
                 return Err(ToolError::Msg("task: write persona requires the parent's captured workspace and tool environment".into()));
             }
-            isolated = specialization
-                .as_ref()
-                .is_some_and(|persona| persona.isolation_worktree);
+            isolated = call_isolation
+                || specialization
+                    .as_ref()
+                    .is_some_and(|persona| persona.isolation_worktree);
+            if isolated && resumed.is_some() {
+                return Err(ToolError::Msg(
+                    "task: a worktree-isolated child cannot be resumed: its worktree ended with it; merge its branch and start a new task".into(),
+                ));
+            }
             if isolated && self.permission.is_none() {
                 return Err(ToolError::Msg(
                     "task: worktree isolation requires permission checks; none are active".into(),
@@ -1128,6 +1451,11 @@ editing in a known location, grepping for a literal you will act on immediately.
                 limits.max_concurrency = 1;
             }
         }
+        if args.options.base_ref.is_some() && !isolated {
+            return Err(ToolError::Msg(
+                "task: base_ref applies only to worktree-isolated children; add \"isolation\": \"worktree\" (write personas)".into(),
+            ));
+        }
         self.preflight_persona_tools(specialization.as_ref(), &config)?;
         #[cfg(feature = "hooks")]
         let (hook_agent_type, hook_agent_source) =
@@ -1135,7 +1463,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         let result_notice = specialization
             .as_ref()
             .and_then(|resolved| resolved.result_notice.clone());
-        let runtime = resolve_persona_runtime(
+        let mut runtime = resolve_persona_runtime(
             client,
             &provider_name,
             &session_provider,
@@ -1144,6 +1472,13 @@ editing in a known location, grepping for a literal you will act on immediately.
             api_key.as_deref(),
             &config,
             specialization.as_ref(),
+        )?;
+        apply_run_settings(
+            &args.options,
+            specialization.as_ref().map(|persona| persona.run),
+            &config,
+            &mut runtime.max_turns,
+            &mut limits,
         )?;
         let selected_alias = specialization
             .as_ref()
@@ -1208,6 +1543,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             )
         });
         let evidence_enabled = super::evidence::enabled(&config);
+        let evidence_limits = super::evidence::EvidenceLimits::from_config(&config);
         // Opt-in inline image lane: per-child cap (configured, narrowed by the
         // persona, hard-capped), a per-call image/byte budget shared by all
         // children, and the selected images collected by prompt index.
@@ -1232,6 +1568,15 @@ editing in a known location, grepping for a literal you will act on immediately.
             Some(observation) => run.with_background_observation(observation.clone()),
             None => run,
         });
+        let (read_only_shell, web_tools) = self.child_extras(specialization.as_ref(), &config);
+        let report_policy = ReportPolicy::from_config(
+            &config,
+            specialization
+                .as_ref()
+                .is_some_and(|persona| persona.run.free_form),
+        );
+        runtime.execution.tools =
+            with_read_only_shell_tool(runtime.execution.tools.take(), read_only_shell);
         let specialization = specialization.map(|resolved| resolved.prompt);
 
         // A session job must not retain the foreground event channel: that
@@ -1278,6 +1623,14 @@ editing in a known location, grepping for a literal you will act on immediately.
         } else {
             None
         });
+        let authorization = if read_only_shell {
+            authorization.with_read_only_shell_planned()
+        } else {
+            authorization
+        }
+        .with_web_tools(web_tools);
+        #[cfg(feature = "git-worktree")]
+        let shell_parent = self.write_tools.clone();
         let child_name = agent_type.clone().unwrap_or_else(|| "explore".into());
         #[cfg(feature = "js")]
         let authorization = if let Some((sandbox, containment_status)) = read_only_js {
@@ -1299,6 +1652,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         )
                     })?,
                 base_dir: self.isolation_base_dir.clone(),
+                base_ref: args.options.base_ref.clone(),
                 #[cfg(test)]
                 create_gate: None,
             })
@@ -1328,8 +1682,17 @@ editing in a known location, grepping for a literal you will act on immediately.
                 head.split_whitespace().collect::<Vec<_>>().join(" ")
             })
             .unwrap_or_default();
+        let resume_history = resumed.map(|stored| Arc::new(stored.history));
+        let job_inbox = admission.as_ref().map(super::background::Admission::inbox);
+        let resume_agent_type = agent_type.clone();
         let executor: TaskExecutor = Arc::new(move |index, prompt_text| {
             let details_sink = executor_sink.clone();
+            let resume_history = resume_history.clone();
+            let resume_store = resume_store.clone();
+            let resume_agent_type = resume_agent_type.clone();
+            let report_policy = report_policy;
+            #[cfg(feature = "git-worktree")]
+            let shell_parent = shell_parent.clone();
             let task_budget = executor_budget.clone();
             let repair_budget = LiveTaskBudget::new(repair_max_cost_units);
             let child_budget = LiveTaskBudget::new(u64::MAX);
@@ -1364,6 +1727,12 @@ editing in a known location, grepping for a literal you will act on immediately.
             let max_turns = runtime.max_turns;
             let mut persona = runtime.execution.clone();
             persona.evidence = evidence_enabled;
+            persona.free_form = report_policy.free_form;
+            persona.inbox = job_inbox.as_ref().map(|inbox| inbox.child(index));
+            let inbox_guard = persona
+                .inbox
+                .as_ref()
+                .map(super::inbox::ChildInbox::running_guard);
             persona.inline_images = inline_cap;
             let inline_budget = inline_budget.clone();
             let inline_sink = executor_inline_sink.clone();
@@ -1421,6 +1790,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                     .max(cost_policy.units(&observed))
             });
             let future = crate::startup::heap_future(|| async move {
+                // Held for the child's whole run: dropping it ends delivery.
+                let _inbox_guard = inbox_guard;
                 if let Some(spend) = &spend_profile
                     && let Err(error) = spend.admit()
                 {
@@ -1458,6 +1829,48 @@ editing in a known location, grepping for a literal you will act on immediately.
                         }
                     },
                     None => (None, authorization),
+                };
+                // Opt-in read-only shell: bind it to a private scratch
+                // directory (kept until this child ends) or drop it.
+                #[cfg(feature = "git-worktree")]
+                let (_scratch, authorization, execution_prompt) = match (
+                    authorization.read_only_shell_planned(),
+                    &shell_parent,
+                ) {
+                    (true, Some(parent)) => {
+                        let root = authorization
+                            .workspace()
+                            .map(|workspace| workspace.root().to_path_buf());
+                        match root
+                            .ok_or_else(|| "no captured workspace".to_string())
+                            .and_then(|root| {
+                                super::read_only_shell::prepare(parent, &root)
+                                    .map(|prepared| (prepared, root))
+                            }) {
+                            Ok(((scratch, shell), root)) => {
+                                let note =
+                                    super::read_only_shell::prompt_note(scratch.path(), &root);
+                                (
+                                    Some(scratch),
+                                    authorization.with_read_only_shell(Some(shell)),
+                                    format!("{note}\n\n{execution_prompt}"),
+                                )
+                            }
+                            Err(error) => (
+                                None,
+                                authorization.with_read_only_shell(None),
+                                format!(
+                                    "[host note: no shell tool: the read-only shell is unavailable ({error})]\n\n{execution_prompt}"
+                                ),
+                            ),
+                        }
+                    }
+                    (true, None) => (
+                        None,
+                        authorization.with_read_only_shell(None),
+                        execution_prompt,
+                    ),
+                    (false, _) => (None, authorization, execution_prompt),
                 };
                 let model = client.completion_model_with_cache_ttl(
                     model_name,
@@ -1508,16 +1921,35 @@ editing in a known location, grepping for a literal you will act on immediately.
                 };
                 // Live task/repair admission bounds every provider call, so
                 // no separate per-run token reservation is passed.
-                let result = agent
-                    .run_subagent(
-                        &execution_prompt,
-                        max_turns,
-                        event_tx.as_ref(),
-                        &config.retry,
-                        initial_usage.clone(),
-                        None,
-                    )
-                    .await;
+                let result = match resume_history {
+                    // A resumed child continues its stored conversation with
+                    // the follow-up prompt as its next user turn.
+                    Some(history) => {
+                        agent
+                            .run_subagent_with_history(
+                                &execution_prompt,
+                                history.as_ref().clone(),
+                                max_turns,
+                                event_tx.as_ref(),
+                                &config.retry,
+                                initial_usage.clone(),
+                                None,
+                            )
+                            .await
+                    }
+                    None => {
+                        agent
+                            .run_subagent(
+                                &execution_prompt,
+                                max_turns,
+                                event_tx.as_ref(),
+                                &config.retry,
+                                initial_usage.clone(),
+                                None,
+                            )
+                            .await
+                    }
+                };
                 // A child whose next request would exceed its window compacts
                 // its own conversation and continues (mini-agent-d0rfu).
                 let relief_agent = agent.clone();
@@ -1563,7 +1995,9 @@ editing in a known location, grepping for a literal you will act on immediately.
                 .await;
                 // Host-minted evidence comes from the child's actual tool
                 // results, in call order; the report contract can only cite it.
-                let mut evidence = super::evidence::ChildEvidence::default();
+                let mut evidence = super::evidence::ChildEvidence::with_limits(evidence_limits);
+                #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+                let mut omitted_images = super::image_cost::omitted_images(&run.history);
                 if evidence_enabled {
                     evidence.record_history(&run.history);
                 }
@@ -1593,20 +2027,29 @@ editing in a known location, grepping for a literal you will act on immediately.
                     if evidence_enabled {
                         evidence.record_history(&retried.history);
                     }
+                    omitted_images += super::image_cost::omitted_images(&retried.history);
                     run = merge_forced_continuation_run(run, retried);
                 }
 
+                // The conversation a later `resume` continues (an isolated
+                // child's worktree does not outlive it, so it is not kept).
+                let conversation = if !isolated && run.response.is_ok() {
+                    run.history.clone()
+                } else {
+                    Vec::new()
+                };
                 // Budget write-up and report repair are tool-free continuations
                 // of this child's own conversation (tool results included).
                 let continuation_agent = agent.clone();
                 let continuation_retry = config.retry.clone();
                 let continuation_events = event_tx.clone();
                 let evidence_ids = evidence_enabled.then(|| evidence.len());
-                let finished = finish_child_run(
+                let finished = finish_child_run_with(
                     run,
                     || task_budget.exhausted(),
                     max_report_bytes,
                     evidence_ids,
+                    report_policy,
                     |stage, prompt, history| {
                         let ledger = match stage {
                             Continuation::WriteUp => writeup_usage.clone(),
@@ -1709,6 +2152,29 @@ editing in a known location, grepping for a literal you will act on immediately.
                     ),
                     _ => None,
                 };
+                let resume_id = output
+                    .is_ok()
+                    .then(|| resume_store.insert(resume_agent_type, conversation))
+                    .flatten();
+                // Host-authored: images the child's history ceiling dropped.
+                let host_suffix = match (omitted_images, host_suffix) {
+                    (0, suffix) => suffix,
+                    (count, Some(suffix)) => Some(format!(
+                        "{}{suffix}",
+                        super::image_cost::omission_note(count)
+                    )),
+                    (count, None) if output.is_ok() => {
+                        Some(super::image_cost::omission_note(count))
+                    }
+                    (_, None) => None,
+                };
+                let host_suffix = match (resume_id, host_suffix) {
+                    (Some(id), Some(evidence)) => {
+                        Some(format!("{}{evidence}", super::resume::resume_line(&id)))
+                    }
+                    (Some(id), None) => Some(super::resume::resume_line(&id)),
+                    (None, suffix) => suffix,
+                };
                 inline_sink.record(index, selection.images);
                 let output = match isolated_worktree {
                     Some(worktree) => {
@@ -1760,7 +2226,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                             Some(live_budget),
                         )
                         .await;
-                        let failed = report.stop_reason.is_some();
+                        let failed = report.failed();
                         let text = super::inline_images::guard_text_output(report.render());
                         let details = Some(details_sink.take());
                         (if failed { Err(text) } else { Ok(text) }, details)
@@ -1776,11 +2242,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             execute_tasks_with_budget(prompts, limits, executor, result_notice, Some(live_budget))
                 .await;
         if let Some(pool) = &task_pool {
-            pool.record_foreground(
-                task_label,
-                report.stop_reason.is_some(),
-                details_sink.take(),
-            );
+            pool.record_foreground(task_label, report.failed(), details_sink.take());
         }
         // Only the host builds the envelope: the quoted text report first,
         // the admitted images appended after it, in prompt order.
@@ -1896,11 +2358,72 @@ struct FinishedChild {
 /// child's own conversation through `continue_tool_free`; the repair therefore
 /// sees the tool results behind the findings it restates. The raw text of a
 /// report the host ends up replacing is kept in the details, for the user.
+#[cfg(test)]
 async fn finish_child_run<C, Fut>(
+    run: SubagentRunOutput,
+    budget_exhausted: impl Fn() -> bool,
+    max_report_bytes: usize,
+    evidence_ids: Option<usize>,
+    continue_tool_free: C,
+) -> FinishedChild
+where
+    C: FnMut(Continuation, String, Vec<Message>) -> Fut,
+    Fut: Future<Output = SubagentRunOutput>,
+{
+    finish_child_run_with(
+        run,
+        budget_exhausted,
+        max_report_bytes,
+        evidence_ids,
+        ReportPolicy::default(),
+        continue_tool_free,
+    )
+    .await
+}
+
+/// How a child's final text is checked and what of it is kept for the user.
+#[derive(Clone, Copy, Debug)]
+struct ReportPolicy {
+    /// Persona `contract: none`: the text is returned verbatim (within the
+    /// report cap) without section validation or repair.
+    free_form: bool,
+    /// `[subagents] task_unverified_bytes`: raw text kept for `/tasks result`
+    /// when the host replaces a report.
+    unverified_bytes: usize,
+}
+
+impl Default for ReportPolicy {
+    fn default() -> Self {
+        Self {
+            free_form: false,
+            unverified_bytes: crate::extras::subagents::background::MAX_UNVERIFIED_BYTES,
+        }
+    }
+}
+
+impl ReportPolicy {
+    fn from_config(config: &crate::config::Config, free_form: bool) -> Self {
+        use crate::extras::subagents::background::{
+            MAX_UNVERIFIED_BYTES, MAX_UNVERIFIED_BYTES_CEILING,
+        };
+        Self {
+            free_form,
+            unverified_bytes: config
+                .subagents
+                .as_ref()
+                .and_then(|policy| policy.task_unverified_bytes)
+                .unwrap_or(MAX_UNVERIFIED_BYTES)
+                .min(MAX_UNVERIFIED_BYTES_CEILING),
+        }
+    }
+}
+
+async fn finish_child_run_with<C, Fut>(
     mut run: SubagentRunOutput,
     budget_exhausted: impl Fn() -> bool,
     max_report_bytes: usize,
     evidence_ids: Option<usize>,
+    policy: ReportPolicy,
     mut continue_tool_free: C,
 ) -> FinishedChild
 where
@@ -1941,7 +2464,10 @@ where
     }
 
     let mut known_violations = None;
-    if !budget_exhausted()
+    if policy.free_form {
+        // `contract: none`: the child's text is the report, as written.
+        known_violations = Some(Vec::new());
+    } else if !budget_exhausted()
         && let Ok(response) = run.response.as_ref()
     {
         let violations = report_contract_violations_with(response, evidence_ids);
@@ -1964,7 +2490,7 @@ where
             if !selected_violations.is_empty() {
                 details.unverified = Some(crate::extras::subagents::background::clip_bytes(
                     &selected,
-                    crate::extras::subagents::background::MAX_UNVERIFIED_BYTES,
+                    policy.unverified_bytes,
                 ));
             }
             run.response = Ok(selected);
@@ -1975,7 +2501,7 @@ where
     {
         details.unverified = Some(crate::extras::subagents::background::clip_bytes(
             response,
-            crate::extras::subagents::background::MAX_UNVERIFIED_BYTES,
+            policy.unverified_bytes,
         ));
     }
     FinishedChild {
@@ -2246,6 +2772,7 @@ fn indexed_child_future(
     prompt_len: usize,
     child: ChildFuture,
     clock: &Arc<BatchClock>,
+    capture: super::partial::PartialCapture,
 ) -> IndexedChildFuture {
     struct InFlight(Arc<BatchClock>);
     impl Drop for InFlight {
@@ -2259,7 +2786,7 @@ fn indexed_child_future(
     let in_flight = InFlight(clock.clone());
     Box::pin(async move {
         let _in_flight = in_flight;
-        let child = BATCH_SLOT.scope(BatchSlot { clock, index }, child);
+        let child = capture.scope(BATCH_SLOT.scope(BatchSlot { clock, index }, child));
         let child = match AssertUnwindSafe(child).catch_unwind().await {
             Ok(child) => child,
             Err(_) => {
@@ -2285,6 +2812,8 @@ enum TaskOutcome {
     Partial(String),
     Failed(String),
     Cancelled(String),
+    /// A cancelled child's host-rendered, quoted narration so far.
+    CancelledPartial(String),
     NotStarted(String),
 }
 
@@ -2299,6 +2828,7 @@ impl TaskOutcome {
             Self::Partial(rendered) => rendered.clone(),
             Self::Failed(error) => format!("[failed: {error}]\n"),
             Self::Cancelled(reason) => format!("[cancelled: {reason}]\n"),
+            Self::CancelledPartial(rendered) => rendered.clone(),
             Self::NotStarted(reason) => format!("[not started: {reason}]\n"),
         }
     }
@@ -2312,6 +2842,7 @@ impl TaskOutcome {
             Self::Partial(rendered) => rendered.len(),
             Self::Failed(error) => "[failed: ]\n".len() + error.len(),
             Self::Cancelled(reason) => "[cancelled: ]\n".len() + reason.len(),
+            Self::CancelledPartial(rendered) => rendered.len(),
             Self::NotStarted(reason) => "[not started: ]\n".len() + reason.len(),
         }
     }
@@ -2361,6 +2892,17 @@ struct TaskReport {
 }
 
 impl TaskReport {
+    /// The call failed as a whole: it was stopped early, or no child
+    /// returned anything but a failure.
+    fn failed(&self) -> bool {
+        self.stop_reason.is_some()
+            || (!self.outcomes.is_empty()
+                && self
+                    .outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, TaskOutcome::Failed(_))))
+    }
+
     fn render(&self) -> String {
         let mut preamble = String::new();
         if let Some(notice) = &self.notice {
@@ -2503,6 +3045,41 @@ fn fit_success(response: String, budget: usize) -> (TaskOutcome, bool) {
             .saturating_sub((rendered.len() - budget).max(1))
             .max(minimum.len());
     }
+}
+
+/// A cancelled child's streamed narration, quoted and marked partial, fitted
+/// to `budget` rendered bytes; a terse `[cancelled]` when nothing fits.
+fn cancelled_partial(
+    reason: &str,
+    snapshot: &super::partial::PartialSnapshot,
+    budget: usize,
+) -> TaskOutcome {
+    const CUT: &str = "\n…[narration truncated]";
+    let header = format!(
+        "[partial: cancelled ({reason}) after {} tool calls; narration so far, not a validated report]\n",
+        snapshot.tool_calls
+    );
+    let fixed = header.len() + SUBAGENT_OUTPUT_BEGINS.len() + SUBAGENT_OUTPUT_ENDS.len();
+    let mut raw_budget = budget.saturating_sub(fixed);
+    while raw_budget > CUT.len() + 16 {
+        let text = if snapshot.text.len() <= raw_budget {
+            if snapshot.truncated && snapshot.text.len() + CUT.len() <= raw_budget {
+                format!("{}{CUT}", snapshot.text)
+            } else {
+                snapshot.text.clone()
+            }
+        } else {
+            truncate_total_bytes(&snapshot.text, raw_budget, CUT)
+        };
+        let quoted = quote_untrusted_output(&text);
+        if fixed + quoted.len() <= budget {
+            return TaskOutcome::CancelledPartial(format!(
+                "{header}{SUBAGENT_OUTPUT_BEGINS}{quoted}{SUBAGENT_OUTPUT_ENDS}"
+            ));
+        }
+        raw_budget = raw_budget.saturating_sub((fixed + quoted.len() - budget).max(1));
+    }
+    TaskOutcome::Cancelled(reason.to_string())
 }
 
 /// Rows of the evidence index offered when the child's report was withheld.
@@ -2689,6 +3266,9 @@ async fn execute_tasks_with_budget(
         (output_bytes >= limits.max_output_bytes).then_some(StopReason::OutputLimit);
     let mut cancellation_costs: Vec<Option<CancellationCost>> =
         std::iter::repeat_with(|| None).take(task_count).collect();
+    let captures: Vec<super::partial::PartialCapture> = std::iter::repeat_with(Default::default)
+        .take(task_count)
+        .collect();
     let deadline = Instant::now() + limits.timeout;
     let clock = Arc::new(BatchClock::new(limits.timeout));
     let mut in_flight: FuturesUnordered<IndexedChildFuture> = FuturesUnordered::new();
@@ -2712,6 +3292,7 @@ async fn execute_tasks_with_budget(
             prompt_len,
             child.future,
             &clock,
+            captures[index].clone(),
         ));
     }
 
@@ -2787,7 +3368,7 @@ async fn execute_tasks_with_budget(
         // only when work that has not finished is being abandoned.
         if child_failed && live_budget.as_ref().is_some_and(LiveTaskBudget::exhausted) {
             stop_reason = Some(StopReason::CostLimit);
-        } else if child_failed {
+        } else if child_failed && limits.fail_fast {
             stop_reason = Some(StopReason::ChildFailure(index));
         } else if work_remains && (output_exhausted || output_bytes >= limits.max_output_bytes) {
             stop_reason = Some(StopReason::OutputLimit);
@@ -2826,6 +3407,7 @@ async fn execute_tasks_with_budget(
                 prompt_len,
                 child.future,
                 &clock,
+                captures[index].clone(),
             ));
         }
     }
@@ -2851,14 +3433,39 @@ async fn execute_tasks_with_budget(
     if let Some(budget) = &live_budget {
         cost_units = cost_units.max(budget.used.load(std::sync::atomic::Ordering::Acquire));
     }
-    if let Some(reason) = &stop_reason {
-        let reason = reason.description(limits);
+    if let Some(stop) = &stop_reason {
+        let reason = stop.description(limits);
+        // Resource stops (deadline, cost, output) return the narration an
+        // in-flight child had streamed, marked partial. A fail-fast stop
+        // cancels siblings because of another child, so they stay terse.
+        let keep_narration = !matches!(stop, StopReason::ChildFailure(_));
+        let narrating = (0..task_count)
+            .filter(|&index| {
+                keep_narration
+                    && started[index]
+                    && outcomes[index].is_none()
+                    && captures[index].snapshot().is_some()
+            })
+            .count();
+        // The partial-status header is added when the report renders; keep
+        // room for it so the narration is not cut by the final hard cap.
+        let share = limits
+            .max_output_bytes
+            .saturating_sub(output_bytes)
+            .saturating_sub(MIN_OUTPUT_BYTES)
+            .checked_div(narrating)
+            .unwrap_or(0);
         for index in 0..task_count {
             if outcomes[index].is_none() {
-                outcomes[index] = Some(if started[index] {
-                    TaskOutcome::Cancelled(reason.clone())
-                } else {
+                outcomes[index] = Some(if !started[index] {
                     TaskOutcome::NotStarted(reason.clone())
+                } else if let Some(snapshot) = captures[index].snapshot().filter(|_| keep_narration)
+                {
+                    let budget = share
+                        .saturating_sub(task_heading(index, &prompts[index], task_count).len());
+                    cancelled_partial(&reason, &snapshot, budget)
+                } else {
+                    TaskOutcome::Cancelled(reason.clone())
                 });
             }
         }
@@ -2943,9 +3550,11 @@ fn task_heading(index: usize, prompt: &str, task_count: usize) -> String {
     // instead of normalising a brief of up to 64 KB.
     let mut label = String::new();
     let mut chars = 0;
+    let mut cut = false;
     'words: for word in prompt.split_whitespace() {
         if chars > 0 {
             if chars == 60 {
+                cut = true;
                 break;
             }
             label.push(' ');
@@ -2953,11 +3562,16 @@ fn task_heading(index: usize, prompt: &str, task_count: usize) -> String {
         }
         for ch in word.chars() {
             if chars == 60 {
+                cut = true;
                 break 'words;
             }
             label.push(ch);
             chars += 1;
         }
+    }
+    // A shortened label is marked; the full prompt still reaches the child.
+    if cut {
+        label.push('…');
     }
     format!("{separator}## Task {}: {}\n\n", index + 1, label)
 }
@@ -3818,6 +4432,7 @@ mod tests {
             max_output_bytes: 16 * 1024,
             max_cost_units: 1_000,
             timeout: Duration::from_secs(1),
+            fail_fast: false,
         }
     }
 
@@ -4456,6 +5071,7 @@ mod tests {
             }]),
             agent_type: None,
             run_in_background: false,
+            options: Default::default(),
         };
 
         let prompts = prepare_task_prompts(&args, limits()).unwrap();
@@ -4476,6 +5092,7 @@ mod tests {
             briefs: Some(Vec::new()),
             agent_type: None,
             run_in_background: false,
+            options: Default::default(),
         };
         assert!(prepare_task_prompts(&empty, limits()).is_err());
 
@@ -4489,6 +5106,7 @@ mod tests {
             }]),
             agent_type: None,
             run_in_background: false,
+            options: Default::default(),
         };
         let error = prepare_task_prompts(&oversized, limits()).unwrap_err();
         assert!(error.to_string().contains("files item 1"));
@@ -4512,6 +5130,7 @@ mod tests {
             }]),
             agent_type: None,
             run_in_background: false,
+            options: Default::default(),
         };
         let response = "## Findings\n- [confidence: high] No finding.\n\n## Unverified\n- Runtime behavior.\n\n## Coverage\n- Covered: src/auth.rs.\n- Skipped: None.";
 
@@ -4622,6 +5241,7 @@ mod tests {
             model: None,
             turn_budget: None,
             inline_images: None,
+            run: Default::default(),
             #[cfg(feature = "mcp")]
             mcp_servers: None,
         };
@@ -4659,6 +5279,7 @@ mod tests {
             model: Some("fast-review".into()),
             turn_budget: Some(crate::context::agents::AgentTurnBudget::Medium),
             inline_images: None,
+            run: Default::default(),
             #[cfg(feature = "mcp")]
             mcp_servers: None,
         }
@@ -5187,7 +5808,10 @@ mod tests {
             ];
             let report = execute_tasks(
                 prompts(4),
-                limits(),
+                TaskLimits {
+                    fail_fast: true,
+                    ..limits()
+                },
                 fake_executor(steps, Arc::clone(&counters)),
                 None,
             )
@@ -5227,6 +5851,484 @@ mod tests {
                 .collect();
             assert!(headings.windows(2).all(|pair| pair[0] < pair[1]));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_child_does_not_cancel_its_siblings_by_default() {
+        let counters = Arc::new(FakeCounters::default());
+        let steps = vec![
+            FakeStep {
+                delay: Duration::from_millis(200),
+                output: Ok("first report".into()),
+                cost_units: 1,
+            },
+            FakeStep {
+                delay: Duration::from_millis(5),
+                output: Err("subagent error: provider returned 500".into()),
+                cost_units: 1,
+            },
+            FakeStep {
+                delay: Duration::from_millis(100),
+                output: Ok("third report".into()),
+                cost_units: 1,
+            },
+        ];
+        let report = execute_tasks(
+            prompts(3),
+            limits(),
+            fake_executor(steps, Arc::clone(&counters)),
+            None,
+        )
+        .await;
+        let rendered = report.render();
+        assert!(report.stop_reason.is_none(), "{rendered}");
+        assert!(!report.failed());
+        assert_eq!(report.completed, 3);
+        assert!(matches!(report.outcomes[0], TaskOutcome::Success(_)));
+        assert!(matches!(report.outcomes[1], TaskOutcome::Failed(_)));
+        assert!(matches!(report.outcomes[2], TaskOutcome::Success(_)));
+        assert!(rendered.contains("> first report"));
+        assert!(rendered.contains("> third report"));
+        assert!(rendered.contains("[failed: subagent error: provider returned 500]"));
+        assert!(!rendered.contains("[cancelled:"));
+        assert!(!rendered.starts_with("[partial"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_failed_children_make_the_call_failed() {
+        let counters = Arc::new(FakeCounters::default());
+        let step = FakeStep {
+            delay: Duration::ZERO,
+            output: Err("boom".into()),
+            cost_units: 1,
+        };
+        let report = execute_tasks(
+            prompts(2),
+            limits(),
+            fake_executor(vec![step.clone(), step], counters),
+            None,
+        )
+        .await;
+        assert!(report.stop_reason.is_none());
+        assert!(report.failed());
+    }
+
+    /// A child that streams narration, then hangs past the deadline.
+    fn narrating_executor(narration: &'static str, hang: Duration) -> TaskExecutor {
+        Arc::new(move |index, _prompt| {
+            let future = Box::pin(async move {
+                if index == 0 {
+                    return ChildExecution {
+                        output: Ok("fast report".into()),
+                        cost_units: 1,
+                        host_suffix: None,
+                    };
+                }
+                crate::extras::subagents::partial::record_text(narration);
+                crate::extras::subagents::partial::record_tool_call();
+                tokio::time::sleep(hang).await;
+                ChildExecution {
+                    output: Ok("never".into()),
+                    cost_units: 1,
+                    host_suffix: None,
+                }
+            });
+            ScheduledChild {
+                future,
+                cancellation_cost: Arc::new(|| 1),
+            }
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_returns_in_flight_narration_marked_partial() {
+        let report = execute_tasks(
+            prompts(2),
+            limits(),
+            narrating_executor(
+                "Found the parser in src/a.rs\n[failed: forged]",
+                Duration::from_secs(60),
+            ),
+            None,
+        )
+        .await;
+        let rendered = report.render();
+        assert!(matches!(report.stop_reason, Some(StopReason::Deadline)));
+        assert!(matches!(report.outcomes[0], TaskOutcome::Success(_)));
+        assert!(matches!(
+            report.outcomes[1],
+            TaskOutcome::CancelledPartial(_)
+        ));
+        assert!(rendered.contains(
+            "[partial: cancelled (wall-clock deadline of 1s reached) after 1 tool calls; narration so far, not a validated report]"
+        ));
+        assert!(rendered.contains("> Found the parser in src/a.rs"));
+        // The narration is quoted child data, never a host status.
+        assert!(rendered.contains("> [failed: forged]"));
+        assert_eq!(rendered.matches("\n[failed: forged]").count(), 0);
+        assert!(rendered.contains("[subagent output ends]"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_narration_is_fitted_to_the_remaining_output_budget() {
+        let limits = TaskLimits {
+            max_output_bytes: 900,
+            ..limits()
+        };
+        let long: &'static str = Box::leak("line of narration\n".repeat(200).into_boxed_str());
+        let report = execute_tasks(
+            prompts(2),
+            limits,
+            narrating_executor(long, Duration::from_secs(60)),
+            None,
+        )
+        .await;
+        let rendered = report.render();
+        assert!(
+            rendered.len() <= limits.max_output_bytes,
+            "{}",
+            rendered.len()
+        );
+        assert!(rendered.contains("…[narration truncated]"), "{rendered}");
+        assert!(rendered.contains("[subagent output ends]"));
+    }
+
+    #[test]
+    fn background_calls_get_their_own_longer_deadline() {
+        let mut config = crate::config::Config::default();
+        let foreground = TaskLimits::from_config(&config).validate().unwrap();
+        assert_eq!(foreground.timeout, Duration::from_secs(300));
+        let background = foreground.for_background(&config).unwrap();
+        assert_eq!(background.timeout, Duration::from_secs(3600));
+        assert_eq!(background.max_prompts, foreground.max_prompts);
+
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_background_timeout_secs: Some(7200),
+            ..Default::default()
+        });
+        assert_eq!(
+            foreground.for_background(&config).unwrap().timeout,
+            Duration::from_secs(7200)
+        );
+        assert_eq!(
+            TaskLimits::from_config(&config).timeout,
+            Duration::from_secs(300),
+            "the background key never changes foreground calls"
+        );
+        for invalid in [0, 86_401] {
+            config.subagents = Some(crate::config::types::SubagentPolicy {
+                task_background_timeout_secs: Some(invalid),
+                ..Default::default()
+            });
+            assert!(foreground.for_background(&config).is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_child_runs_past_300s_under_a_longer_background_deadline() {
+        let slow = || FakeStep {
+            delay: Duration::from_secs(400),
+            output: Ok("slow report".into()),
+            cost_units: 1,
+        };
+        let config = crate::config::Config::default();
+        let background = TaskLimits {
+            timeout: Duration::from_secs(300),
+            ..limits()
+        }
+        .for_background(&config)
+        .unwrap();
+        let report = execute_tasks(
+            prompts(1),
+            background,
+            fake_executor(vec![slow()], Arc::new(FakeCounters::default())),
+            None,
+        )
+        .await;
+        assert!(report.stop_reason.is_none());
+        assert!(report.render().contains("> slow report"));
+
+        let foreground = TaskLimits {
+            timeout: Duration::from_secs(300),
+            ..limits()
+        };
+        let report = execute_tasks(
+            prompts(1),
+            foreground,
+            fake_executor(vec![slow()], Arc::new(FakeCounters::default())),
+            None,
+        )
+        .await;
+        assert!(matches!(report.stop_reason, Some(StopReason::Deadline)));
+    }
+
+    #[test]
+    fn per_call_and_persona_run_settings_are_bounded_by_ceilings() {
+        use crate::context::agents::AgentRunSettings;
+        let mut config = crate::config::Config::default();
+        let base = TaskLimits::from_config(&config).validate().unwrap();
+        let run = |options: TaskCallOptions,
+                   persona: Option<AgentRunSettings>,
+                   config: &crate::config::Config| {
+            let mut turns = 20;
+            let mut limits = base;
+            apply_run_settings(&options, persona, config, &mut turns, &mut limits)
+                .map(|()| (turns, limits.timeout.as_secs()))
+        };
+        assert_eq!(
+            run(TaskCallOptions::default(), None, &config).unwrap(),
+            (20, 300)
+        );
+        let persona = AgentRunSettings {
+            max_turns: Some(60),
+            timeout_secs: Some(900),
+            ..Default::default()
+        };
+        assert_eq!(
+            run(TaskCallOptions::default(), Some(persona), &config).unwrap(),
+            (60, 900)
+        );
+        // The call takes precedence over the persona.
+        let call = TaskCallOptions {
+            max_turns: Some(40),
+            timeout_secs: Some(1200),
+            ..Default::default()
+        };
+        assert_eq!(
+            run(call.clone(), Some(persona), &config).unwrap(),
+            (40, 1200)
+        );
+        // Above the ceiling is rejected, naming the key that raises it.
+        let error = run(
+            TaskCallOptions {
+                max_turns: Some(101),
+                ..Default::default()
+            },
+            None,
+            &config,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exceeds the ceiling of 100"), "{error}");
+        assert!(error.contains("task_max_turns_ceiling"));
+        let error = run(
+            TaskCallOptions::default(),
+            Some(AgentRunSettings {
+                timeout_secs: Some(7200),
+                ..Default::default()
+            }),
+            &config,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("task_timeout_ceiling_secs"), "{error}");
+        assert!(
+            run(
+                TaskCallOptions {
+                    max_turns: Some(0),
+                    ..Default::default()
+                },
+                None,
+                &config
+            )
+            .is_err()
+        );
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_max_turns_ceiling: Some(500),
+            task_timeout_ceiling_secs: Some(7200),
+            ..Default::default()
+        });
+        let raised = TaskCallOptions {
+            max_turns: Some(400),
+            timeout_secs: Some(7200),
+            ..Default::default()
+        };
+        assert_eq!(run(raised, None, &config).unwrap(), (400, 7200));
+    }
+
+    #[test]
+    fn read_only_shell_and_web_tools_stay_closed_without_their_opt_ins() {
+        use crate::context::agents::AgentTool;
+        let root = crate::tests::OwnedTestDirectory::new("child-extras");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let tool = TaskTool::new(None, None, false)
+            .with_workspace_binding(workspace.clone())
+            .with_write_tools(builder::WriteChildTools {
+                sandbox: crate::sandbox::Sandbox::new(true, "auto")
+                    .with_workspace_binding(workspace),
+                write_enabled: true,
+                edit_enabled: true,
+                shell_enabled: true,
+                max_text_file_size: None,
+                max_shell_output_lines: None,
+                shell_timeout_secs: 10,
+                diff_options: Default::default(),
+                formatter: None,
+                #[cfg(feature = "lsp")]
+                lsp: None,
+            })
+            .with_parent_web_tools(builder::ParentWebTools {
+                fetch: true,
+                search: true,
+                ..Default::default()
+            });
+        let persona = |write_mode: bool| ResolvedSpecialization {
+            write_mode,
+            isolation_worktree: false,
+            prompt: "p".into(),
+            result_notice: None,
+            source: "test".into(),
+            tools: Some(vec![
+                AgentTool::Read,
+                AgentTool::WebFetch,
+                AgentTool::WebSearch,
+            ]),
+            required_tools: Vec::new(),
+            model: None,
+            turn_budget: None,
+            inline_images: None,
+            run: crate::context::agents::AgentRunSettings {
+                read_only_shell: true,
+                ..Default::default()
+            },
+            #[cfg(feature = "mcp")]
+            mcp_servers: None,
+        };
+        let mut config = crate::config::Config::default();
+        let (shell, web) = tool.child_extras(Some(&persona(false)), &config);
+        assert!(!shell && web.is_none(), "default stays closed");
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            allow_read_only_shell: true,
+            allow_web: true,
+            ..Default::default()
+        });
+        let (shell, web) = tool.child_extras(Some(&persona(false)), &config);
+        assert_eq!(shell, cfg!(feature = "git-worktree"));
+        let web = web.unwrap();
+        assert!(web.fetch && web.search);
+        // Write personas keep their own shell; no default child gets extras.
+        assert!(!tool.child_extras(Some(&persona(true)), &config).0);
+        assert!(!tool.child_extras(None, &config).0);
+        let narrowed = with_read_only_shell_tool(Some(vec![AgentTool::Read]), true).unwrap();
+        assert!(narrowed.contains(&AgentTool::Shell));
+        assert!(
+            !with_read_only_shell_tool(Some(vec![AgentTool::Read]), false)
+                .unwrap()
+                .contains(&AgentTool::Shell)
+        );
+
+        let authorization = SubagentAuthorization::new(None, None, false)
+            .with_web_tools(Some(web))
+            .with_read_only_shell_planned();
+        let names = builder::persona_tool_names(
+            &authorization,
+            &builder::PersonaExecution {
+                tools: persona(false).tools,
+                ..Default::default()
+            },
+            #[cfg(feature = "skills")]
+            false,
+        );
+        for name in ["web_fetch", "web_search"] {
+            assert!(names.contains(&name), "{names:?}");
+        }
+        let default_names = builder::persona_tool_names(
+            &authorization,
+            &builder::PersonaExecution::default(),
+            #[cfg(feature = "skills")]
+            false,
+        );
+        assert!(
+            !default_names
+                .iter()
+                .any(|name| matches!(*name, "shell" | "web_fetch" | "web_search")),
+            "{default_names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_call_isolation_is_only_for_write_personas_and_base_ref_needs_it() {
+        let root = crate::tests::OwnedTestDirectory::new("call-isolation");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let tool = TaskTool::new(None, None, false).with_workspace_binding(workspace);
+        let config = crate::extras::subagents::SubagentConfig {
+            client: crate::provider::create_client(
+                "openrouter",
+                Some("unused-local-test-key"),
+                &Default::default(),
+                None,
+            )
+            .unwrap(),
+            provider_name: "openrouter".into(),
+            session_provider: "openrouter".into(),
+            model_name: "fixture".into(),
+            fallback_notice: None,
+            api_key: None,
+            max_turns: 2,
+            config: Default::default(),
+        };
+        for (options, expected) in [
+            (
+                serde_json::json!({"isolation": "worktree"}),
+                "applies only to a mode: write persona",
+            ),
+            (
+                serde_json::json!({"isolation": "sometimes"}),
+                "isolation must be",
+            ),
+            (
+                serde_json::json!({"base_ref": "main"}),
+                "base_ref applies only",
+            ),
+            (
+                serde_json::json!({"base_ref": "--evil"}),
+                "base_ref must name one commit",
+            ),
+        ] {
+            let mut args = serde_json::json!({"prompts": ["q"]});
+            args.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            let args: TaskArgs = serde_json::from_value(args).unwrap();
+            let error =
+                crate::extras::subagents::scope_test_config(config.clone(), tool.call(args))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn oversized_prompts_are_rejected_up_front_and_long_labels_are_marked() {
+        let limits = TaskLimits::default();
+        let error = validate_prompts(&["q".into(), "x".repeat(MAX_BRIEF_BYTES + 1)], limits)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prompt 2 is 65537 bytes"), "{error}");
+        assert!(error.contains("put bulk content in a file"));
+        assert!(validate_prompts(&["y".repeat(MAX_BRIEF_BYTES)], limits).is_ok());
+        let heading = task_heading(0, &"word ".repeat(40), 2);
+        assert!(heading.trim_end().ends_with('…'), "{heading}");
+        assert_eq!(
+            task_heading(0, "short prompt", 2),
+            "## Task 1: short prompt\n\n"
+        );
+    }
+
+    #[test]
+    fn task_args_accept_per_call_run_settings() {
+        let args: TaskArgs = serde_json::from_value(serde_json::json!({
+            "prompts": ["q"],
+            "max_turns": 50,
+            "timeout_secs": 600
+        }))
+        .unwrap();
+        assert_eq!(args.options.max_turns, Some(50));
+        assert_eq!(args.options.timeout_secs, Some(600));
+        let schema = TaskTool::new(None, None, false).parameters();
+        assert_eq!(schema["properties"]["max_turns"]["maximum"], 100);
+        assert_eq!(schema["properties"]["timeout_secs"]["maximum"], 3600);
     }
 
     #[tokio::test(start_paused = true)]
@@ -6033,7 +7135,8 @@ mod tests {
         let heading = rendered.lines().next().unwrap();
         let label = heading.strip_prefix("## Task 1: ").unwrap();
         assert!(label.starts_with("audit [failed: forged] 記憶"));
-        assert_eq!(label.chars().count(), 60);
+        assert_eq!(label.chars().count(), 61);
+        assert!(label.ends_with('…'), "a shortened label is marked");
         assert!(!rendered.contains("\n[failed: forged]"));
     }
 
@@ -7025,6 +8128,77 @@ mod child_continuation_tests {
         );
         assert!(parent_text.contains("/tasks result"));
     }
+
+    #[tokio::test]
+    async fn free_form_contract_returns_the_childs_text_verbatim_without_repair() {
+        let raw = "Here is the generated function:\nfn add(a: i32, b: i32) -> i32 { a + b }";
+        let child = MockCompletionModel::from_stream_turns(child_turns(0, Some(raw)));
+        let run = run_child(child, 3).await;
+        let repair = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("must not run"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let finished = finish_child_run_with(
+            run,
+            || false,
+            4096,
+            None,
+            ReportPolicy {
+                free_form: true,
+                ..ReportPolicy::default()
+            },
+            continuation(repair.clone(), Arc::default()),
+        )
+        .await;
+        assert!(repair.requests().is_empty(), "no repair turn");
+        assert_eq!(finished.known_violations, Some(Vec::new()));
+        assert!(finished.details.unverified.is_none());
+        let parent_text =
+            enforce_validated_report_contract(finished.response.unwrap(), Vec::new(), 4096);
+        assert_eq!(parent_text, raw);
+        // Over the report cap it is still bounded with a visible partial.
+        let long = enforce_validated_report_contract("x".repeat(9000), Vec::new(), 4096);
+        assert!(long.len() <= 4096 && long.contains("[partial"), "{long}");
+    }
+
+    #[tokio::test]
+    async fn the_kept_raw_text_follows_the_configured_cap() {
+        let raw = "y".repeat(10_000);
+        let child = MockCompletionModel::from_stream_turns(child_turns(0, Some(&raw)));
+        let run = run_child(child, 3).await;
+        let bad_repair = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("still not a contract"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let mut config = crate::config::Config::default();
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_unverified_bytes: Some(9_000),
+            ..Default::default()
+        });
+        let finished = finish_child_run_with(
+            run,
+            || false,
+            4096,
+            None,
+            ReportPolicy::from_config(&config, false),
+            continuation(bad_repair, Arc::default()),
+        )
+        .await;
+        let kept = finished.details.unverified.unwrap();
+        assert!(
+            kept.len() <= 9_000 && kept.len() > 6 * 1024,
+            "{}",
+            kept.len()
+        );
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_unverified_bytes: Some(1 << 30),
+            ..Default::default()
+        });
+        assert_eq!(
+            ReportPolicy::from_config(&config, false).unverified_bytes,
+            crate::extras::subagents::background::MAX_UNVERIFIED_BYTES_CEILING
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7201,13 +8375,12 @@ mod response_limit_tests {
                 return String::new();
             }
             let separator = if index > 0 { "\n" } else { "" };
-            let label = prompt
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(60)
-                .collect::<String>();
+            let label = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            let cut = label.chars().count() > 60;
+            let mut label = label.chars().take(60).collect::<String>();
+            if cut {
+                label.push('…');
+            }
             format!("{separator}## Task {}: {}\n\n", index + 1, label)
         }
         let long_word = "w".repeat(80);

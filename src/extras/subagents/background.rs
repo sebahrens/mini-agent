@@ -23,6 +23,8 @@ const MAX_LOG_ARGS_BYTES: usize = 100;
 const MAX_LOG_ERROR_BYTES: usize = 80;
 /// Raw child text kept for the user after a host repair.
 pub(crate) const MAX_UNVERIFIED_BYTES: usize = 6 * 1024;
+/// Largest configurable `[subagents] task_unverified_bytes`.
+pub(crate) const MAX_UNVERIFIED_BYTES_CEILING: usize = 16 * 1024;
 /// Foreground task records kept in memory for `/tasks`.
 const MAX_RECENT_FOREGROUND: usize = 8;
 
@@ -120,11 +122,11 @@ impl TaskDetails {
                     && child
                         .unverified
                         .as_ref()
-                        .is_none_or(|text| text.len() <= MAX_UNVERIFIED_BYTES)
+                        .is_none_or(|text| text.len() <= MAX_UNVERIFIED_BYTES_CEILING)
                     && child.evidence.as_ref().is_none_or(|evidence| {
                         evidence.task_id.len() <= 64
                             && evidence.records
-                                <= crate::extras::subagents::evidence::MAX_EVIDENCE_RECORDS
+                                <= crate::extras::subagents::evidence::MAX_EVIDENCE_RECORDS_CEILING
                     })
             })
     }
@@ -358,6 +360,16 @@ impl History {
             stamp: state.stamp.clone(),
         })
     }
+    /// Drop finished rows. The admitted job whose admission evicted them is
+    /// the attribution; a user `/tasks clear` passes none.
+    fn remove(&self, ids: &[String], observation: Option<&JobObservation>) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let before = state.rows.len();
+        state.rows.retain(|row| !ids.contains(&row.id));
+        if state.rows.len() != before {
+            state.stamp.changed(observation);
+        }
+    }
     fn set(&self, saved: &SavedTask, observation: Option<&JobObservation>) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         // notified is runtime-only and cannot rewrite persisted/native bytes.
@@ -384,6 +396,8 @@ struct Entry {
     result: Option<String>,
     scope: Option<Arc<AgentWorkScope>>,
     observation: Option<JobObservation>,
+    /// Parent messages for this job's running children (`task_send`).
+    inbox: Option<Arc<crate::extras::subagents::inbox::JobInbox>>,
 }
 #[derive(Default)]
 struct State {
@@ -432,6 +446,8 @@ pub(crate) struct Pool {
     recent: Mutex<std::collections::VecDeque<RecentTask>>,
     /// Host-minted child evidence stores (foreground and background).
     evidence: crate::extras::subagents::evidence::EvidenceIndex,
+    /// Child conversations a later `task {"resume": id}` can continue.
+    resumable: Arc<crate::extras::subagents::resume::ResumeStore>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -504,6 +520,7 @@ impl NoticeLease {
 pub(crate) struct Admission {
     pool: Arc<Pool>,
     id: String,
+    inbox: Arc<crate::extras::subagents::inbox::JobInbox>,
     job_scope: Arc<AgentWorkScope>,
     observation: JobObservation,
     recorder: crate::session::file_checkpoints::Recorder,
@@ -522,6 +539,91 @@ fn clip(text: &str, cap: usize) -> String {
         end -= 1;
     }
     format!("{}{suffix}", &text[..end])
+}
+
+/// Opening of the notice that ends a saved result clipped to
+/// [`MAX_SAVED_RESULT_BYTES`].
+const SAVED_RESULT_NOTICE: &str = "[background task result truncated in the saved session";
+
+/// Where a long background report is kept in full: a name derived only from
+/// the session and the validated task id, inside that session's private
+/// tool-output directory. Saved session data never supplies this path.
+fn full_result_path(session_id: &str, id: &str) -> Option<std::path::PathBuf> {
+    uuid::Uuid::parse_str(id).ok()?;
+    let name = crate::paths::digest_filename(
+        "background-task-result",
+        &[session_id.as_bytes(), id.as_bytes()],
+        "txt",
+    )
+    .ok()?;
+    Some(crate::session::storage::tool_output_dir(session_id).join(name))
+}
+
+/// The copy of `text` that the session file keeps. A report longer than the
+/// saved ceiling is written in full to [`full_result_path`] first, and the
+/// saved copy ends with an explicit notice naming its size and that path.
+fn saved_result_copy(session_id: &str, id: &str, text: &str) -> String {
+    if text.len() <= MAX_SAVED_RESULT_BYTES {
+        return text.to_owned();
+    }
+    let stored = full_result_path(session_id, id).filter(|path| {
+        path.parent()
+            .is_some_and(|dir| crate::paths::ensure_private_directory(dir).is_ok())
+            && crate::fs::private_atomic_create_sync(path, text.as_bytes())
+                .inspect_err(
+                    |error| tracing::warn!(%error, "failed to keep full background task result"),
+                )
+                .is_ok()
+    });
+    let notice = match stored {
+        Some(path) => format!(
+            "\n{SAVED_RESULT_NOTICE} at {MAX_SAVED_RESULT_BYTES} of {} bytes; the full report is kept at {}; task_result and /tasks result return it]",
+            text.len(),
+            path.display()
+        ),
+        None => format!(
+            "\n{SAVED_RESULT_NOTICE} at {MAX_SAVED_RESULT_BYTES} of {} bytes; the full report could not be kept]",
+            text.len()
+        ),
+    };
+    let mut end = MAX_SAVED_RESULT_BYTES.saturating_sub(notice.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{notice}", &text[..end])
+}
+
+/// The full report of a restored entry whose saved copy was clipped, read
+/// from its derived path (bounded, private file checks). `None` when the
+/// copy was not clipped or the file is gone.
+fn load_full_result(session_id: &str, id: &str, saved: &str) -> Option<String> {
+    use std::io::Read;
+    if !saved.contains(SAVED_RESULT_NOTICE) {
+        return None;
+    }
+    let path = full_result_path(session_id, id)?;
+    let file = crate::fs::open_private_file(&path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RESULT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_RESULT_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Remove the full-report files of forgotten entries.
+fn delete_full_results(session_id: &str, ids: &[String]) {
+    for id in ids {
+        if let Some(path) = full_result_path(session_id, id)
+            && path.exists()
+            && let Err(error) =
+                crate::session::storage::delete_uncommitted_tool_output(session_id, &path)
+        {
+            tracing::warn!(%error, "failed to delete a forgotten background task result");
+        }
+    }
 }
 
 impl Pool {
@@ -569,6 +671,7 @@ impl Pool {
                     saved,
                     scope: None,
                     observation: None,
+                    inbox: None,
                 },
             );
         }
@@ -591,6 +694,7 @@ impl Pool {
             write_lane: Arc::new(tokio::sync::Semaphore::new(1)),
             recent: Mutex::default(),
             evidence: Default::default(),
+            resumable: Default::default(),
         });
         session.background_pool = Some(pool.clone());
         Ok(pool)
@@ -657,13 +761,28 @@ impl Pool {
             !state.closing && !state.history_paused,
             "background task owner is closing or changing history"
         );
-        anyhow::ensure!(
-            state.jobs.len() < MAX_JOBS,
-            "background task capacity reached; start a new session after inspecting existing results"
-        );
+        // A full history makes room by dropping its oldest finished entry
+        // whose completion was already delivered; running and undelivered
+        // entries are never evicted.
+        let evict = if state.jobs.len() < MAX_JOBS {
+            None
+        } else {
+            Some(self.finished_ids(&state).into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "background task capacity reached: {MAX_JOBS} tasks are running or have undelivered results; inspect them with task_result or /tasks, or cancel one"
+                )
+            })?)
+        };
         let (observation, lifetime) = self.observations.admit()?;
+        if let Some(id) = evict {
+            state.jobs.remove(&id);
+            let ids = [id];
+            self.history.remove(&ids, Some(&observation));
+            delete_full_results(&self.session, &ids);
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let job_scope = AgentWorkScope::new();
+        let inbox = Arc::new(crate::extras::subagents::inbox::JobInbox::default());
         state.jobs.insert(
             id.clone(),
             Entry {
@@ -677,6 +796,7 @@ impl Pool {
                 result: None,
                 scope: Some(job_scope.clone()),
                 observation: Some(observation.clone()),
+                inbox: Some(inbox.clone()),
             },
         );
         self.history.set(&state.jobs[&id].saved, Some(&observation));
@@ -684,6 +804,7 @@ impl Pool {
         Ok(Admission {
             pool: self.clone(),
             id,
+            inbox,
             job_scope,
             recorder: recorder.for_background(observation.clone()),
             observation,
@@ -842,6 +963,40 @@ impl Pool {
         }
     }
 
+    /// Finished entries whose completion was delivered (or that were
+    /// restored from a saved session), oldest first.
+    fn finished_ids(&self, state: &State) -> Vec<String> {
+        self.history
+            .rows()
+            .into_iter()
+            .filter(|row| {
+                state.jobs.get(&row.id).is_some_and(|entry| {
+                    !entry.saved.status.is_active()
+                        && entry.scope.is_none()
+                        && (entry.saved.notified || entry.observation.is_none())
+                })
+            })
+            .map(|row| row.id)
+            .collect()
+    }
+
+    /// `/tasks clear`: forget every finished, delivered entry. Running jobs
+    /// and results not yet announced to the model are kept.
+    pub(crate) fn clear_finished(&self) -> usize {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ids = self.finished_ids(&state);
+        for id in &ids {
+            state.jobs.remove(id);
+        }
+        self.history.remove(&ids, None);
+        if !ids.is_empty() {
+            self.changed.notify_one();
+        }
+        drop(state);
+        delete_full_results(&self.session, &ids);
+        ids.len()
+    }
+
     pub(crate) fn list(&self) -> Vec<SavedTask> {
         self.state
             .lock()
@@ -880,6 +1035,34 @@ impl Pool {
     pub(crate) fn evidence(&self) -> &crate::extras::subagents::evidence::EvidenceIndex {
         &self.evidence
     }
+    /// Why `task_id` has no evidence store: expired (evicted, or saved before
+    /// a restart) or unknown.
+    pub(crate) fn missing_evidence_message(&self, task_id: &str) -> String {
+        if self.evidence.was_evicted(task_id) {
+            return format!(
+                "evidence task {task_id} expired: its store was evicted after the session's newest [subagents] evidence_max_children children; the task report itself is unchanged"
+            );
+        }
+        let saved = self.list().into_iter().any(|row| {
+            row.details.as_ref().is_some_and(|details| {
+                details.children.iter().any(|child| {
+                    child
+                        .evidence
+                        .as_ref()
+                        .is_some_and(|evidence| evidence.task_id == task_id)
+                })
+            })
+        });
+        if saved {
+            return format!(
+                "evidence task {task_id} expired: evidence handles are kept in memory and do not survive a restart; the saved report is still available with task_result"
+            );
+        }
+        "unknown evidence task in this session (evidence does not survive a restart)".into()
+    }
+    pub(crate) fn resumable(&self) -> &Arc<crate::extras::subagents::resume::ResumeStore> {
+        &self.resumable
+    }
     pub(crate) fn recent_foreground(&self) -> Vec<RecentTask> {
         self.recent
             .lock()
@@ -896,7 +1079,42 @@ impl Pool {
             .ok_or_else(|| anyhow::anyhow!("unknown task in this session"))?;
         let mut saved = entry.saved.clone();
         saved.result = entry.result.clone();
+        // A restored entry has only its saved copy in memory; a clipped copy
+        // is replaced by the full report kept beside the session.
+        if entry.observation.is_none()
+            && let Some(full) = saved
+                .result
+                .as_deref()
+                .and_then(|text| load_full_result(&self.session, id, text))
+        {
+            saved.result = Some(full);
+        }
         Ok(saved)
+    }
+    /// `task_send`: queue `message` for the running children of job `id`
+    /// (all, or the 0-based `child`). Refused for unknown, finished,
+    /// cancelling and restored tasks.
+    pub(crate) fn send(
+        &self,
+        id: &str,
+        child: Option<usize>,
+        message: &str,
+    ) -> anyhow::Result<usize> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = state
+            .jobs
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("unknown task in this session"))?;
+        anyhow::ensure!(
+            entry.saved.status == Status::Running,
+            "task {id} is {}; task_send reaches only running background tasks",
+            entry.saved.status.as_str()
+        );
+        let inbox = entry
+            .inbox
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("task {id} has no live children"))?;
+        inbox.send(child, message).map_err(anyhow::Error::msg)
     }
     pub(crate) fn request_cancel(&self, id: &str) -> anyhow::Result<SavedTask> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -953,13 +1171,16 @@ impl Pool {
         result: Option<String>,
         details: Option<TaskDetails>,
     ) {
+        // Written before taking the state lock: a long report goes to the
+        // session's private tool-output directory.
+        let saved_result = result
+            .as_ref()
+            .map(|text| saved_result_copy(&self.session, id, text));
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = state.jobs.get_mut(id) {
             entry.saved.status = status;
             entry.saved.details = details.filter(TaskDetails::within_bounds);
-            entry.saved.result = result
-                .as_ref()
-                .map(|text| clip(text, MAX_SAVED_RESULT_BYTES));
+            entry.saved.result = saved_result;
             entry.result = result;
             entry.scope = None;
             self.history.set(&entry.saved, entry.observation.as_ref());
@@ -993,6 +1214,10 @@ impl Admission {
     }
     pub(crate) fn observation(&self) -> JobObservation {
         self.observation.clone()
+    }
+    /// The job's inbox for `task_send` messages to its running children.
+    pub(crate) fn inbox(&self) -> Arc<crate::extras::subagents::inbox::JobInbox> {
+        self.inbox.clone()
     }
     #[cfg(test)]
     pub(crate) fn start<F>(self, work: F, run: crate::spend::run::Run) -> anyhow::Result<String>
@@ -1483,6 +1708,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_history_evicts_the_oldest_delivered_finished_entry() {
+        let root = crate::tests::OwnedTestDirectory::new("background-evict");
+        let (session, pool, workspace, run, recorder) = fixture(&root);
+        let mut ids = Vec::new();
+        for index in 0..MAX_JOBS {
+            let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+            let id = admission
+                .start(async move { Ok(format!("report {index}")) }, run.clone())
+                .unwrap();
+            settled(&pool, &id).await;
+            ids.push(id);
+        }
+        // Undelivered completions are never evicted.
+        assert!(pool.reserve(&workspace, &run, &recorder).is_err());
+        pool.pending_notices().unwrap().acknowledge();
+
+        // A running entry is never evicted either: hold the oldest slot open.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let running = admission
+            .start(
+                async move {
+                    let _ = release_rx.await;
+                    Ok("late".into())
+                },
+                run.clone(),
+            )
+            .unwrap();
+        assert!(
+            pool.result(&ids[0]).is_err(),
+            "oldest delivered entry dropped"
+        );
+        assert!(pool.result(&ids[1]).is_ok());
+        assert_eq!(pool.list().len(), MAX_JOBS);
+        assert_eq!(session.background_history.rows().len(), MAX_JOBS);
+        assert!(
+            !session
+                .background_history
+                .rows()
+                .iter()
+                .any(|row| row.id == ids[0])
+        );
+
+        // The 34th admission evicts the next delivered entry, not the running one.
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        drop(admission);
+        assert!(pool.result(&running).is_ok());
+        assert!(pool.result(&ids[1]).is_err());
+
+        // `/tasks clear` keeps running and undelivered entries only.
+        let cleared = pool.clear_finished();
+        assert_eq!(cleared, MAX_JOBS - 2);
+        let kept = pool.list();
+        assert_eq!(
+            kept.len(),
+            2,
+            "the running job and the undelivered cancellation"
+        );
+        assert!(kept.iter().any(|row| row.id == running));
+        assert_eq!(session.background_history.rows().len(), 2);
+        release_tx.send(()).unwrap();
+        settled(&pool, &running).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_long_report_survives_resume_in_full_or_with_an_explicit_notice() {
+        let root = crate::tests::OwnedTestDirectory::new("background-long-report");
+        let (session, pool, workspace, run, recorder) = fixture(&root);
+        let report = (0..3500)
+            .map(|line| format!("finding line {line:05}\n"))
+            .collect::<String>();
+        assert!(report.len() > 60 * 1024);
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let expected = report.clone();
+        let id = admission
+            .start(async move { Ok(expected) }, run.clone())
+            .unwrap();
+        assert_eq!(
+            settled(&pool, &id).await.result.as_deref(),
+            Some(report.as_str())
+        );
+
+        let saved = session
+            .background_history
+            .rows()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .result
+            .unwrap();
+        assert!(saved.len() <= MAX_SAVED_RESULT_BYTES);
+        assert!(
+            saved.contains(SAVED_RESULT_NOTICE),
+            "explicit truncation notice"
+        );
+        assert!(saved.contains(&format!("of {} bytes", report.len())));
+
+        let mut imported: crate::session::Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let reloaded = Pool::for_session(&mut imported, 1).unwrap();
+        assert_eq!(
+            reloaded.result(&id).unwrap().result.as_deref(),
+            Some(report.as_str()),
+            "the restored entry returns the full report"
+        );
+
+        // Without the kept file, the clipped copy and its notice remain.
+        delete_full_results(reloaded.session_id(), std::slice::from_ref(&id));
+        let clipped = reloaded.result(&id).unwrap().result.unwrap();
+        assert!(clipped.contains(SAVED_RESULT_NOTICE));
+        pool.close().await;
+        reloaded.close().await;
+    }
+
+    #[tokio::test]
+    async fn evidence_handles_of_a_restored_task_read_as_expired() {
+        let root = crate::tests::OwnedTestDirectory::new("background-evidence-expired");
+        let (session, pool, workspace, run, recorder) = fixture(&root);
+        let evidence_id = uuid::Uuid::new_v4().to_string();
+        let mut details = sample_details();
+        details.children[0].evidence = Some(EvidenceSummary {
+            task_id: evidence_id.clone(),
+            records: 3,
+        });
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let id = admission
+            .start_with_details(async move { (Ok("report".into()), Some(details)) }, run)
+            .unwrap();
+        settled(&pool, &id).await;
+        let mut imported: crate::session::Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let reloaded = Pool::for_session(&mut imported, 1).unwrap();
+        let message = reloaded.missing_evidence_message(&evidence_id);
+        assert!(message.contains("expired"), "{message}");
+        assert!(message.contains("do not survive a restart"));
+        let unknown = reloaded.missing_evidence_message(&uuid::Uuid::new_v4().to_string());
+        assert!(unknown.starts_with("unknown evidence task"), "{unknown}");
+        pool.close().await;
+        reloaded.close().await;
+    }
+
+    #[tokio::test]
+    async fn task_send_reaches_running_children_and_refuses_finished_tasks() {
+        let root = crate::tests::OwnedTestDirectory::new("background-send");
+        let (_session, pool, workspace, run, recorder) = fixture(&root);
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let inbox = admission.inbox();
+        let child = inbox.child(0);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let id = admission
+            .start(
+                async move {
+                    let _guard = child.running_guard();
+                    let _ = release_rx.await;
+                    Ok("done".into())
+                },
+                run.clone(),
+            )
+            .unwrap();
+        assert_eq!(pool.send(&id, None, "steer").unwrap(), 1);
+        assert!(
+            pool.send(&uuid::Uuid::new_v4().to_string(), None, "x")
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        settled(&pool, &id).await;
+        let error = pool.send(&id, None, "too late").unwrap_err().to_string();
+        assert!(error.contains("completed"), "{error}");
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn background56_closed_owner_refuses_reserved_but_not_registered_work() {
         let root = crate::tests::OwnedTestDirectory::new("background56-close-admission");
         let (_session, pool, workspace, run, recorder) = fixture(&root);
@@ -1719,6 +2117,93 @@ impl<const OP: u8> rig::tool::Tool for ControlTool<OP> {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SendArgs {
+    id: String,
+    message: String,
+    /// 1-based task index within the job; omitted sends to every running child.
+    #[serde(default)]
+    task: Option<usize>,
+}
+
+/// `task_send`: a bounded message from the parent to the running children of
+/// one of its background tasks, delivered as user input at their next model
+/// boundary. Ordinary tool permissions apply; it grants the child nothing.
+pub(crate) struct SendTool {
+    permission: Option<crate::permission::checker::PermCheck>,
+    ask: Option<crate::permission::ask::AskSender>,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+}
+
+impl SendTool {
+    pub(crate) fn new(
+        permission: Option<crate::permission::checker::PermCheck>,
+        ask: Option<crate::permission::ask::AskSender>,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        Self {
+            permission,
+            ask,
+            workspace,
+        }
+    }
+}
+
+impl rig::tool::Tool for SendTool {
+    const NAME: &'static str = "task_send";
+    type Error = crate::agent::tools::ToolError;
+    type Args = SendArgs;
+    type Output = String;
+    fn description(&self) -> String {
+        "Send a follow-up message to the running children of one of this session's background tasks. Each running child receives it as a user message at its next model turn boundary; finished, cancelled or restored tasks are refused. The message grants no permission.".into()
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "maxLength": 64, "description": "Background task ID returned by task or task_list"},
+                "message": {"type": "string", "minLength": 1, "maxLength": crate::extras::subagents::inbox::MAX_MESSAGE_BYTES, "description": "Follow-up instruction or context for the child"},
+                "task": {"type": "integer", "minimum": 1, "description": "Optional 1-based child (Task N) within the job; omit to message every running child"}
+            },
+            "required": ["id", "message"],
+            "additionalProperties": false
+        })
+    }
+    async fn call(&self, args: SendArgs) -> Result<String, Self::Error> {
+        use crate::agent::tools::ToolError;
+        let run = crate::spend::run::Run::current()
+            .ok_or_else(|| ToolError::Msg("task_send requires the owning session run".into()))?;
+        let pool = run
+            .background_pool()
+            .ok_or_else(|| ToolError::Msg("task_send has no owning session pool".into()))?;
+        let validate = || -> anyhow::Result<()> {
+            anyhow::ensure!(
+                run.belongs_to_account(&pool.session, &pool.account),
+                "task control account changed"
+            );
+            pool.validate_workspace(&self.workspace)
+        };
+        validate().map_err(|error| ToolError::Msg(error.to_string()))?;
+        if args.id.len() > 64 || uuid::Uuid::parse_str(&args.id).is_err() {
+            return Err(ToolError::Msg("task_send requires a valid task ID".into()));
+        }
+        let child = match args.task {
+            Some(0) => return Err(ToolError::Msg("task_send: task is 1-based".into())),
+            other => other.map(|task| task - 1),
+        };
+        crate::agent::tools::check_perm(&self.permission, &self.ask, Self::NAME, &args.id).await?;
+        validate().map_err(|error| ToolError::Msg(error.to_string()))?;
+        let count = pool
+            .send(&args.id, child, &args.message)
+            .map_err(|error| ToolError::Msg(error.to_string()))?;
+        Ok(format!(
+            "Message queued for {count} running child(ren) of task {}; each receives it as a user message at its next model turn boundary (a child that finishes first never sees it).",
+            args.id
+        ))
+    }
+}
+
 /// Lines returned by one `task_evidence` page when `limit` is omitted.
 const EVIDENCE_DEFAULT_LINES: usize = 400;
 const EVIDENCE_MAX_LINES: usize = 2000;
@@ -1894,12 +2379,10 @@ impl rig::tool::Tool for EvidenceTool {
         }
         let key = format!("{} {}", args.task_id, args.id);
         crate::agent::tools::check_perm(&self.permission, &self.ask, Self::NAME, &key).await?;
-        let stored = pool.evidence().get(&args.task_id).ok_or_else(|| {
-            ToolError::Msg(
-                "unknown evidence task in this session (evidence does not survive a restart)"
-                    .into(),
-            )
-        })?;
+        let stored = pool
+            .evidence()
+            .get(&args.task_id)
+            .ok_or_else(|| ToolError::Msg(pool.missing_evidence_message(&args.task_id)))?;
         let (meta, path) = stored.get(&args.id).ok_or_else(|| {
             ToolError::Msg(format!(
                 "unknown evidence ID; this task recorded E1-E{}",

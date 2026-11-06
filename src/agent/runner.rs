@@ -5845,12 +5845,14 @@ where
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
                 full_response.push_str(&text.text);
+                crate::extras::subagents::partial::record_text(&text.text);
             }
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
                 tool_call,
                 internal_call_id,
             })) => {
                 tool_calls = tool_calls.saturating_add(1);
+                crate::extras::subagents::partial::record_tool_call();
                 if tool_log.len() < MAX_TOOL_LOG_ENTRIES {
                     logged.insert(internal_call_id, tool_log.len());
                     tool_log.push(ToolLogEntry::new(

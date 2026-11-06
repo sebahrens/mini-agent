@@ -15,6 +15,46 @@ pub struct SubagentPolicy {
     /// Omitted when 0, so saving a config never adds the key.
     #[serde(skip_serializing_if = "is_zero_u8")]
     pub task_inline_images: u8,
+    /// Opt-in: the first child failure cancels its in-flight siblings and
+    /// stops queued launches. Default false: a failed child is only that
+    /// child's outcome and its siblings run to completion.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub task_fail_fast: bool,
+    /// Whole-call deadline of `run_in_background` task calls, in seconds
+    /// (default 3600, at most 86400). Foreground calls keep `task_timeout_secs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_background_timeout_secs: Option<u64>,
+    /// Highest per-call or persona `max_turns` accepted (default 100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_max_turns_ceiling: Option<usize>,
+    /// Highest per-call or persona `timeout_secs` accepted (default 3600,
+    /// at most 86400).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_timeout_ceiling_secs: Option<u64>,
+    /// Opt-in: a read-mode persona that names `shell` gets a read-only shell
+    /// (sandboxed, writes only to a private scratch directory). Default false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_read_only_shell: bool,
+    /// Opt-in: a persona that names `web_fetch`/`web_search` gets the
+    /// parent's eligible web tools under its permissions. Default false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_web: bool,
+    /// Bytes of a replaced report's raw text kept for `/tasks result`
+    /// (default 6144, at most 16384).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_unverified_bytes: Option<usize>,
+    /// Evidence records kept per child (default 64, at most 1024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_max_records: Option<usize>,
+    /// Text bytes kept per evidence record (default 262144, at most 4 MiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_max_record_bytes: Option<usize>,
+    /// Evidence content bytes kept per child (default 16 MiB, at most 256 MiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_max_child_bytes: Option<usize>,
+    /// Child evidence stores kept per session (default 64, at most 1024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_max_children: Option<usize>,
 }
 
 #[cfg(feature = "subagents")]

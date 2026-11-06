@@ -1366,6 +1366,8 @@ impl Cli {
             #[cfg(feature = "subagents")]
             "task_cancel",
             #[cfg(feature = "subagents")]
+            "task_send",
+            #[cfg(feature = "subagents")]
             "task_evidence",
             #[cfg(feature = "memory")]
             "memory_write",

@@ -48,6 +48,16 @@ pub(super) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
                 }
             }
         }
+        ["/tasks", "clear"] => {
+            let message = match &ctx.session.background_pool {
+                Some(pool) => match pool.clear_finished() {
+                    0 => "no finished, delivered background tasks to clear".to_string(),
+                    count => format!("cleared {count} finished background task(s)"),
+                },
+                None => "no live background task owner in this session".to_string(),
+            };
+            ctx.renderer.write_line(&message, C_TOOL)?;
+        }
         ["/tasks", id] if uuid::Uuid::parse_str(id).is_ok() => {
             let recent = ctx
                 .session
@@ -137,7 +147,7 @@ pub(super) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             }
         }
         _ => ctx.renderer.write_line(
-            "usage: /tasks | /tasks <id> | /tasks result <id> | /tasks cancel <id>",
+            "usage: /tasks | /tasks <id> | /tasks result <id> | /tasks cancel <id> | /tasks clear",
             C_ERROR,
         )?,
     }

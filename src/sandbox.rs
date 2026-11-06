@@ -2258,6 +2258,16 @@ impl Sandbox {
         self
     }
 
+    /// A copy whose commands may also read `root`, as an explicit read root
+    /// (a read-only subagent shell bound to a scratch workspace).
+    #[cfg(all(feature = "git-worktree", feature = "subagents"))]
+    pub(crate) fn with_extra_read_root(self, root: PathBuf) -> Self {
+        let mut reads = self.read_roots.clone();
+        reads.push(root);
+        let (profile, writes) = (self.profile, self.write_roots.clone());
+        self.with_general_profile(profile, reads, writes)
+    }
+
     /// HOME-relative `sandbox-home-mounts` (read-only, or writable with a
     /// `:rw` suffix) and `sandbox-home-masks` (added to the built-in private
     /// masks). Entries are validated, fail closed, when roots are captured.

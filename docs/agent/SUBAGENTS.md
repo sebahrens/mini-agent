@@ -50,9 +50,17 @@ Main-agent definition loading remains available when subagents are disabled.
 ## Background tasks
 
 Set `run_in_background: true` on an ordinary `task` call to return a task ID
-immediately. The same persona, tools, permission checks, deadlines, captured
-prices and session cost cap apply. The session keeps at most 32 tasks, including
-finished reports; start a new session when that bounded history is full.
+immediately. The same persona, tools, permission checks, captured prices and
+session cost cap apply. A background call has its own whole-call deadline,
+`[subagents] task_background_timeout_secs` (default 3600 seconds, at most
+86400), instead of the foreground `task_timeout_secs` (300 s); when it expires,
+in-flight children return their narration so far as `[partial: cancelled ...]`
+sections (see [Bounded execution](#bounded-execution-and-partial-results)). The session keeps at most 32 tasks, including
+finished reports. When it is full, the next admission drops the oldest finished
+task whose completion notice was already delivered (or that was restored from a
+saved session); running tasks and undelivered results are never evicted, and
+admission fails with an actionable error only when every entry is one of those.
+`/tasks clear` forgets every finished, delivered entry at once.
 Background batches share one lane of `task_max_concurrency` children, while the
 parent turn's own foreground `task` call uses a separate lane of the same size,
 so running background jobs cannot serialize it. Write-enabled children across
@@ -63,8 +71,16 @@ identity again after waiting for that lane. Time a call's children spend
 waiting for a lane is not charged to its deadline (see
 [Configuration](#configuration)).
 
-Use `task_list`, `task_result {"id":"…"}` and `task_cancel {"id":"…"}` from an
-agent (and `task_evidence`, see [Evidence handles](#evidence-handles)), or `/tasks`, `/tasks result <id>` and `/tasks cancel <id>` from the TUI.
+Use `task_list`, `task_result {"id":"…"}`, `task_cancel {"id":"…"}` and `task_send` from an
+agent (and `task_evidence`, see [Evidence handles](#evidence-handles)), or `/tasks`, `/tasks result <id>`, `/tasks cancel <id>` and `/tasks clear` from the TUI.
+`task_send {"id":"…","message":"…","task":2}` sends a follow-up message
+(at most 16 KiB, at most 8 waiting per child) to the running children of a
+background task, or only to its `## Task N` child with `task`. Each running
+child receives it as a user message, labelled as coming from the parent
+agent, at its next model-call boundary; a child that finishes first never sees
+it, and finished, cancelling, unknown or restored tasks are refused. The
+message is data: it grants no permission and changes no tool, sandbox or
+budget. Children do not message each other; there is no team mode.
 Agent controls obey ordinary tool ceilings and permissions. Cancellation reports
 `cancelling` until the actual model, approvals and effects settle. The default
 `background_tasks` footer item shows active tasks and reports awaiting delivery.
@@ -79,8 +95,16 @@ old jobs before changing their launch history. A saved entry is **data only**:
 there is no deserialized task, grant or resumable handle, and entries last saved
 as active are shown as `interrupted` after restart. The background result store
 has a 256 KiB memory ceiling and a 16 KiB saved-entry ceiling; ordinary report
-defaults remain 32 KiB per child and 128 KiB per batch. No report path is
-dereferenced on import.
+defaults remain 32 KiB per child and 128 KiB per batch. A report longer than
+16 KiB is also written in full to the session's private tool-output directory
+under a name derived only from the session and task IDs, and the saved copy
+ends with `[background task result truncated in the saved session at 16384 of
+N bytes; the full report is kept at <path>; ...]`. After a restart,
+`task_result` and `/tasks result <id>` return that full report (read with the
+private-file checks, at most 256 KiB); if the file is gone, the clipped copy
+and its notice are returned. Saved data never supplies a path: nothing is
+dereferenced on import, and the derived file is deleted when its entry is
+evicted or cleared.
 
 `subagents::background` owns the pool, and `session::background_observation`
 tracks private runtime provenance for the shared account, file checkpoints and
@@ -135,11 +159,59 @@ permission grants. `constraints` bound the investigation, while
 sections rather than replacing them. Each list is limited to 64 non-empty
 items, each item to 8 KiB, and the complete rendered brief to 64 KiB.
 
+Optional `max_turns` and `timeout_secs` arguments set the child model-turn
+budget and the whole-call deadline for one call (for example
+`{"prompts": ["…"], "max_turns": 60, "timeout_secs": 1800}`). They override a
+persona's frontmatter values and the configured defaults, and are rejected
+when above `[subagents] task_max_turns_ceiling` (default 100) or
+`task_timeout_ceiling_secs` (default 3600, at most 86400); the schema states
+the current ceilings.
+
 - **Single prompt**: one subagent explores, returns findings.
 - **Multiple prompts or briefs**: up to `task_max_concurrency` subagents run at once.
   Each result appears under a `## Task N:` heading in original prompt order.
 - The complete request is rejected before permission checking or execution if
-  it is empty, contains a blank prompt, or exceeds `task_max_prompts`.
+  it is empty, contains a blank prompt, exceeds `task_max_prompts`, or has a
+  prompt longer than 64 KiB (`MAX_BRIEF_BYTES`, the same bound as a rendered
+  brief); the error says to put bulk content in a file and name it, or to
+  split the work.
+
+Display-only bounds (none of them changes what a child receives; source
+constants in `task_tool.rs` and `background.rs`):
+
+| What | Bound | Marker |
+|---|---|---|
+| `## Task N:` heading label | 60 characters of the whitespace-collapsed prompt (`task_heading`) | `…` when shortened |
+| Foreground `/tasks` label | 200 characters, then 60 bytes | `...` |
+| Tool log per child | 24 rows (`MAX_TOOL_LOG_ENTRIES`), names 48 / arguments 100 / errors 80 bytes | `...` per field, `... N more tool calls not logged` |
+| Children with details per task | 8 (`MAX_DETAIL_CHILDREN`) | later children have no `/tasks` detail |
+| Foreground calls kept for `/tasks` | 8 most recent (`MAX_RECENT_FOREGROUND`) | oldest dropped |
+
+### Resuming a child (`resume`)
+
+After a child returns a report, the host keeps its conversation (prompt, tool
+calls, tool results and final text) and prints, after the child's closing
+`[subagent output ends]` fence:
+
+```text
+[child id: <uuid>; continue this child's conversation with task {"resume": "<uuid>", "prompts": ["<follow-up>"]}]
+```
+
+A later `task {"resume": "<uuid>", "prompts": ["follow-up"]}` continues that
+conversation with the single prompt as its next user turn, so the child keeps
+what it already read. The call is otherwise ordinary: it passes the `task`
+permission check again, runs as the stored `agent_type` (a different
+`agent_type` is rejected; omit it), uses the current persona, tools,
+deadlines and report contract, and its requests are charged to the call's
+`task_max_cost_units` and the session spend account. A resumed child gets a
+new child id. Exactly one prompt is accepted.
+
+The conversations are bounded and in memory only: the session keeps the 16
+most recent (8 MiB of serialized conversation each; larger ones get no id),
+owned by the session's task pool (or the task tool without one). They do not
+survive a restart. An unknown or expired id is rejected with an explicit
+error. Worktree-isolated children are not resumable (their worktree ends with
+them); failed children get no id.
 
 ## Specialist Agent Types
 
@@ -331,6 +403,19 @@ tools: Read, Grep, Edit, Write, Shell
 Implement the delegated change in your worktree and report the result.
 ```
 
+The same isolation can be requested per call, without editing the persona,
+by adding `"isolation": "worktree"` to a `task` call whose `agent_type` is a
+`mode: write` persona; it is rejected for read-only children (and
+`"isolation": "none"` is the default, leaving the persona's setting in
+effect). An optional `"base_ref"` (a branch, tag or commit id, resolved to
+one commit; no options, ranges or whitespace) makes isolated children branch
+from that commit instead of the parent's `HEAD`; it requires isolation:
+
+```json
+{"agent_type": "implementer", "isolation": "worktree", "base_ref": "release/1.4",
+ "briefs": [{"objective": "Backport the fix to the release branch"}]}
+```
+
 Requires the `git-worktree` and `subagents` features (both default), a parent
 workspace that is a git repository, `[subagents] allow_write = true`, and active
 permission checks (without a permission checker the parent-tree denial below
@@ -341,7 +426,8 @@ run.
 For each isolated child the host:
 
 1. Creates a worktree and branch `subagent-<id>` from the parent's current
-   `HEAD` through the same `git_worktree::create` path as `/worktree`, next to
+   `HEAD` (or the call's `base_ref`) through the same `git_worktree::create`
+   path as `/worktree`, next to
    the repository or under `wt_base_dir` / `--wt-base-dir`. Uncommitted parent
    changes are not visible to the child.
 2. Binds the child's workspace capability, file tools, sandbox and permission
@@ -488,6 +574,21 @@ mode: review
   `[reasoning] effort`. The older `effort` key is still accepted as a
   deprecated alias and logs a warning; setting both `turn_budget` and `effort`
   rejects the definition.
+- `max_turns` (1–10000) sets the child's model-turn budget, replacing the
+  `turn_budget` fraction of `task_max_turns`; `timeout_secs` (1–86400) sets
+  the whole-call deadline of calls using the persona. Both may exceed the
+  global defaults but are checked against `[subagents] task_max_turns_ceiling`
+  (default 100) and `task_timeout_ceiling_secs` (default 3600): a value above
+  its ceiling rejects the `task` call with an error naming the key, never a
+  silent clamp. A per-call `max_turns`/`timeout_secs` argument takes
+  precedence over the persona.
+- `contract: none` (default `sections`) returns the child's final text
+  verbatim instead of requiring the Findings/Unverified/Coverage sections: the
+  child is told to answer in plain text, the host skips section validation and
+  the repair turn, and the text reaches the parent quoted inside the usual
+  `[subagent output ...]` fence and cut (with a visible partial marker) at
+  `task_max_report_bytes`. Use it for free-form delegation such as code
+  generation or summaries. The safety and honesty rules still apply.
 - `inline_images` is an integer from 0 to 3 that narrows
   `[subagents] task_inline_images` for this persona (it can never widen it);
   see [Inline image lane](#inline-image-lane).
@@ -583,7 +684,8 @@ extra calls only counted).
 `/tasks <id>` shows it for background tasks (stored with the task result and
 persisted with the session) and for the eight most recent foreground calls
 (in memory, listed by `/tasks`). When the host replaces a child's text with a
-repaired report, the child's raw text (capped at 6 KiB) is kept for the user:
+repaired report, the child's raw text (capped at `[subagents]
+task_unverified_bytes`, default 6 KiB, at most 16 KiB) is kept for the user:
 `/tasks result <id>` prints it marked unverified. Neither the log nor the raw
 text is part of `task_result` output or any other model-visible text.
 
@@ -594,12 +696,21 @@ result of each child, in tool-call order, as `E1`, `E2`, … (forced
 `SubagentStop` continuations continue the numbering). A record holds the text
 and validated image parts, the tool name, a sanitized argument summary, size,
 MIME type, image dimensions and an estimated token cost. Content is written to
-the session's private tool-output directory; the session keeps only metadata:
-at most 64 records per child (later results are counted), 256 KiB of text per
-record (a longer result keeps a prefix), 16 MiB of content per child, and 64
-children per session (the oldest is evicted and its files deleted). Handles are
-in memory only: they do not survive a restart. `/tasks <id>` shows each child's
-evidence `task_id` and record count.
+the session's private tool-output directory; the session keeps only metadata.
+The limits are configurable in `[subagents]` (each clamped to 1..ceiling):
+
+| Key | Default | Ceiling | Effect (source constant in `evidence.rs`) |
+|---|---:|---:|---|
+| `evidence_max_records` | 64 | 1024 | Records per child; later tool results are only counted and cannot be cited (`MAX_EVIDENCE_RECORDS`) |
+| `evidence_max_record_bytes` | 262144 | 4 MiB | Text kept per record; a longer result keeps a prefix, marked clipped (`MAX_RECORD_TEXT_BYTES`) |
+| `evidence_max_child_bytes` | 16 MiB | 256 MiB | Content per child; later records keep metadata only, marked over ceiling (`MAX_CHILD_EVIDENCE_BYTES`) |
+| `evidence_max_children` | 64 | 1024 | Child stores per session; the oldest is evicted and its files deleted (`MAX_EVIDENCE_TASKS`) |
+
+Handles are in memory only: they do not survive a restart. `task_evidence`
+for a handle whose store was evicted, or whose task was saved before a
+restart, fails with an explicit `evidence task <id> expired: ...` message (the
+task report itself stays available with `task_result`). `/tasks <id>` shows
+each child's evidence `task_id` and record count.
 
 Children are told, as host policy appended after the read-only or write-mode
 rules, that a Findings entry may end with `[evidence: E3, E7]`. The validator
@@ -750,7 +861,25 @@ record and in attachment order:
   remaining budget cannot cover is omitted.
 
 Every attached record is listed in the Evidence table, and an `Inline images`
-block there states what was attached or why not. If at least one image was
+block there states what was attached or why not.
+
+The image limits are fixed constants, not configuration (only the count,
+`task_inline_images` ≤ 3, is configurable):
+
+| Limit | Value | Source constant |
+|---|---:|---|
+| Images one child may inline | 3 | `inline_images.rs` `MAX_PER_CHILD` |
+| Images one call may inline (all children) | 5 | `inline_images.rs` `MAX_PER_CALL` |
+| Longest side of an inlined image | 1,568 px | `inline_images.rs` `MAX_LONG_EDGE_PX` |
+| Base64 bytes one call may inline | 1.5 MiB | `inline_images.rs` `MAX_ENCODED_BYTES_PER_CALL` |
+| Base64 image bytes in one child's history | 4 MiB | `image_cost.rs` `MAX_CHILD_IMAGE_ENCODED_BYTES` |
+| Token charge per image | ≤ 4,784 | `image_cost.rs` `MAX_IMAGE_TOKENS` |
+
+Attachments beyond the per-child or per-call caps are listed in the Evidence
+table with a note instead of inlined. When the 4 MiB history ceiling drops a
+child's image tool result, the child is told in that result, and the parent's
+report carries a host line after the child's output:
+`[host note: N image result(s) were omitted from this child's history at its 4 MiB image ceiling ...]`. If at least one image was
 admitted, the `task` output is the same `{"response": …, "parts": [...]}`
 envelope `read` uses: `response` is the complete quoted text report and the
 images follow it at the end of `parts`, so earlier prompt-cache prefixes are
@@ -932,13 +1061,56 @@ Only active pure learned-JS exports can be installed in this realm.
 | `memory_read`   | Read memory files (long-term, notes…)  |
 | `memory_search` | Keyword search across all memory       |
 
+### Opt-in read-only shell and web tools
+
+Two `[subagents]` opt-ins (both default `false`) let a read-mode persona run
+checks or fetch documentation without becoming a write child:
+
+```toml
+[subagents]
+allow_read_only_shell = true   # a persona naming shell/Bash gets a read-only shell
+allow_web = true               # a persona naming web_fetch/web_search gets them
+```
+
+```yaml
+---
+tools: Read, Grep, Bash, web_fetch, web_search
+---
+```
+
+- **Read-only shell.** A read-mode persona whose `tools` names `shell` or
+  `Bash` (without the opt-in the name is ignored with a notice, as before)
+  receives the parent's shell rebound to a fresh private scratch directory
+  under the system temporary directory. The scratch directory is the
+  command's only writable workspace and is deleted when the child ends; the
+  parent workspace is added as a read root, so commands can read but not
+  write it (use absolute paths or `cd`, and point build outputs at the scratch
+  directory, for example `CARGO_TARGET_DIR`). The child is told this in a host
+  note. The shell is installed only when the rebound sandbox provably cannot
+  write the workspace: an uncontained sandbox, the `host-full` profile or an
+  extra write root overlapping the workspace removes it (the child is told
+  why), and explicit read roots need the Seatbelt or bubblewrap backend. It
+  needs the `git-worktree` feature (default) and a parent with an eligible
+  shell tool. Permission rules, approvals, the network policy, output cap and
+  deadline are the parent's. Such children are not write children: they run
+  in parallel with other read-only children.
+- **Web tools.** A persona whose `tools` names `web_fetch` and/or
+  `web_search` receives the parent's eligible web tools with the parent's
+  origin/provider settings and permission checks. Without the opt-in, or when
+  the parent lacks the tool, they are not installed.
+
+No default child (without a persona `tools` entry) ever receives a shell or
+web tool. `required_tools` can name `shell`, `web_fetch` or `web_search` to
+refuse a call before any child request when they are unavailable.
+
 ### Default profile exclusions
 
 | Tool           | Reason                                  |
 |----------------|-----------------------------------------|
 | `write`        | Available only to an opted-in `mode: write` child         |
 | `edit`         | Available only to an opted-in `mode: write` child         |
-| `bash`         | Only opted-in write children receive the parent’s eligible `shell`; default children cannot run builds or tests |
+| `bash`         | Only opted-in write children receive the parent’s eligible `shell`; a read persona can opt into the sandboxed read-only shell (`allow_read_only_shell`) |
+| `web_fetch`, `web_search` | Only a persona that names them under `[subagents] allow_web = true` |
 | `memory_write` | Subagent should not persist memory      |
 | `todo`         | Not registered — no planning tool in child context |
 | `task`         | Nested subagents are deliberately unsupported |
@@ -982,7 +1154,11 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_cost_weighting`       | `string` | `"auto"`                 | Model-aware ratios; `"fixed"` uses configured weights |
 | `task_cost_weights`         | `object` | See below                | Token-category weights and automatic-mode fallbacks |
 | `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
-| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline; completed sibling results are retained when it expires |
+| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline of foreground calls; completed sibling results and in-flight narration are retained when it expires |
+| `[subagents] task_background_timeout_secs` | `u64` | `3600` | Whole-call deadline of `run_in_background` calls (at most 86400) |
+| `[subagents] task_max_turns_ceiling` | `usize` | `100` | Highest per-call or persona `max_turns`; larger values are rejected |
+| `[subagents] task_unverified_bytes` | `usize` | `6144` | Raw text of a host-replaced report kept for `/tasks result` (at most 16384) |
+| `[subagents] task_timeout_ceiling_secs` | `u64` | `3600` | Highest per-call or persona `timeout_secs` (at most 86400); larger values are rejected |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `task_evidence`             | `bool`   | `true`                   | Host-minted evidence handles, citations, the Evidence section and `task_evidence` ([details](#evidence-handles)); tool registration follows a restart |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
@@ -1137,7 +1313,8 @@ subagent_provider = "openrouter"
 
 ## Current structured handoff contract
 
-- The child receives no conversation history. Callers can provide a
+- The child receives no conversation history, except a `resume` call, which
+  continues one earlier child's own conversation. Callers can provide a
   structured brief (`objective`, `files`, `constraints`, `expected_sections`),
   and every successful return is checked against the Findings, Unverified, and
   Coverage skeleton (mini-agent-nfd7, mini-agent-sux9).
@@ -1243,15 +1420,30 @@ estimate's patch-formula image charge. A child's history admits at most 4 MiB
 of encoded image data; see [IMAGE_READ.md](IMAGE_READ.md) for the formula and
 the omission behaviour.
 
-The first child failure stops new launches and cancels in-flight siblings.
-Aggregate output exhaustion, aggregate cost exhaustion, and the whole-call
-deadline do the same. Every prompt still receives one deterministic status in
-original prompt order:
+A child failure (for example a provider error) is that child's outcome only:
+it is reported as `[failed: ...]` and its queued and in-flight siblings run to
+completion (mini-agent-xwsaa). Set `[subagents] task_fail_fast = true` to
+restore the older behaviour where the first failure stops new launches and
+cancels in-flight siblings. Aggregate output exhaustion, aggregate cost
+exhaustion, and the whole-call deadline stop new launches and cancel in-flight
+children. Every prompt still receives one deterministic status in original
+prompt order:
 
 - completed children contain their response;
-- the triggering failure contains `[failed: ...]`;
-- started siblings contain `[cancelled: ...]`;
+- a failed child contains `[failed: ...]`;
+- an in-flight child cancelled by the deadline or an output/cost limit that
+  had already streamed text returns that narration, quoted like any child
+  output, under the host header
+  `[partial: cancelled (<reason>) after N tool calls; narration so far, not a validated report]`
+  (at most 32 KiB per child, sharing the remaining output budget with the
+  other cancelled children and marked `…[narration truncated]` when cut);
+- other started children contain `[cancelled: ...]` (a fail-fast stop always
+  uses this terse form for its siblings);
 - queued prompts contain `[not started: ...]`.
+
+A background task is recorded as `failed` only when the call stopped early or
+every child failed; a batch with some failed children is `completed` and shows
+their `[failed: ...]` sections.
 
 The scheduler checks the absolute deadline before admitting each child.
 A result already ready when the scheduler resumes is
@@ -1278,8 +1470,8 @@ defaults to 32 KiB and is bounded by the aggregate limit, while
 entire rendered tool result, including headings and status markers.
 Scheduling charges completed responses with their quotation prefixes and host
 markers, plus any specialist notice, before starting queued work. Task labels
-collapse prompt whitespace into a single line and keep at most 60 characters;
-the full execution prompt is preserved.
+collapse prompt whitespace into a single line and keep at most 60 characters,
+ending with `…` when shortened; the full execution prompt is preserved.
 
 Children report their nested tool calls on the parent run's event channel.
 Runs started while delegation is installed use a 512-slot channel instead of

@@ -60,6 +60,8 @@ pub(crate) enum AgentTool {
     Write,
     Edit,
     Shell,
+    WebFetch,
+    WebSearch,
     #[cfg(feature = "js")]
     Js,
     #[cfg(feature = "skills")]
@@ -85,6 +87,8 @@ impl AgentTool {
             "write" => Some(Self::Write),
             "edit" => Some(Self::Edit),
             "bash" | "shell" => Some(Self::Shell),
+            "web_fetch" | "webfetch" => Some(Self::WebFetch),
+            "web_search" | "websearch" => Some(Self::WebSearch),
             #[cfg(feature = "js")]
             "js" | "javascript" => Some(Self::Js),
             #[cfg(feature = "skills")]
@@ -106,6 +110,8 @@ impl AgentTool {
             Self::Write => "write",
             Self::Edit => "edit",
             Self::Shell => "shell",
+            Self::WebFetch => "web_fetch",
+            Self::WebSearch => "web_search",
             #[cfg(feature = "js")]
             Self::Js => "js",
             #[cfg(feature = "skills")]
@@ -125,6 +131,29 @@ pub(crate) enum AgentTurnBudget {
     High,
 }
 
+/// Per-persona child run settings from frontmatter (`max_turns`,
+/// `timeout_secs`). Each is checked against `[subagents]` ceilings when a
+/// task uses the persona; a value above its ceiling rejects the call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgentRunSettings {
+    /// Child model turns; replaces the `turn_budget` fraction of `task_max_turns`.
+    pub(crate) max_turns: Option<usize>,
+    /// Whole-call deadline in seconds for calls using this persona.
+    pub(crate) timeout_secs: Option<u64>,
+    /// A read-mode persona named `shell`/`Bash` in `tools`: it receives the
+    /// sandboxed read-only shell when `[subagents] allow_read_only_shell`.
+    pub(crate) read_only_shell: bool,
+    /// `contract: none`: the child's final text is returned verbatim
+    /// (quoted, within the report cap) without the Findings/Unverified/
+    /// Coverage contract, its validation or its repair turn.
+    pub(crate) free_form: bool,
+}
+
+/// Largest `max_turns` frontmatter value accepted while parsing.
+const MAX_FRONTMATTER_TURNS: u64 = 10_000;
+/// Largest `timeout_secs` frontmatter value accepted while parsing.
+const MAX_FRONTMATTER_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AgentMetadata {
     mode: Option<String>,
@@ -138,6 +167,7 @@ struct AgentMetadata {
     isolation_worktree: bool,
     /// `inline_images: N` (0-3) narrows `[subagents] task_inline_images`.
     inline_images: Option<u8>,
+    run: AgentRunSettings,
     /// The turn budget came from the deprecated `effort` alias.
     deprecated_effort_alias: bool,
     #[cfg(feature = "mcp")]
@@ -241,9 +271,9 @@ fn normalize_agent_definition(
         .get(serde_yaml_ng::Value::String("tools".into()))
         .map(|value| parse_agent_tools(value, mode.as_deref() == Some("write")))
         .transpose()?;
-    let (tools, tool_narrowing_notice) = match parsed_tools {
-        Some((tools, notice)) => (Some(tools), notice),
-        None => (None, None),
+    let (tools, tool_narrowing_notice, read_only_shell) = match parsed_tools {
+        Some((tools, notice, shell)) => (Some(tools), notice, shell),
+        None => (None, None, false),
     };
     let required_tools = mapping
         .get(serde_yaml_ng::Value::String("required_tools".into()))
@@ -310,6 +340,37 @@ fn normalize_agent_definition(
             _ => return Err("frontmatter inline_images must be an integer from 0 to 3"),
         },
     };
+    let bounded_integer = |key: &str, max: u64, error: &'static str| match mapping
+        .get(serde_yaml_ng::Value::String(key.into()))
+    {
+        None => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(count @ 1..) if count <= max => Ok(Some(count)),
+            _ => Err(error),
+        },
+    };
+    let run = AgentRunSettings {
+        max_turns: bounded_integer(
+            "max_turns",
+            MAX_FRONTMATTER_TURNS,
+            "frontmatter max_turns must be an integer from 1 to 10000",
+        )?
+        .map(|turns| turns as usize),
+        timeout_secs: bounded_integer(
+            "timeout_secs",
+            MAX_FRONTMATTER_TIMEOUT_SECS,
+            "frontmatter timeout_secs must be an integer from 1 to 86400",
+        )?,
+        read_only_shell,
+        free_form: match mapping.get(serde_yaml_ng::Value::String("contract".into())) {
+            None => false,
+            Some(value) => match value.as_str() {
+                Some("none") => true,
+                Some("sections") => false,
+                _ => return Err("frontmatter contract must be none or sections"),
+            },
+        },
+    };
     #[cfg(feature = "mcp")]
     let mcp_servers = mapping
         .get(serde_yaml_ng::Value::String("mcp_servers".into()))
@@ -327,6 +388,9 @@ fn normalize_agent_definition(
         "turn_budget",
         "effort",
         "inline_images",
+        "max_turns",
+        "timeout_secs",
+        "contract",
         "mcp_servers",
     ];
     #[cfg(not(feature = "mcp"))]
@@ -341,6 +405,9 @@ fn normalize_agent_definition(
         "turn_budget",
         "effort",
         "inline_images",
+        "max_turns",
+        "timeout_secs",
+        "contract",
     ];
     let mut unknown_keys = mapping
         .keys()
@@ -368,6 +435,7 @@ fn normalize_agent_definition(
                     turn_budget,
                     isolation_worktree,
                     inline_images,
+                    run,
                     deprecated_effort_alias,
                     #[cfg(feature = "mcp")]
                     mcp_servers,
@@ -506,7 +574,7 @@ fn requires_indexer_cli(prompt: &str) -> bool {
 fn parse_agent_tools(
     value: &serde_yaml_ng::Value,
     write_mode: bool,
-) -> Result<(Vec<AgentTool>, Option<String>), &'static str> {
+) -> Result<(Vec<AgentTool>, Option<String>, bool), &'static str> {
     let names = if let Some(list) = value.as_sequence() {
         list.iter()
             .map(|value| {
@@ -527,6 +595,12 @@ fn parse_agent_tools(
     }
     let mut tools = Vec::new();
     let mut ignored = Vec::new();
+    // A read-mode persona that names `shell`/`Bash` asks for the opt-in
+    // read-only shell; its tool list itself never gains a mutating tool.
+    let shell_requested = !write_mode
+        && names
+            .iter()
+            .any(|name| AgentTool::parse(name) == Some(AgentTool::Shell));
     for name in names {
         if name.is_empty() {
             return Err("frontmatter tools contains an empty tool name");
@@ -554,11 +628,13 @@ fn parse_agent_tools(
         } else { String::new() };
         if write_mode {
             format!("tools {names}{more} ignored: write personas support only installed tools")
+        } else if shell_requested {
+            format!("tools {names}{more} ignored: subagents are read-only and support only installed read tools; a named shell becomes the sandboxed read-only shell only under [subagents] allow_read_only_shell = true")
         } else {
             format!("tools {names}{more} ignored: subagents are read-only and support only installed read tools")
         }
     });
-    Ok((tools, notice))
+    Ok((tools, notice, shell_requested))
 }
 
 #[cfg(test)]
@@ -622,6 +698,8 @@ pub struct AgentDefinition {
     pub(crate) isolation_worktree: bool,
     /// `inline_images: N`: narrows the configured inline image lane cap.
     pub(crate) inline_images: Option<u8>,
+    /// `max_turns` / `timeout_secs` child run settings.
+    pub(crate) run: AgentRunSettings,
     pub source: AgentDefinitionSource,
     project_notes_path: Option<PathBuf>,
     ignored_definition_notices: Vec<String>,
@@ -649,6 +727,7 @@ fn merge_definitions(
                 mcp_servers: metadata.mcp_servers,
                 isolation_worktree: metadata.isolation_worktree,
                 inline_images: metadata.inline_images,
+                run: metadata.run,
                 source: source.clone(),
                 project_notes_path: None,
                 ignored_definition_notices: notices,
@@ -692,6 +771,7 @@ impl AgentDefinition {
             mcp_servers: None,
             isolation_worktree: false,
             inline_images: None,
+            run: AgentRunSettings::default(),
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -1066,6 +1146,7 @@ fn merge_external_definitions(
                         mcp_servers: metadata.mcp_servers,
                         isolation_worktree: metadata.isolation_worktree,
                         inline_images: metadata.inline_images,
+                        run: metadata.run,
                         source: source.clone(),
                         project_notes_path: None,
                         ignored_definition_notices: notices,
@@ -2371,6 +2452,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn persona_max_turns_and_timeout_are_bounded_positive_integers() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition(
+                "long".into(),
+                format!("---\nname: long\n{frontmatter}\n---\nbody"),
+            )
+        };
+        assert_eq!(
+            parse("tools: Read").unwrap().2.run,
+            AgentRunSettings::default()
+        );
+        let parsed = parse("max_turns: 60\ntimeout_secs: 1800").unwrap().2;
+        assert_eq!(parsed.run.max_turns, Some(60));
+        assert_eq!(parsed.run.timeout_secs, Some(1800));
+        assert!(parsed.unknown_keys.is_empty());
+        assert!(parse("max_turns: 0").unwrap_err().contains("max_turns"));
+        assert!(parse("max_turns: lots").unwrap_err().contains("max_turns"));
+        assert!(
+            parse("timeout_secs: 86401")
+                .unwrap_err()
+                .contains("timeout_secs")
+        );
+        // A read persona naming Bash asks for the opt-in read-only shell
+        // without gaining a shell entry in its tool narrowing.
+        let shell = parse("tools: Read, Bash").unwrap().2;
+        assert!(shell.run.read_only_shell);
+        assert_eq!(shell.tools, Some(vec![AgentTool::Read]));
+        assert!(
+            shell
+                .tool_narrowing_notice
+                .unwrap()
+                .contains("allow_read_only_shell")
+        );
+        assert!(
+            !parse("mode: write\ntools: Read, Bash")
+                .unwrap()
+                .2
+                .run
+                .read_only_shell
+        );
+        assert!(!parse("tools: Read").unwrap().2.run.read_only_shell);
+        assert!(parse("contract: none").unwrap().2.run.free_form);
+        assert!(!parse("contract: sections").unwrap().2.run.free_form);
+        assert!(!parse("tools: Read").unwrap().2.run.free_form);
+        assert!(parse("contract: loose").unwrap_err().contains("contract"));
+    }
+
+    #[test]
     fn persona_isolation_is_an_explicit_worktree_opt_in() {
         let parse = |frontmatter: &str| {
             normalize_agent_definition(
@@ -2582,6 +2711,7 @@ pub(crate) mod tests {
             mcp_servers: None,
             isolation_worktree: false,
             inline_images: None,
+            run: AgentRunSettings::default(),
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -2598,6 +2728,7 @@ pub(crate) mod tests {
             mcp_servers: None,
             isolation_worktree: false,
             inline_images: None,
+            run: AgentRunSettings::default(),
             source: AgentDefinitionSource::UserGlobal,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -2620,6 +2751,7 @@ pub(crate) mod tests {
             mcp_servers: None,
             isolation_worktree: false,
             inline_images: None,
+            run: AgentRunSettings::default(),
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),

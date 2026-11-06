@@ -1013,6 +1013,7 @@ async fn usd_budget_native_actual_task_batch_held_children_keep_independent_prof
         briefs: None,
         agent_type: Some("cost-fixture".into()),
         run_in_background: false,
+        options: Default::default(),
     };
     let work = super::run::scope(
         Some(run.clone()),
@@ -1909,4 +1910,119 @@ async fn background56_actual_task_and_signed_native_next_prompt_overlap_and_noti
     child.task.abort();
     let _ = (&mut parent.task).await;
     let _ = (&mut child.task).await;
+}
+
+#[cfg(feature = "subagents")]
+#[tokio::test]
+async fn task_resume_continues_the_stored_child_conversation_and_is_charged() {
+    use rig::tool::Tool;
+    let root = crate::tests::OwnedTestDirectory::new("task-resume");
+    let bindings = [
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
+    ]
+    .map(|name| (name, Some(root.path().join(name).into_os_string())));
+    let _env = crate::tests::ScopedProcessEnv::set(&bindings);
+    let report = |marker: &str| {
+        format!(
+            "## Findings\n- [confidence: high] {marker}\n\n## Unverified\n- None\n\n## Coverage\n- Covered: delegated fixture.\n- Skipped: None.\n"
+        )
+    };
+    let wire = Wire::new(vec![
+        Some(response(&report("FIRST_CHILD_ANSWER"), false)),
+        Some(response(&report("RESUMED_CHILD_ANSWER"), false)),
+    ])
+    .await;
+    let (client, cfg) = wire.client();
+    let mut value = serde_json::to_value(cfg).unwrap();
+    value["task_max_turns"] = serde_json::json!(2);
+    value["task_evidence"] = serde_json::json!(false);
+    let cfg: Config = serde_json::from_value(value).unwrap();
+    let (run, ledger) = profile(&root, &cfg, RequestKind::Turn, None);
+    run.prepare().await.unwrap();
+    let config = crate::extras::subagents::SubagentConfig {
+        client,
+        provider_name: "cost-wire".into(),
+        session_provider: "cost-wire".into(),
+        model_name: "fixture".into(),
+        fallback_notice: None,
+        api_key: Some("unused-fixture-key".into()),
+        max_turns: 2,
+        config: cfg.into(),
+    };
+    let tool = crate::extras::subagents::task_tool::TaskTool::new(None, None, false)
+        .with_workspace_binding(Arc::new(
+            crate::paths::WorkspaceBinding::capture(root.path()).unwrap(),
+        ));
+    let call =
+        |prompt: &str, resume: Option<String>| crate::extras::subagents::task_tool::TaskArgs {
+            prompts: vec![prompt.into()],
+            briefs: None,
+            agent_type: None,
+            run_in_background: false,
+            options: crate::extras::subagents::task_tool::TaskCallOptions {
+                resume,
+                ..Default::default()
+            },
+        };
+    let first = super::run::scope(
+        Some(run.clone()),
+        crate::extras::subagents::scope_test_config(
+            config.clone(),
+            tool.call(call("ORIGINAL_DELEGATED_QUESTION", None)),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(first.contains("FIRST_CHILD_ANSWER"), "{first}");
+    let id = first
+        .split("[child id: ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("a resumable child id after the report")
+        .to_string();
+
+    let unknown = super::run::scope(
+        Some(run.clone()),
+        crate::extras::subagents::scope_test_config(
+            config.clone(),
+            tool.call(call("again", Some(uuid::Uuid::new_v4().to_string()))),
+        ),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        unknown.contains("unknown or expired resume id"),
+        "{unknown}"
+    );
+
+    let second = super::run::scope(
+        Some(run.clone()),
+        crate::extras::subagents::scope_test_config(
+            config,
+            tool.call(call("FOLLOW_UP_QUESTION", Some(id))),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(second.contains("RESUMED_CHILD_ANSWER"), "{second}");
+    assert_eq!(wire.calls.load(Ordering::Acquire), 2);
+    let resumed_body = wire.bodies.lock().unwrap()[1].to_string();
+    for prior in [
+        "ORIGINAL_DELEGATED_QUESTION",
+        "FIRST_CHILD_ANSWER",
+        "FOLLOW_UP_QUESTION",
+    ] {
+        assert!(
+            resumed_body.contains(prior),
+            "{prior} missing: {resumed_body}"
+        );
+    }
+    // The resumed turn is an ordinary charged child request.
+    assert_eq!(ledger.summary().unwrap().all_time.records, 2);
 }

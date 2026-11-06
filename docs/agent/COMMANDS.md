@@ -373,6 +373,7 @@ Requires the `subagents` feature (default-on; see [SUBAGENTS.md](SUBAGENTS.md)).
 | `/tasks` | List this session's background `task` jobs (`run_in_background: true`) with their status. Works while the agent runs. |
 | `/tasks result <id>` | Show the retained report of that task. |
 | `/tasks cancel <id>` | Request cancellation; the task reports `cancelling` until its model, approvals and effects settle. |
+| `/tasks clear` | Forget every finished background task whose completion was already delivered; running tasks and undelivered results stay. A full 32-entry history also drops its oldest such entry automatically. |
 
 `/model-subagent` and `/models-subagent` remain accepted as hidden aliases
 for `/subagent-model` and `/subagent-models`. Without the `subagents` feature,

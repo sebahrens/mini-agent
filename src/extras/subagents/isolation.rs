@@ -23,6 +23,9 @@ pub(crate) struct IsolationPlan {
     /// Directory that receives the worktrees. `None` is the parent's directory
     /// (the same default as `/worktree`).
     pub(crate) base_dir: Option<PathBuf>,
+    /// Commit-ish the child branches start from (`task` `base_ref`);
+    /// `None` is the parent's `HEAD`.
+    pub(crate) base_ref: Option<String>,
     /// Test seam: signalled once creation finished, then held until released,
     /// so a test can drop the caller while the create is still in flight.
     #[cfg(test)]
@@ -87,6 +90,22 @@ impl IsolationOutcome {
             ),
         }
     }
+}
+
+/// Check a `task` `base_ref` before any git command: one commit-ish, not an
+/// option, printable ASCII without whitespace, at most 256 bytes, no range.
+pub(crate) fn validate_base_ref(base: &str) -> Result<(), String> {
+    if base.is_empty()
+        || base.len() > 256
+        || base.starts_with('-')
+        || base.contains("..")
+        || !base.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(format!(
+            "task: base_ref must name one commit (a branch, tag or commit id; no options, ranges or whitespace), got {base:?}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "git-worktree")]
@@ -234,12 +253,25 @@ mod real {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let create_plan = plan.clone();
         drop(crate::agent::runner::spawn_async_scoped(async move {
-            let created = git_worktree::create(
-                &create_plan.parent_root,
-                &name,
-                create_plan.base_dir.as_deref(),
-            )
-            .await
+            let created = match create_plan.base_ref.as_deref() {
+                Some(base) => {
+                    git_worktree::create_at(
+                        &create_plan.parent_root,
+                        &name,
+                        create_plan.base_dir.as_deref(),
+                        base,
+                    )
+                    .await
+                }
+                None => {
+                    git_worktree::create(
+                        &create_plan.parent_root,
+                        &name,
+                        create_plan.base_dir.as_deref(),
+                    )
+                    .await
+                }
+            }
             .map(|(_, info)| IsolatedWorktree {
                 info,
                 base: String::new(),

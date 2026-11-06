@@ -25,8 +25,71 @@ pub(crate) const MAX_EVIDENCE_TASKS: usize = 64;
 const MAX_TOOL_NAME_BYTES: usize = 48;
 const MAX_TARGET_BYTES: usize = 60;
 const MAX_PATH_BYTES: usize = 4096;
-/// Largest stored record file read back (text cap plus the image ceiling).
-const MAX_RECORD_FILE_BYTES: u64 = 24 * 1024 * 1024;
+/// Ceilings of the configurable `[subagents] evidence_*` limits.
+pub(crate) const MAX_EVIDENCE_RECORDS_CEILING: usize = 1024;
+pub(crate) const MAX_RECORD_TEXT_BYTES_CEILING: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_CHILD_EVIDENCE_BYTES_CEILING: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_EVIDENCE_TASKS_CEILING: usize = 1024;
+/// Evicted child task ids remembered so a stale handle reads as expired.
+const MAX_EXPIRED_TASK_IDS: usize = 1024;
+/// Largest stored record file read back (text ceiling plus the image ceiling).
+const MAX_RECORD_FILE_BYTES: u64 = (MAX_RECORD_TEXT_BYTES_CEILING + 24 * 1024 * 1024) as u64;
+
+/// The evidence store's limits, from `[subagents] evidence_max_records`,
+/// `evidence_max_record_bytes`, `evidence_max_child_bytes` and
+/// `evidence_max_children`; each is clamped to 1..=its ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EvidenceLimits {
+    pub records: usize,
+    pub record_text_bytes: usize,
+    pub child_bytes: usize,
+    pub children: usize,
+}
+
+impl Default for EvidenceLimits {
+    fn default() -> Self {
+        Self {
+            records: MAX_EVIDENCE_RECORDS,
+            record_text_bytes: MAX_RECORD_TEXT_BYTES,
+            child_bytes: MAX_CHILD_EVIDENCE_BYTES,
+            children: MAX_EVIDENCE_TASKS,
+        }
+    }
+}
+
+impl EvidenceLimits {
+    pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+        let defaults = Self::default();
+        let Some(policy) = config.subagents.as_ref() else {
+            return defaults;
+        };
+        let pick = |value: Option<usize>, default: usize, ceiling: usize| {
+            value.unwrap_or(default).clamp(1, ceiling)
+        };
+        Self {
+            records: pick(
+                policy.evidence_max_records,
+                defaults.records,
+                MAX_EVIDENCE_RECORDS_CEILING,
+            ),
+            record_text_bytes: pick(
+                policy.evidence_max_record_bytes,
+                defaults.record_text_bytes,
+                MAX_RECORD_TEXT_BYTES_CEILING,
+            ),
+            child_bytes: pick(
+                policy.evidence_max_child_bytes,
+                defaults.child_bytes,
+                MAX_CHILD_EVIDENCE_BYTES_CEILING,
+            ),
+            children: pick(
+                policy.evidence_max_children,
+                defaults.children,
+                MAX_EVIDENCE_TASKS_CEILING,
+            ),
+        }
+    }
+}
 
 /// Whether the host records evidence and offers `task_evidence` for
 /// delegations started now (`task_evidence = false` turns both off).
@@ -134,12 +197,20 @@ pub(crate) struct StoredImage {
 #[derive(Debug, Default)]
 pub(crate) struct ChildEvidence {
     records: Vec<(EvidenceMeta, Option<EvidenceContent>)>,
-    /// Tool results past [`MAX_EVIDENCE_RECORDS`], counted only.
+    /// Tool results past the record limit, counted only.
     unrecorded: usize,
     content_bytes: usize,
+    limits: EvidenceLimits,
 }
 
 impl ChildEvidence {
+    pub(crate) fn with_limits(limits: EvidenceLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.records.len()
     }
@@ -207,7 +278,7 @@ impl ChildEvidence {
         arguments: &serde_json::Value,
         result: &rig::message::ToolResult,
     ) {
-        if self.records.len() >= MAX_EVIDENCE_RECORDS {
+        if self.records.len() >= self.limits.records {
             self.unrecorded = self.unrecorded.saturating_add(1);
             return;
         }
@@ -234,8 +305,11 @@ impl ChildEvidence {
         }
         let text_bytes = text.len() as u64;
         let mut retention = Retention::Full;
-        if text.len() > MAX_RECORD_TEXT_BYTES {
-            text = crate::extras::subagents::background::clip_bytes(&text, MAX_RECORD_TEXT_BYTES);
+        if text.len() > self.limits.record_text_bytes {
+            text = crate::extras::subagents::background::clip_bytes(
+                &text,
+                self.limits.record_text_bytes,
+            );
             retention = Retention::TextClipped;
         }
         let content_len = text.len()
@@ -243,7 +317,7 @@ impl ChildEvidence {
                 .iter()
                 .map(|image: &StoredImage| image.data.len())
                 .sum::<usize>();
-        let content = if self.content_bytes.saturating_add(content_len) > MAX_CHILD_EVIDENCE_BYTES {
+        let content = if self.content_bytes.saturating_add(content_len) > self.limits.child_bytes {
             retention = Retention::OverCeiling;
             None
         } else {
@@ -379,9 +453,20 @@ pub(crate) fn parse_id(id: &str) -> Option<usize> {
 #[derive(Debug, Default)]
 pub(crate) struct EvidenceIndex {
     tasks: Mutex<std::collections::VecDeque<Arc<StoredEvidence>>>,
+    /// Bounded ids of evicted stores, so their handles read as expired.
+    expired: Mutex<std::collections::VecDeque<String>>,
 }
 
 impl EvidenceIndex {
+    /// Whether `task_id` named a store this session evicted.
+    pub(crate) fn was_evicted(&self, task_id: &str) -> bool {
+        self.expired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|id| id == task_id)
+    }
+
     pub(crate) fn get(&self, task_id: &str) -> Option<Arc<StoredEvidence>> {
         self.tasks
             .lock()
@@ -403,6 +488,7 @@ impl EvidenceIndex {
         let session = session_id.to_string();
         let records = evidence.records;
         let unrecorded = evidence.unrecorded;
+        let max_children = evidence.limits.children;
         let written = crate::agent::runner::spawn_blocking_scoped(move || {
             let mut metas = Vec::with_capacity(records.len());
             let mut files = Vec::with_capacity(records.len());
@@ -435,10 +521,18 @@ impl EvidenceIndex {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             tasks.push_back(stored.clone());
             let mut evicted = Vec::new();
-            while tasks.len() > MAX_EVIDENCE_TASKS {
+            while tasks.len() > max_children {
                 if let Some(old) = tasks.pop_front() {
                     evicted.push(old);
                 }
+            }
+            drop(tasks);
+            let mut expired = self.expired.lock().unwrap_or_else(|e| e.into_inner());
+            for old in &evicted {
+                expired.push_back(old.task_id.clone());
+            }
+            while expired.len() > MAX_EXPIRED_TASK_IDS {
+                expired.pop_front();
             }
             evicted
         };
@@ -686,7 +780,59 @@ mod tests {
                 .await;
         }
         assert!(index.get("task-0").is_none());
+        assert!(
+            index.was_evicted("task-0"),
+            "an evicted handle reads as expired"
+        );
+        assert!(!index.was_evicted("task-never"));
         assert!(index.get(&format!("task-{MAX_EVIDENCE_TASKS}")).is_some());
         assert!(!path.exists(), "evicted evidence content is deleted");
+    }
+
+    #[tokio::test]
+    async fn evidence_limits_come_from_config_with_ceilings() {
+        let mut config = crate::config::Config::default();
+        assert_eq!(
+            EvidenceLimits::from_config(&config),
+            EvidenceLimits::default()
+        );
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            evidence_max_records: Some(2),
+            evidence_max_record_bytes: Some(4),
+            evidence_max_child_bytes: Some(usize::MAX),
+            evidence_max_children: Some(1),
+            ..Default::default()
+        });
+        let limits = EvidenceLimits::from_config(&config);
+        assert_eq!(limits.records, 2);
+        assert_eq!(limits.record_text_bytes, 4);
+        assert_eq!(limits.child_bytes, MAX_CHILD_EVIDENCE_BYTES_CEILING);
+        let mut history = Vec::new();
+        for index in 0..3 {
+            let id = format!("call-{index}");
+            history.push(call(&id, "read", serde_json::json!({"path": "f"})));
+            history.push(result(&id, vec![text("abcdefgh")]));
+        }
+        let mut evidence = ChildEvidence::with_limits(limits);
+        evidence.record_history(&history);
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence.unrecorded(), 1);
+        assert!(
+            evidence
+                .metas()
+                .all(|meta| meta.retention == Retention::TextClipped)
+        );
+        let session = format!("evidence-limits-{}", uuid::Uuid::new_v4());
+        let index = EvidenceIndex::default();
+        index.store(&session, "first".into(), evidence).await;
+        index
+            .store(
+                &session,
+                "second".into(),
+                ChildEvidence::with_limits(limits),
+            )
+            .await;
+        assert!(index.get("first").is_none() && index.was_evicted("first"));
+        assert!(index.get("second").is_some());
     }
 }

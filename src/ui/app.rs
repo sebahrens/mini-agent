@@ -16653,6 +16653,7 @@ mod plan_approval_tests {
                             briefs: None,
                             agent_type: None,
                             run_in_background: true,
+                            options: Default::default(),
                         }),
                     ),
                 ),
