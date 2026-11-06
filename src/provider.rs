@@ -8730,6 +8730,9 @@ pub(crate) struct NativeRunOwner {
     cleanup: Option<crate::agent::runner::AgentRunCleanupGuard>,
     pub(crate) outcome: crate::session::native_replay::RetiredNativeOutcome,
     retired_session_end: Option<NativeSessionEndOwner>,
+    /// Set once [`NativeRunOwner::finish`] published the retired boundary, so a
+    /// mid-run finish (headless context relief) is not repeated at run end.
+    finished: bool,
 }
 
 pub(crate) struct NativeSessionEndOwner {
@@ -8782,6 +8785,7 @@ impl NativeRunOwner {
             cleanup: Some(cleanup),
             outcome: crate::session::native_replay::RetiredNativeOutcome::Incomplete,
             retired_session_end: None,
+            finished: false,
         }
     }
     pub(crate) fn take_retired_session_end(&mut self) -> Option<NativeSessionEndOwner> {
@@ -8801,6 +8805,9 @@ impl NativeRunOwner {
         &mut self,
         session: &mut crate::session::Session,
     ) -> anyhow::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
         // SessionEnd may have admitted async command children after the
         // model retired. Cancel and join that exact scope before publishing.
         // Its cleanup owner retains the unique ticket even if this await drops.
@@ -8860,6 +8867,7 @@ impl NativeRunOwner {
                 host: binding.host.clone(),
             });
         }
+        self.finished = result.is_ok();
         result
     }
 }

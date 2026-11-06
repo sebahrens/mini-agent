@@ -3605,7 +3605,7 @@ pub(crate) async fn run_goal_rounds_for_loop(
 /// The agent is reused between rounds: the goal preamble block is static for
 /// the goal's life, so a rebuild would produce an identical system prompt.
 #[allow(clippy::too_many_arguments)]
-async fn run_bound_headless_round(
+async fn run_bound_headless_segment(
     agent: &provider::AnyAgent,
     session: &mut Session,
     cli: &Cli,
@@ -3616,6 +3616,7 @@ async fn run_bound_headless_round(
     question_turn: crate::question::QuestionTurn,
     native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
     native_owner: &mut Option<provider::NativeRunOwner>,
+    mid_turn_armed: bool,
     #[cfg(feature = "hooks")] startup_context: &mut Option<
         crate::extras::hooks::OwnedSessionStartContext,
     >,
@@ -3768,9 +3769,11 @@ async fn run_bound_headless_round(
     owner.binding = Some(binding);
     // Provider-native replay history cannot be summarized in place (its signed
     // thinking blocks and tool_use/tool_result pairing must replay verbatim),
-    // so pressure at a tool-batch boundary ends the turn cleanly instead of
-    // running into a provider context error (mini-agent-q3ki6).
-    let mid_turn = (cfg.resolve_compact_enabled() && session.context_window > 0)
+    // so pressure at a tool-batch boundary ends this segment cleanly instead
+    // of running into a provider context error (mini-agent-q3ki6).
+    // `run_bound_headless_round` then closes the native epoch, compacts the
+    // saved transcript and resumes in a new epoch (mini-agent-tmysj).
+    let mid_turn = (mid_turn_armed && cfg.resolve_compact_enabled() && session.context_window > 0)
         .then(|| cfg.resolve_mid_turn_compact_threshold())
         .flatten()
         .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
@@ -3871,6 +3874,235 @@ async fn run_bound_headless_round(
     (turn, true)
 }
 
+/// The outcome of one native context relief between headless segments.
+enum NativeRelief {
+    /// The saved transcript was compacted and the chain restarted as a new
+    /// epoch; the next segment continues on it. `freed` is whether the
+    /// compaction reduced the context estimate.
+    Compacted { freed: bool },
+    /// Nothing older than the recent history exists to compact.
+    NothingToCompact,
+}
+
+/// Close the native epoch at a tool-batch boundary, compact the saved
+/// transcript and restart the thinking chain from it as a new epoch, exactly
+/// as `reopen_native_turn` does between multi-turn prompts (mini-agent-tmysj).
+///
+/// The segment's records are already committed in the session with a
+/// `LiveToolReply` boundary. Whatever fails after the owner retired leaves
+/// that finished owner in place, so the caller's ordinary end-of-run
+/// publication stays valid.
+async fn relieve_native_headless_segment(
+    session: &mut Session,
+    cfg: &config::Config,
+    cli: &Cli,
+    client: &provider::AnyClient,
+    native_owner: &mut Option<provider::NativeRunOwner>,
+    native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
+    relief_usage: &mut crate::event::UsageDelta,
+) -> anyhow::Result<NativeRelief> {
+    let pending_tokens =
+        Session::estimate_tokens(crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT);
+    if headless_compaction_plan_with(
+        session,
+        cfg,
+        pending_tokens,
+        #[cfg(feature = "memory")]
+        None,
+        true,
+    )
+    .is_none()
+    {
+        return Ok(NativeRelief::NothingToCompact);
+    }
+    let owner = native_owner
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("native context owner is missing"))?;
+    // Publish the retired LiveToolReply boundary before the transcript changes.
+    owner.finish(session).await?;
+    let tokens_before = session
+        .effective_context_tokens_after_tool_result_pruning(cfg.resolve_keep_recent_tool_results());
+    match compact_headless_session(
+        session,
+        client,
+        cfg,
+        #[cfg(feature = "memory")]
+        None,
+        pending_tokens,
+        cli.compact_instructions.as_deref(),
+        true,
+    )
+    .await
+    {
+        Ok((usage, true)) => *relief_usage = relief_usage.saturating_add(usage),
+        Ok((usage, false)) => {
+            *relief_usage = relief_usage.saturating_add(usage);
+            return Ok(NativeRelief::NothingToCompact);
+        }
+        Err(error) => {
+            if let Some(observed) = error.downcast_ref::<HeadlessCompactionUsage>() {
+                *relief_usage = relief_usage.saturating_add(observed.0);
+            }
+            return Err(error);
+        }
+    }
+    let freed = session
+        .effective_context_tokens_after_tool_result_pruning(cfg.resolve_keep_recent_tool_results())
+        < tokens_before;
+    if cli.no_session {
+        session.restart_native_chain()?;
+    } else {
+        // Opens a fresh ticket on the compacted transcript; an unreplayable
+        // chain is restarted (with its one-line notice) before it publishes.
+        let publication =
+            crate::session::native_publication::NativeStartupPublication::begin(session).await?;
+        *native_ticket = Some(publication.into_model_ticket(session).await?);
+    }
+    *native_owner = None;
+    Ok(NativeRelief::Compacted { freed })
+}
+
+/// One headless round on a provider-native session, with context relief.
+///
+/// A segment that stops at a complete tool batch because real prompt pressure
+/// crossed `mid_turn_compact_threshold` is not a dead end: the native epoch is
+/// closed, the saved transcript is compacted, the chain restarts as a new
+/// epoch and the task resumes with the relief prompt. Relief continues for as
+/// long as each compaction frees space and tools ran since the previous relief;
+/// it stops, with the reason named in the error, when nothing is left to
+/// compact, a compaction frees no space or fails, or two consecutive reliefs
+/// happen with no tool progress in between (mini-agent-tmysj, mini-agent-sfbv9).
+/// Non-native sessions run exactly one segment.
+#[allow(clippy::too_many_arguments)]
+async fn run_bound_headless_round(
+    agent: &provider::AnyAgent,
+    session: &mut Session,
+    cli: &Cli,
+    cfg: &config::Config,
+    client: &provider::AnyClient,
+    message: &str,
+    history: std::sync::Arc<[rig::completion::Message]>,
+    output: crate::print::HeadlessOutputPolicy,
+    question_turn: crate::question::QuestionTurn,
+    native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
+    native_owner: &mut Option<provider::NativeRunOwner>,
+    relief_usage: &mut crate::event::UsageDelta,
+    #[cfg(feature = "hooks")] startup_context: &mut Option<
+        crate::extras::hooks::OwnedSessionStartContext,
+    >,
+    #[cfg(feature = "agent-skills")] instruction_turn: Option<
+        std::sync::Arc<crate::extras::skills::session::InstructionTurn>,
+    >,
+    #[cfg(feature = "hooks")] loop_info: Option<crate::extras::hooks::LoopInfo>,
+) -> (crate::agent::runner::HeadlessTurn, bool) {
+    let mut prompt = message.to_owned();
+    let mut history = history;
+    let mut reliefs = 0usize;
+    let mut last_freed_nothing = false;
+    loop {
+        let (mut turn, persisted) = run_bound_headless_segment(
+            agent,
+            session,
+            cli,
+            cfg,
+            &prompt,
+            history.clone(),
+            output,
+            question_turn.clone(),
+            native_ticket,
+            native_owner,
+            true,
+            #[cfg(feature = "hooks")]
+            startup_context,
+            #[cfg(feature = "agent-skills")]
+            instruction_turn.clone(),
+            #[cfg(feature = "hooks")]
+            loop_info,
+        )
+        .await;
+        let Some(full) = turn
+            .failure
+            .as_ref()
+            .and_then(|error| error.downcast_ref::<crate::agent::runner::NativeContextFull>())
+            .cloned()
+        else {
+            return (turn, persisted);
+        };
+        if !persisted
+            || !cfg.resolve_compact_enabled()
+            || crate::print::headless_force_stopped()
+            || native_owner.is_none()
+        {
+            return (turn, persisted);
+        }
+        let stop = |turn: &mut crate::agent::runner::HeadlessTurn, why: String| {
+            turn.failure =
+                Some(anyhow::Error::new(full.clone()).context(format!("{full} ({why})")));
+        };
+        if reliefs > 0 && turn.interactions.is_empty() {
+            stop(
+                &mut turn,
+                format!(
+                    "context relief stopped after {reliefs} compaction(s): the segment since the last one ran no tools, so another compaction cannot help"
+                ),
+            );
+            return (turn, persisted);
+        }
+        if last_freed_nothing {
+            stop(
+                &mut turn,
+                format!(
+                    "context relief stopped after {reliefs} compaction(s): the last compaction freed no space"
+                ),
+            );
+            return (turn, persisted);
+        }
+        let usage = cfg.normalize_usage(&session.provider, turn.usage.into());
+        if let Err(error) = crate::print::headless_stderr_async(
+            "mid-turn context relief: compacting the headless session and continuing...\n"
+                .to_owned(),
+        )
+        .await
+        {
+            stop(
+                &mut turn,
+                format!("context relief could not report: {error:#}"),
+            );
+            return (turn, persisted);
+        }
+        match relieve_native_headless_segment(
+            session,
+            cfg,
+            cli,
+            client,
+            native_owner,
+            native_ticket,
+            relief_usage,
+        )
+        .await
+        {
+            Ok(NativeRelief::Compacted { freed }) => {
+                reliefs += 1;
+                last_freed_nothing = !freed;
+                *relief_usage = relief_usage.saturating_add(usage);
+                prompt = crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT.to_owned();
+                history = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+                    session,
+                    cfg.resolve_keep_recent_tool_results(),
+                );
+            }
+            Ok(NativeRelief::NothingToCompact) => return (turn, persisted),
+            Err(error) => {
+                stop(
+                    &mut turn,
+                    format!("context relief after {reliefs} compaction(s) failed: {error:#}"),
+                );
+                return (turn, persisted);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_headless_goal_rounds(
     agent: &provider::AnyAgent,
@@ -3915,6 +4147,7 @@ async fn run_headless_goal_rounds(
         } else {
             crate::print::HeadlessOutputPolicy::from_cli(cli)
         };
+        let mut native_relief_usage = crate::event::UsageDelta::default();
         let (turn, persisted) = if agent.history_protocol()
             == crate::session::native_replay::HistoryProtocol::AnthropicMessages
             || session.native_history_snapshot().is_some()
@@ -3925,12 +4158,14 @@ async fn run_headless_goal_rounds(
                     session,
                     cli,
                     cfg,
+                    client,
                     message,
                     history,
                     output,
                     crate::question::QuestionTurn::default(),
                     native_ticket,
                     native_owner,
+                    &mut native_relief_usage,
                     #[cfg(feature = "hooks")]
                     startup_context,
                     #[cfg(feature = "agent-skills")]
@@ -3972,7 +4207,7 @@ async fn run_headless_goal_rounds(
             turn,
             prompt: message.to_owned(),
             persisted,
-            relief_usage: Default::default(),
+            relief_usage: native_relief_usage,
         };
     }
     heap_future(|| {
@@ -4063,12 +4298,14 @@ async fn run_headless_goal_rounds_inner(
                 session,
                 cli,
                 cfg,
+                client,
                 message,
                 history,
                 output,
                 question_turn.clone(),
                 native_ticket,
                 native_owner,
+                &mut relief_usage,
                 #[cfg(feature = "hooks")]
                 startup_context,
                 #[cfg(feature = "agent-skills")]
@@ -4497,10 +4734,6 @@ async fn run_headless_goal_rounds_inner(
     }
 }
 
-/// How many times one headless turn may compact for context relief before the
-/// next pressure signal or provider rejection is surfaced unchanged.
-const MAX_HEADLESS_CONTEXT_RELIEFS: usize = 3;
-
 /// A non-native headless turn after any context relief it needed.
 pub(crate) struct RelievedHeadlessTurn {
     /// The last segment. When `persisted`, its records and usage are already
@@ -4601,7 +4834,9 @@ async fn run_relieved_headless_turn(
             .await
         },
         async |session: &mut Session, pending_tokens| {
-            heap_future(|| {
+            let keep = cfg.resolve_keep_recent_tool_results();
+            let before = session.effective_context_tokens_after_tool_result_pruning(keep);
+            let (usage, happened) = heap_future(|| {
                 compact_headless_session(
                     session,
                     client,
@@ -4613,7 +4848,11 @@ async fn run_relieved_headless_turn(
                     true,
                 )
             })
-            .await
+            .await?;
+            // A compaction that frees no space cannot relieve anything: report
+            // it as "nothing to compact" so the caller stops relieving.
+            let freed = session.effective_context_tokens_after_tool_result_pruning(keep) < before;
+            Ok((usage, happened && freed))
         },
     )
     .await
@@ -4639,23 +4878,26 @@ async fn relieve_headless_turn(
     let mut prompt = message.to_owned();
     let mut history = history;
     let mut relief_usage = crate::event::UsageDelta::default();
+    // There is no fixed number of reliefs per turn (mini-agent-sfbv9): a long
+    // autonomous run may legitimately fill the window many times. Relief
+    // continues while each compaction frees space and tools run between
+    // reliefs, and stops, saying why, when nothing is left to compact or two
+    // consecutive reliefs occur with no tool progress in between.
     let mut reliefs = 0usize;
     let mut reactive_used = false;
     let mut mid_turn_available = true;
     loop {
-        let mid_turn = (mid_turn_available
-            && cfg.resolve_compact_enabled()
-            && reliefs < MAX_HEADLESS_CONTEXT_RELIEFS
-            && session.context_window > 0)
-            .then(|| cfg.resolve_mid_turn_compact_threshold())
-            .flatten()
-            .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
-                window: session.context_window,
-                threshold,
-                anthropic_native: cfg.is_anthropic_native(&session.provider),
-            });
+        let mid_turn =
+            (mid_turn_available && cfg.resolve_compact_enabled() && session.context_window > 0)
+                .then(|| cfg.resolve_mid_turn_compact_threshold())
+                .flatten()
+                .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
+                    window: session.context_window,
+                    threshold,
+                    anthropic_native: cfg.is_anthropic_native(&session.provider),
+                });
         let turn = run_segment(session, &prompt, history.clone(), mid_turn).await;
-        let cause = if cfg.resolve_compact_enabled() && reliefs < MAX_HEADLESS_CONTEXT_RELIEFS {
+        let cause = if cfg.resolve_compact_enabled() {
             headless_relief_cause(&turn, reactive_used)
         } else {
             None
@@ -4668,6 +4910,24 @@ async fn relieve_headless_turn(
                 relief_usage,
             };
         };
+        if reliefs > 0 && turn.interactions.is_empty() {
+            // A second relief with no tool progress since the previous one
+            // would only repeat it. Name the cause instead of looping.
+            let mut turn = turn;
+            let reason = format!(
+                "context relief stopped after {reliefs} compaction(s): the segment since the last one made no tool progress"
+            );
+            turn.failure = Some(match turn.failure.take() {
+                Some(failure) => failure.context(reason),
+                None => anyhow::anyhow!(reason),
+            });
+            return RelievedHeadlessTurn {
+                turn,
+                prompt,
+                persisted: false,
+                relief_usage,
+            };
+        }
         reliefs += 1;
         if cause == HeadlessReliefCause::ContextLength {
             reactive_used = true;
@@ -5499,6 +5759,122 @@ mod tests {
                 crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT
             );
         }
+    }
+
+    fn boundary_turn(tools: bool) -> crate::agent::runner::HeadlessTurn {
+        crate::agent::runner::HeadlessTurn {
+            response: String::new(),
+            usage: Default::default(),
+            interactions: if tools {
+                vec![rig::completion::Message::user("tool work")]
+            } else {
+                Vec::new()
+            },
+            failure: Some(anyhow::anyhow!(
+                crate::agent::runner::MidTurnCompactionBoundary { pressure: 0.95 }
+            )),
+        }
+    }
+
+    // mini-agent-sfbv9: there is no fixed per-turn relief cap; ten window-fills
+    // with tool progress between them all compact and the turn finishes.
+    #[tokio::test]
+    async fn headless_relief_is_not_capped_while_each_compaction_makes_progress() {
+        let mut session = relief_session();
+        let cfg = crate::config::Config::default();
+        let mut segments = 0;
+        let mut compactions = 0;
+        let relieved = relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, _prompt: &str, _history, _mid_turn| {
+                segments += 1;
+                if segments <= 10 {
+                    boundary_turn(true)
+                } else {
+                    ok_turn("done")
+                }
+            },
+            async |_session: &mut crate::session::Session, _pending| {
+                compactions += 1;
+                Ok((crate::event::UsageDelta::default(), true))
+            },
+        )
+        .await;
+        assert!(
+            relieved.turn.failure.is_none(),
+            "{:?}",
+            relieved.turn.failure
+        );
+        assert_eq!((segments, compactions), (11, 10));
+    }
+
+    // Two consecutive reliefs with no tool progress in between stop the turn
+    // with a failure that names the cause.
+    #[tokio::test]
+    async fn headless_relief_stops_when_no_tool_progress_separates_two_reliefs() {
+        let mut session = relief_session();
+        let cfg = crate::config::Config::default();
+        let mut segments = 0;
+        let mut compactions = 0;
+        let relieved = relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, _prompt: &str, _history, _mid_turn| {
+                segments += 1;
+                // The first segment ran a tool; every later one stops at once.
+                boundary_turn(segments == 1)
+            },
+            async |_session: &mut crate::session::Session, _pending| {
+                compactions += 1;
+                Ok((crate::event::UsageDelta::default(), true))
+            },
+        )
+        .await;
+        assert_eq!((segments, compactions), (2, 1));
+        let failure = format!("{:#}", relieved.turn.failure.expect("named stop"));
+        assert!(
+            failure.contains("context relief stopped after 1 compaction(s)")
+                && failure.contains("no tool progress"),
+            "{failure}"
+        );
+    }
+
+    // A compaction that frees nothing disables the mid-turn trigger instead of
+    // compacting at every batch.
+    #[tokio::test]
+    async fn headless_relief_stops_relieving_when_compaction_frees_nothing() {
+        let mut session = relief_session();
+        let cfg = crate::config::Config::default();
+        let mut armed = Vec::new();
+        let mut compactions = 0;
+        relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, _prompt: &str, _history, mid_turn| {
+                armed.push(mid_turn.is_some());
+                if armed.len() == 1 {
+                    boundary_turn(true)
+                } else {
+                    ok_turn("done")
+                }
+            },
+            async |_session: &mut crate::session::Session, _pending| {
+                compactions += 1;
+                Ok((crate::event::UsageDelta::default(), false))
+            },
+        )
+        .await;
+        assert_eq!((armed, compactions), (vec![true, false], 1));
     }
 
     #[tokio::test]

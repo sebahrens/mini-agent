@@ -1043,10 +1043,14 @@ impl std::fmt::Display for MidTurnCompactionBoundary {
 
 impl std::error::Error for MidTurnCompactionBoundary {}
 
-/// A provider-native replay turn stopped at a tool-batch boundary because real
-/// prompt pressure crossed the mid-turn threshold. Native history cannot be
-/// compacted in place, so the turn ends here with every tool result saved and
-/// the session resumable; it is not a provider error.
+/// A provider-native replay segment stopped at a tool-batch boundary because
+/// real prompt pressure crossed the mid-turn threshold. The native epoch is
+/// closed there with every tool result saved; headless runs then compact the
+/// saved transcript and resume in a new epoch. This error reaches the user
+/// only when that relief was impossible (nothing older than the recent history
+/// to compact, a compaction that freed no space or failed, or no tool progress
+/// between two reliefs); the session stays resumable and a follow-up prompt
+/// compacts it first. It is not a provider error.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NativeContextFull {
     pub(crate) pressure: f64,
@@ -1058,9 +1062,9 @@ impl std::fmt::Display for NativeContextFull {
         write!(
             f,
             "context is {:.0}% full: stopped at a tool boundary before a provider context error. \
-             Native Anthropic replay history cannot be compacted in place; completed tool results \
-             are saved in session {} and its unfinished reply is preserved. Start a fresh context \
-             to continue.",
+             Completed tool results are saved in session {} and its unfinished reply is preserved; \
+             continue it with a follow-up prompt (which compacts the saved context first) or start \
+             a fresh context.",
             self.pressure * 100.0,
             self.session_id,
         )

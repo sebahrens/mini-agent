@@ -245,7 +245,10 @@ async fn acp_native_compaction_restarts_the_chain_over_the_compacted_transcript(
     };
     // The ACP gate no longer exempts native history from token pressure.
     let limits = crate::extras::acp::acp_native_limits_for_test(&cfg, 20_000, 2_000);
-    assert!(limits, "native ACP history must be subject to token pressure");
+    assert!(
+        limits,
+        "native ACP history must be subject to token pressure"
+    );
     let run = drive(
         "native-acp-compact",
         vec![

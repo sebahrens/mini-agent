@@ -8,6 +8,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- ACP sessions on the Anthropic provider are auto-compacted between turns under token pressure like
+  the TUI (the thinking chain restarts over the compacted transcript) instead of dying at the
+  context window or byte guard (mini-agent-ewkrr). A native Anthropic turn that fills the context
+  mid-turn compacts and continues in a new native epoch in headless runs, and the TUI compacts at
+  the stop so Enter continues (mini-agent-tmysj). Headless context relief has no fixed three-per-turn
+  cap; it stops, naming the reason, when nothing is left to compact, a compaction frees no space, or
+  two reliefs happen with no tool progress between them (mini-agent-sfbv9).
 - Relative `--add-dir`, `--image`, `--output-schema`, `--loop-plan` and `--log-file` paths keep
   resolving against the launch directory under `project_root_discovery` (mini-agent-k8w51). The
   `--stream-json-control` sandbox network ask is per `host:port` (concurrent connections share one
