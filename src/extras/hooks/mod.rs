@@ -168,6 +168,11 @@ pub(crate) fn active_workspace() -> std::path::PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
+/// A capability binding of the active hook workspace, for read-only helpers.
+pub(crate) fn active_workspace_binding() -> Option<crate::paths::WorkspaceBinding> {
+    crate::paths::WorkspaceBinding::capture(&active_workspace()).ok()
+}
+
 pub(crate) fn set_active_session(session_id: &str) {
     let session_path = crate::session::storage::session_path(session_id)
         .map(|path| path.display().to_string())

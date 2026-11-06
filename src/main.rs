@@ -657,6 +657,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         crate::extras::hooks::backend::set_mcp_tool_hooks_enabled(
             cfg.hooks_mcp_tool_enabled.unwrap_or(false),
         );
+        crate::extras::hooks::backend::set_mcp_tool_hooks_unprompted(
+            cfg.hooks_mcp_tool_unprompted.unwrap_or(false),
+        );
+        crate::extras::hooks::backend::set_agent_hook_reads(
+            cfg.hooks_agent_read_files.unwrap_or(false),
+        );
         crate::extras::hooks::backend::set_model_hooks_enabled(
             cfg.hooks_model_enabled.unwrap_or(false),
         );

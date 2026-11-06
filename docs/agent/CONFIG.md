@@ -1255,7 +1255,9 @@ prompt and model are shown in the project-hook approval prompt; `command`, `args
   read like a command hook's stdout after exit 0, an error result like a non-zero exit, a missing or
   closed server as a failure. `${a.b.c}` inside `input` string values is replaced by that path of the
   event JSON (nothing else is evaluated). The call is made by operator-authored, trust-approved
-  configuration and does not prompt per call. The server is resolved by name among the servers
+  configuration and does not prompt per call, so by default (`hooks_mcp_tool_unprompted` unset) the
+  tool must be listed by the server with `readOnlyHint: true`; any other tool, an unlisted tool or a
+  failed lookup is refused. Set `hooks_mcp_tool_unprompted = true` to allow any tool. The server is resolved by name among the servers
   connected in this process, so give servers distinct names when several ACP sessions run.
 - `prompt` and `agent` need `hooks_model_enabled = true`, which sends the event JSON to a model
   provider. The handler's text is the instruction; `$ARGUMENTS` is replaced by the event (bounded
@@ -1263,9 +1265,13 @@ prompt and model are shown in the project-hook approval prompt; `command`, `args
   `{"ok": true|false, "reason": "..."}`: `false` blocks through the event's normal block path, an
   unparseable reply is a failure. The model is the startup model (or `model`, a quick-model name or a
   model of that provider); usage is attributed to the current run. Default timeouts: 30 s (`prompt`),
-  60 s (`agent`). The `agent` type is currently a tool-free, single-turn verdict: it cannot read files
-  or run tools, so it can never change anything, but it also cannot investigate like Claude Code's
-  agent hook.
+  60 s (`agent`). By default the `agent` type is a tool-free verdict. With
+  `hooks_agent_read_files = true` it becomes a read-only investigator: it may answer
+  `{"read": "relative/path"}` up to 5 times (32 KiB per file, UTF-8 text) before giving its verdict.
+  Reads go through the workspace capability (no `..`, absolute paths or symlinks, regular files only)
+  and refuse `.git`, `.env*`, `.ssh`, `.aws`, key/pem files and names containing `secret` or
+  `credential`. File text is sent to the model as untrusted data. It has no write, shell or network
+  tools. The model is still the startup model, not live `/model` switches.
 
 ### Events
 
