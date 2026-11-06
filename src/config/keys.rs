@@ -255,6 +255,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .described("JS fetch() origin narrowing: \"all\" (no narrowing), \"none\" (deny every fetch), or an array of exact origins. Absent is unrestricted; the js/fetch permission check always applies.")
         .shaped(ConfigShape::AllNoneOrStrings),
     gated_aliased("js", "js-fetch-allow-http", &["js_fetch_allow_http"]).shaped(ConfigShape::Bool),
+    gated_aliased("js", "js-step-timeout-secs", &["js_step_timeout_secs"])
+        .described("Whole-call deadline of one js tool call in seconds, including brokered spawn/fetch waits; clamped to 1..=300. Default: 30.")
+        .shaped(ConfigShape::Integer),
     aliased("allow_all_mcp_calls", &["allow-all-mcp-calls"]).shaped(ConfigShape::Bool),
     gated("mcp", "mcp_tool_timeout_secs").described("Bound on one MCP `tools/call` round trip, in seconds. Default: 120.").shaped(ConfigShape::Integer),
     gated_aliased("mcp", "enable-exa-mcp", &["enable_exa_mcp"]).shaped(ConfigShape::Bool),

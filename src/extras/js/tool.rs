@@ -703,6 +703,8 @@ pub struct JsTool {
     #[cfg(feature = "skills")]
     skill_tool_call_ordinal: AtomicU64,
     profile: ModelEffectProfile,
+    /// Whole-invocation deadline (`js-step-timeout-secs`, default 30 s).
+    step_timeout: Duration,
 }
 
 impl JsTool {
@@ -793,7 +795,21 @@ impl JsTool {
             #[cfg(feature = "skills")]
             skill_tool_call_ordinal: AtomicU64::new(0),
             profile: ModelEffectProfile::Full,
+            step_timeout: STEP_TIMEOUT,
         }
+    }
+
+    /// Configure the whole-step deadline, clamped to
+    /// [`MIN_STEP_TIMEOUT_SECS`]..=[`MAX_STEP_TIMEOUT_SECS`]. It bounds
+    /// queueing, IPC, JavaScript and brokered effects (including `spawn`)
+    /// together; CPU-bound JavaScript stays subject to the worker's native
+    /// CPU ceiling.
+    pub(crate) fn with_step_timeout_secs(mut self, seconds: u64) -> Self {
+        self.step_timeout = Duration::from_secs(seconds.clamp(
+            super::types::MIN_STEP_TIMEOUT_SECS,
+            super::types::MAX_STEP_TIMEOUT_SECS,
+        ));
+        self
     }
 
     pub(crate) fn with_scratch_store(mut self, scratch: ScratchStore) -> Self {
@@ -1136,7 +1152,7 @@ impl Tool for JsTool {
                  note), and {} read effects.",
                 helper_globals_doc().join(" "),
                 READ_ONLY_IDIOMS,
-                STEP_TIMEOUT.as_secs(),
+                self.step_timeout.as_secs(),
                 MEMORY_LIMIT / (1024 * 1024),
                 STACK_LIMIT / 1024,
                 MAX_RESULT_BYTES / 1024,
@@ -1247,7 +1263,7 @@ impl Tool for JsTool {
              use closed, source-free error classes.{}",
             globals.join(" "),
             IDIOMS,
-            STEP_TIMEOUT.as_secs(),
+            self.step_timeout.as_secs(),
             MEMORY_LIMIT / (1024 * 1024),
             STACK_LIMIT / 1024,
             MAX_RESULT_BYTES / 1024,
@@ -1267,6 +1283,24 @@ impl Tool for JsTool {
     }
 
     async fn call(&self, args: JsArgs) -> Result<String, ToolError> {
+        let rendered = self.call_with_deadline(args).await?;
+        if self.step_timeout == STEP_TIMEOUT {
+            return Ok(rendered);
+        }
+        // Name the configured deadline instead of the built-in 30 s.
+        Ok(rendered.replacen(
+            "(30s limit exceeded)",
+            &format!(
+                "({}s js-step-timeout-secs limit exceeded)",
+                self.step_timeout.as_secs()
+            ),
+            1,
+        ))
+    }
+}
+
+impl JsTool {
+    async fn call_with_deadline(&self, args: JsArgs) -> Result<String, ToolError> {
         self.permission_bridge
             .bridge()
             .check_async("js", &args.code)
@@ -1283,7 +1317,7 @@ impl Tool for JsTool {
 
         // Create one absolute deadline for the entire invocation (30s from start)
         let call_deadline = Instant::now()
-            .checked_add(STEP_TIMEOUT)
+            .checked_add(self.step_timeout)
             .ok_or_else(|| ToolError::Msg("JS tool deadline unavailable".into()))?;
 
         let cancellation = PermCancellation::new();
@@ -1402,7 +1436,8 @@ impl Tool for JsTool {
         let run_step = RunStep::new(model_source.clone())
             .with_model_grant(model_grant_id)
             .with_model_effect_profile(self.profile)
-            .with_spawn_available(self.spawn_available());
+            .with_spawn_available(self.spawn_available())
+            .with_timeout(self.step_timeout);
         #[cfg(feature = "skills")]
         let run_step = if let Some(grant_id) = proposal_grant_id {
             run_step.with_proposal_grant(grant_id)

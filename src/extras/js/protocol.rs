@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub(crate) const PROTOCOL_VERSION: u16 = 11;
+pub(crate) const PROTOCOL_VERSION: u16 = 12;
 pub(crate) const VERIFICATION_LOADER_VERSION: u16 = 1;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
@@ -328,6 +328,10 @@ pub(crate) struct RunStep {
     /// This controls whether the worker installs the model-facing `spawn` global at all. The
     /// broker still enforces the corresponding grant on every call.
     pub(crate) spawn_available: bool,
+    /// Configured whole-step deadline in milliseconds (`js-step-timeout-secs`);
+    /// `None` keeps the built-in 30 s. The worker refuses values outside the
+    /// configurable bounds.
+    pub(crate) timeout_ms: Option<u64>,
     #[cfg(feature = "skills")]
     pub(crate) proposal_grant_id: Option<GrantId>,
     #[cfg(feature = "skills")]
@@ -351,6 +355,7 @@ impl RunStep {
             model_grant_id: None,
             model_effect_profile: ModelEffectProfile::Full,
             spawn_available: false,
+            timeout_ms: None,
             #[cfg(feature = "skills")]
             proposal_grant_id: None,
             #[cfg(feature = "skills")]
@@ -382,6 +387,12 @@ impl RunStep {
 
     pub(crate) fn with_spawn_available(mut self, available: bool) -> Self {
         self.spawn_available = available;
+        self
+    }
+
+    pub(crate) fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout_ms = (timeout != super::types::STEP_TIMEOUT)
+            .then(|| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
         self
     }
 

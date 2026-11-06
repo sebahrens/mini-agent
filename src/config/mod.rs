@@ -515,6 +515,15 @@ pub struct Config {
         alias = "js_fetch_allow_http"
     )]
     pub js_fetch_allow_http: Option<bool>,
+    /// `js-step-timeout-secs`: whole-invocation deadline of one `js` call,
+    /// clamped to 1..=300 (default 30). Sensitive in project layers.
+    #[cfg(feature = "js")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "js-step-timeout-secs",
+        alias = "js_step_timeout_secs"
+    )]
+    pub js_step_timeout_secs: Option<u64>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         rename = "web-fetch-origins",

@@ -25,6 +25,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   (`stat`, `name_status`) and `offset` paging so changes larger than 192 KiB can be read in full
   (mini-agent-k4fem).
 
+- `js-step-timeout-secs` (1..=300, default 30, project-trust-gated) sets the whole-call deadline of
+  the `js` tool, so a brokered `spawn` can run past 30 s; the worker receives the deadline through
+  the step protocol (version 12) and refuses out-of-range values. Every JavaScript limit is now
+  listed in `docs/agent/TOOL_RUNTIME.md`; the 64 MiB heap stays fixed (mini-agent-blbmw).
+
 ### Changed
 
 - Foreground `shell` commands that print more than 1 MiB are no longer killed: the capture keeps

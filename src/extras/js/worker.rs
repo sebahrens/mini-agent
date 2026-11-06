@@ -1809,6 +1809,22 @@ mod trusted_bootstrap_bytecode_tests {
     }
 
     #[test]
+    fn configured_step_timeouts_are_bounded_and_never_clamped() {
+        let base = ExecutionLimits {
+            timeout: STEP_TIMEOUT,
+            max_pending_jobs: 7,
+        };
+        assert_eq!(step_limits(base, None).unwrap().timeout, STEP_TIMEOUT);
+        let raised = step_limits(base, Some(120_000)).unwrap();
+        assert_eq!(raised.timeout, Duration::from_secs(120));
+        assert_eq!(raised.max_pending_jobs, 7);
+        assert!(step_limits(base, Some(0)).is_err());
+        assert!(step_limits(base, Some(999)).is_err());
+        assert!(step_limits(base, Some(300_001)).is_err());
+        assert!(step_limits(base, Some(300_000)).is_ok());
+    }
+
+    #[test]
     fn oversized_encoded_results_are_cut_for_the_model_and_rejected_for_verification() {
         let small = "{\"a\":1}".to_string();
         assert_eq!(
@@ -1948,6 +1964,23 @@ mod trusted_bootstrap_bytecode_tests {
 struct ExecutionLimits {
     timeout: Duration,
     max_pending_jobs: usize,
+}
+
+/// Apply a parent-configured step deadline. A value outside the configurable
+/// bounds is a protocol violation, never silently clamped.
+fn step_limits(limits: ExecutionLimits, timeout_ms: Option<u64>) -> Result<ExecutionLimits, ()> {
+    let Some(timeout_ms) = timeout_ms else {
+        return Ok(limits);
+    };
+    let bounds =
+        super::types::MIN_STEP_TIMEOUT_SECS * 1000..=super::types::MAX_STEP_TIMEOUT_SECS * 1000;
+    if !bounds.contains(&timeout_ms) {
+        return Err(());
+    }
+    Ok(ExecutionLimits {
+        timeout: Duration::from_millis(timeout_ms),
+        ..limits
+    })
 }
 
 impl ExecutionLimits {
@@ -2592,6 +2625,7 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
     sequence: u64,
 ) -> Result<(StepResult, u64), ()> {
     let model_grant_id = request.model_grant_id.clone();
+    let limits = step_limits(limits, request.timeout_ms)?;
     let ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
     #[cfg(feature = "skills")]
     let skill_request_ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));

@@ -841,13 +841,18 @@ fn register_js_tool_with_status(
             .and_then(crate::config::JsFetchOrigins::as_policy_origins),
         cfg.js_fetch_allow_http.unwrap_or(false),
     );
+    let step_timeout_secs = cfg
+        .js_step_timeout_secs
+        .unwrap_or(crate::extras::js::types::STEP_TIMEOUT.as_secs());
     #[cfg(feature = "skills")]
-    let mut js_tool =
-        JsTool::new(sandbox, permission, ask_tx, allow_config).with_scratch_store(scratch);
+    let mut js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config)
+        .with_scratch_store(scratch)
+        .with_step_timeout_secs(step_timeout_secs);
 
     #[cfg(not(feature = "skills"))]
-    let js_tool =
-        JsTool::new(sandbox, permission, ask_tx, allow_config).with_scratch_store(scratch);
+    let js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config)
+        .with_scratch_store(scratch)
+        .with_step_timeout_secs(step_timeout_secs);
 
     #[cfg(feature = "skills")]
     if let Some(services) = skill_services {

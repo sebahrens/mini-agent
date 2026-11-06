@@ -49,8 +49,8 @@ installed-binary path because libtest is not a production worker executable.
 Foreground shell commands default to a 120 s deadline. `shell_timeout_secs`
 sets it between 1 and 600 seconds; the tool definition publishes the effective
 deadline. A call's millisecond `timeout` can only lower that deadline and must
-be positive. Other sandbox command classes, including brokered JS `spawn`,
-retain their existing limits. A shell call with
+be positive. Other sandbox command classes retain their existing limits;
+brokered JS `spawn` is bounded by the remaining `js-step-timeout-secs` deadline. A shell call with
 `background = true` instead returns a session-scoped job id immediately and
 uses a 24-hour maximum (again lowerable with `timeout`).
 
@@ -429,10 +429,22 @@ is no longer valid JSON). Verification roles (embedded, mutation, inherited and
 held-out skill tests) keep the strict 64 KiB contract and fail with
 `invalid_result`. Non-JSON values still fail with `invalid_result`.
 
-#### JavaScript step output limits
+#### JavaScript step limits
 
 | Limit | Value | When exceeded |
 |-------|-------|---------------|
+| Whole call (queueing, IPC, JavaScript, brokered effects) | 30 s; `js-step-timeout-secs` 1..=300 | `execution timed out` naming the limit |
+| Brokered `spawn` | The remaining whole-call deadline | `timed_out: true`, process tree killed |
+| JavaScript heap / stack | 64 MiB / 512 KiB (fixed, Phase 6 invariant 4) | `out of memory` / `stack_limit` |
+| Worker CPU (native) | 35 s per worker process on Linux (`RLIMIT_CPU`) and Windows (Job) | Worker killed; workers within 30 s of it are retired first |
+| Worker address space / descriptors / file size (Linux) | 256 MiB / 64 / 1 MiB | Allocation or open fails inside the worker |
+| Worker reuse | 256 invocations or 15 minutes per process | A fresh worker is started |
+| Effect calls | 256 per step | Closed `effect_limit` error |
+| `read_file` / `write_file` | 1 MiB per call | `too_large` |
+| `read_files` | 256 paths, 6 MiB encoded results | `too_large` |
+| `spawn` output | 1 MiB stdout, 1 MiB stderr, 1.5 MiB combined; 4,096 arguments, 1 MiB argument bytes | Output truncated flags / `too_large` |
+| `fetch` | 256 KiB request body (POST only), 1 MiB response body | `too_large` |
+| `scratch_put` | 128-byte keys, 1 MiB values, 4 MiB and 128 entries per session | `too_large` |
 | Final expression value | 64 KiB UTF-8 (`MAX_RESULT_BYTES`) | Model steps: truncated with a size marker; verification roles: `invalid_result` |
 | `result(value)` structured result | 256 KiB | The call throws `too_large` |
 | Console records | 256 per step | Later records are dropped; the last kept record is marked `[truncated]` and the result ends with a cap notice |

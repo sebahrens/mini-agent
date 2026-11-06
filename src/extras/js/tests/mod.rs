@@ -509,6 +509,51 @@ async fn test_spawn_captures_output_and_exit_code() {
     );
 }
 
+/// `js-step-timeout-secs` below the default is enforced by the worker deadline.
+#[tokio::test]
+async fn test_configured_lower_step_timeout_is_enforced() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
+    use rig::tool::Tool;
+    let tool = make_test_tool(&audit_dirs).with_step_timeout_secs(2);
+    assert!(tool.description().contains("Limits per call: 2 s total"));
+    let started = std::time::Instant::now();
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "while (true) {}".to_string(),
+        })
+        .await
+        .expect("timeout call failed");
+    assert_eq!(
+        result,
+        "JS error: execution timed out (2s js-step-timeout-secs limit exceeded)"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the 2 s deadline was not applied: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A raised `js-step-timeout-secs` lets one brokered spawn run past the
+/// built-in 30 s: here a 45 s command completes normally.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_raised_step_timeout_allows_a_45_second_spawn() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
+    use rig::tool::Tool;
+    let tool = make_test_tool(&audit_dirs).with_step_timeout_secs(60);
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: r#"JSON.stringify(spawn("sh", ["-c", "sleep 45; printf done"]))"#.to_string(),
+        })
+        .await
+        .expect("spawn call failed");
+    assert_eq!(
+        result,
+        r#"{"stdout":"done","stderr":"","code":0,"timed_out":false,"stdout_truncated":false,"stderr_truncated":false}"#
+    );
+}
+
 /// Regression for mini-agent-wp7t6: raw-capped control-byte output expands six-fold when
 /// JSON-escaped. An executed command must come back as a truncated result, never as a worker
 /// protocol fault that invites the model to replay a possibly mutating command.
