@@ -2113,6 +2113,10 @@ mod tests {
         let authorization = writable_parent(root.path(), None);
         let tools = filesystem_tools(&authorization);
         assert!(tools.iter().all(|tool| tool.name() != "task"));
+        assert!(
+            tools.iter().all(|tool| tool.name() != "task_evidence"),
+            "task_evidence is parent-only"
+        );
         let write = tools.iter().find(|tool| tool.name() == "write").unwrap();
         assert!(
             write

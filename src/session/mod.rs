@@ -31,7 +31,15 @@ pub const TOOL_RESULT_TAIL_CHARS: usize = 8_000;
 pub(crate) fn tool_result_is_self_bounded(name: &str) -> bool {
     matches!(
         name,
-        "read" | "shell" | "grep" | "find_files" | "list_dir" | "js" | "web_fetch" | "web_search"
+        "read"
+            | "shell"
+            | "grep"
+            | "find_files"
+            | "list_dir"
+            | "js"
+            | "web_fetch"
+            | "web_search"
+            | "task_evidence"
     )
 }
 /// Count-only pruning is opt-in. The normal context-budget compactor decides
