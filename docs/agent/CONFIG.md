@@ -2952,9 +2952,13 @@ OAuth fields (all optional):
 | `redirect_port` | `8970`                         | Loopback port for the redirect URI `http://<redirect_host>:<port>/callback`. |
 
 A confidential pre-registered client takes its secret only from the environment
-variable `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>` (server name upper-cased,
-every character other than a letter or digit replaced by `_`; for example
-`my-server` reads `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_MY_SERVER`). It is read at
+variable `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>`. The server name is
+encoded injectively, so differently spelled names never share a secret: each
+lowercase ASCII letter becomes its uppercase form, each digit is kept, and every
+other byte of the UTF-8 name (an uppercase letter, `_`, `-`, `.`, any non-ASCII
+byte) becomes `_` plus two uppercase hex digits. For example `my-server` reads
+`MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_MY_2DSERVER`, `my.server` reads
+`..._MY_2ESERVER` and `My_Server` reads `..._4DY_5F_53ERVER`. It is read at
 login and when a stored token is restored, sent to the token endpoint
 (`client_secret_basic`), and never written to configuration or the credential
 file. There is deliberately no config key for it, so a project config cannot

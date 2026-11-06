@@ -1407,21 +1407,29 @@ async fn authorization_manager_bound(
 }
 
 /// Environment variable holding the client secret of a pre-registered
-/// confidential client: `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>`, with the
-/// server name upper-cased and every other character replaced by `_`. The
+/// confidential client: `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>`. The
 /// secret is never read from configuration files, so a project config cannot
 /// name an arbitrary variable to be sent to its authorization server.
+///
+/// The `<SERVER>` encoding is injective, so two differently spelled server
+/// names can never read the same variable: a lowercase ASCII letter becomes its
+/// uppercase form, a digit stays, and every other byte of the UTF-8 name (an
+/// uppercase letter, `_`, `-`, `.`, any non-ASCII byte) becomes `_` followed by
+/// two uppercase hex digits. `_` therefore always starts an escape, so the
+/// result decodes back to exactly one name (`my-server` is `MY_2DSERVER`,
+/// `my.server` is `MY_2ESERVER`, `My_Server` is `_4DY_5F_53ERVER`).
 pub(crate) fn client_secret_env_name(server_name: &str) -> String {
-    let suffix: String = server_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
+    use std::fmt::Write as _;
+    let mut suffix = String::with_capacity(server_name.len() * 2);
+    for byte in server_name.bytes() {
+        match byte {
+            b'a'..=b'z' => suffix.push(char::from(byte.to_ascii_uppercase())),
+            b'0'..=b'9' => suffix.push(char::from(byte)),
+            other => {
+                let _ = write!(suffix, "_{other:02X}");
             }
-        })
-        .collect();
+        }
+    }
     format!("MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_{suffix}")
 }
 
@@ -2337,11 +2345,58 @@ mod product_identity_tests {
         }
     }
 
+    // mini-agent-ipcr6: differently named servers must not share one secret.
+    #[test]
+    fn client_secret_env_name_is_injective() {
+        let collided = [
+            "my-server",
+            "my.server",
+            "My_Server",
+            "my_server",
+            "MY_SERVER",
+            "my server",
+        ];
+        let names: std::collections::HashSet<_> = collided
+            .iter()
+            .map(|name| super::client_secret_env_name(name))
+            .collect();
+        assert_eq!(names.len(), collided.len(), "{names:?}");
+        assert_eq!(
+            super::client_secret_env_name("My_Server"),
+            "MINI_AGENT_MCP_OAUTH_CLIENT_SECRET__4DY_5F_53ERVER"
+        );
+        // Exhaustive over a small alphabet that exercises every escape class.
+        let alphabet = ['a', 'A', '0', '_', '-', '.', 'é'];
+        let mut seen = std::collections::HashMap::new();
+        let mut frontier: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for c in alphabet {
+                    let name = format!("{prefix}{c}");
+                    let env = super::client_secret_env_name(&name);
+                    if let Some(previous) = seen.insert(env.clone(), name.clone()) {
+                        panic!("{previous:?} and {name:?} both map to {env}");
+                    }
+                    next.push(name);
+                }
+            }
+            frontier = next;
+        }
+        // The suffix is always a valid portable environment-variable tail.
+        for env in seen.keys() {
+            assert!(
+                env.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            );
+        }
+    }
+
     #[test]
     fn client_secret_comes_only_from_a_server_derived_environment_name() {
         assert_eq!(
             super::client_secret_env_name("my-server.v2"),
-            "MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_MY_SERVER_V2"
+            "MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_MY_2DSERVER_2EV2"
         );
         let settings = super::OAuthSettings {
             client_id: Some("id".into()),
