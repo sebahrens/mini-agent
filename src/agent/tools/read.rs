@@ -12,6 +12,49 @@ use crate::config::types::EditSystem;
 
 const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
 
+/// Characters of the tool-result backstop reserved for the file header,
+/// coaching and continuation notices around a line-mode excerpt.
+const READ_RESULT_RESERVE_CHARS: usize = 2_000;
+/// Approximate per-line rendering overhead (line number, tag, separator)
+/// counted against the character budget.
+const READ_LINE_OVERHEAD_CHARS: usize = 20;
+
+/// Number of Unicode scalar values in a valid UTF-8 byte slice, counted
+/// without decoding (continuation bytes are skipped).
+fn utf8_chars(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| (**byte & 0xC0) != 0x80).count()
+}
+
+/// Render one selected line, clipping it to `width` characters with a marker
+/// that names the exact `character_offset` of the first omitted character.
+/// `start_char` is the 1-indexed file character offset of the line's start.
+fn clip_line(
+    line: &str,
+    width: usize,
+    line_num: usize,
+    start_char: usize,
+) -> std::borrow::Cow<'_, str> {
+    let Some((cut, _)) = line.char_indices().nth(width) else {
+        return std::borrow::Cow::Borrowed(line);
+    };
+    let total = line.chars().count();
+    std::borrow::Cow::Owned(format!(
+        "{} … [line {line_num} truncated: {total} chars, showing {width}; continue with character_offset={}]",
+        &line[..cut],
+        start_char.saturating_add(width)
+    ))
+}
+
+/// Characters a selected line contributes to the rendered excerpt.
+fn clipped_line_chars(line_chars: usize, width: usize) -> usize {
+    if line_chars > width {
+        width.saturating_add(120)
+    } else {
+        line_chars
+    }
+    .saturating_add(READ_LINE_OVERHEAD_CHARS)
+}
+
 /// Feed one already-validated slice of line content to the whole-file CRC and,
 /// when the line is inside the requested window, to the retained excerpt.
 fn absorb(
@@ -177,7 +220,8 @@ impl Tool for ReadTool {
             ),
         };
         format!(
-            "{text} For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization."
+            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization.",
+            super::limits::current().max_result_chars
         )
     }
 
@@ -538,6 +582,19 @@ impl ReadTool {
         let scan_to_eof = !oversized || es == EditSystem::Hashedit;
         let hashedit = es == EditSystem::Hashedit;
         let requested_end = offset.saturating_add(limit);
+        // The final `[tool_limits] max_result_chars` backstop applies to the
+        // rendered excerpt: selection stops before the first line that would
+        // exceed it, and the notice names the exact next offset.
+        let tool_limits = super::limits::current();
+        let char_budget = tool_limits
+            .max_result_chars
+            .saturating_sub(READ_RESULT_RESERVE_CHARS);
+        let clip_width = char_budget.saturating_sub(200).max(1);
+        let mut selection_end = requested_end;
+        let mut budget_stop: Option<usize> = None;
+        let mut excerpt_chars = 0_usize;
+        let mut file_chars = 0_usize;
+        let mut excerpt_starts: Vec<usize> = Vec::with_capacity(limit.min(256));
         let mut excerpt_lines: Vec<String> = Vec::with_capacity(limit.min(256));
         let mut excerpt_bytes = 0_u64;
         let mut total_lines = 0_usize;
@@ -555,7 +612,8 @@ impl ReadTool {
 
         'lines: loop {
             let line_index = total_lines;
-            let selected = line_index >= offset && line_index < requested_end;
+            let selected = line_index >= offset && line_index < selection_end;
+            let line_start_char = file_chars.saturating_add(1);
             let separator_bytes = u64::from(!excerpt_lines.is_empty());
             let mut retained: Vec<u8> = Vec::new();
             let mut held_cr = false;
@@ -597,6 +655,7 @@ impl ReadTool {
                     }
                     absorb(chunk, hashedit, &mut file_crc, selected, &mut retained);
                 }
+                file_chars = file_chars.saturating_add(utf8_chars(&available[..consumed]));
                 reader.consume(consumed);
                 scan_budget = scan_budget.saturating_sub(consumed as u64);
                 saw_bytes = true;
@@ -635,9 +694,22 @@ impl ReadTool {
             }
 
             total_lines += 1;
+            let selected = selected && {
+                let rendered = clipped_line_chars(utf8_chars(&retained), clip_width);
+                if !excerpt_lines.is_empty() && excerpt_chars.saturating_add(rendered) > char_budget
+                {
+                    budget_stop = Some(line_index);
+                    selection_end = line_index;
+                    false
+                } else {
+                    excerpt_chars = excerpt_chars.saturating_add(rendered);
+                    true
+                }
+            };
             if selected {
                 let line = String::from_utf8(retained)
                     .expect("line bytes were validated as UTF-8 while streaming");
+                excerpt_starts.push(line_start_char);
                 excerpt_bytes = excerpt_bytes
                     .saturating_add(separator_bytes)
                     .saturating_add(line.len() as u64);
@@ -685,19 +757,28 @@ impl ReadTool {
                     .enumerate()
                     .map(|(i, line)| {
                         let line_num = start + i + 1;
+                        // The tag always covers the complete line, so a
+                        // clipped display still authorizes the same edit.
                         let tag = crc32_hex(line.as_bytes());
                         format!(
                             "{:>width$}|{} {}",
                             line_num,
                             tag,
-                            line,
+                            clip_line(line, clip_width, line_num, excerpt_starts[i]),
                             width = line_num_width
                         )
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
             }
-            EditSystem::Similarity => numbered_excerpt(&excerpt_lines, start, line_num_width),
+            EditSystem::Similarity => {
+                let clipped: Vec<std::borrow::Cow<'_, str>> = excerpt_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| clip_line(line, clip_width, start + i + 1, excerpt_starts[i]))
+                    .collect();
+                numbered_excerpt(&clipped, start, line_num_width)
+            }
         };
 
         let total_lines_label = if has_more_lines {
@@ -752,7 +833,15 @@ impl ReadTool {
             }
         };
 
-        let info = if has_more_lines {
+        let info = if let Some(stop) = budget_stop {
+            format!(
+                "{}\n\n[truncated after {} lines — the output reached the {} character tool-result budget ([tool_limits] max_result_chars); re-call with offset {} and a bounded limit to continue]",
+                info,
+                end - start,
+                tool_limits.max_result_chars,
+                stop + 1,
+            )
+        } else if has_more_lines {
             format!(
                 "{}\n\n[truncated after {} lines — more lines are available; re-call with offset {} and a bounded limit to continue]",
                 info,
@@ -855,11 +944,18 @@ fn line_number_width(total_lines: usize) -> usize {
     total_lines.max(1).to_string().len().max(3)
 }
 
-fn numbered_excerpt(lines: &[String], start: usize, width: usize) -> String {
+fn numbered_excerpt<S: AsRef<str>>(lines: &[S], start: usize, width: usize) -> String {
     lines
         .iter()
         .enumerate()
-        .map(|(i, line)| format!("{:>width$}| {}", start + i + 1, line, width = width))
+        .map(|(i, line)| {
+            format!(
+                "{:>width$}| {}",
+                start + i + 1,
+                line.as_ref(),
+                width = width
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1381,5 +1477,107 @@ mod tests {
         assert!(output.contains("line 19997 "), "{output}");
         assert!(output.contains("line 19998 "), "{output}");
         assert!(!output.contains("line 19996 "), "{output}");
+    }
+
+    fn read_args(path: &std::path::Path) -> ReadArgs {
+        ReadArgs {
+            raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
+            path: path.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn wide_line_read_stops_at_the_result_backstop_with_an_exact_next_offset() {
+        let dir = crate::tests::support::temp::TempDir::new("read-backstop");
+        let path = dir.path().join("wide.txt");
+        let line = "w".repeat(600);
+        let body: String = (0..2000).map(|_| format!("{line}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let backstop = crate::agent::tools::limits::DEFAULT_MAX_RESULT_CHARS;
+
+        let output = ReadTool::new(None, None, Some(4 * 1024 * 1024), 2000)
+            .call(read_args(&path))
+            .await
+            .unwrap();
+
+        assert!(output.chars().count() <= backstop, "{}", output.len());
+        let marker = "tool-result budget ([tool_limits] max_result_chars); re-call with offset ";
+        let next = output
+            .split(marker)
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .expect("explicit next offset");
+        assert!(
+            output.contains(&format!("showing lines 1-{}", next - 1)),
+            "{output:.200}"
+        );
+        let resumed = ReadTool::new(None, None, Some(4 * 1024 * 1024), 2000)
+            .call(ReadArgs {
+                offset: Some(next),
+                limit: Some(3),
+                ..read_args(&path)
+            })
+            .await
+            .unwrap();
+        assert!(
+            resumed.contains(&format!("showing lines {next}-{}", next + 2)),
+            "{resumed:.200}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_huge_line_is_clipped_with_a_character_offset_continuation() {
+        let dir = crate::tests::support::temp::TempDir::new("read-backstop");
+        let path = dir.path().join("one-line.min.js");
+        std::fs::write(&path, format!("ab\n{}\n", "é".repeat(300_000))).unwrap();
+
+        let output = ReadTool::new(None, None, Some(4 * 1024 * 1024), 2000)
+            .call(ReadArgs {
+                offset: Some(2),
+                limit: Some(1),
+                ..read_args(&path)
+            })
+            .await
+            .unwrap();
+
+        let backstop = crate::agent::tools::limits::DEFAULT_MAX_RESULT_CHARS;
+        assert!(
+            output.chars().count() <= backstop,
+            "{}",
+            output.chars().count()
+        );
+        // Line 2 starts at character 4 ("a", "b", "\n" precede it).
+        let shown = output
+            .split("chars, showing ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .expect("clip width");
+        assert!(
+            output.contains(&format!(
+                "[line 2 truncated: 300000 chars, showing {shown}; continue with character_offset={}]",
+                4 + shown
+            )),
+            "{}",
+            &output[output.len() - 300..]
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_under_the_backstop_are_unchanged() {
+        let dir = crate::tests::support::temp::TempDir::new("read-backstop");
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let output = ReadTool::new(None, None, None, 100)
+            .call(read_args(&path))
+            .await
+            .unwrap();
+        assert!(output.ends_with("  1| one\n  2| two"), "{output}");
+        assert!(!output.contains("truncated"), "{output}");
     }
 }

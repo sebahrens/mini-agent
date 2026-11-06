@@ -1043,3 +1043,15 @@ mod running_input_tests {
         assert!(toml::from_str::<crate::config::Config>("running_input = 'replace'").is_err());
     }
 }
+
+/// `[tool_limits]`: output and traversal bounds for the built-in tools. Every
+/// field is optional; an omitted field keeps the documented default (see
+/// `crate::agent::tools::limits::ToolLimits`). Benign in project config: the
+/// values bound how much tool output reaches the model, never what may run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolLimitsConfig {
+    /// Final per-result character backstop for self-bounded tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_result_chars: Option<u64>,
+}

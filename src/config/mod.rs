@@ -746,6 +746,9 @@ pub struct Config {
     #[cfg(feature = "advisor")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advisor: Option<types::AdvisorConfig>,
+    /// Output and traversal bounds for built-in tools (`[tool_limits]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_limits: Option<types::ToolLimitsConfig>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///

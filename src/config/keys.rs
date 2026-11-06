@@ -317,6 +317,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("chain").shaped(ConfigShape::Object),
     gated("lsp", "lsp").shaped(ConfigShape::Object),
     gated("advisor", "advisor").shaped(ConfigShape::Object),
+    key("tool_limits").described("Output and traversal bounds for built-in tools: result character backstop, read line width, search budgets.").shaped(ConfigShape::Object),
 ];
 
 /// Whether the running build compiled in `feature`.

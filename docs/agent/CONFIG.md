@@ -740,6 +740,7 @@ Accepted top-level keys:
 | `subagent_max_grep_results` | integer | Per-subagent grep-result cap. Default: `200`; requires `subagents`. |
 | `subagent_max_find_results` | integer | Per-subagent file-result cap. Default: `200`; requires `subagents`. |
 | `subagent_max_list_dir_entries` | integer | Optional per-subagent directory-entry cap; requires `subagents`. |
+| `tool_limits`             | object  | Output and traversal bounds for built-in tools. `max_result_chars` (default `100000`, about 25k tokens; minimum `4000`) is the final per-result character backstop for the self-bounded tools (`read`, `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`, `task`, `task_evidence`): a larger result keeps a head (a quarter of the backstop) and tail (half of it) around a notice naming the backstop and the private spill path, in live and replayed history. `read` applies the same budget itself and stops line mode before the first line that would exceed it, naming the exact next `offset`. Benign in project configuration. See [Tool Limits](#tool-limits). |
 | `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section while its prior result remains in the current conversation. The section's served-content CRC joins file length and modification time in the version key, so same-length or mtime-preserving edits remain readable. Editing or writing the target, compaction, failed-turn rollback, clear, undo/rewind, and redo reset the relevant session tracker. Ordinary agent rebuilds retain it; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
 | `show_cost_always`        | boolean | Show the session cost in the status bar even when it is `$0.0000` (for example when the model has no per-token pricing configured). Default: `false`, which hides the cost until it is above zero. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, and opt-in mid-turn compaction). Default: `false`. When `false`, nothing is ever compacted automatically.            |
@@ -1350,7 +1351,27 @@ directories, writes, JavaScript file reads, or symlink escapes; explicit tool
 and external-directory deny rules still apply. The artifact directory is bound
 to its identity and reads use its retained directory capability. If the spill
 write fails, the head/tail bound remains in force and the
-notice reports that the complete output is unavailable. A single long turn with
+notice reports that the complete output is unavailable.
+
+#### Tool limits
+
+The self-bounded tools above are exempt from the 12,000-character spill but not
+unbounded: `[tool_limits] max_result_chars` (default `100000`) is a final
+per-result backstop. A shell command printing a minified bundle, a few very long
+JSON lines, or a wide-line `read` therefore cannot inject hundreds of thousands
+of tokens in one result. Over the backstop, the complete output is saved to the
+same private tool-output directory and the model sees a head, a notice naming
+the backstop and spill path, and a tail. `read` budgets its own excerpt
+(rendered lines plus a small header reserve) and ends with `re-call with offset
+N` instead; a single line longer than the budget is clipped with the exact
+`character_offset` that continues it. Image envelopes are never rewritten.
+
+```toml
+[tool_limits]
+max_result_chars = 100000
+```
+
+A single long turn with
 many individually bounded results can still exceed the model's real context
 limit before the between-turn check runs, because aggregate in-flight tool
 traffic does not enter the session's token estimate.

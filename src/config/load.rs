@@ -67,6 +67,8 @@ pub(super) const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "subagent_max_read_lines",
     "temperature",
     "tool_output",
+    // Output/traversal bounds only limit what tool output reaches the model.
+    "tool_limits",
     // Masks only hide more of HOME from contained commands, and project
     // layers can only add to the list (see `merge_config_value_layer`).
     "sandbox-home-masks",
