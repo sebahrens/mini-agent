@@ -177,6 +177,16 @@ pub struct Cli {
     pub input_format: Option<InputFormat>,
 
     #[arg(
+        short = 'i',
+        long = "image",
+        value_name = "FILE",
+        action = clap::ArgAction::Append,
+        requires = "print",
+        help = "With -p: attach an image (png, jpeg, gif, webp) to the prompt; repeatable, same size limits and downscaling as /add"
+    )]
+    pub image: Vec<std::path::PathBuf>,
+
+    #[arg(
         long = "stream-json-preview-bytes",
         value_name = "BYTES",
         requires = "print",
@@ -1633,6 +1643,20 @@ pub fn write_completions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_flag_is_repeatable_and_needs_print() {
+        let cli = Cli::try_parse_from(["mini-agent", "-p", "-i", "a.png", "--image", "b.png", "q"])
+            .unwrap();
+        assert_eq!(
+            cli.image,
+            vec![
+                std::path::PathBuf::from("a.png"),
+                std::path::PathBuf::from("b.png")
+            ]
+        );
+        assert!(Cli::try_parse_from(["mini-agent", "-i", "a.png"]).is_err());
+    }
+
     #[test]
     fn output_format_is_a_hidden_alias_of_output() {
         for flag in ["--output", "--output-format"] {

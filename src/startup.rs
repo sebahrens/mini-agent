@@ -2280,8 +2280,23 @@ impl Startup {
                 None => match crate::print::read_stream_input_line().await? {
                     None => break,
                     Some(Ok(line)) if line.trim().is_empty() => continue,
-                    Some(Ok(line)) => match crate::print::parse_stream_input_line(line.trim()) {
-                        Ok(text) => text,
+                    Some(Ok(line)) => match crate::headless_media::parse_stream_user_input(
+                        line.trim(),
+                    )
+                    .and_then(|input| {
+                        let media = crate::headless_media::resolve_images(
+                            self.workspace.root(),
+                            input.images,
+                        )?;
+                        Ok((input.text, media))
+                    }) {
+                        Ok((text, media)) => {
+                            #[cfg(feature = "multimodal")]
+                            self.session.pending_media.extend(media);
+                            #[cfg(not(feature = "multimodal"))]
+                            drop(media);
+                            text
+                        }
                         Err(error) => {
                             output
                                 .emit_event(
@@ -2337,8 +2352,40 @@ impl Startup {
         result
     }
 
+    /// Images for this headless turn: `-i/--image` files (first turn only)
+    /// followed by stream-json image blocks already queued on the session.
+    /// Refused up front when the turn cannot carry them.
+    fn take_headless_media(
+        &mut self,
+        is_bang: bool,
+    ) -> anyhow::Result<Vec<crate::headless_media::Attachment>> {
+        let files = std::mem::take(&mut self.cli.image)
+            .into_iter()
+            .map(crate::headless_media::ImageSource::Path)
+            .collect();
+        #[cfg_attr(not(feature = "multimodal"), allow(unused_mut))]
+        let mut media = crate::headless_media::resolve_images(self.workspace.root(), files)
+            .map_err(anyhow::Error::msg)?;
+        #[cfg(feature = "multimodal")]
+        media.extend(self.session.drain_media());
+        if media.is_empty() {
+            return Ok(media);
+        }
+        anyhow::ensure!(!is_bang, "images cannot be attached to a `!` shell command");
+        anyhow::ensure!(
+            self.native_ticket.is_none() && self.native_headless.is_none(),
+            "image attachments do not support provider-native session history yet"
+        );
+        #[cfg(feature = "multimodal")]
+        crate::headless_media::ensure_vision(&self.session.provider, &self.session.model)
+            .map_err(anyhow::Error::msg)?;
+        Ok(media)
+    }
+
     async fn dispatch_print_inner(&mut self) -> anyhow::Result<()> {
         let mut msg = self.cli.message.join(" ").trim().to_string();
+        #[cfg_attr(not(feature = "multimodal"), allow(unused_variables))]
+        let media = self.take_headless_media(msg.starts_with('!'))?;
         let schema = self.cli.loaded_output_schema.clone();
         if let Some(schema) = &schema {
             msg.push_str("\n\n");
@@ -2580,6 +2627,20 @@ impl Startup {
                 &self.session,
                 self.cfg.resolve_keep_recent_tool_results(),
             );
+            // Attached images persist as one typed user message and are sent
+            // ahead of the prompt, the order a replay produces.
+            #[cfg(feature = "multimodal")]
+            let history = if media.is_empty() {
+                history
+            } else {
+                let user = crate::headless_media::images_user_message(&media)?;
+                let mut with_images = history.to_vec();
+                with_images.push(user.to_message());
+                if !self.cli.no_session {
+                    self.session.add_user_message(user);
+                }
+                with_images.into()
+            };
             // Goal verdicts are skill evidence. The recorder lives behind the
             // provider, so the driver installs it rather than building one.
             #[cfg(all(feature = "goal", feature = "skills"))]

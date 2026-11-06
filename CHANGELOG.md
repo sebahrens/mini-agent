@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### ACP, IDE and headless
 
+- Headless `-p` accepts images: `-i/--image FILE` (repeatable) and `image` content blocks
+  (base64 or path source) on `--input-format stream-json`. They use `/add`'s size limits and
+  downscaling, persist as a typed user message, and are refused with a clear error for a model the
+  catalog lists as text-only, with a `!` command, or with provider-native session history.
 - `--output-format` is accepted as a hidden alias of `--output` (scripts written for Claude Code's
   `claude -p --output-format stream-json`); the docs now use `--output` throughout.
 - `!` shell commands now time out after 120 s by default (was 30 s) and accept a per-command

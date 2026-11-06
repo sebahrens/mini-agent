@@ -12,6 +12,7 @@ mod event;
 mod extras;
 mod fs;
 mod git;
+mod headless_media;
 mod hex;
 mod logging;
 mod models_catalog;

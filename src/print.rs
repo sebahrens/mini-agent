@@ -35,6 +35,7 @@ pub(crate) fn reset_headless_result_emitted() {
 /// One `--input-format stream-json` line: `{"type":"user","message":
 /// {"content": "..." | [{"type":"text","text":"..."}]}}` (Claude Code shape)
 /// or the flat `{"type":"user","content":...}`. Returns the user text.
+#[cfg(test)]
 pub(crate) fn parse_stream_input_line(line: &str) -> Result<String, String> {
     let value: serde_json::Value =
         serde_json::from_str(line).map_err(|error| format!("invalid JSON: {error}"))?;
