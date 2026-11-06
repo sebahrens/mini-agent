@@ -582,6 +582,18 @@ pub struct Config {
         alias = "web_search_provider"
     )]
     pub web_search_provider: Option<String>,
+    /// Opt-in, default off: let the active Anthropic or OpenAI Responses
+    /// provider run its own hosted web search (Anthropic `web_search` server
+    /// tool, OpenAI Responses `web_search`) instead of the native Exa tool.
+    /// Hosted search executes provider-side, so it bypasses the per-call
+    /// `web_search` network permission; project configuration cannot enable it
+    /// without trust.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "hosted-web-search",
+        alias = "hosted_web_search"
+    )]
+    pub hosted_web_search: Option<bool>,
     /// Total `web_fetch` deadline in seconds (DNS, approval, redirects and
     /// body). Default 30; clamped to 1..=300.
     #[serde(

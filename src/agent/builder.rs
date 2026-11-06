@@ -1135,6 +1135,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         // Without EXA_API_KEY the native tool could only fail, so it is not
         // registered; the keyless built-in Exa MCP server is the fallback.
         if cli.tool_is_eligible(cfg, "web_search")
+            && !crate::provider::declares_hosted_web_search(additional_params.as_ref())
             && native_web_search_registered(cfg, tools::web_search::exa_api_key_present())
         {
             base_tools.push(Box::new(tools::web_search::WebSearchTool::new(

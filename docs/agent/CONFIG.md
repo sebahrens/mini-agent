@@ -4352,15 +4352,26 @@ totals.
 most 20; not both) and `recency` (`day`, `week`, `month`, `year`). The filters
 are sent to Exa and also enforced on the returned URLs. Each result carries a
 title (256 characters) and a snippet of at most 3,000 characters.
-Provider-native hosted search (Anthropic `web_search` server tool, OpenAI
-Responses `web_search`) is not bridged: hosted tools are stripped from provider
-requests by policy because they bypass per-call network permission.
+Provider-native hosted search (Anthropic `web_search_20250305` server tool,
+OpenAI Responses `web_search`) is available only through the explicit opt-in
+`hosted-web-search = true` (default `false`). It needs no `EXA_API_KEY`. When it
+is on and the active model is Anthropic or OpenAI Responses, the main agent's
+requests carry the hosted tool and the native Exa `web_search` function tool is
+not registered (the names would collide). Other providers (Chat Completions,
+OpenRouter, Gemini, Ollama, Copilot) are unchanged. Hosted tools run on the
+provider side, so they bypass the per-call `web_search` network permission and
+the native domain/recency parameters; the opt-in is the only approval. The
+setting is ignored when `web-search-provider = "off"`, when a `web_search` deny
+rule exists, or when `--no-tools`/`--tools` excludes `web_search`. Subagents and
+auxiliary calls never receive the hosted tool. It is authority-sensitive, so an
+untrusted project config cannot enable it.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `web-fetch-origins` (`web_fetch_origins`) | omitted | Exact permitted HTTP(S) origins; omitted accepts any otherwise-safe public origin, an empty/invalid list denies all. This restriction does not grant permission. |
 | `web-fetch-allow-http` (`web_fetch_allow_http`) | `false` | Permit plaintext HTTP to otherwise-safe public destinations. Private addresses remain denied. |
 | `web-search-provider` (`web_search_provider`) | `"exa"` | Fixed-endpoint Exa search, or `"off"` to omit the tool. Other provider names fail visibly before I/O. |
+| `hosted-web-search` (`hosted_web_search`) | `false` | Opt in to the Anthropic or OpenAI Responses provider-hosted web search instead of native Exa. Bypasses per-call `web_search` permission; see above. |
 | `web-fetch-timeout-secs` (`web_fetch_timeout_secs`) | `30` | Total `web_fetch` deadline in seconds, spanning DNS, approval, redirects and body. Clamped to 1..=300. The idle gap allowed between body reads is half of it (at least 3 s). `web_search` keeps its fixed 10 s deadline. |
 
 These are authority-sensitive project config keys and require existing project
