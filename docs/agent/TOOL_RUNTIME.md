@@ -81,7 +81,8 @@ win, nothing is remembered, headless runs refuse, the use is logged to the
 `mini_agent::audit::sandbox_escalation` target). `sandbox-network = "allowlist"`
 routes contained shell traffic through a loopback filtering proxy
 (`src/sandbox/net_proxy.rs`) limited to `sandbox-network-hosts` plus prompted
-hosts, on Seatbelt. See CONFIG.md for the rules.
+hosts, on Seatbelt and Linux bwrap (Unix-socket proxy plus the in-namespace forwarder in
+`src/sandbox/net_forwarder.rs`). See CONFIG.md for the rules.
 
 | Command class | Deadline |
 |---------------|----------|

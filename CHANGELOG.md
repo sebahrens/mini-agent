@@ -38,7 +38,7 @@ Notable changes to mini-agent are documented in this file. The format follows
   refused, global-only `shell-env-allow-secrets`), `shell-max-background-jobs` (an
   `auto_background` call now runs in the foreground when the job table is full),
   `shell-allow-escalation` (per-command `escalate` with forced approval and audit) and
-  `sandbox-network = "allowlist"` with `sandbox-network-hosts` (filtering proxy, macOS Seatbelt)
+  `sandbox-network = "allowlist"` with `sandbox-network-hosts` (filtering proxy; macOS Seatbelt and Linux bwrap via a Unix-socket forwarder)
   (mini-agent-wr6xh, mini-agent-tb3zw, mini-agent-a1ive, mini-agent-yz1hr).
 - JS `grep` returns `skipped: {large, binary, non_utf8, unreadable}` and decodes lossily like the
   native tool (mini-agent-azgi7).

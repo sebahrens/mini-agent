@@ -20,6 +20,8 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod general_profile;
+#[cfg(unix)]
+pub(crate) mod net_forwarder;
 pub(crate) mod net_proxy;
 pub(crate) mod shell_env;
 pub use shell_env::ShellEnvPolicy;
@@ -489,6 +491,9 @@ pub struct Sandbox {
     /// The filtering proxy of `sandbox-network = "allowlist"`, started on the
     /// first contained command that needs it and shared by all clones.
     network_proxy: NetworkProxyCell,
+    /// Executable that runs the in-namespace forwarder for the bwrap
+    /// allowlist; `None` means this process's own executable.
+    net_forwarder_exe: Option<PathBuf>,
     /// Where the proxy asks about unlisted hosts; set once the UI exists.
     network_prompt: Arc<Mutex<Option<crate::permission::ask::AskSender>>>,
     /// Canonicalized cache directory computed once per instance.
@@ -2471,6 +2476,14 @@ impl Sandbox {
         self
     }
 
+    /// Run the bwrap allowlist forwarder from this executable instead of the
+    /// current one (test harness binaries cannot act as the helper).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_net_forwarder_exe(mut self, exe: PathBuf) -> Self {
+        self.net_forwarder_exe = Some(exe);
+        self
+    }
+
     pub fn network_hosts(&self) -> &[String] {
         &self.network_hosts
     }
@@ -2487,7 +2500,9 @@ impl Sandbox {
     /// Whether shell commands are held to the allowlist proxy: the mode is
     /// set, containment is active, and the backend can enforce it.
     pub fn shell_network_proxied(&self) -> bool {
-        self.enabled && self.network.is_allowlist() && self.backend == "seatbelt"
+        self.enabled
+            && self.network.is_allowlist()
+            && matches!(self.backend.as_str(), "seatbelt" | "bwrap")
     }
 
     /// The running allowlist proxy, started on first use. `None` unless
@@ -2499,8 +2514,17 @@ impl Sandbox {
         self.network_proxy
             .get_or_init(|| {
                 let rules = net_proxy::parse_rules(&self.network_hosts)?;
-                net_proxy::NetworkProxy::start(rules, self.network_prompt.clone())
-                    .map_err(|error| format!("sandbox network proxy failed to start: {error}"))
+                // bwrap's empty network namespace reaches the proxy over a
+                // private Unix socket instead of host loopback.
+                #[cfg(unix)]
+                let started = if self.backend == "bwrap" {
+                    net_proxy::NetworkProxy::start_with_socket(rules, self.network_prompt.clone())
+                } else {
+                    net_proxy::NetworkProxy::start(rules, self.network_prompt.clone())
+                };
+                #[cfg(not(unix))]
+                let started = net_proxy::NetworkProxy::start(rules, self.network_prompt.clone());
+                started.map_err(|error| format!("sandbox network proxy failed to start: {error}"))
             })
             .clone()
             .map(Some)
@@ -2734,6 +2758,7 @@ impl Sandbox {
             background_jobs: Arc::new(BackgroundJobsInner::default()),
             cached_essential_env: Arc::new(OnceLock::new()),
             network_proxy: Arc::new(OnceLock::new()),
+            net_forwarder_exe: None,
             network_prompt: Arc::default(),
             cached_cache_dir: Arc::new(Mutex::new(None)),
             cached_seatbelt_profiles: Arc::new(Mutex::new(SeatbeltProfileMap::default())),
@@ -4437,7 +4462,12 @@ impl Sandbox {
             self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata, read_roots)?;
         let sandbox_cwd = self.sandbox_cwd(cwd);
         let deny_network = !self.network.allows();
-        if !deny_network && self.profile == SandboxProfile::Workspace {
+        // `sandbox-network = "allowlist"`: the namespace stays empty
+        // (`--unshare-net`); the only way out is a Unix socket to the host
+        // filtering proxy, relayed onto the namespace's own loopback by the
+        // forwarder helper that starts the command.
+        let proxy = self.network_proxy()?;
+        if (!deny_network || proxy.is_some()) && self.profile == SandboxProfile::Workspace {
             // The workspace profile exposes only a synthetic /etc; resolver
             // and CA configuration must be visible for the opt-in to work.
             for path in BWRAP_NETWORK_ETC_FILES {
@@ -4450,7 +4480,15 @@ impl Sandbox {
             self.profile != SandboxProfile::HostFull,
             deny_network,
         );
+        let mut launcher: Vec<OsString> = Vec::new();
+        if let Some(proxy) = &proxy {
+            launcher =
+                bwrap_forwarder_launcher(&mut cmd, proxy, self.net_forwarder_exe.as_deref())?;
+        }
         cmd.args(["--new-session", "--die-with-parent", "--"]);
+        for argument in &launcher {
+            cmd.arg(argument);
+        }
         if self.workspace_binding.is_some() {
             // bwrap needs fd 197 while constructing the workspace bind, but
             // the model process must not inherit that authority into the new
@@ -7099,6 +7137,55 @@ fn append_bwrap_isolation(
         command.args(["--remount-ro", "/"]);
     }
     command.arg("--chdir").arg(cwd);
+}
+
+/// Where the forwarder helper and the proxy socket appear inside a `bwrap`
+/// namespace. `/dev` is a fresh tmpfs under every profile.
+#[cfg(unix)]
+const BWRAP_FORWARDER_EXECUTABLE: &str = "/dev/mini-agent-net-forwarder";
+#[cfg(unix)]
+const BWRAP_FORWARDER_SOCKET: &str = "/dev/mini-agent-net-proxy.sock";
+
+/// Mount the proxy socket and this executable (read-only) into the namespace,
+/// export the proxy variables, and return the argv prefix that runs the
+/// command behind the forwarder. Must come after `--dev /dev`.
+#[cfg(unix)]
+fn bwrap_forwarder_launcher(
+    cmd: &mut Command,
+    proxy: &net_proxy::NetworkProxy,
+    executable: Option<&Path>,
+) -> Result<Vec<OsString>, String> {
+    let socket = proxy
+        .socket_path()
+        .ok_or("sandbox network proxy has no socket for the bwrap namespace")?;
+    let executable = match executable {
+        Some(path) => std::fs::canonicalize(path),
+        None => std::env::current_exe().and_then(std::fs::canonicalize),
+    }
+    .map_err(|error| format!("sandbox: cannot locate the forwarder executable: {error}"))?;
+    cmd.arg("--ro-bind")
+        .arg(&executable)
+        .arg(BWRAP_FORWARDER_EXECUTABLE);
+    cmd.arg("--bind").arg(socket).arg(BWRAP_FORWARDER_SOCKET);
+    for (key, value) in proxy.env_for_forwarder() {
+        cmd.arg("--setenv").arg(key).arg(value);
+    }
+    Ok(vec![
+        OsString::from(BWRAP_FORWARDER_EXECUTABLE),
+        OsString::from(net_forwarder::FORWARDER_ARG),
+        OsString::from(BWRAP_FORWARDER_SOCKET),
+        OsString::from(net_proxy::FORWARDER_PORT.to_string()),
+        OsString::from("--"),
+    ])
+}
+
+#[cfg(not(unix))]
+fn bwrap_forwarder_launcher(
+    _cmd: &mut Command,
+    _proxy: &net_proxy::NetworkProxy,
+    _executable: Option<&Path>,
+) -> Result<Vec<OsString>, String> {
+    Err("sandbox network allowlist is not available on this platform".into())
 }
 
 fn canonical_non_root(path: &Path, label: &str) -> Result<PathBuf, String> {
