@@ -1778,6 +1778,7 @@ impl EvidenceTool {
         Vec<crate::extras::subagents::evidence::StoredImage>,
         Vec<String>,
     ) {
+        #[cfg_attr(not(feature = "multimodal"), allow(unused_mut))]
         let mut admitted = Vec::new();
         let mut notes = Vec::new();
         for (index, image) in images.into_iter().enumerate() {
@@ -2107,6 +2108,8 @@ mod evidence_tool_tests {
         permission: Option<crate::permission::checker::PermCheck>,
         vision: bool,
     ) -> EvidenceTool {
+        #[cfg(not(feature = "multimodal"))]
+        let _ = vision;
         EvidenceTool::new(
             permission,
             None,
