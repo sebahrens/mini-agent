@@ -1391,7 +1391,7 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
     }
 
     /// Case-insensitive, multi-term keyword search over the global MEMORY.md +
-    /// the current project's notes/ and daily/. The query is split on whitespace
+    /// the current project's SCRATCHPAD.md (closed items included), notes/ and daily/. The query is split on whitespace
     /// into distinct terms; each term is matched literally (escaped, never as a
     /// regex). A line is a match if it contains ANY term. Per file, matched lines
     /// are expanded to ±CONTEXT and adjacent regions merged, up to MAX_BLOCKS
@@ -1447,13 +1447,23 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
             (self.daily_dir(), true),
         ];
 
+        let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
         for (dir, is_daily) in dirs {
-            let rd = match fs::read_dir(&dir) {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
-            for e in rd.flatten() {
-                let path = e.path();
+            if let Ok(rd) = fs::read_dir(&dir) {
+                candidates.extend(rd.flatten().map(|e| (e.path(), is_daily)));
+            }
+        }
+        // The project scratchpad lives beside notes/ and daily/, in none of the
+        // scanned directories, and is injected into the prompt as open items
+        // only: closed `- [x]` items and text past the injection budget are
+        // reachable only through search (mini-agent-o7r8j).
+        let scratchpad = self.scratchpad();
+        if scratchpad.is_file() {
+            candidates.push((scratchpad, false));
+        }
+
+        {
+            for (path, is_daily) in candidates {
                 if path.extension().is_none_or(|x| x != "md") {
                     continue;
                 }
@@ -1642,7 +1652,12 @@ impl SearchResults {
                 } else {
                     h.matched_terms.join(", ")
                 };
-                format!("{}  [matched: {}]\n{}", h.path.display(), mt, h.body)
+                let label = if h.path.file_name().is_some_and(|n| n == "SCRATCHPAD.md") {
+                    " (project scratchpad, all items; memory_read source=scratchpad)"
+                } else {
+                    ""
+                };
+                format!("{}{label}  [matched: {}]\n{}", h.path.display(), mt, h.body)
             })
             .collect();
 
@@ -2132,7 +2147,7 @@ impl Tool for MemorySearch {
 
     fn description(&self) -> String {
         "Case-insensitive keyword search across all memory files (long-term, \
-notes, daily logs, including older ones). Space-separated words are treated as separate terms; a \
+the project scratchpad including completed items, notes, daily logs, including older ones). Space-separated words are treated as separate terms; a \
 line matches if it contains ANY term, and files matching more distinct terms rank higher. Matches \
 are returned with surrounding context and the file path; to read a relevant file in full, follow \
 up with memory_read. Use to recall older context that is not auto-injected. If a search returns \

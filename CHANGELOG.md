@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `memory_search` also searches the project `SCRATCHPAD.md` (closed `- [x]` items included, labelled as the
+  scratchpad), so completed checklist items are findable (mini-agent-o7r8j).
 - ACP sessions on the Anthropic provider are auto-compacted between turns under token pressure like
   the TUI (the thinking chain restarts over the compacted transcript) instead of dying at the
   context window or byte guard (mini-agent-ewkrr). A native Anthropic turn that fills the context

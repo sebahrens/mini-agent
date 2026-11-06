@@ -74,7 +74,7 @@ Public API:
 - `write(target, content, mode, name)` — persist content to the target
 - `append_daily(heading, body)` — timestamped entry to today's log
 - `context_block()` — builds the injected `<memory>` block (see below)
-- `search(query)` — multi-term keyword search across all memory files
+- `search(query)` — multi-term keyword search across all memory files: MEMORY.md, the project scratchpad (closed `- [x]` items included, labelled "project scratchpad"), notes and daily logs
 
 ### `SearchHit`
 
