@@ -1218,3 +1218,177 @@ fn regex_matchers_canonicalize_builtin_names_but_keep_mcp_names_literal() {
             .is_empty()
     );
 }
+
+/// One-shot local HTTP endpoint: returns the request body it received and
+/// replies with `response` JSON.
+async fn one_shot_http(
+    response: &'static str,
+) -> (String, tokio::task::JoinHandle<Option<String>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    let served = listener;
+    let task = tokio::spawn(async move {
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), served.accept())
+                .await
+                .ok()?
+                .ok()?;
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut read = 0;
+        loop {
+            let n = socket.read(&mut buffer[read..]).await.ok()?;
+            read += n;
+            let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            if let Some(split) = text.find("\r\n\r\n") {
+                let length = text[..split]
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if read >= split + 4 + length {
+                    let body = text[split + 4..split + 4 + length].to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                        response.len()
+                    );
+                    socket.write_all(reply.as_bytes()).await.ok()?;
+                    return Some(body);
+                }
+            }
+            if n == 0 {
+                return None;
+            }
+        }
+    });
+    (url, task)
+}
+
+fn http_handler(url: &str) -> HookHandler {
+    HookHandler {
+        kind: "http".to_string(),
+        command: Some(url.to_string()),
+        args: None,
+        ..handler("unused")
+    }
+}
+
+fn stop_fields() -> EventFields {
+    EventFields::Stop {
+        stop_hook_active: false,
+        loop_iteration: None,
+        loop_active: None,
+        goal_id: None,
+        goal_status: None,
+        goal_round: None,
+    }
+}
+
+// mini-agent-ytyt3: http handlers are inert unless hooks_http_enabled, and
+// when enabled their JSON response drives the same decision contract.
+#[tokio::test]
+async fn ytyt3_http_hook_is_closed_by_default_and_decides_when_enabled() {
+    assert!(!crate::extras::hooks::http_hooks_enabled());
+    let (url, server) = one_shot_http(r#"{"decision":"block","reason":"from http"}"#).await;
+    let config = config_with("Stop", None, vec![http_handler(&url)]);
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    let decision = dispatcher
+        .dispatch("Stop", None, &ctx(), stop_fields())
+        .await;
+    assert_eq!(decision, Decision::Continue, "default stays closed");
+    crate::extras::hooks::set_http_hooks_enabled(true);
+    let decision = dispatcher
+        .dispatch("Stop", None, &ctx(), stop_fields())
+        .await;
+    crate::extras::hooks::set_http_hooks_enabled(false);
+    assert_eq!(
+        decision,
+        Decision::Block {
+            reason: "from http".into()
+        }
+    );
+    let body = server
+        .await
+        .unwrap()
+        .expect("exactly one request after opt-in");
+    let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(envelope["hook_event_name"], "Stop");
+}
+
+#[tokio::test]
+async fn ytyt3_new_lifecycle_events_dispatch_with_their_envelopes() {
+    let root = crate::tests::OwnedTestDirectory::new("hooks-new-events");
+    let out = root.path().join("events.jsonl");
+    let script = format!("cat >> '{}'; echo >> '{}'", out.display(), out.display());
+    let mut config: HooksConfig = HashMap::new();
+    for event in [
+        "PostCompact",
+        "StopFailure",
+        "InstructionsLoaded",
+        "FileChanged",
+        "CwdChanged",
+    ] {
+        config.insert(
+            event.into(),
+            vec![HookGroup {
+                matcher: None,
+                hooks: vec![handler(&script)],
+            }],
+        );
+    }
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    for (event, fields) in [
+        (
+            "PostCompact",
+            EventFields::PostCompact {
+                trigger: "auto".into(),
+                compact_summary: Some("recap".into()),
+            },
+        ),
+        (
+            "StopFailure",
+            EventFields::StopFailure {
+                error: "rate limited".into(),
+            },
+        ),
+        (
+            "InstructionsLoaded",
+            EventFields::InstructionsLoaded {
+                file_path: "pkg/AGENTS.md".into(),
+                load_reason: "nested_traversal".into(),
+            },
+        ),
+        (
+            "FileChanged",
+            EventFields::FileChanged {
+                file_path: "src/lib.rs".into(),
+                tool_name: "edit".into(),
+            },
+        ),
+        (
+            "CwdChanged",
+            EventFields::CwdChanged {
+                old_cwd: "/a".into(),
+                new_cwd: "/b".into(),
+            },
+        ),
+    ] {
+        let decision = dispatcher.dispatch(event, Some(""), &ctx(), fields).await;
+        assert_eq!(decision, Decision::Continue, "{event}");
+    }
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&out)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 5);
+    assert_eq!(lines[0]["compact_summary"], "recap");
+    assert_eq!(lines[1]["error"], "rate limited");
+    assert_eq!(lines[2]["load_reason"], "nested_traversal");
+    assert_eq!(lines[3]["file_path"], "src/lib.rs");
+    assert_eq!(lines[4]["new_cwd"], "/b");
+}

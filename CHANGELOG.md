@@ -13,6 +13,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `pulldown-cmark` is updated to 0.13.5 for RUSTSEC-2026-0414 (exponential event growth with
   `ENABLE_WIKILINKS`).
 
+### Added
+
+- Hooks: new observation events `PostCompact`, `StopFailure`, `InstructionsLoaded`,
+  `FileChanged` and `CwdChanged`; an opt-in `type: "http"` handler (`hooks_http_enabled`, default
+  off); unsupported handler types are skipped per hook with a warning instead of rejecting the
+  whole settings file; `/hooks` lists supported and undispatched events and handler types.
+
 ### Fixed
 
 - ACP (IDE) sessions no longer force a paid summarization after 128 user turns or 2 MiB regardless

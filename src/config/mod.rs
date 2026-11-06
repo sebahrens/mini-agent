@@ -764,6 +764,10 @@ pub struct Config {
     /// ACP: client-supplied MCP servers per session (default 8).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_max_client_mcp_servers: Option<usize>,
+    /// Allow `type: "http"` hook handlers to send requests. Default false:
+    /// http handlers load but are never contacted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_http_enabled: Option<bool>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///

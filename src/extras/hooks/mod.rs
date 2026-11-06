@@ -110,15 +110,27 @@ impl Drop for TestWorkspaceSelection {
 
 pub(crate) fn set_active_workspace(path: &std::path::Path) {
     let selected = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    *ACTIVE_WORKSPACE
+    let previous = ACTIVE_WORKSPACE
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(selected);
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(selected.clone());
     if let Some(dispatcher) = get_dispatcher()
         && let Err(error) = dispatcher.rebind_execution_root(path)
     {
         // The dispatcher records an invalid execution state and will refuse
         // to launch hooks until a valid workspace is selected.
         tracing::error!(error = %error, "hooks: failed to rebind execution workspace");
+    }
+    if let Some(previous) = previous.filter(|previous| *previous != selected)
+        && tokio::runtime::Handle::try_current().is_ok()
+    {
+        let (old_cwd, new_cwd) = (
+            previous.to_string_lossy().into_owned(),
+            selected.to_string_lossy().into_owned(),
+        );
+        std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
+            dispatch_cwd_changed(&old_cwd, &new_cwd).await;
+        }));
     }
 }
 
@@ -597,6 +609,108 @@ pub(crate) async fn dispatch_pre_compact(auto: bool, instructions: Option<&str>)
             },
         )
     })
+    .await;
+}
+
+static HTTP_HOOKS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `hooks_http_enabled`: `type: "http"` handlers stay inert (never contacted)
+/// unless the operator opts in. Default off.
+pub(crate) fn set_http_hooks_enabled(enabled: bool) {
+    HTTP_HOOKS_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn http_hooks_enabled() -> bool {
+    HTTP_HOOKS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Shared shape of the observation-only lifecycle events added for Claude
+/// Code parity. None of them can block, grant or rewrite anything.
+async fn dispatch_observation(event: &'static str, matcher: &str, fields: envelope::EventFields) {
+    let Some(dispatcher) = get_dispatcher() else {
+        return;
+    };
+    if FORMAT_REPAIR.try_with(|_| ()).is_ok() {
+        return;
+    }
+    if dispatcher.handlers_for(event, matcher).is_empty() {
+        return;
+    }
+    let ctx = best_effort_ctx();
+    let _ = crate::startup::heap_future(|| dispatcher.dispatch(event, Some(matcher), &ctx, fields))
+        .await;
+}
+
+/// `PostCompact`, after a compaction committed. Matcher: `auto`/`manual`.
+pub(crate) async fn dispatch_post_compact(auto: bool, summary: Option<&str>) {
+    let trigger = if auto { "auto" } else { "manual" };
+    dispatch_observation(
+        "PostCompact",
+        trigger,
+        envelope::EventFields::PostCompact {
+            trigger: trigger.into(),
+            compact_summary: summary.map(|summary| {
+                crate::extras::validation::sanitize_bytes(summary.as_bytes(), 32 * 1024).0
+            }),
+        },
+    )
+    .await;
+}
+
+/// `StopFailure`, when a turn ends in an error instead of a response.
+pub(crate) async fn dispatch_stop_failure(error: &str) {
+    let (error, _) = crate::extras::validation::sanitize_bytes(error.as_bytes(), 8 * 1024);
+    dispatch_observation(
+        "StopFailure",
+        "",
+        envelope::EventFields::StopFailure { error },
+    )
+    .await;
+}
+
+/// `InstructionsLoaded`, for each instruction file captured. Matcher: the
+/// load reason (`session_start` or `nested_traversal`).
+pub(crate) async fn dispatch_instructions_loaded(file_path: &str, load_reason: &str) {
+    dispatch_observation(
+        "InstructionsLoaded",
+        load_reason,
+        envelope::EventFields::InstructionsLoaded {
+            file_path: file_path.into(),
+            load_reason: load_reason.into(),
+        },
+    )
+    .await;
+}
+
+/// `FileChanged`, after a native file tool changed a file. Matcher: the
+/// file's base name.
+pub(crate) async fn dispatch_file_changed(file_path: &str, tool_name: &str) {
+    let base = std::path::Path::new(file_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dispatch_observation(
+        "FileChanged",
+        &base,
+        envelope::EventFields::FileChanged {
+            file_path: file_path.into(),
+            tool_name: tool_name.into(),
+        },
+    )
+    .await;
+}
+
+/// `CwdChanged`, after the session's working directory was rebound.
+pub(crate) async fn dispatch_cwd_changed(old_cwd: &str, new_cwd: &str) {
+    dispatch_observation(
+        "CwdChanged",
+        "",
+        envelope::EventFields::CwdChanged {
+            old_cwd: old_cwd.into(),
+            new_cwd: new_cwd.into(),
+        },
+    )
     .await;
 }
 

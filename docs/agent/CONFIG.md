@@ -734,6 +734,7 @@ Accepted top-level keys:
 | `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, and other command classes, including brokered JS `spawn`, retain their existing limits. Sensitive in project-local configuration: changing it requires project trust. |
 | `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Headless, loop, and ACP modes skip it. Requires project trust when set locally. No automatic download or installation. |
 | `session_retention_days` | integer | Delete saved session snapshots (`<uuid>.json` in the sessions directory) whose modification time is older than this many days, once per interactive startup in a background thread. Default: unset/`0` (keep forever). A session open in this or another live process (its lock is held) is never removed; tool-output spill directories are left in place. Requires project trust when set locally. |
+| `hooks_http_enabled` | boolean | Allow `type: "http"` hook handlers to POST event JSON to their configured URL. Default: `false` (http hooks load but are never contacted). Requires `hooks`. See [HTTP handlers](#http-handlers). |
 | `acp_history_max_turns` | integer | ACP only: summarize live history after this many user turns. Default: unset/`0` (no turn cap; compaction follows token pressure under `compact_enabled` and the byte guard). |
 | `acp_history_max_bytes` | integer | ACP only: serialized live-history memory guard. Default: max(2 MiB, 4 bytes per context-window token); minimum 64 KiB. |
 | `acp_max_sessions` | integer | ACP only: concurrently loaded sessions per process. Default: `64`. |
@@ -1081,7 +1082,7 @@ mini-agent sets `$MINI_AGENT_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `type` | string | Only `"command"` is supported. |
+| `type` | string | `"command"` or `"http"` (see HTTP handlers). Other Claude Code types (`prompt`, `agent`, `mcp_tool`) are skipped per handler with a warning; the rest of the file stays loaded. |
 | `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical selected workspace; bare names resolve through absolute `PATH` entries only. Workspace-resident files are content-bound (see Trust model). Receives the stdin envelope as JSON; `$MINI_AGENT_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
 | `args` | array of strings | Required, but may be empty. Passed directly as the executable's argv with no shell metacharacter expansion. |
 | `timeout` | integer (seconds) | Per-hook timeout; the whole process group is killed on expiry. Default: 60. |
@@ -1155,11 +1156,49 @@ is not a reversible identity when components contain `__`; use the structured
 fields to distinguish those tuples. Identity is captured by the parent at tool
 registration, never inferred from an alias or rewritten input.
 
+### HTTP handlers
+
+```json
+{ "type": "http", "url": "https://hooks.example.com/pre", "headers": { "Authorization": "Bearer literal-token" }, "timeout": 30 }
+```
+
+An `http` handler POSTs the same JSON stdin envelope to `url` (absolute
+`http`/`https` only) with `Content-Type: application/json` and the literal
+`headers` (at most 32, no environment interpolation). A 2xx response body is
+interpreted exactly like a command hook's stdout after exit 0 (decision JSON);
+any other status behaves like a non-zero exit (the event's failure policy, so a
+failing `PreToolUse` http hook denies). Redirects are not followed, the
+response body is capped at 1 MiB, and `timeout` covers the whole exchange.
+`command`, `args`, `env` and `if` are rejected for http handlers; `async` and
+`once` work as for commands. The URL and headers are part of the hook's trust
+identity and are shown in the project-hook approval prompt.
+
+**HTTP hooks are off by default.** Set `hooks_http_enabled = true` in
+`config.toml` (a sensitive key; project-local values need trust) to let them
+send requests; otherwise they load but are never contacted, and `/hooks`
+reports them as disabled.
+
 ### Events
 
 `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`,
-`Stop`, `SessionStart`, `SessionEnd`, `SubagentStart`, `SubagentStop`,
-`PreCompact`, `Notification`, `PermissionRequest`.
+`Stop`, `StopFailure`, `SessionStart`, `SessionEnd`, `SubagentStart`,
+`SubagentStop`, `PreCompact`, `PostCompact`, `Notification`,
+`PermissionRequest`, `InstructionsLoaded`, `FileChanged`, `CwdChanged`.
+
+The last five are observation-only (their output cannot block or grant):
+
+| Event | When | Envelope fields | Matcher |
+|-------|------|-----------------|---------|
+| `PostCompact` | after a compaction committed (TUI, headless, ACP) | `trigger`, `compact_summary` (≤ 32 KiB) | `auto` / `manual` |
+| `StopFailure` | a turn ended in an error instead of a response (TUI, headless) | `error` (≤ 8 KiB, sanitized) | — |
+| `InstructionsLoaded` | instruction sources captured at startup, and nested `AGENTS.md`/`CLAUDE.md` delivered by a file tool | `file_path`, `load_reason` | `session_start` / `nested_traversal` |
+| `FileChanged` | after a successful native `edit`, `write` or `notebook_edit` | `file_path`, `event: "change"`, `tool_name` | file base name |
+| `CwdChanged` | the hook workspace was rebound (e.g. worktree switch) | `old_cwd`, `new_cwd` | — |
+
+Other Claude Code event names (for example `PermissionDenied`, `ConfigChange`,
+`TaskCreated`, `WorktreeCreate`, `Elicitation`, `PostToolBatch`) are accepted
+with a load warning and stay inert; `/hooks` lists supported events, the
+undispatched ones, and the handler types.
 
 Interactive startup begins `SessionStart` as soon as resume state is known,
 starts the independent agent/MCP prebuild, and joins the hook before accepting

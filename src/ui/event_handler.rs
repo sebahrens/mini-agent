@@ -502,6 +502,9 @@ pub async fn handle_agent_event(
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             let safe = sanitize_output(&e);
             renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
+            #[cfg(feature = "hooks")]
+            crate::startup::heap_future(|| crate::extras::hooks::dispatch_stop_failure(&safe))
+                .await;
             // A failed run is a goal round too: the gate retries it, or parks
             // the goal after repeated failures, exactly as headless does. Left
             // unsettled, the goal silently stopped, and the next ordinary turn

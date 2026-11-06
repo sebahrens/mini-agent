@@ -10,8 +10,8 @@ use super::normalize::{McpToolIdentity, canonical_tool_name};
 use super::pins::HookContentPins;
 use super::settings::{HookHandler, HooksConfig};
 use super::subprocess::{
-    HookOutput, HookPolicy, HookStatus, ProjectDirMemo, run_hook_with_policy_at_root,
-    run_shell_condition_at_root,
+    HookDiagnostics, HookOutput, HookPolicy, HookStatus, OutputLimit, ProjectDirMemo,
+    run_hook_with_policy_at_root, run_shell_condition_at_root,
 };
 use super::{Decision, HookCtx, PreDecision, Verdict};
 
@@ -802,11 +802,48 @@ impl HookDispatcher {
         // One canonicalize of the project directory per event, shared by all
         // handlers; the next event resolves it afresh.
         let dir_memo = Arc::new(ProjectDirMemo::default());
-        let mut futures = Vec::new();
+        let mut futures: Vec<
+            std::pin::Pin<Box<dyn std::future::Future<Output = HookOutput> + Send>>,
+        > = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
                 continue;
             };
+            if handler.kind == "http" {
+                // Network egress from hooks is an explicit operator opt-in.
+                if !super::http_hooks_enabled() {
+                    tracing::warn!(
+                        event,
+                        "hooks: http hook skipped (set hooks_http_enabled = true to allow hook HTTP requests)"
+                    );
+                    continue;
+                }
+                let once_key = handler
+                    .once
+                    .then(|| (event.to_string(), (*handler).clone()));
+                let Some(mut once_reservation) =
+                    OnceReservation::reserve(Arc::clone(&self.once_ran), once_key)
+                else {
+                    continue;
+                };
+                let timeout =
+                    std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
+                let headers = handler.env.clone();
+                let body = stdin.clone();
+                let request = async move {
+                    let output = run_http_hook(&command, &headers, &body, timeout).await;
+                    once_reservation.consume_if_started(&output);
+                    output
+                };
+                if handler.is_async {
+                    std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
+                        let _ = request.await;
+                    }));
+                } else {
+                    futures.push(Box::pin(request));
+                }
+                continue;
+            }
 
             if handler.is_async {
                 let handler = (*handler).clone();
@@ -972,7 +1009,7 @@ impl HookDispatcher {
                 network = diagnostics.network,
                 "hooks: applying subprocess policy"
             );
-            futures.push(async move {
+            futures.push(Box::pin(async move {
                 let output = run_hook_with_policy_at_root(
                     &command,
                     args.as_deref(),
@@ -986,9 +1023,90 @@ impl HookDispatcher {
                 once_reservation.consume_if_started(&output);
                 audit_hook_outcome(&audit_event, &command, "handler", trust, &output);
                 output
-            });
+            }));
         }
         futures::future::join_all(futures).await
+    }
+}
+
+const MAX_HTTP_HOOK_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// One `type: "http"` hook: POST the event envelope as JSON; a 2xx response
+/// body is read exactly like a command hook's stdout after exit 0, any other
+/// status like a non-zero exit (the event's failure policy applies). No
+/// redirects, bounded body, the handler timeout covers the whole exchange.
+pub(super) async fn run_http_hook(
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    body: &[u8],
+    timeout: std::time::Duration,
+) -> HookOutput {
+    let diagnostics = || HookDiagnostics {
+        containment: "none (http request)",
+        environment: "not applicable (http request)",
+        filesystem: "not applicable (http request)",
+        network: "http request to the configured url",
+    };
+    let output =
+        |started: bool, exit_code: Option<i32>, stdout: Vec<u8>, status: HookStatus| HookOutput {
+            started,
+            exit_code,
+            stdout,
+            stderr: Vec::new(),
+            status,
+            diagnostics: diagnostics(),
+        };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout.min(std::time::Duration::from_secs(10)))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("mini-agent-hooks/", env!("CARGO_PKG_VERSION")))
+        .build()
+    else {
+        return output(false, None, Vec::new(), HookStatus::Failed);
+    };
+    let mut request = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec());
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let exchange = async {
+        let mut response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                return output(true, None, Vec::new(), HookStatus::TimedOut);
+            }
+            Err(_) => return output(true, None, Vec::new(), HookStatus::Failed),
+        };
+        let exit_code = if response.status().is_success() { 0 } else { 1 };
+        let mut bytes = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if chunk.len() > MAX_HTTP_HOOK_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+                        return output(
+                            true,
+                            None,
+                            Vec::new(),
+                            HookStatus::OutputLimitExceeded(OutputLimit::Stdout),
+                        );
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) if error.is_timeout() => {
+                    return output(true, None, Vec::new(), HookStatus::TimedOut);
+                }
+                Err(_) => return output(true, None, Vec::new(), HookStatus::Failed),
+            }
+        }
+        output(true, Some(exit_code), bytes, HookStatus::Completed)
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(output) => output,
+        Err(_) => output(true, None, Vec::new(), HookStatus::TimedOut),
     }
 }
 

@@ -836,7 +836,11 @@ async fn compact_headless_session_if_needed(
     };
 
     #[cfg(feature = "hooks")]
-    if compacted.is_some() {
+    if let Some(compacted) = &compacted {
+        crate::startup::heap_future(|| {
+            crate::extras::hooks::dispatch_post_compact(true, Some(&compacted.summary))
+        })
+        .await;
         let notices =
             crate::startup::heap_future(|| crate::extras::hooks::dispatch_session_start("compact"))
                 .await;

@@ -605,6 +605,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     // model call.
     #[cfg(feature = "hooks")]
     {
+        crate::extras::hooks::set_http_hooks_enabled(cfg.hooks_http_enabled.unwrap_or(false));
         crate::extras::hooks::init_dispatcher(crate::extras::hooks::trust::load_dispatcher(
             &app_paths,
             cli.no_hooks,

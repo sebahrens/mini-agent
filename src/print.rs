@@ -987,6 +987,13 @@ where
     if forced.is_some() {
         record_forced_stop();
     }
+    #[cfg(feature = "hooks")]
+    if forced.is_none()
+        && let Some(failure) = &result.failure
+    {
+        let error = format!("{failure:#}");
+        crate::startup::heap_future(|| crate::extras::hooks::dispatch_stop_failure(&error)).await;
+    }
     result
 }
 

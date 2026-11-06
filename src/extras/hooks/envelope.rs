@@ -46,6 +46,25 @@ pub(crate) enum EventFields {
         tool_name: String,
         tool_input: Value,
     },
+    PostCompact {
+        trigger: String,
+        compact_summary: Option<String>,
+    },
+    StopFailure {
+        error: String,
+    },
+    InstructionsLoaded {
+        file_path: String,
+        load_reason: String,
+    },
+    FileChanged {
+        file_path: String,
+        tool_name: String,
+    },
+    CwdChanged {
+        old_cwd: String,
+        new_cwd: String,
+    },
     SessionStart {
         source: String,
     },
@@ -141,6 +160,22 @@ pub(crate) fn build_envelope(ctx: &HookCtx, hook_event_name: &str, fields: Event
         } => json!({
             "tool_name": tool_name, "tool_input": tool_input,
         }),
+        EventFields::PostCompact {
+            trigger,
+            compact_summary,
+        } => json!({ "trigger": trigger, "compact_summary": compact_summary }),
+        EventFields::StopFailure { error } => json!({ "error": error }),
+        EventFields::InstructionsLoaded {
+            file_path,
+            load_reason,
+        } => json!({ "file_path": file_path, "load_reason": load_reason }),
+        EventFields::FileChanged {
+            file_path,
+            tool_name,
+        } => json!({ "file_path": file_path, "event": "change", "tool_name": tool_name }),
+        EventFields::CwdChanged { old_cwd, new_cwd } => {
+            json!({ "old_cwd": old_cwd, "new_cwd": new_cwd })
+        }
         EventFields::SessionStart { source } => json!({ "source": source }),
         EventFields::SessionEnd { reason } => json!({ "reason": reason }),
         #[cfg(any(feature = "subagents", test))]

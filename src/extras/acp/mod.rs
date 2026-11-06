@@ -4582,6 +4582,11 @@ async fn execute_prompt(
         }
         #[cfg(feature = "hooks")]
         {
+            let summary = history.session.compacted_context().0.map(str::to_owned);
+            crate::startup::heap_future(|| {
+                crate::extras::hooks::dispatch_post_compact(true, summary.as_deref())
+            })
+            .await;
             let notices = crate::startup::heap_future(|| {
                 crate::extras::hooks::dispatch_session_start("compact")
             })

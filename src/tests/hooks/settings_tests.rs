@@ -54,19 +54,34 @@ fn if_and_once_fields_still_parse_and_are_preserved() {
 }
 
 #[test]
-fn unsupported_handler_type_is_a_parse_error() {
+fn unsupported_handler_types_are_skipped_per_hook_without_dropping_the_file() {
     let value = json!({
         "PreToolUse": [
             {
                 "hooks": [
-                    {"type": "http", "command": "irrelevant"}
+                    {"type": "http", "command": "irrelevant"},
+                    {"type": "prompt", "prompt": "judge"},
+                    {"type": "command", "command": "guard"},
+                    {"type": "http", "url": "https://hooks.example.invalid/pre", "headers": {"X-Token": "literal"}},
+                    {"type": "http", "url": "file:///etc/passwd"}
                 ]
             }
         ]
     });
 
-    let err = parse_hooks_config(&value).expect_err("non-command type must fail in v1");
-    assert!(err.contains("http") || err.to_lowercase().contains("unsupported"));
+    let config = parse_hooks_config(&value).expect("one bad hook must not fail the file");
+    let hooks = &config["PreToolUse"][0].hooks;
+    assert_eq!(hooks.len(), 2);
+    assert_eq!(hooks[0].kind, "command");
+    assert_eq!(hooks[1].kind, "http");
+    assert_eq!(
+        hooks[1].command.as_deref(),
+        Some("https://hooks.example.invalid/pre")
+    );
+    assert_eq!(
+        hooks[1].env.get("X-Token").map(String::as_str),
+        Some("literal")
+    );
 }
 
 #[test]

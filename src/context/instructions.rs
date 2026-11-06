@@ -759,7 +759,33 @@ impl WorkspaceInstructions {
         old_bytes: usize,
     ) {
         let cache = self.clone();
+        #[cfg(feature = "hooks")]
+        let root_paths: Vec<String> = roots
+            .iter()
+            .map(|root| root.path.to_string_lossy().into_owned())
+            .collect();
         let result = instruction_blocking(move || cache.capture_initial(roots, old_bytes)).await;
+        #[cfg(feature = "hooks")]
+        if matches!(result, Ok(Ok(()))) {
+            let loaded: Vec<String> = root_paths
+                .into_iter()
+                .chain(
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .initial
+                        .sources
+                        .iter()
+                        .map(|source| source.path.to_string_lossy().into_owned()),
+                )
+                .collect();
+            for path in loaded {
+                crate::startup::heap_future(|| {
+                    crate::extras::hooks::dispatch_instructions_loaded(&path, "session_start")
+                })
+                .await;
+            }
+        }
         if !matches!(result, Ok(Ok(()))) {
             let error = match result {
                 Ok(Err(error)) => error,
@@ -950,6 +976,14 @@ impl WorkspaceInstructions {
             .collect();
         if pending.is_empty() && omitted.is_empty() {
             return Ok(None);
+        }
+        #[cfg(feature = "hooks")]
+        for source in pending.iter().filter(|source| source.project) {
+            let path = source.path.to_string_lossy().into_owned();
+            crate::startup::heap_future(|| {
+                crate::extras::hooks::dispatch_instructions_loaded(&path, "nested_traversal")
+            })
+            .await;
         }
         Ok(Some(ContextNotice::new(pending, omitted)?))
     }
