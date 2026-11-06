@@ -70,6 +70,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- MCP `notifications/tools/list_changed` is honoured: the connection relists at the next tool
+  collection and the TUI rebuilds the agent before the next turn; a failed relist keeps the
+  previous tools with a notice (mini-agent-7mqfb).
 - MCP server entries accept `enabled = false`, `enabled_tools` and `disabled_tools`; the
   selection applies before the 128-tool cap and `/mcp <server>` reports excluded counts
   (mini-agent-nkmpj).

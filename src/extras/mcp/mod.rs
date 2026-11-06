@@ -446,6 +446,12 @@ impl McpClientManager {
         manager
     }
 
+    /// Whether any connected server announced `tools/list_changed` since its
+    /// tools were last collected; the next agent build relists it.
+    pub(crate) fn tool_list_changed(&self) -> bool {
+        self.handles.iter().any(|handle| handle.tools.is_stale())
+    }
+
     /// Drain and return any pending connection and tool-collection notices.
     pub(crate) fn take_notices(&mut self) -> Vec<McpNotice> {
         let mut notices = std::mem::take(&mut self.notices);
@@ -512,12 +518,13 @@ impl McpClientManager {
                     .begin(&server_name, health::AttemptKind::Catalogue);
                 async move {
                     let _permit = sem.acquire_owned().await;
-                    let result = listed
-                        .get_or_try_init(|| {
-                            client::list_bounded_tools(&peer, list_timeout, &options)
-                        })
-                        .await
-                        .cloned();
+                    let cached = listed
+                        .get_or_list(|| client::list_bounded_tools(&peer, list_timeout, &options))
+                        .await;
+                    let (result, kept_previous) = match cached {
+                        Ok(cached) => (Ok(cached.listed), cached.kept_previous),
+                        Err(error) => (Err(error), None),
+                    };
                     let outcome = match &result {
                         Ok(_) => health::AttemptOutcome::Succeeded,
                         Err(rmcp::ServiceError::Timeout { .. }) => health::AttemptOutcome::TimedOut,
@@ -533,6 +540,7 @@ impl McpClientManager {
                         peer,
                         result,
                         (list_timeout, call_timeout),
+                        kept_previous,
                     )
                 }
             })
@@ -550,8 +558,18 @@ impl McpClientManager {
             peer,
             result,
             (list_timeout, call_timeout),
+            kept_previous,
         ) in results
         {
+            if let Some(error) = &kept_previous {
+                self.push_tool_notice(format!(
+                    "MCP server '{server_name}' announced a changed tool list, but relisting failed ({}); keeping its previous tools",
+                    match error {
+                        rmcp::ServiceError::Timeout { .. } => "timed out",
+                        _ => "server error",
+                    }
+                ));
+            }
             match result {
                 Ok(tools) => {
                     tracing::debug!(

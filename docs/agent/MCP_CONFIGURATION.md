@@ -193,10 +193,15 @@ MCP permission and question prompts revalidate their source once per second
 instead of on every event-loop pass; prompt creation, key handling and the
 reply paths keep the full check.
 
-A connection keeps its first successful `tools/list` result, so agent rebuilds do
-not page `tools/list` again; a reconnect is a
-new connection, failures are not cached, and mini-agent does not subscribe to
-`tools/list_changed`. Shutdown closes all servers concurrently, and a worktree
+A connection keeps its last successful `tools/list` result, so agent rebuilds do
+not page `tools/list` again; a reconnect is a new connection and failures are not
+cached. A server's `notifications/tools/list_changed` marks that connection's
+listing stale: the next tool collection lists it again, and the interactive
+session rebuilds the agent before the next turn so its first model request
+advertises the new set (deferred schemas, source-proof checks, tool selection
+and the tool cap apply as for the first listing). If that relist fails, the
+previous set is kept and a notice says so. Prompt and resource catalogues are
+still discovered once per connection. Shutdown closes all servers concurrently, and a worktree
 switch closes the previous binding's servers while the new binding connects.
 
 ## Deferred tool schemas

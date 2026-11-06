@@ -47,6 +47,9 @@ impl std::fmt::Debug for Request {
 pub struct Handler {
     pub forms: RawForms,
     leases: Arc<Mutex<Vec<Weak<LeaseInner>>>>,
+    /// Set by `notifications/tools/list_changed`; consumed by the
+    /// connection's `ToolListCache` at the next tool collection.
+    pub(crate) tools_changed: Arc<AtomicBool>,
 }
 struct LeaseInner {
     active: AtomicBool,
@@ -147,6 +150,10 @@ impl rmcp::ClientHandler for Handler {
                 .with_form(rmcp::model::FormElicitationCapability::default()),
         );
         info
+    }
+    async fn on_tool_list_changed(&self, _context: rmcp::service::NotificationContext<RoleClient>) {
+        tracing::debug!("MCP server announced tools/list_changed");
+        self.tools_changed.store(true, Ordering::Release);
     }
     async fn create_elicitation(
         &self,

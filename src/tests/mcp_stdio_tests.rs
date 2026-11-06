@@ -163,6 +163,7 @@ fn main() {
     let mut aux_id = 0_u64;
     let mut concurrent_ids = Vec::<String>::new();
     let mut concurrent_answers = Vec::<String>::new();
+    let mut list_calls = 0_u32;
     for line in stdin.lock().lines() {
         let line = line.unwrap();
         let compact = line.replace(' ', "").replace('\t', "");
@@ -247,6 +248,18 @@ fn main() {
                 );
                 continue;
             }
+            if mode.starts_with("list-changed") {
+                list_calls += 1;
+                if list_calls > 1 {
+                    let response = if mode == "list-changed-fail" {
+                        format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32603,\"message\":\"relist failure\"}}}}")
+                    } else {
+                        format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"probe\",\"inputSchema\":{{\"type\":\"object\"}}}},{{\"name\":\"added\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}")
+                    };
+                    write_response(&mut stdout, &response);
+                    continue;
+                }
+            }
             if mode == "many-tools" {
                 let tools = (0..200)
                     .map(|index| format!("{{\"name\":\"t{index}\",\"inputSchema\":{{\"type\":\"object\"}}}}"))
@@ -269,6 +282,12 @@ fn main() {
         } else if compact.contains("\"method\":\"tools/call\"") {
             if mode == "hang-tools-call" {
                 continue;
+            }
+            if mode.starts_with("list-changed") {
+                write_response(
+                    &mut stdout,
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}",
+                );
             }
             let id = request_id(&compact);
             if mode == "aux-elicit-concurrent" {
@@ -1758,6 +1777,66 @@ async fn mcp_enabled_and_disabled_tools_apply_before_the_cap_and_enabled_false_s
 }
 
 #[tokio::test]
+async fn mcp_tools_list_changed_relists_at_the_next_collection_or_keeps_the_old_set() {
+    let fixture = FixtureBuild::compile();
+    for (mode, expected) in [
+        ("list-changed", vec!["added", "probe"]),
+        ("list-changed-fail", vec!["probe"]),
+    ] {
+        let lease = fixture.lease(mode);
+        let handle = McpClientHandle::connect(
+            CompactString::new("fixture"),
+            &fixture.config(
+                fixture.executable.display().to_string(),
+                Vec::new(),
+                mode,
+                &lease,
+            ),
+        )
+        .await
+        .unwrap();
+        let mut manager = McpClientManager::from_handles(vec![handle]);
+        let permission = Some(permission_for(Action::Allow));
+        let tools = manager
+            .collect_tools_with_timeouts(permission.clone(), None, McpToolTimeouts::default())
+            .await;
+        assert_eq!(tools.len(), 1);
+        assert!(!manager.tool_list_changed());
+        // The call makes the server announce notifications/tools/list_changed.
+        tools[0].call("{}".to_string()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.tool_list_changed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the notification marks the connection's tools stale");
+        let tools = manager
+            .collect_tools_with_timeouts(permission, None, McpToolTimeouts::default())
+            .await;
+        let mut names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+        names.sort();
+        assert_eq!(names, expected, "{mode}");
+        assert!(!manager.tool_list_changed());
+        let notices = manager.take_notices();
+        if mode == "list-changed-fail" {
+            assert!(
+                notices.iter().any(|notice| notice
+                    .message()
+                    .contains("relisting failed (server error); keeping its previous tools")),
+                "{notices:?}"
+            );
+        } else {
+            assert!(notices.is_empty(), "{notices:?}");
+        }
+        let pid = wait_for_pid(&lease).await;
+        shutdown(manager).await;
+        assert_process_reaped(pid).await;
+    }
+    fixture.cleanup();
+}
+
+#[tokio::test]
 async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
     let fixture = FixtureBuild::compile();
     let alpha_lease = fixture.lease("dup-alpha");
@@ -1859,7 +1938,7 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
     );
     assert!(Arc::ptr_eq(
         &listed_before,
-        manager.handles[0].tools.get().unwrap()
+        &manager.handles[0].tools.get().unwrap()
     ));
 
     let alpha_output = tools

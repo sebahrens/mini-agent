@@ -109,6 +109,85 @@ pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
     }
 }
 
+/// Per-connection `tools/list` cache invalidated by
+/// `notifications/tools/list_changed`. The flag is shared with the
+/// connection's client handler, which sets it when the notification arrives.
+#[derive(Default)]
+pub(crate) struct ToolListCache {
+    cell: Mutex<Arc<tokio::sync::OnceCell<Arc<ListedTools>>>>,
+    changed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Outcome of a cached listing; `kept_previous` is set when a relist after
+/// `list_changed` failed and the previous successful set was retained.
+pub(crate) struct CachedListing {
+    pub(crate) listed: Arc<ListedTools>,
+    pub(crate) kept_previous: Option<ServiceError>,
+}
+
+impl ToolListCache {
+    pub(crate) fn with_flag(changed: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            cell: Mutex::default(),
+            changed,
+        }
+    }
+
+    fn current(&self) -> Arc<tokio::sync::OnceCell<Arc<ListedTools>>> {
+        self.cell.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether the server announced a changed tool list since the last listing.
+    pub(crate) fn is_stale(&self) -> bool {
+        self.changed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn initialized(&self) -> bool {
+        self.current().initialized()
+    }
+
+    pub(crate) fn get(&self) -> Option<Arc<ListedTools>> {
+        self.current().get().cloned()
+    }
+
+    /// The cached listing, listing with `list` on first use or after a
+    /// `list_changed` notification. A failed relist keeps (and re-caches) the
+    /// previous successful set and reports the error; a failed first listing
+    /// is returned and not cached.
+    pub(crate) async fn get_or_list<F, Fut>(&self, list: F) -> Result<CachedListing, ServiceError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<ListedTools>, ServiceError>>,
+    {
+        let mut previous = None;
+        if self
+            .changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let mut cell = self.cell.lock().unwrap_or_else(|e| e.into_inner());
+            previous = cell.get().cloned();
+            *cell = Arc::new(tokio::sync::OnceCell::new());
+        }
+        let cell = self.current();
+        match cell.get_or_try_init(list).await {
+            Ok(listed) => Ok(CachedListing {
+                listed: listed.clone(),
+                kept_previous: None,
+            }),
+            Err(error) => match previous {
+                Some(previous) => {
+                    let _ = cell.set(previous.clone());
+                    Ok(CachedListing {
+                        listed: previous,
+                        kept_previous: Some(error),
+                    })
+                }
+                None => Err(error),
+            },
+        }
+    }
+}
+
 pub struct McpClientHandle {
     pub server_name: CompactString,
     pub trusted_identity: Option<TrustedMcpServer>,
@@ -118,10 +197,10 @@ pub struct McpClientHandle {
     pub(crate) liveness: std::sync::Arc<()>,
     pub(crate) auxiliary: Arc<tokio::sync::OnceCell<super::catalogue::Catalogue>>,
     /// Successful `tools/list` of this connection generation. A reconnect is a
-    /// new handle (and cell); failures are not cached. Without a
-    /// `notifications/tools/list_changed` subscription, re-listing on every
-    /// agent rebuild could not observe anything this cache hides.
-    pub(crate) tools: Arc<tokio::sync::OnceCell<Arc<ListedTools>>>,
+    /// new handle (and cache); failures are not cached. A server's
+    /// `notifications/tools/list_changed` marks it stale, so the next
+    /// collection (the next agent build) lists again.
+    pub(crate) tools: Arc<ToolListCache>,
     /// Per-server options captured from the configuration that connected.
     pub(crate) options: super::config::McpServerOptions,
 }
@@ -513,6 +592,7 @@ impl McpClientHandle {
                 })?;
                 validate()?;
                 let elicitation = super::elicitation::Handler::default();
+                let tools_changed = elicitation.tools_changed.clone();
                 let (transport, cleanup_complete, stderr) =
                     spawn_stdio_server(cmd, MCP_STDIO_MAX_LINE_BYTES, elicitation.forms.clone())
                         .map_err(|error| {
@@ -577,7 +657,7 @@ impl McpClientHandle {
                     source_proof: None,
                     liveness: std::sync::Arc::new(()),
                     auxiliary: Arc::new(tokio::sync::OnceCell::new()),
-                    tools: Arc::new(tokio::sync::OnceCell::new()),
+                    tools: Arc::new(ToolListCache::with_flag(tools_changed)),
                     options: Default::default(),
                 })
             }
@@ -664,6 +744,7 @@ impl McpClientHandle {
             .custom_headers(custom_headers);
         let oauth_settings = oauth.and_then(|o| o.settings());
         let elicitation = super::elicitation::Handler::default();
+        let tools_changed = elicitation.tools_changed.clone();
         // Every response body and SSE event is capped (see `bounded_http`).
         let http_client = BoundedHttpClient::new(
             http_client_for(initialize_timeout, endpoint)?,
@@ -720,7 +801,7 @@ impl McpClientHandle {
             source_proof: None,
             liveness: std::sync::Arc::new(()),
             auxiliary: Arc::new(tokio::sync::OnceCell::new()),
-            tools: Arc::new(tokio::sync::OnceCell::new()),
+            tools: Arc::new(ToolListCache::with_flag(tools_changed)),
             options: Default::default(),
         })
     }
@@ -771,7 +852,7 @@ impl McpClientHandle {
     pub async fn cached_tools(&self) -> Result<Arc<ListedTools>, ServiceError> {
         let peer = self.running_service.peer();
         self.tools
-            .get_or_try_init(|| {
+            .get_or_list(|| {
                 list_bounded_tools(
                     peer,
                     self.options.list_timeout(MCP_LIST_TOOLS_TIMEOUT),
@@ -779,7 +860,7 @@ impl McpClientHandle {
                 )
             })
             .await
-            .cloned()
+            .map(|cached| cached.listed)
     }
 }
 
