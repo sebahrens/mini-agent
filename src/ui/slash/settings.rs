@@ -328,6 +328,13 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
             format!("sandbox profile: {}", ctx.sandbox.profile()),
         );
         write_result(ctx.renderer, shell_network_line(ctx.sandbox));
+        write_result(
+            ctx.renderer,
+            format!(
+                "  shell environment: {}",
+                ctx.sandbox.shell_env_policy().summary()
+            ),
+        );
         for profile in [
             SandboxProfile::Workspace,
             SandboxProfile::HostRead,

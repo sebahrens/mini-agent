@@ -20,6 +20,8 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod general_profile;
+pub(crate) mod shell_env;
+pub use shell_env::ShellEnvPolicy;
 #[cfg(test)]
 mod network_tests;
 mod output_capture;
@@ -424,6 +426,9 @@ pub struct SandboxConfig {
     profile: SandboxProfile,
     /// `sandbox-network`: whether contained shell commands may use the network.
     network: SandboxNetwork,
+    /// `shell-inherit-env` / `shell-env`: variables layered after the fixed
+    /// allowlist for contained shell commands. Default closed.
+    shell_env: ShellEnvPolicy,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     /// Raw HOME-relative `sandbox-home-mounts` entries, validated at capture.
@@ -2433,6 +2438,23 @@ impl Sandbox {
         self.network
     }
 
+    /// `shell-inherit-env` / `shell-env` / `shell-env-allow-secrets` for
+    /// shell, background, pty, `!` and validation commands. Hooks and
+    /// workspace services keep the fixed allowlist.
+    pub fn with_shell_env(mut self, policy: ShellEnvPolicy) -> Self {
+        self.shell_env = policy;
+        self
+    }
+
+    pub fn shell_env_policy(&self) -> &ShellEnvPolicy {
+        &self.shell_env
+    }
+
+    /// Variables the shell-env policy adds after the fixed allowlist.
+    fn shell_env_extra(&self) -> Vec<(String, String)> {
+        self.shell_env.resolve()
+    }
+
     /// Whether contained shell commands can actually reach the network: the
     /// opt-in is set, containment is active, and the backend honours it.
     pub fn shell_network_effective(&self) -> bool {
@@ -2598,6 +2620,7 @@ impl Sandbox {
                 backend: backend.to_string(),
                 profile: SandboxProfile::Workspace,
                 network: SandboxNetwork::Deny,
+                shell_env: ShellEnvPolicy::default(),
                 read_roots: Vec::new(),
                 write_roots: Vec::new(),
                 home_mounts: Vec::new(),
@@ -3520,6 +3543,7 @@ impl Sandbox {
                 for (key, value) in self.get_essential_env() {
                     cmd.env(key, value);
                 }
+                cmd.envs(self.shell_env_extra());
                 configure_new_session_child_lifetime(&mut cmd);
                 self.bind_workspace_cwd(&mut cmd)?;
                 return Ok(cmd.into());
@@ -3632,6 +3656,7 @@ impl Sandbox {
         for (key, value) in self.get_essential_env() {
             cmd.env(key, value);
         }
+        cmd.envs(self.shell_env_extra());
         configure_new_session_child_lifetime(&mut cmd);
         cmd
     }
@@ -4272,6 +4297,9 @@ impl Sandbox {
         for (key, value) in self.get_essential_env() {
             cmd.arg(format!("{key}={value}"));
         }
+        for (key, value) in self.shell_env_extra() {
+            cmd.arg(format!("{key}={value}"));
+        }
         for key in ["TMPDIR", "TMP", "TEMP"] {
             let mut assignment = OsString::from(format!("{key}="));
             assignment.push(cache_dir.join("tmp"));
@@ -4396,9 +4424,19 @@ impl Sandbox {
         let mut cmd = Command::new(bwrap);
         cmd.arg("--clearenv");
         let mut host_path = None;
-        for (key, value) in self.get_essential_env() {
-            if *key == "PATH" {
-                host_path = Some(value.as_str());
+        let extra = self.shell_env_extra();
+        let layered = self
+            .get_essential_env()
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .chain(
+                extra
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            );
+        for (key, value) in layered {
+            if key == "PATH" {
+                host_path = Some(value);
                 continue;
             }
             cmd.arg("--setenv").arg(key).arg(value);
@@ -12105,5 +12143,92 @@ echo PRIVATE_TEMP_PASS"#,
                 "zerobox command restored non-allow-listed variable {key:?}"
             );
         }
+    }
+
+    /// `shell-inherit-env` / `shell-env` reach shell commands on every spawn
+    /// path, stay off by default, and never carry credentials or loader hooks.
+    #[cfg(unix)]
+    #[test]
+    fn shell_env_policy_layers_after_the_allowlist_and_is_default_closed() {
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[
+            ("MA_SHELL_ENV_INHERIT", Some("inherited".into())),
+            ("MA_SHELL_ENV_TOKEN", Some("secret".into())),
+            ("BASH_ENV", Some("/evil-rc".into())),
+        ]);
+        let cwd = std::env::temp_dir();
+        let policy = ShellEnvPolicy {
+            inherit: vec!["MA_SHELL_ENV_*".into(), "BASH_ENV".into()],
+            set: [("MA_SHELL_ENV_LITERAL".to_string(), "literal".to_string())].into(),
+            allow_secrets: false,
+        };
+        let value = |command: &Command, name: &str| {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        };
+
+        let closed = Sandbox::new(false, "none");
+        assert_eq!(
+            value(
+                &closed.wrap_command("true").unwrap(),
+                "MA_SHELL_ENV_INHERIT"
+            ),
+            None
+        );
+
+        let open = Sandbox::new(false, "none").with_shell_env(policy.clone());
+        let plain = open.wrap_command("true").unwrap();
+        assert_eq!(
+            value(&plain, "MA_SHELL_ENV_INHERIT").as_deref(),
+            Some("inherited")
+        );
+        assert_eq!(
+            value(&plain, "MA_SHELL_ENV_LITERAL").as_deref(),
+            Some("literal")
+        );
+        assert_eq!(
+            value(&plain, "MA_SHELL_ENV_TOKEN"),
+            None,
+            "credential glob match"
+        );
+        assert_eq!(value(&plain, "BASH_ENV"), None, "loader injection");
+
+        let zerobox = Sandbox::new(true, "zerobox")
+            .with_shell_env(policy.clone())
+            .build_zerobox_shell_command(Path::new("/usr/local/bin/zerobox"), "true", &cwd);
+        assert_eq!(
+            value(&zerobox, "MA_SHELL_ENV_LITERAL").as_deref(),
+            Some("literal")
+        );
+
+        let seatbelt = Sandbox::new(true, "seatbelt").with_shell_env(policy);
+        let cache = seatbelt.get_cached_cache_dir().unwrap();
+        let command = seatbelt
+            .build_seatbelt_command(
+                Path::new("/usr/bin/sandbox-exec"),
+                "true",
+                &cwd,
+                &cache,
+                None,
+            )
+            .unwrap();
+        let argv = command_argv(&command);
+        assert!(
+            argv.iter()
+                .any(|arg| arg == "MA_SHELL_ENV_INHERIT=inherited"),
+            "{argv:?}"
+        );
+        assert!(
+            argv.iter().any(|arg| arg == "MA_SHELL_ENV_LITERAL=literal"),
+            "{argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.contains("secret") || arg.contains("evil")),
+            "{argv:?}"
+        );
     }
 }

@@ -2637,11 +2637,16 @@ mod tests {
         let status =
             JobStatusTool::new(shell.sandbox.clone(), None).with_permission(Some(permission), None);
         // `ls` + Ctrl-U + `touch ...` is judged as one allowed word without the guard.
-        for byte in ["\u{15}", "\u{8}", "\u{7f}", "\u{17}", "\u{3}", "\u{4}", "\u{1b}"] {
+        for byte in [
+            "\u{15}", "\u{8}", "\u{7f}", "\u{17}", "\u{3}", "\u{4}", "\u{1b}",
+        ] {
             let error = job_input(
                 &status,
                 &id,
-                &format!("ls{byte}touch {}\n", kill.file_name().unwrap().to_string_lossy()),
+                &format!(
+                    "ls{byte}touch {}\n",
+                    kill.file_name().unwrap().to_string_lossy()
+                ),
             )
             .await
             .unwrap_err();

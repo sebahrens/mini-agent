@@ -2301,6 +2301,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         cfg.sandbox_home_masks.clone(),
     )
     .with_network(cfg.sandbox_network.unwrap_or_default())
+    .with_shell_env(cfg.shell_env_policy())
     .with_shell(&shell)
     .with_windows_appcontainer_roots(
         cli.resolve_windows_appcontainer_read_roots(cfg),
@@ -2453,6 +2454,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
             ("sandbox", sandbox.to_string()),
             sandbox_profile_entry(cli, cfg),
             sandbox_network_entry(cfg),
+            ("shell-env", cfg.shell_env_policy().summary()),
             ("no-tools", no_tools.to_string()),
             ("tools", tools_allowlist),
             ("no-context-files", no_context_files.to_string()),

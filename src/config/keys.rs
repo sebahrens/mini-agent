@@ -251,6 +251,15 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("sandbox-network", &["sandbox_network"])
         .described("Network access for contained shell commands: deny (default) or allow. Project layers need trust.")
         .shaped(ConfigShape::Enum(crate::sandbox::SandboxNetwork::NAMES)),
+    aliased("shell-inherit-env", &["shell_inherit_env"])
+        .described("Parent-process variable names (or * globs) passed to contained shell commands in addition to the fixed allowlist. Credential-looking names are refused. Project layers need trust.")
+        .shaped(ConfigShape::Strings),
+    aliased("shell-env", &["shell_env"])
+        .described("Literal environment variables set for contained shell commands. Project layers need trust.")
+        .shaped(ConfigShape::StringMap),
+    aliased("shell-env-allow-secrets", &["shell_env_allow_secrets"])
+        .described("Global-only: permit credential-looking names (GH_TOKEN, *_API_KEY) in shell-inherit-env and shell-env.")
+        .shaped(ConfigShape::Bool),
     aliased(
         "windows-appcontainer-read-roots",
         &["windows_appcontainer_read_roots"],
