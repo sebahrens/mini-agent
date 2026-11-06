@@ -415,15 +415,13 @@ impl MarkdownWriter {
                     self.row_has_header = false;
                 }
             }
-            "td" | "th" => {
-                if !closing {
-                    if bare == "th" {
-                        self.row_has_header = true;
-                    }
-                    self.output
-                        .push_str(if self.row_cells == 0 { "| " } else { " | " });
-                    self.row_cells += 1;
+            "td" | "th" if !closing => {
+                if bare == "th" {
+                    self.row_has_header = true;
                 }
+                self.output
+                    .push_str(if self.row_cells == 0 { "| " } else { " | " });
+                self.row_cells += 1;
             }
             "a" => {
                 if closing {
