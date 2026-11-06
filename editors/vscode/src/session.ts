@@ -43,6 +43,9 @@ function extensionVersion(context: vscode.ExtensionContext): string {
 }
 
 /** Supervises one mini-agent ACP process and one reusable workspace conversation. */
+/** Matches the Rust session catalogue cap (MAX_ROWS). */
+const MAX_RESUME_ROWS = 100;
+
 export class AgentSession {
   private proc: cp.ChildProcessWithoutNullStreams | undefined;
   private connection: acp.ClientConnection | undefined;
@@ -279,9 +282,20 @@ export class AgentSession {
       if (this.conversation.isPrompting) { throw new Error('Wait for the current prompt to settle before resuming a saved session.'); }
       const client = this.client;
       if (!client || !this.supportsLoad) { throw new Error('This agent does not support saved ACP sessions.'); }
-      const response = await client.request(acp.methods.agent.session.list, { cwd: this.folder.uri.fsPath },
-        { cancellationSignal: AbortSignal.timeout(10_000) });
-      const items = response.sessions.slice(0, 100).map(row => ({
+      const rows: { sessionId: string; title?: string | null }[] = [];
+      const seenCursors = new Set<string>();
+      let cursor: string | null | undefined;
+      // Follow nextCursor until exhausted, bounded by the catalogue's 100-row cap and a page limit.
+      for (let page = 0; page < 50 && rows.length < MAX_RESUME_ROWS; page += 1) {
+        const response = await client.request(acp.methods.agent.session.list,
+          cursor ? { cwd: this.folder.uri.fsPath, cursor } : { cwd: this.folder.uri.fsPath },
+          { cancellationSignal: AbortSignal.timeout(10_000) });
+        rows.push(...response.sessions);
+        cursor = response.nextCursor;
+        if (!cursor || seenCursors.has(cursor)) { break; }
+        seenCursors.add(cursor);
+      }
+      const items = rows.slice(0, MAX_RESUME_ROWS).map(row => ({
         label: safeSessionLabel(row.title ?? row.sessionId),
         description: row.sessionId,
         sessionId: row.sessionId,
