@@ -159,6 +159,21 @@ clamped to 1..=3600). Built-in registrations use the defaults.
   "startup_timeout_sec": 60, "tool_timeout_sec": 300}}}
 ```
 
+## Per-server tool selection and enable toggle
+
+Command and URL entries also accept:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | `false` keeps the entry configured but never launches or connects it (startup and explicit reconnect both refuse). |
+| `enabled_tools` | omitted | Only these exact server tool names are registered. |
+| `disabled_tools` | `[]` | These exact server tool names are never registered (applied after `enabled_tools`). |
+
+Selection runs on each `tools/list` page before the 128-tool per-server cap, so
+the cap counts only admitted tools and a selected tool past index 128 is still
+reached. `/mcp <server>` shows how many listed tools the selection excluded.
+Selection only narrows the registered set; it grants no permission.
+
 ## Captured source checks at tool dispatch
 
 Each configured connection retains its captured workspace, selected server and

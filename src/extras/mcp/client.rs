@@ -65,14 +65,21 @@ pub(crate) struct BoundedModelMetadata {
 pub struct ListedTools {
     pub entries: Vec<ListedTool>,
     pub(crate) reached_tool_cap: bool,
+    /// Tools the server listed that the entry's `enabled_tools` /
+    /// `disabled_tools` selection excluded (they do not count toward the cap).
+    pub(crate) filtered_by_config: usize,
 }
 
 pub(crate) async fn list_bounded_tools(
     peer: &Peer<RoleClient>,
     timeout: Duration,
+    options: &super::config::McpServerOptions,
 ) -> Result<Arc<ListedTools>, ServiceError> {
-    let tools = list_all_tools_bounded(peer, timeout).await?;
-    Ok(Arc::new(bound_listed_tools(tools)))
+    let (tools, filtered) =
+        list_all_tools_selected(peer, timeout, &|name| options.admits_tool(name)).await?;
+    let mut listed = bound_listed_tools(tools);
+    listed.filtered_by_config = filtered;
+    Ok(Arc::new(listed))
 }
 
 pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
@@ -98,6 +105,7 @@ pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
     ListedTools {
         entries,
         reached_tool_cap,
+        filtered_by_config: 0,
     }
 }
 
@@ -464,6 +472,10 @@ impl McpClientHandle {
         if crate::agent::runner::current_work_scope_is_cancelled() {
             anyhow::bail!("MCP connection cancelled");
         }
+        anyhow::ensure!(
+            config.options().is_enabled(),
+            "MCP server '{server_name}' is disabled by configuration (enabled = false)"
+        );
         let result: anyhow::Result<Self> = match config {
             McpServerConfig::Command {
                 command,
@@ -760,7 +772,11 @@ impl McpClientHandle {
         let peer = self.running_service.peer();
         self.tools
             .get_or_try_init(|| {
-                list_bounded_tools(peer, self.options.list_timeout(MCP_LIST_TOOLS_TIMEOUT))
+                list_bounded_tools(
+                    peer,
+                    self.options.list_timeout(MCP_LIST_TOOLS_TIMEOUT),
+                    &self.options,
+                )
             })
             .await
             .cloned()
@@ -803,6 +819,20 @@ pub(crate) async fn list_all_tools_bounded(
     peer: &Peer<RoleClient>,
     timeout: Duration,
 ) -> Result<Vec<Tool>, ServiceError> {
+    list_all_tools_selected(peer, timeout, &|_| true)
+        .await
+        .map(|(tools, _)| tools)
+}
+
+/// [`list_all_tools_bounded`] keeping only tools `admit` accepts. Selection
+/// runs per page before the tool cap, so excluded tools never displace an
+/// admitted one; the second value counts excluded tools.
+pub(crate) async fn list_all_tools_selected(
+    peer: &Peer<RoleClient>,
+    timeout: Duration,
+    admit: &(dyn Fn(&str) -> bool + Sync),
+) -> Result<(Vec<Tool>, usize), ServiceError> {
+    let mut filtered = 0_usize;
     let deadline = tokio::time::Instant::now() + timeout;
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
@@ -825,7 +855,16 @@ pub(crate) async fn list_all_tools_bounded(
             Err(ServiceError::Timeout { .. }) => return Err(ServiceError::Timeout { timeout }),
             Err(error) => return Err(error),
         };
-        let reached_tool_cap = extend_tools_capped(&mut tools, result.tools);
+        let page: Vec<Tool> = result
+            .tools
+            .into_iter()
+            .filter(|tool| {
+                let admitted = admit(tool.name.as_ref());
+                filtered += usize::from(!admitted);
+                admitted
+            })
+            .collect();
+        let reached_tool_cap = extend_tools_capped(&mut tools, page);
         pages += 1;
         if reached_tool_cap {
             tracing::debug!(
@@ -844,7 +883,7 @@ pub(crate) async fn list_all_tools_bounded(
             next => cursor = next,
         }
     }
-    Ok(tools)
+    Ok((tools, filtered))
 }
 
 fn extend_tools_capped(tools: &mut Vec<Tool>, page: Vec<Tool>) -> bool {

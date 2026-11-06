@@ -70,6 +70,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- MCP server entries accept `enabled = false`, `enabled_tools` and `disabled_tools`; the
+  selection applies before the 128-tool cap and `/mcp <server>` reports excluded counts
+  (mini-agent-nkmpj).
 - MCP server entries accept `startup_timeout_sec` (initialize, default 10 s; also raises the
   30 s `tools/list` budget) and `tool_timeout_sec` (per-server `tools/call`, default
   `mcp_tool_timeout_secs` = 120 s), clamped to 1..=3600 (mini-agent-02r1x).

@@ -345,6 +345,18 @@ impl McpClientManager {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        // `enabled = false` keeps an entry configured but never launches it.
+        let mut disabled = Vec::new();
+        sorted.retain(|(name, cfg)| {
+            let enabled = cfg.options().is_enabled();
+            if !enabled {
+                disabled.push(name.clone());
+            }
+            enabled
+        });
+        for name in &disabled {
+            tracing::debug!("MCP server '{name}' is disabled by configuration (enabled = false)");
+        }
 
         let workspace_path = workspace.to_path_buf();
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_MCP_CONNECT_CONCURRENCY));
@@ -490,6 +502,7 @@ impl McpClientManager {
                 let liveness = Arc::downgrade(&handle.liveness);
                 let list_timeout = handle.options.list_timeout(timeouts.list);
                 let call_timeout = handle.options.tool_timeout(timeouts.call);
+                let options = handle.options.clone();
                 let live_peer = peer.clone();
                 let client_is_live: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                     liveness.upgrade().is_some() && !live_peer.is_transport_closed()
@@ -500,7 +513,9 @@ impl McpClientManager {
                 async move {
                     let _permit = sem.acquire_owned().await;
                     let result = listed
-                        .get_or_try_init(|| client::list_bounded_tools(&peer, list_timeout))
+                        .get_or_try_init(|| {
+                            client::list_bounded_tools(&peer, list_timeout, &options)
+                        })
                         .await
                         .cloned();
                     let outcome = match &result {

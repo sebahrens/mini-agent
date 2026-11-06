@@ -247,6 +247,17 @@ fn main() {
                 );
                 continue;
             }
+            if mode == "many-tools" {
+                let tools = (0..200)
+                    .map(|index| format!("{{\"name\":\"t{index}\",\"inputSchema\":{{\"type\":\"object\"}}}}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                write_response(
+                    &mut stdout,
+                    &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{tools}]}}}}"),
+                );
+                continue;
+            }
             write_response(
                 &mut stdout,
                 &format!(
@@ -1668,6 +1679,81 @@ async fn mcp_per_server_startup_and_tool_timeouts_override_the_defaults() {
     let pid = wait_for_pid(&lease).await;
     shutdown(manager).await;
     assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_enabled_and_disabled_tools_apply_before_the_cap_and_enabled_false_skips() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("many-tools");
+    let mut config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "many-tools",
+        &lease,
+    );
+    let McpServerConfig::Command { options, .. } = &mut config else {
+        unreachable!()
+    };
+    // Both selected tools sit past the 128-tool cap in server order.
+    options.enabled_tools = Some(vec!["t150".into(), "t199".into(), "t3".into()]);
+    options.disabled_tools = vec!["t3".into()];
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .unwrap();
+    let listed = handle.cached_tools().await.unwrap();
+    let names: Vec<_> = listed
+        .entries
+        .iter()
+        .map(|entry| entry.definition.name.to_string())
+        .collect();
+    assert_eq!(names, ["t150", "t199"]);
+    assert_eq!(listed.filtered_by_config, 198);
+    assert!(!listed.reached_tool_cap);
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let tools = manager
+        .collect_tools_with_timeouts(None, None, McpToolTimeouts::default())
+        .await;
+    assert_eq!(tools.len(), 2);
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+
+    // disabled_tools alone: 50 removed before the cap, the cap counts the rest.
+    let mut config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "many-tools",
+        &lease,
+    );
+    let McpServerConfig::Command { options, .. } = &mut config else {
+        unreachable!()
+    };
+    options.disabled_tools = (0..50).map(|index| format!("t{index}")).collect();
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .unwrap();
+    let listed = handle.cached_tools().await.unwrap();
+    assert_eq!(listed.entries.len(), 128);
+    assert_eq!(listed.entries[0].definition.name, "t50");
+    assert!(listed.reached_tool_cap);
+    let pid = wait_for_pid(&lease).await;
+    shutdown(McpClientManager::from_handles(vec![handle])).await;
+    assert_process_reaped(pid).await;
+
+    // enabled = false never launches the server.
+    let _ = std::fs::remove_file(&lease);
+    let McpServerConfig::Command { options, .. } = &mut config else {
+        unreachable!()
+    };
+    options.enabled = Some(false);
+    let error = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .err()
+        .expect("a disabled server must not connect")
+        .to_string();
+    assert!(error.contains("disabled"), "{error}");
+    assert!(!lease.exists());
     fixture.cleanup();
 }
 

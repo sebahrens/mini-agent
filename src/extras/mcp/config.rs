@@ -177,6 +177,15 @@ pub struct McpServerOptions {
     /// `mcp_tool_timeout_secs` (default 120 s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_timeout_sec: Option<u64>,
+    /// `false` keeps the entry configured but never connects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// When set, only these server tool names are registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+    /// Server tool names never registered. Applied after `enabled_tools`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
 }
 
 fn clamp_timeout(secs: u64) -> std::time::Duration {
@@ -198,6 +207,25 @@ impl McpServerOptions {
     pub(crate) fn list_timeout(&self, default: std::time::Duration) -> std::time::Duration {
         self.startup_timeout_sec
             .map_or(default, |secs| clamp_timeout(secs).max(default))
+    }
+
+    /// Whether the entry should be connected at all (default `true`).
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled != Some(false)
+    }
+
+    /// Whether a tool with this exact server-side name may be registered.
+    /// The selection applies before the per-server tool cap.
+    pub(crate) fn admits_tool(&self, name: &str) -> bool {
+        self.enabled_tools
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|tool| tool == name))
+            && !self.disabled_tools.iter().any(|tool| tool == name)
+    }
+
+    /// Whether any tool selection is configured.
+    pub(crate) fn filters_tools(&self) -> bool {
+        self.enabled_tools.is_some() || !self.disabled_tools.is_empty()
     }
 
     /// `tools/call` bound: the configured value or `default`.
@@ -366,5 +394,26 @@ mod options_tests {
         assert_eq!(plain.options().startup_timeout(default), default);
         let text = serde_json::to_string(&plain).unwrap();
         assert!(!text.contains("timeout"), "{text}");
+        assert!(!text.contains("enabled"), "{text}");
+    }
+
+    #[test]
+    fn mcp_server_tool_selection_and_enable_toggle() {
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "server", "enabled_tools": ["a", "b"], "disabled_tools": ["b"]
+        }))
+        .unwrap();
+        let options = config.options();
+        assert!(options.is_enabled());
+        assert!(options.filters_tools());
+        assert!(options.admits_tool("a"));
+        assert!(!options.admits_tool("b"));
+        assert!(!options.admits_tool("c"));
+        let off: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url": "https://mcp.example/mcp", "enabled": false
+        }))
+        .unwrap();
+        assert!(!off.options().is_enabled());
+        assert!(McpServerOptions::default().admits_tool("anything"));
     }
 }
