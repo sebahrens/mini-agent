@@ -2286,7 +2286,11 @@ impl Startup {
             }
             self.resume_override_pending = false;
         }
-        let housekeeping = if self.cli.print || self.cli.loop_mode {
+        #[cfg(feature = "loop")]
+        let headless_run = self.cli.print || self.cli.loop_mode;
+        #[cfg(not(feature = "loop"))]
+        let headless_run = self.cli.print;
+        let housekeeping = if headless_run {
             spawn_noninteractive_housekeeping(&self.cfg, self.cli.no_session)
         } else {
             None

@@ -18997,10 +18997,7 @@ mod plan_approval_tests {
         let mut surfaced_errors = 0;
         let mut done = false;
         tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let Some(rx) = app.run.agent_rx.as_mut() else {
-                    break;
-                };
+            while let Some(rx) = app.run.agent_rx.as_mut() {
                 let event = rx.recv().await.unwrap();
                 let terminal_error = matches!(event, AgentEvent::Error { .. });
                 let spent = app.run.reactive_relief_used;
