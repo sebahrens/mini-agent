@@ -546,6 +546,7 @@ impl Mem {
 
     /// Read a memory file, capping the output; an oversized append-only daily log keeps its
     /// newest entries (the tail) instead of its oldest.
+    #[cfg(test)]
     pub(crate) fn read_capped_tail(p: &Path) -> String {
         match read_text(p) {
             Ok(s) if s.is_empty() => "(empty)".to_string(),

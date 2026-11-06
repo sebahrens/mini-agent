@@ -89,6 +89,9 @@ pub(crate) struct WorkspaceBinding {
 #[cfg(feature = "memory")]
 pub(crate) type RecentFirstLines = (Vec<(String, String, bool)>, usize, bool);
 
+/// Definition files read from one layer, plus the names skipped past the file limit.
+pub(crate) type DefinitionLayer = (Vec<(String, Result<String, String>)>, Vec<String>);
+
 impl WorkspaceBinding {
     /// Bounded compatibility data, never a persisted workspace capability.
     /// Check the path size before canonicalization or any owned encoding, and
@@ -434,7 +437,7 @@ impl WorkspaceBinding {
         max_bytes: usize,
         max_entries: usize,
         max_files: usize,
-    ) -> io::Result<(Vec<(String, Result<String, String>)>, Vec<String>)> {
+    ) -> io::Result<DefinitionLayer> {
         self.read_relative_definition_layer_inner(
             path,
             extension,
@@ -453,7 +456,7 @@ impl WorkspaceBinding {
         max_entries: usize,
         max_files: usize,
         degrade: bool,
-    ) -> io::Result<(Vec<(String, Result<String, String>)>, Vec<String>)> {
+    ) -> io::Result<DefinitionLayer> {
         let directory = self.open_dir_relative(path)?;
         let mut names = Vec::new();
         for (index, entry) in directory.read_dir(".")?.enumerate() {
