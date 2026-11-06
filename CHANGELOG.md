@@ -67,6 +67,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `web_search` accepts optional `num_results` (<= 10), `allowed_domains` / `blocked_domains`
+  (enforced locally as well) and `recency`; snippets grow to 3,000 characters. Without
+  `EXA_API_KEY` the native tool is no longer registered, leaving the keyless Exa MCP server
+  (mini-agent-5hgoo).
 - `web-fetch-timeout-secs` sets the total `web_fetch` deadline (default raised from 10 s to 30 s,
   clamped 1..=300); the idle read bound derives from it (half, at least 3 s) and the tool
   description states the deadline (mini-agent-6s7vs).

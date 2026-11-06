@@ -1588,7 +1588,11 @@ private/special addresses and mixed public/private DNS answers are refused. DNS
 answers are checked before approval and pinned for the exchange; redirects are
 never followed by reqwest. `web_fetch` independently validates and authorizes
 at most five redirects. Search posts only to `https://api.exa.ai/search`, captures
-`EXA_API_KEY` when the agent is built, and refuses every redirect. Keys never come
+`EXA_API_KEY` when the agent is built (the tool is not registered without it),
+and refuses every redirect. Optional `num_results` (<= 10), `allowed_domains` /
+`blocked_domains` and `recency` map to Exa `numResults`, `includeDomains` /
+`excludeDomains` and `startPublishedDate`; domain filters are re-applied to the
+returned URLs. Keys never come
 from a tool argument, are never sent to returned search URLs, and backend error
 bodies are not exposed. Exact credential echoes in returned titles/snippets are
 redacted within the same character caps; result URLs containing the captured

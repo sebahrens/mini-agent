@@ -4046,8 +4046,20 @@ session’s active Task jobs and completed reports awaiting next-turn notice.
 
 Native `web_fetch` and `web_search` tools do not require JS or MCP. They can be
 selected with `--tools web_fetch,web_search`, and `--no-tools` removes both.
-`EXA_API_KEY` also supplies native Exa search; a missing key produces an error
-before network I/O. Exa service charges are separate from model-usage totals.
+`EXA_API_KEY` also supplies native Exa search. Without the key the native
+`web_search` tool is not registered at all (the model never sees a tool that can
+only fail); the keyless built-in Exa MCP server (`enable-exa-mcp`, default on)
+remains available for search. Exa service charges are separate from model-usage
+totals.
+
+`web_search` accepts `query` plus optional `num_results` (1..=10, default 5),
+`allowed_domains` or `blocked_domains` (bare domains, subdomains included, at
+most 20; not both) and `recency` (`day`, `week`, `month`, `year`). The filters
+are sent to Exa and also enforced on the returned URLs. Each result carries a
+title (256 characters) and a snippet of at most 3,000 characters.
+Provider-native hosted search (Anthropic `web_search` server tool, OpenAI
+Responses `web_search`) is not bridged: hosted tools are stripped from provider
+requests by policy because they bypass per-call network permission.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
