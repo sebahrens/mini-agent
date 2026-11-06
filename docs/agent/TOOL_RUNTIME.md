@@ -1606,9 +1606,11 @@ request bodies to 256 KiB and response bodies to 1 MiB for search and the JS
 broker. `web_fetch` reads at most 10 MiB of a response body; a larger body is not
 an error: the first 10 MiB are converted and the result states
 `Response body truncated at N bytes`, while the excerpt/spill path covers only that
-prefix. Encoded or non-UTF-8 bodies are rejected. A native HTTP operation has one ten-second deadline spanning DNS,
-approval, redirects and body consumption, with three-second DNS/connect/read
-bounds. Cancellation drops native approval and asynchronous socket work. The
+prefix. Encoded or non-UTF-8 bodies are rejected. A native HTTP operation has one deadline spanning DNS,
+approval, redirects and body consumption: ten seconds for `web_search` and the JS
+broker, `web-fetch-timeout-secs` (default 30, clamped 1..=300) for `web_fetch`,
+whose idle read bound is half that deadline (at least three seconds). DNS and
+connect bounds stay at three seconds. Cancellation drops native approval and asynchronous socket work. The
 non-abortable OS resolver remains bounded by four process-wide permits; its
 actual scoped blocking closure retains the permit and turn ownership until it
 returns. Private spill writes also retain scoped ownership until the OS operation

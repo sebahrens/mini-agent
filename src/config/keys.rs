@@ -145,6 +145,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("web-fetch-origins", &["web_fetch_origins"]).described("Exact permitted origins for native web retrieval; independent of JS fetch grants").shaped(ConfigShape::Strings),
     aliased("web-fetch-allow-http", &["web_fetch_allow_http"]).described("Permit native HTTP to safe public destinations").shaped(ConfigShape::Bool),
     aliased("web-search-provider", &["web_search_provider"]).described("Native search provider, exa or off").shaped(ConfigShape::Enum(&["exa", "off"])),
+    aliased("web-fetch-timeout-secs", &["web_fetch_timeout_secs"]).described("Total web_fetch deadline in seconds (DNS, approval, redirects, body). Default 30; clamped to 1..=300").shaped(ConfigShape::Integer),
     key("headless_questions").shaped(ConfigShape::Enum(&["error", "fail"])),
     key("headless_agent_mentions").described("Opt-in: resolve @agent:<name> mentions in -p and ACP prompts; an unknown name fails the request (needs the subagents feature)").shaped(ConfigShape::Bool),
     key("no_context_files")

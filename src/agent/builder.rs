@@ -1073,6 +1073,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 cfg.web_fetch_allow_http.unwrap_or(false),
                 tool_output_session_id,
                 tool_result_spills.clone(),
+                cfg.web_fetch_timeout_secs,
             )));
         }
         if cli.tool_is_eligible(cfg, "web_search")

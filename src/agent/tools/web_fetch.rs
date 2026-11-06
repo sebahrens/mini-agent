@@ -22,6 +22,7 @@ pub(crate) struct WebFetchArgs {
 pub(crate) struct WebFetchTool {
     client: NativeWebClient,
     body_max_bytes: usize,
+    timeout_secs: u64,
     session_id: String,
     spills: Option<crate::session::ToolResultSpillStore>,
 }
@@ -34,8 +35,9 @@ impl WebFetchTool {
         allow_http: bool,
         session_id: &str,
         spills: Option<crate::session::ToolResultSpillStore>,
+        timeout_secs: Option<u64>,
     ) -> Self {
-        let limits = web_fetch_limits();
+        let limits = web_fetch_limits().with_total_timeout_secs(timeout_secs);
         Self {
             client: NativeWebClient::new(
                 FetchPolicy::from_settings(origins, allow_http),
@@ -44,6 +46,7 @@ impl WebFetchTool {
             )
             .with_limits(limits),
             body_max_bytes: limits.body_max_bytes,
+            timeout_secs: limits.total_timeout.as_secs(),
             session_id: session_id.to_owned(),
             spills,
         }
@@ -55,7 +58,9 @@ fn web_fetch_limits() -> NativeFetchLimits {
     NativeFetchLimits {
         body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
         truncate_body: true,
+        ..NativeFetchLimits::default()
     }
+    .with_total_timeout_secs(None)
 }
 
 fn mib(bytes: usize) -> String {
@@ -74,8 +79,9 @@ impl Tool for WebFetchTool {
     type Error = ToolError;
     fn description(&self) -> String {
         format!(
-            "Retrieve a public HTTPS page as untrusted reference text. GET only; no credentials or custom headers. DNS, origin permission and each redirect are checked. Reads at most {} of the response body (a larger body is truncated at that point and marked so). Returns up to 50,000 text characters, with a private session spill pointer when available. Optional prompt describes your retrieval focus; it does not invoke another model.",
-            mib(self.body_max_bytes)
+            "Retrieve a public HTTPS page as untrusted reference text. GET only; no credentials or custom headers. DNS, origin permission and each redirect are checked. Reads at most {} of the response body (a larger body is truncated at that point and marked so) within a {}-second deadline covering DNS, approval, redirects and the body. Returns up to 50,000 text characters, with a private session spill pointer when available. Optional prompt describes your retrieval focus; it does not invoke another model.",
+            mib(self.body_max_bytes),
+            self.timeout_secs
         )
     }
     fn parameters(&self) -> serde_json::Value {
@@ -309,6 +315,7 @@ mod web_fetch_tests {
         )]);
         let tool = WebFetchTool {
             body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            timeout_secs: 30,
             client: fixture_client(&peer).with_limits(web_fetch_limits()),
             session_id: "fixture-unused".into(),
             spills: None,
@@ -335,6 +342,7 @@ mod web_fetch_tests {
         let peer = Peer::new(vec![]);
         let tool = WebFetchTool {
             body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            timeout_secs: 30,
             client: fixture_client(&peer).with_limits(web_fetch_limits()),
             session_id: "fixture-unused".into(),
             spills: None,
@@ -384,6 +392,7 @@ mod web_fetch_persistence_tests {
             .unwrap();
         let tool = WebFetchTool {
             body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            timeout_secs: 30,
             client: client.with_limits(web_fetch_limits()),
             session_id: session.id.to_string(),
             spills: Some(session.tool_result_spills.clone()),
@@ -461,9 +470,10 @@ mod web_fetch_body_cap_tests {
         let peer = Peer::new(vec![Peer::response(&body)]);
         let tool = WebFetchTool {
             body_max_bytes: cap,
+            timeout_secs: 30,
             client: fixture_client(&peer).with_limits(NativeFetchLimits {
                 body_max_bytes: cap,
-                truncate_body: true,
+                ..web_fetch_limits()
             }),
             session_id: "web-body-cap".into(),
             spills: None,
@@ -495,6 +505,7 @@ mod web_fetch_body_cap_tests {
         let peer = Peer::new(vec![Peer::response(&body)]);
         let tool = WebFetchTool {
             body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            timeout_secs: 30,
             client: fixture_client(&peer).with_limits(web_fetch_limits()),
             session_id: "web-body-cap".into(),
             spills: None,
@@ -523,6 +534,86 @@ mod web_fetch_body_cap_tests {
 }
 
 #[cfg(test)]
+mod web_fetch_timeout_tests {
+    use super::super::web_http::web_http_tests::allowed_permission;
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    #[test]
+    fn web_fetch_timeout_config_is_clamped_and_derives_the_idle_read_bound() {
+        let limits = web_fetch_limits();
+        assert_eq!(limits.total_timeout, Duration::from_secs(30));
+        assert_eq!(limits.read_timeout, Duration::from_secs(15));
+        let low = web_fetch_limits().with_total_timeout_secs(Some(0));
+        assert_eq!(low.total_timeout, Duration::from_secs(1));
+        assert_eq!(low.read_timeout, Duration::from_secs(1));
+        let high = web_fetch_limits().with_total_timeout_secs(Some(100_000));
+        assert_eq!(high.total_timeout, Duration::from_secs(300));
+        let tool = WebFetchTool::new(None, None, None, false, "unused", None, Some(45));
+        assert!(tool.description().contains("45-second deadline"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_configured_timeout_survives_a_five_second_mid_body_stall() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            let _ = socket.read(&mut buffer);
+            let first = "<p>before stall</p>";
+            let second = "<p>after stall</p>";
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}",
+                    first.len() + second.len()
+                )
+                .as_bytes(),
+            );
+            let _ = socket.flush();
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = socket.write_all(second.as_bytes());
+        });
+        let mut client = NativeWebClient::new(
+            FetchPolicy::from_settings(None, true),
+            Some(allowed_permission()),
+            None,
+        )
+        .with_limits(web_fetch_limits().with_total_timeout_secs(Some(12)));
+        client.test_resolution = Some((
+            vec![std::net::SocketAddr::new(
+                "93.184.216.34".parse().unwrap(),
+                address.port(),
+            )],
+            vec![address],
+        ));
+        let tool = WebFetchTool {
+            body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            timeout_secs: 12,
+            client,
+            session_id: "unused".into(),
+            spills: None,
+        };
+        let page = Tool::call(
+            &tool,
+            WebFetchArgs {
+                url: "http://fixture.invalid/slow".into(),
+                prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        assert!(page.contains("before stall"), "{page}");
+        assert!(page.contains("after stall"), "{page}");
+    }
+}
+
+#[cfg(test)]
 mod web_fetch_sdk_tests {
     use super::super::web_http::web_http_tests::{Peer, fixture_client};
     use super::*;
@@ -535,6 +626,7 @@ mod web_fetch_sdk_tests {
         )]);
         let tool = WebFetchTool {
             body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            timeout_secs: 30,
             client: fixture_client(&peer).with_limits(web_fetch_limits()),
             session_id: "sdk-no-spill".into(),
             spills: None,
@@ -594,6 +686,7 @@ mod web_fetch_acp_tests {
         client.configure_permissions_for_test(Some(checker), Some(tx));
         let tools = super::super::concurrency::bind(vec![Box::new(WebFetchTool {
             body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
+            timeout_secs: 30,
             client,
             session_id: "acp-no-spill".into(),
             spills: None,

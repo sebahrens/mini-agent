@@ -63,6 +63,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `web-fetch-timeout-secs` sets the total `web_fetch` deadline (default raised from 10 s to 30 s,
+  clamped 1..=300); the idle read bound derives from it (half, at least 3 s) and the tool
+  description states the deadline (mini-agent-6s7vs).
 - `js-fetch-origins` accepts the strings `"all"` (no narrowing) and `"none"` (deny every JS `fetch()`) as
   well as an array of exact origins; other strings are rejected with an error naming the three forms.
   A project config cannot widen inherited origins to `"all"`. When the key is unset, a one-time

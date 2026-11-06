@@ -822,6 +822,10 @@ pub(crate) struct NativeFetchLimits {
     /// Keep the first `body_max_bytes` of a larger body and mark the result
     /// truncated instead of failing the exchange.
     pub(crate) truncate_body: bool,
+    /// Absolute deadline spanning DNS, approval, every redirect and body read.
+    pub(crate) total_timeout: Duration,
+    /// Longest idle gap allowed between two body reads.
+    pub(crate) read_timeout: Duration,
 }
 
 impl Default for NativeFetchLimits {
@@ -829,7 +833,32 @@ impl Default for NativeFetchLimits {
         Self {
             body_max_bytes: FETCH_RESPONSE_BODY_MAX_BYTES,
             truncate_body: false,
+            total_timeout: FETCH_TOTAL_TIMEOUT,
+            read_timeout: FETCH_READ_TIMEOUT,
         }
+    }
+}
+
+/// Default `web_fetch` total deadline (`web-fetch-timeout-secs`).
+pub(crate) const WEB_FETCH_DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Accepted `web-fetch-timeout-secs` range; values outside are clamped.
+pub(crate) const WEB_FETCH_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
+
+impl NativeFetchLimits {
+    /// Total deadline from a configured second count (clamped to
+    /// `WEB_FETCH_TIMEOUT_SECS_RANGE`). The idle read bound derives from it:
+    /// half the total, never below the historical three seconds nor above
+    /// the total itself.
+    pub(crate) fn with_total_timeout_secs(mut self, secs: Option<u64>) -> Self {
+        let secs = secs.unwrap_or(WEB_FETCH_DEFAULT_TIMEOUT_SECS).clamp(
+            *WEB_FETCH_TIMEOUT_SECS_RANGE.start(),
+            *WEB_FETCH_TIMEOUT_SECS_RANGE.end(),
+        );
+        self.total_timeout = Duration::from_secs(secs);
+        self.read_timeout = (self.total_timeout / 2)
+            .max(FETCH_READ_TIMEOUT)
+            .min(self.total_timeout);
+        self
     }
 }
 
@@ -887,9 +916,14 @@ pub(crate) async fn send_async(
         return Err(FetchError::RequestBodyTooLarge);
     }
     let host = url.host_str().ok_or(FetchError::MissingHost)?;
-    // Limits are the compile-time defaults, so the client depends only on the
-    // pinned host and destination set.
-    let client = if let Some(client) = ASYNC_CLIENTS.lookup(host, addresses) {
+    // Header/body caps are compile-time defaults. The pinned client also bakes in the idle-read and total bounds, so they
+    // are part of the cache key alongside the host.
+    let key = format!(
+        "{host}|{}|{}",
+        native.read_timeout.as_millis(),
+        native.total_timeout.as_millis()
+    );
+    let client = if let Some(client) = ASYNC_CLIENTS.lookup(&key, addresses) {
         client
     } else {
         // A cache miss builds a fresh client, which synchronously parses the
@@ -900,6 +934,7 @@ pub(crate) async fn send_async(
         // cancellation check or a sibling exchange's timers.
         let host_owned = host.to_string();
         let addresses_owned = addresses.to_vec();
+        let (read_timeout, total_timeout) = (native.read_timeout, native.total_timeout);
         let built = tokio::task::spawn_blocking(move || {
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -911,8 +946,8 @@ pub(crate) async fn send_async(
                 .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
                 .pool_idle_timeout(POOL_IDLE_TIMEOUT)
                 .connect_timeout(limits.connect_timeout)
-                .read_timeout(limits.read_timeout)
-                .timeout(limits.total_timeout)
+                .read_timeout(read_timeout)
+                .timeout(total_timeout)
                 .user_agent(concat!("mini-agent-web/", env!("CARGO_PKG_VERSION")))
                 .resolve_to_addrs(&host_owned, &addresses_owned)
                 .build()
@@ -920,7 +955,7 @@ pub(crate) async fn send_async(
         })
         .await
         .map_err(|_| FetchError::ClientBuild("client build task panicked".to_string()))??;
-        ASYNC_CLIENTS.insert(host, addresses, built)
+        ASYNC_CLIENTS.insert(&key, addresses, built)
     };
     let mut builder = client
         .request(request.method.clone(), url.clone())
@@ -985,8 +1020,6 @@ pub(crate) struct NativeWebClient {
     pub(crate) test_resolution: Option<(Vec<SocketAddr>, Vec<SocketAddr>)>,
     #[cfg(test)]
     pub(crate) test_transport_http: bool,
-    #[cfg(test)]
-    pub(crate) test_total_timeout: Duration,
 }
 
 impl NativeWebClient {
@@ -1004,8 +1037,6 @@ impl NativeWebClient {
             test_resolution: None,
             #[cfg(test)]
             test_transport_http: false,
-            #[cfg(test)]
-            test_total_timeout: FETCH_TOTAL_TIMEOUT,
         }
     }
 
@@ -1143,10 +1174,7 @@ impl NativeWebClient {
             }
             Err(native_error(FetchError::TooManyRedirects))
         };
-        #[cfg(not(test))]
-        let total_timeout = FETCH_TOTAL_TIMEOUT;
-        #[cfg(test)]
-        let total_timeout = self.test_total_timeout;
+        let total_timeout = self.limits.total_timeout;
         tokio::select! { biased;
             _ = crate::agent::runner::current_work_scope_cancelled() => Err(native_error(FetchError::Cancelled)),
             result = tokio::time::timeout(total_timeout, work) => result.unwrap_or_else(|_| Err(native_error(FetchError::TimedOut))),
@@ -1968,7 +1996,7 @@ mod web_deadline_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         client.ask_tx = Some(tx);
         client.permission = Some(checker.clone());
-        client.test_total_timeout = Duration::from_millis(750);
+        client.limits.total_timeout = Duration::from_millis(750);
         let request = FetchRequest::get();
         let fetch = client.execute("http://fixture.invalid/docs", &request, "web_fetch", true);
         let late = async {
@@ -2009,7 +2037,7 @@ mod web_deadline_tests {
         let setup = setup.elapsed();
         let peer = Peer::new(vec![String::new()]);
         let mut client = fixture_client(&peer);
-        client.test_total_timeout = setup * 3 + Duration::from_millis(75);
+        client.limits.total_timeout = setup * 3 + Duration::from_millis(75);
         let before = std::time::Instant::now();
         let error = client
             .execute(
@@ -2024,7 +2052,7 @@ mod web_deadline_tests {
         assert!(error.contains("timed out"));
         let elapsed = before.elapsed();
         assert!(
-            elapsed < client.test_total_timeout + setup + Duration::from_secs(1),
+            elapsed < client.limits.total_timeout + setup + Duration::from_secs(1),
             "elapsed {elapsed:?} with TLS setup {setup:?}"
         );
         assert_eq!(peer.count(), 1);

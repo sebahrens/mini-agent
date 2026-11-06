@@ -4054,6 +4054,7 @@ before network I/O. Exa service charges are separate from model-usage totals.
 | `web-fetch-origins` (`web_fetch_origins`) | omitted | Exact permitted HTTP(S) origins; omitted accepts any otherwise-safe public origin, an empty/invalid list denies all. This restriction does not grant permission. |
 | `web-fetch-allow-http` (`web_fetch_allow_http`) | `false` | Permit plaintext HTTP to otherwise-safe public destinations. Private addresses remain denied. |
 | `web-search-provider` (`web_search_provider`) | `"exa"` | Fixed-endpoint Exa search, or `"off"` to omit the tool. Other provider names fail visibly before I/O. |
+| `web-fetch-timeout-secs` (`web_fetch_timeout_secs`) | `30` | Total `web_fetch` deadline in seconds, spanning DNS, approval, redirects and body. Clamped to 1..=300. The idle gap allowed between body reads is half of it (at least 3 s). `web_search` keeps its fixed 10 s deadline. |
 
 These are authority-sensitive project config keys and require existing project
 trust. They are independent of `js-fetch-origins`/`js-fetch-allow-http`; changing
