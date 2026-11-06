@@ -1175,10 +1175,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     tool_output_session_id,
                 )),
             ));
-            base_tools.push(Box::new(tools::JobStatusTool::new(
-                sandbox.clone(),
-                max_bash_output_lines,
-            )));
+            base_tools.push(Box::new(
+                tools::JobStatusTool::new(sandbox.clone(), max_bash_output_lines)
+                    .with_permission(permission.clone(), ask_tx.clone()),
+            ));
         }
         base_tools.push(Box::new(
             tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)

@@ -6,6 +6,16 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- `read` of a PDF parses in linear time and within node, font and ToUnicode-entry budgets, with a
+  20 s deadline, so crafted unterminated objects or compressed array bombs fail fast instead of
+  hanging a blocking thread (mini-agent-ys23r, mini-agent-itjui).
+- `job_status action=input` is permission-checked like a shell command (deny rules and manual
+  approval apply), its write times out after 5 s and reports bytes accepted, and `pty` output is
+  shown without terminal escapes or redraw noise (mini-agent-jj068, mini-agent-y53qh,
+  mini-agent-ktcqn).
+
 ### Subagents
 
 - A failed `task` child no longer cancels its siblings: the other children run to completion and

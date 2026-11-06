@@ -513,6 +513,10 @@ impl ShellTool {
 
         let output_len = transcript.total_bytes;
         let mut result = render_transcript(&transcript);
+        if args.pty {
+            // The log file keeps the raw bytes.
+            result = normalize_terminal_output(&result);
+        }
         if output.descendants_escaped {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
@@ -644,6 +648,9 @@ impl ShellTool {
             ));
         }
         let mut result = render_transcript(&transcript);
+        if args.pty {
+            result = normalize_terminal_output(&result);
+        }
         if snapshot.descendants_escaped {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
@@ -707,6 +714,8 @@ async fn forward_progress<T>(
 pub struct JobStatusTool {
     sandbox: Sandbox,
     max_output_lines: Option<u64>,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
 }
 
 impl JobStatusTool {
@@ -714,9 +723,51 @@ impl JobStatusTool {
         Self {
             sandbox,
             max_output_lines,
+            permission: None,
+            ask_tx: None,
+        }
+    }
+
+    /// Judge typed terminal input (`action=input`) like a shell command.
+    pub fn with_permission(
+        mut self,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+    ) -> Self {
+        self.permission = permission;
+        self.ask_tx = ask_tx;
+        self
+    }
+
+    /// Wait until the job's output goes quiet after input, bounded.
+    async fn settle_after_input(&self, id: &str) {
+        let deadline = tokio::time::Instant::now() + INPUT_SETTLE_MAX;
+        let mut seen = self
+            .sandbox
+            .background_job_snapshot(id)
+            .map(|snapshot| snapshot.transcript.total_bytes);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(snapshot) = self
+                .sandbox
+                .wait_background_job(id, INPUT_QUIET_WINDOW)
+                .await
+            else {
+                return;
+            };
+            let total = snapshot.transcript.total_bytes;
+            if snapshot.status.is_terminal() || seen.as_ref().is_ok_and(|seen| *seen == total) {
+                return;
+            }
+            seen = Ok(total);
         }
     }
 }
+
+/// Output must be silent this long after typed input before the result is
+/// returned.
+const INPUT_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+/// Longest `action=input` waits for the program's reply to settle.
+const INPUT_SETTLE_MAX: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Tool for JobStatusTool {
     const NAME: &'static str = "job_status";
@@ -746,7 +797,7 @@ impl Tool for JobStatusTool {
                 "input": {
                     "type": "string",
                     "maxLength": 16384,
-                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The result shows output produced within 200 ms."
+                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -825,17 +876,32 @@ impl Tool for JobStatusTool {
                 .map(drop),
             JobAction::Input => {
                 let input = args.input.as_deref().unwrap_or_default();
+                // Typed text can run anything the terminal's program accepts,
+                // so it is judged exactly like a shell script: deny rules
+                // apply, and manual mode prompts. Unknown or finished jobs are
+                // rejected before any prompt.
+                self.sandbox
+                    .background_job_input_handle(id, input.len())
+                    .map(drop)
+                    .map_err(ToolError::Msg)?;
+                let (checked, _released) = super::concurrency::prompt_unlocked(check_perm(
+                    &self.permission,
+                    &self.ask_tx,
+                    "shell",
+                    // Typing Enter is not part of the command text a rule
+                    // would name.
+                    input.trim_end_matches(['\n', '\r']),
+                ))
+                .await;
+                checked?;
                 match self
                     .sandbox
                     .write_background_job_input(id, input.as_bytes())
                     .await
                 {
                     Ok(()) => {
-                        // Give the program a moment to echo and answer.
-                        let _ = self
-                            .sandbox
-                            .wait_background_job(id, std::time::Duration::from_millis(200))
-                            .await;
+                        // Give the program time to echo and answer.
+                        self.settle_after_input(id).await;
                         Ok(())
                     }
                     Err(error) => Err(error),
@@ -878,6 +944,70 @@ fn render_termination(status: Option<std::process::ExitStatus>) -> Option<String
     Some("Process terminated without an exit code".to_string())
 }
 
+/// Make terminal output model-readable: drop CSI/OSC/DCS and other escape
+/// sequences and stray control bytes, and collapse carriage-return redraws
+/// (progress bars) so each line keeps only its final state.
+pub(crate) fn normalize_terminal_output(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters and intermediates until a final byte.
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC, DCS, SOS, PM and APC: until BEL or the string
+                // terminator (ESC \).
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Charset selection and similar: intermediates, then a final.
+                Some(' '..='/') => {
+                    for next in chars.by_ref() {
+                        if !(' '..='/').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\n' | '\t' | '\r' => stripped.push(ch),
+            ch if ch.is_control() => {}
+            ch => stripped.push(ch),
+        }
+    }
+    // Per line: CRLF is a newline; a bare CR rewinds, so only the last
+    // non-empty segment survives.
+    let mut out = String::with_capacity(stripped.len());
+    for (index, line) in stripped.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        out.push_str(
+            line.rsplit('\r')
+                .find(|segment| !segment.is_empty())
+                .unwrap_or(""),
+        );
+    }
+    out
+}
+
 /// Bytes of new job output one `job_status` call returns.
 const JOB_OUTPUT_READ_BYTES: usize = 64 * 1024;
 
@@ -916,7 +1046,15 @@ fn render_background_job(output: BackgroundJobOutput, max_output_lines: Option<u
         ));
         return result;
     }
-    let mut text = String::from_utf8_lossy(&window.head).into_owned();
+    let lossy = |bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes);
+        if snapshot.pty {
+            normalize_terminal_output(&text)
+        } else {
+            text.into_owned()
+        }
+    };
+    let mut text = lossy(&window.head);
     if window.skipped > 0 {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
@@ -932,9 +1070,14 @@ fn render_background_job(output: BackgroundJobOutput, max_output_lines: Option<u
             window.skipped
         ));
     }
-    text.push_str(&String::from_utf8_lossy(&window.tail));
+    text.push_str(&lossy(&window.tail));
+    let stripped = if snapshot.pty {
+        "; terminal escapes removed and carriage-return redraws collapsed, the log keeps the raw bytes"
+    } else {
+        ""
+    };
     result.push_str(&format!(
-        "\nOutput (bytes {}..{} of {total}; next poll continues at since={}):\n",
+        "\nOutput (bytes {}..{} of {total}; next poll continues at since={}{stripped}):\n",
         window.start, window.next, window.next
     ));
     result.push_str(&bound_output_lines(text, max_output_lines));
@@ -2262,6 +2405,133 @@ mod tests {
         // A finished job no longer accepts input.
         let error = job_input(&status, &id, "1\n").await.unwrap_err();
         assert!(error.to_string().contains("already finished"), "{error}");
+    }
+
+    fn shell_permission(
+        config: crate::permission::PermissionConfig,
+        mode: crate::permission::SecurityMode,
+    ) -> PermCheck {
+        use crate::permission::PermissionConfigs;
+        use crate::permission::checker::PermissionChecker;
+        std::sync::Arc::new(std::sync::Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                mode,
+                Some(std::env::temp_dir()),
+                Some(vec!["standard".to_string(), "yolo".to_string()]),
+            )
+            .expect("valid permission test configuration"),
+        ))
+    }
+
+    async fn start_pty_job(shell: &BashTool, command: &str) -> String {
+        let started = shell
+            .call(BashArgs {
+                command: command.to_string(),
+                timeout: Some(30_000),
+                background: true,
+                pty: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        background_id(&started)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_input_honours_shell_deny_rules_and_never_reaches_the_terminal() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        let marker = std::env::current_dir()
+            .unwrap()
+            .join(format!("job-input-deny-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let shell = test_tool();
+        let id = start_pty_job(&shell, "sh").await;
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("touch *".to_string(), Action::Deny),
+                        ("*".to_string(), Action::Allow),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Yolo,
+        );
+        let status =
+            JobStatusTool::new(shell.sandbox.clone(), None).with_permission(Some(permission), None);
+        let error = job_input(
+            &status,
+            &id,
+            &format!("touch {}\n", marker.file_name().unwrap().to_string_lossy()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("denied"),
+            "{error}"
+        );
+        // An allowed line still works, proving the shell is alive and that the
+        // denied line was never typed.
+        let seen = job_input(&status, &id, "echo allowed-input\n")
+            .await
+            .unwrap();
+        assert!(seen.contains("allowed-input"), "{seen}");
+        assert!(!marker.exists(), "denied input reached the terminal");
+        job_input(&status, &id, "exit\n").await.unwrap();
+    }
+
+    /// Default closed: with an ask policy and nobody to ask, typed input is
+    /// refused rather than written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_input_is_refused_when_approval_is_required_and_unavailable() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        let shell = test_tool();
+        let id = start_pty_job(&shell, "sh").await;
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Simple(Action::Ask)),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Standard,
+        );
+        let status =
+            JobStatusTool::new(shell.sandbox.clone(), None).with_permission(Some(permission), None);
+        job_input(&status, &id, "echo typed\n").await.unwrap_err();
+        let seen = poll_job(&status, &id, Some(0)).await;
+        assert!(!seen.contains("typed"), "{seen}");
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    #[test]
+    fn terminal_output_is_normalised_for_the_model() {
+        let raw = "\u{1b}[?2004h\u{1b}[31mred\u{1b}[0m\u{1b}]0;title\u{7}ok\u{1b}]8;;http://x\u{1b}\\link\u{1b}(B\r\n\
+                   10%\r50%\r100% done\r\nplain\u{7}\u{8}\ttab\r\n";
+        assert_eq!(
+            normalize_terminal_output(raw),
+            "redoklink\n100% done\nplain\ttab\n"
+        );
+        // An unterminated sequence at the end swallows only itself.
+        assert_eq!(normalize_terminal_output("a\u{1b}[31"), "a");
+        assert_eq!(normalize_terminal_output("a\u{1b}]0;no end"), "a");
+        assert_eq!(normalize_terminal_output("a\u{1b}"), "a");
+        assert_eq!(normalize_terminal_output("héllo ✓\n"), "héllo ✓\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_job_output_is_normalised_while_the_log_keeps_raw_bytes() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_pty_job(&shell, "printf '\\033[31mred\\033[0m\\n1\\r2\\r3 done\\n'").await;
+        let terminal = wait_for_terminal_job(&status, &id).await;
+        assert!(terminal.contains("red\n3 done"), "{terminal}");
+        assert!(!terminal.contains('\u{1b}'), "{terminal:?}");
+        assert!(terminal.contains("terminal escapes removed"), "{terminal}");
     }
 
     #[cfg(unix)]

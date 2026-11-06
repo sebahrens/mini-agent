@@ -106,7 +106,13 @@ and permission decision apply. A foreground pty command reads end-of-file
 behaviour from an idle terminal, so drive interactive programs as background
 jobs: `job_status` `action = "input"` with `input` (at most 16 KiB per call,
 include `\n` for Enter) types into a running pty job and returns the output
-produced within 200 ms. Jobs without `pty` keep a null stdin and reject input.
+once it goes quiet (200 ms of silence, at most 3 s). The typed text is judged
+like a `shell` script: deny rules apply, manual mode asks, and an unapproved
+input is never written. The write gives up after 5 s with `the program is not
+reading its terminal input` and the bytes accepted. `pty` output shown to the
+model has CSI/OSC escape sequences and control bytes removed and carriage-return
+redraws collapsed to each line's final state; the log file keeps the raw bytes.
+Jobs without `pty` keep a null stdin and reject input.
 The companion `job_status` tool polls live output, stops and reaps
 the job, or waits for completion. `poll`, `wait` and `stop` return only output
 produced since the previous such call for that job (at most 64 KiB; a larger
@@ -927,8 +933,14 @@ without text show `[no text layer on this page]`; when no selected page has a
 text layer the result says the PDF is probably scanned and suggests exporting
 the pages as PNG (for example with `pdftoppm`) and reading the images. Encrypted
 PDFs are refused. Limits: 64 MiB per file, 32 MiB decoded per stream, 256 MiB
-decoded per call, nesting depth 64. The extracted text never authorizes an
-overwrite of the PDF.
+decoded per call, nesting depth 64, 1,000,000 parsed nodes per object and
+4,000,000 per document (work on discarded candidates counts), 1024 fonts and
+262,144 ToUnicode entries per page (streams shared by several fonts decode
+once), and a 20 s parse deadline. Object scanning advances past the bytes each
+candidate consumed, so parse cost is linear in file size; a PDF that exceeds a
+budget fails with a message naming the budget (`exceeds the parsing budget` or
+`exceeded its time limit`). The extracted text never authorizes an overwrite of
+the PDF.
 
 ### Notebook cells
 

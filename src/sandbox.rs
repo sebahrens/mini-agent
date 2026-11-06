@@ -893,6 +893,9 @@ pub(crate) struct BackgroundJobSnapshot {
     pub status: BackgroundJobStatus,
     pub exit_code: Option<i32>,
     pub descendants_escaped: bool,
+    /// Whether the job runs on a pseudo-terminal (`pty = true`), whose output
+    /// carries terminal escape sequences and redraws.
+    pub pty: bool,
     /// Arrival-ordered retained output, total size and full-output log.
     pub transcript: OutputTranscript,
 }
@@ -4865,42 +4868,71 @@ impl Sandbox {
         }
     }
 
+    #[cfg(unix)]
+    pub(crate) async fn write_pty_input(
+        &self,
+        input: &pty::PtyInput,
+        bytes: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        input
+            .write_all(bytes, timeout)
+            .await
+            .map_err(|error| match error.failure {
+                pty::PtyWriteFailure::TimedOut => format!(
+                    "the program is not reading its terminal input: {} of {} bytes were accepted within {} s and the rest was not sent. Wait for it to finish its current work (job_status action=wait) and send the remainder in a smaller input.",
+                    error.written,
+                    bytes.len(),
+                    timeout.as_secs()
+                ),
+                pty::PtyWriteFailure::Io(error) => format!("failed to write job input: {error}"),
+            })
+    }
+
+    /// The terminal input handle of a running `pty = true` job, or why input
+    /// to `id` cannot be accepted. Nothing is written.
+    pub(crate) fn background_job_input_handle(
+        &self,
+        id: &str,
+        len: usize,
+    ) -> Result<BackgroundJobInput, String> {
+        validate_background_job_id(id)?;
+        #[cfg(unix)]
+        if len > pty::MAX_PTY_INPUT_BYTES {
+            return Err(format!(
+                "job_status input is limited to {} bytes per call",
+                pty::MAX_PTY_INPUT_BYTES
+            ));
+        }
+        #[cfg(not(unix))]
+        let _ = len;
+        let jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let job = jobs
+            .get(id)
+            .ok_or_else(|| self.missing_background_job(id))?;
+        if job.terminal.is_some() {
+            return Err("background job has already finished; input was not sent".into());
+        }
+        job.input.clone().ok_or_else(|| {
+            "background job was not started with pty=true and has no terminal input".to_string()
+        })
+    }
+
     /// Type `bytes` into a running `pty = true` job's terminal.
     pub(crate) async fn write_background_job_input(
         &self,
         id: &str,
         bytes: &[u8],
     ) -> Result<(), String> {
-        validate_background_job_id(id)?;
-        #[cfg(unix)]
-        if bytes.len() > pty::MAX_PTY_INPUT_BYTES {
-            return Err(format!(
-                "job_status input is limited to {} bytes per call",
-                pty::MAX_PTY_INPUT_BYTES
-            ));
-        }
-        let input = {
-            let jobs = self
-                .background_jobs
-                .jobs
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let job = jobs
-                .get(id)
-                .ok_or_else(|| self.missing_background_job(id))?;
-            if job.terminal.is_some() {
-                return Err("background job has already finished; input was not sent".into());
-            }
-            job.input.clone().ok_or_else(|| {
-                "background job was not started with pty=true and has no terminal input".to_string()
-            })?
-        };
+        let input = self.background_job_input_handle(id, bytes.len())?;
         #[cfg(unix)]
         {
-            input
-                .write_all(bytes)
+            self.write_pty_input(&input, bytes, pty::PTY_INPUT_WRITE_TIMEOUT)
                 .await
-                .map_err(|error| format!("failed to write job input: {error}"))
         }
         #[cfg(not(unix))]
         {
@@ -6144,6 +6176,7 @@ fn snapshot_background_job(id: &str, job: &BackgroundJobRecord) -> BackgroundJob
         status,
         exit_code,
         descendants_escaped,
+        pty: job.input.is_some(),
         transcript,
     }
 }
