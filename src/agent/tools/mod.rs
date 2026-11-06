@@ -21,6 +21,7 @@ pub(crate) mod memoize;
 pub(crate) mod mutation_diff;
 pub(crate) mod normalize;
 pub(crate) mod notebook;
+pub(crate) mod pdf_crypt;
 pub(crate) mod pdf_filters;
 pub(crate) mod pdf_text;
 pub(crate) mod read;

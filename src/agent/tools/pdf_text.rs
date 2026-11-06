@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
+use super::pdf_crypt;
 use super::pdf_filters;
 
 /// Largest PDF file the read tool loads.
@@ -393,10 +394,164 @@ pub(crate) struct Document {
 /// Why a PDF could not be read as text.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PdfError {
+    /// Encryption settings that could not be read at all.
     Encrypted,
+    /// The standard security handler needs a non-empty user password.
+    PasswordRequired,
+    /// A security handler or revision this reader does not implement.
+    UnsupportedEncryption(String),
     Malformed(&'static str),
     TooLarge,
     TimedOut,
+}
+
+/// First string of a trailer `/ID` array.
+fn first_id(dict: &Dict) -> Vec<u8> {
+    match dict.get(b"ID") {
+        Some(Obj::Array(items)) => match items.first() {
+            Some(Obj::Str(bytes)) => bytes.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn follow<'a>(objects: &'a HashMap<u32, Obj>, mut object: &'a Obj) -> &'a Obj {
+    for _ in 0..8 {
+        match object {
+            Obj::Ref(number) => match objects.get(number) {
+                Some(next) => object = next,
+                None => return &Obj::Null,
+            },
+            _ => break,
+        }
+    }
+    object
+}
+
+/// Open the standard security handler with the empty user password and
+/// decrypt every stream in place. Strings are left alone: the text this
+/// extractor reads lives in streams.
+fn decrypt_streams(
+    objects: &mut HashMap<u32, Obj>,
+    generations: &HashMap<u32, u16>,
+    entry: &Obj,
+    id0: Vec<u8>,
+) -> Result<(), PdfError> {
+    let decryptor = {
+        let Some(dict) = follow(objects, entry).as_dict() else {
+            return Err(PdfError::Encrypted);
+        };
+        let get = |key: &[u8]| dict.get(key).map(|value| follow(objects, value));
+        let integer = |key: &[u8], default: i64| {
+            get(key)
+                .and_then(Obj::as_num)
+                .map_or(default, |value| value as i64)
+        };
+        let bytes = |key: &[u8]| match get(key) {
+            Some(Obj::Str(bytes)) => bytes.clone(),
+            _ => Vec::new(),
+        };
+        let version = integer(b"V", 0);
+        let stream_method = if version >= 4 {
+            let name = get(b"StmF")
+                .and_then(Obj::as_name)
+                .unwrap_or(b"Identity")
+                .to_vec();
+            if name == b"Identity" {
+                pdf_crypt::Method::Identity
+            } else {
+                let cfm = get(b"CF")
+                    .and_then(Obj::as_dict)
+                    .and_then(|filters| filters.get(&name))
+                    .map(|filter| follow(objects, filter))
+                    .and_then(Obj::as_dict)
+                    .and_then(|filter| filter.get(b"CFM"))
+                    .and_then(Obj::as_name);
+                match cfm {
+                    Some(b"V2") => pdf_crypt::Method::Rc4,
+                    Some(b"AESV2") => pdf_crypt::Method::AesV2,
+                    Some(b"AESV3") => pdf_crypt::Method::AesV3,
+                    Some(b"None") => pdf_crypt::Method::Identity,
+                    other => {
+                        return Err(PdfError::UnsupportedEncryption(format!(
+                            "crypt filter method {}",
+                            other.map_or_else(
+                                || "(missing)".to_owned(),
+                                |name| String::from_utf8_lossy(name).into_owned()
+                            )
+                        )));
+                    }
+                }
+            }
+        } else {
+            pdf_crypt::Method::Rc4
+        };
+        let params = pdf_crypt::EncryptParams {
+            filter: get(b"Filter")
+                .and_then(Obj::as_name)
+                .unwrap_or_default()
+                .to_vec(),
+            version,
+            revision: integer(b"R", 0),
+            length_bits: integer(b"Length", 40),
+            owner: bytes(b"O"),
+            user: bytes(b"U"),
+            user_key: bytes(b"UE"),
+            permissions: integer(b"P", 0) as u32 as i32,
+            id0,
+            encrypt_metadata: !matches!(get(b"EncryptMetadata"), Some(Obj::Bool(false))),
+            stream_method,
+        };
+        pdf_crypt::Decryptor::open(&params).map_err(|error| match error {
+            pdf_crypt::CryptError::PasswordRequired => PdfError::PasswordRequired,
+            pdf_crypt::CryptError::Unsupported(what) => PdfError::UnsupportedEncryption(what),
+        })?
+    };
+    let encrypt_object = match entry {
+        Obj::Ref(number) => Some(*number),
+        _ => None,
+    };
+    for (number, object) in objects.iter_mut() {
+        if Some(*number) == encrypt_object {
+            continue;
+        }
+        let Obj::Stream(dict, data) = object else {
+            continue;
+        };
+        if decryptor.leaves_clear(dict.get(b"Type").and_then(Obj::as_name))
+            || has_identity_crypt_filter(dict)
+        {
+            continue;
+        }
+        let generation = generations.get(number).copied().unwrap_or(0);
+        *data = decryptor
+            .decrypt_stream(*number, generation, data)
+            .unwrap_or_default();
+    }
+    Ok(())
+}
+
+/// A stream whose first filter is `/Crypt` with the Identity filter is stored
+/// unencrypted even in an encrypted document.
+fn has_identity_crypt_filter(dict: &Dict) -> bool {
+    let first = match dict.get(b"Filter") {
+        Some(Obj::Name(name)) => Some(name.as_slice()),
+        Some(Obj::Array(items)) => items.first().and_then(Obj::as_name),
+        _ => None,
+    };
+    if first != Some(b"Crypt") {
+        return false;
+    }
+    let params = match dict.get(b"DecodeParms") {
+        Some(Obj::Dict(params)) => Some(params),
+        Some(Obj::Array(items)) => items.first().and_then(Obj::as_dict),
+        _ => None,
+    };
+    params
+        .and_then(|params| params.get(b"Name"))
+        .and_then(Obj::as_name)
+        .is_none_or(|name| name == b"Identity")
 }
 
 /// What one page's content streams yielded.
@@ -446,9 +601,16 @@ struct ContentFlags {
 impl std::fmt::Display for PdfError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PdfError::Encrypted => {
-                f.write_str("the PDF is encrypted; text extraction is not supported")
-            }
+            PdfError::Encrypted => f.write_str(
+                "the PDF is encrypted and its encryption dictionary could not be read",
+            ),
+            PdfError::PasswordRequired => f.write_str(
+                "password required: the PDF is protected by a non-empty user password, which mini-agent cannot supply",
+            ),
+            PdfError::UnsupportedEncryption(what) => write!(
+                f,
+                "the PDF is encrypted with an unsupported scheme ({what}); only the standard security handler with an empty user password is supported"
+            ),
             PdfError::Malformed(reason) => write!(f, "the PDF could not be parsed ({reason})"),
             PdfError::TooLarge => f.write_str(
                 "the PDF exceeds the parsing budget (too many objects, nested nodes, fonts or ToUnicode entries, or too many decoded bytes)",
@@ -467,7 +629,10 @@ impl Document {
 
     fn parse_until(data: &[u8], deadline: std::time::Instant) -> Result<Self, PdfError> {
         let mut objects: HashMap<u32, Obj> = HashMap::new();
-        let mut encrypted = false;
+        let mut generations: HashMap<u32, u16> = HashMap::new();
+        // The last `/Encrypt` entry (object dictionary or trailer) and the
+        // first `/ID` string beside it.
+        let mut encrypt: Option<(Obj, Vec<u8>)> = None;
         let mut position = 0;
         let mut nodes = 0usize;
         // Once one stream lacks `endstream`, no later one can have it either.
@@ -492,7 +657,7 @@ impl Document {
             {
                 continue;
             }
-            let Some(number) = object_number_before(data, found) else {
+            let Some((number, generation)) = object_number_before(data, found) else {
                 continue;
             };
             let mut lexer = Lexer::new(data, found + 3);
@@ -558,10 +723,11 @@ impl Document {
                 other => other,
             };
             if let Some(dict) = object.as_dict()
-                && dict.get(b"Encrypt").is_some()
+                && let Some(entry) = dict.get(b"Encrypt")
             {
-                encrypted = true;
+                encrypt = Some((entry.clone(), first_id(dict)));
             }
+            generations.insert(number, generation);
             objects.insert(number, object);
         }
         // Classic trailers are not objects; check them separately.
@@ -582,13 +748,13 @@ impl Document {
             // Never rescan the bytes this trailer consumed.
             position = position.max(lexer.pos);
             if let Some(Obj::Dict(dict)) = parsed
-                && dict.get(b"Encrypt").is_some()
+                && let Some(entry) = dict.get(b"Encrypt")
             {
-                encrypted = true;
+                encrypt = Some((entry.clone(), first_id(&dict)));
             }
         }
-        if encrypted {
-            return Err(PdfError::Encrypted);
+        if let Some((entry, id0)) = encrypt {
+            decrypt_streams(&mut objects, &generations, &entry, id0)?;
         }
         let mut document = Self {
             objects,
@@ -1003,7 +1169,7 @@ impl Document {
     }
 }
 
-fn object_number_before(data: &[u8], obj_at: usize) -> Option<u32> {
+fn object_number_before(data: &[u8], obj_at: usize) -> Option<(u32, u16)> {
     let mut index = obj_at;
     let skip_ws = |index: &mut usize| {
         while *index > 0 && is_whitespace(data[*index - 1]) {
@@ -1021,7 +1187,7 @@ fn object_number_before(data: &[u8], obj_at: usize) -> Option<u32> {
     if index == obj_at {
         return None;
     }
-    digits(&mut index)?;
+    let (generation_start, generation_end) = digits(&mut index)?;
     let before_generation = index;
     skip_ws(&mut index);
     if index == before_generation {
@@ -1031,7 +1197,12 @@ fn object_number_before(data: &[u8], obj_at: usize) -> Option<u32> {
     if index > 0 && !is_whitespace(data[index - 1]) && !is_delimiter(data[index - 1]) {
         return None;
     }
-    std::str::from_utf8(&data[start..end]).ok()?.parse().ok()
+    let number = std::str::from_utf8(&data[start..end]).ok()?.parse().ok()?;
+    let generation = std::str::from_utf8(&data[generation_start..generation_end])
+        .ok()?
+        .parse()
+        .unwrap_or(0);
+    Some((number, generation))
 }
 
 /// A decoded ToUnicode map shared by every font pointing at its stream, with
@@ -1947,6 +2118,116 @@ mod tests {
         // A blank page alone is not called scanned.
         let blank = render(&pdf, "doc.pdf", Some("2"), 10_000).unwrap();
         assert!(!blank.contains("probably scanned"), "{blank}");
+    }
+
+    const OWNER_ONLY: [(&str, &[u8]); 5] = [
+        (
+            "RC4-40 (R2)",
+            include_bytes!("fixtures/pdf/encrypted-rc4_40.pdf"),
+        ),
+        (
+            "RC4-128 (R3)",
+            include_bytes!("fixtures/pdf/encrypted-rc4_128.pdf"),
+        ),
+        (
+            "AESV2 (R4)",
+            include_bytes!("fixtures/pdf/encrypted-aesv2.pdf"),
+        ),
+        (
+            "AES-256 (R5)",
+            include_bytes!("fixtures/pdf/encrypted-aes256r5.pdf"),
+        ),
+        (
+            "AES-256 (R6)",
+            include_bytes!("fixtures/pdf/encrypted-aes256.pdf"),
+        ),
+    ];
+
+    /// The fixtures were written by Ghostscript (RC4) and pypdf (AES) with an
+    /// owner password only; viewers open them with no password.
+    #[test]
+    fn owner_password_only_pdfs_decrypt_with_the_empty_user_password() {
+        for (label, pdf) in OWNER_ONLY {
+            assert!(find(pdf, b"/Encrypt", 0).is_some(), "{label} is encrypted");
+            assert!(
+                find(pdf, b"Hello Encrypted", 0).is_none(),
+                "{label} hides text"
+            );
+            let document = Document::parse(pdf).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let text = document.page_text(0).unwrap();
+            assert!(text.contains("Hello Encrypted World"), "{label}: {text}");
+            assert!(text.contains("Second line of text"), "{label}: {text}");
+            let rendered = render(pdf, "doc.pdf", None, 10_000).unwrap();
+            assert!(
+                rendered.contains("Hello Encrypted World"),
+                "{label}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn pdfs_with_a_real_user_password_report_password_required() {
+        let pdf = include_bytes!("fixtures/pdf/encrypted-needpw.pdf");
+        assert_eq!(Document::parse(pdf).err(), Some(PdfError::PasswordRequired));
+        let message = render(pdf, "doc.pdf", None, 10_000).unwrap_err();
+        assert!(message.contains("password required"), "{message}");
+    }
+
+    /// Replace `from` (once) with the same-length `to` in a fixture.
+    fn patched(pdf: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        assert_eq!(from.len(), to.len());
+        let at = find(pdf, from, 0).unwrap_or_else(|| panic!("{from:?} not found"));
+        let mut out = pdf.to_vec();
+        out[at..at + from.len()].copy_from_slice(to);
+        out
+    }
+
+    #[test]
+    fn tampered_or_unsupported_encryption_fails_closed_without_panicking() {
+        let rc4 = include_bytes!("fixtures/pdf/encrypted-rc4_128.pdf");
+        let aes = include_bytes!("fixtures/pdf/encrypted-aes256.pdf");
+        // A foreign security handler is named, never "decrypted".
+        let foreign = patched(rc4, b"/Standard", b"/Foo.Bar!");
+        match Document::parse(&foreign) {
+            Err(PdfError::UnsupportedEncryption(what)) => {
+                assert!(what.contains("security handler Foo.Bar!"), "{what}")
+            }
+            other => panic!("unexpected {:?}", other.err()),
+        }
+        // A different revision is unsupported rather than guessed at.
+        let revision = patched(rc4, b"/R 3", b"/R 9");
+        assert!(matches!(
+            Document::parse(&revision).err(),
+            Some(PdfError::UnsupportedEncryption(_))
+        ));
+        // A damaged user-validation entry is a password failure, not garbage text.
+        let mut broken_user = aes.to_vec();
+        let at = find(&broken_user, b"/U", 0).unwrap();
+        let hex = find(&broken_user, b"<", at).unwrap() + 1;
+        broken_user[hex] = if broken_user[hex] == b'0' { b'1' } else { b'0' };
+        assert_eq!(
+            Document::parse(&broken_user).err(),
+            Some(PdfError::PasswordRequired)
+        );
+        // Every truncation of an encrypted file parses or errors; none panics.
+        for len in (0..aes.len()).step_by(37) {
+            let _ = Document::parse(&aes[..len]);
+            let _ = Document::parse(&rc4[..len.min(rc4.len())]);
+        }
+        // Garbage in encrypted stream bodies yields a note, not a panic.
+        let mut garbled = aes.to_vec();
+        let stream = find(&garbled, b"stream", 0).unwrap() + 8;
+        for byte in garbled.iter_mut().skip(stream).take(24) {
+            *byte ^= 0xA5;
+        }
+        if let Ok(document) = Document::parse(&garbled) {
+            let _ = document.page_content(0);
+        }
+        // An Encrypt entry that points nowhere stays a clean refusal.
+        let mut dangling = build(&[Content::Plain(HELLO_PAGE.into())], false);
+        let trailer = find(&dangling, b"/Root", 0).unwrap();
+        dangling.splice(trailer..trailer, b"/Encrypt 99 0 R ".iter().copied());
+        assert_eq!(Document::parse(&dangling).err(), Some(PdfError::Encrypted));
     }
 
     #[test]

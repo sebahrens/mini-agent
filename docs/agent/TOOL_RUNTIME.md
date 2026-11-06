@@ -967,8 +967,14 @@ explains why per page: skipped streams are named; only pages that paint images (
 or inline images) and run no text operator are called probably scanned, with the `pdftoppm`
 export hint; pages with neither text nor images are called blank or vector-only; pages whose
 text operators decode to nothing say their characters could not be mapped. `web_fetch` PDFs use
-the same classification. Encrypted
-PDFs are refused. Limits: 64 MiB per file, 32 MiB decoded per stream, 256 MiB
+the same classification. PDFs
+protected by the standard security handler open when the user password is empty, which is how
+owner-password-only (permission-restricted) files behave in any viewer: RC4-40/128 (revisions 2-3),
+RC4 or AESV2 (revision 4) and AES-256 (revisions 5 and 6) streams are decrypted in memory
+(`src/agent/tools/pdf_crypt.rs`; strings are not, since text lives in streams). A file that needs
+a real user password fails with `password required` (mini-agent never asks for or guesses one),
+and other handlers or revisions fail naming the unsupported scheme. Nothing is written back to
+the PDF. Limits: 64 MiB per file, 32 MiB decoded per stream, 256 MiB
 decoded per call, nesting depth 64, 1,000,000 parsed nodes per object and
 4,000,000 per document (work on discarded candidates counts), 1024 fonts and
 262,144 ToUnicode entries per page (streams shared by several fonts decode

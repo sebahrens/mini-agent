@@ -35,6 +35,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `grep`, `find_files` and `list_dir` accept `no_ignore` (default false) to include gitignored and
   generated files, and otherwise count and name the ignored entries they skipped
   (mini-agent-hacmm).
+- `read` and `web_fetch` open PDFs encrypted with the standard security handler and an empty user
+  password (RC4-40/128, AESV2, AES-256); files needing a real password report `password required`
+  (mini-agent-6xx6x). Adds the `aes` and `md-5` crates (RustCrypto, already-shared digest stack).
 - `list_dir` pages through every entry of a flat directory (the 10,000-entry cap now applies only to
   depth 2-3 trees); `find_files` accepts `offset`/`limit` and names `continue with offset=N`.
 - `git` diff/show pages and `job_status` polls are self-bounded (git pages scale under
