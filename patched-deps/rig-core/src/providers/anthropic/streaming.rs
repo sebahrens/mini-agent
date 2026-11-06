@@ -784,11 +784,11 @@ mod tests {
         });
 
         let mut tools = build_tool_definitions(
-            vec![crate::completion::ToolDefinition {
+            vec![std::sync::Arc::new(crate::completion::ToolDefinition {
                 name: "rig_tool".to_string(),
                 description: "Rig tool".to_string(),
                 parameters: json!({"type": "object", "properties": {}}),
-            }],
+            })],
             &mut additional_params,
         )
         .unwrap();
@@ -934,14 +934,14 @@ mod tests {
             preamble: None,
             chat_history: OneOrMany::one(RigMessage::user("Add 2 and 3")),
             documents: vec![],
-            tools: vec![crate::completion::ToolDefinition {
+            tools: vec![std::sync::Arc::new(crate::completion::ToolDefinition {
                 name: "add".to_string(),
                 description: "Add x and y".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": { "x": { "type": "integer" } }
                 }),
-            }],
+            })],
             temperature: None,
             max_tokens: Some(64),
             tool_choice: None,
@@ -1010,11 +1010,11 @@ mod tests {
         let top_level_cache_control =
             resolve_top_level_cache_control(false, None, &mut additional_params).unwrap();
         let mut tools = build_tool_definitions(
-            vec![crate::completion::ToolDefinition {
+            vec![std::sync::Arc::new(crate::completion::ToolDefinition {
                 name: "rig_tool".to_string(),
                 description: "Rig tool".to_string(),
                 parameters: json!({"type": "object", "properties": {}}),
-            }],
+            })],
             &mut additional_params,
         )
         .unwrap();

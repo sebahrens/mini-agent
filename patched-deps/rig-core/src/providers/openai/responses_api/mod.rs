@@ -2627,7 +2627,7 @@ mod tests {
             preamble: None,
             chat_history: crate::OneOrMany::one(message::Message::user("what's the weather?")),
             documents: Vec::new(),
-            tools: vec![weather_tool_definition()],
+            tools: vec![std::sync::Arc::new(weather_tool_definition())],
             temperature: None,
             max_tokens: None,
             tool_choice: None,

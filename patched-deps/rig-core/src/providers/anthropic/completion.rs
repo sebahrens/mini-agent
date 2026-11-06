@@ -3437,7 +3437,7 @@ mod tests {
             preamble: Some("System prompt".to_string()),
             chat_history: OneOrMany::one(message::Message::from("Hello")),
             documents: Vec::new(),
-            tools,
+            tools: tools.into_iter().map(std::sync::Arc::new).collect(),
             temperature: None,
             max_tokens: Some(64),
             tool_choice: None,

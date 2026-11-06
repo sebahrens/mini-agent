@@ -2209,6 +2209,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::CompletionClient;
+    use crate::completion::CompletionModel;
     use crate::completion::CompletionRequestBuilder;
     use crate::providers::openai::CompletionsClient;
     use crate::telemetry::ProviderResponseExt;
@@ -2820,7 +2822,7 @@ mod tests {
                 "Hello, whats the weather in London?",
             )),
             documents: vec![],
-            tools: vec![completion::ToolDefinition {
+            tools: vec![std::sync::Arc::new(completion::ToolDefinition {
                 name: "weather".to_string(),
                 description: "Get the weather".to_string(),
                 parameters: serde_json::json!({
@@ -2830,7 +2832,7 @@ mod tests {
                     },
                     "required": ["city"]
                 }),
-            }],
+            })],
             temperature: None,
             max_tokens: None,
             tool_choice: None,
@@ -2890,7 +2892,7 @@ mod tests {
             ])
             .expect("history should be non-empty"),
             documents: vec![],
-            tools: vec![completion::ToolDefinition {
+            tools: vec![std::sync::Arc::new(completion::ToolDefinition {
                 name: "weather".to_string(),
                 description: "Get the weather".to_string(),
                 parameters: serde_json::json!({
@@ -2900,7 +2902,7 @@ mod tests {
                     },
                     "required": ["city"]
                 }),
-            }],
+            })],
             temperature: None,
             max_tokens: None,
             tool_choice: None,
@@ -3352,17 +3354,17 @@ mod tests {
 
     fn claude_cache_test_request(
         model: &super::CompletionModel<RecordingHttpClient>,
-    ) -> CompletionRequest {
+    ) -> crate::completion::CompletionRequest {
         model
             .completion_request("new turn")
             .preamble("You are a careful agent.".to_string())
             .message(message::Message::user("earlier turn"))
             .message(message::Message::assistant("earlier reply"))
-            .tool(completion::ToolDefinition {
+            .tool(std::sync::Arc::new(completion::ToolDefinition {
                 name: "read_file".to_string(),
                 description: "Read a file".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
-            })
+            }))
             .build()
     }
 

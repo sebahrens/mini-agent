@@ -213,11 +213,11 @@ mod tests {
             additional_params: None,
             output_schema: None,
         };
-        request.tools = vec![crate::completion::ToolDefinition {
+        request.tools = vec![std::sync::Arc::new(crate::completion::ToolDefinition {
             name: "lookup".to_string(),
             description: String::new(),
             parameters: serde_json::json!({}),
-        }];
+        })];
 
         let converted = OpenAICompletionRequest::try_from(OpenAIRequestParams {
             model: SONAR.to_string(),
@@ -273,11 +273,11 @@ mod tests {
             MockCompletionModel::default(),
             "What's new today?",
         )
-        .tool(crate::completion::ToolDefinition {
+        .tool(std::sync::Arc::new(crate::completion::ToolDefinition {
             name: "lookup".to_string(),
             description: "Lookup".to_string(),
             parameters: serde_json::json!({"type":"object","properties":{},"required":[]}),
-        })
+        }))
         .tool_choice(crate::message::ToolChoice::Required)
         .build();
 
