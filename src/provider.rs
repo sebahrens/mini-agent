@@ -509,6 +509,27 @@ fn hosted_search_options(cfg: &Config) -> Result<HostedSearchOptions, String> {
     })
 }
 
+/// Config-load validation of the three `hosted-web-search-*` keys. Returns the
+/// same error the agent build would otherwise only log at `warn` level (which
+/// silently removed hosted search), so a bad value is reported at startup.
+pub(crate) fn validate_hosted_search_config(cfg: &Config) -> Result<(), String> {
+    if cfg.hosted_web_search_allowed_domains.is_none()
+        && cfg.hosted_web_search_blocked_domains.is_none()
+        && cfg.hosted_web_search_max_uses.is_none()
+    {
+        return Ok(());
+    }
+    hosted_search_options(cfg).map(|_| ())
+}
+
+/// Whether a block-list is configured for hosted search (the OpenAI Responses
+/// bridge has no such filter and withholds the tool when one is set).
+pub(crate) fn hosted_search_has_block_list(cfg: &Config) -> bool {
+    cfg.hosted_web_search_blocked_domains
+        .as_ref()
+        .is_some_and(|domains| !domains.is_empty())
+}
+
 /// Hosted web-search tool definition for providers that run search
 /// server-side, or `None` where the provider has no supported bridge. Invalid
 /// filter configuration, or a block-list on a provider that cannot express one,

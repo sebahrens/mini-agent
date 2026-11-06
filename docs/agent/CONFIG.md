@@ -4552,10 +4552,14 @@ the native domain/recency parameters; the opt-in is the only approval. Optional
 `hosted-web-search-allowed-domains` or `hosted-web-search-blocked-domains` (bare
 domains, at most 20, not both) are sent as Anthropic `allowed_domains` /
 `blocked_domains`; the OpenAI Responses tool takes `filters.allowed_domains`
-only, so a block-list there withholds hosted search (fail closed, with a
-warning) instead of searching unfiltered. `hosted-web-search-max-uses` (1..=50,
-default 5) sets the Anthropic per-request search cap. Invalid filters, both lists,
-or an out-of-range cap also withhold the hosted tool. The filters never enable
+only, so a block-list there withholds hosted search (fail closed) instead of
+searching unfiltered; when the configured provider is OpenAI Responses and
+`hosted-web-search` is on, startup prints a visible config warning for it.
+`hosted-web-search-max-uses` (1..=50, default 5) sets the Anthropic per-request
+search cap. Invalid filters, both lists, or an out-of-range cap are rejected at
+config load (a fatal error in the user config and `--config` overrides, a startup
+warning for an untrusted-values project config, which then withholds the hosted
+tool) rather than only logged. The filters never enable
 hosted search by themselves. The
 setting is ignored when `web-search-provider = "off"`, when any `web_search`
 deny rule exists (a `permission-deny` entry with or without patterns, `web_search

@@ -214,6 +214,7 @@ pub(crate) fn validate_responses_extra_body(
 /// keys that would be dropped in silence.
 pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, String> {
     cfg.shell_env_policy().validate()?;
+    crate::provider::validate_hosted_search_config(cfg)?;
     crate::sandbox::net_proxy::parse_rules(&cfg.sandbox_network_hosts)?;
     if let Some(max) = cfg.shell_max_background_jobs
         && !(1..=crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT).contains(&max)
@@ -238,6 +239,17 @@ pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, Strin
         .collect();
 
     let mut warnings = Vec::new();
+    if global_is_responses
+        && cfg.hosted_web_search.unwrap_or(false)
+        && crate::provider::hosted_search_has_block_list(cfg)
+    {
+        warnings.push(
+            "hosted-web-search-blocked-domains is not supported by the OpenAI Responses \
+             web_search tool: hosted search is withheld for this provider (use \
+             hosted-web-search-allowed-domains, or turn hosted-web-search off)"
+                .to_string(),
+        );
+    }
     if global_is_responses && let Some(extra) = cfg.extra_body.as_mut() {
         warnings.extend(validate_responses_extra_body("extra_body", extra)?);
     }
@@ -1680,7 +1692,7 @@ fn load_from_path_with_sources(
     match validate_extra_body(&mut cfg) {
         Ok(body_warnings) => emit_config_warnings(&mut warnings, body_warnings),
         Err(error) => fatal_config_load(format!(
-            "error: {} configures an unusable OpenAI Responses request body: {}\n\
+            "error: {} configures an unusable provider request setting: {}\n\
              Fix the value or remove it.",
             path.display(),
             error,
