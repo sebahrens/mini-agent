@@ -66,6 +66,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   `LSP (<server>): no diagnostics received within N ms` instead of looking like a clean file, and
   the shortened 50 ms wait used after a miss re-probes the full window after 30 s
   (mini-agent-zoq2d).
+- The edit tool's fuzzy fallback (closest-match preview and `fuzzy: true`) now works on ordinary
+  source files: windows are pruned with a character-histogram bound and scored with a bounded
+  bit-parallel Levenshtein distance, and overlapping windows count as one region. The old
+  8M-cell budget made it inert for multi-line SEARCH blocks beyond ~45-line files; the new
+  64M-word budget is documented in `docs/agent/TOOL_RUNTIME.md` (mini-agent-73js3).
 
 ### Added
 

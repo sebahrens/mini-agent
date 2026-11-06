@@ -314,8 +314,25 @@ unchanged.
 `list_dir` keeps only actual directories in its directory-first sort group and
 renders symbolic links as `name -> target`. Read windows size their line-number
 column from the actual range and report an offset past EOF directly instead of
-showing an inverted range. When edit's bounded fuzzy search is too expensive,
-the error says that no closest-match suggestion was computed.
+showing an inverted range.
+
+When a SEARCH block matches neither exactly nor after whitespace
+normalization, edit compares it with every line-aligned window of the same
+line count. A sliding character-histogram difference (a lower bound on the
+edit distance) prunes windows that cannot reach the current threshold
+(60% for a closest-match suggestion, raised to the best similarity seen so
+far, or 85% once a window qualifies to be applied); windows are scored
+best-bound first with a bit-parallel bounded Levenshtein distance (Myers /
+Hyyrö) that stops as soon as the threshold is out of reach. Overlapping
+windows above 85% are one region (the best-scoring alignment is used); two
+disjoint regions above 85% are ambiguous. The scan is bounded to 64,000,000
+work units per SEARCH block, where one unit is one window character times
+one 64-character word of the normalized SEARCH text: for example a 20-line,
+~700-character block costs about 11 units per window character, so a
+3000-line file is far inside the budget. Only many windows whose character
+composition is close to the SEARCH text (heavily repetitive or generated
+files) can exhaust it; the error then says that no closest-match suggestion
+was computed.
 
 SEARCH/REPLACE edits require a unique match, including occurrences that overlap
 in the original or whitespace-normalized text. For example, `aba` is ambiguous
