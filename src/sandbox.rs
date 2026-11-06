@@ -32,8 +32,8 @@ mod output_capture;
 #[cfg(unix)]
 pub(crate) mod pty;
 pub(crate) use output_capture::{
-    OutputChannel, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy,
-    TranscriptPart,
+    OutputChannel, OutputLog, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy,
+    TranscriptPart, write_private_log,
 };
 mod git_metadata;
 mod read_roots;

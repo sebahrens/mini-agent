@@ -7,8 +7,9 @@ use crate::extras::truncate::head_tail_lines;
 use crate::sandbox::{
     BackgroundJobOutput, CommandLimits, CommandOutput, CommandOutputLimit, CommandProgress,
     CommandStatus, DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS,
-    MAX_BACKGROUND_JOB_WAIT_MILLIS, OutputChannel, OutputTranscript, SHELL_HARD_OUTPUT_BYTES,
-    Sandbox, ShellOutputCapture, SpoolPolicy, TranscriptPart,
+    MAX_BACKGROUND_JOB_WAIT_MILLIS, OutputChannel, OutputLog, OutputTranscript,
+    SHELL_HARD_OUTPUT_BYTES, Sandbox, ShellOutputCapture, SpoolPolicy, TranscriptPart,
+    write_private_log,
 };
 use compact_str::CompactString;
 
@@ -713,6 +714,7 @@ impl ShellTool {
             result.push_str(&termination);
         }
 
+        let transcript = self.spill_line_capped_output(transcript, &result);
         let mut result = bound_output_lines(result, self.max_output_lines);
         push_log_footer(&mut result, &transcript);
 
@@ -851,9 +853,60 @@ impl ShellTool {
             }
             result.push_str(&format!("Exit code: {code}"));
         }
+        let transcript = self.spill_line_capped_output(transcript, &result);
         let mut result = bound_output_lines(result, self.max_output_lines);
         push_log_footer(&mut result, &transcript);
         Ok(Some(result))
+    }
+}
+
+impl ShellTool {
+    /// When the line cap will drop lines but the byte-retention log was never
+    /// opened (everything still fit in memory), save the complete retained
+    /// output to a private log so the omitted lines stay recoverable.
+    fn spill_line_capped_output(
+        &self,
+        mut transcript: OutputTranscript,
+        rendered: &str,
+    ) -> OutputTranscript {
+        let Some(cap) = self.max_output_lines else {
+            return transcript;
+        };
+        let cap = usize::try_from(cap).unwrap_or(usize::MAX).max(1);
+        if transcript.log.is_some()
+            || transcript.omitted_bytes > 0
+            || crate::extras::truncate::line_count(rendered) <= cap
+        {
+            return transcript;
+        }
+        let Some(dir) = self.output_log_dir.as_deref() else {
+            return transcript;
+        };
+        let bytes: Vec<u8> = transcript
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                TranscriptPart::Output(_, bytes) => Some(bytes.as_slice()),
+                TranscriptPart::Omitted(_) => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        let path = ShellOutputCapture::log_path_in(dir, "shell-output");
+        match write_private_log(&path, &bytes) {
+            Ok(()) => {
+                transcript.log = Some(OutputLog {
+                    path,
+                    bytes: bytes.len() as u64,
+                    complete: true,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "failed to save line-capped command output");
+                transcript.log_error = Some(error.to_string());
+            }
+        }
+        transcript
     }
 }
 
@@ -1701,7 +1754,7 @@ fn push_log_footer(result: &mut String, transcript: &OutputTranscript) {
             log.bytes,
             log.path.display()
         )
-    } else if transcript.omitted_bytes > 0 {
+    } else if transcript.omitted_bytes > 0 || transcript.log_error.is_some() {
         let reason = transcript.log_error.as_deref().map_or_else(
             || "no output log is configured".to_string(),
             |error| format!("the output log could not be written: {error}"),
@@ -1737,6 +1790,46 @@ mod tests {
 
     fn test_tool() -> BashTool {
         BashTool::new(None, None, Sandbox::new(false, "bwrap"), None)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn line_cap_saves_the_full_output_to_a_log_even_under_the_byte_cap() {
+        let dir = crate::tests::support::temp::TempDir::new("line-cap-log");
+        let logs = dir.path().join("logs");
+        let mut shell = test_tool().with_output_log_dir(Some(logs.clone()));
+        shell.max_output_lines = Some(50);
+        let result = shell
+            .call(BashArgs {
+                command: "seq 1 5000".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("lines omitted"), "{result}");
+        let footer = result
+            .lines()
+            .find(|line| line.contains("saved to"))
+            .unwrap_or_else(|| panic!("no log footer: {result}"));
+        let logged = std::fs::read_dir(&logs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .next()
+            .unwrap();
+        assert!(footer.contains(&logged.display().to_string()), "{footer}");
+        let body = std::fs::read_to_string(&logged).unwrap();
+        assert_eq!(body.lines().count(), 5000);
+        assert!(body.contains("\n2500\n"));
+        // Output under the cap creates no log.
+        let small = shell
+            .call(BashArgs {
+                command: "seq 1 10".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!small.contains("saved to"), "{small}");
+        assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
