@@ -44,6 +44,9 @@ impl PreservedConfig {
 /// Default `max_bash_output_lines` when the config does not set one. Output
 /// beyond this many lines keeps its head and tail with an omitted-count marker.
 pub const DEFAULT_MAX_BASH_OUTPUT_LINES: u64 = 2000;
+/// Mid-turn compaction threshold used when `mid_turn_compact_threshold` is
+/// unset (fraction of the context window of real provider prompt pressure).
+pub const DEFAULT_MID_TURN_COMPACT_THRESHOLD: f64 = 0.9;
 pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
 pub const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
 
@@ -315,10 +318,10 @@ pub struct Config {
     /// and the built-in layers. Default: `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_project_agents: Option<bool>,
-    /// Opt-in mid-turn compaction threshold, as a fraction of the context
-    /// window (0.0–1.0) of real provider prompt pressure. `None` (default)
-    /// disables mid-turn compaction entirely; the agent only compacts between
-    /// turns. Honored only when `compact_enabled` is also true.
+    /// Mid-turn compaction threshold, as a fraction of the context window
+    /// (0.0–1.0) of real provider prompt pressure. `None` (default) resolves
+    /// to [`DEFAULT_MID_TURN_COMPACT_THRESHOLD`]; an explicit `0` disables
+    /// mid-turn compaction. Honored only when `compact_enabled` is also true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mid_turn_compact_threshold: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -760,6 +763,28 @@ pub struct Config {
     #[cfg(feature = "advisor")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advisor: Option<types::AdvisorConfig>,
+    /// Generic tool-result spill threshold in characters for tools without
+    /// their own output bound (MCP, git, docs, ...). Unset scales with the
+    /// context window (mini-agent-bjiqr).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_spill_chars: Option<u64>,
+    /// Characters kept from the start of a spilled tool result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_spill_head_chars: Option<u64>,
+    /// Characters kept from the end of a spilled tool result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_spill_tail_chars: Option<u64>,
+    /// Token budget for re-attaching the newest file windows read before a
+    /// compaction (mini-agent-xzt6g). `0` disables; unset scales with the
+    /// context window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_restore_read_tokens: Option<u64>,
+    /// Combined byte budget for root context files (AGENTS.md, CLAUDE.md,
+    /// ARCHITECTURE.md, global AGENTS.md). Unset: as many bytes as the
+    /// model's context window has tokens, within 16 KiB..512 KiB
+    /// (mini-agent-59sgr).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_files_max_bytes: Option<u64>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///
@@ -1133,21 +1158,26 @@ impl Config {
         self.extra_body.clone()
     }
 
+    /// Master switch for automatic compaction. Defaults to `true`
+    /// (mini-agent-3mswy): an unconfigured long session compacts between turns
+    /// instead of ending in a provider context-length error. An explicit
+    /// `false` is honored.
     pub fn resolve_compact_enabled(&self) -> bool {
-        self.compact_enabled.unwrap_or(false)
+        self.compact_enabled.unwrap_or(true)
     }
 
     /// Mid-turn compaction pressure threshold as a fraction of the context
-    /// window. Unlike the other resolvers this one substitutes **no** enabling
-    /// default: `None` means the mid-turn trigger never fires (preserving the
-    /// historical between-turn-only behavior). Values outside `(0.0, 1.0]` are
-    /// treated as unset; [`load`](crate::config::load) warns about such values
-    /// once at startup, since this resolver runs in the per-call hot path and
-    /// must not log. The caller must additionally check
+    /// window. Unset resolves to [`DEFAULT_MID_TURN_COMPACT_THRESHOLD`]
+    /// (mini-agent-3mswy). An explicit value outside `(0.0, 1.0]` (including
+    /// `0`, the documented opt-out) disables the mid-turn trigger;
+    /// [`load`](crate::config::load) warns about such values once at startup,
+    /// since this resolver runs in the per-call hot path and must not log. The
+    /// caller must additionally check
     /// [`resolve_compact_enabled`](Self::resolve_compact_enabled), which is the
     /// master switch for all compaction.
     pub fn resolve_mid_turn_compact_threshold(&self) -> Option<f64> {
         match self.mid_turn_compact_threshold {
+            None => Some(DEFAULT_MID_TURN_COMPACT_THRESHOLD),
             Some(t) if t > 0.0 && t <= 1.0 => Some(t),
             _ => None,
         }
@@ -1163,6 +1193,29 @@ impl Config {
     /// Post-edit formatter timeout, clamped to 1-600 seconds.
     pub fn resolve_format_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.format_timeout_secs.unwrap_or(10).clamp(1, 600))
+    }
+
+    /// Generic tool-result spill limits for a context window: explicit
+    /// `tool_result_spill_*` keys over [`ToolResultSpillLimits::for_window`].
+    ///
+    /// [`ToolResultSpillLimits::for_window`]: crate::session::ToolResultSpillLimits::for_window
+    pub fn resolve_tool_result_spill_limits(
+        &self,
+        context_window: u64,
+    ) -> crate::session::ToolResultSpillLimits {
+        crate::session::ToolResultSpillLimits::for_window(context_window).with_overrides(
+            self.tool_result_spill_chars,
+            self.tool_result_spill_head_chars,
+            self.tool_result_spill_tail_chars,
+        )
+    }
+
+    /// Budget for file windows restored after compaction: explicit
+    /// `compact_restore_read_tokens`, else a twentieth of the window capped
+    /// at 25,000 tokens.
+    pub fn resolve_compact_restore_read_tokens(&self, context_window: u64) -> u64 {
+        self.compact_restore_read_tokens
+            .unwrap_or_else(|| (context_window / 20).min(25_000))
     }
 
     pub fn resolve_max_read_lines(&self) -> u64 {

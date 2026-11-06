@@ -35,7 +35,75 @@ pub enum MediaAttachment {
     },
 }
 
+/// Edge of one vision patch (Claude's published `ceil(w/28) * ceil(h/28)`
+/// formula, about `w * h / 750` for typical sizes).
+const IMAGE_PATCH_PX: u64 = 28;
+/// Highest per-image charge (Claude's high-resolution tier): providers
+/// downscale larger images.
+const MAX_IMAGE_PREFLIGHT_TOKENS: u64 = 4_784;
+/// Conservative per-page charge for a PDF (page text plus its page image).
+const PDF_PAGE_PREFLIGHT_TOKENS: u64 = 3_000;
+/// Flat estimate kept for audio and for content whose size is unknown.
+const DEFAULT_ATTACHMENT_PREFLIGHT_TOKENS: u64 = 2_048;
+
+/// Number of `/Type /Page` objects (not `/Pages`) in a PDF, a cheap lower
+/// bound of its page count without parsing the document.
+fn pdf_page_count(data: &[u8]) -> u64 {
+    let mut pages = 0u64;
+    let mut index = 0usize;
+    while let Some(offset) = data[index..]
+        .windows(5)
+        .position(|window| window == b"/Type")
+    {
+        let mut cursor = index + offset + 5;
+        while data.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if data[cursor..].starts_with(b"/Page")
+            && data.get(cursor + 5).is_none_or(|byte| *byte != b's')
+        {
+            pages += 1;
+        }
+        index = cursor;
+    }
+    pages
+}
+
 impl MediaAttachment {
+    /// Local token estimate of this attachment for the context preflight
+    /// (mini-agent-d6x7s): images by their header dimensions (patch formula,
+    /// capped at the high-resolution maximum), PDFs per page, other documents
+    /// by their text, audio and unknown content at a flat 2,048.
+    pub(crate) fn preflight_tokens(&self) -> u64 {
+        match self {
+            MediaAttachment::Image { data, .. } => {
+                match crate::agent::tools::read_image::inspect(data) {
+                    Ok(Some(info)) => (u64::from(info.width).div_ceil(IMAGE_PATCH_PX)
+                        * u64::from(info.height).div_ceil(IMAGE_PATCH_PX))
+                    .clamp(1, MAX_IMAGE_PREFLIGHT_TOKENS),
+                    // Unknown dimensions: four pixels per byte, densely.
+                    _ => (data.len() as u64)
+                        .saturating_mul(4)
+                        .div_ceil(IMAGE_PATCH_PX * IMAGE_PATCH_PX)
+                        .clamp(
+                            DEFAULT_ATTACHMENT_PREFLIGHT_TOKENS,
+                            MAX_IMAGE_PREFLIGHT_TOKENS,
+                        ),
+                }
+            }
+            MediaAttachment::Document { data, mime, .. } if mime == "application/pdf" => {
+                pdf_page_count(data)
+                    .max(1)
+                    .saturating_mul(PDF_PAGE_PREFLIGHT_TOKENS)
+            }
+            MediaAttachment::Document { data, .. } => {
+                crate::session::Session::estimate_tokens(&String::from_utf8_lossy(data))
+                    .max(DEFAULT_ATTACHMENT_PREFLIGHT_TOKENS)
+            }
+            MediaAttachment::Audio { .. } => DEFAULT_ATTACHMENT_PREFLIGHT_TOKENS,
+        }
+    }
+
     pub fn size(&self) -> usize {
         match self {
             MediaAttachment::Image { data, .. }
@@ -389,5 +457,70 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains("not a regular file"), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::MediaAttachment;
+
+    pub(crate) fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        let mut chunk = b"IHDR".to_vec();
+        chunk.extend_from_slice(&width.to_be_bytes());
+        chunk.extend_from_slice(&height.to_be_bytes());
+        chunk.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let crc = crate::agent::tools::crc::crc32(&chunk);
+        bytes.extend_from_slice(&chunk);
+        bytes.extend_from_slice(&crc.to_be_bytes());
+        bytes
+    }
+
+    fn image(data: Vec<u8>) -> MediaAttachment {
+        MediaAttachment::Image {
+            path: "shot.png".into(),
+            data,
+            mime: "image/png".into(),
+            clipboard: None,
+        }
+    }
+
+    // mini-agent-d6x7s: the estimate scales with image size and PDF pages.
+    #[test]
+    fn preflight_estimate_scales_with_image_dimensions_and_pdf_pages() {
+        assert_eq!(image(png(28, 28)).preflight_tokens(), 1);
+        assert_eq!(image(png(560, 560)).preflight_tokens(), 400);
+        assert_eq!(image(png(4_000, 3_000)).preflight_tokens(), 4_784);
+        let pdf = |pages: usize| MediaAttachment::Document {
+            path: "doc.pdf".into(),
+            data: format!(
+                "%PDF-1.7\n1 0 obj << /Type /Pages /Count {pages} >> endobj\n{}",
+                "2 0 obj << /Type /Page >> endobj\n".repeat(pages)
+            )
+            .into_bytes(),
+            mime: "application/pdf".into(),
+        };
+        assert_eq!(pdf(1).preflight_tokens(), 3_000);
+        assert_eq!(pdf(12).preflight_tokens(), 36_000);
+        let audio = MediaAttachment::Audio {
+            path: "a.mp3".into(),
+            data: vec![0; 10],
+            mime: "audio/mpeg".into(),
+        };
+        assert_eq!(audio.preflight_tokens(), 2_048);
+    }
+
+    // A large image near the window is rejected locally where the flat
+    // 2,048-token estimate would have let it through.
+    #[test]
+    fn large_image_near_the_window_is_rejected_by_the_preflight() {
+        let mut session = crate::session::Session::new("anthropic", "claude", 8_000, "");
+        session.overhead_tokens = 3_000;
+        let reserve = 1_000;
+        let text = crate::session::Session::estimate_tokens("describe this");
+        let tokens = image(png(4_000, 3_000)).preflight_tokens();
+        assert!(!session.is_irreducible_with_pending(reserve, text + 2_048));
+        assert!(session.is_irreducible_with_pending(reserve, text + tokens));
     }
 }

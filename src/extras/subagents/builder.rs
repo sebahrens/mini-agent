@@ -38,8 +38,15 @@ impl<M: CompletionModel> rig::agent::AgentHook<M> for ReportRepairGuard {
 /// of model capacity. Observe the complete normalized request after patches;
 /// never trim signed history or rewrite the request to make it fit.
 #[derive(Clone, Copy)]
-struct ChildContextGuard {
+pub(crate) struct ChildContextGuard {
     window: u64,
+}
+
+impl ChildContextGuard {
+    #[cfg(test)]
+    pub(crate) fn new(window: u64) -> Self {
+        Self { window }
+    }
 }
 impl<M: CompletionModel> rig::agent::AgentHook<M> for ChildContextGuard {
     async fn on_event(
@@ -53,9 +60,7 @@ impl<M: CompletionModel> rig::agent::AgentHook<M> for ChildContextGuard {
             if estimated.is_none_or(|input| {
                 input.saturating_add(request.max_tokens.unwrap_or(0)) > self.window
             }) {
-                return rig::agent::Flow::terminate(
-                    "task: child context estimate exceeds its configured/model window; use a narrower brief or raise subagent_context_window for a supported model",
-                );
+                return rig::agent::Flow::terminate(crate::agent::runner::CHILD_CONTEXT_REFUSAL);
             }
         }
         rig::agent::Flow::cont()
@@ -84,6 +89,8 @@ pub(crate) struct SubagentAuthorization {
     instructions: Option<std::sync::Arc<crate::context::instructions::WorkspaceInstructions>>,
     #[cfg(feature = "js")]
     read_only_js: Option<ReadOnlyJsAuthorization>,
+    /// Generic spill bound for this child's unbounded tool results.
+    spill_limits: crate::session::ToolResultSpillLimits,
 }
 
 /// Captured from the actual parent builder, including its tool eligibility.
@@ -167,6 +174,7 @@ impl SubagentAuthorization {
             instructions: None,
             #[cfg(feature = "js")]
             read_only_js: None,
+            spill_limits: Default::default(),
         }
     }
 
@@ -846,10 +854,10 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
             window: context_window,
         })
         .add_hook(crate::extras::subagents::image_cost::ChildImageCeiling::default());
-    builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
-        uuid::Uuid::new_v4().to_string(),
-        None,
-    ));
+    builder = builder.add_hook(
+        crate::agent::runner::ToolResultSpillHook::new(uuid::Uuid::new_v4().to_string(), None)
+            .with_limits(authorization.spill_limits),
+    );
 
     builder = builder.add_hook(crate::context::instructions::WorkspaceInstructionHook(
         authorization.instructions.clone(),
@@ -968,6 +976,8 @@ pub(crate) async fn build_explore_agent_with_suffix(
         .into_iter()
         .fold(cfg.resolve_subagent_max_tokens(), u64::min);
     let context_window = child_context_window(&model, cfg);
+    let mut authorization = authorization;
+    authorization.spill_limits = cfg.resolve_tool_result_spill_limits(context_window);
     let max_text_file_size = cfg.max_text_file_size.unwrap_or(10 * 1024 * 1024);
     let max_read_lines = cfg.resolve_subagent_max_read_lines();
     let max_grep_results = cfg.resolve_subagent_max_grep_results();

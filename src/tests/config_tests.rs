@@ -50,9 +50,12 @@ fn is_anthropic_native_resolves_custom_provider_type() {
 }
 
 #[test]
-fn mid_turn_threshold_unset_by_default() {
+fn mid_turn_threshold_defaults_when_unset() {
     let cfg = Config::default();
-    assert_eq!(cfg.resolve_mid_turn_compact_threshold(), None);
+    assert_eq!(
+        cfg.resolve_mid_turn_compact_threshold(),
+        Some(crate::config::DEFAULT_MID_TURN_COMPACT_THRESHOLD)
+    );
 }
 
 #[test]
@@ -74,10 +77,9 @@ fn mid_turn_threshold_upper_bound_inclusive() {
 }
 
 #[test]
-fn mid_turn_threshold_out_of_range_treated_as_unset() {
-    // Zero would compact constantly; negatives and >1 are nonsense. All map to
-    // "unset" so a misconfigured value silently disables the feature rather
-    // than wedging the agent.
+fn mid_turn_threshold_out_of_range_disables_mid_turn_compaction() {
+    // Zero is the documented opt-out; negatives and >1 are nonsense. All
+    // disable the mid-turn trigger rather than wedging the agent.
     for bad in [0.0, -0.1, 1.5, 2.0] {
         let cfg = Config {
             mid_turn_compact_threshold: Some(bad),
@@ -86,14 +88,19 @@ fn mid_turn_threshold_out_of_range_treated_as_unset() {
         assert_eq!(
             cfg.resolve_mid_turn_compact_threshold(),
             None,
-            "threshold {bad} should be treated as unset"
+            "threshold {bad} should disable mid-turn compaction"
         );
     }
 }
 
 #[test]
-fn compact_enabled_default_false() {
-    assert!(!Config::default().resolve_compact_enabled());
+fn compact_enabled_defaults_true_and_explicit_false_is_honored() {
+    assert!(Config::default().resolve_compact_enabled());
+    let disabled = Config {
+        compact_enabled: Some(false),
+        ..Config::default()
+    };
+    assert!(!disabled.resolve_compact_enabled());
 }
 
 #[test]
@@ -1631,4 +1638,60 @@ fn edit_file_size_limit_is_separate_from_read_size_and_defaults_to_16_mib() {
     assert_eq!(cfg.resolve_max_edit_file_size(), 4096);
     let parsed: Config = toml::from_str("max_edit_file_size = 5000000").unwrap();
     assert_eq!(parsed.resolve_max_edit_file_size(), 5_000_000);
+}
+
+// mini-agent-bjiqr: the generic spill bound scales with the window and
+// explicit keys override it, always leaving head + tail below the threshold.
+#[test]
+fn tool_result_spill_limits_scale_with_window_and_accept_overrides() {
+    use crate::session::ToolResultSpillLimits;
+    let defaults = Config::default();
+    assert_eq!(
+        defaults.resolve_tool_result_spill_limits(32_000),
+        ToolResultSpillLimits {
+            threshold: 12_000,
+            head: 2_000,
+            tail: 8_000
+        }
+    );
+    assert_eq!(
+        defaults.resolve_tool_result_spill_limits(200_000).threshold,
+        20_000
+    );
+    assert_eq!(
+        defaults.resolve_tool_result_spill_limits(1_000_000),
+        ToolResultSpillLimits {
+            threshold: 50_000,
+            head: 8_333,
+            tail: 33_333
+        }
+    );
+    let explicit = Config {
+        tool_result_spill_chars: Some(30_000),
+        tool_result_spill_head_chars: Some(20_000),
+        ..Config::default()
+    };
+    let limits = explicit.resolve_tool_result_spill_limits(1_000_000);
+    assert_eq!(limits.threshold, 30_000);
+    assert!(limits.head + limits.tail < limits.threshold, "{limits:?}");
+    let tiny = Config {
+        tool_result_spill_chars: Some(10),
+        ..Config::default()
+    };
+    assert_eq!(
+        tiny.resolve_tool_result_spill_limits(128_000).threshold,
+        ToolResultSpillLimits::MIN_THRESHOLD
+    );
+    let yaml: Config = serde_yaml_ng::from_str(
+        "tool_result_spill_chars: 40000\ntool_result_spill_head_chars: 10000\ntool_result_spill_tail_chars: 20000\n",
+    )
+    .unwrap();
+    assert_eq!(
+        yaml.resolve_tool_result_spill_limits(128_000),
+        ToolResultSpillLimits {
+            threshold: 40_000,
+            head: 10_000,
+            tail: 20_000
+        }
+    );
 }

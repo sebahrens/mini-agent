@@ -2624,3 +2624,60 @@ async fn compaction_text_serializer_marks_user_and_tool_images_without_sending_b
     .unwrap();
     assert_eq!(output.messages_included, session.messages.len());
 }
+
+// mini-agent-wu3uc: summary caps scale with the context window, so a 1M-window
+// session may keep a summary larger than the historical 4,096 tokens / 16 KiB.
+#[test]
+fn compaction_summary_caps_scale_with_the_context_window() {
+    use crate::provider::{rolling_summary_byte_cap, summary_output_token_cap};
+    assert_eq!(summary_output_token_cap(128_000), 4_096);
+    assert_eq!(summary_output_token_cap(200_000), 6_250);
+    assert_eq!(summary_output_token_cap(1_000_000), 20_000);
+    assert_eq!(rolling_summary_byte_cap(128_000), 16 * 1024);
+    assert_eq!(rolling_summary_byte_cap(1_000_000), 80_000);
+    // Historical behavior for a 128k window: output clamped to 4,096.
+    assert_eq!(compaction_request_limits(112_000, 16_000, 0).1, 4_096);
+    // 1M window: the reserve-sized response is allowed beyond 4,096.
+    let (_, output_tokens) = compaction_request_limits(984_000, 16_000, 0);
+    assert_eq!(output_tokens, 16_000);
+    assert!(output_tokens > 4_096);
+}
+
+#[tokio::test]
+async fn one_million_window_compaction_keeps_a_summary_beyond_sixteen_kib() {
+    use crate::provider::{compress_messages_with_capped, rolling_summary_byte_cap};
+    let messages = compaction_messages(4, "decision: keep the cache layer");
+    let long_summary = format!("## Goal\n{}", "file list and decisions ".repeat(2_500));
+    assert!(long_summary.len() > 16 * 1024 && long_summary.len() < 80_000);
+    let (prompt_budget, _) = compaction_request_limits(984_000, 16_000, 0);
+    let returned = long_summary.clone();
+    let output = compress_messages_with_capped(
+        &messages,
+        None,
+        None,
+        prompt_budget,
+        rolling_summary_byte_cap(1_000_000),
+        move |_prompt| {
+            let returned = returned.clone();
+            async move { Ok((returned, UsageDelta::default())) }
+        },
+    )
+    .await
+    .unwrap();
+    assert!(output.summary_byte_budget > 16 * 1024);
+    assert_eq!(
+        output.summary, long_summary,
+        "the summary is not cut to 16 KiB"
+    );
+    let mut session = crate::session::Session::new("openai", "model", 1_000_000, "");
+    session.add_message(MessageRole::User, "old");
+    session.add_message(MessageRole::Assistant, "old answer");
+    session.add_message(MessageRole::User, "recent");
+    session.compress_with_budget(output.summary, 2, 10, output.summary_byte_budget);
+    let stored = session.compacted_context().0.expect("summary stored");
+    assert!(
+        stored.len() > 16 * 1024,
+        "stored summary keeps {} bytes",
+        stored.len()
+    );
+}

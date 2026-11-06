@@ -658,11 +658,33 @@ struct HeadlessCompactionPlan {
 
 // `pending_tokens`: estimated tokens in the pending request payload (user
 // prompt + media) to include in the compaction decision.
+#[cfg(test)]
 fn headless_compaction_plan(
     session: &Session,
     cfg: &Config,
     pending_tokens: u64,
     #[cfg(feature = "memory")] memory: Option<&str>,
+) -> Option<HeadlessCompactionPlan> {
+    headless_compaction_plan_with(
+        session,
+        cfg,
+        pending_tokens,
+        #[cfg(feature = "memory")]
+        memory,
+        false,
+    )
+}
+
+/// As [`headless_compaction_plan`]; `force` skips the estimate-based pressure
+/// test. Context relief (a provider context-length rejection or real mid-turn
+/// prompt pressure) is evidence the local estimate under-counts, so it
+/// compacts whatever older history the keep-recent cut leaves.
+fn headless_compaction_plan_with(
+    session: &Session,
+    cfg: &Config,
+    pending_tokens: u64,
+    #[cfg(feature = "memory")] memory: Option<&str>,
+    force: bool,
 ) -> Option<HeadlessCompactionPlan> {
     if !cfg.resolve_compact_enabled() {
         return None;
@@ -675,11 +697,13 @@ fn headless_compaction_plan(
         crate::extras::memory::effective_session_reserve(configured_reserve, memory, session);
     #[cfg(not(feature = "memory"))]
     let reserve = configured_reserve;
-    if !session.needs_compaction_with_pending_after_tool_result_pruning(
-        reserve,
-        pending_tokens,
-        cfg.resolve_keep_recent_tool_results(),
-    ) {
+    if !force
+        && !session.needs_compaction_with_pending_after_tool_result_pruning(
+            reserve,
+            pending_tokens,
+            cfg.resolve_keep_recent_tool_results(),
+        )
+    {
         return None;
     }
 
@@ -788,18 +812,47 @@ async fn compact_headless_session_if_needed(
     pending_tokens: u64,
     instructions: Option<&str>,
 ) -> anyhow::Result<crate::event::UsageDelta> {
+    #[cfg(feature = "memory")]
+    let memory = context.memory.as_deref();
     #[cfg(not(feature = "memory"))]
     let _ = context;
+    compact_headless_session(
+        session,
+        client,
+        cfg,
+        #[cfg(feature = "memory")]
+        memory,
+        pending_tokens,
+        instructions,
+        false,
+    )
+    .await
+    .map(|(usage, _)| usage)
+}
+
+/// Compact the headless session; `force` is context relief (see
+/// [`headless_compaction_plan_with`]). Returns the summarizer usage (already
+/// charged to the session) and whether any history was compacted.
+async fn compact_headless_session(
+    session: &mut Session,
+    client: &AnyClient,
+    cfg: &Config,
+    #[cfg(feature = "memory")] memory: Option<&str>,
+    pending_tokens: u64,
+    instructions: Option<&str>,
+    force: bool,
+) -> anyhow::Result<(crate::event::UsageDelta, bool)> {
     let spend =
         crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Compaction);
     let observed = crate::spend::run::UsageObserver::with_run(spend.clone());
     let request_observer = observed.clone();
-    let compacted = compact_headless_session_with(
+    let compacted = compact_headless_session_with_force(
         session,
         cfg,
         pending_tokens,
         #[cfg(feature = "memory")]
-        context.memory.as_deref(),
+        memory,
+        force,
         |model, messages, previous_summary, input_token_budget, response_token_budget| async move {
             #[cfg(feature = "hooks")]
             crate::startup::heap_future(|| {
@@ -851,9 +904,13 @@ async fn compact_headless_session_if_needed(
             Some(compacted.first_kept_index),
         );
     }
-    Ok(compacted
-        .map(|compacted| compacted.usage)
-        .unwrap_or_default())
+    let happened = compacted.is_some();
+    Ok((
+        compacted
+            .map(|compacted| compacted.usage)
+            .unwrap_or_default(),
+        happened,
+    ))
 }
 
 /// A completed headless compaction: the summary, where the kept history now
@@ -869,6 +926,7 @@ struct HeadlessCompaction {
     usage: crate::event::UsageDelta,
 }
 
+#[cfg(test)]
 async fn compact_headless_session_with<S, F>(
     session: &mut Session,
     cfg: &Config,
@@ -880,12 +938,37 @@ where
     S: FnOnce(String, Vec<crate::session::SessionMessage>, Option<String>, u64, u64) -> F,
     F: std::future::Future<Output = anyhow::Result<provider::CompactionOutput>>,
 {
-    let Some(plan) = headless_compaction_plan(
+    compact_headless_session_with_force(
         session,
         cfg,
         pending_tokens,
         #[cfg(feature = "memory")]
         memory,
+        false,
+        summarize,
+    )
+    .await
+}
+
+async fn compact_headless_session_with_force<S, F>(
+    session: &mut Session,
+    cfg: &Config,
+    pending_tokens: u64,
+    #[cfg(feature = "memory")] memory: Option<&str>,
+    force: bool,
+    summarize: S,
+) -> anyhow::Result<Option<HeadlessCompaction>>
+where
+    S: FnOnce(String, Vec<crate::session::SessionMessage>, Option<String>, u64, u64) -> F,
+    F: std::future::Future<Output = anyhow::Result<provider::CompactionOutput>>,
+{
+    let Some(plan) = headless_compaction_plan_with(
+        session,
+        cfg,
+        pending_tokens,
+        #[cfg(feature = "memory")]
+        memory,
+        force,
     ) else {
         return Ok(None);
     };
@@ -934,11 +1017,13 @@ where
             .map(|message| message.estimated_tokens)
             .sum()
     };
-    session.compress_with_budget(
+    let restore_read_tokens = cfg.resolve_compact_restore_read_tokens(session.context_window);
+    session.compress_with_budget_restoring(
         summary.clone(),
         first_kept_index,
         tokens_before,
         summary_byte_budget,
+        restore_read_tokens,
     );
     Ok(Some(HeadlessCompaction {
         summary,
@@ -1117,7 +1202,17 @@ impl Startup {
         cfg.max_budget_usd = max_budget_usd;
         validate_startup_permission_policy(&cli, &cfg)?;
 
-        // Load context first so prompts/themes are available early.
+        // Load context first so prompts/themes are available early. Root
+        // context files share a budget relative to the startup model's window
+        // (mini-agent-59sgr).
+        context::set_context_file_budget(context::context_file_budget_for(
+            cfg.resolve_context_window(
+                &cli.resolve_provider(&cfg),
+                &cli.resolve_model(&cfg),
+                config::quick_models_map(&cfg),
+            ),
+            cfg.context_files_max_bytes,
+        ));
         let no_context_files = cli.resolve_no_context_files(&cfg);
         // Persistent memory is read once below, after the session is known,
         // so a resumed session's compaction exclusion is applied in one pass.
@@ -1384,6 +1479,29 @@ impl Startup {
             cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )?;
+
+        // Ollama truncates silently beyond the model's context length, so a
+        // window larger than it is capped (mini-agent-djwve). Best effort: an
+        // unreachable server keeps the configured window.
+        if let Some(length) = provider::probe_ollama_context_length(
+            &client,
+            session.model.as_str(),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+            && length < session.context_window
+        {
+            if cfg
+                .known_context_window(session.provider.as_str(), session.model.as_str(), qm_map)
+                .is_some()
+            {
+                eprintln!(
+                    "warning: context_window {} exceeds the Ollama model's context length {length}; using {length}",
+                    session.context_window
+                );
+            }
+            session.update_context_window(length);
+        }
 
         let resume_override_pending = resume_decision
             .as_ref()
@@ -2504,6 +2622,7 @@ impl Startup {
                 },
             prompt: recorded_prompt,
             persisted: already_persisted,
+            relief_usage,
         } = response_result;
         // Priced and charged in one shape whatever the provider.
         let usage: rig::completion::Usage = self
@@ -2516,6 +2635,7 @@ impl Startup {
         // reported figure only, never to `usage`, which is charged below.
         let json_usage: rig::completion::Usage = crate::event::UsageDelta::from(usage)
             .saturating_add(compaction_usage)
+            .saturating_add(relief_usage)
             .into();
         let json_context = if json_output {
             let files_changed = crate::print::files_changed_since(
@@ -3384,41 +3504,36 @@ async fn run_headless_goal_rounds(
         } else {
             // An inactive goal has no automatic rounds. Keep its measured
             // 141 KiB polling frame off the ordinary one-turn HTTP path.
-            let turn = heap_future(|| {
-                let agent = agent.clone();
-                #[cfg(feature = "agent-skills")]
-                let agent = agent.with_instruction_turn(instruction_turn);
-                let agent = agent
-                    .with_main_session(cfg, session)
-                    .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
-                    .with_file_checkpoints(session.file_checkpoints.recorder(
-                        &session.id,
-                        session.messages.len(),
-                        cli.no_session,
-                    ))
-                    .with_question_turn(Some(crate::question::QuestionTurn::default()));
-                #[cfg(feature = "hooks")]
-                let loop_info = loop_round_info(session, loop_mode);
-                async move {
-                    agent
-                        .run_print_with_output(
-                            message,
-                            output,
-                            &cfg.retry,
-                            history,
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                        .await
-                }
+            let relieved = heap_future(|| {
+                run_relieved_headless_turn(
+                    agent,
+                    session,
+                    cli,
+                    cfg,
+                    client,
+                    message,
+                    history,
+                    output,
+                    crate::question::QuestionTurn::default(),
+                    #[cfg(feature = "agent-skills")]
+                    instruction_turn,
+                    #[cfg(feature = "hooks")]
+                    loop_mode,
+                )
             })
             .await;
-            (turn, false)
+            return HeadlessRounds {
+                turn: relieved.turn,
+                prompt: relieved.prompt,
+                persisted: relieved.persisted,
+                relief_usage: relieved.relief_usage,
+            };
         };
         return HeadlessRounds {
             turn,
             prompt: message.to_owned(),
             persisted,
+            relief_usage: Default::default(),
         };
     }
     heap_future(|| {
@@ -3488,6 +3603,8 @@ async fn run_headless_goal_rounds_inner(
     // files it under a prompt that was never sent.
     #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
     let mut round_prompt = message.to_string();
+    // Earlier segments of a relieved round, already charged to the session.
+    let mut relief_usage = crate::event::UsageDelta::default();
 
     // A goal's time bound measures how long the agent worked. Headless runs
     // never wait on a permission prompt, so the round's wall clock is its
@@ -3523,38 +3640,27 @@ async fn run_headless_goal_rounds_inner(
         })
         .await
     } else {
-        let turn = heap_future(|| {
-            // The chained setters move a large AnyAgent. Construct it in this
-            // short factory frame before the owned request starts polling HTTP.
-            let agent = agent.clone();
-            #[cfg(feature = "agent-skills")]
-            let agent = agent.with_instruction_turn(instruction_turn.clone());
-            let agent = agent
-                .with_main_session(cfg, session)
-                .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
-                .with_file_checkpoints(session.file_checkpoints.recorder(
-                    &session.id,
-                    session.messages.len(),
-                    cli.no_session,
-                ))
-                .with_question_turn(Some(question_turn.clone()));
-            #[cfg(feature = "hooks")]
-            let loop_info = loop_round_info(session, loop_mode);
-            async move {
-                agent
-                    .run_print_with_output(
-                        message,
-                        output,
-                        &cfg.retry,
-                        history,
-                        #[cfg(feature = "hooks")]
-                        loop_info,
-                    )
-                    .await
-            }
+        let relieved = heap_future(|| {
+            run_relieved_headless_turn(
+                agent,
+                session,
+                cli,
+                cfg,
+                client,
+                message,
+                history,
+                output,
+                question_turn.clone(),
+                #[cfg(feature = "agent-skills")]
+                instruction_turn.clone(),
+                #[cfg(feature = "hooks")]
+                loop_mode,
+            )
         })
         .await;
-        (turn, false)
+        round_prompt = relieved.prompt;
+        relief_usage = relieved.relief_usage;
+        (relieved.turn, relieved.persisted)
     };
     #[cfg(feature = "goal")]
     let mut round_elapsed = round_started.elapsed();
@@ -3914,41 +4020,33 @@ async fn run_headless_goal_rounds_inner(
                 ));
                 break;
             }
+            // Automatic rounds retain the same clarification identity; only
+            // this round's owned financial/request profile is fresh.
             let next = heap_future(|| {
-                // Automatic rounds retain the same clarification identity;
-                // only this round's owned financial/request profile is fresh.
-                let round_agent = round_agent.clone();
-                #[cfg(feature = "agent-skills")]
-                let round_agent = round_agent.with_instruction_turn(instruction_turn.clone());
-                let round_agent = round_agent
-                    .with_main_session(cfg, session)
-                    .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
-                    .with_file_checkpoints(session.file_checkpoints.recorder(
-                        &session.id,
-                        session.messages.len(),
-                        cli.no_session,
-                    ))
-                    .with_question_turn(Some(question_turn.clone()));
-                #[cfg(feature = "hooks")]
-                let loop_info = loop_round_info(session, loop_mode);
-                async move {
-                    round_agent
-                        .run_print_with_output(
-                            &relaunch.prompt,
-                            output,
-                            &cfg.retry,
-                            next_history,
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                        .await
-                }
+                run_relieved_headless_turn(
+                    round_agent,
+                    session,
+                    cli,
+                    cfg,
+                    client,
+                    &relaunch.prompt,
+                    next_history,
+                    output,
+                    question_turn.clone(),
+                    #[cfg(feature = "agent-skills")]
+                    instruction_turn.clone(),
+                    #[cfg(feature = "hooks")]
+                    loop_mode,
+                )
             })
             .await;
             round_elapsed = round_started.elapsed();
             // Only the final round's transcript is returned; earlier rounds are
             // already persisted above.
-            turn = next;
+            round_prompt = next.prompt;
+            persisted = next.persisted;
+            relief_usage = relief_usage.saturating_add(next.relief_usage);
+            turn = next.turn;
         }
     }
 
@@ -3956,6 +4054,275 @@ async fn run_headless_goal_rounds_inner(
         turn,
         prompt: round_prompt,
         persisted,
+        relief_usage,
+    }
+}
+
+/// How many times one headless turn may compact for context relief before the
+/// next pressure signal or provider rejection is surfaced unchanged.
+const MAX_HEADLESS_CONTEXT_RELIEFS: usize = 3;
+
+/// A non-native headless turn after any context relief it needed.
+pub(crate) struct RelievedHeadlessTurn {
+    /// The last segment. When `persisted`, its records and usage are already
+    /// in the session; they remain here for reporting only.
+    pub turn: crate::agent::runner::HeadlessTurn,
+    /// The prompt the last segment ran with (the continuation prompt after a
+    /// relief that recorded progress).
+    pub prompt: String,
+    pub persisted: bool,
+    /// Usage of earlier segments and relief compactions, already charged to
+    /// the session; reported with the turn but never charged again.
+    pub relief_usage: crate::event::UsageDelta,
+}
+
+/// Why a headless segment stopped for context relief.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadlessReliefCause {
+    /// The provider rejected a request for exceeding its context window.
+    ContextLength,
+    /// Real prompt pressure crossed `mid_turn_compact_threshold` and the
+    /// runner stopped at a complete tool-batch boundary (mini-agent-sgzh0).
+    MidTurn,
+}
+
+fn headless_relief_cause(
+    turn: &crate::agent::runner::HeadlessTurn,
+    reactive_used: bool,
+) -> Option<HeadlessReliefCause> {
+    let failure = turn.failure.as_ref()?;
+    if failure
+        .downcast_ref::<crate::agent::runner::MidTurnCompactionBoundary>()
+        .is_some()
+    {
+        return Some(HeadlessReliefCause::MidTurn);
+    }
+    if !reactive_used && crate::retry::is_context_length_error_message(&format!("{failure:#}")) {
+        return Some(HeadlessReliefCause::ContextLength);
+    }
+    None
+}
+
+/// Run one ordinary (non-native) headless turn with context relief: when real
+/// prompt pressure crosses `mid_turn_compact_threshold` at a tool-batch
+/// boundary (mini-agent-sgzh0), or the provider rejects a request for
+/// exceeding its context window (mini-agent-3mswy, once per turn), record the
+/// progress made so far, compact and continue. `--no-session` compacts the
+/// in-memory session the same way; nothing is written to disk.
+#[allow(clippy::too_many_arguments)]
+async fn run_relieved_headless_turn(
+    agent: &provider::AnyAgent,
+    session: &mut Session,
+    cli: &Cli,
+    cfg: &config::Config,
+    client: &provider::AnyClient,
+    message: &str,
+    history: std::sync::Arc<[rig::completion::Message]>,
+    output: crate::print::HeadlessOutputPolicy,
+    question_turn: crate::question::QuestionTurn,
+    #[cfg(feature = "agent-skills")] instruction_turn: Option<
+        std::sync::Arc<crate::extras::skills::session::InstructionTurn>,
+    >,
+    #[cfg(feature = "hooks")] loop_mode: bool,
+) -> RelievedHeadlessTurn {
+    relieve_headless_turn(
+        session,
+        cfg,
+        cli.no_session,
+        message,
+        history,
+        async |session: &mut Session, prompt: &str, history, mid_turn| {
+            let agent = agent.clone();
+            #[cfg(feature = "agent-skills")]
+            let agent = agent.with_instruction_turn(instruction_turn.clone());
+            let agent = agent
+                .with_main_session(cfg, session)
+                .with_spend_for_session(session, cfg, crate::spend::RequestKind::Turn)
+                .with_file_checkpoints(session.file_checkpoints.recorder(
+                    &session.id,
+                    session.messages.len(),
+                    cli.no_session,
+                ))
+                .with_question_turn(Some(question_turn.clone()));
+            #[cfg(feature = "hooks")]
+            let loop_info = loop_round_info(session, loop_mode);
+            heap_future(|| {
+                crate::agent::runner::with_headless_mid_turn(
+                    mid_turn,
+                    agent.run_print_with_output(
+                        prompt,
+                        output,
+                        &cfg.retry,
+                        history,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                    ),
+                )
+            })
+            .await
+        },
+        async |session: &mut Session, pending_tokens| {
+            heap_future(|| {
+                compact_headless_session(
+                    session,
+                    client,
+                    cfg,
+                    #[cfg(feature = "memory")]
+                    None,
+                    pending_tokens,
+                    cli.compact_instructions.as_deref(),
+                    true,
+                )
+            })
+            .await
+        },
+    )
+    .await
+}
+
+/// The context-relief control loop behind [`run_relieved_headless_turn`],
+/// generic over the segment runner and the compactor so it is testable
+/// without a provider.
+async fn relieve_headless_turn(
+    session: &mut Session,
+    cfg: &config::Config,
+    no_session: bool,
+    message: &str,
+    history: std::sync::Arc<[rig::completion::Message]>,
+    mut run_segment: impl AsyncFnMut(
+        &mut Session,
+        &str,
+        std::sync::Arc<[rig::completion::Message]>,
+        Option<crate::agent::runner::HeadlessMidTurnPolicy>,
+    ) -> crate::agent::runner::HeadlessTurn,
+    mut compact: impl AsyncFnMut(&mut Session, u64) -> anyhow::Result<(crate::event::UsageDelta, bool)>,
+) -> RelievedHeadlessTurn {
+    let mut prompt = message.to_owned();
+    let mut history = history;
+    let mut relief_usage = crate::event::UsageDelta::default();
+    let mut reliefs = 0usize;
+    let mut reactive_used = false;
+    let mut mid_turn_available = true;
+    loop {
+        let mid_turn = (mid_turn_available
+            && cfg.resolve_compact_enabled()
+            && reliefs < MAX_HEADLESS_CONTEXT_RELIEFS
+            && session.context_window > 0)
+            .then(|| cfg.resolve_mid_turn_compact_threshold())
+            .flatten()
+            .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
+                window: session.context_window,
+                threshold,
+                anthropic_native: cfg.is_anthropic_native(&session.provider),
+            });
+        let turn = run_segment(session, &prompt, history.clone(), mid_turn).await;
+        let cause = if cfg.resolve_compact_enabled() && reliefs < MAX_HEADLESS_CONTEXT_RELIEFS {
+            headless_relief_cause(&turn, reactive_used)
+        } else {
+            None
+        };
+        let Some(cause) = cause else {
+            return RelievedHeadlessTurn {
+                turn,
+                prompt,
+                persisted: false,
+                relief_usage,
+            };
+        };
+        reliefs += 1;
+        if cause == HeadlessReliefCause::ContextLength {
+            reactive_used = true;
+        }
+        let crate::agent::runner::HeadlessTurn {
+            response,
+            usage,
+            interactions,
+            failure,
+        } = turn;
+        // A boundary is not a failure: the turn continues after relief.
+        let failure = failure.filter(|_| cause == HeadlessReliefCause::ContextLength);
+        let made_progress = cause == HeadlessReliefCause::MidTurn
+            || !interactions.is_empty()
+            || !response.trim().is_empty();
+        // Record what already ran (and its usage) so the summarizer sees it and
+        // a resumed session never repeats completed effects.
+        let usage = cfg.normalize_usage(&session.provider, usage.into());
+        session.charge_usage_delta(usage, cfg.is_anthropic_native(&session.provider));
+        relief_usage = relief_usage.saturating_add(usage);
+        if made_progress {
+            crate::print::persist_headless_turn(session, &prompt, &response, &interactions);
+        }
+        let pending_tokens = if made_progress {
+            Session::estimate_tokens(crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT)
+        } else {
+            Session::estimate_tokens(&prompt)
+        };
+        let surfaced =
+            |failure: Option<anyhow::Error>, prompt: String, relief_usage| RelievedHeadlessTurn {
+                turn: crate::agent::runner::HeadlessTurn {
+                    response: response.clone(),
+                    usage: Default::default(),
+                    interactions: interactions.clone(),
+                    failure,
+                },
+                prompt,
+                persisted: made_progress,
+                relief_usage,
+            };
+        if crate::print::headless_force_stopped() {
+            let failure = failure
+                .or_else(|| Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED)));
+            return surfaced(failure, prompt, relief_usage);
+        }
+        let notice = match cause {
+            HeadlessReliefCause::ContextLength => {
+                "context limit reached; compacting the headless session and retrying once...\n"
+            }
+            HeadlessReliefCause::MidTurn => {
+                "mid-turn context relief: compacting the headless session and continuing...\n"
+            }
+        };
+        if let Err(error) = crate::print::headless_stderr_async(notice.to_string()).await {
+            return surfaced(Some(error), prompt, relief_usage);
+        }
+        match compact(session, pending_tokens).await {
+            Ok((usage, true)) => relief_usage = relief_usage.saturating_add(usage),
+            Ok((usage, false)) => {
+                relief_usage = relief_usage.saturating_add(usage);
+                if cause == HeadlessReliefCause::ContextLength {
+                    // Nothing older than the kept recent history: retrying
+                    // would send the same request again.
+                    return surfaced(failure, prompt, relief_usage);
+                }
+                // Nothing to compact yet: continue without the mid-turn
+                // trigger rather than stopping at every batch.
+                mid_turn_available = false;
+            }
+            Err(error) => {
+                if let Some(observed) = error.downcast_ref::<HeadlessCompactionUsage>() {
+                    relief_usage = relief_usage.saturating_add(observed.0);
+                }
+                let error = match failure {
+                    Some(failure) => failure.context(format!("context relief failed: {error:#}")),
+                    None => error,
+                };
+                return surfaced(Some(error), prompt, relief_usage);
+            }
+        }
+        if !no_session
+            && let Err(error) = session::storage::save_session_recovering(session, |notice| {
+                eprintln!("warning: {notice}")
+            })
+        {
+            return surfaced(Some(error), prompt, relief_usage);
+        }
+        if made_progress {
+            prompt = crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT.to_owned();
+        }
+        history = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+            session,
+            cfg.resolve_keep_recent_tool_results(),
+        );
     }
 }
 
@@ -3996,6 +4363,9 @@ pub(crate) struct HeadlessRounds {
     pub turn: crate::agent::runner::HeadlessTurn,
     pub prompt: String,
     pub persisted: bool,
+    /// Usage of context-relief segments and compactions inside these rounds,
+    /// already charged to the session; reported, never charged again.
+    pub relief_usage: crate::event::UsageDelta,
 }
 
 /// Comparable label for the tool set recorded in the session environment:
@@ -4041,8 +4411,9 @@ mod tests {
         OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
         apply_resume_provider_decision, compact_headless_session_with, headless_compaction_plan,
         interactive_initial_message, js_runtime_banner_lines, needs_openrouter_context_refresh,
-        require_recent_session, resolve_resume_provider_decision, run_startup_probes_concurrently,
-        unavailable_sandbox_must_fail, validate_startup_permission_policy,
+        relieve_headless_turn, require_recent_session, resolve_resume_provider_decision,
+        run_startup_probes_concurrently, unavailable_sandbox_must_fail,
+        validate_startup_permission_policy,
     };
     use crate::cli::Cli;
 
@@ -4365,6 +4736,323 @@ mod tests {
             .is_some(),
             "pending prompt must trigger compaction"
         );
+    }
+
+    // mini-agent-3mswy: a config that never mentions compaction compacts an
+    // over-budget session; an explicit `false` is still honored.
+    #[test]
+    fn default_config_auto_compacts_over_budget_session_and_explicit_false_is_honored() {
+        let mut session = crate::session::Session::new("openai", "model", 2_000, "");
+        session.overhead_tokens = 200;
+        for index in 0..12 {
+            session.add_message(crate::session::MessageRole::User, &"u".repeat(400));
+            session.add_message(
+                crate::session::MessageRole::Assistant,
+                &format!("{index}{}", "a".repeat(400)),
+            );
+        }
+        let fresh = crate::config::Config {
+            keep_recent_tokens: Some(100),
+            ..crate::config::Config::default()
+        };
+        assert!(fresh.resolve_compact_enabled());
+        assert!(
+            headless_compaction_plan(
+                &session,
+                &fresh,
+                0,
+                #[cfg(feature = "memory")]
+                None,
+            )
+            .is_some(),
+            "an unconfigured over-budget session must compact automatically"
+        );
+        let disabled = crate::config::Config {
+            compact_enabled: Some(false),
+            ..fresh
+        };
+        assert!(
+            headless_compaction_plan(
+                &session,
+                &disabled,
+                0,
+                #[cfg(feature = "memory")]
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    fn relief_session() -> crate::session::Session {
+        let mut session = crate::session::Session::new("openai", "model", 200_000, "");
+        session.add_message(crate::session::MessageRole::User, "old question");
+        session.add_message(crate::session::MessageRole::Assistant, "old answer");
+        session
+    }
+
+    fn context_length_turn() -> crate::agent::runner::HeadlessTurn {
+        crate::agent::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            crate::retry::with_context_length_hint(
+                "400 Bad Request: This model's maximum context length is 8192 tokens"
+            )
+        ))
+    }
+
+    fn ok_turn(text: &str) -> crate::agent::runner::HeadlessTurn {
+        crate::agent::runner::HeadlessTurn {
+            response: text.to_owned(),
+            usage: rig::completion::Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..Default::default()
+            },
+            interactions: Vec::new(),
+            failure: None,
+        }
+    }
+
+    // mini-agent-3mswy: a provider context-length rejection triggers exactly
+    // one compaction and one retry of the same prompt.
+    #[tokio::test]
+    async fn headless_context_length_rejection_compacts_once_and_retries_once() {
+        let mut session = relief_session();
+        let cfg = crate::config::Config::default();
+        let mut prompts = Vec::new();
+        let mut compactions = 0;
+        let relieved = relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, prompt: &str, _history, _mid_turn| {
+                prompts.push(prompt.to_owned());
+                if prompts.len() == 1 {
+                    context_length_turn()
+                } else {
+                    ok_turn("done")
+                }
+            },
+            async |_session: &mut crate::session::Session, _pending| {
+                compactions += 1;
+                Ok((crate::event::UsageDelta::default(), true))
+            },
+        )
+        .await;
+        assert!(
+            relieved.turn.failure.is_none(),
+            "{:?}",
+            relieved.turn.failure
+        );
+        assert_eq!(relieved.turn.response, "done");
+        assert_eq!(compactions, 1);
+        assert_eq!(prompts, ["do the thing", "do the thing"]);
+        assert_eq!(relieved.prompt, "do the thing");
+        assert!(!relieved.persisted);
+    }
+
+    #[tokio::test]
+    async fn headless_second_context_length_rejection_is_surfaced_without_another_compaction() {
+        let mut session = relief_session();
+        let cfg = crate::config::Config::default();
+        let mut runs = 0;
+        let mut compactions = 0;
+        let relieved = relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, _prompt: &str, _history, _mid_turn| {
+                runs += 1;
+                context_length_turn()
+            },
+            async |_session: &mut crate::session::Session, _pending| {
+                compactions += 1;
+                Ok((crate::event::UsageDelta::default(), true))
+            },
+        )
+        .await;
+        assert_eq!((runs, compactions), (2, 1));
+        let failure = relieved.turn.failure.expect("second rejection is surfaced");
+        assert!(crate::retry::is_context_length_error_message(
+            &failure.to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn headless_context_length_rejection_is_not_relieved_when_compaction_is_disabled() {
+        let mut session = relief_session();
+        let cfg = crate::config::Config {
+            compact_enabled: Some(false),
+            ..crate::config::Config::default()
+        };
+        let mut runs = 0;
+        let mut compactions = 0;
+        let relieved = relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, _prompt: &str, _history, _mid_turn| {
+                runs += 1;
+                context_length_turn()
+            },
+            async |_session: &mut crate::session::Session, _pending| {
+                compactions += 1;
+                Ok((crate::event::UsageDelta::default(), true))
+            },
+        )
+        .await;
+        assert_eq!((runs, compactions), (1, 0));
+        assert!(relieved.turn.failure.is_some());
+    }
+
+    // A rejection after tool progress records that progress before compacting
+    // and continues with the relief prompt instead of repeating the task.
+    #[tokio::test]
+    async fn headless_context_length_rejection_after_progress_persists_it_and_continues() {
+        let mut session = relief_session();
+        let cfg = crate::config::Config::default();
+        let before = session.messages.len();
+        let mut prompts = Vec::new();
+        let relieved = relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, prompt: &str, _history, _mid_turn| {
+                prompts.push(prompt.to_owned());
+                if prompts.len() == 1 {
+                    let mut turn = context_length_turn();
+                    turn.response = "partial progress".into();
+                    turn
+                } else {
+                    ok_turn("done")
+                }
+            },
+            async |session: &mut crate::session::Session, _pending| {
+                assert!(
+                    session
+                        .messages
+                        .iter()
+                        .any(|message| message.content == "partial progress"),
+                    "progress must be recorded before compaction"
+                );
+                Ok((crate::event::UsageDelta::default(), true))
+            },
+        )
+        .await;
+        assert!(relieved.turn.failure.is_none());
+        assert_eq!(
+            prompts[1],
+            crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT
+        );
+        assert_eq!(
+            relieved.prompt,
+            crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT
+        );
+        assert!(session.messages.len() > before);
+    }
+
+    // mini-agent-sgzh0: the driver arms mid-turn compaction by default, and a
+    // boundary compacts the (possibly in-memory) session and continues the
+    // task with the relief prompt instead of surfacing an error.
+    #[tokio::test]
+    async fn headless_mid_turn_boundary_compacts_and_continues() {
+        {
+            let mut session = relief_session();
+            let cfg = crate::config::Config::default();
+            let mut calls = Vec::new();
+            let mut compactions = 0;
+            let relieved = relieve_headless_turn(
+                &mut session,
+                &cfg,
+                // `--no-session`: the in-memory session is compacted in place.
+                true,
+                "do the thing",
+                std::sync::Arc::from(Vec::new()),
+                async |_session: &mut crate::session::Session, prompt: &str, _history, mid_turn| {
+                    calls.push((prompt.to_owned(), mid_turn));
+                    if calls.len() == 1 {
+                        crate::agent::runner::HeadlessTurn {
+                            response: String::new(),
+                            usage: Default::default(),
+                            interactions: vec![rig::completion::Message::user("tool work")],
+                            failure: Some(anyhow::anyhow!(
+                                crate::agent::runner::MidTurnCompactionBoundary { pressure: 0.95 }
+                            )),
+                        }
+                    } else {
+                        ok_turn("done")
+                    }
+                },
+                async |_session: &mut crate::session::Session, _pending| {
+                    compactions += 1;
+                    Ok((crate::event::UsageDelta::default(), true))
+                },
+            )
+            .await;
+            assert!(
+                relieved.turn.failure.is_none(),
+                "{:?}",
+                relieved.turn.failure
+            );
+            assert_eq!(compactions, 1);
+            assert_eq!(calls.len(), 2);
+            let armed = calls[0].1.expect("mid-turn compaction is armed by default");
+            assert_eq!(armed.window, 200_000);
+            assert_eq!(
+                armed.threshold,
+                crate::config::DEFAULT_MID_TURN_COMPACT_THRESHOLD
+            );
+            assert_eq!(
+                calls[1].0,
+                crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT
+            );
+            assert_eq!(
+                relieved.prompt,
+                crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_mid_turn_is_not_armed_when_disabled() {
+        for cfg in [
+            crate::config::Config {
+                compact_enabled: Some(false),
+                ..crate::config::Config::default()
+            },
+            crate::config::Config {
+                mid_turn_compact_threshold: Some(0.0),
+                ..crate::config::Config::default()
+            },
+        ] {
+            let mut session = relief_session();
+            let mut armed = Vec::new();
+            relieve_headless_turn(
+                &mut session,
+                &cfg,
+                true,
+                "do the thing",
+                std::sync::Arc::from(Vec::new()),
+                async |_session: &mut crate::session::Session,
+                       _prompt: &str,
+                       _history,
+                       mid_turn| {
+                    armed.push(mid_turn.is_some());
+                    ok_turn("done")
+                },
+                async |_session: &mut crate::session::Session, _pending| {
+                    Ok((crate::event::UsageDelta::default(), true))
+                },
+            )
+            .await;
+            assert_eq!(armed, [false]);
+        }
     }
 
     #[test]

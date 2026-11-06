@@ -277,7 +277,7 @@ pub fn is_context_length_error_message(message: &str) -> bool {
 pub fn with_context_length_hint(message: &str) -> String {
     if is_context_length_error_message(message) {
         format!(
-            "{message}\nContext limit reached. Run /compress before retrying. To compact automatically before future requests, set compact_enabled = true."
+            "{message}\nContext limit reached. Run /compress before retrying. Automatic compaction requires compact_enabled = true (the default)."
         )
     } else {
         message.to_string()

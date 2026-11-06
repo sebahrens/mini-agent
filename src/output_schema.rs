@@ -949,6 +949,7 @@ mod tests {
             },
             prompt: "answer".into(),
             persisted: false,
+            relief_usage: Default::default(),
         };
         let outcome = repair_rounds(
             &mut rounds,

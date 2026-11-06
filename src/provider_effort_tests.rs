@@ -1330,3 +1330,83 @@ async fn hooks60_actual_paused_gate_cancellation_retires_hook_before_zero_http()
     ));
     assert!(wire.finish().is_empty());
 }
+
+// mini-agent-djwve: an Ollama request carries the session window as
+// `options.num_ctx`; an explicit user value wins.
+#[tokio::test]
+async fn ollama_request_body_carries_the_session_window_as_num_ctx() {
+    let done = concat!(
+        r#"{"model":"llama3.1","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"hi"},"done":false}"#,
+        "\n",
+        r#"{"model":"llama3.1","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","total_duration":1,"load_duration":1,"prompt_eval_count":3,"prompt_eval_duration":1,"eval_count":1,"eval_duration":1}"#,
+        "\n"
+    );
+    let wire = Wire::at_path(vec![(false, done.to_string())], "/api/chat");
+    let AnyModel::Ollama(model) = wire.client_for("ollama").completion_model("llama3.1") else {
+        panic!("ollama custom provider must build an Ollama model")
+    };
+    let agent = AnyAgent::without_skills(AnyAgentInner::Ollama(
+        rig::agent::AgentBuilder::new(model).build(),
+    ))
+    .with_ollama_context_window(32_768);
+    let _ = agent
+        .run_print_with_output(
+            "hello",
+            crate::print::HeadlessOutputPolicy::legacy(false, true),
+            &RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            Vec::<rig::completion::Message>::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await;
+    let requests = wire.finish();
+    assert_eq!(requests[0]["options"]["num_ctx"], 32_768, "{}", requests[0]);
+}
+
+#[test]
+fn ollama_num_ctx_respects_an_explicit_user_value() {
+    assert_eq!(
+        with_ollama_num_ctx(None, 8192),
+        Some(json!({"num_ctx": 8192}))
+    );
+    assert_eq!(
+        with_ollama_num_ctx(Some(json!({"num_ctx": 4096, "keep_alive": "5m"})), 8192),
+        Some(json!({"num_ctx": 4096, "keep_alive": "5m"}))
+    );
+    assert_eq!(
+        with_ollama_num_ctx(Some(json!({"options": {"num_ctx": 2048}})), 8192),
+        Some(json!({"options": {"num_ctx": 2048}}))
+    );
+    assert_eq!(
+        with_ollama_num_ctx(Some(json!({"temperature": 0.1})), 8192),
+        Some(json!({"temperature": 0.1, "num_ctx": 8192}))
+    );
+    assert_eq!(with_ollama_num_ctx(None, 0), None);
+}
+
+#[tokio::test]
+async fn ollama_show_probe_reads_the_model_context_length() {
+    let show =
+        json!({"model_info": {"general.architecture": "llama", "llama.context_length": 131072}});
+    assert_eq!(ollama_show_context_length(&show), Some(131_072));
+    assert_eq!(ollama_show_context_length(&json!({"model_info": {}})), None);
+    let wire = Wire::at_path(vec![(false, show.to_string())], "/api/show");
+    let length = probe_ollama_context_length(
+        &wire.client_for("ollama"),
+        "llama3.1",
+        Duration::from_secs(5),
+    )
+    .await;
+    let requests = wire.finish();
+    assert_eq!(length, Some(131_072));
+    assert_eq!(requests[0]["model"], "llama3.1");
+    let anthropic = Wire::new(Vec::new());
+    assert_eq!(
+        probe_ollama_context_length(&anthropic.client(), "m", Duration::from_secs(1)).await,
+        None,
+        "only Ollama clients are probed"
+    );
+}

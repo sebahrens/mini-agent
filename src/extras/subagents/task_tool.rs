@@ -1389,11 +1389,13 @@ editing in a known location, grepping for a literal you will act on immediately.
             let hook_agent_source = hook_agent_source.clone();
             let initial_usage = SharedUsageLedger::default().with_admission(admission(false));
             let retry_usage = SharedUsageLedger::default().with_admission(admission(false));
+            let relief_usage = SharedUsageLedger::default().with_admission(admission(false));
             let repair_usage = SharedUsageLedger::default().with_admission(admission(true));
             let writeup_usage = SharedUsageLedger::default().with_admission(admission(true));
             let cancellation_units = child_budget.clone();
             let cancellation_initial_usage = initial_usage.clone();
             let cancellation_retry_usage = retry_usage.clone();
+            let cancellation_relief_usage = relief_usage.clone();
             let cancellation_repair_usage = repair_usage.clone();
             let cancellation_writeup_usage = writeup_usage.clone();
             let cancellation_cost = Arc::new(move || {
@@ -1403,8 +1405,11 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let observed = usage_saturating_add(
                     usage_saturating_add(
                         usage_saturating_add(
-                            cancellation_initial_usage.total(),
-                            cancellation_retry_usage.total(),
+                            usage_saturating_add(
+                                cancellation_initial_usage.total(),
+                                cancellation_retry_usage.total(),
+                            ),
+                            cancellation_relief_usage.total(),
                         ),
                         cancellation_repair_usage.total(),
                     ),
@@ -1513,8 +1518,49 @@ editing in a known location, grepping for a literal you will act on immediately.
                         None,
                     )
                     .await;
+                // A child whose next request would exceed its window compacts
+                // its own conversation and continues (mini-agent-d0rfu).
+                let relief_agent = agent.clone();
+                let relief_retry = config.retry.clone();
+                let relief_events = event_tx.clone();
+                let relief_ledger = relief_usage.clone();
                 #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
-                let mut run = result;
+                let mut run = relieve_child_context(
+                    result,
+                    config.resolve_compact_enabled(),
+                    config.subagent_context_window.unwrap_or(u64::MAX),
+                    &execution_prompt,
+                    || task_budget.exhausted(),
+                    |stage, prompt, history| {
+                        let agent = match stage {
+                            ChildRelief::Summarize => relief_agent
+                                .clone()
+                                .for_subagent_report_repair(repair_max_tokens),
+                            ChildRelief::Continue => relief_agent.clone(),
+                        };
+                        let turns = match stage {
+                            ChildRelief::Summarize => REPORT_REPAIR_MAX_TURNS,
+                            ChildRelief::Continue => max_turns,
+                        };
+                        let retry = relief_retry.clone();
+                        let events = relief_events.clone();
+                        let ledger = relief_ledger.clone();
+                        async move {
+                            agent
+                                .run_subagent_with_history(
+                                    &prompt,
+                                    history,
+                                    turns,
+                                    events.as_ref(),
+                                    &retry,
+                                    ledger,
+                                    None,
+                                )
+                                .await
+                        }
+                    },
+                )
+                .await;
                 // Host-minted evidence comes from the child's actual tool
                 // results, in call order; the report contract can only cite it.
                 let mut evidence = super::evidence::ChildEvidence::default();
@@ -3206,6 +3252,146 @@ fn normalize_report_contract(response: &str) -> Option<String> {
 /// Model turns allowed for the report-contract repair: one reply, no new
 /// tool work.
 const REPORT_REPAIR_MAX_TURNS: usize = 1;
+
+/// How many times one child may compact its own conversation after its next
+/// request would exceed `subagent_context_window` (mini-agent-d0rfu).
+const MAX_CHILD_COMPACTIONS: u32 = 2;
+
+/// Tool-free request that condenses the child's (trimmed) conversation.
+const CHILD_SUMMARY_PROMPT: &str = "Your context window is full. Without calling tools, \
+write a concise working summary of this task so far: the goal, what you inspected (paths, \
+symbols, commands), your findings with their evidence, and what remains to do. The summary \
+replaces the conversation history.";
+
+/// Prompt that resumes the child on its compacted history.
+const CHILD_CONTINUE_PROMPT: &str = "[Your earlier conversation was compacted into the summary \
+above to fit your context window.] Continue the task from there. Do not redo finished work; \
+prefer narrow tool calls.";
+
+/// Notice that replaces an older tool result trimmed from a child's history.
+const CHILD_TRIMMED_RESULT: &str =
+    "[older tool result omitted to fit the child context window; re-run the tool if needed]";
+
+/// Which tool-free/continued child request [`relieve_child_context`] asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildRelief {
+    Summarize,
+    Continue,
+}
+
+fn child_message_tokens(message: &Message) -> u64 {
+    crate::session::Session::estimate_tokens(&serde_json::to_string(message).unwrap_or_default())
+}
+
+/// Replace the oldest tool-result payloads with [`CHILD_TRIMMED_RESULT`]
+/// until the history's local estimate fits `token_budget`. Call ids, order and
+/// every other message are preserved, so the history stays well formed.
+fn trim_child_history(history: &[Message], token_budget: u64) -> Vec<Message> {
+    let mut trimmed = history.to_vec();
+    let mut total: u64 = trimmed.iter().map(child_message_tokens).sum();
+    for message in trimmed.iter_mut() {
+        if total <= token_budget {
+            break;
+        }
+        let Message::User { content } = message else {
+            continue;
+        };
+        if !content
+            .iter()
+            .any(|item| matches!(item, rig::message::UserContent::ToolResult(_)))
+        {
+            continue;
+        }
+        let before = child_message_tokens(&Message::User {
+            content: content.clone(),
+        });
+        let items = content
+            .iter()
+            .map(|item| match item {
+                rig::message::UserContent::ToolResult(result) => {
+                    let mut result = result.clone();
+                    result.content = rig::OneOrMany::one(rig::message::ToolResultContent::text(
+                        CHILD_TRIMMED_RESULT,
+                    ));
+                    rig::message::UserContent::ToolResult(result)
+                }
+                other => other.clone(),
+            })
+            .collect::<Vec<_>>();
+        if let Ok(items) = rig::OneOrMany::many(items) {
+            *content = items;
+        }
+        let after = child_message_tokens(&Message::User {
+            content: content.clone(),
+        });
+        total = total.saturating_sub(before.saturating_sub(after));
+    }
+    trimmed
+}
+
+/// Compact and continue a child whose next request would exceed its window
+/// (mini-agent-d0rfu): trim old tool results to half the window, ask the child
+/// (tool-free) for a working summary, then continue on `[brief, summary]`.
+/// `continue_child` reports the cumulative usage of one shared relief ledger
+/// (charged to the task's weighted units); it is added to the original run's
+/// usage. Disabled compaction or a failed summary keeps the refusal, which
+/// names `subagent_context_window`.
+async fn relieve_child_context<C, Fut>(
+    mut run: SubagentRunOutput,
+    enabled: bool,
+    window: u64,
+    brief: &str,
+    budget_exhausted: impl Fn() -> bool,
+    mut continue_child: C,
+) -> SubagentRunOutput
+where
+    C: FnMut(ChildRelief, String, Vec<Message>) -> Fut,
+    Fut: Future<Output = SubagentRunOutput>,
+{
+    let initial_usage = run.usage;
+    let mut compactions = 0;
+    while run.context_exhausted
+        && enabled
+        && compactions < MAX_CHILD_COMPACTIONS
+        && !run.history.is_empty()
+        && !budget_exhausted()
+    {
+        compactions += 1;
+        let trimmed = trim_child_history(&run.history, window / 2);
+        let summary = continue_child(
+            ChildRelief::Summarize,
+            CHILD_SUMMARY_PROMPT.to_string(),
+            trimmed,
+        )
+        .await;
+        run.usage = usage_saturating_add(initial_usage, summary.usage);
+        let Ok(text) = summary.response else {
+            break;
+        };
+        if text.trim().is_empty() || budget_exhausted() {
+            break;
+        }
+        let history = vec![Message::user(brief), Message::assistant(text)];
+        let next = continue_child(
+            ChildRelief::Continue,
+            CHILD_CONTINUE_PROMPT.to_string(),
+            history,
+        )
+        .await;
+        let relief_usage = next.usage;
+        let mut tool_log = std::mem::take(&mut run.tool_log);
+        tool_log.extend(next.tool_log.iter().cloned());
+        tool_log.truncate(crate::extras::subagents::background::MAX_TOOL_LOG_ENTRIES);
+        let turns = run.turns.saturating_add(next.turns);
+        let tool_calls = run.tool_calls.saturating_add(next.tool_calls);
+        run = next;
+        run.tool_log = tool_log;
+        run.turns = turns;
+        run.tool_calls = tool_calls;
+        run.usage = usage_saturating_add(initial_usage, relief_usage);
+    }
+    run
+}
 
 /// Follow-up asking a child to restate its own findings in the contract
 /// sections. The previous response is quoted as data, not instructions.
@@ -6403,6 +6589,200 @@ mod child_continuation_tests {
                 .await
             })
         }
+    }
+
+    #[derive(Clone)]
+    struct BulkyTool;
+    impl Tool for BulkyTool {
+        const NAME: &'static str = "bulky";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+        fn description(&self) -> String {
+            "Return a large result".to_owned()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok("x".repeat(40_000))
+        }
+    }
+
+    fn small_window_child(
+        model: &MockCompletionModel,
+        window: u64,
+    ) -> rig::agent::Agent<MockCompletionModel> {
+        AgentBuilder::new(model.clone())
+            .tool(BulkyTool)
+            .max_tokens(64)
+            .add_hook(builder::ChildContextGuard::new(window))
+            .build()
+    }
+
+    fn text_usage(text: &str, input_tokens: u64) -> Vec<MockStreamEvent> {
+        vec![
+            MockStreamEvent::text(text),
+            MockStreamEvent::final_response(Usage {
+                input_tokens,
+                output_tokens: 1,
+                total_tokens: input_tokens + 1,
+                ..Usage::new()
+            }),
+        ]
+    }
+
+    // mini-agent-d0rfu: a child that outgrows a small window summarizes its
+    // trimmed conversation and continues; usage of the relief requests is
+    // added to the run (and therefore to the task's weighted units).
+    #[tokio::test]
+    async fn child_exceeding_a_small_window_summarizes_and_continues() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("bulky-1", BulkyTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response(Usage {
+                    input_tokens: 10,
+                    output_tokens: 1,
+                    total_tokens: 11,
+                    ..Usage::new()
+                }),
+            ],
+            text_usage("SUMMARY: bulky output inspected", 20),
+            text_usage("final report", 30),
+        ]);
+        let window = 4_000;
+        let agent = small_window_child(&model, window);
+        let first = run_subagent_with_history(
+            &agent,
+            "inspect the bulky thing",
+            Vec::new(),
+            5,
+            None,
+            &crate::retry::RetryConfig::default(),
+            SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        assert!(first.context_exhausted, "{:?}", first.response);
+        assert!(!first.history.is_empty());
+        let relief_ledger = SharedUsageLedger::default();
+        let mut stages = Vec::new();
+        let run = relieve_child_context(
+            first,
+            true,
+            window,
+            "inspect the bulky thing",
+            || false,
+            |stage, prompt, history| {
+                stages.push(stage);
+                let agent = small_window_child(&model, window);
+                let ledger = relief_ledger.clone();
+                async move {
+                    run_subagent_with_history(
+                        &agent,
+                        &prompt,
+                        history,
+                        3,
+                        None,
+                        &crate::retry::RetryConfig::default(),
+                        ledger,
+                        None,
+                    )
+                    .await
+                }
+            },
+        )
+        .await;
+        assert_eq!(stages, [ChildRelief::Summarize, ChildRelief::Continue]);
+        assert_eq!(run.response.as_deref(), Ok("final report"));
+        assert!(!run.context_exhausted);
+        assert_eq!(run.usage.input_tokens, 10 + 20 + 30);
+        assert_eq!(run.tool_calls, 1);
+        // The refused over-window request never reached the provider.
+        assert_eq!(model.requests().len(), 3);
+        let summary_history = &model.requests()[1].chat_history;
+        assert!(
+            summary_history.iter().any(|message| match message {
+                Message::User { content } => content.iter().any(|item| matches!(item,
+                    UserContent::ToolResult(result) if result.content.iter().any(|part|
+                        matches!(part, ToolResultContent::Text(text) if text.text == CHILD_TRIMMED_RESULT)))),
+                _ => false,
+            }),
+            "the summary request sees the trimmed tool result"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_window_refusal_names_the_key_when_compaction_is_disabled() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::tool_call("bulky-1", BulkyTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = small_window_child(&model, 4_000);
+        let first = run_subagent_with_history(
+            &agent,
+            "inspect the bulky thing",
+            Vec::new(),
+            5,
+            None,
+            &crate::retry::RetryConfig::default(),
+            SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        let mut called = false;
+        let run = relieve_child_context(
+            first,
+            false,
+            4_000,
+            "brief",
+            || false,
+            |_, _, _| {
+                called = true;
+                async { SubagentRunOutput::bare(Ok(String::new()), Usage::new()) }
+            },
+        )
+        .await;
+        assert!(!called);
+        let error = run
+            .response
+            .expect_err("disabled compaction keeps the refusal");
+        assert!(error.contains("subagent_context_window"), "{error}");
+    }
+
+    #[test]
+    fn trim_child_history_replaces_oldest_results_first_and_keeps_ids() {
+        let result = |id: &str, text: &str| Message::User {
+            content: rig::OneOrMany::one(UserContent::tool_result(
+                id,
+                rig::OneOrMany::one(ToolResultContent::text(text)),
+            )),
+        };
+        let history = vec![
+            Message::user("brief"),
+            result("old", &"o".repeat(8_000)),
+            result("new", &"n".repeat(8_000)),
+        ];
+        let full: u64 = history.iter().map(child_message_tokens).sum();
+        let trimmed = trim_child_history(&history, full - 1_000);
+        assert_eq!(trimmed.len(), 3);
+        assert!(history_has_tool_result(&trimmed, CHILD_TRIMMED_RESULT));
+        assert!(
+            history_has_tool_result(&trimmed, &"n".repeat(8_000)),
+            "newest kept"
+        );
+        let ids: Vec<_> = trimmed
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|item| match item {
+                    UserContent::ToolResult(result) => Some(result.id.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["old", "new"]);
+        assert_eq!(trim_child_history(&history, u64::MAX), history);
     }
 
     async fn run_child(model: MockCompletionModel, max_turns: usize) -> SubagentRunOutput {

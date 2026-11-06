@@ -26,6 +26,42 @@ const MAX_PATH_BYTES: usize = 4096;
 const MAX_INCLUDE_DEPTH: usize = 4;
 const MAX_INCLUDE_NODES: usize = 32;
 const CONTEXT_BYTES: usize = 524_288;
+/// Receipt header and per-source JSON keys reserved inside the delivery cap.
+const DELIVERY_OVERHEAD_BYTES: usize = 512;
+/// Marks a nested or included instruction source cut to its bounds.
+const SOURCE_TRUNCATION_NOTICE: &str =
+    "\n\n[instruction source truncated: it exceeds the per-source instruction limit]";
+
+/// `text` (with [`SOURCE_TRUNCATION_NOTICE`] when cut) whose JSON-escaped
+/// form fits `room` bytes. Errors only when not even the notice fits.
+fn fit_instruction_source(
+    mut text: String,
+    mut truncated: bool,
+    room: usize,
+) -> Result<String, String> {
+    let escaped = |text: &str| serde_json::to_string(text).map_or(usize::MAX, |json| json.len());
+    let notice_cost = escaped(SOURCE_TRUNCATION_NOTICE);
+    if !truncated && escaped(&text) <= room {
+        return Ok(text);
+    }
+    if room <= notice_cost {
+        return Err("Workspace instructions exceed the bounded UTF-8 source limit".into());
+    }
+    let target = room - notice_cost;
+    while escaped(&text) > target {
+        let over = escaped(&text) - target;
+        let mut end = text.len().saturating_sub(over.max(1));
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        truncated = true;
+    }
+    if truncated {
+        text.push_str(SOURCE_TRUNCATION_NOTICE);
+    }
+    Ok(text)
+}
 
 /// Captured from the actual typed provider arm at construction, never inferred
 /// from a model/provider name or from untrusted request contents.
@@ -651,15 +687,21 @@ impl WorkspaceInstructions {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.limit.saturating_sub(state.retained)
         };
-        let remaining = remaining
-            .saturating_sub(source_json(loaded)?.len())
-            .min(MAX_SOURCE_BYTES);
-        source.text = match crate::paths::read_utf8_bounded_status(file, remaining)
+        let prior_json = source_json(loaded)?.len();
+        let remaining = remaining.saturating_sub(prior_json).min(MAX_SOURCE_BYTES);
+        // The delivered receipt (all sources of this traversal, JSON-escaped)
+        // must stay within its delivery cap, so an oversized source is cut to
+        // what still fits and marked rather than rejected (mini-agent-59sgr).
+        let delivery_room = MAX_SOURCE_BYTES
+            .saturating_sub(DELIVERY_OVERHEAD_BYTES)
+            .saturating_sub(prior_json)
+            .saturating_sub(source.path.as_os_str().len().saturating_mul(2))
+            .saturating_sub(scope.as_os_str().len().saturating_mul(2))
+            .min(remaining.saturating_sub(DELIVERY_OVERHEAD_BYTES));
+        let (text, truncated) = crate::paths::read_utf8_prefix(file, remaining)
             .map_err(|_| "Could not read workspace instructions")?
-        {
-            crate::paths::BoundedUtf8Read::Content(text) => Arc::from(text),
-            _ => return Err("Workspace instructions exceed the bounded UTF-8 source limit".into()),
-        };
+            .ok_or("Workspace instructions are not valid UTF-8")?;
+        source.text = Arc::from(fit_instruction_source(text, truncated, delivery_room)?);
         binding
             .validate()
             .map_err(|_| "Workspace instruction binding changed")?;
@@ -1445,11 +1487,43 @@ mod tests {
         );
         (root, service)
     }
+    // mini-agent-59sgr: a nested source just over the per-source cap loads
+    // truncated with a notice instead of being rejected, and its delivered
+    // receipt stays within the delivery cap.
+    #[test]
+    fn oversized_nested_instruction_source_loads_truncated_with_notice() {
+        let (_owned, service) = fixture();
+        std::fs::write(
+            service.workspace.root().join("CLAUDE.local.md"),
+            format!(
+                "RULE_START \"quoted\"\n{}",
+                "x".repeat(MAX_SOURCE_BYTES + 1)
+            ),
+        )
+        .unwrap();
+        service.capture_initial(Vec::new(), 0).unwrap();
+        let overlay = service.initial_overlay();
+        let rendered = format!("{overlay:?}");
+        assert!(rendered.contains("RULE_START"), "{rendered}");
+        assert!(
+            rendered.contains("instruction source truncated"),
+            "{rendered}"
+        );
+        let fitted = fit_instruction_source("ab\"c".repeat(10_000), false, 4_096).unwrap();
+        assert!(serde_json::to_string(&fitted).unwrap().len() <= 4_096);
+        assert!(fitted.ends_with(SOURCE_TRUNCATION_NOTICE));
+        assert_eq!(
+            fit_instruction_source("small".into(), false, 4_096).unwrap(),
+            "small"
+        );
+        assert!(fit_instruction_source("x".repeat(100), true, 10).is_err());
+    }
+
     #[test]
     fn context63_source_bytes_utf8_nodes_and_directory_depth_are_bounded() {
-        for bytes in [vec![b'x'; MAX_SOURCE_BYTES + 1], vec![0xff]] {
+        {
             let (_owned, service) = fixture();
-            std::fs::write(service.workspace.root().join("CLAUDE.local.md"), bytes).unwrap();
+            std::fs::write(service.workspace.root().join("CLAUDE.local.md"), vec![0xff]).unwrap();
             assert!(service.capture_initial(Vec::new(), 0).is_err());
             assert!(service.initial_overlay().is_empty());
         }

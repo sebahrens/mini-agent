@@ -1694,7 +1694,7 @@ mod readonly_import_tests {
         );
         assert!(notices.is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
-        session.apply_compaction("explicit compact summary".into(), 2, 0, 16 * 1024);
+        session.apply_compaction("explicit compact summary".into(), 2, 0, 16 * 1024, 0);
         save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
         assert!(notices.is_empty());
         let loaded = load_session_exact(&session.id).unwrap().unwrap();
@@ -1766,7 +1766,7 @@ mod readonly_import_tests {
         session.add_message(super::super::MessageRole::Assistant, "small next turn");
         save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
         assert!(notices.is_empty());
-        session.apply_compaction("summary".into(), 2, 0, 16 * 1024);
+        session.apply_compaction("summary".into(), 2, 0, 16 * 1024, 0);
         save_session_recovering(&mut session, |notice| notices.push(notice.to_owned())).unwrap();
         assert!(notices.is_empty());
         session.add_message(

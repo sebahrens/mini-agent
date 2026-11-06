@@ -1642,10 +1642,15 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         goal_store.clone(),
     ));
     let mut builder = builder;
-    builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
-        tool_output_session_id,
-        tool_result_spills,
-    ));
+    let spill_window = cfg.resolve_context_window(
+        &cli.resolve_provider(cfg),
+        &cli.resolve_model(cfg),
+        crate::config::quick_models_map(cfg),
+    );
+    builder = builder.add_hook(
+        crate::agent::runner::ToolResultSpillHook::new(tool_output_session_id, tool_result_spills)
+            .with_limits(cfg.resolve_tool_result_spill_limits(spill_window)),
+    );
     #[cfg(feature = "advisor")]
     if registered_tools.contains(&"advisor") {
         builder = builder.add_hook(crate::extras::advisor::AdvisorContextHook);

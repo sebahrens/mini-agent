@@ -165,8 +165,7 @@ impl ContextDiagnostic {
         let _ = memory_block;
         let keep = cfg.resolve_keep_recent_tool_results();
         let mid_turn_threshold = cfg
-            .mid_turn_compact_threshold
-            .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
+            .resolve_mid_turn_compact_threshold()
             .map(|value| (session.context_window as f64 * value) as u64);
         Self {
             rows,
@@ -188,7 +187,7 @@ impl ContextDiagnostic {
             threshold: session.context_window.saturating_sub(reserve),
             projected: session.effective_context_tokens_after_tool_result_pruning(keep),
             clearing: session.tool_results_cleared_for_retention(keep),
-            compact_enabled: cfg.compact_enabled.unwrap_or(false),
+            compact_enabled: cfg.resolve_compact_enabled(),
             mid_turn_threshold,
             instructions: actual
                 .and_then(|snapshot| snapshot.instruction_sources.as_ref())

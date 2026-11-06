@@ -5870,15 +5870,17 @@ impl<'a> App<'a> {
         // Preflight: if the pending payload is irreducibly too large, reject
         // locally before any provider I/O or session mutation.
         let text_tokens = crate::session::Session::estimate_tokens(text);
-        // Rough conservative estimate: treat each media attachment as ~2 KiB of
-        // token-equivalent overhead regardless of content type. Exact accounting
-        // is provider-specific and not available at preflight time.
+        // Size-based estimate per attachment (image dimensions, PDF pages);
+        // provider usage stays authoritative once it returns.
         #[cfg(feature = "multimodal")]
-        const MEDIA_TOKENS_PER_ATTACHMENT: u64 = 2048;
-        #[cfg(feature = "multimodal")]
-        let pending_tokens = text_tokens.saturating_add(
-            self.ui.session.pending_media.len() as u64 * MEDIA_TOKENS_PER_ATTACHMENT,
-        );
+        let pending_tokens = self
+            .ui
+            .session
+            .pending_media
+            .iter()
+            .fold(text_tokens, |total, item| {
+                total.saturating_add(item.preflight_tokens())
+            });
         #[cfg(not(feature = "multimodal"))]
         let pending_tokens = text_tokens;
         let no_quick_models = std::collections::HashMap::new();

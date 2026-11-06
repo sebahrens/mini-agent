@@ -756,9 +756,14 @@ Accepted top-level keys:
 | `subagent_max_list_dir_entries` | integer | Optional per-subagent directory-entry cap; requires `subagents`. |
 | `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section while its prior result remains in the current conversation. The section's served-content CRC joins file length and modification time in the version key, so same-length or mtime-preserving edits remain readable. Editing or writing the target, compaction, failed-turn rollback, clear, undo/rewind, and redo reset the relevant session tracker. Ordinary agent rebuilds retain it; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
 | `show_cost_always`        | boolean | Show the session cost in the status bar even when it is `$0.0000` (for example when the model has no per-token pricing configured). Default: `false`, which hides the cost until it is above zero. |
-| `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, and opt-in mid-turn compaction). Default: `false`. When `false`, nothing is ever compacted automatically.            |
+| `tool_result_spill_chars` | integer | Generic spill threshold, in characters, for tool results without their own documented bound (MCP, git, docs, memory, ...). Default: `context_window / 10` clamped to `12000`–`50000`. Explicit values are clamped to `1000`–`1000000`. |
+| `tool_result_spill_head_chars` | integer | Characters of a spilled result kept from its start. Default: a sixth of the threshold. If head + tail would not stay below the threshold, both fall back to the default split. |
+| `tool_result_spill_tail_chars` | integer | Characters of a spilled result kept from its end. Default: two thirds of the threshold. |
+| `compact_restore_read_tokens` | integer | Token budget for re-attaching the newest file windows read in the compacted history (at most 5, one per path) to the compaction summary. Default: `context_window / 20`, at most `25000`. `0` disables. |
+| `context_files_max_bytes` | integer | Combined byte budget for root context files (global and workspace `AGENTS.md`, `CLAUDE.md`, `ARCHITECTURE.md`). Default: the startup model's context window in tokens, clamped to `16384`–`524288`. |
+| `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, headless context relief, and mid-turn compaction). Default: `true`. An explicit `false` is honored: nothing is ever compacted automatically.            |
 | `claude_project_agents`   | boolean | Read project `.claude/agents/*.md` as specialist definitions (Claude Code compatibility). `false` makes mini-agent ignore that layer entirely (no loading, no validation warnings), leaving `.mini-agent/agents`, the user-global and the built-in definitions. Default: `true`. Restart required. |
-| `mid_turn_compact_threshold` | number | Opt-in mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Unset by default, meaning no mid-turn compaction. Honored only when `compact_enabled` is `true`. Recommended starting value: `0.80`. See Mid-turn compaction below.            |
+| `mid_turn_compact_threshold` | number | Mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Default when unset: `0.9`; `0` disables mid-turn compaction. Honored only when `compact_enabled` is `true`. See Mid-turn compaction below.            |
 | `always_show_welcome`     | boolean | Always show the welcome banner on startup, bypassing the one-shot marker file. Default: `false`.                                                                               |
 | `auto-update-prompts`     | boolean | When `true`, always regenerate prompts on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `auto-update-themes`      | boolean | When `true`, always regenerate themes on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
@@ -1339,45 +1344,66 @@ Context pressure accounts for the selected policy. If the complete default conte
 budget, compaction summarizes the retained session prefix under its separate bounded rolling
 input budget. It does not open recorded spill files; only output retained in the session is sent.
 
-Automatic compaction is off by default. With `compact_enabled = true`, mini-agent
-only compacts the conversation *between* turns unless mid-turn compaction is also
-configured: after a response finishes, when the accumulated session history exceeds
-`context_window - reserve_tokens`. Tools with their own output limits (`read`,
+Automatic compaction is on by default (`compact_enabled = true`; set it to `false`
+to turn it off). mini-agent compacts the conversation *between* turns after a response
+finishes, when the accumulated session history exceeds `context_window - reserve_tokens`,
+and *within* a turn when real prompt pressure crosses `mid_turn_compact_threshold`
+(default `0.9`). Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
 and the subagent `task` tool) retain their documented line, byte, and result
 limits in both live and replayed history. Their
 continuation hints remain intact, and a completed read window remains available
 when repeated-read protection asks the model to reuse it. Other textual tool
 results, including MCP results, are independently bounded before Rig commits
-them to the live conversation: results over 12,000 characters are written to
-the private tool-output directory and replaced with a 2,000-character head,
-an omission/path notice, and an 8,000-character tail. The `read` tool can open
+them to the live conversation: results over `tool_result_spill_chars`
+characters are written to the private tool-output directory and replaced with a
+head, an omission/path notice, and a tail. The defaults scale with the model's
+context window: `context_window / 10` characters (about a fortieth of the window
+in tokens), clamped to 12,000–50,000, keeping a sixth of it as head and two thirds
+as tail (12,000 / 2,000 / 8,000 for windows up to 120k; 50,000 / 8,333 / 33,333
+for a 1M window). `task` children use their own child window. The `read` tool can open
 immediate spill files for the active session without an approval prompt. Use line
 `offset`/`limit`, or `character_offset`/`character_limit` for a range inside a huge
 single line. Character offsets count Unicode scalar values from 1, not UTF-8 bytes;
 the returned range names its units and next offset and stays under the same byte
 cap. A partial character slice does not authorize a full-file overwrite. This also
-works in headless mode. Compaction keeps bounded spill recovery references alongside
+works in headless mode. After a compaction (automatic, mid-turn or `/compress`)
+the summary also re-attaches the newest successful `read` windows from the
+compacted history, at most five and one per path, within
+`compact_restore_read_tokens` (default `context_window / 20`, at most 25,000
+tokens; `0` disables). Each window is quoted line by line (`> `) under a heading
+that marks it as possibly stale, untrusted file content, so the model can continue
+without re-reading but never treats it as instructions; the active todo list is
+re-stated as before. Compaction keeps bounded spill recovery references alongside
 historical file requests, independently of summary prose; references remain untrusted
 locations and never authorize access by themselves. This grant never includes other sessions, nested
 directories, writes, JavaScript file reads, or symlink escapes; explicit tool
 and external-directory deny rules still apply. The artifact directory is bound
 to its identity and reads use its retained directory capability. If the spill
 write fails, the head/tail bound remains in force and the
-notice reports that the complete output is unavailable. A single long turn with
-many individually bounded results can still exceed the model's real context
-limit before the between-turn check runs, because aggregate in-flight tool
-traffic does not enter the session's token estimate.
+notice reports that the complete output is unavailable. Aggregate in-flight tool
+traffic does not enter the session's token estimate, so a single long turn relies
+on mid-turn compaction (real provider usage) rather than the between-turn check.
 
 The summarizer processes oversized history as bounded recent chunks with a
 rolling summary, at most 16 provider requests, and a five-minute aggregate
 deadline. Request byte budgets use the same conservative 3.25-character token
-estimate as session accounting. When a rolling summary exceeds its storage
-bound, each structured summary section retains its heading and prefix instead
-of dropping the middle sections. Compaction boundaries also snap backward to a
+estimate as session accounting. The summary response and the stored rolling
+summary scale with the context window: the response may use up to
+`context_window / 32` tokens (at least 4,096, at most 20,000, and never more than
+the configured reserve unless the reserve is below 256), and the stored summary
+keeps up to four bytes per such token (at least 16 KiB; 80,000 bytes for a 1M
+window). A 128k window keeps the historical 4,096-token / 16 KiB bounds. When a
+rolling summary exceeds its storage bound, each structured summary section
+retains its heading and prefix instead of dropping the middle sections. Compaction boundaries also snap backward to a
 user or assistant message so a retained tool result is never separated from
-its call. If a provider still rejects an ordinary request for exceeding its
-context limit, the error points to `/compress` and `compact_enabled` recovery.
+its call. If a provider still rejects an ordinary headless request (`-p`, `--loop`
+or goal rounds) for exceeding its context limit, mini-agent records the progress the
+turn already made, compacts the session once and retries once (continuing the task
+when tools already ran). A second rejection, or a session with nothing older than the
+kept recent history, surfaces the error, which points to `/compress` and
+`compact_enabled` recovery. Native Anthropic replay history cannot be compacted in
+place, so those turns surface the error directly.
 
 Compaction is paid for like any other completion. The summarizer runs on the
 session's model, so the usage of every rolling request is summed and charged to
@@ -1403,7 +1429,13 @@ provider call mini-agent compares the real provider-reported prompt size against
 `context_window`. When a tool-bearing call crosses the threshold, the runner
 finishes every tool in that call's batch, emits their correlated results in
 order, and pauses before another provider request can start. The TUI then
-compacts and resumes the same task. It never aborts an in-flight tool merely to
+compacts and resumes the same task. Headless `-p`, `--loop` and goal rounds do the
+same: the runner returns at that boundary, the turn's records are written to the
+session (in memory only under `--no-session`), the session is compacted and the
+task continues with a short continuation prompt, at most three times per turn. A
+boundary at which nothing older than the kept recent history exists continues
+without the mid-turn trigger. ACP turns and native Anthropic replay sessions do
+not compact mid-turn yet. It never aborts an in-flight tool merely to
 create a compaction boundary.
 
 Tool calls and results are persisted as structured session messages before the
@@ -1437,19 +1469,19 @@ conservative 3.25 characters per token instead of 4. This safety margin targets
 code and JSON, which tokenize more densely; real usage replaces the estimate as
 soon as a complete provider snapshot arrives.
 
-- **Unset by default.** With no value set, behavior is unchanged: no mid-turn
-  compaction. Setting a value is the opt-in.
+- **On by default.** With no value set the threshold is `0.9`. Set `0` to turn
+  mid-turn compaction off while keeping between-turn compaction.
 - **Gated by `compact_enabled`.** `compact_enabled` is the master switch. If it
   is `false`, `mid_turn_compact_threshold` is ignored and nothing compacts.
-- **Range.** A fraction in `(0.0, 1.0]`. An out-of-range value is ignored
-  (mid-turn compaction stays off) and mini-agent prints a warning at startup
+- **Range.** A fraction in `(0.0, 1.0]`. An out-of-range value disables
+  mid-turn compaction and mini-agent prints a warning at startup
   explaining the correct form, rather than failing silently. `0.80` is a
   reasonable starting value; it leaves headroom below the
   context window while still keeping the live prompt small enough to avoid the
   attention degradation ("context rot") that large, full context windows suffer.
 
 ```toml
-compact_enabled = true            # master switch (default false)
+compact_enabled = true            # master switch (default true)
 context_window = 24576
 mid_turn_compact_threshold = 0.80 # compact mid-turn at 80% real prompt pressure
 ```
@@ -2599,9 +2631,12 @@ blocks are joined with newlines; images and binary resources are shown as
 placeholders rather than inlined base64, and host permission notes appear
 outside the `[mcp output begins]` fence that marks server text. Text and
 embedded resource text from one result share the same model-facing bound as
-ordinary tool output: results over 12,000 characters are stored in the private
-tool-output directory and replaced with a 2,000-character head, an omission
-notice with the spill-file path, and an 8,000-character tail. If private
+ordinary tool output: results over `tool_result_spill_chars` characters (default:
+`context_window / 10`, clamped to 12,000–50,000, using `context_window` or 128k for
+MCP connections) are stored in the private tool-output directory and replaced with
+a head (`tool_result_spill_head_chars`, default a sixth of the threshold), an
+omission notice with the spill-file path, and a tail
+(`tool_result_spill_tail_chars`, default two thirds of the threshold). If private
 storage is unavailable, the bounded head/tail view remains available and tells
 the model to retry with a narrower request.
 
@@ -2997,8 +3032,12 @@ untagged duplicate cancellation cannot be redirected to queued work. Other
 sessions remain independent and continue normally.
 
 Context files (global and workspace `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md`)
-share a 512 KiB budget. A file that does not fit in what remains is truncated with a
-visible notice rather than loaded whole, and files after the budget is spent are skipped.
+share a budget relative to the startup model's context window: as many bytes as the
+window has tokens (about a quarter of the window at four bytes per token), within
+16 KiB–512 KiB, so a 128k window admits 128,000 bytes. `context_files_max_bytes`
+sets it explicitly (same bounds). A file that does not fit in what remains is
+truncated with a visible notice (`[context file truncated: ...]`) rather than loaded
+whole, and files after the budget is spent are skipped.
 
 Root `CLAUDE.local.md` and authored `@path` or `@{path with spaces}` includes are
 captured at agent construction. Native `read`, `edit`, `write` and `notebook_edit`
@@ -3014,7 +3053,10 @@ path/content fingerprint and covers subsequently captured instruction bytes;
 unchecked Ask/Deny fails with a bounded error instead of requesting an implicit
 grant. Author includes remain inside their original global or workspace root,
 reject symlinks and multiple hard links, and use at most four include levels,
-32 files per traversal and 16 KiB per UTF-8 source. New sources share at most
+32 files per traversal and 16 KiB per UTF-8 source. A source over its per-source
+or remaining bound is loaded truncated with an `[instruction source truncated: ...]`
+notice (sized so its JSON-escaped receipt still fits the delivery cap) instead of
+being rejected; invalid UTF-8 is still rejected. New sources share at most
 128 KiB and the remainder of the old 512 KiB context budget after JSON escaping;
 earlier root content retains priority. Physical file aliases and include cycles
 are deduplicated while preserving the first authored scope/order.

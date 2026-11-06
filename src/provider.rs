@@ -148,16 +148,35 @@ const COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
 const PROVIDER_ENVELOPE_TOKEN_RESERVE: u64 = 512;
 const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 256;
 const MAX_SUMMARY_OUTPUT_TOKENS: u64 = 4_096;
+const MAX_SCALED_SUMMARY_OUTPUT_TOKENS: u64 = 20_000;
 const NO_PREVIOUS_SUMMARY: &str = "(none)";
 const OLDER_HISTORY_OMITTED: &str = "[older history omitted to bound compaction work]\n";
+
+/// Largest summary response a compaction may request for a context window
+/// (mini-agent-wu3uc): a thirty-second of the window, never below the
+/// historical 4,096 nor above 20,000 tokens, so a 1M-window session keeps far
+/// more state than a 128k one.
+pub(crate) fn summary_output_token_cap(context_window: u64) -> u64 {
+    (context_window / 32).clamp(MAX_SUMMARY_OUTPUT_TOKENS, MAX_SCALED_SUMMARY_OUTPUT_TOKENS)
+}
+
+/// Byte bound of the stored rolling summary for a context window: room for
+/// the scaled response at four bytes per token, never below 16 KiB.
+pub(crate) fn rolling_summary_byte_cap(context_window: u64) -> usize {
+    usize::try_from(summary_output_token_cap(context_window).saturating_mul(4))
+        .unwrap_or(usize::MAX)
+        .max(MAX_ROLLING_SUMMARY_BYTES)
+}
 
 pub(crate) fn compaction_request_limits(
     input_token_budget: u64,
     response_token_budget: u64,
     preamble_bytes: usize,
 ) -> (usize, u64) {
+    // Callers pass `window - reserve` and `reserve`.
+    let window = input_token_budget.saturating_add(response_token_budget);
     let max_output_tokens =
-        response_token_budget.clamp(MIN_SUMMARY_OUTPUT_TOKENS, MAX_SUMMARY_OUTPUT_TOKENS);
+        response_token_budget.clamp(MIN_SUMMARY_OUTPUT_TOKENS, summary_output_token_cap(window));
     let borrowed_output_headroom = max_output_tokens.saturating_sub(response_token_budget);
     let bounded_input_tokens = input_token_budget
         .saturating_sub(borrowed_output_headroom)
@@ -443,6 +462,67 @@ pub(crate) fn merge_extra_body(
         // Non-object base (shouldn't happen for routing) — user value takes over.
         (Some(_), extra) => extra,
     }
+}
+
+/// `params` with `num_ctx` set to `context_window` unless it already names
+/// one (rig's Ollama request moves `num_ctx` under `options`).
+pub(crate) fn with_ollama_num_ctx(
+    params: Option<serde_json::Value>,
+    context_window: u64,
+) -> Option<serde_json::Value> {
+    if context_window == 0 {
+        return params;
+    }
+    match params {
+        Some(serde_json::Value::Object(mut map)) => {
+            let explicit = map.contains_key("num_ctx")
+                || map
+                    .get("options")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|options| options.contains_key("num_ctx"));
+            if !explicit {
+                map.insert("num_ctx".into(), context_window.into());
+            }
+            Some(serde_json::Value::Object(map))
+        }
+        None => Some(serde_json::json!({ "num_ctx": context_window })),
+        other => other,
+    }
+}
+
+/// The model's trained context length from an Ollama `/api/show` response
+/// (`model_info["<architecture>.context_length"]`).
+pub(crate) fn ollama_show_context_length(show: &serde_json::Value) -> Option<u64> {
+    show.get("model_info")?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.ends_with(".context_length"))
+        .and_then(|(_, value)| value.as_u64())
+        .filter(|length| *length > 0)
+}
+
+/// Ask an Ollama server for a model's context length (best effort, bounded
+/// by `timeout`). `None` for any other client or on any failure.
+pub(crate) async fn probe_ollama_context_length(
+    client: &AnyClient,
+    model: &str,
+    timeout: std::time::Duration,
+) -> Option<u64> {
+    let AnyClient::Ollama(client) = client else {
+        return None;
+    };
+    let url = format!("{}/api/show", client.base_url().trim_end_matches('/'));
+    let request = reqwest::Client::new()
+        .post(url)
+        .headers(client.headers().clone())
+        .json(&serde_json::json!({ "model": model }))
+        .timeout(timeout);
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = response.json().await.ok()?;
+    ollama_show_context_length(&body)
 }
 
 /// Provider parameters for tool-free formatting/title requests. Only typed
@@ -1174,14 +1254,17 @@ impl AnyClient {
         // a useful response cap when a custom reserve is smaller than 256.
         let (prompt_budget, max_output_tokens) =
             compaction_request_limits(input_token_budget, response_token_budget, preamble.len());
+        let summary_byte_cap =
+            rolling_summary_byte_cap(input_token_budget.saturating_add(response_token_budget));
 
         tokio::time::timeout(
             COMPACTION_TIMEOUT,
-            compress_messages_with(
+            compress_messages_with_capped(
                 messages,
                 previous_summary,
                 instructions,
                 prompt_budget,
+                summary_byte_cap,
                 |summary_prompt| {
                     let preamble = preamble.clone();
                     let retry_config = retry_config.clone();
@@ -1240,6 +1323,7 @@ pub struct CompactionOutput {
 /// prefix that fits is summarized and its length is returned; the caller must
 /// drain exactly that prefix from the front of the session and may compact the
 /// remainder on a later pass with the returned summary as `previous_summary`.
+#[cfg(test)]
 pub(crate) async fn compress_messages_with<F, Fut>(
     messages: &[SessionMessage],
     previous_summary: Option<&str>,
@@ -1251,19 +1335,54 @@ where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = anyhow::Result<(String, crate::event::UsageDelta)>>,
 {
-    let (conversation, messages_included) =
-        serialize_conversation_bounded(messages, instructions, prompt_budget_bytes)?;
-    let (summary, usage) = summarize_conversation_bounded(
+    compress_messages_with_capped(
+        messages,
+        previous_summary,
+        instructions,
+        prompt_budget_bytes,
+        MAX_ROLLING_SUMMARY_BYTES,
+        summarize,
+    )
+    .await
+}
+
+/// As [`compress_messages_with`] with an explicit rolling-summary byte cap
+/// (see [`rolling_summary_byte_cap`]).
+pub(crate) async fn compress_messages_with_capped<F, Fut>(
+    messages: &[SessionMessage],
+    previous_summary: Option<&str>,
+    instructions: Option<&str>,
+    prompt_budget_bytes: usize,
+    summary_byte_cap: usize,
+    summarize: F,
+) -> anyhow::Result<CompactionOutput>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<(String, crate::event::UsageDelta)>>,
+{
+    let (conversation, messages_included) = serialize_conversation_bounded(
+        messages,
+        instructions,
+        prompt_budget_bytes,
+        summary_byte_cap,
+    )?;
+    let (summary, usage) = summarize_conversation_bounded_capped(
         &conversation,
         previous_summary,
         instructions,
         prompt_budget_bytes,
+        summary_byte_cap,
         summarize,
     )
     .await?;
     Ok(CompactionOutput {
         summary,
-        summary_byte_budget: compaction_payload_budgets(instructions, prompt_budget_bytes)?.0,
+        summary_byte_budget: compaction_payload_budgets_capped(
+            instructions,
+            prompt_budget_bytes,
+            summary_byte_cap,
+        )?
+        .0,
         messages_included,
         usage,
     })
@@ -1369,9 +1488,18 @@ pub(crate) fn bound_summary(value: &str, max_bytes: usize) -> String {
     rendered
 }
 
+#[cfg(test)]
 fn compaction_payload_budgets(
     instructions: Option<&str>,
     prompt_budget_bytes: usize,
+) -> anyhow::Result<(usize, usize)> {
+    compaction_payload_budgets_capped(instructions, prompt_budget_bytes, MAX_ROLLING_SUMMARY_BYTES)
+}
+
+fn compaction_payload_budgets_capped(
+    instructions: Option<&str>,
+    prompt_budget_bytes: usize,
+    summary_byte_cap: usize,
 ) -> anyhow::Result<(usize, usize)> {
     let fixed_overhead = compaction_prompt("", Some(""), instructions).len();
     let available = prompt_budget_bytes.saturating_sub(fixed_overhead);
@@ -1381,7 +1509,7 @@ fn compaction_payload_budgets(
 
     let summary_budget = (available / 2)
         .max(NO_PREVIOUS_SUMMARY.len())
-        .min(MAX_ROLLING_SUMMARY_BYTES);
+        .min(summary_byte_cap);
     let conversation_budget = available.saturating_sub(summary_budget);
     if conversation_budget < 4 {
         anyhow::bail!("Compression input budget cannot fit one UTF-8 character");
@@ -1411,8 +1539,10 @@ fn serialize_conversation_bounded(
     messages: &[SessionMessage],
     instructions: Option<&str>,
     prompt_budget_bytes: usize,
+    summary_byte_cap: usize,
 ) -> anyhow::Result<(String, usize)> {
-    let (_, conversation_budget) = compaction_payload_budgets(instructions, prompt_budget_bytes)?;
+    let (_, conversation_budget) =
+        compaction_payload_budgets_capped(instructions, prompt_budget_bytes, summary_byte_cap)?;
     let history_budget = compaction_history_budget(conversation_budget);
 
     let mut conversation = String::new();
@@ -1453,11 +1583,35 @@ fn bounded_recent_conversation<'a>(
 /// reduction. Every request has a fixed history and summary partition, and the
 /// total number of provider calls is capped. Returns the final summary and the
 /// sum of the usage `summarize` reported for every request it made.
+#[cfg(test)]
 pub(crate) async fn summarize_conversation_bounded<F, Fut>(
     conversation: &str,
     previous_summary: Option<&str>,
     instructions: Option<&str>,
     prompt_budget_bytes: usize,
+    summarize: F,
+) -> anyhow::Result<(String, crate::event::UsageDelta)>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<(String, crate::event::UsageDelta)>>,
+{
+    summarize_conversation_bounded_capped(
+        conversation,
+        previous_summary,
+        instructions,
+        prompt_budget_bytes,
+        MAX_ROLLING_SUMMARY_BYTES,
+        summarize,
+    )
+    .await
+}
+
+async fn summarize_conversation_bounded_capped<F, Fut>(
+    conversation: &str,
+    previous_summary: Option<&str>,
+    instructions: Option<&str>,
+    prompt_budget_bytes: usize,
+    summary_byte_cap: usize,
     mut summarize: F,
 ) -> anyhow::Result<(String, crate::event::UsageDelta)>
 where
@@ -1465,7 +1619,7 @@ where
     Fut: Future<Output = anyhow::Result<(String, crate::event::UsageDelta)>>,
 {
     let (summary_budget, conversation_budget) =
-        compaction_payload_budgets(instructions, prompt_budget_bytes)?;
+        compaction_payload_budgets_capped(instructions, prompt_budget_bytes, summary_byte_cap)?;
     // Defang before bounding so every length below measures the bytes that
     // are actually sent. A transcript from `serialize_message` is already
     // defanged (its only closing tags are `</message>`), so this is a no-op
@@ -3328,7 +3482,9 @@ impl AnyAgent {
     /// Capture main-session data before restoring a binding or starting work.
     /// Independently built auxiliary agents retain their own context policy.
     pub(crate) fn with_main_session(self, cfg: &Config, session: &crate::session::Session) -> Self {
-        let agent = self.with_reasoning_controls(cfg, session.reasoning_controls);
+        let agent = self
+            .with_reasoning_controls(cfg, session.reasoning_controls)
+            .with_ollama_context_window(session.context_window);
         #[cfg(feature = "memory")]
         {
             agent.with_memory_placement(session.memory_placement)
@@ -3337,6 +3493,18 @@ impl AnyAgent {
         {
             agent
         }
+    }
+
+    /// Ollama applies its own small default `num_ctx` and silently drops the
+    /// oldest prompt tokens beyond it (mini-agent-djwve). Send the window the
+    /// session's compaction and reserve math use as `options.num_ctx`. An
+    /// explicit `num_ctx` in the user's `extra_body` wins.
+    pub(crate) fn with_ollama_context_window(mut self, context_window: u64) -> Self {
+        if let AnyAgentInner::Ollama(agent) = &mut self.inner {
+            agent.additional_params =
+                with_ollama_num_ctx(agent.additional_params.take(), context_window);
+        }
+        self
     }
 
     #[cfg(feature = "memory")]
@@ -6702,9 +6870,13 @@ mod compaction_tests {
         let messages = messages(400, 120);
         let prompt_budget = 1_000;
 
-        let (conversation, messages_included) =
-            serialize_conversation_bounded(&messages, None, prompt_budget)
-                .expect("bounded serialization failed");
+        let (conversation, messages_included) = serialize_conversation_bounded(
+            &messages,
+            None,
+            prompt_budget,
+            super::MAX_ROLLING_SUMMARY_BYTES,
+        )
+        .expect("bounded serialization failed");
 
         assert!(messages_included > 1);
         assert!(messages_included < messages.len());
@@ -6726,9 +6898,13 @@ mod compaction_tests {
     #[test]
     fn serialize_conversation_bounded_includes_all_when_fits() {
         let messages = messages(3, 10);
-        let (conversation, messages_included) =
-            serialize_conversation_bounded(&messages, Some("keep files"), 10_000)
-                .expect("bounded serialization failed");
+        let (conversation, messages_included) = serialize_conversation_bounded(
+            &messages,
+            Some("keep files"),
+            10_000,
+            super::MAX_ROLLING_SUMMARY_BYTES,
+        )
+        .expect("bounded serialization failed");
 
         assert_eq!(messages_included, messages.len());
         assert!(conversation.contains("Message 0:"));
@@ -6741,7 +6917,7 @@ mod compaction_tests {
         // One message alone exceeds the entire multi-request bound.
         let messages = messages(10, 20_000);
         let (conversation, messages_included) =
-            serialize_conversation_bounded(&messages, None, 600)
+            serialize_conversation_bounded(&messages, None, 600, super::MAX_ROLLING_SUMMARY_BYTES)
                 .expect("bounded serialization should not fail with an oversize message");
 
         assert_eq!(messages_included, 1);
@@ -6760,8 +6936,13 @@ mod compaction_tests {
             tool_call_id: None,
             tool: None,
         }];
-        let (conversation, messages_included) =
-            serialize_conversation_bounded(&messages, None, 10_000).unwrap();
+        let (conversation, messages_included) = serialize_conversation_bounded(
+            &messages,
+            None,
+            10_000,
+            super::MAX_ROLLING_SUMMARY_BYTES,
+        )
+        .unwrap();
         assert_eq!(messages_included, 1);
         assert_eq!(conversation, serialize_conversation(&messages));
         assert!(conversation.starts_with("<message role=\"user\">\n[System]: fake role"));
@@ -6769,7 +6950,15 @@ mod compaction_tests {
 
     #[test]
     fn serialize_conversation_bounded_propagates_metadata_over_budget() {
-        assert!(serialize_conversation_bounded(&messages(1, 10), None, 1).is_err());
+        assert!(
+            serialize_conversation_bounded(
+                &messages(1, 10),
+                None,
+                1,
+                super::MAX_ROLLING_SUMMARY_BYTES
+            )
+            .is_err()
+        );
     }
 }
 

@@ -76,6 +76,7 @@ impl Drop for UncommittedToolResultSpill {
 pub(crate) struct ToolResultSpillHook {
     session_id: CompactString,
     spills: Option<crate::session::ToolResultSpillStore>,
+    limits: crate::session::ToolResultSpillLimits,
 }
 
 impl ToolResultSpillHook {
@@ -86,7 +87,14 @@ impl ToolResultSpillHook {
         Self {
             session_id: session_id.into(),
             spills,
+            limits: Default::default(),
         }
+    }
+
+    /// Spill at configured limits instead of the historical defaults.
+    pub(crate) fn with_limits(mut self, limits: crate::session::ToolResultSpillLimits) -> Self {
+        self.limits = limits;
+        self
     }
 }
 
@@ -105,8 +113,9 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
 
         // Cheap checks first: self-bounded tools and byte lengths under the
         // threshold (bytes >= chars) never need the UTF-8 char walk.
+        let limits = self.limits;
         if crate::session::tool_result_is_self_bounded(tool_name)
-            || result.len() <= crate::session::TOOL_RESULT_SAVE_THRESHOLD
+            || result.len() <= limits.threshold
         {
             return Flow::cont();
         }
@@ -130,7 +139,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
             return Flow::cont();
         }
         let output_chars = result.chars().count();
-        if output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
+        if output_chars <= limits.threshold {
             return Flow::cont();
         }
 
@@ -150,7 +159,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
 
         match saved {
             Ok(Ok(spill)) => {
-                let bounded = crate::session::format_truncated_tool_output(
+                let bounded = crate::session::format_spilled_tool_output_with(
+                    limits,
                     &output,
                     output_chars,
                     spill.path(),
@@ -174,7 +184,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
                     %error,
                     "failed to persist oversized live tool result"
                 );
-                Flow::rewrite_result(crate::session::format_unpersisted_truncated_tool_output(
+                Flow::rewrite_result(crate::session::format_unpersisted_tool_output_with(
+                    limits,
                     &output,
                     output_chars,
                     &error.to_string(),
@@ -187,7 +198,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
                     %error,
                     "tool-result spill worker failed"
                 );
-                Flow::rewrite_result(crate::session::format_unpersisted_truncated_tool_output(
+                Flow::rewrite_result(crate::session::format_unpersisted_tool_output_with(
+                    limits,
                     &output,
                     output_chars,
                     "the spill worker failed",
@@ -711,6 +723,15 @@ fn goal_hook_info() -> Option<crate::extras::hooks::GoalHookInfo> {
 /// comparison against a message someone later rewords.
 pub const HEADLESS_INTERRUPTED: &str = "headless agent interrupted";
 
+/// Continuation prompt after headless context relief (a compaction inside a
+/// turn). Like the TUI's mid-turn prompt it frames the summary as work already
+/// done rather than as new instructions.
+pub(crate) const HEADLESS_CONTEXT_RELIEF_PROMPT: &str = "[Context was compacted to save space; \
+the full prior history is in the system summary above.]\n\nContinue with the \
+user's original task. Do not redo work already completed per the summary; focus \
+on what remains. Context was tight, so prefer narrower follow-up tool calls over \
+wide ones until pressure subsides.";
+
 pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
     !matches!(
         name,
@@ -912,6 +933,75 @@ impl CompactionDecisionTx {
         self.shared.stop.store(true, Ordering::Release);
     }
 }
+
+/// Mid-turn compaction policy for a headless (`-p`, `--loop`, goal, ACP-free)
+/// run (mini-agent-sgzh0). The driver installs it around one
+/// [`run_print_with_output`](crate::provider::AnyAgent::run_print_with_output)
+/// call; the runner then stops at the first protocol-complete tool-batch
+/// boundary after a completion whose real prompt pressure crosses `threshold`,
+/// and returns [`MidTurnCompactionBoundary`] so the driver can compact and
+/// continue.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HeadlessMidTurnPolicy {
+    pub(crate) window: u64,
+    pub(crate) threshold: f64,
+    pub(crate) anthropic_native: bool,
+}
+
+impl HeadlessMidTurnPolicy {
+    /// Real prompt pressure of a completion as a fraction of the window, when
+    /// it crosses the threshold.
+    fn crossed(self, usage: &rig::completion::Usage) -> Option<f64> {
+        if self.window == 0 {
+            return None;
+        }
+        let real_input_tokens = crate::session::Session::real_input_tokens(
+            self.anthropic_native,
+            usage.input_tokens,
+            usage.total_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+        let pressure = real_input_tokens as f64 / self.window as f64;
+        (pressure > self.threshold).then_some(pressure)
+    }
+}
+
+tokio::task_local! {
+    static HEADLESS_MID_TURN: HeadlessMidTurnPolicy;
+}
+
+/// Run `work` with headless mid-turn compaction armed (`Some`) or not.
+pub(crate) async fn with_headless_mid_turn<F: std::future::Future>(
+    policy: Option<HeadlessMidTurnPolicy>,
+    work: F,
+) -> F::Output {
+    match policy {
+        Some(policy) => HEADLESS_MID_TURN.scope(policy, work).await,
+        None => work.await,
+    }
+}
+
+/// The headless turn stopped at a tool-batch boundary because real prompt
+/// pressure crossed the mid-turn threshold. Every tool call of the batch has
+/// its result in the returned interactions; nothing was aborted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MidTurnCompactionBoundary {
+    pub(crate) pressure: f64,
+}
+
+impl std::fmt::Display for MidTurnCompactionBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "mid-turn compaction boundary at {:.0}% context pressure",
+            self.pressure * 100.0
+        )
+    }
+}
+
+impl std::error::Error for MidTurnCompactionBoundary {}
 
 /// Decision channel capacity. A runner that did not park leaves its decision
 /// queued; at most one `UsageDelta` per completion can be in flight on the
@@ -5095,6 +5185,10 @@ where
     let mut stop_hook_active = false;
     #[cfg(feature = "hooks")]
     let mut consecutive_stop_blocks: u32 = 0;
+    let mid_turn_policy = HEADLESS_MID_TURN.try_with(|policy| *policy).ok();
+    // Pressure of the latest completion that crossed the mid-turn threshold;
+    // honored at the next correlated tool result once the batch is complete.
+    let mut mid_turn_pressure: Option<f64> = None;
 
     while continue_turn {
         continue_turn = false;
@@ -5229,8 +5323,19 @@ where
                         {
                             fail_turn!(error);
                         }
+                        if let Some(pressure) = mid_turn_pressure
+                            && tool_calls.pending.is_empty()
+                            && crate::question::required().is_none()
+                        {
+                            fail_turn!(MidTurnCompactionBoundary { pressure });
+                        }
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                        if let Some(pressure) =
+                            mid_turn_policy.and_then(|policy| policy.crossed(&call.usage))
+                        {
+                            mid_turn_pressure = Some(pressure);
+                        }
                         let delta = record_completion_call(
                             &mut completion_retry,
                             retry_config,
@@ -5524,6 +5629,9 @@ pub(crate) struct SubagentRunOutput {
     pub tool_log: Vec<crate::extras::subagents::background::ToolLogEntry>,
     /// The run ended because its model-turn budget was exhausted.
     pub turn_budget_exhausted: bool,
+    /// The child's next request would exceed its context window
+    /// ([`CHILD_CONTEXT_REFUSAL`]); `history` is the conversation so far.
+    pub context_exhausted: bool,
 }
 
 #[cfg(feature = "subagents")]
@@ -5538,9 +5646,15 @@ impl SubagentRunOutput {
             tool_calls: 0,
             tool_log: Vec::new(),
             turn_budget_exhausted: false,
+            context_exhausted: false,
         }
     }
 }
+
+/// Why a child request was refused locally: its estimate exceeds the child
+/// window. Names the key that raises it.
+#[cfg(feature = "subagents")]
+pub(crate) const CHILD_CONTEXT_REFUSAL: &str = "task: child context estimate exceeds its configured/model window; use a narrower brief or raise subagent_context_window for a supported model";
 
 #[cfg(feature = "subagents")]
 const SUBAGENT_TURN_BUDGET_PARTIAL: &str = "[partial: turn budget exhausted]";
@@ -5688,6 +5802,7 @@ where
                 tool_calls,
                 tool_log,
                 turn_budget_exhausted,
+                context_exhausted: false,
             }
         };
     }
@@ -5781,6 +5896,20 @@ where
                     child_history = chat_history.as_ref().clone();
                 }
                 break;
+            }
+            Err(rig::agent::StreamingError::Prompt(prompt))
+                if matches!(prompt.as_ref(), rig::completion::PromptError::PromptCancelled { reason, .. }
+                    if reason == CHILD_CONTEXT_REFUSAL) =>
+            {
+                // Keep the conversation so the task can compact it and
+                // continue (mini-agent-d0rfu).
+                if let rig::completion::PromptError::PromptCancelled { chat_history, .. } = *prompt
+                {
+                    child_history = chat_history;
+                }
+                let mut out = finish!(Err(format!("subagent error: {CHILD_CONTEXT_REFUSAL}")));
+                out.context_exhausted = true;
+                return out;
             }
             Err(e) => {
                 return SubagentRunOutput::bare(
@@ -5935,6 +6064,103 @@ mod tests {
                     "ordinary start lost the completion: {events:?}"
                 );
             }
+        }
+    }
+
+    async fn headless_mid_turn_probe(
+        policy: Option<super::HeadlessMidTurnPolicy>,
+    ) -> (super::HeadlessTurn, MockCompletionModel, usize) {
+        #[cfg(feature = "hooks")]
+        let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Usage rises from 30% to 95% of a 1000-token window on the
+        // tool-bearing completion.
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("mid-first", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::tool_call("mid-second", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response(usage(950, 8, 0, 0)),
+            ],
+            vec![
+                MockStreamEvent::text("finished"),
+                MockStreamEvent::final_response(usage(300, 4, 0, 0)),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let turn = super::with_headless_mid_turn(
+            policy,
+            super::run_print_with_stream_policy_and_verification(
+                &agent,
+                &crate::agent::input::PromptInput::text("work".to_owned()),
+                crate::print::HeadlessOutputPolicy::legacy(false, true),
+                None,
+                &crate::retry::RetryConfig::default(),
+                None,
+                Arc::from(Vec::new()),
+                super::RunnerStreamPolicy::default(),
+                None,
+                crate::agent::native_capture::NativeCaptureHook::default(),
+                #[cfg(feature = "hooks")]
+                None,
+            ),
+        )
+        .await;
+        (turn, model, calls.load(Ordering::SeqCst))
+    }
+
+    // mini-agent-sgzh0: a headless turn whose real prompt pressure crosses the
+    // mid-turn threshold stops after the complete tool batch, before another
+    // provider request, with every result in its interactions.
+    #[tokio::test]
+    async fn headless_mid_turn_pressure_stops_at_the_complete_tool_batch() {
+        let (turn, model, calls) = headless_mid_turn_probe(Some(super::HeadlessMidTurnPolicy {
+            window: 1000,
+            threshold: 0.9,
+            anthropic_native: false,
+        }))
+        .await;
+        let boundary = turn
+            .failure
+            .as_ref()
+            .and_then(|error| error.downcast_ref::<super::MidTurnCompactionBoundary>())
+            .copied()
+            .expect("pressure over the threshold must stop at a boundary");
+        assert!(boundary.pressure > 0.9);
+        assert_eq!(calls, 2, "both tools of the batch completed");
+        assert_eq!(model.requests().len(), 1, "no request after the boundary");
+        let results = turn
+            .interactions
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User { content }
+                    if content.iter().any(|item| matches!(item, UserContent::ToolResult(_))))
+            })
+            .count();
+        assert!(
+            results >= 1,
+            "tool results are retained: {:?}",
+            turn.interactions
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_turn_below_threshold_or_unarmed_runs_to_completion() {
+        for policy in [
+            None,
+            Some(super::HeadlessMidTurnPolicy {
+                window: 1000,
+                threshold: 0.99,
+                anthropic_native: false,
+            }),
+        ] {
+            let (turn, model, calls) = headless_mid_turn_probe(policy).await;
+            assert!(turn.failure.is_none(), "{:?}", turn.failure);
+            assert_eq!(turn.response, "finished");
+            assert_eq!(calls, 2);
+            assert_eq!(model.requests().len(), 2);
         }
     }
 
@@ -7085,6 +7311,102 @@ mod tests {
             })
             .expect("the next request must contain the tool result");
         assert_eq!(live_output, "é".repeat(6_000));
+    }
+
+    async fn live_tool_output_with_limits(
+        limits: Option<crate::session::ToolResultSpillLimits>,
+    ) -> String {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "mini-agent-live-spill-limits-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("MINI_AGENT_DATA_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_CONFIG_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_STATE_DIR", Some(root.clone().into_os_string())),
+        ]);
+        let session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("limits-id", OversizedTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let mut hook =
+            ToolResultSpillHook::new(session.id.clone(), Some(session.tool_result_spills.clone()));
+        if let Some(limits) = limits {
+            hook = hook.with_limits(limits);
+        }
+        let agent = AgentBuilder::new(model.clone())
+            .tool(OversizedTool)
+            .add_hook(hook)
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        while stream.next().await.is_some() {}
+        let requests = model.requests();
+        let output = requests[1]
+            .chat_history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|content| match content {
+                    UserContent::ToolResult(result) => {
+                        result.content.iter().find_map(|content| match content {
+                            ToolResultContent::Text(text) => Some(text.text.clone()),
+                            ToolResultContent::Image(_) => None,
+                        })
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the next request contains the tool result");
+        let _ = std::fs::remove_dir_all(&root);
+        output
+    }
+
+    // mini-agent-bjiqr: configured spill limits change what stays inline.
+    #[tokio::test]
+    async fn configured_spill_limits_raise_and_lower_the_generic_bound() {
+        let full_chars = crate::session::TOOL_RESULT_HEAD_CHARS
+            + crate::session::TOOL_RESULT_SAVE_THRESHOLD
+            + crate::session::TOOL_RESULT_TAIL_CHARS;
+        let raised = crate::config::Config {
+            tool_result_spill_chars: Some(30_000),
+            ..Default::default()
+        }
+        .resolve_tool_result_spill_limits(128_000);
+        let inline = live_tool_output_with_limits(Some(raised)).await;
+        assert_eq!(
+            inline.chars().count(),
+            full_chars,
+            "raised bound keeps it inline"
+        );
+        assert!(!inline.contains("[tool output truncated:"));
+
+        let lowered = crate::config::Config {
+            tool_result_spill_chars: Some(4_000),
+            tool_result_spill_head_chars: Some(500),
+            tool_result_spill_tail_chars: Some(1_000),
+            ..Default::default()
+        }
+        .resolve_tool_result_spill_limits(128_000);
+        let bounded = live_tool_output_with_limits(Some(lowered)).await;
+        assert!(bounded.contains("[tool output truncated:"));
+        assert!(bounded.starts_with(&format!("{}\n", "H".repeat(500))));
+        assert!(bounded.ends_with(&format!("\n{}", "T".repeat(1_000))));
+        assert!(bounded.chars().count() < 4_000);
+
+        let default = live_tool_output_with_limits(None).await;
+        assert!(default.starts_with(&"H".repeat(crate::session::TOOL_RESULT_HEAD_CHARS)));
+        assert!(default.contains("[tool output truncated:"));
     }
 
     #[tokio::test]

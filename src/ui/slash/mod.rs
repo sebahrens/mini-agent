@@ -528,12 +528,16 @@ pub async fn handle_compress(
     let request_observer = observed.clone();
     let client = &ui.client;
     let retry_config = &ui.cfg.retry;
-    let compacted = compact_session_with(
+    let restore_read_tokens = ui
+        .cfg
+        .resolve_compact_restore_read_tokens(ui.session.context_window);
+    let compacted = compact_session_with_restoring(
         ui.session,
         cut_idx,
         summarizer_input_budget,
         reserve,
         keep_recent_tool_results,
+        restore_read_tokens,
         |model, messages, previous_summary, input_budget, response_budget| async move {
             client
                 .compress_messages_observed(
@@ -667,12 +671,43 @@ pub(crate) fn plan_tui_compaction(
 /// to re-trigger compaction. `stage_summary` observes the summary and drain
 /// length before the session is mutated. Returns the drain length and the
 /// estimated tokens it removed.
+#[cfg(test)]
 pub(crate) async fn compact_session_with<S, F>(
     session: &mut Session,
     cut_idx: usize,
     input_token_budget: u64,
     response_token_budget: u64,
     keep_recent_tool_results: usize,
+    summarize: S,
+    stage_summary: impl FnOnce(&str, usize),
+) -> anyhow::Result<(usize, u64, crate::event::UsageDelta)>
+where
+    S: FnOnce(String, Vec<crate::session::SessionMessage>, Option<String>, u64, u64) -> F,
+    F: std::future::Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
+{
+    compact_session_with_restoring(
+        session,
+        cut_idx,
+        input_token_budget,
+        response_token_budget,
+        keep_recent_tool_results,
+        0,
+        summarize,
+        stage_summary,
+    )
+    .await
+}
+
+/// As [`compact_session_with`], re-attaching the newest file windows read in
+/// the compacted prefix within `restore_read_tokens` (mini-agent-xzt6g).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compact_session_with_restoring<S, F>(
+    session: &mut Session,
+    cut_idx: usize,
+    input_token_budget: u64,
+    response_token_budget: u64,
+    keep_recent_tool_results: usize,
+    restore_read_tokens: u64,
     summarize: S,
     stage_summary: impl FnOnce(&str, usize),
 ) -> anyhow::Result<(usize, u64, crate::event::UsageDelta)>
@@ -711,11 +746,12 @@ where
         .map(|message| message.estimated_tokens)
         .sum();
     stage_summary(&summary, first_kept_index);
-    session.compress_with_budget(
+    session.compress_with_budget_restoring(
         summary,
         first_kept_index,
         tokens_before,
         summary_byte_budget,
+        restore_read_tokens,
     );
     Ok((first_kept_index, tokens_before, usage))
 }

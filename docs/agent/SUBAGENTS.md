@@ -1351,8 +1351,16 @@ you want a child response larger than its value.
 
 Context admission uses the existing token estimator over the complete prepared
 request (including history, system text and tool schemas) and reserves the
-response. It refuses an oversized request locally without trimming signed
-history or silently compacting it. This estimate is not a provider tokenizer;
+response. It refuses an oversized request locally; the refusal names
+`subagent_context_window`. When `compact_enabled` is true (the default), a child
+whose next request is refused compacts its own conversation and continues, at
+most twice per child: its oldest tool-result payloads are replaced with an
+omission notice until the history fits half the child window (call ids and
+order are kept), the child writes a tool-free working summary, and it then
+continues on the brief plus that summary. These relief requests are ordinary
+child requests: they pass the same admission and are charged to the task's
+weighted units. With `compact_enabled = false`, or when the summary fails, the
+refusal is returned as before. This estimate is not a provider tokenizer;
 the provider's actual context/output limits remain authoritative. Unknown model
 capacity uses the independent configured/default child window, not the main
 session's capacity. A failed format repair preserves the original findings in

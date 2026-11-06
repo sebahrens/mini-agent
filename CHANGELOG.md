@@ -8,6 +8,42 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 **Fork release 1.14.2 (2026-10-28)**
 
+### Changed (context management)
+
+- Automatic compaction is now on by default (`compact_enabled` defaults to `true`, and
+  `mid_turn_compact_threshold` defaults to `0.9`; `0` disables the mid-turn trigger). An explicit
+  `compact_enabled: false` is still honored. A headless request the provider rejects for exceeding
+  its context window now records the turn's progress, compacts once and retries once before the
+  error is surfaced (mini-agent-3mswy).
+- Headless `-p`, `--loop`, goal rounds and `--no-session` runs now compact mid-turn: when real
+  prompt pressure crosses `mid_turn_compact_threshold`, the runner stops after the complete tool
+  batch, the session (in memory for `--no-session`) is compacted and the task continues
+  (mini-agent-sgzh0). ACP turns are not covered yet.
+- A `task` child whose next request would exceed `subagent_context_window` now compacts its own
+  conversation (oldest tool results trimmed, tool-free summary, continue) instead of failing, at
+  most twice per child and charged to the task's weighted units; with `compact_enabled = false`
+  the refusal, which names `subagent_context_window`, is unchanged (mini-agent-d0rfu).
+- Ollama requests now send the session's context window as `options.num_ctx` (an explicit
+  `extra_body` `num_ctx` wins), and startup caps the window to the model's context length from
+  `/api/show`, so the server no longer silently truncates at its small default (mini-agent-djwve).
+- The generic tool-result spill bound (MCP and other tools without their own limit) is now
+  configurable with `tool_result_spill_chars`, `tool_result_spill_head_chars` and
+  `tool_result_spill_tail_chars`, and by default scales with the context window
+  (`window / 10` characters, 12,000–50,000) instead of a fixed 12,000 (mini-agent-bjiqr).
+- Compaction summaries scale with the context window: up to `window / 32` response tokens
+  (4,096–20,000) and a matching stored rolling summary (at least 16 KiB), so large-window sessions
+  no longer squeeze all state into 4,096 tokens (mini-agent-wu3uc).
+- After a compaction the summary re-attaches the newest file windows read in the compacted history
+  (up to 5, quoted as untrusted, possibly stale content) within `compact_restore_read_tokens`
+  (default `window / 20`, at most 25,000; `0` disables), so the model need not re-read them
+  (mini-agent-xzt6g).
+- Root context files now share a window-relative budget (window tokens as bytes, 16 KiB–512 KiB,
+  `context_files_max_bytes` overrides) instead of a fixed 512 KiB, and an oversized nested or
+  included instruction source loads truncated with a notice instead of failing (mini-agent-59sgr).
+- The TUI attachment preflight estimates images from their dimensions and PDFs per page instead of
+  a flat 2,048 tokens per attachment, so large images or long PDFs trigger compaction or a local
+  rejection before the provider call (mini-agent-d6x7s).
+
 ### Security
 
 - `pulldown-cmark` is updated to 0.13.5 for RUSTSEC-2026-0414 (exponential event growth with
