@@ -13,6 +13,7 @@ pub(crate) mod instructions;
 #[cfg(any(test, feature = "subagents"))]
 pub(crate) mod mentions;
 pub mod prompts;
+pub(crate) mod rules;
 pub mod themes;
 
 pub(crate) fn load_embedded_files(embedded: &Dir, ext: &str) -> Vec<(String, String)> {
@@ -581,6 +582,55 @@ fn walk_bound_context_files(
                 content
             ));
         }
+    }
+    // Claude Code's modular layout: `.claude/CLAUDE.md` and the one-topic
+    // files under `.claude/rules/`. Unconditional ones join the root context
+    // here; rules scoped by `paths:` are registered for first-touch delivery
+    // (mini-agent-dzrup). Same budget and data framing as CLAUDE.md.
+    let claude_dir_files = std::iter::once(PathBuf::from(".claude/CLAUDE.md")).chain(
+        workspace.relative_markdown_files(
+            Path::new(rules::RULES_DIR),
+            rules::MAX_RULE_DEPTH,
+            rules::MAX_RULE_ENTRIES,
+            rules::MAX_RULE_FILES,
+        ),
+    );
+    for relative in claude_dir_files {
+        let Some((content, truncated, identity)) =
+            workspace.read_relative_context_file(&relative, MAX_ANCESTOR_CONTEXT_BYTES)
+        else {
+            continue;
+        };
+        let name = relative.to_string_lossy().replace('\\', "/");
+        let (content, patterns) = if rules::is_rule_path(&relative) {
+            let rule = rules::parse_rule(&content);
+            (rule.body, rule.patterns)
+        } else {
+            (content, None)
+        };
+        if let Some(patterns) = patterns {
+            if let Ok(root) =
+                instructions::InstructionRoot::workspace(workspace, relative.clone(), "")
+            {
+                roots.push(root.scoped_to(patterns).with_identity(identity));
+            }
+            continue;
+        }
+        let Some(content) = budget.admit(&name, content, truncated) else {
+            continue;
+        };
+        let Ok(root) =
+            instructions::InstructionRoot::workspace(workspace, relative.clone(), &content)
+        else {
+            continue;
+        };
+        roots.push(root.with_identity(identity));
+        agent_parts.push(format!(
+            "# {} ({})\n{}",
+            name,
+            workspace.root().display(),
+            content
+        ));
     }
     (
         (!agent_parts.is_empty()).then(|| agent_parts.join("\n\n")),
@@ -1204,5 +1254,99 @@ mod startup_binding_load_tests {
                 .keys()
                 .collect::<std::collections::BTreeSet<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod claude_layout_tests {
+    use super::*;
+
+    fn bound(root: &Path) -> crate::paths::WorkspaceBinding {
+        crate::paths::WorkspaceBinding::capture(root).unwrap()
+    }
+
+    // mini-agent-dzrup: `.claude/CLAUDE.md` and unconditional `.claude/rules`
+    // files join the root context; `paths:`-scoped rules do not, and are
+    // registered as scoped roots for first-touch delivery.
+    #[test]
+    fn claude_directory_files_load_and_scoped_rules_are_held_back() {
+        let root = crate::tests::OwnedTestDirectory::new("claude-layout-walk");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".claude/rules/deep")).unwrap();
+        std::fs::write(workspace.join("CLAUDE.md"), "ROOT_CLAUDE").unwrap();
+        std::fs::write(workspace.join(".claude/CLAUDE.md"), "DOT_CLAUDE").unwrap();
+        std::fs::write(
+            workspace.join(".claude/rules/style.md"),
+            "---\ndescription: style\n---\nALWAYS_RULE\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join(".claude/rules/deep/api.md"),
+            "---\npaths:\n  - \"src/api/**\"\n---\nSCOPED_RULE_BODY\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join(".claude/rules/notes.txt"), "NOT_MARKDOWN").unwrap();
+        let (agents, _, roots) = walk_bound_context_files(&bound(&workspace));
+        let agents = agents.unwrap();
+        for expected in ["ROOT_CLAUDE", "DOT_CLAUDE", "ALWAYS_RULE"] {
+            assert!(agents.contains(expected), "{expected}: {agents}");
+        }
+        assert!(agents.contains("# .claude/CLAUDE.md ("), "{agents}");
+        assert!(agents.contains("# .claude/rules/style.md ("), "{agents}");
+        assert!(
+            !agents.contains("description: style"),
+            "frontmatter stripped"
+        );
+        assert!(
+            !agents.contains("SCOPED_RULE_BODY") && !agents.contains("NOT_MARKDOWN"),
+            "{agents}"
+        );
+        assert_eq!(roots.len(), 4, "{roots:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_rules_and_directories_are_not_followed() {
+        let root = crate::tests::OwnedTestDirectory::new("claude-layout-symlink");
+        let workspace = root.path().join("ws");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(workspace.join(".claude/rules")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.md"), "OUTSIDE_SECRET").unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("secret.md"),
+            workspace.join(".claude/rules/link.md"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join(".claude/rules/dir")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("secret.md"),
+            workspace.join(".claude/CLAUDE.md"),
+        )
+        .unwrap();
+        let (agents, _, roots) = walk_bound_context_files(&bound(&workspace));
+        assert!(
+            !agents.unwrap_or_default().contains("OUTSIDE_SECRET"),
+            "a symlink must not smuggle outside text into the prompt"
+        );
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn rule_discovery_is_bounded() {
+        let root = crate::tests::OwnedTestDirectory::new("claude-layout-bounds");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".claude/rules")).unwrap();
+        for index in 0..(rules::MAX_RULE_FILES + 20) {
+            std::fs::write(
+                workspace.join(format!(".claude/rules/r{index:03}.md")),
+                format!("RULE_{index:03}"),
+            )
+            .unwrap();
+        }
+        let (agents, _, roots) = walk_bound_context_files(&bound(&workspace));
+        let agents = agents.unwrap();
+        assert_eq!(roots.len(), rules::MAX_RULE_FILES);
+        assert!(agents.contains("RULE_000") && !agents.contains("RULE_083"));
     }
 }

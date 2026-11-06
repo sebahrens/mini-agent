@@ -3418,6 +3418,22 @@ sets it explicitly (same bounds). A file that does not fit in what remains is
 truncated with a visible notice (`[context file truncated: ...]`) rather than loaded
 whole, and files after the budget is spent are skipped.
 
+Claude Code's modular project layout is read too. The root also loads `.claude/CLAUDE.md`
+(after `CLAUDE.md`) and every `.md` file under `.claude/rules/` (recursively, at most 64
+files and 4 levels, symlinks skipped) through the same budget, trust and data framing as
+`CLAUDE.md`, framed with their relative path. A rule without frontmatter, or whose
+frontmatter does not parse, is unconditional and loads at session start. A rule whose YAML
+frontmatter has a `paths:` list (or a comma-separated string) of globs, for example
+`paths: ["src/api/**/*.ts"]`, is instead delivered the first time `read`, `edit`, `write` or
+`notebook_edit` touches a workspace-relative path matching one of the globs (`*` does not cross
+`/`, `**` does, `{a,b}` alternatives work), once per run, like a nested `CLAUDE.md`: it requires a
+trusted project config and existing read authority, and `/context` lists it after delivery. The
+frontmatter is stripped, and keys other than `paths` are ignored. Load order of instruction
+sources: mini-agent global `AGENTS.md`, then with `user_instruction_files = true`
+`~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`, then the workspace `AGENTS.md`, `CLAUDE.md`,
+`ARCHITECTURE.md`, `.claude/CLAUDE.md`, the unconditional `.claude/rules` files and
+`CLAUDE.local.md`; path-scoped rules and nested directory files arrive on first touch.
+
 Root `CLAUDE.local.md` and authored `@path` or `@{path with spaces}` includes are
 captured at agent construction. Native `read`, `edit`, `write` and `notebook_edit`
 also load `AGENTS.md`, `CLAUDE.md` and `CLAUDE.local.md` from directories under

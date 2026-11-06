@@ -667,6 +667,74 @@ impl WorkspaceBinding {
         files
     }
 
+    /// One context file at a retained-root-relative path (for example
+    /// `.claude/CLAUDE.md`), read up to `max_bytes` without following links.
+    /// `None` when it is absent, not a regular file or not UTF-8.
+    pub(crate) fn read_relative_context_file(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> Option<(String, bool, crate::fs::CheckedMetadata)> {
+        let file = self.open_regular_relative(path).ok()?;
+        let identity = crate::fs::checked_file_metadata(&file).ok()?;
+        let (content, truncated) = read_utf8_prefix(file, max_bytes).ok().flatten()?;
+        Some((content, truncated, identity))
+    }
+
+    /// Sorted workspace-relative paths of the plain `.md` files below `dir`
+    /// (recursive to `max_depth` levels). Symlinks, special files and
+    /// directories past the caps are skipped; at most `max_entries` directory
+    /// entries are scanned and `max_files` paths returned, so a huge tree can
+    /// neither stall startup nor flood the prompt.
+    pub(crate) fn relative_markdown_files(
+        &self,
+        dir: &Path,
+        max_depth: usize,
+        max_entries: usize,
+        max_files: usize,
+    ) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut scanned = 0usize;
+        let mut pending = vec![(dir.to_path_buf(), 0usize)];
+        while let Some((current, depth)) = pending.pop() {
+            let Ok(directory) = self.open_dir_relative(&current) else {
+                continue;
+            };
+            let Ok(entries) = directory.read_dir(".") else {
+                continue;
+            };
+            for entry in entries {
+                scanned += 1;
+                if scanned > max_entries {
+                    files.sort();
+                    files.truncate(max_files);
+                    return files;
+                }
+                let Ok(entry) = entry else { continue };
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let name = entry.file_name();
+                let relative = current.join(&name);
+                // cap-std file types never follow a final symlink.
+                if kind.is_dir() {
+                    if depth + 1 < max_depth {
+                        pending.push((relative, depth + 1));
+                    }
+                } else if kind.is_file()
+                    && Path::new(&name)
+                        .extension()
+                        .is_some_and(|extension| extension == "md")
+                {
+                    files.push(relative);
+                }
+            }
+        }
+        files.sort();
+        files.truncate(max_files);
+        files
+    }
+
     pub(crate) fn create_relative_atomic(&self, path: &Path, content: &[u8]) -> io::Result<()> {
         self.create_relative_atomic_policy(path, content, false)
     }
