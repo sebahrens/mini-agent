@@ -371,6 +371,7 @@ fn append_assistant(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdvisorArgs {
     pub question: String,
 }

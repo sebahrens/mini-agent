@@ -419,6 +419,8 @@ pub(crate) mod support;
 #[cfg(test)]
 mod todo_tests;
 #[cfg(test)]
+mod tool_unknown_args_tests;
+#[cfg(test)]
 mod tools_filter_tests;
 #[cfg(test)]
 mod tools_mod_tests;

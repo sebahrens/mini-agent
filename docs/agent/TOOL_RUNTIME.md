@@ -916,6 +916,15 @@ an owned Unix child held before exec. Explicit unlock ends the lock's ownership
 before receipt acknowledgement; inherited descriptors cannot extend it after
 the ledger operation completes. Corrupt-tail failures retain bytes and charges.
 
+### Unknown tool arguments
+
+Every model-facing tool argument struct (`shell`, `job_status`, `read`, `write`, `edit` and its
+nested edit ops, `grep`, `find_files`, `list_dir`, `lsp_*`, `git`, `todo`, `js`, `advisor`,
+`skills_search` and the memory tools) is `deny_unknown_fields`. A call that carries a
+wrong-harness name such as `workdir`, `run_in_background`, `glob` or `head_limit` fails with
+`unknown field \`workdir\`, expected one of ...` listing the valid parameter names, so the model
+corrects the call instead of running it in the wrong directory, in the foreground, or unfiltered.
+
 ### PDF text from `read`
 
 `read` recognises a `%PDF-` header and returns the document's extracted text

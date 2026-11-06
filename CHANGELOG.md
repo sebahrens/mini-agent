@@ -23,6 +23,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   mini-agent-ktcqn).
 ### Tool layer
 
+- Tool argument structs reject unknown field names (`workdir`, `run_in_background`, `glob`,
+  `head_limit`, ...) with an error listing the valid names instead of silently dropping them
+  (mini-agent-hj7hy).
 - `list_dir` pages through every entry of a flat directory (the 10,000-entry cap now applies only to
   depth 2-3 trees); `find_files` accepts `offset`/`limit` and names `continue with offset=N`.
 - `git` diff/show pages and `job_status` polls are self-bounded (git pages scale under

@@ -697,6 +697,7 @@ pub fn is_vcs_metadata(name: &str) -> bool {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadArgs {
     pub path: String,
     #[serde(default)]
@@ -712,6 +713,7 @@ pub struct ReadArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteArgs {
     pub path: String,
     pub content: String,
@@ -720,6 +722,7 @@ pub struct WriteArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EditArgs {
     pub path: String,
     #[serde(default)]
@@ -741,6 +744,7 @@ pub(crate) struct EditBlock {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EditOp {
     pub line: Option<String>,
     pub lines: Option<String>,
@@ -748,6 +752,7 @@ pub(crate) struct EditOp {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BashArgs {
     pub command: String,
     pub timeout: Option<u64>,
@@ -777,6 +782,7 @@ pub enum JobAction {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobStatusArgs {
     pub id: Option<String>,
     #[serde(default)]
@@ -792,6 +798,7 @@ pub struct JobStatusArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrepArgs {
     pub pattern: String,
     pub path: Option<String>,
@@ -830,6 +837,7 @@ pub enum FindFilesSort {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FindFilesArgs {
     pub pattern: String,
     /// Matches to skip (0-based) for paging past the result cap.
@@ -847,6 +855,7 @@ pub struct FindFilesArgs {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ListDirArgs {
     pub path: Option<String>,
     /// Entries to skip (0-based) for paging past the entry cap.
