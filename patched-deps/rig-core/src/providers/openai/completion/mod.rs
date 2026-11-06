@@ -600,6 +600,9 @@ impl TryFrom<message::ToolResult> for Message {
             .map(|content| {
                 match content {
                 message::ToolResultContent::Text(message::Text { text, .. }) => Ok(text),
+                message::ToolResultContent::Document(_) => Ok(
+                    message::ToolResultContent::DOCUMENT_OMITTED_NOTICE.to_string(),
+                ),
                 message::ToolResultContent::Image(_) => Err(message::MessageError::ConversionError(
                     "OpenAI does not support images in tool results. Tool results must be text."
                         .into(),

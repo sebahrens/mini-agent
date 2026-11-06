@@ -102,6 +102,41 @@ impl std::ops::AddAssign for ImageCost {
     }
 }
 
+/// Model tokens one PDF page is charged: Anthropic documents bill roughly
+/// 1.5k-3k text tokens plus one image per page; the higher figure keeps the
+/// estimate on the conservative side.
+const PDF_PAGE_TOKENS: u64 = 3_000;
+
+/// Cost of one base64 PDF document block. The page count comes from the
+/// `/Type /Page` markers (the native subset writer emits them verbatim; a
+/// foreign PDF falls back to a byte-based count), never from the base64
+/// length, which would otherwise be read as megabytes of prose.
+fn pdf_document_cost(document: &rig::message::Document) -> ImageCost {
+    let DocumentSourceKind::Base64(data) = &document.data else {
+        return ImageCost {
+            encoded_chars: 0,
+            tokens: PDF_PAGE_TOKENS,
+        };
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .unwrap_or_default();
+    let marker = b"/Type /Page";
+    let pages = decoded
+        .windows(marker.len() + 1)
+        .filter(|window| window.starts_with(marker) && !matches!(window[marker.len()], b's'))
+        .count() as u64;
+    let pages = if pages == 0 {
+        (decoded.len() as u64).div_ceil(100 * 1024).max(1)
+    } else {
+        pages
+    };
+    ImageCost {
+        encoded_chars: data.chars().count() as u64,
+        tokens: pages.saturating_mul(PDF_PAGE_TOKENS),
+    }
+}
+
 /// Images carried by one history message: user images and tool-result images.
 pub(crate) fn message_image_cost(message: &Message) -> ImageCost {
     let mut cost = ImageCost::default();
@@ -111,8 +146,12 @@ pub(crate) fn message_image_cost(message: &Message) -> ImageCost {
                 UserContent::Image(image) => cost += image_cost(image),
                 UserContent::ToolResult(result) => {
                     for part in result.content.iter() {
-                        if let ToolResultContent::Image(image) = part {
-                            cost += image_cost(image);
+                        match part {
+                            ToolResultContent::Image(image) => cost += image_cost(image),
+                            ToolResultContent::Document(document) => {
+                                cost += pdf_document_cost(document)
+                            }
+                            ToolResultContent::Text(_) => {}
                         }
                     }
                 }
@@ -131,7 +170,7 @@ fn envelope_image_bytes(output: &str) -> Option<(u64, serde_json::Value)> {
     let parts = value.get("parts")?.as_array()?;
     let bytes = parts
         .iter()
-        .filter(|part| part["type"] == "image")
+        .filter(|part| part["type"] == "image" || part["type"] == "document")
         .filter_map(|part| part["data"].as_str())
         .fold(0u64, |total, data| total.saturating_add(data.len() as u64));
     (bytes > 0).then_some((bytes, value))
@@ -228,6 +267,16 @@ mod tests {
         ];
         assert_eq!(omitted_images(&history), 1);
         assert!(omission_note(1).contains("1 image result(s) were omitted"));
+    }
+
+    #[test]
+    fn child_ceiling_counts_pdf_document_parts_like_images() {
+        let envelope = serde_json::json!({
+            "response": "scan",
+            "parts": [{"type": "document", "mimeType": "application/pdf", "data": "A".repeat(1000)}]
+        })
+        .to_string();
+        assert_eq!(envelope_image_bytes(&envelope).unwrap().0, 1000);
     }
 
     #[test]

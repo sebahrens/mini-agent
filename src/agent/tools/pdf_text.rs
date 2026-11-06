@@ -19,6 +19,9 @@ use super::pdf_filters;
 mod pdf_images;
 #[cfg(feature = "multimodal")]
 pub(crate) use pdf_images::PdfImage;
+#[cfg(feature = "multimodal")]
+#[path = "pdf_subset.rs"]
+mod pdf_subset;
 
 /// Largest PDF file the read tool loads.
 pub(crate) const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
@@ -395,6 +398,9 @@ pub(crate) struct Document {
     objects: HashMap<u32, Obj>,
     pages: Vec<(Dict, Option<Dict>)>,
     decoded_budget: std::cell::Cell<u64>,
+    /// The file declared encryption (its objects were decrypted in memory).
+    #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
+    encrypted: bool,
 }
 
 /// Why a PDF could not be read as text.
@@ -763,6 +769,7 @@ impl Document {
                 encrypt = Some((entry.clone(), first_id(&dict)));
             }
         }
+        let encrypted = encrypt.is_some();
         if let Some((entry, id0)) = encrypt {
             decrypt_streams(&mut objects, &generations, &entry, id0)?;
         }
@@ -770,6 +777,7 @@ impl Document {
             objects,
             pages: Vec::new(),
             decoded_budget: std::cell::Cell::new(MAX_TOTAL_DECODED),
+            encrypted,
         };
         document.expand_object_streams(nodes, deadline)?;
         document.collect_pages()?;
@@ -1758,7 +1766,10 @@ fn no_text_report(
     out.push_str(&attached.sentence());
     let scanned: Vec<usize> = scanned
         .into_iter()
-        .filter(|page| !attached.images.iter().any(|image| image.page == *page))
+        .filter(|page| {
+            !attached.images.iter().any(|image| image.page == *page)
+                && !attached.document_pages.contains(page)
+        })
         .collect();
     if !scanned.is_empty() {
         out.push_str(&format!(
@@ -1811,6 +1822,8 @@ struct AttachedImage {
 #[derive(Default)]
 struct Attached {
     images: Vec<AttachedImage>,
+    /// Pages carried, in order, by the native PDF document block.
+    document_pages: Vec<usize>,
     /// Why other scanned pages have no image.
     problems: Vec<String>,
 }
@@ -1819,6 +1832,18 @@ impl Attached {
     /// Model-facing sentence mapping image blocks to pages; empty when none.
     fn sentence(&self) -> String {
         let mut out = String::new();
+        if !self.document_pages.is_empty() {
+            let items: Vec<String> = self
+                .document_pages
+                .iter()
+                .enumerate()
+                .map(|(slot, page)| format!("document page {} = page {page}", slot + 1))
+                .collect();
+            out.push_str(&format!(
+                " The page(s) without a text layer are attached as one PDF document block holding only those pages ({}); read their text and figures from it.",
+                items.join(", ")
+            ));
+        }
         if !self.images.is_empty() {
             let items: Vec<String> = self
                 .images
@@ -1848,6 +1873,10 @@ impl Attached {
 /// What [`render_with_images`] produced.
 pub(crate) struct Rendered {
     pub(crate) text: String,
+    /// A standalone PDF of the pages that have no text layer, when native
+    /// document input was requested and the pages could be extracted.
+    #[cfg(feature = "multimodal")]
+    pub(crate) document: Option<Vec<u8>>,
     #[cfg(feature = "multimodal")]
     pub(crate) images: Vec<PdfImage>,
 }
@@ -1860,7 +1889,7 @@ pub(crate) fn render(
     pages: Option<&str>,
     budget: usize,
 ) -> Result<String, String> {
-    render_with_images(bytes, path, pages, budget, 0).map(|rendered| rendered.text)
+    render_with_images(bytes, path, pages, budget, 0, false).map(|rendered| rendered.text)
 }
 
 /// Render the selected pages' text layer for the read tool, bounded by
@@ -1874,6 +1903,7 @@ pub(crate) fn render_with_images(
     pages: Option<&str>,
     budget: usize,
     max_images: usize,
+    native_pdf: bool,
 ) -> Result<Rendered, String> {
     let document = Document::parse(bytes)
         .map_err(|error| format!("Cannot read '{path}' as PDF text: {error}."))?;
@@ -1940,7 +1970,25 @@ pub(crate) fn render_with_images(
     #[cfg(feature = "multimodal")]
     let mut images: Vec<PdfImage> = Vec::new();
     #[cfg(feature = "multimodal")]
-    {
+    let mut native_document: Option<Vec<u8>> = None;
+    #[cfg(feature = "multimodal")]
+    if native_pdf && !without_text.is_empty() {
+        let numbers: Vec<usize> = without_text.iter().map(|(page, _)| *page).collect();
+        match document.subset_pdf(&numbers) {
+            Ok(subset) => {
+                attached.document_pages = numbers;
+                native_document = Some(subset);
+            }
+            // Fall back to lifting page images below.
+            Err(reason) => attached
+                .problems
+                .push(format!("native PDF block unavailable: {reason}")),
+        }
+    }
+    #[cfg(not(feature = "multimodal"))]
+    let _ = native_pdf;
+    #[cfg(feature = "multimodal")]
+    if native_document.is_none() {
         let mut skipped_for_limit = Vec::new();
         for (page, content) in &without_text {
             if !content.notes.is_empty() || content.text_operators || content.images == 0 {
@@ -1985,6 +2033,8 @@ pub(crate) fn render_with_images(
             text: no_text_report(path, count, &without_text, &attached),
             #[cfg(feature = "multimodal")]
             images,
+            #[cfg(feature = "multimodal")]
+            document: native_document,
         });
     }
     let mut out = format!(
@@ -2006,6 +2056,8 @@ pub(crate) fn render_with_images(
         text: out,
         #[cfg(feature = "multimodal")]
         images,
+        #[cfg(feature = "multimodal")]
+        document: native_document,
     })
 }
 
@@ -2137,6 +2189,129 @@ mod tests {
 
     fn page_with(dict: &str, data: Vec<u8>) -> Document {
         Document::parse(&build(&[Content::Encoded(dict.into(), data)], false)).unwrap()
+    }
+
+    #[cfg(feature = "multimodal")]
+    fn scanned_fixture(pages: usize) -> Vec<u8> {
+        let jpeg = include_bytes!("fixtures/read-image64/3x2.jpg");
+        let mut image = format!(
+            "<< /Type /XObject /Subtype /Image /Width 3 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
+            jpeg.len()
+        )
+        .into_bytes();
+        image.extend_from_slice(jpeg);
+        image.extend_from_slice(b"\nendstream");
+        let contents: Vec<Content> = (0..pages)
+            .map(|_| Content::Plain("q 612 0 0 792 0 0 cm /Im0 Do Q".into()))
+            .collect();
+        build_with(
+            &contents,
+            false,
+            &format!("/XObject << /Im0 {} 0 R >>", first_extra_object(pages)),
+            vec![image],
+        )
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn subset_keeps_only_the_chosen_pages_with_inherited_resources() {
+        let document = Document::parse(&scanned_fixture(3)).unwrap();
+        let subset = document.subset_pdf(&[3, 1]).unwrap();
+        assert!(subset.starts_with(b"%PDF-1.7"));
+        let reparsed = Document::parse(&subset).unwrap();
+        assert_eq!(reparsed.page_count(), 2);
+        for index in 0..2 {
+            let content = reparsed.page_content(index).unwrap();
+            assert_eq!(content.images, 1, "page {index} lost its image");
+            assert_eq!(content.image_names, vec![b"Im0".to_vec()]);
+        }
+        // The image bytes travel once per page tree, not once per source page.
+        let jpeg = include_bytes!("fixtures/read-image64/3x2.jpg");
+        let copies = subset
+            .windows(jpeg.len())
+            .filter(|window| *window == jpeg.as_slice())
+            .count();
+        assert_eq!(copies, 1);
+        assert!(subset.len() < scanned_fixture(3).len() + 1024);
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn subset_drops_active_content_and_links_to_other_pages() {
+        let mut pdf = scanned_fixture(2);
+        let swap = |pdf: &mut Vec<u8>, from: &[u8], to: &[u8]| {
+            let at = pdf.windows(from.len()).position(|w| w == from).unwrap();
+            pdf.splice(at..at + from.len(), to.iter().copied());
+        };
+        swap(
+            &mut pdf,
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /JavaScript /JS (app.alert) >> /Names << /JavaScript << >> >> >>",
+        );
+        let annot = first_extra_object(2) + 1;
+        swap(
+            &mut pdf,
+            b"/MediaBox [0 0 612 792] /Contents 6 0 R",
+            format!("/MediaBox [0 0 612 792] /Contents 6 0 R /AA << /O << /S /JavaScript /JS (evil) >> >> /Annots [{annot} 0 R] /Group << /S /Transparency /Back 7 0 R >>").as_bytes(),
+        );
+        // The annotation links to the other page and runs a URI action.
+        pdf.extend_from_slice(
+            format!("{annot} 0 obj\n<< /Type /Annot /Subtype /Link /Dest [7 0 R /Fit] /A << /S /URI /URI (http://evil.test/x) >> /P 5 0 R >>\nendobj\n").as_bytes(),
+        );
+        let document = Document::parse(&pdf).unwrap();
+        assert_eq!(document.page_count(), 2);
+        let subset = document.subset_pdf(&[1]).unwrap();
+        let text = String::from_utf8_lossy(&subset);
+        for forbidden in [
+            "evil",
+            "JavaScript",
+            "OpenAction",
+            "Annots",
+            "/AA",
+            "/URI",
+            "Names",
+            "Outlines",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden} survived: {text}");
+        }
+        let reparsed = Document::parse(&subset).unwrap();
+        assert_eq!(reparsed.page_count(), 1);
+        // Only the requested page's content stream is in the copy.
+        assert_eq!(text.matches("/Type /Page ").count(), 1);
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn subset_refuses_encrypted_oversized_and_missing_pages() {
+        let document = Document::parse(&scanned_fixture(1)).unwrap();
+        assert!(
+            document
+                .subset_pdf(&[2])
+                .unwrap_err()
+                .contains("does not exist")
+        );
+        assert!(document.subset_pdf(&[]).is_err());
+        let mut encrypted = Document::parse(&scanned_fixture(1)).unwrap();
+        encrypted.encrypted = true;
+        assert!(
+            encrypted
+                .subset_pdf(&[1])
+                .unwrap_err()
+                .contains("encrypted")
+        );
+        // A page whose single stream is over the cap is refused, not truncated.
+        let big = vec![b'x'; pdf_subset::MAX_NATIVE_PDF_BYTES + 1];
+        let mut object = format!("<< /Length {} >>\nstream\n", big.len()).into_bytes();
+        object.extend_from_slice(&big);
+        object.extend_from_slice(b"\nendstream");
+        let pdf = build_with(
+            &[Content::Plain("q /Big Do Q".into())],
+            false,
+            &format!("/XObject << /Big {} 0 R >>", first_extra_object(1)),
+            vec![object],
+        );
+        let document = Document::parse(&pdf).unwrap();
+        assert!(document.subset_pdf(&[1]).unwrap_err().contains("limit"));
     }
 
     #[test]
@@ -2339,6 +2514,24 @@ mod tests {
                 "{label}: {rendered}"
             );
         }
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn decrypted_documents_are_never_re_emitted_as_a_subset() {
+        for (label, pdf) in OWNER_ONLY {
+            let document = Document::parse(pdf).unwrap();
+            assert!(document.encrypted, "{label}");
+            assert!(
+                document.subset_pdf(&[1]).unwrap_err().contains("encrypted"),
+                "{label}"
+            );
+        }
+        assert!(
+            !Document::parse(&build(&[Content::Plain("x".into())], false))
+                .unwrap()
+                .encrypted
+        );
     }
 
     #[test]

@@ -6293,7 +6293,7 @@ mod history_tests {
                 Message::User { content } => content.iter().find_map(|item| match item {
                     UserContent::ToolResult(result) => match result.content.first() {
                         ToolResultContent::Text(text) => Some(text.text),
-                        ToolResultContent::Image(_) => None,
+                        ToolResultContent::Image(_) | ToolResultContent::Document(_) => None,
                     },
                     _ => None,
                 }),

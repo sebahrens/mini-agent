@@ -1182,3 +1182,86 @@ async fn image_read64_incomplete_and_ambiguous_batches_refuse_before_http() {
         );
     }
 }
+
+#[tokio::test]
+async fn pdf_document_envelopes_survive_the_generic_spill_hook() {
+    use futures::StreamExt;
+    use rig::agent::AgentBuilder;
+    use rig::streaming::StreamingChat;
+    use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+    use rig::tool::Tool;
+
+    struct PdfEnvelopeTool(String);
+    impl Tool for PdfEnvelopeTool {
+        const NAME: &'static str = "pdf_envelope";
+        type Error = crate::agent::tools::ToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+        fn description(&self) -> String {
+            "Return a PDF envelope".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(&self, _: Self::Args) -> Result<String, Self::Error> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let root = super::OwnedTestDirectory::new("pdf-envelope-spill");
+    let _environment = super::ScopedProcessEnv::set(&[
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(root.path().join("data").into_os_string()),
+        ),
+        ("MINI_AGENT_CONFIG_DIR", Some(root.path().into())),
+        ("MINI_AGENT_STATE_DIR", Some(root.path().into())),
+    ]);
+    let data = base64::engine::general_purpose::STANDARD.encode(vec![b'%'; 300 * 1024]);
+    let output = serde_json::json!({
+        "response": "scan",
+        "parts": [{"type": "document", "mimeType": "application/pdf", "data": data}]
+    })
+    .to_string();
+    let model = MockCompletionModel::from_stream_turns(vec![
+        vec![
+            MockStreamEvent::tool_call("pdf-id", PdfEnvelopeTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        vec![
+            MockStreamEvent::text("seen"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+    ]);
+    let session = crate::session::Session::new("test", "mock", 128_000, "");
+    let agent = AgentBuilder::new(model.clone())
+        .tool(PdfEnvelopeTool(output))
+        .add_hook(crate::agent::runner::ToolResultSpillHook::new(
+            session.id.clone(),
+            Some(session.tool_result_spills.clone()),
+        ))
+        .build();
+    let mut stream = agent
+        .stream_chat("inspect", Vec::<Message>::new())
+        .max_turns(2)
+        .await;
+    while let Some(item) = stream.next().await {
+        item.unwrap();
+    }
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    let carried = requests[1].chat_history.iter().any(|message| match message {
+        Message::User { content } => content.iter().any(|part| match part {
+            UserContent::ToolResult(result) => result.content.iter().any(|part| {
+                matches!(part, ToolResultContent::Document(document)
+                    if matches!(&document.data, rig::message::DocumentSourceKind::Base64(d) if *d == data))
+            }),
+            _ => false,
+        }),
+        _ => false,
+    });
+    assert!(
+        carried,
+        "the document block must reach the next request intact"
+    );
+}

@@ -868,6 +868,28 @@ pub mod gemini_api_types {
                                     None => json!({ "result": result }),
                                 });
                             }
+                            message::ToolResultContent::Document(document) => {
+                                let DocumentSourceKind::Base64(b64) = &document.data else {
+                                    return Err(message::MessageError::ConversionError(
+                                        "Only inline base64 documents can be used in Gemini tool results"
+                                            .to_string(),
+                                    ));
+                                };
+                                if document.media_type != Some(message::DocumentMediaType::PDF) {
+                                    return Err(message::MessageError::ConversionError(
+                                        "Only PDF documents can be used in Gemini tool results"
+                                            .to_string(),
+                                    ));
+                                }
+                                parts.push(FunctionResponsePart {
+                                    inline_data: Some(FunctionResponseInlineData {
+                                        mime_type: "application/pdf".to_string(),
+                                        data: b64.clone(),
+                                        display_name: None,
+                                    }),
+                                    file_data: None,
+                                });
+                            }
                             message::ToolResultContent::Image(image) => {
                                 let part = match &image.data {
                                     DocumentSourceKind::Base64(b64) => {
@@ -2191,6 +2213,26 @@ pub mod gemini_api_types {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pdf_document_tool_result_is_inline_data() {
+        let content = message::UserContent::ToolResult(message::ToolResult {
+            id: "read".into(),
+            call_id: None,
+            content: OneOrMany::many(vec![
+                message::ToolResultContent::text("scanned"),
+                message::ToolResultContent::pdf_base64("JVBERg=="),
+            ])
+            .unwrap(),
+        });
+        let part = Part::try_from(content).unwrap();
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(
+            json["functionResponse"]["parts"][0]["inlineData"],
+            serde_json::json!({"mimeType":"application/pdf","data":"JVBERg=="})
+        );
+    }
+
+
     use crate::{
         message,
         providers::gemini::completion::gemini_api_types::{
