@@ -388,7 +388,7 @@ pub(super) mod tests {
         assert!(large.len() > MAX_USER_IMAGE_BYTES);
         let shrunk = decode_png(large).unwrap();
         assert!(shrunk.data.len() <= MAX_USER_IMAGE_BYTES);
-        assert!(shrunk.info.width <= 2000 && shrunk.info.width < 1100 + 1);
+        assert!(shrunk.info.width <= 1100);
         assert_eq!(
             crate::agent::tools::read_image::ImageFormat::from_magic(&shrunk.data)
                 .map(|format| format.mime()),
