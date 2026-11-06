@@ -882,8 +882,37 @@ pub(super) fn maybe_run_hosted_lifecycle() -> Option<ExitCode> {
             println!("{HOSTED_PASS_RECORD}");
             ExitCode::SUCCESS
         }
-        Err(_) => ExitCode::FAILURE,
+        Err(error) => {
+            // Every owning stage reports its own closed token. An error that reached this point
+            // without one still gets a closed label and I/O class instead of silence; its
+            // `Display` text is never printed.
+            for line in unclassified_matrix_failure_lines(
+                PREFLIGHT_STAGE_TOKEN_REPORTED.load(std::sync::atomic::Ordering::SeqCst),
+                &error,
+            ) {
+                eprintln!("{line}");
+            }
+            ExitCode::FAILURE
+        }
     })
+}
+
+/// Set once any parent-side preflight stage token has been reported in this process.
+static PREFLIGHT_STAGE_TOKEN_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The closed fallback lines for a hosted matrix error that no owning stage labelled.
+fn unclassified_matrix_failure_lines(
+    stage_token_reported: bool,
+    error: &io::Error,
+) -> Vec<&'static str> {
+    if stage_token_reported {
+        return Vec::new();
+    }
+    vec![
+        "MACOS_CONTAINMENT_MATRIX_FAILED=unclassified",
+        HostedProbeIoClass::from_kind(error.kind()).token(),
+    ]
 }
 
 fn initialize_hosted_process_paths() -> io::Result<()> {
@@ -927,6 +956,7 @@ fn preflight_token_stderr_line(token: &str, evidence_requested: bool) -> Option<
 /// Record a parent-side preflight stage token: on stderr only for opted-in evidence collection,
 /// otherwise as a debug trace.
 fn report_preflight_token(token: &str) {
+    PREFLIGHT_STAGE_TOKEN_REPORTED.store(true, std::sync::atomic::Ordering::SeqCst);
     match preflight_token_stderr_line(token, containment_evidence_requested()) {
         Some(line) => eprintln!("{line}"),
         None => tracing::debug!(token, "macOS containment preflight stage failed"),
@@ -1073,7 +1103,11 @@ fn run_containment_preflight_with_proof_hook(
             let first = (|| {
                 let authentication = authenticate_ready_and_probe(&mut process, true);
                 if authentication.is_err() {
+                    // Classify the root's own exit (if any) before the parent's teardown can
+                    // turn it into a parent-delivered signal; only the closed class is reported.
+                    let exit = HostedWorkerExitClass::classify(process.try_wait());
                     let _ = process.terminate_and_reap(PREFLIGHT_TIMEOUT);
+                    report_preflight_token(exit.token());
                 }
                 let closed_code = diagnostic_drain.join().ok().flatten();
                 if let Some(code) = closed_code {
@@ -2074,69 +2108,386 @@ fn guardian_group_matches(expected: libc::pid_t) -> bool {
         && (unsafe { libc::getpid() }) != expected
 }
 
+/// A fixed phase of the parent's hosted Hello/Ready/attestation/shutdown exchange.
+///
+/// Each phase has one closed, source-free `MACOS_CONTAINMENT_MATRIX_FAILED=<phase>` label so a
+/// first-generation attestation failure no longer collapses to the generic `bootstrap` fallback.
+/// The label never carries worker bytes, paths, tokens, configuration or error `Display` text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostedProbePhase {
+    HelloProtocol,
+    HelloWrite,
+    HelloFlush,
+    ReadyRead,
+    ReadyProtocol,
+    ReadyFrame,
+    ImageUnlink,
+    ProbeProtocol,
+    ProbeWrite,
+    ProbeFlush,
+    AttestationRead,
+    AttestationProtocol,
+    AttestationResult,
+    ShutdownProtocol,
+    ShutdownWrite,
+    ShutdownFlush,
+    ShutdownWait,
+    ShutdownExit,
+    ShutdownTimeout,
+}
+
+impl HostedProbePhase {
+    #[cfg(test)]
+    const ALL: [Self; 19] = [
+        Self::HelloProtocol,
+        Self::HelloWrite,
+        Self::HelloFlush,
+        Self::ReadyRead,
+        Self::ReadyProtocol,
+        Self::ReadyFrame,
+        Self::ImageUnlink,
+        Self::ProbeProtocol,
+        Self::ProbeWrite,
+        Self::ProbeFlush,
+        Self::AttestationRead,
+        Self::AttestationProtocol,
+        Self::AttestationResult,
+        Self::ShutdownProtocol,
+        Self::ShutdownWrite,
+        Self::ShutdownFlush,
+        Self::ShutdownWait,
+        Self::ShutdownExit,
+        Self::ShutdownTimeout,
+    ];
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::HelloProtocol => "MACOS_CONTAINMENT_MATRIX_FAILED=hello_protocol",
+            Self::HelloWrite => "MACOS_CONTAINMENT_MATRIX_FAILED=hello_write",
+            Self::HelloFlush => "MACOS_CONTAINMENT_MATRIX_FAILED=hello_flush",
+            Self::ReadyRead => "MACOS_CONTAINMENT_MATRIX_FAILED=ready_read",
+            Self::ReadyProtocol => "MACOS_CONTAINMENT_MATRIX_FAILED=ready_protocol",
+            Self::ReadyFrame => "MACOS_CONTAINMENT_MATRIX_FAILED=ready_frame",
+            Self::ImageUnlink => "MACOS_CONTAINMENT_MATRIX_FAILED=image_unlink",
+            Self::ProbeProtocol => "MACOS_CONTAINMENT_MATRIX_FAILED=probe_protocol",
+            Self::ProbeWrite => "MACOS_CONTAINMENT_MATRIX_FAILED=probe_write",
+            Self::ProbeFlush => "MACOS_CONTAINMENT_MATRIX_FAILED=probe_flush",
+            Self::AttestationRead => "MACOS_CONTAINMENT_MATRIX_FAILED=attestation_read",
+            Self::AttestationProtocol => "MACOS_CONTAINMENT_MATRIX_FAILED=attestation_protocol",
+            Self::AttestationResult => "MACOS_CONTAINMENT_MATRIX_FAILED=attestation_result",
+            Self::ShutdownProtocol => "MACOS_CONTAINMENT_MATRIX_FAILED=shutdown_protocol",
+            Self::ShutdownWrite => "MACOS_CONTAINMENT_MATRIX_FAILED=shutdown_write",
+            Self::ShutdownFlush => "MACOS_CONTAINMENT_MATRIX_FAILED=shutdown_flush",
+            Self::ShutdownWait => "MACOS_CONTAINMENT_MATRIX_FAILED=shutdown_wait",
+            Self::ShutdownExit => "MACOS_CONTAINMENT_MATRIX_FAILED=shutdown_exit",
+            Self::ShutdownTimeout => "MACOS_CONTAINMENT_MATRIX_FAILED=shutdown_timeout",
+        }
+    }
+}
+
+/// The closed I/O class of a hosted-probe failure, derived only from `io::ErrorKind` (never from
+/// an OS message or error `Display`). `encode` marks a frame that failed before any I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostedProbeIoClass {
+    BrokenPipe,
+    UnexpectedEof,
+    TimedOut,
+    WouldBlock,
+    Interrupted,
+    PermissionDenied,
+    NotFound,
+    InvalidData,
+    InvalidInput,
+    ConnectionReset,
+    Encode,
+    Other,
+}
+
+impl HostedProbeIoClass {
+    #[cfg(test)]
+    const ALL: [Self; 12] = [
+        Self::BrokenPipe,
+        Self::UnexpectedEof,
+        Self::TimedOut,
+        Self::WouldBlock,
+        Self::Interrupted,
+        Self::PermissionDenied,
+        Self::NotFound,
+        Self::InvalidData,
+        Self::InvalidInput,
+        Self::ConnectionReset,
+        Self::Encode,
+        Self::Other,
+    ];
+
+    fn from_kind(kind: io::ErrorKind) -> Self {
+        match kind {
+            io::ErrorKind::BrokenPipe => Self::BrokenPipe,
+            io::ErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            io::ErrorKind::TimedOut => Self::TimedOut,
+            io::ErrorKind::WouldBlock => Self::WouldBlock,
+            io::ErrorKind::Interrupted => Self::Interrupted,
+            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            io::ErrorKind::NotFound => Self::NotFound,
+            io::ErrorKind::InvalidData => Self::InvalidData,
+            io::ErrorKind::InvalidInput => Self::InvalidInput,
+            io::ErrorKind::ConnectionReset => Self::ConnectionReset,
+            _ => Self::Other,
+        }
+    }
+
+    fn from_frame_error(error: &crate::extras::js::protocol::FrameError) -> Self {
+        match error {
+            crate::extras::js::protocol::FrameError::Io(kind) => Self::from_kind(*kind),
+            _ => Self::Encode,
+        }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::BrokenPipe => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=broken_pipe",
+            Self::UnexpectedEof => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=unexpected_eof",
+            Self::TimedOut => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=timed_out",
+            Self::WouldBlock => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=would_block",
+            Self::Interrupted => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=interrupted",
+            Self::PermissionDenied => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=permission_denied",
+            Self::NotFound => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=not_found",
+            Self::InvalidData => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=invalid_data",
+            Self::InvalidInput => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=invalid_input",
+            Self::ConnectionReset => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=connection_reset",
+            Self::Encode => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=encode",
+            Self::Other => "MACOS_CONTAINMENT_MATRIX_IO_CLASS=other",
+        }
+    }
+}
+
+/// The closed classification of the hosted worker root's exit, observed after a failed
+/// first-generation attestation and before the parent's own teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostedWorkerExitClass {
+    ExitedSuccess,
+    ExitedFailure,
+    ExitedSysexits,
+    ExitedOther,
+    SignalKill,
+    SignalTerm,
+    SignalAbort,
+    SignalSegv,
+    SignalBus,
+    SignalCpuLimit,
+    SignalOther,
+    Running,
+    Unavailable,
+}
+
+impl HostedWorkerExitClass {
+    #[cfg(test)]
+    const ALL: [Self; 13] = [
+        Self::ExitedSuccess,
+        Self::ExitedFailure,
+        Self::ExitedSysexits,
+        Self::ExitedOther,
+        Self::SignalKill,
+        Self::SignalTerm,
+        Self::SignalAbort,
+        Self::SignalSegv,
+        Self::SignalBus,
+        Self::SignalCpuLimit,
+        Self::SignalOther,
+        Self::Running,
+        Self::Unavailable,
+    ];
+
+    fn classify(observed: io::Result<Option<ExitStatus>>) -> Self {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = match observed {
+            Ok(Some(status)) => status,
+            Ok(None) => return Self::Running,
+            Err(_) => return Self::Unavailable,
+        };
+        if let Some(code) = status.code() {
+            return match code {
+                0 => Self::ExitedSuccess,
+                1 => Self::ExitedFailure,
+                64..=78 => Self::ExitedSysexits,
+                _ => Self::ExitedOther,
+            };
+        }
+        match status.signal() {
+            Some(libc::SIGKILL) => Self::SignalKill,
+            Some(libc::SIGTERM) => Self::SignalTerm,
+            Some(libc::SIGABRT) => Self::SignalAbort,
+            Some(libc::SIGSEGV) => Self::SignalSegv,
+            Some(libc::SIGBUS) => Self::SignalBus,
+            Some(libc::SIGXCPU) => Self::SignalCpuLimit,
+            Some(_) => Self::SignalOther,
+            None => Self::Unavailable,
+        }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::ExitedSuccess => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=exited_success",
+            Self::ExitedFailure => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=exited_failure",
+            Self::ExitedSysexits => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=exited_sysexits",
+            Self::ExitedOther => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=exited_other",
+            Self::SignalKill => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=signal_kill",
+            Self::SignalTerm => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=signal_term",
+            Self::SignalAbort => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=signal_abort",
+            Self::SignalSegv => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=signal_segv",
+            Self::SignalBus => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=signal_bus",
+            Self::SignalCpuLimit => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=signal_cpu_limit",
+            Self::SignalOther => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=signal_other",
+            Self::Running => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=running",
+            Self::Unavailable => "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=unavailable",
+        }
+    }
+}
+
+/// A hosted-probe failure: its fixed phase, optional closed I/O class, and the unchanged static
+/// error returned to callers.
+#[derive(Debug)]
+struct HostedProbeFailure {
+    phase: HostedProbePhase,
+    io_class: Option<HostedProbeIoClass>,
+    error: io::Error,
+}
+
+impl HostedProbeFailure {
+    fn protocol(phase: HostedProbePhase, error: io::Error) -> Self {
+        Self {
+            phase,
+            io_class: None,
+            error,
+        }
+    }
+
+    fn io(phase: HostedProbePhase, error: io::Error) -> Self {
+        Self {
+            phase,
+            io_class: Some(HostedProbeIoClass::from_kind(error.kind())),
+            error,
+        }
+    }
+
+    /// The closed stderr lines for this failure, in emission order.
+    fn diagnostic_lines(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.phase.token()).chain(self.io_class.map(HostedProbeIoClass::token))
+    }
+}
+
 fn authenticate_ready_and_probe(
     process: &mut WorkerProcess,
     graceful_teardown: bool,
 ) -> io::Result<()> {
+    authenticate_ready_and_probe_phased(process, graceful_teardown).map_err(|failure| {
+        for line in failure.diagnostic_lines() {
+            report_preflight_token(line);
+        }
+        failure.error
+    })
+}
+
+fn authenticate_ready_and_probe_phased(
+    process: &mut WorkerProcess,
+    graceful_teardown: bool,
+) -> Result<(), HostedProbeFailure> {
     use crate::extras::js::protocol::{
         BuildIdentity, ContainmentAttestation, ContainmentProbe, ParentFrame, ParentProtocol,
         WireFrame, WorkerFrame, write_frame,
     };
+    use HostedProbeFailure as Failure;
+    use HostedProbePhase as Phase;
+
+    fn encode_failure(
+        phase: HostedProbePhase,
+        error: &crate::extras::js::protocol::FrameError,
+        message: &'static str,
+    ) -> HostedProbeFailure {
+        HostedProbeFailure {
+            phase,
+            io_class: Some(HostedProbeIoClass::from_frame_error(error)),
+            error: io::Error::other(message),
+        }
+    }
 
     let build = BuildIdentity::current();
     let mut protocol = ParentProtocol::new(build.clone());
     let hello = WireFrame::connection(build.clone(), 0, ParentFrame::Hello(protocol.hello()));
-    protocol
-        .on_send(&hello)
-        .map_err(|_| io::Error::other("macOS preflight rejected Hello"))?;
-    write_frame(&mut process.input, &hello)
-        .map_err(|_| io::Error::other("macOS preflight could not encode Hello"))?;
-    process.input.flush()?;
+    protocol.on_send(&hello).map_err(|_| {
+        Failure::protocol(
+            Phase::HelloProtocol,
+            io::Error::other("macOS preflight rejected Hello"),
+        )
+    })?;
+    write_frame(&mut process.input, &hello).map_err(|error| {
+        encode_failure(
+            Phase::HelloWrite,
+            &error,
+            "macOS preflight could not encode Hello",
+        )
+    })?;
+    process
+        .input
+        .flush()
+        .map_err(|error| Failure::io(Phase::HelloFlush, error))?;
 
-    let ready = read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT).inspect_err(
-        |_error| {
-            report_preflight_token("MACOS_CONTAINMENT_MATRIX_FAILED=ready_read");
-        },
-    )?;
-    protocol
-        .on_receive(&ready)
-        .map_err(|_| io::Error::other("macOS preflight received unauthenticated Ready"))?;
+    let ready = read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT)
+        .map_err(|error| Failure::io(Phase::ReadyRead, error))?;
+    protocol.on_receive(&ready).map_err(|_| {
+        Failure::protocol(
+            Phase::ReadyProtocol,
+            io::Error::other("macOS preflight received unauthenticated Ready"),
+        )
+    })?;
     if !matches!(ready.message, WorkerFrame::Ready(_)) {
-        return Err(io::Error::other(
-            "macOS preflight received a non-Ready frame",
+        return Err(Failure::protocol(
+            Phase::ReadyFrame,
+            io::Error::other("macOS preflight received a non-Ready frame"),
         ));
     }
     process
         .finalize_authenticated_ready()
-        .inspect_err(|_error| {
-            report_preflight_token("MACOS_CONTAINMENT_MATRIX_FAILED=image_unlink");
-        })?;
+        .map_err(|error| Failure::io(Phase::ImageUnlink, error))?;
 
     let containment = WireFrame::connection(
         build.clone(),
         2,
         ParentFrame::ContainmentProbe(ContainmentProbe {}),
     );
-    protocol
-        .on_send(&containment)
-        .map_err(|_| io::Error::other("macOS hosted containment probe was rejected"))?;
-    write_frame(&mut process.input, &containment)
-        .map_err(|_| io::Error::other("macOS hosted containment probe could not be encoded"))?;
-    process.input.flush()?;
-    let attested = read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT).inspect_err(
-        |_error| {
-            report_preflight_token("MACOS_CONTAINMENT_MATRIX_FAILED=attestation_read");
-        },
-    )?;
-    protocol
-        .on_receive(&attested)
-        .map_err(|_| io::Error::other("macOS hosted containment attestation was invalid"))?;
+    protocol.on_send(&containment).map_err(|_| {
+        Failure::protocol(
+            Phase::ProbeProtocol,
+            io::Error::other("macOS hosted containment probe was rejected"),
+        )
+    })?;
+    write_frame(&mut process.input, &containment).map_err(|error| {
+        encode_failure(
+            Phase::ProbeWrite,
+            &error,
+            "macOS hosted containment probe could not be encoded",
+        )
+    })?;
+    process
+        .input
+        .flush()
+        .map_err(|error| Failure::io(Phase::ProbeFlush, error))?;
+    let attested = read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT)
+        .map_err(|error| Failure::io(Phase::AttestationRead, error))?;
+    protocol.on_receive(&attested).map_err(|_| {
+        Failure::protocol(
+            Phase::AttestationProtocol,
+            io::Error::other("macOS hosted containment attestation was invalid"),
+        )
+    })?;
     if !matches!(
         attested.message,
         WorkerFrame::ContainmentAttested(ContainmentAttestation::Passed)
     ) {
-        return Err(io::Error::other(
-            "macOS hosted containment attestation did not pass",
+        return Err(Failure::protocol(
+            Phase::AttestationResult,
+            io::Error::other("macOS hosted containment attestation did not pass"),
         ));
     }
     if !graceful_teardown {
@@ -2144,29 +2495,47 @@ fn authenticate_ready_and_probe(
     }
 
     let shutdown = WireFrame::connection(build, 4, ParentFrame::Shutdown);
-    protocol
-        .on_send(&shutdown)
-        .map_err(|_| io::Error::other("macOS preflight rejected graceful Shutdown"))?;
-    write_frame(&mut process.input, &shutdown)
-        .map_err(|_| io::Error::other("macOS preflight could not encode graceful Shutdown"))?;
-    process.input.flush()?;
+    protocol.on_send(&shutdown).map_err(|_| {
+        Failure::protocol(
+            Phase::ShutdownProtocol,
+            io::Error::other("macOS preflight rejected graceful Shutdown"),
+        )
+    })?;
+    write_frame(&mut process.input, &shutdown).map_err(|error| {
+        encode_failure(
+            Phase::ShutdownWrite,
+            &error,
+            "macOS preflight could not encode graceful Shutdown",
+        )
+    })?;
+    process
+        .input
+        .flush()
+        .map_err(|error| Failure::io(Phase::ShutdownFlush, error))?;
 
     let deadline = Instant::now() + PREFLIGHT_TIMEOUT;
     loop {
-        if let Some(status) = process.try_wait()? {
+        if let Some(status) = process
+            .try_wait()
+            .map_err(|error| Failure::io(Phase::ShutdownWait, error))?
+        {
             return if status.success() {
                 Ok(())
             } else {
-                Err(io::Error::other(
-                    "macOS preflight rejected graceful Shutdown",
+                Err(Failure::protocol(
+                    Phase::ShutdownExit,
+                    io::Error::other("macOS preflight rejected graceful Shutdown"),
                 ))
             };
         }
         if Instant::now() >= deadline {
             let _ = process.terminate_and_reap(PREFLIGHT_TIMEOUT);
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "macOS preflight graceful Shutdown timed out",
+            return Err(Failure::protocol(
+                Phase::ShutdownTimeout,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "macOS preflight graceful Shutdown timed out",
+                ),
             ));
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -6079,6 +6448,267 @@ mod tests {
             ),
             Some("MACOS_CONTAINMENT_PROBE_FAILED=worker_limits")
         );
+    }
+
+    fn is_closed_matrix_diagnostic_line(line: &str) -> bool {
+        [
+            "MACOS_CONTAINMENT_MATRIX_FAILED=",
+            "MACOS_CONTAINMENT_MATRIX_IO_CLASS=",
+            "MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=",
+        ]
+        .iter()
+        .any(|prefix| {
+            line.strip_prefix(prefix).is_some_and(|label| {
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            })
+        })
+    }
+
+    #[test]
+    fn closed_probe_diagnostic_hosted_phase_labels_are_closed_and_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        let phases = HostedProbePhase::ALL.map(HostedProbePhase::token);
+        let classes = HostedProbeIoClass::ALL.map(HostedProbeIoClass::token);
+        let exits = HostedWorkerExitClass::ALL.map(HostedWorkerExitClass::token);
+        let stages = PreflightStage::ALL.map(PreflightStage::token);
+        for token in phases
+            .iter()
+            .chain(&classes)
+            .chain(&exits)
+            .chain(&stages)
+            .copied()
+            .chain([
+                "MACOS_CONTAINMENT_MATRIX_FAILED=unclassified",
+                "MACOS_CONTAINMENT_PROBE_FAILED=bootstrap",
+            ])
+        {
+            assert!(seen.insert(token), "duplicate closed label {token}");
+            assert!(
+                is_closed_matrix_diagnostic_line(token)
+                    || token == "MACOS_CONTAINMENT_PROBE_FAILED=bootstrap",
+                "label outside the closed grammar: {token}"
+            );
+            // Parent-owned labels can never be relayed (or forged) through worker stderr.
+            assert_eq!(parse_closed_probe_diagnostic(token.as_bytes()), None);
+        }
+        // The pre-existing parent labels keep their exact spelling.
+        assert_eq!(
+            HostedProbePhase::ReadyRead.token(),
+            "MACOS_CONTAINMENT_MATRIX_FAILED=ready_read"
+        );
+        assert_eq!(
+            HostedProbePhase::ImageUnlink.token(),
+            "MACOS_CONTAINMENT_MATRIX_FAILED=image_unlink"
+        );
+        assert_eq!(
+            HostedProbePhase::AttestationRead.token(),
+            "MACOS_CONTAINMENT_MATRIX_FAILED=attestation_read"
+        );
+        assert_eq!(
+            PreflightStage::WorkerAttestation.token(),
+            "MACOS_CONTAINMENT_MATRIX_FAILED=worker_attestation"
+        );
+        assert_eq!(
+            HostedProbeIoClass::from_frame_error(&crate::extras::js::protocol::FrameError::Io(
+                io::ErrorKind::BrokenPipe
+            )),
+            HostedProbeIoClass::BrokenPipe
+        );
+        assert_eq!(
+            HostedProbeIoClass::from_frame_error(
+                &crate::extras::js::protocol::FrameError::Serialization
+            ),
+            HostedProbeIoClass::Encode
+        );
+        assert_eq!(
+            HostedProbeIoClass::from_kind(io::ErrorKind::AddrInUse),
+            HostedProbeIoClass::Other
+        );
+    }
+
+    #[test]
+    fn closed_probe_diagnostic_worker_exit_classes_cover_codes_and_signals() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let exit = |code: i32| ExitStatus::from_raw(code << 8);
+        for (observed, expected) in [
+            (Ok(Some(exit(0))), HostedWorkerExitClass::ExitedSuccess),
+            (Ok(Some(exit(1))), HostedWorkerExitClass::ExitedFailure),
+            (Ok(Some(exit(64))), HostedWorkerExitClass::ExitedSysexits),
+            (Ok(Some(exit(71))), HostedWorkerExitClass::ExitedSysexits),
+            (Ok(Some(exit(78))), HostedWorkerExitClass::ExitedSysexits),
+            (Ok(Some(exit(2))), HostedWorkerExitClass::ExitedOther),
+            (Ok(Some(exit(255))), HostedWorkerExitClass::ExitedOther),
+            (
+                Ok(Some(ExitStatus::from_raw(libc::SIGKILL))),
+                HostedWorkerExitClass::SignalKill,
+            ),
+            (
+                Ok(Some(ExitStatus::from_raw(libc::SIGTERM))),
+                HostedWorkerExitClass::SignalTerm,
+            ),
+            (
+                Ok(Some(ExitStatus::from_raw(libc::SIGABRT))),
+                HostedWorkerExitClass::SignalAbort,
+            ),
+            (
+                Ok(Some(ExitStatus::from_raw(libc::SIGSEGV))),
+                HostedWorkerExitClass::SignalSegv,
+            ),
+            (
+                Ok(Some(ExitStatus::from_raw(libc::SIGBUS))),
+                HostedWorkerExitClass::SignalBus,
+            ),
+            (
+                Ok(Some(ExitStatus::from_raw(libc::SIGXCPU))),
+                HostedWorkerExitClass::SignalCpuLimit,
+            ),
+            (
+                Ok(Some(ExitStatus::from_raw(libc::SIGHUP))),
+                HostedWorkerExitClass::SignalOther,
+            ),
+            (Ok(None), HostedWorkerExitClass::Running),
+            (
+                Err(io::Error::other("raw secret detail")),
+                HostedWorkerExitClass::Unavailable,
+            ),
+        ] {
+            assert_eq!(HostedWorkerExitClass::classify(observed), expected);
+        }
+    }
+
+    #[test]
+    fn macos_preflight_stderr_unclassified_fallback_only_without_a_stage_token() {
+        let error = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "/private/secret/path SECRET_TOKEN",
+        );
+        assert_eq!(
+            unclassified_matrix_failure_lines(false, &error),
+            [
+                "MACOS_CONTAINMENT_MATRIX_FAILED=unclassified",
+                "MACOS_CONTAINMENT_MATRIX_IO_CLASS=permission_denied",
+            ]
+        );
+        assert!(unclassified_matrix_failure_lines(true, &error).is_empty());
+    }
+
+    /// Controlled failure injection through the real scripted worker bootstrap: each injected
+    /// fault maps to exactly one fixed phase (plus an I/O class for I/O phases) and one closed
+    /// worker-exit class, the public error stays static, and no worker byte is ever relayed.
+    #[test]
+    fn macos_preflight_stderr_injected_worker_failures_map_to_fixed_phases() {
+        use crate::sandbox::worker::{TestSupervisorStartup, TestWorkerLauncher, WorkerLauncher};
+
+        struct Case {
+            startup: TestSupervisorStartup,
+            wait_for_exit: bool,
+            force_unlink_error: bool,
+            phase: HostedProbePhase,
+            io_class: Option<HostedProbeIoClass>,
+            exit: &'static [HostedWorkerExitClass],
+            message: &'static str,
+        }
+        let cases = [
+            // Worker exits before reading Hello: the parent's Hello write hits a closed pipe.
+            Case {
+                startup: TestSupervisorStartup::ExitBeforeReady,
+                wait_for_exit: true,
+                force_unlink_error: false,
+                phase: HostedProbePhase::HelloWrite,
+                io_class: Some(HostedProbeIoClass::BrokenPipe),
+                exit: &[HostedWorkerExitClass::ExitedSysexits],
+                message: "macOS preflight could not encode Hello",
+            },
+            // Worker reads Hello, writes a truncated frame and exits.
+            Case {
+                startup: TestSupervisorStartup::MalformedReady,
+                wait_for_exit: false,
+                force_unlink_error: false,
+                phase: HostedProbePhase::ReadyRead,
+                io_class: Some(HostedProbeIoClass::UnexpectedEof),
+                exit: &[
+                    HostedWorkerExitClass::ExitedSysexits,
+                    HostedWorkerExitClass::Running,
+                ],
+                message: "macOS preflight EOF",
+            },
+            // Worker answers with a well-formed Ready bound to the wrong launch challenge.
+            Case {
+                startup: TestSupervisorStartup::ChallengeMismatch,
+                wait_for_exit: false,
+                force_unlink_error: false,
+                phase: HostedProbePhase::ReadyProtocol,
+                io_class: None,
+                exit: &[HostedWorkerExitClass::Running],
+                message: "macOS preflight received unauthenticated Ready",
+            },
+            // Authenticated Ready, then the parent's Ready finalization fails.
+            Case {
+                startup: TestSupervisorStartup::Healthy,
+                wait_for_exit: false,
+                force_unlink_error: true,
+                phase: HostedProbePhase::ImageUnlink,
+                io_class: Some(HostedProbeIoClass::Other),
+                exit: &[HostedWorkerExitClass::Running],
+                message: "forced authenticated-Ready finalization failure",
+            },
+            // Authenticated Ready, then the worker rejects the containment probe and exits.
+            Case {
+                startup: TestSupervisorStartup::Healthy,
+                wait_for_exit: false,
+                force_unlink_error: false,
+                phase: HostedProbePhase::AttestationRead,
+                io_class: Some(HostedProbeIoClass::UnexpectedEof),
+                exit: &[
+                    HostedWorkerExitClass::ExitedFailure,
+                    HostedWorkerExitClass::Running,
+                ],
+                message: "macOS preflight EOF",
+            },
+        ];
+        for case in cases {
+            let launcher =
+                TestWorkerLauncher::scripted_internal_worker_with_startup(64, case.startup);
+            let mut process = launcher.launch().expect("scripted worker must launch");
+            if case.force_unlink_error {
+                process.force_authenticated_ready_finalization_error_for_test();
+            }
+            if case.wait_for_exit {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while process.try_wait().unwrap().is_none() {
+                    assert!(Instant::now() < deadline, "scripted worker did not exit");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let failure = authenticate_ready_and_probe_phased(&mut process, true)
+                .expect_err("injected worker failure must fail the hosted probe");
+            let exit = HostedWorkerExitClass::classify(process.try_wait());
+            let _ = process.terminate_and_reap(PREFLIGHT_TIMEOUT);
+
+            assert_eq!(failure.phase, case.phase, "{:?}", case.startup);
+            assert_eq!(failure.io_class, case.io_class, "{:?}", case.startup);
+            assert!(
+                case.exit.contains(&exit),
+                "{:?}: unexpected exit class {exit:?}",
+                case.startup
+            );
+            assert_eq!(failure.error.to_string(), case.message);
+            let lines = failure
+                .diagnostic_lines()
+                .chain([exit.token()])
+                .collect::<Vec<_>>();
+            assert_eq!(lines[0], case.phase.token());
+            assert_eq!(lines.len(), 2 + usize::from(case.io_class.is_some()));
+            for line in &lines {
+                assert!(is_closed_matrix_diagnostic_line(line), "{line}");
+                // The worker's injected raw stderr filler is never relayed into a parent line.
+                assert!(!line.contains("xxxx"), "{line}");
+            }
+        }
     }
 
     /// Runs only with an explicitly supplied, same-source installed production binary

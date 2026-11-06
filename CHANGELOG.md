@@ -15,6 +15,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- The macOS production-binary containment matrix now reports a fixed, source-free phase label,
+  I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
+  `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for
+  Hello, Ready, attestation and graceful-shutdown failures instead of only `bootstrap`; the pass
+  record and availability decision are unchanged.
 - MCP tool results now deliver supported image blocks and image blob resources to the model,
   preserving image envelopes while bounding and spilling only their text. Excess images retain
   placeholders with an omission note (8 images / 7 MiB encoded per result).
