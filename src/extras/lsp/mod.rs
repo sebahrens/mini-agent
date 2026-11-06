@@ -1029,6 +1029,12 @@ impl LspManager {
         })
     }
 
+    /// Files whose diagnostics were evicted from the full cache and have not
+    /// been republished; the project-wide listing discloses this count.
+    pub fn dropped_diagnostic_files(&self) -> usize {
+        self.inner.diags.dropped_files()
+    }
+
     pub fn all_diagnostics_block_for_snapshots(
         &self,
         snapshots: &[DiagnosticSnapshot],

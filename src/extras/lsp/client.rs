@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -317,11 +317,66 @@ pub struct FileDiags {
     pub content: Option<crate::fs::ContentDigest>,
     /// Conservative retained-memory accounting used by the global cache cap.
     pub cached_bytes: usize,
+    /// Store-clock stamp of the last publication; the eviction recency.
+    pub last_touched: u64,
+}
+
+/// URIs whose non-empty diagnostics were evicted (or refused) because the
+/// cache was full. Bounded: past [`MAX_TRACKED_DROPPED`] only a count is kept.
+const MAX_TRACKED_DROPPED: usize = 1024;
+
+#[derive(Default)]
+struct DroppedFiles {
+    uris: std::collections::HashSet<String>,
+    overflow: usize,
+}
+
+/// The diagnostic cache: uri → latest diagnostics plus the bookkeeping that
+/// makes eviction visible. `lock()` exposes the map exactly as before.
+#[derive(Default)]
+pub struct DiagStoreState {
+    map: Mutex<HashMap<String, FileDiags>>,
+    /// Monotonic recency clock for [`FileDiags::last_touched`].
+    clock: AtomicU64,
+    /// Highest version of any evicted entry. A re-created entry starts above
+    /// it so a waiter holding a pre-eviction baseline still sees progress.
+    version_floor: AtomicU64,
+    dropped: Mutex<DroppedFiles>,
+}
+
+impl DiagStoreState {
+    pub fn lock(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashMap<String, FileDiags>>> {
+        self.map.lock()
+    }
+
+    /// Files whose diagnostics were lost to a full cache and not republished.
+    pub fn dropped_files(&self) -> usize {
+        let dropped = self.dropped.lock().unwrap();
+        dropped.uris.len().saturating_add(dropped.overflow)
+    }
+
+    fn note_dropped(&self, uri: &str) {
+        let mut dropped = self.dropped.lock().unwrap();
+        if dropped.uris.contains(uri) {
+            return;
+        }
+        if dropped.uris.len() < MAX_TRACKED_DROPPED {
+            dropped.uris.insert(uri.to_string());
+        } else {
+            dropped.overflow = dropped.overflow.saturating_add(1);
+        }
+    }
+
+    fn note_published(&self, uri: &str) {
+        self.dropped.lock().unwrap().uris.remove(uri);
+    }
 }
 
 /// uri → latest diagnostics. Shared between the manager and every client's
 /// reader task.
-pub type DiagStore = Arc<Mutex<HashMap<String, FileDiags>>>;
+pub type DiagStore = Arc<DiagStoreState>;
 
 /// Hard ceiling for distinct files retained in the diagnostic cache. Updates
 /// to existing files remain allowed at the ceiling; new files are ignored.
@@ -1755,6 +1810,41 @@ pub(crate) fn store_diagnostics(
     stored
 }
 
+/// Evicts one entry other than `keep` (restricted to `server` when given):
+/// clean (empty) entries first, then the least recently published. Returns
+/// the freed bytes, or `None` when nothing is evictable. An evicted entry that
+/// still held diagnostics is recorded as dropped.
+fn evict_one(
+    state: &DiagStoreState,
+    store: &mut HashMap<String, FileDiags>,
+    server: Option<&str>,
+    keep: &str,
+    clean_only: bool,
+) -> Option<usize> {
+    let victim = store
+        .iter()
+        .filter(|(uri, entry)| {
+            uri.as_str() != keep
+                && server.is_none_or(|server| entry.server == server)
+                && (!clean_only || (entry.diagnostics.is_empty() && entry.omitted == 0))
+        })
+        .min_by_key(|(_, entry)| {
+            (
+                !(entry.diagnostics.is_empty() && entry.omitted == 0),
+                entry.last_touched,
+            )
+        })
+        .map(|(uri, _)| uri.clone())?;
+    let entry = store.remove(&victim)?;
+    state
+        .version_floor
+        .fetch_max(entry.version, Ordering::AcqRel);
+    if !entry.diagnostics.is_empty() || entry.omitted > 0 {
+        state.note_dropped(&victim);
+    }
+    Some(entry.cached_bytes)
+}
+
 pub(crate) fn commit_diagnostics(
     diags: &DiagStore,
     uri: String,
@@ -1765,24 +1855,54 @@ pub(crate) fn commit_diagnostics(
 ) -> bool {
     let (diagnostics, omitted) = sanitize_diagnostics(diagnostics);
     let cached_bytes = retained_diagnostic_bytes(&uri, server, &diagnostics);
+    // An incoming clean publication may only displace clean entries: it must
+    // not push out a file that still has errors.
+    let incoming_clean = diagnostics.is_empty() && omitted == 0;
     let mut store = diags.lock().unwrap();
-    if !store.contains_key(&uri)
-        && (store.len() >= MAX_DIAGNOSTIC_FILES
-            || store
-                .values()
-                .filter(|entry| entry.server == server)
-                .count()
-                >= MAX_DIAGNOSTIC_FILES_PER_SERVER)
-    {
-        return false;
+    if !store.contains_key(&uri) {
+        while store.len() >= MAX_DIAGNOSTIC_FILES {
+            if evict_one(diags, &mut store, None, &uri, incoming_clean).is_none() {
+                if !incoming_clean {
+                    diags.note_dropped(&uri);
+                }
+                return false;
+            }
+        }
+        while store
+            .values()
+            .filter(|entry| entry.server == server)
+            .count()
+            >= MAX_DIAGNOSTIC_FILES_PER_SERVER
+        {
+            if evict_one(diags, &mut store, Some(server), &uri, incoming_clean).is_none() {
+                if !incoming_clean {
+                    diags.note_dropped(&uri);
+                }
+                return false;
+            }
+        }
     }
     let old_bytes = store.get(&uri).map(|entry| entry.cached_bytes).unwrap_or(0);
-    let current_bytes: usize = store.values().map(|entry| entry.cached_bytes).sum();
+    let mut current_bytes: usize = store.values().map(|entry| entry.cached_bytes).sum();
+    while current_bytes
+        .saturating_sub(old_bytes)
+        .saturating_add(cached_bytes)
+        > MAX_DIAGNOSTIC_CACHE_BYTES
+    {
+        match evict_one(diags, &mut store, None, &uri, incoming_clean) {
+            Some(freed) => current_bytes = current_bytes.saturating_sub(freed),
+            None => break,
+        }
+    }
     let replacement_bytes = current_bytes
         .saturating_sub(old_bytes)
         .saturating_add(cached_bytes);
+    let touched = diags.clock.fetch_add(1, Ordering::AcqRel).saturating_add(1);
     if replacement_bytes > MAX_DIAGNOSTIC_CACHE_BYTES {
         let Some(entry) = store.get_mut(&uri) else {
+            if !incoming_clean {
+                diags.note_dropped(&uri);
+            }
             return false;
         };
         let mut tombstone_bytes = retained_diagnostic_bytes(&uri, server, &[]);
@@ -1803,16 +1923,20 @@ pub(crate) fn commit_diagnostics(
         entry.identity = identity;
         entry.content = content;
         entry.cached_bytes = tombstone_bytes;
+        entry.last_touched = touched;
+        diags.note_dropped(&uri);
         return true;
     }
-    let entry = store.entry(uri).or_insert_with(|| FileDiags {
+    let floor = diags.version_floor.load(Ordering::Acquire);
+    let entry = store.entry(uri.clone()).or_insert_with(|| FileDiags {
         server: server.to_string(),
-        version: 0,
+        version: floor,
         diagnostics: Vec::new(),
         omitted: 0,
         identity: None,
         content: None,
         cached_bytes: 0,
+        last_touched: touched,
     });
     entry.server.clear();
     entry.server.push_str(server);
@@ -1822,6 +1946,9 @@ pub(crate) fn commit_diagnostics(
     entry.identity = identity;
     entry.content = content;
     entry.cached_bytes = cached_bytes;
+    entry.last_touched = touched;
+    drop(store);
+    diags.note_published(&uri);
     true
 }
 
@@ -1898,19 +2025,6 @@ pub(crate) fn store_diagnostics_for_test(
                 params.get("diagnostics")?.clone(),
             )
             .ok()?;
-            {
-                let store = diags.lock().unwrap();
-                if !store.contains_key(&uri)
-                    && (store.len() >= MAX_DIAGNOSTIC_FILES
-                        || store
-                            .values()
-                            .filter(|entry| entry.server == server)
-                            .count()
-                            >= MAX_DIAGNOSTIC_FILES_PER_SERVER)
-                {
-                    return None;
-                }
-            }
             Some(commit_diagnostics(
                 diags,
                 uri,

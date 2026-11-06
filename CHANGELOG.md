@@ -23,6 +23,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   mini-agent-ktcqn).
 ### Tool layer
 
+- `lsp_diagnostics` no longer silently loses files once the diagnostic cache is full: clean entries
+  are evicted first, then least recently published, and the project-wide listing appends
+  `[N files' diagnostics dropped: cache full]` (mini-agent-643mg).
 - `git` diff/log accept revision ranges (`a..b`, `a...b`), `diff` a second revision and `staged`,
   `log` `skip`/`next_skip`/`author`/`grep`, and a new `blame` operation; history-rewriting and
   network operations stay intentionally excluded (mini-agent-kg67c).

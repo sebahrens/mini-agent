@@ -3980,6 +3980,12 @@ payloads such as arbitrary JSON `data` are discarded before cache commit.
 Updating an entry replaces its contribution to the aggregate byte budget.
 If a valid newer update cannot fit, its older cached diagnostics are replaced
 by an empty version tombstone so waits complete without exposing stale data.
+When a new file arrives at the file or byte ceiling, clean (empty) entries are
+evicted first, then the least recently published entry; an incoming clean
+publication only displaces clean entries. Evicted entries that still held
+diagnostics are counted, the project-wide `lsp_diagnostics` listing appends
+`[N files' diagnostics dropped: cache full]`, and a re-created entry's version
+stays above the evicted one so edit waits still complete.
 These limits also bound aggregate candidate allocation and sorting. Retained
 diagnostic message bodies are supplied by the configured language server and
 can mention other files, so language-server commands and configuration must

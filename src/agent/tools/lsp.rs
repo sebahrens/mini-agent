@@ -167,11 +167,17 @@ impl Tool for LspTool {
                     // `binding` and its descriptor are released here before
                     // the next cache candidate is opened.
                 }
-                let output = self
+                let mut output = self
                     .manager
                     .all_diagnostics_block_for_snapshots(&snapshots)
                     .map(|block| format!("Files with diagnostics:\n{block}"))
                     .unwrap_or_else(|| "No diagnostics.".to_string());
+                let dropped = self.manager.dropped_diagnostic_files();
+                if dropped > 0 {
+                    output.push_str(&format!(
+                        "\n[{dropped} files' diagnostics dropped: cache full]"
+                    ));
+                }
                 Ok(with_coaching(coaching, output))
             }
         }
