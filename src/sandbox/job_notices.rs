@@ -123,6 +123,7 @@ pub(crate) fn register(session_id: &str, queue: &Arc<JobNoticeQueue>) {
 }
 
 /// Pending notices of `session_id`, taken, rendered for the model.
+#[cfg(any(test, feature = "hooks", feature = "memory", feature = "subagents"))]
 pub(crate) fn take_messages(session_id: &str) -> Vec<String> {
     let queue = registry()
         .lock()
@@ -133,6 +134,7 @@ pub(crate) fn take_messages(session_id: &str) -> Vec<String> {
 }
 
 /// Notices of the current run's session, for the next model request.
+#[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
 pub(crate) fn take_messages_for_current_run() -> Vec<String> {
     crate::spend::run::Run::current()
         .filter(|run| run.kind().is_main_turn())

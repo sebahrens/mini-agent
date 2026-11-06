@@ -101,6 +101,7 @@ impl Run {
         self.background_pool()?.pending_notices()
     }
 
+    #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
     }
