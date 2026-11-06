@@ -420,7 +420,7 @@ so fixture names remain visible without advertising them as product configuratio
 | Command-file fixtures | `MINI_AGENT_TEST_COMMAND_FIFO`: test-only bounded child probe for command-file and project-trust FIFO reads. |
 | Harness evaluation seed | `HARNESS_EVAL_SEED`: optional generator seed for the ignored evidence-axis harness evaluation (drift runs); test-only, never read by the product. |
 | Process-env lock fixture | `ZS_SHARED_READER_TEST`: test-only variable set under the exclusive process-env scope to prove a shared reader never observes a mutator scope; never read by production code. |
-| MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `MINI_AGENT_NETWORK_TESTS`, `MINI_AGENT_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_PUBLISH_DELAY_MS`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_SAVE_LOG`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYMBOL_URI`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
+| MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `MINI_AGENT_NETWORK_TESTS`, `MINI_AGENT_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_NAV_BEHAVIOR`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_PUBLISH_DELAY_MS`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_SAVE_LOG`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYMBOL_URI`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
 
 mini-agent sends no analytics or network telemetry. Learned-skill telemetry is stored in the
 local skill store; provider, embedding, MCP, sharing and explicitly invoked tool requests
@@ -3897,6 +3897,26 @@ each request at 10 seconds. An op the server does not advertise in its
 `initialize` capabilities (for example no `implementationProvider`) fails
 with a message naming the missing capability. Restrict the tool with
 `--tools` like any other; it is registered whenever an LSP manager is.
+
+Further ops: `incoming_calls` and `outgoing_calls` (call hierarchy of the
+symbol at `line`/`column`; the tool sends `prepareCallHierarchy` and then the
+call request, listing callers or callees as locations), `rename` (`new_name`,
+a single identifier of at most 256 bytes) and `code_actions` (optional
+`end_line`/`end_column`; `action`=N previews the edit of that action). The
+client now advertises `window.workDoneProgress`, call-hierarchy, rename,
+code-action and workspace-edit capabilities. `rename` and a previewed code
+action return the server's workspace edit as a bounded review (50 files, 50
+edits per file, 500 total, replacement text cut at 200 bytes, files outside
+the workspace counted but never named, `read`-denied files hidden); **no file is
+modified**. `rename` additionally requires `edit` permission for `path`
+(deny/ask rules for `edit` apply) so a project that forbids edits cannot even
+request proposals, and server commands attached to code actions are described
+but never executed. Readiness: the client tracks `$/progress` work-done tokens;
+an empty answer while a token is active waits up to 8 seconds for it to end and
+asks once more, and a still-empty answer is annotated "the language server is
+still indexing" instead of reading as a true negative. A `ContentModified`
+(-32801) or `ServerCancelled` (-32802) reply is retried once, then reported
+as such.
 
 `lsp_diagnostics` uses the existing `read` permission policy. A file query
 checks the canonical file path before synchronizing it or starting a language

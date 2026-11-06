@@ -1311,7 +1311,7 @@ impl GitRunner {
         command_result(operation, limits, output)
     }
 
-    #[cfg(any(test, feature = "git-worktree"))]
+    #[cfg(feature = "git-worktree")]
     pub(crate) async fn run_allow_exit<I, S>(
         &self,
         repo_path: &Path,

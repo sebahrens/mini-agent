@@ -2386,3 +2386,58 @@ fn idle_timeout_defaults_to_fifteen_minutes_and_zero_disables_retirement() {
     cfg.idle_timeout_secs = Some(30);
     assert_eq!(cfg.idle_timeout(), Some(Duration::from_secs(30)));
 }
+
+#[test]
+fn rename_preview_is_bounded_and_never_names_outside_files() {
+    use crate::extras::lsp::navigate::{MAX_EDIT_FILES, MAX_EDITS_PER_FILE, edit_preview};
+    let root = std::path::PathBuf::from("/ws");
+    let map = |uri: &str| uri.strip_prefix("file:///ws/").map(|rest| root.join(rest));
+    let edit = |n: usize| {
+        serde_json::json!({
+            "range": {"start": {"line": n, "character": 0}, "end": {"line": n, "character": 1}},
+            "newText": format!("line one\nforged {}", "x".repeat(10_000)),
+        })
+    };
+    let mut changes = serde_json::Map::new();
+    changes.insert(
+        "file:///ws/many.rs".into(),
+        serde_json::Value::Array((0..200).map(edit).collect()),
+    );
+    for index in 0..(MAX_EDIT_FILES + 5) {
+        changes.insert(
+            format!("file:///ws/f{index}.rs"),
+            serde_json::json!([edit(0)]),
+        );
+    }
+    changes.insert("file:///etc/passwd".into(), serde_json::json!([edit(0)]));
+    let preview = edit_preview(&serde_json::json!({ "changes": changes }), &map);
+    assert_eq!(preview.files.len(), MAX_EDIT_FILES);
+    assert!(preview.omitted_files >= 5, "{}", preview.omitted_files);
+    assert_eq!(preview.outside, 1);
+    let many = preview
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("many.rs"))
+        .unwrap();
+    assert_eq!(many.edits.len(), MAX_EDITS_PER_FILE);
+    assert_eq!(many.omitted_edits, 200 - MAX_EDITS_PER_FILE);
+    assert!(
+        preview
+            .files
+            .iter()
+            .flat_map(|file| &file.edits)
+            .all(|edit| edit.new_text.len() <= 200),
+        "replacement text is cut"
+    );
+    // File operations outside the workspace are counted, never named.
+    let ops = edit_preview(
+        &serde_json::json!({"documentChanges": [
+            {"kind": "delete", "uri": "file:///etc/shadow"},
+            {"kind": "rename", "oldUri": "file:///ws/a.rs", "newUri": "file:///elsewhere/b.rs"},
+            {"kind": "create", "uri": "file:///ws/new.rs"},
+        ]}),
+        &map,
+    );
+    assert_eq!(ops.outside, 2);
+    assert_eq!(ops.file_ops, vec!["create /ws/new.rs".to_string()]);
+}

@@ -1,6 +1,7 @@
 //! Read-only code navigation through a running language server:
 //! definition, references, implementation, type definition, hover, document
-//! symbols and workspace symbols. Requests reuse the capability-bound
+//! symbols, workspace symbols, call hierarchy, rename preview and code
+//! actions. Requests reuse the capability-bound
 //! document sync of the diagnostics path; every result location is mapped
 //! back to a canonical workspace path. A location outside the workspace
 //! (dependency or standard-library source) is returned as an `external` item
@@ -19,6 +20,23 @@ use super::LspManager;
 /// Bound for one navigation request; indexing servers can be slow to answer
 /// the first query.
 const NAV_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an empty answer waits for a server that is still indexing before
+/// the result is reported as "still indexing".
+const INDEX_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(8)
+};
+/// Rename/code-action previews: files, edits per file and total edits shown.
+pub(crate) const MAX_EDIT_FILES: usize = 50;
+pub(crate) const MAX_EDITS_PER_FILE: usize = 50;
+pub(crate) const MAX_EDITS_TOTAL: usize = 500;
+/// Most code actions listed.
+pub(crate) const MAX_ACTIONS: usize = 50;
+/// Replacement text in a preview is cut at this many bytes.
+const MAX_EDIT_TEXT_BYTES: usize = 200;
+/// Longest accepted `new_name`.
+pub(crate) const MAX_NEW_NAME_BYTES: usize = 256;
 /// Most locations or symbols returned in one result.
 pub(crate) const MAX_NAV_ITEMS: usize = 100;
 /// Hover text is cut at this many bytes (UTF-8 safe).
@@ -37,6 +55,10 @@ pub(crate) enum NavOp {
     Hover,
     Symbols,
     WorkspaceSymbols,
+    IncomingCalls,
+    OutgoingCalls,
+    Rename,
+    CodeActions,
 }
 
 impl NavOp {
@@ -49,6 +71,10 @@ impl NavOp {
             "hover" => Self::Hover,
             "symbols" | "document_symbols" => Self::Symbols,
             "workspace_symbols" => Self::WorkspaceSymbols,
+            "incoming_calls" => Self::IncomingCalls,
+            "outgoing_calls" => Self::OutgoingCalls,
+            "rename" => Self::Rename,
+            "code_actions" | "code_action" => Self::CodeActions,
             _ => return None,
         })
     }
@@ -66,6 +92,10 @@ impl NavOp {
             Self::Hover => "textDocument/hover",
             Self::Symbols => "textDocument/documentSymbol",
             Self::WorkspaceSymbols => "workspace/symbol",
+            Self::IncomingCalls => "callHierarchy/incomingCalls",
+            Self::OutgoingCalls => "callHierarchy/outgoingCalls",
+            Self::Rename => "textDocument/rename",
+            Self::CodeActions => "textDocument/codeAction",
         }
     }
 
@@ -78,6 +108,9 @@ impl NavOp {
             Self::Hover => "hoverProvider",
             Self::Symbols => "documentSymbolProvider",
             Self::WorkspaceSymbols => "workspaceSymbolProvider",
+            Self::IncomingCalls | Self::OutgoingCalls => "callHierarchyProvider",
+            Self::Rename => "renameProvider",
+            Self::CodeActions => "codeActionProvider",
         }
     }
 }
@@ -90,6 +123,12 @@ pub(crate) struct NavQuery {
     pub line: u32,
     pub character: u32,
     pub query: String,
+    /// code_actions: end of the range (defaults to the start position).
+    pub end: Option<(u32, u32)>,
+    /// rename: the new identifier.
+    pub new_name: String,
+    /// code_actions: 1-based index of the action whose edit to preview.
+    pub action_index: Option<u32>,
 }
 
 /// A result location inside the workspace. Positions are zero-based.
@@ -122,16 +161,72 @@ pub(crate) enum NavAnswer {
         text: String,
         truncated: bool,
     },
+    /// A workspace edit shown for review; nothing is applied.
+    Edit(EditPreview),
+    Actions {
+        actions: Vec<ActionView>,
+        truncated: usize,
+    },
+}
+
+/// One text edit, zero-based positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EditView {
+    pub start: (u32, u32),
+    pub end: (u32, u32),
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileEdits {
+    pub path: PathBuf,
+    pub edits: Vec<EditView>,
+    /// Edits for this file dropped by the per-file or total cap.
+    pub omitted_edits: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct EditPreview {
+    pub files: Vec<FileEdits>,
+    /// `create`/`rename`/`delete` resource operations inside the workspace.
+    pub file_ops: Vec<String>,
+    /// Files or operations outside the workspace (omitted, never named).
+    pub outside: usize,
+    /// Files dropped by [`MAX_EDIT_FILES`].
+    pub omitted_files: usize,
+    pub total_edits: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActionView {
+    pub title: String,
+    pub kind: Option<String>,
+    pub preferred: bool,
+    pub edit_files: usize,
+    pub edit_count: usize,
+    pub has_command: bool,
+    pub disabled: Option<String>,
+}
+
+/// Whether a server answer carries nothing, so it may only mean "not ready".
+fn result_is_empty(op: NavOp, result: &Value) -> bool {
+    match result {
+        Value::Null => true,
+        Value::Array(entries) => entries.is_empty(),
+        Value::Object(_) if op == NavOp::Hover => hover_text(result).0.is_empty(),
+        _ => false,
+    }
 }
 
 impl LspManager {
     /// Runs one navigation request for an already-authorized, already
-    /// synchronized canonical workspace file.
+    /// synchronized canonical workspace file. The flag is true when the answer
+    /// is empty while the server was still indexing, so it is not a verdict.
     pub(crate) async fn navigate(
         &self,
         path: &Path,
         query: &NavQuery,
-    ) -> Result<NavAnswer, String> {
+    ) -> Result<(NavAnswer, bool), String> {
         let client = self
             .client_for(path)
             .await
@@ -147,30 +242,375 @@ impl LspManager {
             .wire_uri(path)
             .ok_or_else(|| "file is outside the language-server workspace".to_string())?;
         let position = json!({ "line": query.line, "character": query.character });
-        let params = match query.op {
-            NavOp::Definition | NavOp::TypeDefinition | NavOp::Implementation | NavOp::Hover => {
-                json!({ "textDocument": { "uri": uri }, "position": position })
-            }
-            NavOp::References => json!({
-                "textDocument": { "uri": uri },
-                "position": position,
-                "context": { "includeDeclaration": true }
-            }),
-            NavOp::Symbols => json!({ "textDocument": { "uri": uri } }),
-            NavOp::WorkspaceSymbols => json!({ "query": query.query }),
-        };
-        let result = client.query(query.op.method(), params, NAV_TIMEOUT).await?;
         let map = |uri: &str| client.parent_path(uri);
-        Ok(match query.op {
-            NavOp::Hover => {
-                let (text, truncated) = hover_text(&result);
-                NavAnswer::Hover { text, truncated }
+        // One request; an empty answer from a server that is still indexing
+        // waits (bounded) for it to finish and asks once more.
+        let ask = |method: &'static str, params: Value| {
+            let client = &client;
+            async move {
+                let mut result = client.query(method, params.clone(), NAV_TIMEOUT).await?;
+                let mut indexing = false;
+                if result_is_empty(query.op, &result) && client.is_indexing() {
+                    if client.wait_until_idle(INDEX_WAIT).await {
+                        result = client.query(method, params, NAV_TIMEOUT).await?;
+                    }
+                    indexing = client.is_indexing() && result_is_empty(query.op, &result);
+                }
+                Ok::<_, String>((result, indexing))
             }
-            NavOp::Symbols => symbols_answer(&result, Some(path), &map),
-            NavOp::WorkspaceSymbols => symbols_answer(&result, None, &map),
-            _ => locations_answer(&result, &map),
-        })
+        };
+        let (answer, indexing) = match query.op {
+            NavOp::IncomingCalls | NavOp::OutgoingCalls => {
+                let (prepared, indexing) = ask(
+                    "textDocument/prepareCallHierarchy",
+                    json!({ "textDocument": { "uri": uri }, "position": position }),
+                )
+                .await?;
+                let Some(item) = prepared.as_array().and_then(|items| items.first()).cloned()
+                else {
+                    return Ok((
+                        NavAnswer::Items {
+                            items: Vec::new(),
+                            outside: 0,
+                            truncated: 0,
+                        },
+                        indexing,
+                    ));
+                };
+                let key = if query.op == NavOp::IncomingCalls {
+                    "from"
+                } else {
+                    "to"
+                };
+                let calls = client
+                    .query(query.op.method(), json!({ "item": item }), NAV_TIMEOUT)
+                    .await?;
+                (calls_answer(&calls, key, &map), false)
+            }
+            NavOp::Rename => {
+                let (result, indexing) = ask(
+                    "textDocument/rename",
+                    json!({
+                        "textDocument": { "uri": uri },
+                        "position": position,
+                        "newName": query.new_name,
+                    }),
+                )
+                .await?;
+                (NavAnswer::Edit(edit_preview(&result, &map)), indexing)
+            }
+            NavOp::CodeActions => {
+                let (end_line, end_character) = query.end.unwrap_or((query.line, query.character));
+                let parent_uri = super::client::file_uri(path).unwrap_or_default();
+                let context = self.diagnostics_for_range(&parent_uri, query.line, end_line);
+                let (result, indexing) = ask(
+                    "textDocument/codeAction",
+                    json!({
+                        "textDocument": { "uri": uri },
+                        "range": {
+                            "start": position,
+                            "end": { "line": end_line, "character": end_character }
+                        },
+                        "context": { "diagnostics": context },
+                    }),
+                )
+                .await?;
+                let answer = match query.action_index {
+                    Some(index) => {
+                        let entries = result.as_array().map(Vec::as_slice).unwrap_or_default();
+                        let entry = usize::try_from(index)
+                            .ok()
+                            .and_then(|index| index.checked_sub(1))
+                            .and_then(|index| entries.get(index))
+                            .ok_or_else(|| {
+                                format!(
+                                    "no code action number {index}; the server offered {}",
+                                    entries.len()
+                                )
+                            })?;
+                        match entry.get("edit") {
+                            Some(edit) => NavAnswer::Edit(edit_preview(edit, &map)),
+                            None => {
+                                return Err(
+                                    "that code action carries no edit (server commands are never executed)"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    None => actions_answer(&result),
+                };
+                (answer, indexing)
+            }
+            op => {
+                let params = match op {
+                    NavOp::Definition
+                    | NavOp::TypeDefinition
+                    | NavOp::Implementation
+                    | NavOp::Hover => {
+                        json!({ "textDocument": { "uri": uri }, "position": position })
+                    }
+                    NavOp::References => json!({
+                        "textDocument": { "uri": uri },
+                        "position": position,
+                        "context": { "includeDeclaration": true }
+                    }),
+                    NavOp::Symbols => json!({ "textDocument": { "uri": uri } }),
+                    _ => json!({ "query": query.query }),
+                };
+                let (result, indexing) = ask(op.method(), params).await?;
+                let answer = match op {
+                    NavOp::Hover => {
+                        let (text, truncated) = hover_text(&result);
+                        NavAnswer::Hover { text, truncated }
+                    }
+                    NavOp::Symbols => symbols_answer(&result, Some(path), &map),
+                    NavOp::WorkspaceSymbols => symbols_answer(&result, None, &map),
+                    _ => locations_answer(&result, &map),
+                };
+                (answer, indexing)
+            }
+        };
+        Ok((answer, indexing))
     }
+
+    /// Cached diagnostics whose line span overlaps `[start, end]`, as LSP
+    /// JSON for a code-action request context.
+    fn diagnostics_for_range(&self, uri: &str, start: u32, end: u32) -> Vec<Value> {
+        self.inner
+            .diags
+            .lock()
+            .unwrap()
+            .get(uri)
+            .map(|entry| {
+                entry
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.range.start.line <= end && diagnostic.range.end.line >= start
+                    })
+                    .take(20)
+                    .filter_map(|diagnostic| serde_json::to_value(diagnostic).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// `CallHierarchyIncomingCall[]` / `OutgoingCall[]`: the item under `key`
+/// (`from` or `to`) of each entry, shown at its selection range.
+pub(crate) fn calls_answer(
+    result: &Value,
+    key: &str,
+    map: &dyn Fn(&str) -> Option<PathBuf>,
+) -> NavAnswer {
+    let mut items: Vec<NavItem> = Vec::new();
+    let mut outside = 0;
+    let mut truncated = 0;
+    for entry in result.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let Some(call) = entry.get(key) else {
+            continue;
+        };
+        let uri = call.get("uri").and_then(Value::as_str);
+        let (path, external) = match uri.and_then(map) {
+            Some(path) => (path, false),
+            None => match uri.and_then(external_location) {
+                Some(path) => (path, true),
+                None => {
+                    outside += 1;
+                    continue;
+                }
+            },
+        };
+        let (line, character) =
+            position_of(call.get("selectionRange").or_else(|| call.get("range")));
+        let name = call.get("name").and_then(Value::as_str).unwrap_or("?");
+        let kind = symbol_kind(call.get("kind").and_then(Value::as_u64).unwrap_or(0));
+        let item = NavItem {
+            path,
+            line,
+            character,
+            label: Some(format!("{kind} {}", clean_name(name))),
+            depth: 0,
+            external,
+        };
+        if items.contains(&item) {
+            continue;
+        }
+        if items.len() >= MAX_NAV_ITEMS {
+            truncated += 1;
+            continue;
+        }
+        items.push(item);
+    }
+    NavAnswer::Items {
+        items,
+        outside,
+        truncated,
+    }
+}
+
+/// A `WorkspaceEdit` (`changes` and/or `documentChanges`) reduced to a bounded
+/// per-file preview. Only workspace files are named; anything else is counted.
+pub(crate) fn edit_preview(edit: &Value, map: &dyn Fn(&str) -> Option<PathBuf>) -> EditPreview {
+    let mut preview = EditPreview::default();
+    let add = |preview: &mut EditPreview, uri: &str, edits: &Value| {
+        let Some(path) = map(uri) else {
+            preview.outside += 1;
+            return;
+        };
+        let entries = edits.as_array().map(Vec::as_slice).unwrap_or_default();
+        preview.total_edits += entries.len();
+        let index = match preview.files.iter().position(|file| file.path == path) {
+            Some(index) => index,
+            None if preview.files.len() >= MAX_EDIT_FILES => {
+                preview.omitted_files += 1;
+                return;
+            }
+            None => {
+                preview.files.push(FileEdits {
+                    path,
+                    edits: Vec::new(),
+                    omitted_edits: 0,
+                });
+                preview.files.len() - 1
+            }
+        };
+        let shown_total: usize = preview.files.iter().map(|file| file.edits.len()).sum();
+        let file = &mut preview.files[index];
+        for (offset, entry) in entries.iter().enumerate() {
+            let range = entry.get("range");
+            if file.edits.len() >= MAX_EDITS_PER_FILE || shown_total + offset >= MAX_EDITS_TOTAL {
+                file.omitted_edits += 1;
+                continue;
+            }
+            let end = range.and_then(|range| range.get("end"));
+            let get = |key: &str| {
+                end.and_then(|end| end.get(key))
+                    .and_then(Value::as_u64)
+                    .map_or(0, |value| value.min(u64::from(u32::MAX)) as u32)
+            };
+            file.edits.push(EditView {
+                start: position_of(range),
+                end: (get("line"), get("character")),
+                new_text: truncate(
+                    entry.get("newText").and_then(Value::as_str).unwrap_or(""),
+                    MAX_EDIT_TEXT_BYTES,
+                )
+                .0,
+            });
+        }
+    };
+    if let Some(changes) = edit.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in changes {
+            add(&mut preview, uri, edits);
+        }
+    }
+    for change in edit
+        .get("documentChanges")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        match change.get("kind").and_then(Value::as_str) {
+            Some(kind @ ("create" | "delete")) => {
+                match change.get("uri").and_then(Value::as_str).and_then(map) {
+                    Some(path) if preview.file_ops.len() < MAX_EDIT_FILES => preview.file_ops.push(
+                        format!("{kind} {}", clean_name(&path.display().to_string())),
+                    ),
+                    Some(_) => preview.omitted_files += 1,
+                    None => preview.outside += 1,
+                }
+            }
+            Some("rename") => {
+                let old = change.get("oldUri").and_then(Value::as_str).and_then(map);
+                let new = change.get("newUri").and_then(Value::as_str).and_then(map);
+                match (old, new) {
+                    (Some(old), Some(new)) if preview.file_ops.len() < MAX_EDIT_FILES => {
+                        preview.file_ops.push(format!(
+                            "rename {} -> {}",
+                            clean_name(&old.display().to_string()),
+                            clean_name(&new.display().to_string())
+                        ));
+                    }
+                    (Some(_), Some(_)) => preview.omitted_files += 1,
+                    _ => preview.outside += 1,
+                }
+            }
+            _ => {
+                let uri = change
+                    .get("textDocument")
+                    .and_then(|document| document.get("uri"))
+                    .and_then(Value::as_str);
+                if let (Some(uri), Some(edits)) = (uri, change.get("edits")) {
+                    add(&mut preview, uri, edits);
+                }
+            }
+        }
+    }
+    preview
+}
+
+/// `(Command | CodeAction)[]` reduced to titles with an edit summary. Server
+/// commands are described, never executed.
+pub(crate) fn actions_answer(result: &Value) -> NavAnswer {
+    let entries = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut actions = Vec::new();
+    let mut truncated = 0;
+    for entry in entries {
+        if actions.len() >= MAX_ACTIONS {
+            truncated += 1;
+            continue;
+        }
+        let (mut edit_files, mut edit_count) = (0, 0);
+        if let Some(edit) = entry.get("edit") {
+            let mut files = std::collections::HashSet::new();
+            if let Some(changes) = edit.get("changes").and_then(Value::as_object) {
+                for (uri, edits) in changes {
+                    files.insert(uri.clone());
+                    edit_count += edits.as_array().map_or(0, Vec::len);
+                }
+            }
+            for change in edit
+                .get("documentChanges")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                if let Some(uri) = change
+                    .get("textDocument")
+                    .and_then(|document| document.get("uri"))
+                    .and_then(Value::as_str)
+                {
+                    files.insert(uri.to_string());
+                    edit_count += change
+                        .get("edits")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                } else {
+                    edit_count += 1;
+                }
+            }
+            edit_files = files.len();
+        }
+        let has_command = entry
+            .get("command")
+            .is_some_and(|command| command.is_string() || command.get("command").is_some());
+        actions.push(ActionView {
+            title: clean_name(entry.get("title").and_then(Value::as_str).unwrap_or("?")),
+            kind: entry.get("kind").and_then(Value::as_str).map(clean_name),
+            preferred: entry.get("isPreferred").and_then(Value::as_bool) == Some(true),
+            edit_files,
+            edit_count,
+            has_command,
+            disabled: entry
+                .get("disabled")
+                .and_then(|disabled| disabled.get("reason"))
+                .and_then(Value::as_str)
+                .map(clean_name),
+        });
+    }
+    NavAnswer::Actions { actions, truncated }
 }
 
 fn position_of(range: Option<&Value>) -> (u32, u32) {
@@ -536,7 +976,11 @@ mod tests {
     fn ops_parse_and_report_position_needs() {
         assert_eq!(NavOp::parse("definition"), Some(NavOp::Definition));
         assert_eq!(NavOp::parse("symbols"), Some(NavOp::Symbols));
-        assert!(NavOp::parse("rename").is_none());
+        assert_eq!(NavOp::parse("rename"), Some(NavOp::Rename));
+        assert_eq!(NavOp::parse("incoming_calls"), Some(NavOp::IncomingCalls));
+        assert_eq!(NavOp::parse("code_actions"), Some(NavOp::CodeActions));
+        assert!(NavOp::parse("apply_rename").is_none());
+        assert!(NavOp::Rename.needs_position());
         assert!(NavOp::References.needs_position());
         assert!(!NavOp::WorkspaceSymbols.needs_position());
     }

@@ -23,6 +23,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   mini-agent-ktcqn).
 ### Tool layer
 
+- `lsp_navigate` waits (bounded) for an indexing server and says "still indexing" instead of
+  "No results", retries `ContentModified`/`ServerCancelled` once, and the LSP client advertises
+  work-done progress (mini-agent-jayd0). It also gains `incoming_calls`/`outgoing_calls`, a
+  preview-only `rename` (needs `edit` permission, changes no file) and `code_actions` (mini-agent-dl2ie).
 - `lsp_diagnostics` no longer silently loses files once the diagnostic cache is full: clean entries
   are evicted first, then least recently published, and the project-wide listing appends
   `[N files' diagnostics dropped: cache full]` (mini-agent-643mg).

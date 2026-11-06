@@ -426,6 +426,55 @@ struct DiagnosticProbe {
     release: std::sync::mpsc::Receiver<()>,
 }
 
+/// Most distinct server progress tokens tracked at once; further tokens are
+/// ignored so a hostile server cannot grow the set.
+const MAX_PROGRESS_TOKENS: usize = 64;
+/// Delay before the single retry of a request the server cancelled.
+const RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_millis(250)
+};
+/// LSP `ContentModified` and `ServerCancelled` error codes.
+const CONTENT_MODIFIED: i64 = -32801;
+const SERVER_CANCELLED: i64 = -32802;
+
+/// Work-done progress the server has begun and not ended (indexing, loading
+/// the workspace). While non-empty, an empty navigation answer is
+/// indistinguishable from "not ready yet".
+#[derive(Default)]
+struct ProgressState {
+    active: Mutex<std::collections::HashSet<String>>,
+}
+
+impl ProgressState {
+    fn apply(&self, params: &Value) {
+        let token = match params.get("token") {
+            Some(Value::String(token)) => token.clone(),
+            Some(Value::Number(token)) => token.to_string(),
+            _ => return,
+        };
+        let mut active = self.active.lock().unwrap();
+        match params
+            .get("value")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+        {
+            Some("begin") if active.len() < MAX_PROGRESS_TOKENS => {
+                active.insert(token);
+            }
+            Some("end") => {
+                active.remove(&token);
+            }
+            _ => {}
+        }
+    }
+
+    fn busy(&self) -> bool {
+        !self.active.lock().unwrap().is_empty()
+    }
+}
+
 struct TransportState {
     closing: AtomicBool,
     shutdown_tx: mpsc::UnboundedSender<()>,
@@ -491,6 +540,8 @@ pub struct LspClient {
     save_mode: AtomicU8,
     /// `capabilities` from the server's `initialize` result.
     capabilities: std::sync::OnceLock<Value>,
+    /// Active `$/progress` work-done tokens.
+    progress: Arc<ProgressState>,
     #[cfg(test)]
     sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
     #[cfg(test)]
@@ -604,6 +655,7 @@ impl LspClient {
         let stopped = Arc::new(AtomicBool::new(false));
         let stopped_notify = Arc::new(Notify::new());
         let open = Arc::new(Mutex::new(HashMap::new()));
+        let progress = Arc::new(ProgressState::default());
         // The reader is sequential, but its blocking publication can survive
         // reader cancellation. The supervisor retains this barrier until all
         // cache access and captured file handles have been released.
@@ -628,6 +680,7 @@ impl LspClient {
             let server_root = server_root.clone();
             let transport = transport.clone();
             let diagnostic_work = diagnostic_work.clone();
+            let progress = progress.clone();
             #[cfg(test)]
             let diagnostic_probe = diagnostic_probe.clone();
             tokio::spawn(async move {
@@ -739,6 +792,11 @@ impl LspClient {
                                 }
                             }
                         }
+                        (Some("$/progress"), None) => {
+                            if let Some(params) = msg.get("params") {
+                                progress.apply(params);
+                            }
+                        }
                         // Response to one of our requests.
                         (None, Some(id)) => {
                             if let Some(tx) = pending.lock().unwrap().remove(&id) {
@@ -748,6 +806,7 @@ impl LspClient {
                         _ => {}
                     }
                 }
+                progress.active.lock().unwrap().clear();
                 // Mark the transport unavailable before waking failed requests.
                 transport.close();
                 pending.lock().unwrap().clear();
@@ -814,6 +873,7 @@ impl LspClient {
             idle_task: Mutex::new(None),
             save_mode: AtomicU8::new(SAVE_NONE),
             capabilities: std::sync::OnceLock::new(),
+            progress,
             #[cfg(test)]
             sync_probes: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
@@ -833,7 +893,28 @@ impl LspClient {
                         "willSaveWaitUntil": false,
                         "didSave": true
                     },
-                    "publishDiagnostics": { "versionSupport": true }
+                    "publishDiagnostics": { "versionSupport": true },
+                    "callHierarchy": { "dynamicRegistration": false },
+                    "rename": { "dynamicRegistration": false, "prepareSupport": false },
+                    "codeAction": {
+                        "dynamicRegistration": false,
+                        "isPreferredSupport": true,
+                        "disabledSupport": true,
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": { "valueSet": [
+                                "quickfix", "refactor", "refactor.extract",
+                                "refactor.inline", "refactor.rewrite", "source",
+                                "source.organizeImports"
+                            ] }
+                        }
+                    }
+                },
+                "window": { "workDoneProgress": true },
+                "workspace": {
+                    "workspaceEdit": {
+                        "documentChanges": true,
+                        "resourceOperations": ["create", "rename", "delete"]
+                    }
                 }
             },
             "initializationOptions": cfg.initialization.clone().unwrap_or(Value::Null),
@@ -944,30 +1025,85 @@ impl LspClient {
             .is_some_and(|value| !matches!(value, Value::Null | Value::Bool(false)))
     }
 
+    /// Whether the server has work-done progress (indexing, workspace load)
+    /// in flight.
+    pub(crate) fn is_indexing(&self) -> bool {
+        self.progress.busy()
+    }
+
+    /// Waits until no progress is active, at most `timeout`. Returns whether
+    /// the server went idle.
+    pub(crate) async fn wait_until_idle(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.progress.busy() {
+            if !self.is_usable() || tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        true
+    }
+
     /// Sends a navigation request and returns its `result` (`Value::Null`
     /// for an empty answer). Errors on timeout, transport failure or an
-    /// error response.
+    /// error response. A `ContentModified` (-32801) or `ServerCancelled`
+    /// (-32802) reply is retried once, as the LSP specification directs.
     pub(crate) async fn query(
         &self,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
-        if !self.is_usable() {
-            return Err("language server is not running".to_string());
+        let started = tokio::time::Instant::now();
+        let mut retried = false;
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            match self.query_once(method, params.clone(), remaining).await {
+                Err((Some(CONTENT_MODIFIED | SERVER_CANCELLED), _))
+                    if !retried && started.elapsed() + RETRY_DELAY < timeout =>
+                {
+                    retried = true;
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err((code, message)) => {
+                    return Err(match code {
+                        Some(CONTENT_MODIFIED | SERVER_CANCELLED) => format!(
+                            "{message} (the server reported the document changed or cancelled the request, again after one retry; try again shortly)"
+                        ),
+                        _ => message,
+                    });
+                }
+                Ok(value) => return Ok(value),
+            }
         }
-        let response = self
-            .request(method, params, timeout)
-            .await
-            .ok_or_else(|| format!("'{method}' timed out after {} ms", timeout.as_millis()))?;
+    }
+
+    async fn query_once(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, (Option<i64>, String)> {
+        if !self.is_usable() {
+            return Err((None, "language server is not running".to_string()));
+        }
+        let response = self.request(method, params, timeout).await.ok_or_else(|| {
+            (
+                None,
+                format!("'{method}' timed out after {} ms", timeout.as_millis()),
+            )
+        })?;
         if let Some(error) = response.get("error") {
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            return Err(format!(
-                "'{method}' failed: {}",
-                truncate_utf8_bytes(message, MAX_DIAGNOSTIC_MESSAGE_BYTES)
+            return Err((
+                error.get("code").and_then(Value::as_i64),
+                format!(
+                    "'{method}' failed: {}",
+                    truncate_utf8_bytes(message, MAX_DIAGNOSTIC_MESSAGE_BYTES)
+                ),
             ));
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
