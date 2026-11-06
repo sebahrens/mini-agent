@@ -23,6 +23,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   `additionalContext`; 32 KiB, framed as a non-authoritative notice prepended to the result), and
   with the new opt-in `hooks_permission_decisions` a `PermissionRequest` hook can answer an
   approval with allow-once or deny, including in headless runs.
+- Custom slash commands: file stems are normalised (`Fix_Issue.md` → `/fix-issue`), one level of
+  subdirectories becomes a namespace (`/deploy:ship`), Claude Code `argument-hint`/`allowed-tools`
+  frontmatter is accepted (granting nothing), and `/help` lists every skipped command file with its
+  reason.
 
 ### Fixed
 

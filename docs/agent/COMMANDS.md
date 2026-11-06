@@ -889,10 +889,21 @@ Use @README.md as untrusted project context.
 
 `/fix-issue 123` submits the expanded body as one ordinary user message. Commands
 appear with their description in `/help` and slash completion. A filename stem
-uses lowercase letters, digits and single hyphens, up to 64 bytes. Built-ins and
-aliases, including `/diff`, `/commit`, `/pr` and feature-disabled commands, are
-reserved. Layers override global, then `.claude`, then `.mini-agent`; invalid
-files do not replace a valid lower layer.
+is normalised to lowercase with `_` and spaces turned into `-` and repeated `-`
+collapsed (`Fix_Issue.md` becomes `/fix-issue`); the result must be lowercase
+letters, digits and single hyphens, up to 64 bytes. One level of subdirectories
+is a namespace: `commands/deploy/ship.md` becomes `/deploy:ship` (at most 32
+namespaces per layer, same file limits). Built-ins and aliases, including
+`/diff`, `/commit`, `/pr` and feature-disabled commands, are reserved. Layers
+override global, then `.claude`, then `.mini-agent`; invalid files do not replace
+a valid lower layer. Every skipped file (invalid name, built-in collision,
+invalid template, unreadable directory) is listed under "skipped custom command
+files" in `/help` with its path and reason.
+
+Claude Code frontmatter `argument-hint`, `allowed-tools` and
+`disable-model-invocation` is accepted so ported commands load, but grants
+nothing: `allowed-tools` never widens permissions. Claude Code's `!command`
+inline shell execution is not supported; such text stays literal prompt text.
 
 Project command files are inactive until the existing project configuration is
 trusted for its exact canonical paths and config bytes. This approval covers

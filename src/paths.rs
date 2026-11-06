@@ -382,6 +382,28 @@ impl WorkspaceBinding {
 
     /// Enumerate a bounded project definition layer before reading any files.
     /// Oversized layers fail closed; directory order cannot select a partial layer.
+    /// Names of the plain (non-symlink) subdirectories directly under
+    /// `path`, sorted; at most `max_entries` entries are scanned.
+    pub(crate) fn relative_subdirectories(
+        &self,
+        path: &Path,
+        max_entries: usize,
+    ) -> io::Result<Vec<String>> {
+        let directory = self.open_dir_relative(path)?;
+        let mut names = Vec::new();
+        for entry in directory.read_dir(".")?.take(max_entries) {
+            let Ok(entry) = entry else { continue };
+            // cap-std file types never follow a final symlink.
+            if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && let Some(name) = entry.file_name().to_str()
+            {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort_unstable();
+        Ok(names)
+    }
+
     pub(crate) fn read_relative_definition_layer(
         &self,
         path: &Path,

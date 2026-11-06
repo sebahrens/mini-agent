@@ -9,6 +9,39 @@ const MAX_INCLUDE_BYTES: usize = 64 * 1024;
 const MAX_INCLUDES: usize = 8;
 const MAX_ENTRIES: usize = 1024;
 const MAX_FILES: usize = 128;
+/// One level of `<layer>/<namespace>/<name>.md` subdirectories, invoked as
+/// `/<namespace>:<name>`.
+const MAX_NAMESPACES: usize = 32;
+const MAX_SKIPPED_REPORTS: usize = 32;
+
+/// Files skipped by the most recent load (`path: reason`), shown by `/help`.
+static SKIPPED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Template files the last load skipped, each naming the file and the reason.
+pub(crate) fn skipped_commands() -> Vec<String> {
+    SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Claude-style file stems are normalised: ASCII lowercase, `_` and spaces
+/// become `-`, repeated `-` collapse, leading/trailing `-` are trimmed.
+/// `Fix_Issue.md` becomes `/fix-issue`.
+pub(crate) fn normalize_name(stem: &str) -> String {
+    let mut out = String::with_capacity(stem.len());
+    for ch in stem.chars() {
+        let ch = match ch {
+            '_' | ' ' => '-',
+            other => other.to_ascii_lowercase(),
+        };
+        if ch == '-' && (out.is_empty() || out.ends_with('-')) {
+            continue;
+        }
+        out.push(ch);
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Segment {
@@ -107,6 +140,9 @@ impl CommandTemplate {
                         mode = Some(value);
                     }
                     Some("model") => model = Some(bounded_field(value, 256)?),
+                    // Claude Code fields accepted for portability. They grant
+                    // nothing here: `allowed-tools` never widens permissions.
+                    Some("argument-hint" | "allowed-tools" | "disable-model-invocation") => {}
                     _ => {
                         return Err(
                             "unsupported frontmatter field (only description, mode, model)".into(),
@@ -315,9 +351,29 @@ struct DirStamp {
     link: (Option<std::time::SystemTime>, u64, bool),
     target: Option<(Option<std::time::SystemTime>, u64)>,
     entries: Vec<(std::ffi::OsString, Option<std::time::SystemTime>, u64)>,
+    children: Vec<(std::ffi::OsString, DirStampEntries)>,
 }
 
+type DirStampEntries = Vec<(std::ffi::OsString, Option<std::time::SystemTime>, u64)>;
+
 fn dir_stamp(path: &Path) -> Option<DirStamp> {
+    let mut stamp = dir_stamp_flat(path)?;
+    // Namespace subdirectories change their own mtime, not the layer's.
+    for (name, _, _) in stamp.entries.clone() {
+        let child = path.join(&name);
+        if std::fs::symlink_metadata(&child).is_ok_and(|meta| meta.is_dir())
+            && let Some(nested) = dir_stamp_flat(&child)
+        {
+            stamp.children.push((name, nested.entries));
+        }
+        if stamp.children.len() >= MAX_NAMESPACES {
+            break;
+        }
+    }
+    Some(stamp)
+}
+
+fn dir_stamp_flat(path: &Path) -> Option<DirStamp> {
     let link = std::fs::symlink_metadata(path).ok()?;
     let target = std::fs::metadata(path).ok();
     let mut entries: Vec<_> = std::fs::read_dir(path)
@@ -339,6 +395,7 @@ fn dir_stamp(path: &Path) -> Option<DirStamp> {
         link: (link.modified().ok(), link.len(), link.is_symlink()),
         target: target.map(|meta| (meta.modified().ok(), meta.len())),
         entries,
+        children: Vec::new(),
     })
 }
 
@@ -438,7 +495,18 @@ fn load_layers(
     workspace: &crate::paths::WorkspaceBinding,
     trusted: bool,
 ) -> BTreeMap<String, CommandTemplate> {
+    let (commands, skipped) = load_layers_reporting(paths, workspace, trusted);
+    *SKIPPED.lock().unwrap_or_else(|e| e.into_inner()) = skipped;
+    commands
+}
+
+fn load_layers_reporting(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+    trusted: bool,
+) -> (BTreeMap<String, CommandTemplate>, Vec<String>) {
     let mut commands = BTreeMap::new();
+    let mut skipped = Vec::new();
     // Global definitions are only read through the private app root. Missing
     // command directories are optional and never created while listing.
     if paths.config_dir.join("commands").exists() {
@@ -446,7 +514,13 @@ fn load_layers(
             .and_then(|_| crate::paths::WorkspaceBinding::capture(&paths.config_dir))
         {
             Ok(global) if global.root() == paths.config_dir && global.validate().is_ok() => {
-                merge_layer(&mut commands, &global, Path::new("commands"));
+                merge_layer(
+                    &mut commands,
+                    &global,
+                    Path::new("commands"),
+                    None,
+                    &mut skipped,
+                );
             }
             Ok(_) => tracing::warn!("private custom command root changed or was linked"),
             Err(error) => tracing::warn!(%error, "could not load private custom commands"),
@@ -454,10 +528,17 @@ fn load_layers(
     }
     if trusted {
         for layer in PROJECT_LAYERS {
-            merge_layer(&mut commands, workspace, Path::new(layer));
+            merge_layer(
+                &mut commands,
+                workspace,
+                Path::new(layer),
+                None,
+                &mut skipped,
+            );
         }
     }
-    commands
+    skipped.truncate(MAX_SKIPPED_REPORTS);
+    (commands, skipped)
 }
 
 #[cfg(test)]
@@ -470,6 +551,8 @@ fn merge_layer(
     commands: &mut BTreeMap<String, CommandTemplate>,
     binding: &crate::paths::WorkspaceBinding,
     directory: &Path,
+    namespace: Option<&str>,
+    skipped: &mut Vec<String>,
 ) {
     #[cfg(test)]
     LAYER_READS.with(|reads| reads.set(reads.get() + 1));
@@ -484,18 +567,63 @@ fn merge_layer(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
             tracing::warn!(%error, "could not load custom command directory");
+            skipped.push(format!("{}: {error}", directory.display()));
             return;
         }
     };
-    for (name, text) in entries {
-        if !valid_name(&name) || crate::ui::pickers::list::reserved_command(&name) {
+    for (stem, text) in entries {
+        let file = directory.join(format!("{stem}.md"));
+        let normalized = normalize_name(&stem);
+        if !valid_name(&normalized) {
+            skipped.push(format!(
+                "{}: name must normalise to 1-64 of a-z, 0-9 and single '-'",
+                file.display()
+            ));
+            continue;
+        }
+        let name = match namespace {
+            Some(namespace) => format!("{namespace}:{normalized}"),
+            None => normalized,
+        };
+        if crate::ui::pickers::list::reserved_command(&name) {
+            skipped.push(format!(
+                "{}: /{name} collides with a built-in command",
+                file.display()
+            ));
             continue;
         }
         match text.and_then(|text| CommandTemplate::parse(&text)) {
             Ok(template) => {
                 commands.insert(name, template);
             }
-            Err(error) => tracing::warn!(command = name, %error, "ignoring invalid custom command"),
+            Err(error) => {
+                tracing::warn!(command = name, %error, "ignoring invalid custom command");
+                skipped.push(format!("{}: {error}", file.display()));
+            }
+        }
+    }
+    if namespace.is_none() {
+        for sub in binding
+            .relative_subdirectories(directory, MAX_ENTRIES)
+            .unwrap_or_default()
+            .into_iter()
+            .take(MAX_NAMESPACES)
+        {
+            let normalized = normalize_name(&sub);
+            if !valid_name(&normalized) {
+                skipped.push(format!(
+                    "{}/: namespace must normalise to 1-64 of a-z, 0-9 and single '-'",
+                    directory.join(&sub).display()
+                ));
+                continue;
+            }
+            merge_layer(
+                commands,
+                binding,
+                &directory.join(&sub),
+                Some(&normalized),
+                skipped,
+            );
         }
     }
 }
@@ -602,6 +730,49 @@ mod tests {
         reads();
         load_cached_for_paths(&mut cache, &paths, &other);
         assert_eq!(reads(), 1);
+    }
+
+    #[test]
+    fn vwtmy_names_normalise_namespaces_load_and_skips_are_reported() {
+        let root = crate::tests::OwnedTestDirectory::new("command-namespaces");
+        let paths = paths(root.path());
+        let commands = paths.config_dir.join("commands");
+        std::fs::create_dir_all(commands.join("Deploy_Tools")).unwrap();
+        crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
+        std::fs::write(commands.join("Fix_Issue.md"), "Fix $1").unwrap();
+        std::fs::write(
+            commands.join("ported.md"),
+            "---\ndescription: Ported\nargument-hint: <issue>\nallowed-tools: Bash(git:*)\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(commands.join("help.md"), "shadow").unwrap();
+        std::fs::write(commands.join("!!!.md"), "bad").unwrap();
+        std::fs::write(commands.join("broken.md"), "%%mode=unknown\nbody").unwrap();
+        std::fs::write(commands.join("Deploy_Tools/ship.md"), "Ship it").unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
+        let (loaded, skipped) = load_layers_reporting(&paths, &workspace, false);
+        assert!(loaded.contains_key("fix-issue"), "{loaded:?}");
+        assert!(loaded.contains_key("deploy-tools:ship"), "{loaded:?}");
+        assert_eq!(loaded["ported"].description, "Ported");
+        assert!(!loaded.contains_key("help"));
+        let report = skipped.join("\n");
+        assert!(
+            report.contains("help.md") && report.contains("built-in"),
+            "{report}"
+        );
+        assert!(
+            report.contains("!!!.md") && report.contains("normalise"),
+            "{report}"
+        );
+        assert!(report.contains("broken.md"), "{report}");
+        assert_eq!(normalize_name("Fix__Issue_"), "fix-issue");
+        // A namespaced edit changes the stamp (cache reload).
+        let before = commands_stamp(&paths, &workspace);
+        std::fs::write(commands.join("Deploy_Tools/ship.md"), "Ship it twice").unwrap();
+        std::fs::write(commands.join("Deploy_Tools/new.md"), "New").unwrap();
+        assert_ne!(before, commands_stamp(&paths, &workspace));
     }
 
     #[test]

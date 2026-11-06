@@ -69,6 +69,16 @@ pub fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) {
             );
         }
     }
+    let skipped = crate::context::commands::skipped_commands();
+    if !skipped.is_empty() {
+        write_ok(ctx.renderer, "skipped custom command files:");
+        for line in skipped {
+            write_result(
+                ctx.renderer,
+                format!("  {}", crate::ui::events::sanitize_output(&line)),
+            );
+        }
+    }
 }
 
 /// Every line `/help` prints, in order; `true` marks a section heading.
