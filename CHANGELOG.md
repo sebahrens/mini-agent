@@ -17,6 +17,8 @@ Notable changes to mini-agent are documented in this file. The format follows
   visible by choosing `offset`/`limit`.
 - `write` `overwrite=true` on a file too large for one read result now explains the ceiling and
   recommends `edit`/`shell`.
+- `read` decodes text with stray invalid UTF-8 bytes lossily (U+FFFD plus a visible warning that
+  `edit`/`write` are unavailable) instead of failing the whole file; binary data is still refused.
 - `web_fetch` retries transient failures once, caches converted pages for 15 minutes, extracts PDF
   text, and hints when a page converts to almost no text.
 

@@ -405,7 +405,7 @@ subdirectories into an indented, directory-first tree of relative paths that
 shares the same cap and paging; subdirectories are opened no-follow relative to
 their parent descriptor with the same ignore, skip and deny filters, and a tree
 stops collecting at 10,000 entries with a notice; a flat depth-1 listing is
-pageable through every entry (safety ceiling 1,000,000, named in the notice). Read windows size their line-number
+pageable through every entry (safety ceiling 1,000,000, named in the notice). `read` decodes invalid UTF-8 with U+FFFD replacement and appends a warning naming the replaced byte count (or that the file has invalid bytes outside the window) and that `edit`/`write` stay unavailable for it; data with NUL bytes or mostly invalid bytes is still refused as binary. Read windows size their line-number
 column from the actual range and report an offset past EOF directly instead of
 showing an inverted range.
 

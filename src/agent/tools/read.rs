@@ -718,6 +718,12 @@ impl ReadTool {
         let mut file_crc = Crc32::new();
         let mut served_content_crc = Crc32::new();
         let mut utf8 = Utf8Stream::default();
+        // Invalid UTF-8 is decoded with replacement characters (never for
+        // data that looks binary); edit and write stay fail-closed on it.
+        let mut file_invalid_bytes = 0_u64;
+        let mut window_invalid_bytes = 0_u64;
+        let mut saw_nul = false;
+        let mut scanned_bytes = 0_u64;
         // Lines are consumed in bounded chunks: an unselected or oversized line
         // is scanned without ever being retained, so a single arbitrarily long
         // line cannot allocate proportionally to its length in the parent.
@@ -754,8 +760,18 @@ impl ReadTool {
                         Some(position) => (&available[..position], position + 1, true),
                         None => (available, available.len(), false),
                     };
+                scanned_bytes = scanned_bytes.saturating_add(body.len() as u64);
                 if !utf8.push(body) {
-                    return Err(not_utf8(&path));
+                    file_invalid_bytes = file_invalid_bytes.saturating_add(
+                        body.utf8_chunks()
+                            .map(|chunk| chunk.invalid().len() as u64)
+                            .sum::<u64>()
+                            .max(1),
+                    );
+                    utf8 = Utf8Stream::default();
+                }
+                if file_invalid_bytes > 0 && body.contains(&0) {
+                    saw_nul = true;
                 }
                 // A carriage return at the end of a chunk is held back until the
                 // next byte decides whether it belongs to a CRLF terminator.
@@ -806,6 +822,10 @@ impl ReadTool {
             // A multi-byte sequence never spans a newline, so an incomplete
             // sequence at the end of a line is invalid rather than pending.
             if !utf8.finish() {
+                file_invalid_bytes = file_invalid_bytes.saturating_add(1);
+                utf8 = Utf8Stream::default();
+            }
+            if saw_nul || file_invalid_bytes.saturating_mul(2) > scanned_bytes {
                 return Err(not_utf8(&path));
             }
 
@@ -823,8 +843,13 @@ impl ReadTool {
                 }
             };
             if selected {
-                let line = String::from_utf8(retained)
-                    .expect("line bytes were validated as UTF-8 while streaming");
+                window_invalid_bytes = window_invalid_bytes.saturating_add(
+                    retained
+                        .utf8_chunks()
+                        .map(|chunk| chunk.invalid().len() as u64)
+                        .sum::<u64>(),
+                );
+                let line = String::from_utf8_lossy(&retained).into_owned();
                 excerpt_starts.push(line_start_char);
                 excerpt_bytes = excerpt_bytes
                     .saturating_add(separator_bytes)
@@ -978,6 +1003,17 @@ impl ReadTool {
             info
         };
 
+        let info = if window_invalid_bytes > 0 {
+            format!(
+                "{info}\n\n[warning: {window_invalid_bytes} invalid UTF-8 byte(s) replaced with U+FFFD in this window; the file is not valid UTF-8, so edit and write are unavailable for it]"
+            )
+        } else if file_invalid_bytes > 0 {
+            format!(
+                "{info}\n\n[warning: this file contains invalid UTF-8 outside this window; edit and write are unavailable for it]"
+            )
+        } else {
+            info
+        };
         let info = match decoded_from {
             Some(encoding) => format!(
                 "{info}\n\n[decoded from {encoding}; edit writes changes back in this encoding]"
@@ -1422,7 +1458,7 @@ mod tests {
             "mini-agent-read-invalid-utf8-{}",
             uuid::Uuid::new_v4()
         ));
-        std::fs::write(&path, [b'o', b'k', b'\n', 0xff, b'\n']).unwrap();
+        std::fs::write(&path, [b'o', b'k', 0, 0xff, 0, 0xfe, b'\n']).unwrap();
         let tool = ReadTool::new(None, None, None, 100);
 
         let error = tool
@@ -1443,6 +1479,43 @@ mod tests {
         assert!(error.contains("strings"), "{error}");
         assert!(error.contains("xxd"), "{error}");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stray_invalid_bytes_are_replaced_with_a_visible_warning_and_edit_stays_closed() {
+        let temp = crate::tests::support::temp::TempDir::new("read-lossy");
+        let path = temp.path().join("latin1.txt");
+        let mut bytes = b"first line\ncaf".to_vec();
+        bytes.push(0xe9);
+        bytes.extend_from_slice(b" cr\xc3\xa8me\nthird\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let tool = ReadTool::new(None, None, None, 100);
+        let args = |offset, limit| ReadArgs {
+            pages: None,
+            raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
+            path: path.to_string_lossy().into_owned(),
+            offset,
+            limit,
+        };
+        let whole = tool.call(args(None, None)).await.unwrap();
+        assert!(whole.contains("caf\u{fffd} crème"), "{whole}");
+        assert!(
+            whole.contains("1 invalid UTF-8 byte(s) replaced"),
+            "{whole}"
+        );
+        assert!(whole.contains("edit and write are unavailable"), "{whole}");
+        // A window that excludes the bad byte still says the file has some.
+        let window = tool.call(args(Some(3), Some(1))).await.unwrap();
+        assert!(window.contains("third"), "{window}");
+        assert!(
+            window.contains("invalid UTF-8 outside this window"),
+            "{window}"
+        );
+        // The file itself is untouched; edit/write refusal is covered by the
+        // edit tool's own invalid-UTF-8 tests.
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[cfg(unix)]
