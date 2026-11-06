@@ -549,6 +549,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -563,6 +564,7 @@ async fn execute_native(
                             revision: None,
                             message: None,
                             max_count: Some(8),
+                            ..Default::default()
                         },
                         events,
                     )
@@ -613,6 +615,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -628,6 +631,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -641,6 +645,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -654,6 +659,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -667,6 +673,7 @@ async fn execute_native(
                     revision: None,
                     message: Some(message),
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -796,16 +803,7 @@ async fn call_git(
     args: crate::git::tool::GitArgs,
     events: &tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
 ) -> Result<serde_json::Value, String> {
-    use crate::git::tool::GitOperation;
-    let operation = match &args.operation {
-        GitOperation::Status => "status",
-        GitOperation::Diff => "diff",
-        GitOperation::Log => "log",
-        GitOperation::Show => "show",
-        GitOperation::Stage => "stage",
-        GitOperation::Unstage => "unstage",
-        GitOperation::Commit => "commit",
-    };
+    let operation = args.operation.name();
     let payload = serde_json::json!({"operation":operation,"paths":args.paths,"revision":args.revision,"message":args.message,"max_count":args.max_count});
     let value = emit_call(
         "git",
@@ -844,7 +842,8 @@ async fn call_shell(
         ask_tx: _ask_tx,
         observations: None,
     };
-    let args = serde_json::json!({"command":command,"background":false,"timeout":null});
+    // gh writes progress to stderr; the PR URL must come from stdout alone.
+    let args = serde_json::json!({"command":command,"background":false,"timeout":null,"separate_streams":true});
     emit_call("shell", args.clone(), events, None, async {
         let (actual, displayed) = tool.call(&args).await?;
         let url = actual
@@ -2435,6 +2434,7 @@ mod windows_native_pr_tests {
                 let work = scope.run(async {
                     rig::tool::Tool::call_structured(&tool, crate::agent::tools::BashArgs {
                         command: command.into(), timeout: None, background: false,
+                        ..Default::default()
                     }, &ToolCallExtensions::default()).await
                 });
                 tokio::pin!(work);
@@ -2744,6 +2744,7 @@ mod windows_native_pr_tests {
                             command: command.clone(),
                             timeout: None,
                             background: false,
+                            ..Default::default()
                         },
                         &ToolCallExtensions::default(),
                     ).await

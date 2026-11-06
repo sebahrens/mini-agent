@@ -26,9 +26,21 @@ const FILTER_PROBE_LIMITS: crate::sandbox::CommandLimits = crate::sandbox::Comma
     combined_bytes: 16 * 1024 * 1024 + 64 * 1024,
 };
 
-#[derive(Debug, Deserialize)]
+/// Bounds for one diff/show run whose output is then paged. Larger output
+/// is reported as truncated at this ceiling.
+const PAGED_TEXT_LIMITS: crate::sandbox::CommandLimits = crate::sandbox::CommandLimits {
+    timeout: std::time::Duration::from_secs(30),
+    stdout_bytes: 16 * 1024 * 1024,
+    stderr_bytes: 64 * 1024,
+    combined_bytes: 16 * 1024 * 1024 + 64 * 1024,
+};
+/// Bytes of diff/show text one call returns; `offset` pages through the rest.
+const TEXT_PAGE_BYTES: usize = 192 * 1024;
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GitOperation {
+    #[default]
     Status,
     Diff,
     Log,
@@ -36,9 +48,58 @@ pub(crate) enum GitOperation {
     Stage,
     Unstage,
     Commit,
+    /// List local branches.
+    Branches,
+    /// Create a branch at `revision` (default HEAD) without switching.
+    BranchCreate,
+    /// Switch the working tree to an existing local branch.
+    Switch,
+    /// Save and clean local changes (`git stash push`).
+    StashPush,
+    /// Re-apply and drop the newest stash.
+    StashPop,
+    StashList,
+    /// Create a lightweight tag, or an annotated one with `message`.
+    Tag,
+    /// Discard working-tree changes of `paths` (from the index, or `revision`).
+    Restore,
 }
 
-#[derive(Debug, Deserialize)]
+impl GitOperation {
+    // The native /diff and /commit actors (git-worktree) report the name.
+    #[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Diff => "diff",
+            Self::Log => "log",
+            Self::Show => "show",
+            Self::Stage => "stage",
+            Self::Unstage => "unstage",
+            Self::Commit => "commit",
+            Self::Branches => "branches",
+            Self::BranchCreate => "branch_create",
+            Self::Switch => "switch",
+            Self::StashPush => "stash_push",
+            Self::StashPop => "stash_pop",
+            Self::StashList => "stash_list",
+            Self::Tag => "tag",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+/// Diff/show rendering.
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiffFormat {
+    #[default]
+    Patch,
+    Stat,
+    NameStatus,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct GitArgs {
     pub operation: GitOperation,
     #[serde(default)]
@@ -46,6 +107,15 @@ pub(crate) struct GitArgs {
     pub revision: Option<String>,
     pub message: Option<String>,
     pub max_count: Option<u16>,
+    /// Branch or tag name for branch_create, switch and tag.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// diff/show output format.
+    #[serde(default)]
+    pub format: Option<DiffFormat>,
+    /// Byte offset of the diff/show page to return.
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
 pub(crate) struct GitTool {
@@ -176,6 +246,7 @@ impl GitTool {
             revision: None,
             message: None,
             max_count: None,
+            ..Default::default()
         })
         .await
         .map_err(|error| error.to_string())
@@ -768,7 +839,335 @@ impl GitTool {
         Ok(result)
     }
 
+    /// Validate a new or existing branch/tag name with Git's own rules.
+    async fn validate_ref_name(&self, name: &str, kind: &'static str) -> Result<(), ToolError> {
+        if name.is_empty() || name.starts_with('-') || name.contains('\0') || name.len() > 255 {
+            return Err(ToolError::Msg(format!("invalid Git {kind} name")));
+        }
+        let candidate = match kind {
+            "tag" => format!("refs/tags/{name}"),
+            _ => format!("refs/heads/{name}"),
+        };
+        self.run(
+            "check-ref-format",
+            vec!["check-ref-format".into(), candidate],
+            QUERY_LIMITS,
+            false,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| ToolError::Msg(format!("invalid Git {kind} name")))
+    }
+
+    fn required_name<'a>(args: &'a GitArgs, operation: &str) -> Result<&'a str, ToolError> {
+        args.name
+            .as_deref()
+            .ok_or_else(|| ToolError::Msg(format!("{operation} requires a name")))
+    }
+
+    async fn branches(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, false, false, false)?;
+        if !args.paths.is_empty() {
+            return Err(ToolError::Msg("branches takes no paths".to_string()));
+        }
+        let coaching = self.permission("git/status", "branches").await?;
+        let output = self
+            .run(
+                "branches",
+                vec![
+                    "for-each-ref".into(),
+                    "--format=%(HEAD)%00%(refname:short)%00%(objectname)%00%(upstream:short)%00%(contents:subject)".into(),
+                    "refs/heads".into(),
+                ],
+                QUERY_LIMITS,
+                false,
+            )
+            .await?;
+        let branches = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split('\0').collect();
+                (fields.len() == 5).then(|| {
+                    serde_json::json!({
+                        "current": fields[0] == "*",
+                        "name": fields[1],
+                        "id": fields[2],
+                        "upstream": fields[3],
+                        "subject": fields[4],
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "operation": "branches",
+            "branches": branches,
+            "coaching": coaching,
+        }))
+    }
+
+    async fn branch_create(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, false, true, false)?;
+        if !args.paths.is_empty() {
+            return Err(ToolError::Msg("branch_create takes no paths".to_string()));
+        }
+        let name = Self::required_name(&args, "branch_create")?;
+        self.validate_ref_name(name, "branch").await?;
+        if let Some(revision) = args.revision.as_deref() {
+            self.validate_revision(revision).await?;
+        }
+        let identity = match args.revision.as_deref() {
+            Some(revision) => format!("{name} {revision}"),
+            None => name.to_string(),
+        };
+        let coaching = self.permission("git/branch", &identity).await?;
+        let _mutation = self
+            .runner
+            .acquire_mutation(self.workspace.root())
+            .await
+            .map_err(ToolError::Msg)?;
+        let mut command = vec!["branch".into(), "--no-track".into(), name.to_string()];
+        if let Some(revision) = args.revision {
+            command.push(revision);
+        }
+        let output = self.run_mutation("branch", command).await?;
+        Ok(render_ref_result("branch_create", coaching, output))
+    }
+
+    async fn switch(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, false, false, false)?;
+        if !args.paths.is_empty() {
+            return Err(ToolError::Msg("switch takes no paths".to_string()));
+        }
+        let name = Self::required_name(&args, "switch")?;
+        self.validate_ref_name(name, "branch").await?;
+        let coaching = self.permission("git/switch", name).await?;
+        let _mutation = self
+            .runner
+            .acquire_mutation(self.workspace.root())
+            .await
+            .map_err(ToolError::Msg)?;
+        // Updating the working tree runs checkout conversion (smudge).
+        let guard = self.filter_guard("switch").await?;
+        let before = self.status_snapshot(&guard).await?;
+        let output = self
+            .run_mutation(
+                "switch",
+                guarded(
+                    &guard,
+                    vec![
+                        "switch".into(),
+                        "--no-guess".into(),
+                        "--no-recurse-submodules".into(),
+                        name.to_string(),
+                    ],
+                ),
+            )
+            .await?;
+        let after = self.status_snapshot(&guard).await?;
+        Ok(render_mutation_result(
+            "switch", coaching, before, after, output,
+        ))
+    }
+
+    async fn stash(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        let operation = args.operation;
+        let push = operation == GitOperation::StashPush;
+        reject_irrelevant_fields(&args, push, false, false)?;
+        if operation == GitOperation::StashList {
+            if !args.paths.is_empty() {
+                return Err(ToolError::Msg("stash_list takes no paths".to_string()));
+            }
+            let coaching = self.permission("git/status", "stash_list").await?;
+            let output = self
+                .run(
+                    "stash-list",
+                    vec![
+                        "stash".into(),
+                        "list".into(),
+                        "--format=%gd%x00%H%x00%gs".into(),
+                    ],
+                    QUERY_LIMITS,
+                    false,
+                )
+                .await?;
+            let entries = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let fields: Vec<&str> = line.split('\0').collect();
+                    (fields.len() == 3).then(|| {
+                        serde_json::json!({"ref": fields[0], "id": fields[1], "subject": fields[2]})
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(serde_json::json!({
+                "operation": "stash_list",
+                "stashes": entries,
+                "coaching": coaching,
+            }));
+        }
+        let paths = if push {
+            self.validate_paths(&args.paths, Some("write")).await?
+        } else if args.paths.is_empty() {
+            Vec::new()
+        } else {
+            return Err(ToolError::Msg("stash_pop takes no paths".to_string()));
+        };
+        let message = args.message.as_deref().unwrap_or("");
+        if message.len() > 16 * 1024 || message.contains('\0') {
+            return Err(ToolError::Msg(
+                "stash message exceeds 16 KiB or contains NUL".to_string(),
+            ));
+        }
+        let (label, identity) = if push {
+            ("stash_push", format!("push {message}"))
+        } else {
+            ("stash_pop", "pop".to_string())
+        };
+        let coaching = self.permission("git/stash", &identity).await?;
+        let _mutation = self
+            .runner
+            .acquire_mutation(self.workspace.root())
+            .await
+            .map_err(ToolError::Msg)?;
+        let guard = self.filter_guard(label).await?;
+        let before = self.status_snapshot(&guard).await?;
+        let mut command = vec!["stash".into()];
+        if push {
+            command.push("push".into());
+            if !message.is_empty() {
+                command.push("--message".into());
+                command.push(message.to_string());
+            }
+            if !paths.is_empty() {
+                command.push("--".into());
+                command.extend(paths);
+            }
+        } else {
+            command.push("pop".into());
+        }
+        // A stash is a commit: it needs the host-resolved identity.
+        let output = self
+            .run_with_input(
+                "stash",
+                guarded(&guard, command),
+                Vec::new(),
+                LOCAL_MUTATION_LIMITS,
+            )
+            .await?;
+        let after = self.status_snapshot(&guard).await?;
+        Ok(render_mutation_result(
+            label, coaching, before, after, output,
+        ))
+    }
+
+    async fn tag(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, true, true, false)?;
+        if !args.paths.is_empty() {
+            return Err(ToolError::Msg("tag takes no paths".to_string()));
+        }
+        let name = Self::required_name(&args, "tag")?;
+        self.validate_ref_name(name, "tag").await?;
+        if let Some(revision) = args.revision.as_deref() {
+            self.validate_revision(revision).await?;
+        }
+        let message = args
+            .message
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        if message.is_some_and(|message| message.len() > 16 * 1024 || message.contains('\0')) {
+            return Err(ToolError::Msg(
+                "tag message exceeds 16 KiB or contains NUL".to_string(),
+            ));
+        }
+        let identity = format!(
+            "{name}{}",
+            args.revision
+                .as_deref()
+                .map(|revision| format!(" {revision}"))
+                .unwrap_or_default()
+        );
+        let coaching = self.permission("git/tag", &identity).await?;
+        let _mutation = self
+            .runner
+            .acquire_mutation(self.workspace.root())
+            .await
+            .map_err(ToolError::Msg)?;
+        let mut command = vec!["tag".into()];
+        if message.is_some() {
+            command.push("--annotate".into());
+            command.push("--file=-".into());
+            command.push("--cleanup=verbatim".into());
+        }
+        command.push(name.to_string());
+        if let Some(revision) = args.revision.clone() {
+            command.push(revision);
+        }
+        let output = match message {
+            Some(message) => {
+                self.run_with_input(
+                    "tag",
+                    command,
+                    message.as_bytes().to_vec(),
+                    LOCAL_MUTATION_LIMITS,
+                )
+                .await?
+            }
+            None => self.run_mutation("tag", command).await?,
+        };
+        Ok(render_ref_result("tag", coaching, output))
+    }
+
+    async fn restore(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, false, true, false)?;
+        require_paths(&args.paths, "restore")?;
+        let paths = self.validate_paths(&args.paths, Some("write")).await?;
+        if let Some(revision) = args.revision.as_deref() {
+            self.validate_revision(revision).await?;
+        }
+        let identity = serde_json::to_string(&serde_json::json!({
+            "revision": args.revision,
+            "paths": paths,
+        }))?;
+        let coaching = self.permission("git/restore", &identity).await?;
+        let _mutation = self
+            .runner
+            .acquire_mutation(self.workspace.root())
+            .await
+            .map_err(ToolError::Msg)?;
+        let guard = self.filter_guard("restore").await?;
+        let before = self.status_snapshot(&guard).await?;
+        self.reject_recursive_paths(&paths)?;
+        let mut command = vec!["restore".into(), "--worktree".into()];
+        if let Some(revision) = args.revision {
+            command.push(format!("--source={revision}"));
+        }
+        command.push("--".into());
+        command.extend(paths);
+        let output = self
+            .run_mutation("restore", guarded(&guard, command))
+            .await?;
+        let after = self.status_snapshot(&guard).await?;
+        Ok(render_mutation_result(
+            "restore", coaching, before, after, output,
+        ))
+    }
+
     async fn read_operation(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        let pages = matches!(args.operation, GitOperation::Diff | GitOperation::Show);
+        if !pages && (args.format.is_some() || args.offset.is_some()) {
+            return Err(ToolError::Msg(
+                "format and offset are supported only by diff and show".to_string(),
+            ));
+        }
+        let named = matches!(
+            args.operation,
+            GitOperation::BranchCreate | GitOperation::Switch | GitOperation::Tag
+        );
+        if !named && args.name.is_some() {
+            return Err(ToolError::Msg(
+                "name is supported only by branch_create, switch and tag".to_string(),
+            ));
+        }
         match args.operation {
             GitOperation::Status => {
                 reject_irrelevant_fields(&args, false, false, false)?;
@@ -798,6 +1197,7 @@ impl GitTool {
                     "--no-textconv".into(),
                     "--ignore-submodules=all".into(),
                 ];
+                command.extend(format_args(args.format));
                 if let Some(revision) = args.revision.as_deref() {
                     self.validate_revision(revision).await?;
                     command.push(revision.to_string());
@@ -806,11 +1206,12 @@ impl GitTool {
                 command.extend(paths);
                 // Without `--cached` every diff reads the working tree.
                 let guard = self.filter_guard("diff").await?;
-                render_text_result(
+                render_paged_text_result(
                     "diff",
                     coaching,
-                    self.run("diff", guarded(&guard, command), TEXT_LIMITS, true)
+                    self.run("diff", guarded(&guard, command), PAGED_TEXT_LIMITS, true)
                         .await?,
+                    args.offset,
                 )
             }
             GitOperation::Log => {
@@ -865,19 +1266,29 @@ impl GitTool {
                     "--no-textconv".into(),
                     "--ignore-submodules=all".into(),
                     "--format=fuller".into(),
-                    revision.to_string(),
-                    "--".into(),
                 ];
+                command.extend(format_args(args.format));
+                command.push(revision.to_string());
+                command.push("--".into());
                 command.extend(paths);
-                render_text_result(
+                render_paged_text_result(
                     "show",
                     coaching,
-                    self.run("show", command, TEXT_LIMITS, true).await?,
+                    self.run("show", command, PAGED_TEXT_LIMITS, true).await?,
+                    args.offset,
                 )
             }
             GitOperation::Stage => self.stage(args).await,
             GitOperation::Unstage => self.unstage(args).await,
             GitOperation::Commit => self.commit(args).await,
+            GitOperation::Branches => self.branches(args).await,
+            GitOperation::BranchCreate => self.branch_create(args).await,
+            GitOperation::Switch => self.switch(args).await,
+            GitOperation::StashPush | GitOperation::StashPop | GitOperation::StashList => {
+                self.stash(args).await
+            }
+            GitOperation::Tag => self.tag(args).await,
+            GitOperation::Restore => self.restore(args).await,
         }
     }
 }
@@ -923,7 +1334,7 @@ impl Tool for GitTool {
     type Output = serde_json::Value;
 
     fn description(&self) -> String {
-        "Inspect and update the bound Git repository through fixed structured operations. No shell, raw argv, remotes, or network access is available.".to_string()
+        "Inspect and update the bound Git repository through fixed structured operations: status, diff/show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log, stage, unstage, commit, branches, branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -932,16 +1343,19 @@ impl Tool for GitTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "show", "stage", "unstage", "commit"]
+                    "enum": ["status", "diff", "log", "show", "stage", "unstage", "commit", "branches", "branch_create", "switch", "stash_push", "stash_pop", "stash_list", "tag", "restore"]
                 },
+                "name": { "type": "string", "maxLength": 255, "description": "Branch name for branch_create/switch, tag name for tag" },
+                "format": { "type": "string", "enum": ["patch", "stat", "name_status"], "description": "diff/show output format (default patch)" },
+                "offset": { "type": "integer", "minimum": 0, "description": "diff/show byte offset; pass the previous next_offset to fetch the next page" },
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
                     "maxItems": 128,
                     "description": "Literal repository-relative paths; never options or globs. Commit with paths commits only that selection; with no paths it commits the existing index."
                 },
-                "revision": { "type": "string", "description": "Revision for diff, log, or show" },
-                "message": { "type": "string", "maxLength": 16384, "description": "Required commit message for commit only" },
+                "revision": { "type": "string", "description": "Revision for diff, log, show, branch_create (start point), tag (target) or restore (source)" },
+                "message": { "type": "string", "maxLength": 16384, "description": "Commit message (required for commit), stash_push message, or annotated tag message" },
                 "max_count": { "type": "integer", "minimum": 1, "maximum": 100 }
             },
             "required": ["operation"],
@@ -1044,25 +1458,92 @@ fn neutralizing_args(drivers: &[String]) -> Vec<String> {
                 "-c".to_string(),
                 format!("filter.{driver}.process="),
                 "-c".to_string(),
+                format!("filter.{driver}.smudge="),
+                "-c".to_string(),
                 format!("filter.{driver}.required=false"),
             ]
         })
         .collect()
 }
 
-fn render_text_result(
+fn format_args(format: Option<DiffFormat>) -> Vec<String> {
+    match format.unwrap_or_default() {
+        DiffFormat::Patch => Vec::new(),
+        DiffFormat::Stat => vec!["--stat=200".into(), "--summary".into()],
+        DiffFormat::NameStatus => vec!["--name-status".into()],
+    }
+}
+
+/// One page of diff/show text: at most [`TEXT_PAGE_BYTES`] from `offset`,
+/// ending on a line (or UTF-8) boundary, with the offset of the next page.
+fn render_paged_text_result(
     operation: &str,
     coaching: Option<String>,
     output: CommandOutput,
+    offset: Option<u64>,
 ) -> Result<serde_json::Value, ToolError> {
+    let CommandOutput {
+        exit_status,
+        stdout,
+        stderr,
+        status: command_status,
+        ..
+    } = output;
+    let total = stdout.len();
+    let start = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
+    if start > total {
+        return Err(ToolError::Msg(format!(
+            "{operation} offset {start} is beyond the {total}-byte output"
+        )));
+    }
+    let mut end = total.min(start + TEXT_PAGE_BYTES);
+    if end < total {
+        if let Some(newline) = stdout[start..end].iter().rposition(|byte| *byte == b'\n') {
+            end = start + newline + 1;
+        }
+        while end > start && end < total && (stdout[end] & 0b1100_0000) == 0b1000_0000 {
+            end -= 1;
+        }
+    }
+    let next_offset = (end < total).then_some(end);
+    let page = String::from_utf8_lossy(&stdout[start..end]);
+    let stderr = String::from_utf8_lossy(&stderr);
+    // Output beyond the 16 MiB run ceiling was not captured at all.
+    let truncated = matches!(command_status, CommandStatus::OutputLimitExceeded(_));
+    let exit_code = exit_status.and_then(|exit| exit.code());
     Ok(serde_json::json!({
         "operation": operation,
-        "text": String::from_utf8_lossy(&output.stdout),
-        "stderr": String::from_utf8_lossy(&output.stderr),
-        "truncated": matches!(output.status, CommandStatus::OutputLimitExceeded(_)),
-        "exit_code": output.exit_status.and_then(|status| status.code()),
+        "text": page,
+        "stderr": stderr,
+        "offset": start,
+        "next_offset": next_offset,
+        "total_bytes": total,
+        "truncated": truncated,
+        "exit_code": exit_code,
         "coaching": coaching,
     }))
+}
+
+fn render_ref_result(
+    operation: &str,
+    coaching: Option<String>,
+    output: CommandOutput,
+) -> serde_json::Value {
+    let CommandOutput {
+        exit_status,
+        stdout,
+        stderr,
+        status: command_status,
+        ..
+    } = output;
+    serde_json::json!({
+        "operation": operation,
+        "stdout": String::from_utf8_lossy(&stdout),
+        "stderr": String::from_utf8_lossy(&stderr),
+        "status": mutation_status(command_status, exit_status),
+        "exit_code": exit_status.and_then(|exit| exit.code()),
+        "coaching": coaching,
+    })
 }
 
 fn require_paths(paths: &[String], operation: &str) -> Result<(), ToolError> {
@@ -1083,7 +1564,7 @@ fn reject_irrelevant_fields(
 ) -> Result<(), ToolError> {
     if !allow_message && args.message.is_some() {
         return Err(ToolError::Msg(
-            "message is supported only by commit".to_string(),
+            "message is supported only by commit, stash_push and tag".to_string(),
         ));
     }
     if !allow_revision && args.revision.is_some() {
@@ -1243,6 +1724,7 @@ mod tests {
             revision: None,
             message: message.map(str::to_string),
             max_count: None,
+            ..Default::default()
         }
     }
 
@@ -1805,6 +2287,8 @@ mod tests {
                 "-c",
                 "filter.lfs.process=",
                 "-c",
+                "filter.lfs.smudge=",
+                "-c",
                 "filter.lfs.required=false",
             ]
         );
@@ -1919,6 +2403,334 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         vec![("GIT_CONFIG_GLOBAL".to_string(), missing.into_os_string())]
+    }
+
+    fn named(operation: GitOperation, name: &str) -> GitArgs {
+        GitArgs {
+            operation,
+            name: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn commit_file(repo: &TestRepo, path: &str, contents: &str, message: &str) {
+        repo.write(path, contents);
+        repo.git(["add", "--", path]);
+        repo.git(["commit", "--quiet", "-m", message]);
+    }
+
+    #[tokio::test]
+    async fn branch_create_list_and_switch_move_head_between_branches() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        let tool = repo.tool();
+        let created = tool
+            .call(named(GitOperation::BranchCreate, "feature/x"))
+            .await
+            .unwrap();
+        assert_eq!(created["status"], "success", "{created}");
+        let listed = tool
+            .call(GitArgs {
+                operation: GitOperation::Branches,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let names: Vec<_> = listed["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|branch| branch["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"feature/x".to_string()), "{listed}");
+        let switched = tool
+            .call(named(GitOperation::Switch, "feature/x"))
+            .await
+            .unwrap();
+        assert_eq!(switched["status"], "success", "{switched}");
+        assert_eq!(repo.git(["branch", "--show-current"]), "feature/x\n");
+        // Git's own ref rules reject bad names before anything runs.
+        for bad in ["-x", "a..b", "with space", "end.lock"] {
+            assert!(
+                tool.call(named(GitOperation::BranchCreate, bad))
+                    .await
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        let missing = tool
+            .call(named(GitOperation::Switch, "nope"))
+            .await
+            .unwrap();
+        assert_eq!(missing["status"], "nonzero", "{missing}");
+    }
+
+    #[tokio::test]
+    async fn stash_push_list_pop_round_trips_working_tree_changes() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        repo.write("a.txt", "changed\n");
+        let tool = repo.tool();
+        let pushed = tool
+            .call(GitArgs {
+                operation: GitOperation::StashPush,
+                message: Some("wip change".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(pushed["status"], "success", "{pushed}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "one\n"
+        );
+        let listed = tool
+            .call(GitArgs {
+                operation: GitOperation::StashList,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed["stashes"][0]["ref"], "stash@{0}", "{listed}");
+        assert!(
+            listed["stashes"][0]["subject"]
+                .as_str()
+                .unwrap()
+                .contains("wip change")
+        );
+        let popped = tool
+            .call(GitArgs {
+                operation: GitOperation::StashPop,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(popped["status"], "success", "{popped}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "changed\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_creates_lightweight_and_annotated_tags() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        let tool = repo.tool();
+        let light = tool.call(named(GitOperation::Tag, "v1")).await.unwrap();
+        assert_eq!(light["status"], "success", "{light}");
+        let annotated = tool
+            .call(GitArgs {
+                message: Some("release two".into()),
+                ..named(GitOperation::Tag, "v2")
+            })
+            .await
+            .unwrap();
+        assert_eq!(annotated["status"], "success", "{annotated}");
+        assert_eq!(repo.git(["cat-file", "-t", "v1"]), "commit\n");
+        assert_eq!(repo.git(["cat-file", "-t", "v2"]), "tag\n");
+        assert!(repo.git(["tag", "-n1", "v2"]).contains("release two"));
+    }
+
+    #[tokio::test]
+    async fn restore_discards_working_tree_changes_of_selected_paths_only() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        commit_file(&repo, "b.txt", "two\n", "second");
+        repo.write("a.txt", "dirty a\n");
+        repo.write("b.txt", "dirty b\n");
+        let tool = repo.tool();
+        let restored = tool
+            .call(args(GitOperation::Restore, &["a.txt"], None))
+            .await
+            .unwrap();
+        assert_eq!(restored["status"], "success", "{restored}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("b.txt")).unwrap(),
+            "dirty b\n"
+        );
+        assert!(
+            tool.call(args(GitOperation::Restore, &[], None))
+                .await
+                .is_err()
+        );
+        assert!(
+            tool.call(args(GitOperation::Restore, &["../x"], None))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn large_diff_is_paged_by_offset_and_has_stat_and_name_status_forms() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "big.txt", "seed\n", "first");
+        commit_file(&repo, "small.txt", "seed\n", "second");
+        let big: String = (0..12_000)
+            .map(|line| format!("changed line {line:06} with padding\n"))
+            .collect();
+        repo.write("big.txt", &big);
+        repo.write("small.txt", "edited\n");
+        let tool = repo.tool();
+        let mut offset = None;
+        let mut pages = 0;
+        let mut text = String::new();
+        loop {
+            let page = tool
+                .call(GitArgs {
+                    operation: GitOperation::Diff,
+                    offset,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            pages += 1;
+            assert_eq!(page["truncated"], false);
+            let chunk = page["text"].as_str().unwrap();
+            assert!(chunk.len() <= super::TEXT_PAGE_BYTES);
+            text.push_str(chunk);
+            match page["next_offset"].as_u64() {
+                Some(next) => offset = Some(next),
+                None => {
+                    assert_eq!(page["total_bytes"].as_u64().unwrap() as usize, text.len());
+                    break;
+                }
+            }
+        }
+        assert!(pages >= 3, "a >192 KiB diff spans several pages: {pages}");
+        assert!(text.contains("+changed line 011999 with padding"));
+        assert!(text.contains("+edited"));
+        let stat = tool
+            .call(GitArgs {
+                operation: GitOperation::Diff,
+                format: Some(super::DiffFormat::Stat),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(stat["text"].as_str().unwrap().contains("big.txt"), "{stat}");
+        assert!(
+            stat["text"].as_str().unwrap().contains("2 files changed"),
+            "{stat}"
+        );
+        let names = tool
+            .call(GitArgs {
+                operation: GitOperation::Diff,
+                format: Some(super::DiffFormat::NameStatus),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(names["text"], "M\tbig.txt\nM\tsmall.txt\n");
+        let beyond = tool
+            .call(GitArgs {
+                operation: GitOperation::Diff,
+                offset: Some(u64::MAX),
+                ..Default::default()
+            })
+            .await;
+        assert!(beyond.is_err());
+        let misplaced = tool
+            .call(GitArgs {
+                operation: GitOperation::Log,
+                offset: Some(1),
+                ..Default::default()
+            })
+            .await;
+        assert!(misplaced.is_err());
+    }
+
+    /// The new mutations under the real Seatbelt `.git` protection model:
+    /// refs, HEAD, objects and the index stay writable while config, hooks
+    /// and info remain protected.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn new_git_mutations_work_inside_the_contained_git_service() {
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        if !crate::sandbox::seatbelt_exists() {
+            crate::sandbox::skip_unusable_real_sandbox_test("Seatbelt is unavailable");
+            return;
+        }
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        let mut tool = repo.tool();
+        tool.sandbox = crate::sandbox::Sandbox::new(true, "seatbelt")
+            .with_workspace_binding(tool.workspace.clone());
+        tool.test_uncontained = false;
+        for call in [
+            named(GitOperation::BranchCreate, "contained"),
+            named(GitOperation::Switch, "contained"),
+            named(GitOperation::Tag, "contained-tag"),
+        ] {
+            let operation = call.operation;
+            let result = tool.call(call).await.unwrap();
+            assert_eq!(result["status"], "success", "{operation:?}: {result}");
+        }
+        assert_eq!(repo.git(["branch", "--show-current"]), "contained\n");
+        repo.write("a.txt", "dirty\n");
+        let pushed = tool
+            .call(GitArgs {
+                operation: GitOperation::StashPush,
+                message: Some("contained stash".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(pushed["status"], "success", "{pushed}");
+        let popped = tool
+            .call(GitArgs {
+                operation: GitOperation::StashPop,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(popped["status"], "success", "{popped}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "dirty\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_git_mutations_use_their_own_permission_keys() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        repo.write("a.txt", "dirty\n");
+        let tool = repo.tool_with_permission(PermissionConfig {
+            git_branch: Some(ToolPerm::Simple(Action::Deny)),
+            git_switch: Some(ToolPerm::Simple(Action::Deny)),
+            git_stash: Some(ToolPerm::Simple(Action::Deny)),
+            git_tag: Some(ToolPerm::Simple(Action::Deny)),
+            git_restore: Some(ToolPerm::Simple(Action::Deny)),
+            write: Some(ToolPerm::Simple(Action::Allow)),
+            ..PermissionConfig::default()
+        });
+        for call in [
+            named(GitOperation::BranchCreate, "denied"),
+            named(GitOperation::Switch, "master"),
+            GitArgs {
+                operation: GitOperation::StashPush,
+                ..Default::default()
+            },
+            named(GitOperation::Tag, "denied"),
+            args(GitOperation::Restore, &["a.txt"], None),
+        ] {
+            let operation = call.operation;
+            assert!(
+                tool.call(call).await.is_err(),
+                "{operation:?} was not denied"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert!(repo.git(["tag"]).is_empty());
+        assert!(!repo.git(["branch"]).contains("denied"));
     }
 
     #[tokio::test]

@@ -188,6 +188,8 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("max_read_lines").shaped(ConfigShape::Integer),
     key("max_bash_output_lines").shaped(ConfigShape::Integer),
     key("shell_timeout_secs").described("Foreground shell tool deadline. Other sandbox command classes retain their own limits; this does not alter brokered JavaScript spawn limits.").shaped(ConfigShape::Integer),
+    key("shell_auto_background").described("Keep a foreground shell command that reaches its deadline running as a background job instead of killing it. Default: false.").shaped(ConfigShape::Bool),
+    key("command_timeout_secs").described("Deadline of `!` commands in seconds, 1..=600. Default: 30.").shaped(ConfigShape::Integer),
     key("update_check").described("Opt-in anonymous release check, only during interactive startup.").shaped(ConfigShape::Bool),
     key("max_grep_results").shaped(ConfigShape::Integer),
     key("max_find_results").shaped(ConfigShape::Integer),
@@ -243,6 +245,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("sandbox-home-masks", &["sandbox_home_masks"])
         .described("HOME-relative dot paths hidden in every sandbox profile, added to the built-in masks")
         .shaped(ConfigShape::Strings),
+    aliased("sandbox-network", &["sandbox_network"])
+        .described("Network access for contained shell commands: deny (default) or allow. Project layers need trust.")
+        .shaped(ConfigShape::Enum(crate::sandbox::SandboxNetwork::NAMES)),
     aliased(
         "windows-appcontainer-read-roots",
         &["windows_appcontainer_read_roots"],
@@ -264,6 +269,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .described("JS fetch() origin narrowing: \"all\" (no narrowing), \"none\" (deny every fetch), or an array of exact origins. Absent is unrestricted; the js/fetch permission check always applies.")
         .shaped(ConfigShape::AllNoneOrStrings),
     gated_aliased("js", "js-fetch-allow-http", &["js_fetch_allow_http"]).shaped(ConfigShape::Bool),
+    gated_aliased("js", "js-step-timeout-secs", &["js_step_timeout_secs"])
+        .described("Whole-call deadline of one js tool call in seconds, including brokered spawn/fetch waits; clamped to 1..=300. Default: 30.")
+        .shaped(ConfigShape::Integer),
     aliased("allow_all_mcp_calls", &["allow-all-mcp-calls"]).shaped(ConfigShape::Bool),
     gated("mcp", "mcp_tool_timeout_secs").described("Bound on one MCP `tools/call` round trip, in seconds. Default: 120.").shaped(ConfigShape::Integer),
     gated_aliased("mcp", "enable-exa-mcp", &["enable_exa_mcp"]).shaped(ConfigShape::Bool),

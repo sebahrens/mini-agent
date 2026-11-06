@@ -144,10 +144,14 @@ pub(crate) fn sandbox_label(sandbox: &crate::sandbox::Sandbox) -> Option<&'stati
     // `Disabled` exactly when containment was not requested, and running it
     // would canonicalize roots and masks on each frame.
     if sandbox.containment_requested() {
-        match sandbox.profile() {
-            crate::sandbox::SandboxProfile::HostFull => Some("sandbox:host-full"),
-            crate::sandbox::SandboxProfile::HostRead => Some("sandbox:host-read"),
-            crate::sandbox::SandboxProfile::Workspace => None,
+        let network = sandbox.network().allows();
+        match (sandbox.profile(), network) {
+            (crate::sandbox::SandboxProfile::HostFull, false) => Some("sandbox:host-full"),
+            (crate::sandbox::SandboxProfile::HostFull, true) => Some("sandbox:host-full+net"),
+            (crate::sandbox::SandboxProfile::HostRead, false) => Some("sandbox:host-read"),
+            (crate::sandbox::SandboxProfile::HostRead, true) => Some("sandbox:host-read+net"),
+            (crate::sandbox::SandboxProfile::Workspace, false) => None,
+            (crate::sandbox::SandboxProfile::Workspace, true) => Some("sandbox:net"),
         }
     } else {
         sandbox

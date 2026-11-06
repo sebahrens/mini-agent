@@ -49,21 +49,90 @@ installed-binary path because libtest is not a production worker executable.
 Foreground shell commands default to a 120 s deadline. `shell_timeout_secs`
 sets it between 1 and 600 seconds; the tool definition publishes the effective
 deadline. A call's millisecond `timeout` can only lower that deadline and must
-be positive. Other sandbox command classes, including brokered JS `spawn`,
-retain their existing limits. A shell call with
+be positive. Other sandbox command classes retain their existing limits;
+brokered JS `spawn` is bounded by the remaining `js-step-timeout-secs` deadline. A shell call with
 `background = true` instead returns a session-scoped job id immediately and
 uses a 24-hour maximum (again lowerable with `timeout`).
-The companion `job_status` tool polls bounded live output, stops and reaps
-the job, or waits for completion. `action = "wait"` accepts `timeout_ms` from
+
+With `auto_background = true` on the call (or `shell_auto_background = true` in
+config) a foreground command runs as a job from the start: if it finishes
+before its deadline the result reads exactly like a foreground result (output,
+exit code, log footer) and the job record is dropped; if it reaches the
+deadline it is not killed but returned as `[status: promoted_to_background;
+job_id: ...]` with the output so far, and keeps running as an ordinary
+background job whose next `job_status` poll continues after that output. If the
+call is interrupted before either happens, the job is stopped.
+
+| Command class | Deadline |
+|---------------|----------|
+| `shell` foreground | `shell_timeout_secs` (default 120 s, 1..=600); call `timeout` can only lower it; optional promotion to a job |
+| `shell` background job | 24 h, call `timeout` can lower it |
+| `!` commands (TUI and headless) | `command_timeout_secs` (default 30 s, 1..=600) |
+| Loop and goal validation commands | Their own configured validation limits |
+| Hooks | Their own hook timeouts |
+| Brokered JS `spawn` | Remaining `js-step-timeout-secs` deadline (default 30 s) |
+| Structured Git | 10 s queries, 30 s diff/show pages, 60 s local mutations |
+
+On Unix a shell command's stdout and stderr share one pipe by default (like
+`2>&1`), so the result shows lines in their exact write order without stream
+labels. `separate_streams = true` captures two pipes instead and labels each run
+of one stream `[stdout]`/`[stderr]` in arrival order; ordering between the two
+pipes is then only approximate. Windows always uses two labelled pipes. The
+native `/pr` flow requests separate streams so the PR URL comes from stdout
+alone. Background jobs follow the same choice, and `pty = true` output is
+always one unlabelled terminal stream.
+
+Foreground shell output is not a reason to stop a command. The capture keeps an
+arrival-ordered 768 KiB head and 256 KiB rolling tail in memory and lets the
+child run to completion, so the result carries its real exit status. Dropped
+middle bytes are marked in place (`[... N bytes of output omitted ...]`) and a
+footer reports the total size. When the session's private tool-output directory
+is available, the first byte that would be dropped creates an owner-only log
+(`shell-output-<uuid>.log`) holding the complete stream (stdout and stderr in
+arrival order, no labels); the footer names it so `read` (offset/limit or
+`character_offset`) and `grep` can recover the middle. Only a pathological
+64 MiB total stops the command, reported as `[status: output_truncated; limit:
+combined; byte_cap: 67108864; ...]` with the partial transcript. The
+`max_bash_output_lines` head/tail line cap still bounds the rendered text; the
+log footer is appended after it so it is never cut. Hook, validation and other
+sandbox command classes keep their existing bounded 1 MiB/1.5 MiB capture.
+`pty = true` (Unix only) runs the command under a fresh 120x40
+pseudo-terminal instead of pipes: its stdin, stdout and stderr are one TTY, so
+`isatty()` is true and colour/progress/prompt behaviour matches an interactive
+terminal. The output is one merged, unlabelled stream. The terminal belongs to
+the command; it is never the user's terminal, the command still gets a new
+session with no controlling terminal, and the same sandbox wrapper, workspace
+and permission decision apply. A foreground pty command reads end-of-file
+behaviour from an idle terminal, so drive interactive programs as background
+jobs: `job_status` `action = "input"` with `input` (at most 16 KiB per call,
+include `\n` for Enter) types into a running pty job and returns the output
+produced within 200 ms. Jobs without `pty` keep a null stdin and reject input.
+The companion `job_status` tool polls live output, stops and reaps
+the job, or waits for completion. `poll`, `wait` and `stop` return only output
+produced since the previous such call for that job (at most 64 KiB; a larger
+range shows its first 16 KiB and last 48 KiB around a reported byte gap) and
+name the offset the next call continues at; `since = N` re-reads the complete
+stream from byte `N` (from memory or the job log). Each job keeps a 48 KiB head
+and 16 KiB tail in memory and, when the session tool-output directory is
+available, tees its complete output (stdout and stderr in arrival order) to an
+owner-only `shell-<job id>.log` there, capped at 256 MiB, which `read`/`grep`
+can open. Logs are retained with the session's other tool outputs; a pruned job
+record keeps its log on disk and `job_status` on the pruned id reports the log
+path (the newest 256 pruned ids are remembered). `action = "wait"` accepts `timeout_ms` from
 1 to 60000 (default 10000); expiration or dropping the wait leaves the job
 running. `action = "list"` needs no id and returns bounded command summaries,
 ids, and statuses without copying captured output. The job registry belongs
 to the session's sandbox, so list can recover ids after transcript compaction
 and agent rebuilds. A session permits at most eight concurrent jobs and retains the newest
-32 job records; each stream keeps a 64 KiB rolling head/tail view. Background
+32 job records; `list` also shows each job's log path. Background
 commands use the same shell, workspace, sandbox, and permission decision as
-foreground commands, and all are cancelled on turn cancellation or session
-shutdown.
+foreground commands. Jobs are session-scoped: interrupting a turn (Esc, Ctrl+C,
+ACP `session/cancel`) kills only foreground process groups, and the TUI then
+reports how many jobs are still running. Job process groups register in the
+job registry's own set, so `kill_active` never signals them. A job ends when it
+exits, reaches its deadline, is stopped through `job_status`/`/jobs stop`, or
+when the session ends: `/quit` cancels every job and dropping the session's
+sandbox cancels and reaps the rest.
 
 While a foreground shell call runs in an interactive turn, the tool forwards a
 throttled (at most every 100 ms) display-only `AgentEvent::ToolProgress` with
@@ -421,7 +490,35 @@ descriptor-only plain JSON up to 256 KiB, is parent-validated and durably
 audited, and stops later JavaScript/effects after acknowledgement. The tool
 returns that JSON directly without another model round trip. Ordinary final
 expressions remain limited to strings, finite scalars, or plain JSON and use the
-smaller 64 KiB result channel.
+smaller 64 KiB result channel. A model step whose final value is larger is not
+failed: a string is cut on a code-point boundary and a plain JSON value (encoded
+up to 1 MiB, 100,000 nodes) is cut on a character boundary, each followed by a
+marker naming the full size in bytes and the 64 KiB cap (a cut JSON value says it
+is no longer valid JSON). Verification roles (embedded, mutation, inherited and
+held-out skill tests) keep the strict 64 KiB contract and fail with
+`invalid_result`. Non-JSON values still fail with `invalid_result`.
+
+#### JavaScript step limits
+
+| Limit | Value | When exceeded |
+|-------|-------|---------------|
+| Whole call (queueing, IPC, JavaScript, brokered effects) | 30 s; `js-step-timeout-secs` 1..=300 | `execution timed out` naming the limit |
+| Brokered `spawn` | The remaining whole-call deadline | `timed_out: true`, process tree killed |
+| JavaScript heap / stack | 64 MiB / 512 KiB (fixed, Phase 6 invariant 4) | `out of memory` / `stack_limit` |
+| Worker CPU (native) | 35 s per worker process on Linux (`RLIMIT_CPU`) and Windows (Job) | Worker killed; workers within 30 s of it are retired first |
+| Worker address space / descriptors / file size (Linux) | 256 MiB / 64 / 1 MiB | Allocation or open fails inside the worker |
+| Worker reuse | 256 invocations or 15 minutes per process | A fresh worker is started |
+| Effect calls | 256 per step | Closed `effect_limit` error |
+| `read_file` / `write_file` | 1 MiB per call | `too_large` |
+| `read_files` | 256 paths, 6 MiB encoded results | `too_large` |
+| `spawn` output | 1 MiB stdout, 1 MiB stderr, 1.5 MiB combined; 4,096 arguments, 1 MiB argument bytes | Output truncated flags / `too_large` |
+| `fetch` | 256 KiB request body (POST only), 1 MiB response body | `too_large` |
+| `scratch_put` | 128-byte keys, 1 MiB values, 4 MiB and 128 entries per session | `too_large` |
+| Final expression value | 64 KiB UTF-8 (`MAX_RESULT_BYTES`) | Model steps: truncated with a size marker; verification roles: `invalid_result` |
+| `result(value)` structured result | 256 KiB | The call throws `too_large` |
+| Console records | 256 per step | Later records are dropped; the last kept record is marked `[truncated]` and the result ends with a cap notice |
+| Console total | 256 KiB per step | As above |
+| Console record | 8 KiB each | The record is cut and marked `[truncated]` |
 
 
 ## Turn-scoped cron tool
@@ -610,6 +707,26 @@ first-message fallback without inventing usage.
 See [CONFIG.md](CONFIG.md) for the default model and opt-out.
 
 ## Native Git command proposals
+
+The model-facing `git` tool (`src/git/tool.rs`) runs fixed, hardened Git argv
+inside the workspace-service sandbox, where refs, `HEAD`, objects and the index
+are writable but `.git` config, hooks, info and modules stay protected. Besides
+`status`, `diff`, `log`, `show`, `stage`, `unstage` and `commit` it offers
+`branches` (list), `branch_create` (`name`, optional start `revision`), `switch`
+(existing local branch `name`), `stash_push` (optional `message` and `paths`),
+`stash_pop`, `stash_list`, `tag` (`name`, optional `revision`; `message` makes it
+annotated) and `restore` (discard working-tree changes of `paths`, from the
+index or a `revision`). Each mutation has its own permission key
+(`git/branch`, `git/switch`, `git/stash`, `git/tag`, `git/restore`; restore and
+stash paths additionally need `write`); listing reuses `git/status`. Names are
+validated with `git check-ref-format`; stashes and annotated tags receive the
+host-resolved commit identity. Operations that touch the working tree use the
+filter guard, which now also empties `filter.<driver>.smudge`. `diff` and `show`
+accept `format` (`patch`, `stat` with `--summary`, or `name_status`) and page
+their output: one run captures up to 16 MiB (30 s), each call returns at most
+192 KiB ending on a line boundary with `offset`, `next_offset` and
+`total_bytes`, and `truncated` reports output beyond the run ceiling. There are
+still no remotes, fetch/pull/push or network operations.
 
 `src/ui/slash/git.rs` owns parsing, bounded request-path selection, proposal
 validation and SDK-free native actors for `/diff`, `/commit` and `/pr`. The App

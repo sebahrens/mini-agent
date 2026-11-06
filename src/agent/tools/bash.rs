@@ -5,9 +5,10 @@ use crate::agent::tools::{
 };
 use crate::extras::truncate::head_tail_lines;
 use crate::sandbox::{
-    BackgroundJobSnapshot, CommandLimits, CommandOutput, CommandOutputLimit, CommandProgress,
+    BackgroundJobOutput, CommandLimits, CommandOutput, CommandOutputLimit, CommandProgress,
     CommandStatus, DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS,
-    MAX_BACKGROUND_JOB_WAIT_MILLIS, Sandbox,
+    MAX_BACKGROUND_JOB_WAIT_MILLIS, OutputChannel, OutputTranscript, SHELL_HARD_OUTPUT_BYTES,
+    Sandbox, ShellOutputCapture, SpoolPolicy, TranscriptPart,
 };
 use compact_str::CompactString;
 
@@ -134,13 +135,21 @@ async fn output_with_progress(
     sandbox: &Sandbox,
     command: &str,
     limits: CommandLimits,
+    capture: &ShellOutputCapture,
+    (pty, separate_streams): (bool, bool),
     id: CompactString,
     events: tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
 ) -> std::io::Result<CommandOutput> {
     let progress = CommandProgress::new();
     let mut changes = progress.subscribe();
-    let command_run =
-        sandbox.output_command_with_limits_and_progress(command, limits, Some(progress.clone()));
+    let command_run = sandbox.output_shell_command_captured(
+        command,
+        limits,
+        Some(progress.clone()),
+        capture,
+        pty,
+        separate_streams,
+    );
     tokio::pin!(command_run);
     let mut last_sent: Option<tokio::time::Instant> = None;
     let mut pending = false;
@@ -201,6 +210,12 @@ pub struct ShellTool {
     /// is [`crate::config::DEFAULT_MAX_BASH_OUTPUT_LINES`].
     pub max_output_lines: Option<u64>,
     foreground_timeout: std::time::Duration,
+    /// Private directory (the session tool-output directory) receiving
+    /// full-output logs when a command's output exceeds in-memory retention.
+    output_log_dir: Option<std::path::PathBuf>,
+    /// `shell_auto_background`: promote a foreground command that reaches
+    /// its deadline to a background job instead of killing it.
+    auto_background: bool,
 }
 
 impl ShellTool {
@@ -218,7 +233,22 @@ impl ShellTool {
             foreground_timeout: std::time::Duration::from_secs(
                 crate::config::DEFAULT_SHELL_TIMEOUT_SECS,
             ),
+            output_log_dir: None,
+            auto_background: false,
         }
+    }
+
+    /// Default for the per-call `auto_background` flag.
+    pub fn with_auto_background(mut self, enabled: bool) -> Self {
+        self.auto_background = enabled;
+        self
+    }
+
+    /// Spool oversized output to private logs in `dir` so the model can
+    /// recover the omitted middle with `read`/`grep`.
+    pub fn with_output_log_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.output_log_dir = dir;
+        self
     }
 
     pub fn with_foreground_timeout_secs(mut self, seconds: u64) -> Self {
@@ -277,6 +307,18 @@ impl Tool for ShellTool {
                 "background": {
                     "type": "boolean",
                     "description": "Start a session-scoped background job and return its id (default false)"
+                },
+                "auto_background": {
+                    "type": "boolean",
+                    "description": "Foreground only: if the command reaches its deadline, keep it running as a background job (returning its job id and output so far) instead of killing it. Defaults to the shell_auto_background setting."
+                },
+                "separate_streams": {
+                    "type": "boolean",
+                    "description": "Capture stdout and stderr in separate pipes, labelled [stdout]/[stderr] in arrival order (interleaving across the two is approximate). Default false: on Unix both share one pipe, like 2>&1, so lines keep their exact write order and are unlabelled."
+                },
+                "pty": {
+                    "type": "boolean",
+                    "description": "Run under a pseudo-terminal so isatty() is true and stdin/stdout/stderr are one 120x40 TTY (Unix only; default false). With background=true, job_status action=input types into it, e.g. for REPLs or prompts."
                 }
             },
             "required": ["command"]
@@ -352,10 +394,27 @@ impl ShellTool {
                 .unwrap_or(DEFAULT_BACKGROUND_COMMAND_TIMEOUT);
             let id = self
                 .sandbox
-                .start_background_command(args.command, timeout)
+                .start_background_command_logged(
+                    args.command,
+                    timeout,
+                    self.output_log_dir.as_deref(),
+                    args.pty,
+                    args.separate_streams,
+                    None,
+                )
                 .await?;
+            let log = self
+                .output_log_dir
+                .as_ref()
+                .map(|dir| {
+                    format!(
+                        "\nComplete output is logged to {}",
+                        dir.join(format!("shell-{id}.log")).display()
+                    )
+                })
+                .unwrap_or_default();
             let result = format!(
-                "Background job started: {id}\nUse job_status with this id to poll output or stop it."
+                "Background job started: {id}\nUse job_status with this id to poll output or stop it; each poll returns only output not returned before.{log}"
             );
             return Ok((
                 match coaching {
@@ -371,6 +430,23 @@ impl ShellTool {
         if let Some(timeout_ms) = args.timeout {
             limits.timeout = std::time::Duration::from_millis(timeout_ms);
         }
+        if args.auto_background.unwrap_or(self.auto_background) {
+            let result = self.run_auto_background(&args, limits.timeout).await?;
+            return Ok((
+                match coaching {
+                    Some(message) => format!("{message}\n\n{result}"),
+                    None => result,
+                },
+                None,
+            ));
+        }
+        // Retention never stops the child; only this ceiling does.
+        limits.combined_bytes = usize::try_from(SHELL_HARD_OUTPUT_BYTES).unwrap_or(usize::MAX);
+        let capture = ShellOutputCapture::new(SpoolPolicy::foreground_shell(
+            self.output_log_dir
+                .as_deref()
+                .map(|dir| ShellOutputCapture::log_path_in(dir, "shell-output")),
+        ));
         let live = SHELL_CALL_ID
             .try_with(Clone::clone)
             .ok()
@@ -378,30 +454,56 @@ impl ShellTool {
             .zip(crate::agent::tools::mutation_diff::scoped_event_sender());
         let output = match live {
             Some((id, events)) => {
-                output_with_progress(&self.sandbox, &args.command, limits, id, events).await?
+                output_with_progress(
+                    &self.sandbox,
+                    &args.command,
+                    limits,
+                    &capture,
+                    (args.pty, args.separate_streams),
+                    id,
+                    events,
+                )
+                .await?
             }
             None => {
                 self.sandbox
-                    .output_command_with_limits(&args.command, limits)
+                    .output_shell_command_captured(
+                        &args.command,
+                        limits,
+                        None,
+                        &capture,
+                        args.pty,
+                        args.separate_streams,
+                    )
                     .await?
             }
         };
+        let transcript = capture.transcript();
 
         if output.status != CommandStatus::Completed {
             tracing::debug!("tool shell stopped before completion: {:?}", output.status);
-            return Err(resource_limit_error(output, limits, self.max_output_lines));
+            return Err(resource_limit_error(
+                output.status,
+                &transcript,
+                limits,
+                self.max_output_lines,
+            ));
         }
 
         #[cfg(any(feature = "git-worktree", test))]
         const METADATA_STDOUT_BYTES: usize = 64 * 1024;
         #[cfg(any(feature = "git-worktree", test))]
-        let metadata = Some(ForegroundResult {
-            status: output.status,
-            exit_code: output.exit_status.and_then(|status| status.code()),
-            descendants_escaped: output.descendants_escaped,
-            stdout: output.stdout[..output.stdout.len().min(METADATA_STDOUT_BYTES)].to_vec(),
-            stdout_complete: output.stdout.len() <= METADATA_STDOUT_BYTES,
-        });
+        let metadata = {
+            let stdout = transcript.channel_bytes(OutputChannel::Stdout);
+            Some(ForegroundResult {
+                status: output.status,
+                exit_code: output.exit_status.and_then(|status| status.code()),
+                descendants_escaped: output.descendants_escaped,
+                stdout_complete: transcript.omitted_bytes == 0
+                    && stdout.len() <= METADATA_STDOUT_BYTES,
+                stdout: stdout[..stdout.len().min(METADATA_STDOUT_BYTES)].to_vec(),
+            })
+        };
         #[cfg(not(any(feature = "git-worktree", test)))]
         let metadata = None;
         let termination = render_termination(output.exit_status);
@@ -409,8 +511,8 @@ impl ShellTool {
             tracing::debug!("tool shell: {termination}");
         }
 
-        let output_len = output.stdout.len() + output.stderr.len();
-        let mut result = render_streams(&output.stdout, &output.stderr);
+        let output_len = transcript.total_bytes;
+        let mut result = render_transcript(&transcript);
         if output.descendants_escaped {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
@@ -426,7 +528,8 @@ impl ShellTool {
             result.push_str(&termination);
         }
 
-        let result = bound_output_lines(result, self.max_output_lines);
+        let mut result = bound_output_lines(result, self.max_output_lines);
+        push_log_footer(&mut result, &transcript);
 
         let result = match coaching {
             Some(msg) => format!("{}\n\n{}", msg, result),
@@ -438,6 +541,166 @@ impl ShellTool {
             output_len,
         );
         Ok((result, metadata))
+    }
+}
+
+/// Stops a job started for an auto-background call if the call is dropped
+/// (turn interrupted) before the command finished or was promoted.
+struct PendingAutoJob<'a> {
+    sandbox: &'a Sandbox,
+    id: String,
+    armed: bool,
+}
+
+impl Drop for PendingAutoJob<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.sandbox.request_stop_background_job(&self.id);
+        }
+    }
+}
+
+impl ShellTool {
+    /// Run a foreground command as a job so that reaching `deadline` promotes
+    /// it to a background job (output preserved) instead of killing it. A
+    /// command that finishes in time is reported like a foreground result and
+    /// its job record is dropped.
+    async fn run_auto_background(
+        &self,
+        args: &BashArgs,
+        deadline: std::time::Duration,
+    ) -> Result<String, ToolError> {
+        let progress = CommandProgress::new();
+        let id = self
+            .sandbox
+            .start_background_command_logged(
+                args.command.clone(),
+                DEFAULT_BACKGROUND_COMMAND_TIMEOUT,
+                self.output_log_dir.as_deref(),
+                args.pty,
+                args.separate_streams,
+                Some(progress.clone()),
+            )
+            .await?;
+        let mut pending = PendingAutoJob {
+            sandbox: &self.sandbox,
+            id: id.clone(),
+            armed: true,
+        };
+        let live = SHELL_CALL_ID
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .zip(crate::agent::tools::mutation_diff::scoped_event_sender());
+        let started = tokio::time::Instant::now();
+        let wait = async {
+            loop {
+                let remaining = deadline.saturating_sub(started.elapsed());
+                let snapshot = self
+                    .sandbox
+                    .wait_background_job(&id, remaining)
+                    .await
+                    .map_err(ToolError::Msg)?;
+                if snapshot.status.is_terminal() || started.elapsed() >= deadline {
+                    return Ok::<_, ToolError>(snapshot);
+                }
+            }
+        };
+        let snapshot = match live {
+            Some((call_id, events)) => forward_progress(&progress, wait, call_id, events).await?,
+            None => wait.await?,
+        };
+        pending.armed = false;
+        if !snapshot.status.is_terminal() {
+            let so_far = self
+                .sandbox
+                .read_background_job_output(&id, None, JOB_OUTPUT_READ_BYTES)
+                .map_err(ToolError::Msg)?;
+            let rendered = render_background_job(so_far, self.max_output_lines);
+            let deadline_ms = deadline.as_millis();
+            return Ok(format!(
+                "[status: promoted_to_background; job_id: {id}; the command reached its {deadline_ms} ms foreground deadline and keeps running as a background job. Use job_status with this id to poll (only new output), wait or stop it]\n{rendered}"
+            ));
+        }
+        let transcript = snapshot.transcript.clone();
+        self.sandbox.forget_background_job(&id);
+        let status = match snapshot.status {
+            crate::sandbox::BackgroundJobStatus::Completed => CommandStatus::Completed,
+            crate::sandbox::BackgroundJobStatus::TimedOut => CommandStatus::TimedOut,
+            crate::sandbox::BackgroundJobStatus::Cancelled => CommandStatus::Cancelled,
+            crate::sandbox::BackgroundJobStatus::OutputLimitExceeded => {
+                CommandStatus::OutputLimitExceeded(CommandOutputLimit::Combined)
+            }
+            _ => CommandStatus::Failed,
+        };
+        if status != CommandStatus::Completed {
+            let mut limits = DEFAULT_COMMAND_LIMITS;
+            limits.timeout = deadline;
+            return Err(resource_limit_error(
+                status,
+                &transcript,
+                limits,
+                self.max_output_lines,
+            ));
+        }
+        let mut result = render_transcript(&transcript);
+        if snapshot.descendants_escaped {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(
+                "[status: descendants_escaped; direct command result preserved; containment cleanup incomplete]",
+            );
+        }
+        if let Some(code) = snapshot.exit_code.filter(|code| *code != 0) {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&format!("Exit code: {code}"));
+        }
+        let mut result = bound_output_lines(result, self.max_output_lines);
+        push_log_footer(&mut result, &transcript);
+        Ok(result)
+    }
+}
+
+/// Forward throttled display-only previews of `progress` while `work` runs.
+async fn forward_progress<T>(
+    progress: &CommandProgress,
+    work: impl std::future::Future<Output = T>,
+    id: CompactString,
+    events: tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
+) -> T {
+    let mut changes = progress.subscribe();
+    tokio::pin!(work);
+    let mut last_sent: Option<tokio::time::Instant> = None;
+    let mut pending = false;
+    loop {
+        let due = last_sent.map(|sent| sent + SHELL_PROGRESS_INTERVAL);
+        tokio::select! {
+            biased;
+            result = &mut work => return result,
+            changed = changes.changed(), if !pending => {
+                if changed.is_ok() {
+                    pending = true;
+                }
+            }
+            _ = async {
+                if let Some(due) = due {
+                    tokio::time::sleep_until(due).await;
+                }
+            }, if pending => {
+                pending = false;
+                last_sent = Some(tokio::time::Instant::now());
+                let text = progress.tail_lines(SHELL_PROGRESS_LINES);
+                if !text.is_empty() {
+                    let _ = events.try_send(crate::event::AgentEvent::ToolProgress {
+                        id: id.clone(),
+                        text: CompactString::from(text),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -463,7 +726,7 @@ impl Tool for JobStatusTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Poll, wait for, stop, or list session-scoped background shell jobs. Poll returns current bounded head/tail output. Wait returns when the job ends or timeout_ms expires (default 10000, maximum 60000 milliseconds); expiration leaves the job running. List returns ids, commands and statuses without an id. Stop waits up to 5 seconds for process-tree cleanup."
+        "Poll, wait for, stop, or list session-scoped background shell jobs. Poll, wait and stop return only output produced since the previous poll/wait/stop of that job (at most 64 KiB per call; a larger range shows its start and end around a byte gap), with the byte offset to continue from. Pass since=<offset> to re-read the complete stream from any offset (for example since=0). The complete output is also logged to the file named in the result, readable with read/grep, and the log outlives the job record. Wait returns when the job ends or timeout_ms expires (default 10000, maximum 60000 milliseconds); expiration leaves the job running. List returns ids, commands, statuses and log paths without an id. Stop waits up to 5 seconds for process-tree cleanup."
             .to_string()
     }
 
@@ -477,14 +740,24 @@ impl Tool for JobStatusTool {
                 },
                 "action": {
                     "type": "string",
-                    "enum": ["poll", "stop", "wait", "list"],
-                    "description": "Poll status/output, wait for completion, stop and reap, or list current session jobs (default poll)"
+                    "enum": ["poll", "stop", "wait", "list", "input"],
+                    "description": "Poll status/output, wait for completion, stop and reap, list current session jobs, or type input into a pty=true job (default poll)"
+                },
+                "input": {
+                    "type": "string",
+                    "maxLength": 16384,
+                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The result shows output produced within 200 ms."
                 },
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_BACKGROUND_JOB_WAIT_MILLIS,
                     "description": "Only with action=wait: maximum wait in milliseconds (default 10000). Expiration does not stop the job."
+                },
+                "since": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Byte offset in the job's complete output to read from instead of the end of the previous read (poll, wait or stop)"
                 }
             },
             "required": []
@@ -498,6 +771,11 @@ impl Tool for JobStatusTool {
         {
             return Err(ToolError::Msg(
                 "job_status timeout_ms is only valid with action=wait and must be between 1 and 60000 milliseconds. Example: {\"id\":\"job-...\",\"action\":\"wait\",\"timeout_ms\":10000}".into(),
+            ));
+        }
+        if args.input.is_some() != (args.action == JobAction::Input) {
+            return Err(ToolError::Msg(
+                "job_status input is required with, and only valid with, action=input. Example: {\"id\":\"job-...\",\"action\":\"input\",\"input\":\"print(1+1)\\n\"}".into(),
             ));
         }
         if args.action == JobAction::List {
@@ -517,8 +795,12 @@ impl Tool for JobStatusTool {
                     let exit = job
                         .exit_code
                         .map_or_else(String::new, |code| format!("; exit {code}"));
+                    let log = job
+                        .log_path
+                        .map(|path| format!("\n  log: {}", path.display()))
+                        .unwrap_or_default();
                     format!(
-                        "{}: {}{exit}\n  {}",
+                        "{}: {}{exit}\n  {}{log}",
                         job.id,
                         job.status.as_str(),
                         job.command
@@ -530,21 +812,43 @@ impl Tool for JobStatusTool {
         let id = args.id.as_deref().ok_or_else(|| ToolError::Msg(
             "job_status requires an id for poll, wait or stop. Example: {\"id\":\"job-...\",\"action\":\"wait\"}".into(),
         ))?;
-        let snapshot = match args.action {
-            JobAction::Poll => self.sandbox.background_job_snapshot(id),
-            JobAction::Stop => self.sandbox.stop_background_job(id).await,
-            JobAction::Wait => {
-                self.sandbox
-                    .wait_background_job(
-                        id,
-                        std::time::Duration::from_millis(args.timeout_ms.unwrap_or(10_000)),
-                    )
+        match args.action {
+            JobAction::Poll => self.sandbox.background_job_snapshot(id).map(drop),
+            JobAction::Stop => self.sandbox.stop_background_job(id).await.map(drop),
+            JobAction::Wait => self
+                .sandbox
+                .wait_background_job(
+                    id,
+                    std::time::Duration::from_millis(args.timeout_ms.unwrap_or(10_000)),
+                )
+                .await
+                .map(drop),
+            JobAction::Input => {
+                let input = args.input.as_deref().unwrap_or_default();
+                match self
+                    .sandbox
+                    .write_background_job_input(id, input.as_bytes())
                     .await
+                {
+                    Ok(()) => {
+                        // Give the program a moment to echo and answer.
+                        let _ = self
+                            .sandbox
+                            .wait_background_job(id, std::time::Duration::from_millis(200))
+                            .await;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             }
             JobAction::List => unreachable!("list returned before id lookup"),
         }
         .map_err(ToolError::Msg)?;
-        Ok(render_background_job(snapshot, self.max_output_lines))
+        let output = self
+            .sandbox
+            .read_background_job_output(id, args.since, JOB_OUTPUT_READ_BYTES)
+            .map_err(ToolError::Msg)?;
+        Ok(render_background_job(output, self.max_output_lines))
     }
 }
 
@@ -552,24 +856,6 @@ impl Tool for JobStatusTool {
 /// Rust type. The model-visible tool name is always `shell`.
 #[cfg(test)]
 pub type BashTool = ShellTool;
-
-fn render_streams(stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout);
-    let stderr = String::from_utf8_lossy(stderr);
-    let mut result = String::with_capacity(stdout.len() + stderr.len() + 20);
-    if !stdout.is_empty() {
-        result.push_str("[stdout]\n");
-        result.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !result.is_empty() && !result.ends_with('\n') {
-            result.push('\n');
-        }
-        result.push_str("[stderr]\n");
-        result.push_str(&stderr);
-    }
-    result
-}
 
 fn render_termination(status: Option<std::process::ExitStatus>) -> Option<String> {
     let status = status?;
@@ -592,7 +878,11 @@ fn render_termination(status: Option<std::process::ExitStatus>) -> Option<String
     Some("Process terminated without an exit code".to_string())
 }
 
-fn render_background_job(snapshot: BackgroundJobSnapshot, max_output_lines: Option<u64>) -> String {
+/// Bytes of new job output one `job_status` call returns.
+const JOB_OUTPUT_READ_BYTES: usize = 64 * 1024;
+
+fn render_background_job(output: BackgroundJobOutput, max_output_lines: Option<u64>) -> String {
+    let snapshot = &output.snapshot;
     let mut result = format!(
         "Job: {}\nStatus: {}\nCommand: {}",
         snapshot.id,
@@ -607,14 +897,47 @@ fn render_background_job(snapshot: BackgroundJobSnapshot, max_output_lines: Opti
             "\nContainment warning: descendants escaped process-group cleanup; direct command result preserved",
         );
     }
-    let output = bound_output_lines(
-        render_streams(&snapshot.stdout, &snapshot.stderr),
-        max_output_lines,
-    );
-    if !output.is_empty() {
-        result.push_str("\nOutput:\n");
-        result.push_str(&output);
+    let transcript = &snapshot.transcript;
+    if let Some(log) = &transcript.log {
+        let state = if log.complete {
+            ""
+        } else {
+            " (log size limit reached; later output is not logged)"
+        };
+        result.push_str(&format!("\nLog: {}{state}", log.path.display()));
+    } else if let Some(error) = &transcript.log_error {
+        result.push_str(&format!("\nLog: unavailable ({error})"));
     }
+    let total = transcript.total_bytes;
+    let window = &output.window;
+    if window.start == window.next {
+        result.push_str(&format!(
+            "\nNo new output (total {total} bytes; pass since=0 to re-read from the start)."
+        ));
+        return result;
+    }
+    let mut text = String::from_utf8_lossy(&window.head).into_owned();
+    if window.skipped > 0 {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let resume = window.start + window.head.len() as u64;
+        let hint = if transcript.log.is_some() {
+            format!("read the log or pass since={resume} to page through them")
+        } else {
+            "they were not retained and no log is configured".to_string()
+        };
+        text.push_str(&format!(
+            "[... {} bytes skipped; {hint} ...]\n",
+            window.skipped
+        ));
+    }
+    text.push_str(&String::from_utf8_lossy(&window.tail));
+    result.push_str(&format!(
+        "\nOutput (bytes {}..{} of {total}; next poll continues at since={}):\n",
+        window.start, window.next, window.next
+    ));
+    result.push_str(&bound_output_lines(text, max_output_lines));
     result
 }
 
@@ -641,11 +964,12 @@ fn bound_output_lines(text: String, max_output_lines: Option<u64>) -> String {
 }
 
 fn resource_limit_error(
-    output: CommandOutput,
+    status: CommandStatus,
+    transcript: &OutputTranscript,
     limits: CommandLimits,
     max_output_lines: Option<u64>,
 ) -> ToolError {
-    let metadata = match output.status {
+    let metadata = match status {
         CommandStatus::TimedOut => format!(
             "[status: timed_out; timeout_ms: {}]",
             limits.timeout.as_millis()
@@ -657,15 +981,15 @@ fn resource_limit_error(
                 CommandOutputLimit::Stderr => ("stderr", limits.stderr_bytes),
                 CommandOutputLimit::Combined => ("combined", limits.combined_bytes),
             };
-            format!("[status: output_truncated; limit: {name}; byte_cap: {bytes}]")
+            format!(
+                "[status: output_truncated; limit: {name}; byte_cap: {bytes}; the command was stopped because its total output reached this hard ceiling]"
+            )
         }
         CommandStatus::Failed => "[status: failed]".to_string(),
         CommandStatus::Completed => unreachable!("completed output is handled before this helper"),
     };
-    let partial = bound_output_lines(
-        render_streams(&output.stdout, &output.stderr),
-        max_output_lines,
-    );
+    let mut partial = bound_output_lines(render_transcript(transcript), max_output_lines);
+    push_log_footer(&mut partial, transcript);
     let message = if partial.is_empty() {
         metadata
     } else {
@@ -674,6 +998,77 @@ fn resource_limit_error(
         )
     };
     ToolError::Msg(message)
+}
+
+/// Render a spooled transcript in arrival order. A `[stdout]`/`[stderr]`
+/// label starts each run of one separately captured stream; merged
+/// (`2>&1`/pty) output is unlabelled. The dropped middle is marked in place.
+fn render_transcript(transcript: &OutputTranscript) -> String {
+    let mut result = String::new();
+    let mut current: Option<OutputChannel> = None;
+    for part in &transcript.parts {
+        match part {
+            TranscriptPart::Output(channel, bytes) => {
+                if current != Some(*channel) {
+                    let label = match channel {
+                        OutputChannel::Stdout => Some("[stdout]\n"),
+                        OutputChannel::Stderr => Some("[stderr]\n"),
+                        OutputChannel::Merged => None,
+                    };
+                    if let Some(label) = label {
+                        if !result.is_empty() && !result.ends_with('\n') {
+                            result.push('\n');
+                        }
+                        result.push_str(label);
+                    }
+                    current = Some(*channel);
+                }
+                result.push_str(&String::from_utf8_lossy(bytes));
+            }
+            TranscriptPart::Omitted(bytes) => {
+                if !result.is_empty() && !result.ends_with('\n') {
+                    result.push('\n');
+                }
+                result.push_str(&format!(
+                    "[... {bytes} bytes of output omitted between the retained head and tail ...]\n"
+                ));
+            }
+        }
+    }
+    result
+}
+
+/// Tell the model where the complete output lives when bytes were dropped,
+/// or that it could not be saved.
+fn push_log_footer(result: &mut String, transcript: &OutputTranscript) {
+    let footer = if let Some(log) = &transcript.log {
+        let completeness = if log.complete {
+            "complete output"
+        } else {
+            "output up to the log size limit"
+        };
+        format!(
+            "[{} bytes of output in total; {completeness} ({} bytes) saved to {}; use read with offset/limit or character_offset, or grep, to inspect it]",
+            transcript.total_bytes,
+            log.bytes,
+            log.path.display()
+        )
+    } else if transcript.omitted_bytes > 0 {
+        let reason = transcript.log_error.as_deref().map_or_else(
+            || "no output log is configured".to_string(),
+            |error| format!("the output log could not be written: {error}"),
+        );
+        format!(
+            "[{} bytes of output in total; the omitted middle is not recoverable because {reason}; re-run with a narrower invocation or redirect to a file]",
+            transcript.total_bytes
+        )
+    } else {
+        return;
+    };
+    if !result.is_empty() && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(&footer);
 }
 
 #[cfg(test)]
@@ -696,6 +1091,7 @@ mod tests {
             command: command.to_string(),
             timeout: None,
             background: false,
+            ..Default::default()
         };
         let plain = tool.execute(args()).await.unwrap().0;
 
@@ -848,6 +1244,7 @@ mod tests {
                     ),
                     timeout: Some(30_000),
                     background: true,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -859,7 +1256,11 @@ mod tests {
                         .sandbox
                         .background_job_snapshot(&fixture.id)
                         .unwrap();
-                    if String::from_utf8_lossy(&snapshot.stdout).contains("JOB_READY") {
+                    if String::from_utf8_lossy(
+                        &snapshot.transcript.channel_bytes(OutputChannel::Stdout),
+                    )
+                    .contains("JOB_READY")
+                    {
                         break;
                     }
                     assert!(
@@ -891,6 +1292,7 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.gate.release();
             self.shell.sandbox.kill_active();
+            self.shell.sandbox.cancel_background_jobs();
         }
     }
 
@@ -910,6 +1312,7 @@ mod tests {
                 ),
                 timeout: None,
                 background: false,
+                ..Default::default()
             }),
         )
         .await
@@ -944,6 +1347,7 @@ mod tests {
                 command: "printf CONFIGURED_DEADLINE".into(),
                 timeout: Some(60_001),
                 background: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -952,7 +1356,8 @@ mod tests {
             tool.call(BashArgs {
                 command: "must-not-execute".into(),
                 timeout: Some(600_001),
-                background: false
+                background: false,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -969,7 +1374,9 @@ mod tests {
                 tool.call(JobStatusArgs {
                     id: None,
                     action,
-                    timeout_ms: None
+                    timeout_ms: None,
+                    since: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err()
@@ -987,7 +1394,9 @@ mod tests {
                 tool.call(JobStatusArgs {
                     id: Some("not-a-job-id".into()),
                     action,
-                    timeout_ms: Some(timeout_ms)
+                    timeout_ms: Some(timeout_ms),
+                    since: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err()
@@ -999,7 +1408,9 @@ mod tests {
             tool.call(JobStatusArgs {
                 id: Some("ignored-id".into()),
                 action: JobAction::List,
-                timeout_ms: None
+                timeout_ms: None,
+                since: None,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1023,6 +1434,8 @@ mod tests {
             id: Some(fixture.id.clone()),
             action: JobAction::Wait,
             timeout_ms: Some(60_000),
+            since: None,
+            ..Default::default()
         });
         tokio::pin!(wait);
         assert!(
@@ -1033,6 +1446,8 @@ mod tests {
             id: Some(fixture.id.clone()),
             action: JobAction::Wait,
             timeout_ms: Some(60_000),
+            since: None,
+            ..Default::default()
         });
         tokio::pin!(sibling_wait);
         assert!(futures::poll!(sibling_wait.as_mut()).is_pending());
@@ -1064,6 +1479,8 @@ mod tests {
                 id: None,
                 action: JobAction::List,
                 timeout_ms: None,
+                since: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1081,7 +1498,9 @@ mod tests {
                 .call(JobStatusArgs {
                     id: None,
                     action: JobAction::List,
-                    timeout_ms: None
+                    timeout_ms: None,
+                    since: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap(),
@@ -1100,6 +1519,8 @@ mod tests {
                 id: Some(fixture.id.clone()),
                 action: JobAction::Wait,
                 timeout_ms: Some(60_000),
+                since: None,
+                ..Default::default()
             });
             tokio::pin!(wait);
             assert!(futures::poll!(wait.as_mut()).is_pending());
@@ -1110,6 +1531,8 @@ mod tests {
                 id: Some(fixture.id.clone()),
                 action: JobAction::Wait,
                 timeout_ms: Some(25),
+                since: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1171,7 +1594,9 @@ mod tests {
                 .call(JobStatusArgs {
                     id: Some(id.to_string()),
                     timeout_ms: None,
+                    since: Some(0),
                     action: JobAction::Poll,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -1201,6 +1626,7 @@ mod tests {
                 command: "while :; do :; done".to_string(),
                 timeout: Some(100),
                 background: false,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1220,6 +1646,7 @@ mod tests {
                         command: "printf must-not-run".into(),
                         timeout: Some(timeout),
                         background,
+                        ..Default::default()
                     })
                     .await
                     .unwrap_err()
@@ -1238,6 +1665,7 @@ mod tests {
                 command: "printf should-not-run".to_string(),
                 timeout: Some(0),
                 background: false,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1271,6 +1699,7 @@ mod tests {
                     command,
                     timeout: Some(timeout_ms),
                     background: false,
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err()
@@ -1312,6 +1741,7 @@ mod tests {
                     command,
                     timeout: None,
                     background: false,
+                    ..Default::default()
                 })
                 .await
         });
@@ -1390,13 +1820,21 @@ mod tests {
         let output = test_tool()
             .call(BashArgs {
                 command: "printf stdout; printf stderr >&2; exit 7".to_string(),
-                timeout: None,
-                background: false,
+                separate_streams: true,
+                ..Default::default()
             })
             .await
             .unwrap();
 
         assert_eq!(output, "[stdout]\nstdout\n[stderr]\nstderr\nExit code: 7");
+        let merged = test_tool()
+            .call(BashArgs {
+                command: "printf stdout; printf stderr >&2; exit 7".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(merged, "stdoutstderr\nExit code: 7");
     }
 
     #[cfg(unix)]
@@ -1407,6 +1845,7 @@ mod tests {
                 command: "printf 'one\\ntwo\\nthree\\n'; exit 9".to_string(),
                 timeout: None,
                 background: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1436,6 +1875,7 @@ mod tests {
                 command: "printf start; sleep 0.2; printf end >&2; exit 7".to_string(),
                 timeout: Some(2_000),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1447,7 +1887,9 @@ mod tests {
                 .call(JobStatusArgs {
                     id: Some(id.clone()),
                     timeout_ms: None,
+                    since: None,
                     action: JobAction::Poll,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -1487,6 +1929,7 @@ mod tests {
                 command,
                 timeout: None,
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1498,7 +1941,9 @@ mod tests {
             .call(JobStatusArgs {
                 id: Some(id),
                 timeout_ms: None,
+                since: None,
                 action: JobAction::Stop,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1517,6 +1962,7 @@ mod tests {
                 command: "seq 1 50000".to_string(),
                 timeout: Some(2_000),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1525,8 +1971,480 @@ mod tests {
         assert!(terminal.contains("Status: completed"), "{terminal}");
         assert!(terminal.contains("1\n2\n"), "{terminal}");
         assert!(terminal.contains("50000"), "{terminal}");
-        assert!(terminal.contains("stdout bytes omitted"), "{terminal}");
+        assert!(terminal.contains("bytes skipped"), "{terminal}");
         assert!(terminal.len() < 70 * 1024, "rolling output was not bounded");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_turn_keeps_jobs_and_dropping_the_session_sandbox_reaps_them() {
+        let pid_file =
+            std::env::temp_dir().join(format!("mini-agent-session-job-{}", uuid::Uuid::new_v4()));
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: format!(
+                    "echo $$ > {}; while :; do sleep 1; done",
+                    shell_quote(&pid_file)
+                ),
+                timeout: Some(60_000),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        wait_for_nonempty_file(&pid_file).await;
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Esc / ACP cancel: foreground groups die, the job does not.
+        shell.sandbox.kill_active();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            process_exists(pid),
+            "turn interruption killed a background job"
+        );
+        let listed = status
+            .call(JobStatusArgs {
+                action: JobAction::List,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(listed.contains(&format!("{id}: running")), "{listed}");
+        // Session end: the last sandbox clone cancels and reaps the job tree.
+        drop(status);
+        drop(shell);
+        wait_for_process_exit(pid).await;
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_background_promotes_a_command_at_its_deadline_and_keeps_its_output() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = Instant::now();
+        let promoted = shell
+            .call(BashArgs {
+                command: "printf 'begin-%s\\n' ok; sleep 2; printf 'finish-%s\\n' ok".to_string(),
+                timeout: Some(500),
+                auto_background: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("promotion is not an error");
+        assert!(
+            started.elapsed() < Duration::from_millis(1800),
+            "did not return at the deadline"
+        );
+        assert!(
+            promoted.contains("[status: promoted_to_background; job_id: job-"),
+            "{promoted}"
+        );
+        assert!(promoted.contains("begin-ok"), "{promoted}");
+        let id = promoted
+            .split("job_id: ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .unwrap()
+            .to_string();
+        let finished = status
+            .call(JobStatusArgs {
+                id: Some(id.clone()),
+                action: JobAction::Wait,
+                timeout_ms: Some(10_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(finished.contains("Status: completed"), "{finished}");
+        assert!(finished.contains("finish-ok"), "{finished}");
+        assert!(
+            !finished.contains("begin-ok"),
+            "only new output after promotion: {finished}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_background_command_finishing_in_time_reads_like_a_foreground_result() {
+        let shell = test_tool();
+        let output = shell
+            .call(BashArgs {
+                command: "printf quick; exit 4".to_string(),
+                auto_background: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(output, "quick\nExit code: 4");
+        assert!(
+            shell.sandbox.background_job_summaries().is_empty(),
+            "record not dropped"
+        );
+        // Without the flag the deadline still kills the command.
+        let error = shell
+            .call(BashArgs {
+                command: "sleep 5".to_string(),
+                timeout: Some(300),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("[status: timed_out"), "{error}");
+        // The configured default applies when the call does not say.
+        let configured = test_tool().with_auto_background(true);
+        let promoted = configured
+            .call(BashArgs {
+                command: "sleep 2".to_string(),
+                timeout: Some(300),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(promoted.contains("promoted_to_background"), "{promoted}");
+        configured.sandbox.cancel_background_jobs();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_an_auto_background_call_before_its_deadline_stops_the_job() {
+        let shell = test_tool();
+        let call = shell.call(BashArgs {
+            command: "sleep 30".to_string(),
+            auto_background: Some(true),
+            ..Default::default()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), call)
+                .await
+                .is_err()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let jobs = shell.sandbox.background_job_summaries();
+            assert_eq!(jobs.len(), 1);
+            if jobs[0].status.is_terminal() {
+                assert_eq!(jobs[0].status.as_str(), "cancelled");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "interrupted call left its job running"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn command_timeout_secs_sets_the_bang_command_deadline_within_bounds() {
+        crate::sandbox::set_command_timeout_secs(45);
+        assert_eq!(
+            crate::sandbox::configured_command_limits().timeout,
+            Duration::from_secs(45)
+        );
+        crate::sandbox::set_command_timeout_secs(100_000);
+        assert_eq!(
+            crate::sandbox::configured_command_limits().timeout,
+            Duration::from_secs(600)
+        );
+        crate::sandbox::set_command_timeout_secs(30);
+        assert_eq!(
+            crate::sandbox::configured_command_limits().stdout_bytes,
+            DEFAULT_COMMAND_LIMITS.stdout_bytes
+        );
+    }
+
+    async fn poll_job(status: &JobStatusTool, id: &str, since: Option<u64>) -> String {
+        status
+            .call(JobStatusArgs {
+                id: Some(id.to_string()),
+                timeout_ms: None,
+                since,
+                action: JobAction::Poll,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_polls_return_only_new_output_and_since_rereads() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command:
+                    "printf 'first-%s\\n' chunk; sleep 0.4; printf 'second-%s\\n' chunk; sleep 0.4"
+                        .to_string(),
+                timeout: Some(5_000),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let first = loop {
+            let output = poll_job(&status, &id, None).await;
+            if output.contains("first-chunk") {
+                break output;
+            }
+            assert!(Instant::now() < deadline, "first chunk never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(!first.contains("second-chunk"), "{first}");
+        assert!(first.contains("next poll continues at since=12"), "{first}");
+        let second = loop {
+            let output = poll_job(&status, &id, None).await;
+            if output.contains("second-chunk") {
+                break output;
+            }
+            assert!(
+                !output.contains("first-chunk"),
+                "repeated old output: {output}"
+            );
+            assert!(Instant::now() < deadline, "second chunk never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(!second.contains("first-chunk"), "{second}");
+        assert!(second.contains("bytes 12..25 of 25"), "{second}");
+        let again = poll_job(&status, &id, Some(0)).await;
+        assert!(again.contains("first-chunk\nsecond-chunk"), "{again}");
+        let terminal = wait_for_terminal_job(&status, &id).await;
+        assert!(terminal.contains("Status: completed"), "{terminal}");
+        assert!(poll_job(&status, &id, None).await.contains("No new output"));
+    }
+
+    async fn job_input(status: &JobStatusTool, id: &str, input: &str) -> Result<String, ToolError> {
+        status
+            .call(JobStatusArgs {
+                id: Some(id.to_string()),
+                action: JobAction::Input,
+                input: Some(input.to_string()),
+                ..Default::default()
+            })
+            .await
+    }
+
+    /// Drive an interactive program in a `pty = true` job: one line of input,
+    /// an answer that only the program (not the echo) can contain, then exit.
+    async fn run_pty_repl(shell: BashTool, program: &str, line: &str, answer: &str, exit: &str) {
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: program.to_string(),
+                timeout: Some(20_000),
+                background: true,
+                pty: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        let mut seen = job_input(&status, &id, line).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !seen.contains(answer) {
+            assert!(Instant::now() < deadline, "program never answered: {seen}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen.push_str(&poll_job(&status, &id, None).await);
+        }
+        job_input(&status, &id, exit).await.unwrap();
+        let terminal = wait_for_terminal_job(&status, &id).await;
+        assert!(terminal.contains("Status: completed"), "{terminal}");
+        assert!(terminal.contains("Exit code: 0"), "{terminal}");
+        // A finished job no longer accepts input.
+        let error = job_input(&status, &id, "1\n").await.unwrap_err();
+        assert!(error.to_string().contains("already finished"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_background_job_drives_an_interactive_repl_through_job_status_input() {
+        run_pty_repl(
+            test_tool(),
+            "python3 -i -q",
+            "import os; print('tty', os.isatty(0), os.isatty(1), 1+1)\n",
+            "tty True True 2",
+            "exit()\n",
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn pty_background_job_works_inside_the_real_seatbelt_sandbox() {
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        if !crate::sandbox::seatbelt_exists() {
+            crate::sandbox::skip_unusable_real_sandbox_test("Seatbelt is unavailable");
+            return;
+        }
+        let workspace = std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let sandbox = Sandbox::new(true, "seatbelt").with_workspace_binding(workspace);
+        run_pty_repl(
+            BashTool::new(None, None, sandbox, None),
+            "sh -i",
+            "test -t 0 && test -t 1 && echo tty-$((1+1))-ok\n",
+            "tty-2-ok",
+            "exit 0\n",
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_foreground_command_sees_a_terminal_and_default_commands_do_not() {
+        let tool = test_tool();
+        let probe = "if test -t 0 && test -t 1 && test -t 2; then echo is-$((1+1))-tty; else echo no-$((1+1))-tty; fi";
+        let pty = tool
+            .call(BashArgs {
+                command: probe.to_string(),
+                pty: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(pty.contains("is-2-tty"), "{pty}");
+        assert!(
+            !pty.contains("[stdout]"),
+            "pty output is one merged stream: {pty}"
+        );
+        let plain = tool
+            .call(BashArgs {
+                command: probe.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(plain.contains("no-2-tty"), "{plain}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_input_requires_a_pty_job_and_is_size_bounded() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: "sleep 5".to_string(),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        let error = job_input(&status, &id, "hello\n").await.unwrap_err();
+        assert!(error.to_string().contains("pty=true"), "{error}");
+        let error = job_input(&status, &id, &"x".repeat(16 * 1024 + 1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("16384 bytes"), "{error}");
+        let error = status
+            .call(JobStatusArgs {
+                id: Some(id.clone()),
+                action: JobAction::Poll,
+                input: Some("x".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("only valid with, action=input"),
+            "{error}"
+        );
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_output_is_fully_recoverable_from_its_private_log() {
+        let dir = crate::tests::support::temp::TempDir::new("job-log");
+        let logs = dir.path().join("logs");
+        let shell = test_tool().with_output_log_dir(Some(logs.clone()));
+        let status = JobStatusTool::new(shell.sandbox.clone(), Some(40));
+        let started = shell
+            .call(BashArgs {
+                command: "yes 0123456789abcde | head -c 10485760".to_string(),
+                timeout: Some(20_000),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        let log_path = logs.join(format!("shell-{id}.log"));
+        assert!(
+            started.contains(&log_path.display().to_string()),
+            "{started}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let terminal = loop {
+            let output = poll_job(&status, &id, Some(0)).await;
+            if output.contains("Status: completed") {
+                break output;
+            }
+            assert!(Instant::now() < deadline, "job did not finish");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            terminal.contains(&format!("Log: {}", log_path.display())),
+            "{terminal}"
+        );
+        let log = std::fs::read(&log_path).unwrap();
+        assert_eq!(log.len(), 10_485_760);
+        assert!(log.starts_with(b"0123456789abcde\n0123456789abcde\n"));
+        // A middle range the in-memory head/tail dropped is served by the log.
+        let middle = poll_job(&status, &id, Some(5_000_000)).await;
+        assert!(middle.contains("bytes 5000000.."), "{middle}");
+        assert!(middle.contains("0123456789abcde"), "{middle}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pruned_background_jobs_keep_their_log_path() {
+        let dir = crate::tests::support::temp::TempDir::new("job-prune");
+        let logs = dir.path().join("logs");
+        let shell = test_tool().with_output_log_dir(Some(logs.clone()));
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let mut first = None;
+        for index in 0..34 {
+            let started = shell
+                .call(BashArgs {
+                    command: format!("printf 'job-{index}'"),
+                    timeout: Some(5_000),
+                    background: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let id = background_id(&started);
+            wait_for_terminal_job(&status, &id).await;
+            first.get_or_insert(id);
+        }
+        let first = first.unwrap();
+        let error = status
+            .call(JobStatusArgs {
+                id: Some(first.clone()),
+                timeout_ms: None,
+                since: None,
+                action: JobAction::Poll,
+                ..Default::default()
+            })
+            .await
+            .expect_err("the oldest record is pruned");
+        let message = error.to_string();
+        assert!(message.contains("pruned"), "{message}");
+        let path = logs.join(format!("shell-{first}.log"));
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert_eq!(std::fs::read(path).unwrap(), b"job-0");
     }
 
     #[cfg(unix)]
@@ -1539,6 +2457,7 @@ mod tests {
                 command: "sleep 1".to_string(),
                 timeout: Some(50),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1557,7 +2476,9 @@ mod tests {
             .call(JobStatusArgs {
                 id: Some(id.clone()),
                 timeout_ms: None,
+                since: None,
                 action: JobAction::Poll,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1568,7 +2489,9 @@ mod tests {
             .call(JobStatusArgs {
                 id: Some("x".repeat(128 * 1024)),
                 timeout_ms: None,
+                since: None,
                 action: JobAction::Poll,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1586,6 +2509,7 @@ mod tests {
                 command: "exit 0".to_string(),
                 timeout: Some(1_000),
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1597,7 +2521,9 @@ mod tests {
             .call(JobStatusArgs {
                 id: Some(id),
                 timeout_ms: None,
+                since: None,
                 action: JobAction::Stop,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1616,6 +2542,7 @@ mod tests {
                     command: "while :; do sleep 1; done".to_string(),
                     timeout: None,
                     background: true,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -1628,6 +2555,7 @@ mod tests {
                 command: "exit 0".to_string(),
                 timeout: None,
                 background: true,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -1637,7 +2565,14 @@ mod tests {
             "background job capacity is full (maximum 8 running jobs)"
         );
 
+        // Interrupting a turn kills foreground groups only; jobs survive.
         shell.sandbox.kill_active();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(shell.sandbox.running_background_job_count(), 8);
+        for summary in shell.sandbox.background_job_summaries() {
+            assert_eq!(summary.status.as_str(), "running");
+        }
+        shell.sandbox.cancel_background_jobs();
         for id in ids {
             let terminal = wait_for_terminal_job(&status, &id).await;
             assert!(terminal.contains("Status: cancelled"), "{terminal}");
@@ -1696,6 +2631,7 @@ mod foreground_metadata_tests {
                     command: command.into(),
                     timeout: None,
                     background: false,
+                    ..Default::default()
                 },
                 &extensions,
             )
@@ -1724,6 +2660,7 @@ mod foreground_metadata_tests {
                 command: "head -c 65537 /dev/zero | tr '\\000' x".into(),
                 timeout: None,
                 background: false,
+                ..Default::default()
             },
             &extensions,
         )
@@ -1738,6 +2675,7 @@ mod foreground_metadata_tests {
                 command: "printf 'https://never-claimed.invalid/pull/1\\n'; sleep 5".into(),
                 timeout: Some(30),
                 background: false,
+                ..Default::default()
             },
             &extensions,
         )
@@ -1757,6 +2695,7 @@ mod foreground_metadata_tests {
                 command: "printf BACKGROUND32".into(),
                 timeout: None,
                 background: true,
+                ..Default::default()
             },
             &ToolCallExtensions::default(),
         )

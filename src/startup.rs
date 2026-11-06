@@ -9,7 +9,7 @@ use crate::paths::AppPaths;
 use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::PermCheck;
 use crate::provider::{self, AnyClient};
-use crate::sandbox::{DEFAULT_COMMAND_LIMITS, Sandbox, SandboxPolicy};
+use crate::sandbox::{Sandbox, SandboxPolicy};
 use crate::session::{self, Session};
 
 // ── Helper functions ─────────────────────────────────────────────────────
@@ -2364,12 +2364,13 @@ impl Startup {
                 .is_some_and(|command| !command.trim().is_empty())
             {
                 let change_baseline = join_change_baseline(baseline_task).await;
-                let run = crate::print::run_headless_command(
-                    self.sandbox
-                        .clone()
-                        .run_explicit_shell(&msg, DEFAULT_COMMAND_LIMITS, None),
-                )
-                .await?;
+                let run =
+                    crate::print::run_headless_command(self.sandbox.clone().run_explicit_shell(
+                        &msg,
+                        crate::sandbox::configured_command_limits(),
+                        None,
+                    ))
+                    .await?;
                 let result = run.rendered_output();
                 let json_context = if json_output {
                     let files_changed = crate::print::files_changed_since(

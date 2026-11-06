@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounds of the configurable `js-step-timeout-secs` (default [`STEP_TIMEOUT`]).
+pub const MIN_STEP_TIMEOUT_SECS: u64 = 1;
+pub const MAX_STEP_TIMEOUT_SECS: u64 = 300;
 pub const MEMORY_LIMIT: usize = 64 * 1024 * 1024; // 64 MiB
 pub const STACK_LIMIT: usize = 512 * 1024; // 512 KiB JS stack
 pub const READ_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB

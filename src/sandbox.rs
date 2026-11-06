@@ -20,6 +20,15 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod general_profile;
+#[cfg(test)]
+mod network_tests;
+mod output_capture;
+#[cfg(unix)]
+pub(crate) mod pty;
+pub(crate) use output_capture::{
+    OutputChannel, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy,
+    TranscriptPart,
+};
 mod git_metadata;
 mod read_roots;
 pub(crate) use read_roots::default_sandbox_read_roots;
@@ -297,6 +306,40 @@ impl SandboxProfile {
     }
 }
 
+/// Network reach of contained shell commands (`sandbox-network`). `Deny`
+/// is the default; `Allow` is an explicit, project-trust-gated opt-in that
+/// only changes network policy, never filesystem reach.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxNetwork {
+    #[default]
+    Deny,
+    Allow,
+}
+
+impl SandboxNetwork {
+    pub const NAMES: &'static [&'static str] = &["deny", "allow"];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Allow => "allow",
+        }
+    }
+
+    pub fn allows(self) -> bool {
+        self == Self::Allow
+    }
+}
+
+impl std::fmt::Display for SandboxNetwork {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
 impl std::fmt::Display for SandboxProfile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
@@ -379,6 +422,8 @@ impl ExecutionCommand {
 pub struct SandboxConfig {
     backend: String,
     profile: SandboxProfile,
+    /// `sandbox-network`: whether contained shell commands may use the network.
+    network: SandboxNetwork,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     /// Raw HOME-relative `sandbox-home-mounts` entries, validated at capture.
@@ -754,6 +799,27 @@ pub(crate) const DEFAULT_COMMAND_LIMITS: CommandLimits = CommandLimits {
     combined_bytes: 1536 * 1024,
 };
 
+/// Bounds of `command_timeout_secs`, the deadline of `!` commands and loop
+/// validation commands (default 30 s).
+pub(crate) const MAX_COMMAND_TIMEOUT_SECS: u64 = 600;
+static COMMAND_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(30);
+
+/// Set the process-wide `command_timeout_secs` (clamped to 1..=600).
+pub(crate) fn set_command_timeout_secs(seconds: u64) {
+    COMMAND_TIMEOUT_SECS.store(
+        seconds.clamp(1, MAX_COMMAND_TIMEOUT_SECS),
+        Ordering::Relaxed,
+    );
+}
+
+/// [`DEFAULT_COMMAND_LIMITS`] with the configured `command_timeout_secs`.
+pub(crate) fn configured_command_limits() -> CommandLimits {
+    CommandLimits {
+        timeout: std::time::Duration::from_secs(COMMAND_TIMEOUT_SECS.load(Ordering::Relaxed)),
+        ..DEFAULT_COMMAND_LIMITS
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandOutputLimit {
     Stdout,
@@ -785,7 +851,8 @@ pub(crate) struct CommandOutput {
 
 const MAX_CONCURRENT_BACKGROUND_JOBS: usize = 8;
 const MAX_RETAINED_BACKGROUND_JOBS: usize = 32;
-const BACKGROUND_STREAM_BYTES: usize = 64 * 1024;
+/// Pruned job ids whose log path stays discoverable through `job_status`.
+const MAX_PRUNED_BACKGROUND_LOGS: usize = 256;
 pub(crate) const MAX_BACKGROUND_JOB_WAIT_MILLIS: u64 = 60_000;
 pub(crate) const DEFAULT_BACKGROUND_COMMAND_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
@@ -825,9 +892,16 @@ pub(crate) struct BackgroundJobSnapshot {
     pub command: String,
     pub status: BackgroundJobStatus,
     pub exit_code: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
     pub descendants_escaped: bool,
+    /// Arrival-ordered retained output, total size and full-output log.
+    pub transcript: OutputTranscript,
+}
+
+/// A window of a background job's complete output stream.
+#[derive(Debug, Clone)]
+pub(crate) struct BackgroundJobOutput {
+    pub snapshot: BackgroundJobSnapshot,
+    pub window: OutputWindow,
 }
 
 #[derive(Debug, Clone)]
@@ -836,14 +910,13 @@ pub(crate) struct BackgroundJobSummary {
     pub command: String,
     pub status: BackgroundJobStatus,
     pub exit_code: Option<i32>,
+    pub log_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 struct BackgroundJobTerminal {
     status: BackgroundJobStatus,
     exit_code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
     descendants_escaped: bool,
 }
 
@@ -852,7 +925,14 @@ struct BackgroundJobRecord {
     sequence: u64,
     command: String,
     cancellation: CommandCancellation,
-    capture: Option<SharedCommandCapture>,
+    /// Spooled capture, retained after completion so polls can still read
+    /// by offset; its log (when configured) holds the complete stream.
+    capture: SharedCommandCapture,
+    log_path: Option<PathBuf>,
+    /// Offset up to which `poll`/`wait` already delivered output.
+    delivered: u64,
+    /// Terminal input of a `pty = true` job.
+    input: Option<BackgroundJobInput>,
     terminal: Option<BackgroundJobTerminal>,
     stop_requested: bool,
     changed: Arc<Notify>,
@@ -862,6 +942,11 @@ struct BackgroundJobRecord {
 struct BackgroundJobsInner {
     next_sequence: AtomicU64,
     jobs: Mutex<HashMap<String, BackgroundJobRecord>>,
+    /// Log paths of pruned records, newest last.
+    pruned_logs: Mutex<VecDeque<(String, PathBuf)>>,
+    /// Process groups of running jobs. Kept apart from the owning sandbox's
+    /// active groups so interrupting a turn (`kill_active`) leaves jobs alive.
+    process_groups: Arc<Mutex<HashSet<u32>>>,
     /// Records in `jobs` without a terminal state. Updated only while `jobs`
     /// is locked, so the redraw path can read it without the lock.
     running: AtomicUsize,
@@ -887,6 +972,41 @@ struct OutputCommandOptions {
     input: Option<Vec<u8>>,
     capture: Option<SharedCommandCapture>,
     progress: Option<CommandProgress>,
+    stdio: CommandStdio,
+}
+
+/// How a captured command's stdio is connected.
+#[derive(Debug, Default)]
+enum CommandStdio {
+    /// Separate stdout/stderr pipes (stdin null or caller input).
+    #[default]
+    Pipes,
+    /// One pseudo-terminal for stdin, stdout and stderr.
+    #[cfg(unix)]
+    Pty(pty::PtyPair),
+    /// One pipe for both stdout and stderr (`2>&1`), so the capture sees
+    /// output in exact write order.
+    #[cfg(unix)]
+    MergedPipe(MergedPipe),
+}
+
+/// Reader and the writer descriptor shared by the child's stdout and stderr.
+#[cfg(unix)]
+#[derive(Debug)]
+struct MergedPipe {
+    reader: tokio::net::unix::pipe::Receiver,
+    writer: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl MergedPipe {
+    fn open() -> std::io::Result<Self> {
+        let (sender, reader) = tokio::net::unix::pipe::pipe()?;
+        Ok(Self {
+            reader,
+            writer: sender.into_blocking_fd()?,
+        })
+    }
 }
 
 /// Bytes of recent output a [`CommandProgress`] keeps for display.
@@ -2268,6 +2388,25 @@ impl Sandbox {
         self.with_general_profile(profile, reads, writes)
     }
 
+    /// `sandbox-network`: let contained shell commands reach the network.
+    /// Hooks, workspace services and brokered JS `spawn` keep their own
+    /// (denied) network policy.
+    pub fn with_network(mut self, network: SandboxNetwork) -> Self {
+        self.network = network;
+        self.cached_seatbelt_profiles = Arc::new(Mutex::new(SeatbeltProfileMap::default()));
+        self
+    }
+
+    pub fn network(&self) -> SandboxNetwork {
+        self.network
+    }
+
+    /// Whether contained shell commands can actually reach the network: the
+    /// opt-in is set, containment is active, and the backend honours it.
+    pub fn shell_network_effective(&self) -> bool {
+        self.network.allows() && matches!(self.backend.as_str(), "bwrap" | "seatbelt")
+    }
+
     /// HOME-relative `sandbox-home-mounts` (read-only, or writable with a
     /// `:rw` suffix) and `sandbox-home-masks` (added to the built-in private
     /// masks). Entries are validated, fail closed, when roots are captured.
@@ -2426,6 +2565,7 @@ impl Sandbox {
             config: Arc::new(SandboxConfig {
                 backend: backend.to_string(),
                 profile: SandboxProfile::Workspace,
+                network: SandboxNetwork::Deny,
                 read_roots: Vec::new(),
                 write_roots: Vec::new(),
                 home_mounts: Vec::new(),
@@ -2754,6 +2894,10 @@ impl Sandbox {
                 requested_network_policy: "backend-defined; mini-agent makes no network-isolation claim",
             },
         };
+        if policy == SandboxPolicy::RequiredAndAvailable && self.shell_network_effective() {
+            matrix.network = "shell commands may use the host network (sandbox-network = allow); hooks, workspace services and JS spawn remain denied";
+            matrix.requested_network_policy = "allow for shell commands (sandbox-network opt-in)";
+        }
         if policy == SandboxPolicy::RequiredAndAvailable
             && matches!(self.backend.as_str(), "bwrap" | "seatbelt")
         {
@@ -4085,7 +4229,8 @@ impl Sandbox {
         cache_dir: &Path,
         launch: Option<&LaunchValidation>,
     ) -> Result<Command, String> {
-        let profile = self.get_seatbelt_profile_for_launch(cwd, cache_dir, true, launch)?;
+        let profile =
+            self.get_seatbelt_profile_for_launch(cwd, cache_dir, !self.network.allows(), launch)?;
 
         let mut cmd = Command::new(seatbelt);
         cmd.arg("-p").arg(profile.as_ref());
@@ -4120,10 +4265,19 @@ impl Sandbox {
         let mut cmd =
             self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata, read_roots)?;
         let sandbox_cwd = self.sandbox_cwd(cwd);
+        let deny_network = !self.network.allows();
+        if !deny_network && self.profile == SandboxProfile::Workspace {
+            // The workspace profile exposes only a synthetic /etc; resolver
+            // and CA configuration must be visible for the opt-in to work.
+            for path in BWRAP_NETWORK_ETC_FILES {
+                cmd.args(["--ro-bind-try", path, path]);
+            }
+        }
         append_bwrap_isolation(
             &mut cmd,
             &sandbox_cwd,
             self.profile != SandboxProfile::HostFull,
+            deny_network,
         );
         cmd.args(["--new-session", "--die-with-parent", "--"]);
         if self.workspace_binding.is_some() {
@@ -4170,10 +4324,12 @@ impl Sandbox {
         // descendant can inherit the snapshot descriptor.
         cmd.args(["--perms", "0500", "--ro-bind-data", "3", executable]);
         let sandbox_cwd = self.sandbox_cwd(cwd);
+        // Brokered JS spawn never inherits the shell network opt-in.
         append_bwrap_isolation(
             &mut cmd,
             &sandbox_cwd,
             self.profile != SandboxProfile::HostFull,
+            true,
         );
         cmd.args(["--new-session", "--die-with-parent", "--", executable]);
         cmd.args(arguments);
@@ -4452,10 +4608,26 @@ impl Sandbox {
         self.output_built_command_with_limits(cmd, limits).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_background_command(
         &self,
         command: String,
         timeout: std::time::Duration,
+    ) -> std::io::Result<String> {
+        self.start_background_command_logged(command, timeout, None, false, false, None)
+            .await
+    }
+
+    /// [`Self::start_background_command`] that spools the complete output
+    /// to a private log in `log_dir`, readable after the record is pruned.
+    pub(crate) async fn start_background_command_logged(
+        &self,
+        command: String,
+        timeout: std::time::Duration,
+        log_dir: Option<&Path>,
+        pty: bool,
+        separate_streams: bool,
+        progress: Option<CommandProgress>,
     ) -> std::io::Result<String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             std::io::Error::other("background commands require an active Tokio runtime")
@@ -4464,9 +4636,12 @@ impl Sandbox {
             .background_jobs
             .next_sequence
             .fetch_add(1, Ordering::Relaxed);
+        let stdio = shell_command_stdio(pty, separate_streams)?;
+        let input = background_input(&stdio);
         let id = format!("job-{}", uuid::Uuid::new_v4());
         let cancellation = CommandCancellation::new();
-        let capture = SharedCommandCapture::rolling();
+        let log_path = log_dir.map(|dir| dir.join(format!("shell-{id}.log")));
+        let capture = SharedCommandCapture::spooled(SpoolPolicy::background(log_path.clone()));
         let changed = Arc::new(Notify::new());
         {
             let mut jobs = self
@@ -4474,7 +4649,19 @@ impl Sandbox {
                 .jobs
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            prune_background_jobs(&mut jobs);
+            for (pruned, log) in prune_background_jobs(&mut jobs) {
+                if let Some(log) = log {
+                    let mut logs = self
+                        .background_jobs
+                        .pruned_logs
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    logs.push_back((pruned, log));
+                    while logs.len() > MAX_PRUNED_BACKGROUND_LOGS {
+                        logs.pop_front();
+                    }
+                }
+            }
             if self.background_jobs.running.load(Ordering::Acquire)
                 >= MAX_CONCURRENT_BACKGROUND_JOBS
             {
@@ -4488,7 +4675,10 @@ impl Sandbox {
                     sequence,
                     command: summarize_background_command(&command),
                     cancellation: cancellation.clone(),
-                    capture: Some(capture.clone()),
+                    capture: capture.clone(),
+                    log_path,
+                    delivered: 0,
+                    input,
                     terminal: None,
                     stop_requested: false,
                     changed,
@@ -4505,17 +4695,40 @@ impl Sandbox {
         let run = crate::spend::run::Run::current();
         std::mem::drop(runtime.spawn(crate::spend::run::scope(run, async move {
             let terminal = match sandbox
-                .run_background_command(command, timeout, &cancellation, capture)
+                .run_background_command(
+                    command,
+                    timeout,
+                    &cancellation,
+                    capture.clone(),
+                    stdio,
+                    progress,
+                )
                 .await
             {
-                Ok(output) => background_terminal(output),
-                Err(error) => BackgroundJobTerminal {
-                    status: BackgroundJobStatus::Failed,
-                    exit_code: None,
-                    stdout: Vec::new(),
-                    stderr: format!("background command failed: {error}").into_bytes(),
-                    descendants_escaped: false,
-                },
+                Ok(output) => {
+                    if output.status == CommandStatus::Failed && capture.total_bytes() == 0 {
+                        // Preparation/spawn failures report through stderr
+                        // without ever reaching the capture.
+                        let _ = capture.push(
+                            CommandOutputStream::Stderr,
+                            &output.stderr,
+                            DEFAULT_COMMAND_LIMITS,
+                        );
+                    }
+                    background_terminal(output)
+                }
+                Err(error) => {
+                    let _ = capture.push(
+                        CommandOutputStream::Stderr,
+                        format!("background command failed: {error}").as_bytes(),
+                        DEFAULT_COMMAND_LIMITS,
+                    );
+                    BackgroundJobTerminal {
+                        status: BackgroundJobStatus::Failed,
+                        exit_code: None,
+                        descendants_escaped: false,
+                    }
+                }
             };
             finish_background_job(&owner, &task_id, terminal);
         })));
@@ -4535,8 +4748,50 @@ impl Sandbox {
             .unwrap_or_else(|error| error.into_inner());
         let job = jobs
             .get(id)
-            .ok_or_else(|| format!("background job not found: {id}"))?;
+            .ok_or_else(|| self.missing_background_job(id))?;
         Ok(snapshot_background_job(id, job))
+    }
+
+    fn missing_background_job(&self, id: &str) -> String {
+        let logs = self
+            .background_jobs
+            .pruned_logs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match logs.iter().rev().find(|(pruned, _)| pruned == id) {
+            Some((_, log)) => format!(
+                "background job record was pruned (only the newest {MAX_RETAINED_BACKGROUND_JOBS} are kept); its complete output log remains at {}",
+                log.display()
+            ),
+            None => format!("background job not found: {id}"),
+        }
+    }
+
+    /// Read a window of a job's complete output. With `since = None` the
+    /// window starts where the previous `None` read ended, so consecutive
+    /// polls return only new output. Windows larger than `max` return their
+    /// first quarter and last three quarters around a reported gap.
+    pub(crate) fn read_background_job_output(
+        &self,
+        id: &str,
+        since: Option<u64>,
+        max: usize,
+    ) -> Result<BackgroundJobOutput, String> {
+        validate_background_job_id(id)?;
+        let mut jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let job = jobs
+            .get_mut(id)
+            .ok_or_else(|| self.missing_background_job(id))?;
+        let snapshot = snapshot_background_job(id, job);
+        let window = job.capture.read_window(since.unwrap_or(job.delivered), max);
+        if since.is_none() {
+            job.delivered = window.next;
+        }
+        Ok(BackgroundJobOutput { snapshot, window })
     }
 
     /// Request cancellation of this registry's exact job. The task and launch
@@ -4553,7 +4808,7 @@ impl Sandbox {
             .unwrap_or_else(|e| e.into_inner());
         let job = jobs
             .get_mut(id)
-            .ok_or_else(|| format!("background job not found: {id}"))?;
+            .ok_or_else(|| self.missing_background_job(id))?;
         if job.terminal.is_none() {
             job.stop_requested = true;
             job.cancellation.cancel();
@@ -4586,7 +4841,7 @@ impl Sandbox {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             jobs.get(id)
-                .ok_or_else(|| format!("background job not found: {id}"))?
+                .ok_or_else(|| self.missing_background_job(id))?
                 .changed
                 .clone()
         };
@@ -4607,6 +4862,50 @@ impl Sandbox {
             if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
                 return self.background_job_snapshot(id);
             }
+        }
+    }
+
+    /// Type `bytes` into a running `pty = true` job's terminal.
+    pub(crate) async fn write_background_job_input(
+        &self,
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        validate_background_job_id(id)?;
+        #[cfg(unix)]
+        if bytes.len() > pty::MAX_PTY_INPUT_BYTES {
+            return Err(format!(
+                "job_status input is limited to {} bytes per call",
+                pty::MAX_PTY_INPUT_BYTES
+            ));
+        }
+        let input = {
+            let jobs = self
+                .background_jobs
+                .jobs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let job = jobs
+                .get(id)
+                .ok_or_else(|| self.missing_background_job(id))?;
+            if job.terminal.is_some() {
+                return Err("background job has already finished; input was not sent".into());
+            }
+            job.input.clone().ok_or_else(|| {
+                "background job was not started with pty=true and has no terminal input".to_string()
+            })?
+        };
+        #[cfg(unix)]
+        {
+            input
+                .write_all(bytes)
+                .await
+                .map_err(|error| format!("failed to write job input: {error}"))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (input, bytes);
+            Err("pseudo-terminal input is not supported on this platform".into())
         }
     }
 
@@ -4637,6 +4936,7 @@ impl Sandbox {
                         command: job.command.clone(),
                         status,
                         exit_code: terminal.and_then(|terminal| terminal.exit_code),
+                        log_path: job.log_path.clone(),
                     },
                 )
             })
@@ -4654,7 +4954,39 @@ impl Sandbox {
     fn detached_background_sandbox(&self) -> Self {
         let mut sandbox = self.clone();
         sandbox.background_jobs = Arc::new(BackgroundJobsInner::default());
+        // Job trees register in the registry's own set, so `kill_active`
+        // (turn interruption) does not signal them; their per-job
+        // cancellation token and `cancel_background_jobs` still do.
+        sandbox.active_groups = self.background_jobs.process_groups.clone();
+        sandbox.cancelled_groups = Arc::new(Mutex::new(HashSet::new()));
         sandbox
+    }
+
+    /// Drop a finished job's record (its log file stays). Used when a command
+    /// that ran as a job finished within its foreground deadline.
+    pub(crate) fn forget_background_job(&self, id: &str) {
+        let mut jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if jobs.get(id).is_some_and(|job| job.terminal.is_some()) {
+            jobs.remove(id);
+        }
+    }
+
+    /// Stop every running background job: session shutdown and `/quit`.
+    /// Turn interruption deliberately does not call this.
+    pub(crate) fn cancel_background_jobs(&self) {
+        let mut jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for job in jobs.values_mut().filter(|job| job.terminal.is_none()) {
+            job.stop_requested = true;
+            job.cancellation.cancel();
+        }
     }
 
     async fn run_background_command(
@@ -4663,6 +4995,8 @@ impl Sandbox {
         timeout: std::time::Duration,
         cancellation: &CommandCancellation,
         capture: SharedCommandCapture,
+        stdio: CommandStdio,
+        progress: Option<CommandProgress>,
     ) -> std::io::Result<CommandOutput> {
         if cancellation.is_cancelled() {
             return Ok(CommandOutput {
@@ -4673,11 +5007,12 @@ impl Sandbox {
                 descendants_escaped: false,
             });
         }
+        // The spooled capture never stops a background job for volume.
         let limits = CommandLimits {
             timeout,
-            stdout_bytes: BACKGROUND_STREAM_BYTES,
-            stderr_bytes: BACKGROUND_STREAM_BYTES,
-            combined_bytes: BACKGROUND_STREAM_BYTES * 2,
+            stdout_bytes: usize::MAX,
+            stderr_bytes: usize::MAX,
+            combined_bytes: usize::MAX,
         };
         let (response_tx, response_rx) = oneshot::channel();
         self.run_built_output_command(
@@ -4688,7 +5023,8 @@ impl Sandbox {
                 audit: None,
                 input: None,
                 capture: Some(capture),
-                progress: None,
+                progress,
+                stdio,
             },
             response_tx,
         )
@@ -4717,27 +5053,48 @@ impl Sandbox {
             .await
     }
 
-    /// [`Self::output_command_with_limits`] that also publishes display-only
-    /// output progress. The returned output is identical to the variant
-    /// without progress.
-    pub(crate) async fn output_command_with_limits_and_progress(
+    /// Run a model-authored shell command into a caller-owned spooled
+    /// capture. Unlike the bounded capture, retention never stops the child:
+    /// only the policy's hard ceiling reports `OutputLimitExceeded`.
+    pub(crate) async fn output_shell_command_captured(
         &self,
         command: &str,
         limits: CommandLimits,
         progress: Option<CommandProgress>,
+        capture: &ShellOutputCapture,
+        pty: bool,
+        separate_streams: bool,
     ) -> std::io::Result<CommandOutput> {
-        self.output_pending_command_scoped(
-            PendingCommand::Shell {
-                command: command.to_string(),
-                cwd: None,
-            },
-            limits,
-            None,
-            None,
-            None,
-            progress,
-        )
-        .await
+        let stdio = shell_command_stdio(pty, separate_streams)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        let sandbox = self.clone();
+        let pending = PendingCommand::Shell {
+            command: command.to_string(),
+            cwd: None,
+        };
+        let capture = capture.0.clone();
+        std::mem::drop(crate::agent::runner::spawn_async_scoped(
+            crate::startup::heap_future(|| async move {
+                sandbox
+                    .run_built_output_command(
+                        pending,
+                        limits,
+                        OutputCommandOptions {
+                            cancellation: None,
+                            audit: None,
+                            input: None,
+                            capture: Some(capture),
+                            progress,
+                            stdio,
+                        },
+                        response_tx,
+                    )
+                    .await;
+            }),
+        ));
+        response_rx.await.map_err(|_| {
+            std::io::Error::other("command output worker stopped before returning a result")
+        })
     }
 
     async fn output_command_with_limits_scoped(
@@ -4868,6 +5225,7 @@ impl Sandbox {
                             input,
                             capture: None,
                             progress,
+                            stdio: CommandStdio::Pipes,
                         },
                         response_tx,
                     )
@@ -4972,6 +5330,7 @@ impl Sandbox {
             input,
             capture,
             progress,
+            stdio,
         } = options;
         let settle_early = |output: CommandOutput, response_tx: oneshot::Sender<CommandOutput>| {
             if let Some(audit) = &audit {
@@ -5061,6 +5420,50 @@ impl Sandbox {
             // Captured/model-authored commands never own the user's terminal.
             cmd.stdin(Stdio::null());
         }
+        #[cfg(unix)]
+        if let CommandStdio::MergedPipe(pipe) = &stdio {
+            match (pipe.writer.try_clone(), pipe.writer.try_clone()) {
+                (Ok(stdout), Ok(stderr)) => {
+                    cmd.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    settle_early(
+                        CommandOutput {
+                            exit_status: None,
+                            stdout: Vec::new(),
+                            stderr: format!("failed to prepare merged output pipe: {error}")
+                                .into_bytes(),
+                            status: CommandStatus::Failed,
+                            descendants_escaped: false,
+                        },
+                        response_tx,
+                    );
+                    return;
+                }
+            }
+        }
+        #[cfg(unix)]
+        if let CommandStdio::Pty(pair) = &stdio {
+            match pair.child_stdio() {
+                Ok([stdin, stdout, stderr]) => {
+                    cmd.stdin(stdin).stdout(stdout).stderr(stderr);
+                }
+                Err(error) => {
+                    settle_early(
+                        CommandOutput {
+                            exit_status: None,
+                            stdout: Vec::new(),
+                            stderr: format!("failed to prepare pseudo-terminal: {error}")
+                                .into_bytes(),
+                            status: CommandStatus::Failed,
+                            descendants_escaped: false,
+                        },
+                        response_tx,
+                    );
+                    return;
+                }
+            }
+        }
         let helper_owns_tree = cmd.helper_owns_tree();
         let (mut child, process) = match self.spawn_execution_command(&mut cmd, deadline, || {
             cancellation
@@ -5097,14 +5500,47 @@ impl Sandbox {
         let mut lifecycle = OutputCommandLifecycleGuard::new(process, audit);
         let captured = capture.unwrap_or_else(SharedCommandCapture::bounded);
         let (reader_error_tx, mut reader_error_rx) = mpsc::unbounded_channel();
-        let stdout_handle = spawn_bounded_pipe_reader(
-            child.stdout.take(),
-            CommandOutputStream::Stdout,
-            captured.clone(),
-            limits,
-            reader_error_tx.clone(),
-            progress.clone(),
-        );
+        let stdout_handle = match stdio {
+            CommandStdio::Pipes => spawn_bounded_pipe_reader(
+                child.stdout.take(),
+                CommandOutputStream::Stdout,
+                captured.clone(),
+                limits,
+                reader_error_tx.clone(),
+                progress.clone(),
+            ),
+            #[cfg(unix)]
+            CommandStdio::Pty(pair) => {
+                // Drop the command's copies of the slave so the terminal
+                // reports end of output once the child tree closes it.
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                spawn_bounded_pipe_reader(
+                    Some(pair.into_reader()),
+                    CommandOutputStream::Merged,
+                    captured.clone(),
+                    limits,
+                    reader_error_tx.clone(),
+                    progress.clone(),
+                )
+            }
+            #[cfg(unix)]
+            CommandStdio::MergedPipe(MergedPipe { reader, writer }) => {
+                // Only the child (and its descendants) may hold the write
+                // end, so end of output means the whole tree closed it.
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                drop(writer);
+                spawn_bounded_pipe_reader(
+                    Some(reader),
+                    CommandOutputStream::Merged,
+                    captured.clone(),
+                    limits,
+                    reader_error_tx.clone(),
+                    progress.clone(),
+                )
+            }
+        };
         let stderr_handle = spawn_bounded_pipe_reader(
             child.stderr.take(),
             CommandOutputStream::Stderr,
@@ -5337,27 +5773,25 @@ impl Sandbox {
         let _ = response_tx.send(output);
     }
 
+    /// Kill this sandbox's foreground process groups (turn interruption).
+    /// Background jobs are session-scoped and survive; they stop through
+    /// `job_status`/`/jobs stop`, their deadline, [`Self::cancel_background_jobs`]
+    /// or the registry being dropped with the session.
     pub fn kill_active(&self) {
-        // Cancel registered jobs before examining process groups. A job may
-        // have been inserted but not spawned yet; its command worker observes
-        // this token both before wrapping and immediately before spawning.
-        {
-            let mut jobs = self
-                .background_jobs
-                .jobs
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            for job in jobs.values_mut().filter(|job| job.terminal.is_none()) {
-                job.stop_requested = true;
-                job.cancellation.cancel();
-            }
-        }
+        #[cfg(windows)]
+        let background_groups = self
+            .background_jobs
+            .process_groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         #[cfg(windows)]
         let general: Vec<_> = self
             .general_owners
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
+            .filter(|owner| !background_groups.contains(&owner.pid()))
             .cloned()
             .collect();
         #[cfg(windows)]
@@ -5587,7 +6021,60 @@ fn validate_background_job_id(id: &str) -> Result<(), String> {
     }
 }
 
-fn prune_background_jobs(jobs: &mut HashMap<String, BackgroundJobRecord>) {
+#[cfg(unix)]
+type BackgroundJobInput = pty::PtyInput;
+#[cfg(not(unix))]
+type BackgroundJobInput = std::convert::Infallible;
+
+/// Stdio for a model-authored shell command: a pty, separate pipes, or (the
+/// Unix default) one merged pipe that keeps stdout/stderr write order.
+fn shell_command_stdio(pty: bool, separate_streams: bool) -> std::io::Result<CommandStdio> {
+    if pty || separate_streams {
+        return command_stdio(pty);
+    }
+    #[cfg(unix)]
+    {
+        MergedPipe::open().map(CommandStdio::MergedPipe)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(CommandStdio::Pipes)
+    }
+}
+
+fn command_stdio(pty: bool) -> std::io::Result<CommandStdio> {
+    if !pty {
+        return Ok(CommandStdio::Pipes);
+    }
+    #[cfg(unix)]
+    {
+        pty::PtyPair::open().map(CommandStdio::Pty)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "pty=true is not supported on this platform",
+        ))
+    }
+}
+
+fn background_input(stdio: &CommandStdio) -> Option<BackgroundJobInput> {
+    match stdio {
+        CommandStdio::Pipes => None,
+        #[cfg(unix)]
+        CommandStdio::MergedPipe(_) => None,
+        #[cfg(unix)]
+        CommandStdio::Pty(pair) => Some(pair.input()),
+    }
+}
+
+/// Drop the oldest terminal records over capacity, returning their ids and
+/// log paths (the log files themselves are kept).
+fn prune_background_jobs(
+    jobs: &mut HashMap<String, BackgroundJobRecord>,
+) -> Vec<(String, Option<PathBuf>)> {
+    let mut pruned = Vec::new();
     while jobs.len() >= MAX_RETAINED_BACKGROUND_JOBS {
         let Some(id) = jobs
             .iter()
@@ -5597,8 +6084,11 @@ fn prune_background_jobs(jobs: &mut HashMap<String, BackgroundJobRecord>) {
         else {
             break;
         };
-        jobs.remove(&id);
+        if let Some(job) = jobs.remove(&id) {
+            pruned.push((id, job.log_path));
+        }
     }
+    pruned
 }
 
 fn background_terminal(output: CommandOutput) -> BackgroundJobTerminal {
@@ -5612,8 +6102,6 @@ fn background_terminal(output: CommandOutput) -> BackgroundJobTerminal {
     BackgroundJobTerminal {
         status,
         exit_code: output.exit_status.and_then(|status| status.code()),
-        stdout: output.stdout,
-        stderr: output.stderr,
         descendants_escaped: output.descendants_escaped,
     }
 }
@@ -5631,7 +6119,6 @@ fn finish_background_job(
         let Some(job) = jobs.get_mut(id) else {
             return;
         };
-        job.capture = None;
         if job.terminal.replace(terminal).is_none() {
             owner.running.fetch_sub(1, Ordering::Release);
         }
@@ -5641,34 +6128,23 @@ fn finish_background_job(
 }
 
 fn snapshot_background_job(id: &str, job: &BackgroundJobRecord) -> BackgroundJobSnapshot {
-    if let Some(terminal) = &job.terminal {
-        return BackgroundJobSnapshot {
-            id: id.to_string(),
-            command: job.command.clone(),
-            status: terminal.status,
-            exit_code: terminal.exit_code,
-            stdout: terminal.stdout.clone(),
-            stderr: terminal.stderr.clone(),
-            descendants_escaped: terminal.descendants_escaped,
-        };
-    }
-    let (stdout, stderr) = job
-        .capture
-        .as_ref()
-        .expect("a nonterminal background job must retain its live capture")
-        .snapshot();
+    let transcript = job.capture.transcript();
+    let (status, exit_code, descendants_escaped) = match &job.terminal {
+        Some(terminal) => (
+            terminal.status,
+            terminal.exit_code,
+            terminal.descendants_escaped,
+        ),
+        None if job.stop_requested => (BackgroundJobStatus::Stopping, None, false),
+        None => (BackgroundJobStatus::Running, None, false),
+    };
     BackgroundJobSnapshot {
         id: id.to_string(),
         command: job.command.clone(),
-        status: if job.stop_requested {
-            BackgroundJobStatus::Stopping
-        } else {
-            BackgroundJobStatus::Running
-        },
-        exit_code: None,
-        stdout,
-        stderr,
-        descendants_escaped: false,
+        status,
+        exit_code,
+        descendants_escaped,
+        transcript,
     }
 }
 
@@ -5679,53 +6155,33 @@ struct CapturedCommandOutput {
     combined_bytes: usize,
 }
 
-#[derive(Debug, Default)]
-struct RollingStream {
-    head: Vec<u8>,
-    tail: VecDeque<u8>,
-    total_bytes: usize,
-}
-
-impl RollingStream {
-    fn push(&mut self, bytes: &[u8]) {
-        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
-        let head_limit = BACKGROUND_STREAM_BYTES * 3 / 4;
-        let tail_limit = BACKGROUND_STREAM_BYTES - head_limit;
-        let head_remaining = head_limit.saturating_sub(self.head.len());
-        let to_head = bytes.len().min(head_remaining);
-        self.head.extend_from_slice(&bytes[..to_head]);
-        self.tail.extend(&bytes[to_head..]);
-        let overflow = self.tail.len().saturating_sub(tail_limit);
-        if overflow > 0 {
-            self.tail.drain(..overflow);
-        }
-    }
-
-    fn snapshot(&self, stream: &str) -> Vec<u8> {
-        let retained = self.head.len().saturating_add(self.tail.len());
-        let omitted = self.total_bytes.saturating_sub(retained);
-        let mut output = Vec::with_capacity(retained.saturating_add(96));
-        output.extend_from_slice(&self.head);
-        if omitted > 0 {
-            output.extend_from_slice(
-                format!("\n[... {omitted} {stream} bytes omitted ...]\n").as_bytes(),
-            );
-        }
-        output.extend(self.tail.iter().copied());
-        output
-    }
-}
-
-#[derive(Debug, Default)]
-struct RollingCommandOutput {
-    stdout: RollingStream,
-    stderr: RollingStream,
-}
-
 #[derive(Debug)]
 enum CommandCapture {
     Bounded(CapturedCommandOutput),
-    Rolling(RollingCommandOutput),
+    Spooled(output_capture::SpooledCapture),
+}
+
+/// Caller-owned handle to a spooled shell capture. The caller keeps it after
+/// the command finished to render the arrival-ordered transcript, the
+/// omitted-byte count and the full-output log location.
+#[derive(Clone, Debug)]
+pub(crate) struct ShellOutputCapture(SharedCommandCapture);
+
+impl ShellOutputCapture {
+    pub(crate) fn new(policy: SpoolPolicy) -> Self {
+        Self(SharedCommandCapture(Arc::new(Mutex::new(
+            CommandCapture::Spooled(output_capture::SpooledCapture::new(policy)),
+        ))))
+    }
+
+    /// A unique private log path inside `dir`.
+    pub(crate) fn log_path_in(dir: &Path, prefix: &str) -> PathBuf {
+        output_capture::new_log_path(dir, prefix)
+    }
+
+    pub(crate) fn transcript(&self) -> OutputTranscript {
+        self.0.transcript()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5738,10 +6194,47 @@ impl SharedCommandCapture {
         ))))
     }
 
-    fn rolling() -> Self {
-        Self(Arc::new(Mutex::new(CommandCapture::Rolling(
-            RollingCommandOutput::default(),
+    fn spooled(policy: SpoolPolicy) -> Self {
+        Self(Arc::new(Mutex::new(CommandCapture::Spooled(
+            output_capture::SpooledCapture::new(policy),
         ))))
+    }
+
+    fn total_bytes(&self) -> u64 {
+        let capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &*capture {
+            CommandCapture::Bounded(capture) => {
+                (capture.stdout.len() + capture.stderr.len()) as u64
+            }
+            CommandCapture::Spooled(capture) => capture.total_bytes(),
+        }
+    }
+
+    fn transcript(&self) -> OutputTranscript {
+        let capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &*capture {
+            CommandCapture::Bounded(capture) => OutputTranscript {
+                parts: [
+                    (OutputChannel::Stdout, &capture.stdout),
+                    (OutputChannel::Stderr, &capture.stderr),
+                ]
+                .into_iter()
+                .filter(|(_, bytes)| !bytes.is_empty())
+                .map(|(channel, bytes)| TranscriptPart::Output(channel, bytes.clone()))
+                .collect(),
+                total_bytes: (capture.stdout.len() + capture.stderr.len()) as u64,
+                ..OutputTranscript::default()
+            },
+            CommandCapture::Spooled(capture) => capture.transcript(),
+        }
+    }
+
+    fn read_window(&self, start: u64, max: usize) -> OutputWindow {
+        let capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &*capture {
+            CommandCapture::Bounded(_) => OutputWindow::default(),
+            CommandCapture::Spooled(capture) => capture.read_window(start, max),
+        }
     }
 
     fn push(
@@ -5753,24 +6246,9 @@ impl SharedCommandCapture {
         let mut capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
         match &mut *capture {
             CommandCapture::Bounded(capture) => capture.push(stream, bytes, limits),
-            CommandCapture::Rolling(capture) => {
-                match stream {
-                    CommandOutputStream::Stdout => capture.stdout.push(bytes),
-                    CommandOutputStream::Stderr => capture.stderr.push(bytes),
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
-        let capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        match &*capture {
-            CommandCapture::Bounded(capture) => (capture.stdout.clone(), capture.stderr.clone()),
-            CommandCapture::Rolling(capture) => (
-                capture.stdout.snapshot("stdout"),
-                capture.stderr.snapshot("stderr"),
-            ),
+            CommandCapture::Spooled(capture) => capture
+                .push(stream.channel(), bytes)
+                .map_err(|_| CommandOutputLimit::Combined),
         }
     }
 
@@ -5781,12 +6259,17 @@ impl SharedCommandCapture {
                 std::mem::take(&mut capture.stdout),
                 std::mem::take(&mut capture.stderr),
             ),
-            CommandCapture::Rolling(capture) => (
-                capture.stdout.snapshot("stdout"),
-                capture.stderr.snapshot("stderr"),
-            ),
+            CommandCapture::Spooled(capture) => spooled_streams(capture),
         }
     }
+}
+
+fn spooled_streams(capture: &output_capture::SpooledCapture) -> (Vec<u8>, Vec<u8>) {
+    let transcript = capture.transcript();
+    (
+        transcript.channel_bytes(OutputChannel::Stdout),
+        transcript.channel_bytes(OutputChannel::Stderr),
+    )
 }
 
 impl CapturedCommandOutput {
@@ -5797,7 +6280,7 @@ impl CapturedCommandOutput {
         limits: CommandLimits,
     ) -> Result<(), CommandOutputLimit> {
         let (output, stream_limit, stream_error) = match stream {
-            CommandOutputStream::Stdout => (
+            CommandOutputStream::Stdout | CommandOutputStream::Merged => (
                 &mut self.stdout,
                 limits.stdout_bytes,
                 CommandOutputLimit::Stdout,
@@ -5828,6 +6311,19 @@ impl CapturedCommandOutput {
 enum CommandOutputStream {
     Stdout,
     Stderr,
+    /// One stream carrying both (pseudo-terminal or merged pipe).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Merged,
+}
+
+impl CommandOutputStream {
+    fn channel(self) -> OutputChannel {
+        match self {
+            Self::Stdout => OutputChannel::Stdout,
+            Self::Stderr => OutputChannel::Stderr,
+            Self::Merged => OutputChannel::Merged,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -6347,15 +6843,33 @@ fn essential_env() -> Vec<(&'static str, String)> {
     vars
 }
 
-fn append_bwrap_isolation(command: &mut Command, cwd: &Path, readonly_root: bool) {
-    command.args([
-        "--unshare-user",
-        "--unshare-ipc",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-uts",
-        "--unshare-cgroup",
-    ]);
+/// Resolver, host and CA files bound read-only into the workspace profile
+/// when `sandbox-network = "allow"`.
+const BWRAP_NETWORK_ETC_FILES: &[&str] = &[
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/host.conf",
+    "/etc/gai.conf",
+    "/etc/services",
+    "/etc/protocols",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/pki",
+    "/etc/gitconfig",
+];
+
+fn append_bwrap_isolation(
+    command: &mut Command,
+    cwd: &Path,
+    readonly_root: bool,
+    deny_network: bool,
+) {
+    command.args(["--unshare-user", "--unshare-ipc", "--unshare-pid"]);
+    if deny_network {
+        command.arg("--unshare-net");
+    }
+    command.args(["--unshare-uts", "--unshare-cgroup"]);
     if readonly_root {
         command.args(["--remount-ro", "/"]);
     }
@@ -6421,9 +6935,11 @@ fn seatbelt_profile_ladder(
         )
     };
     let network = if deny_network {
-        "(deny network*)"
+        "(deny network*)".to_string()
+    } else if profile == SandboxProfile::Workspace {
+        format!("{SEATBELT_NETWORK_READS}\n{SEATBELT_ALLOW_NETWORK}")
     } else {
-        "(allow network*)"
+        SEATBELT_ALLOW_NETWORK.to_string()
     };
     let git_rule = if protected_git.is_empty() {
         String::new()
@@ -6511,6 +7027,12 @@ fn seatbelt_root_inputs(
     Ok(inputs)
 }
 
+/// Network opt-in rules: sockets plus the system services name resolution
+/// and certificate evaluation reach over Mach IPC.
+const SEATBELT_ALLOW_NETWORK: &str = "(allow network*)\n(allow system-socket)\n(allow mach-lookup (global-name \"com.apple.dnssd.service\") (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.SystemConfiguration.DNSConfiguration\"))";
+/// Resolver and CA files the workspace profile does not otherwise read.
+const SEATBELT_NETWORK_READS: &str = "(allow file-read* (literal \"/etc\") (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\") (literal \"/private/etc/services\") (literal \"/private/etc/protocols\") (subpath \"/private/etc/ssl\") (literal \"/private/etc/gitconfig\") (subpath \"/private/var/run/resolv.conf\") (subpath \"/Library/Keychains\"))";
+
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn seatbelt_shell_profile(
     workspace_str: &str,
@@ -6522,7 +7044,7 @@ pub(crate) fn seatbelt_shell_profile(
     let network_rule = if deny_network {
         "(deny network*)"
     } else {
-        "(allow network*)"
+        SEATBELT_ALLOW_NETWORK
     };
     let git_rule = if git_write_denies.is_empty() {
         String::new()
@@ -6913,12 +7435,13 @@ mod sandbox_tests {
             sequence,
             command: "fixture".to_string(),
             cancellation: CommandCancellation::new(),
-            capture: (!terminal).then_some(SharedCommandCapture::rolling()),
+            capture: SharedCommandCapture::spooled(SpoolPolicy::background(None)),
+            log_path: None,
+            delivered: 0,
+            input: None,
             terminal: terminal.then_some(BackgroundJobTerminal {
                 status: BackgroundJobStatus::Completed,
                 exit_code: Some(0),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
                 descendants_escaped: false,
             }),
             stop_requested: false,
@@ -10138,7 +10661,7 @@ echo COMMITTED"#;
             "",
             false,
         );
-        assert!(open_network.ends_with("(allow network*)"));
+        assert!(open_network.ends_with(SEATBELT_ALLOW_NETWORK));
         assert!(!open_network.contains("(deny file-write*)"));
         assert!(
             !Sandbox::new(true, "appcontainer")

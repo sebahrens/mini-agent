@@ -303,6 +303,14 @@ pub struct Config {
     /// their own limits; this does not alter brokered JavaScript spawn limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell_timeout_secs: Option<u64>,
+    /// Promote a foreground shell command that reaches its deadline to a
+    /// background job instead of killing it (per-call `auto_background`
+    /// overrides). Default `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_auto_background: Option<bool>,
+    /// Deadline of `!` commands in seconds, clamped to 1..=600 (default 30).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_timeout_secs: Option<u64>,
     /// Opt-in anonymous release check, only during interactive startup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,
@@ -475,6 +483,15 @@ pub struct Config {
         alias = "sandbox_home_masks"
     )]
     pub sandbox_home_masks: Vec<String>,
+    /// `sandbox-network`: `deny` (default) or `allow` network access for
+    /// contained shell commands. A project layer needs project trust.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "sandbox-network",
+        alias = "sandbox_network"
+    )]
+    pub sandbox_network: Option<crate::sandbox::SandboxNetwork>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -538,6 +555,15 @@ pub struct Config {
         alias = "js_fetch_allow_http"
     )]
     pub js_fetch_allow_http: Option<bool>,
+    /// `js-step-timeout-secs`: whole-invocation deadline of one `js` call,
+    /// clamped to 1..=300 (default 30). Sensitive in project layers.
+    #[cfg(feature = "js")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "js-step-timeout-secs",
+        alias = "js_step_timeout_secs"
+    )]
+    pub js_step_timeout_secs: Option<u64>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         rename = "web-fetch-origins",

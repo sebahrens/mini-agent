@@ -82,6 +82,57 @@ Notable changes to mini-agent are documented in this file. The format follows
   embedded entry now records `max_output`, and Bedrock/Vertex Claude ids use their native
   Anthropic metadata (context window, output ceiling, prices).
 
+### Added
+
+- `sandbox-network = "allow"` opts contained shell commands into the network (bwrap omits
+  `--unshare-net`; Seatbelt allows network and name resolution) without widening filesystem reach.
+  The default stays `deny`, a project layer needs project trust, and `/sandbox` plus the
+  `sandbox:net` status segment show it. Hooks, services and JS `spawn` stay denied
+  (mini-agent-p0ski).
+
+- `shell` accepts `pty = true` (Unix) to run a command under its own pseudo-terminal, and
+  `job_status` gains `action = "input"` (at most 16 KiB per call) to type into a running pty
+  background job, so REPLs and prompting tools can be driven inside the sandbox
+  (mini-agent-gklvo).
+
+- The structured `git` tool adds `branches`, `branch_create`, `switch`, `stash_push`,
+  `stash_pop`, `stash_list`, `tag` and `restore`, each behind its own `git/<operation>` permission
+  key and inside the existing `.git` protection model; `diff`/`show` gain `format`
+  (`stat`, `name_status`) and `offset` paging so changes larger than 192 KiB can be read in full
+  (mini-agent-k4fem).
+
+- `js-step-timeout-secs` (1..=300, default 30, project-trust-gated) sets the whole-call deadline of
+  the `js` tool, so a brokered `spawn` can run past 30 s; the worker receives the deadline through
+  the step protocol (version 12) and refuses out-of-range values. Every JavaScript limit is now
+  listed in `docs/agent/TOOL_RUNTIME.md`; the 64 MiB heap stays fixed (mini-agent-blbmw).
+
+- `shell` calls accept `auto_background` (default from the new `shell_auto_background` setting): a
+  foreground command that reaches its deadline is promoted to a background job with its output
+  preserved instead of being killed. `command_timeout_secs` (default 30 s, 1..=600) sets the
+  deadline of `!` commands, and `TOOL_RUNTIME.md` lists which command class uses which deadline
+  (mini-agent-tl5kw).
+
+### Changed
+
+- Foreground `shell` commands that print more than 1 MiB are no longer killed: the capture keeps
+  a 768 KiB head and 256 KiB tail, the command runs to completion with its real exit status, and
+  the complete output is spooled to a private log in the session tool-output directory that the
+  result names for `read`/`grep`. Only a 64 MiB total stops the command (mini-agent-ghs4t).
+- On Unix, `shell` commands and background jobs capture stdout and stderr through one shared pipe,
+  so results keep exact write order and are no longer split into `[stdout]` then `[stderr]` blocks;
+  `separate_streams = true` restores labelled separate capture (mini-agent-c1d8q).
+- Background jobs survive turn interruption (Esc, Ctrl+C, ACP cancel), so dev servers and watchers
+  keep running; the TUI reports the jobs still running, and `/quit` or session end stops them
+  (mini-agent-0l32y).
+- Background jobs tee their complete output to a private `shell-<job id>.log` in the session
+  tool-output directory, and `job_status` poll/wait/stop return only output not returned before
+  (64 KiB per call) with a `since` offset for re-reading any range. Pruned job records keep their
+  log path (mini-agent-qlef1).
+- A `js` step whose final value exceeds 64 KiB now returns the value truncated with a marker that
+  states its full size and the cap instead of failing with `invalid_result` (verification roles keep
+  the strict contract), and reaching the console cap (256 records / 256 KiB) adds a visible notice.
+  The output limits are tabulated in `docs/agent/TOOL_RUNTIME.md` (mini-agent-6tcp3).
+
 **Fork release 1.14.2 (2026-10-28)**
 
 ### Changed (context management)

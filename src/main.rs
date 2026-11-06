@@ -391,6 +391,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
 
     let loaded_warning_count = cfg.load_warnings.len();
     config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
+    sandbox::set_command_timeout_secs(cfg.command_timeout_secs.unwrap_or(30));
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
     provider::set_provider_timeouts(cfg.provider_timeouts);
     provider::set_cli_fallback_model(cli.fallback_model.clone());

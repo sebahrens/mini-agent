@@ -1451,7 +1451,8 @@ impl GitRunner {
         // A contained commit has no HOME or global config to learn its
         // author from; resolve the identity on the host first and fail
         // before anything is spawned when it cannot be resolved.
-        let extra_env = if operation == "commit" {
+        // Stashes and annotated tags are commit-like objects too.
+        let extra_env = if matches!(operation, "commit" | "stash" | "tag") {
             let identity = self.resolve_commit_identity(workspace.root()).await?;
             identity.environment()
         } else {

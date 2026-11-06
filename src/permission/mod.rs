@@ -44,6 +44,16 @@ pub struct PermissionConfig {
     pub git_unstage: Option<ToolPerm>,
     #[serde(rename = "git/commit")]
     pub git_commit: Option<ToolPerm>,
+    #[serde(rename = "git/branch")]
+    pub git_branch: Option<ToolPerm>,
+    #[serde(rename = "git/switch")]
+    pub git_switch: Option<ToolPerm>,
+    #[serde(rename = "git/stash")]
+    pub git_stash: Option<ToolPerm>,
+    #[serde(rename = "git/tag")]
+    pub git_tag: Option<ToolPerm>,
+    #[serde(rename = "git/restore")]
+    pub git_restore: Option<ToolPerm>,
     #[serde(rename = "js/fetch", alias = "fetch")]
     pub js_fetch: Option<ToolPerm>,
     pub web_fetch: Option<ToolPerm>,
@@ -98,6 +108,11 @@ pub(crate) fn is_configurable_tool_name(tool: &str) -> bool {
             | "git/stage"
             | "git/unstage"
             | "git/commit"
+            | "git/branch"
+            | "git/switch"
+            | "git/stash"
+            | "git/tag"
+            | "git/restore"
             | "js/fetch"
             | "web_fetch"
             | "web_search"
@@ -265,6 +280,7 @@ pub(crate) struct ConfiguredSandboxKey {
     appcontainer_read_roots: Vec<std::path::PathBuf>,
     appcontainer_write_roots: Vec<std::path::PathBuf>,
     toolchain_roots: Vec<std::path::PathBuf>,
+    network: crate::sandbox::SandboxNetwork,
 }
 
 #[cfg(test)]
@@ -290,6 +306,7 @@ impl ConfiguredSandboxKey {
             appcontainer_read_roots: cli.resolve_windows_appcontainer_read_roots(cfg),
             appcontainer_write_roots: cli.resolve_windows_appcontainer_write_roots(cfg),
             toolchain_roots: cli.resolve_sandbox_toolchain_roots(cfg),
+            network: cfg.sandbox_network.unwrap_or_default(),
         }
     }
 
@@ -312,6 +329,7 @@ impl ConfiguredSandboxKey {
                 self.appcontainer_write_roots.clone(),
             )
             .with_bwrap_read_roots(self.toolchain_roots.clone())
+            .with_network(self.network)
     }
 }
 

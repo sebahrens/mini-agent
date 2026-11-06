@@ -327,6 +327,7 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
             ctx.renderer,
             format!("sandbox profile: {}", ctx.sandbox.profile()),
         );
+        write_result(ctx.renderer, shell_network_line(ctx.sandbox));
         for profile in [
             SandboxProfile::Workspace,
             SandboxProfile::HostRead,
@@ -373,6 +374,22 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
         ),
     );
     Ok(())
+}
+
+/// `/sandbox` line describing the `sandbox-network` setting and whether it
+/// takes effect with the active backend.
+fn shell_network_line(sandbox: &crate::sandbox::Sandbox) -> String {
+    let network = sandbox.network();
+    let effect = if !sandbox.containment_requested() {
+        "sandbox disabled: shells use the host network"
+    } else if sandbox.shell_network_effective() {
+        "shell commands may reach the network; hooks and JS spawn stay denied"
+    } else if network.allows() {
+        "not supported by this backend; shell network stays denied"
+    } else {
+        "shell commands have no network; set sandbox-network = \"allow\" in config to opt in"
+    };
+    format!("  shell network: {network} ({effect})")
 }
 
 async fn handle_mode(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {

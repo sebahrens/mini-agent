@@ -875,13 +875,18 @@ fn register_js_tool_with_status(
             .and_then(crate::config::JsFetchOrigins::as_policy_origins),
         cfg.js_fetch_allow_http.unwrap_or(false),
     );
+    let step_timeout_secs = cfg
+        .js_step_timeout_secs
+        .unwrap_or(crate::extras::js::types::STEP_TIMEOUT.as_secs());
     #[cfg(feature = "skills")]
-    let mut js_tool =
-        JsTool::new(sandbox, permission, ask_tx, allow_config).with_scratch_store(scratch);
+    let mut js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config)
+        .with_scratch_store(scratch)
+        .with_step_timeout_secs(step_timeout_secs);
 
     #[cfg(not(feature = "skills"))]
-    let js_tool =
-        JsTool::new(sandbox, permission, ask_tx, allow_config).with_scratch_store(scratch);
+    let js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config)
+        .with_scratch_store(scratch)
+        .with_step_timeout_secs(step_timeout_secs);
 
     #[cfg(feature = "skills")]
     if let Some(services) = skill_services {
@@ -1163,7 +1168,11 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     sandbox.clone(),
                     max_bash_output_lines,
                 )
-                .with_foreground_timeout_secs(cfg.resolve_shell_timeout_secs()),
+                .with_foreground_timeout_secs(cfg.resolve_shell_timeout_secs())
+                .with_auto_background(cfg.shell_auto_background.unwrap_or(false))
+                .with_output_log_dir(crate::session::storage::command_log_dir(
+                    tool_output_session_id,
+                )),
             ));
             base_tools.push(Box::new(tools::JobStatusTool::new(
                 sandbox.clone(),

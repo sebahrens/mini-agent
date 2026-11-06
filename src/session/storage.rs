@@ -215,6 +215,16 @@ pub fn tool_output_dir(session_id: &str) -> PathBuf {
         ))
 }
 
+/// Directory for full-output command logs of `session_id`: the same private,
+/// read-tool-authorized directory as tool-result spills. `None` when
+/// tool-output persistence is unavailable.
+pub(crate) fn command_log_dir(session_id: &str) -> Option<PathBuf> {
+    if disabled("tool outputs") || crate::paths::process_paths_ref().is_err() {
+        return None;
+    }
+    Some(tool_output_dir(session_id))
+}
+
 fn app_paths() -> &'static crate::paths::AppPaths {
     crate::paths::process_paths_ref().expect("startup must initialize application paths")
 }

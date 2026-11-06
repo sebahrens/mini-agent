@@ -23,9 +23,7 @@ use crate::event::{AgentEvent, BtwEvent, UserEvent};
 use crate::extras::mcp::{McpClientManager, McpNoticeLevel};
 use crate::provider::AnyAgent;
 use crate::sandbox::CommandCancellation;
-use crate::sandbox::{
-    CommandLimits, CommandStatus, DEFAULT_COMMAND_LIMITS, SupportCommandAudit, SupportCommandLimits,
-};
+use crate::sandbox::{CommandLimits, CommandStatus, SupportCommandAudit, SupportCommandLimits};
 use crate::session::{GitStatus, Session};
 use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
@@ -3772,6 +3770,8 @@ impl<'a> App<'a> {
             UserEvent::Quit => {
                 self.cancel_all_permissions();
                 self.cron.stop_all();
+                // Background jobs outlive interrupted turns but not the session.
+                self.ui.sandbox.cancel_background_jobs();
                 // The terminal may already be gone (SIGHUP): drawing can fail,
                 // but stopping the run and saving must still happen.
                 if self.run.is_running
@@ -5186,6 +5186,16 @@ impl<'a> App<'a> {
             "interrupted (changes may be partial; review with git diff)",
             C_ERROR,
         )?;
+        let jobs = self.ui.sandbox.running_background_job_count();
+        if jobs > 0 {
+            self.renderer.write_line(
+                &format!(
+                    "{jobs} background job{} still running; /jobs lists them and /jobs stop <id> ends one",
+                    if jobs == 1 { "" } else { "s" }
+                ),
+                C_AGENT,
+            )?;
+        }
         Ok(())
     }
 
@@ -7474,7 +7484,7 @@ impl<'a> App<'a> {
         let mut progress_changes = progress.subscribe();
         let operation = sandbox.run_explicit_shell_with_progress(
             text,
-            DEFAULT_COMMAND_LIMITS,
+            crate::sandbox::configured_command_limits(),
             Some(&cancellation),
             Some(progress.clone()),
         );
@@ -16899,7 +16909,8 @@ mod plan_approval_tests {
                     .sandbox
                     .background_job_snapshot(&id)
                     .unwrap()
-                    .stdout
+                    .transcript
+                    .channel_bytes(crate::sandbox::OutputChannel::Stdout)
                     .windows(10)
                     .any(|bytes| bytes == b"BG_READY67")
                 {
