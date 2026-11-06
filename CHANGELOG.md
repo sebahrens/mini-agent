@@ -30,6 +30,49 @@ Notable changes to mini-agent are documented in this file. The format follows
   `edit`/`write` are unavailable) instead of failing the whole file; binary data is still refused.
 - `web_fetch` retries transient failures once, caches converted pages for 15 minutes, extracts PDF
   text, and hints when a page converts to almost no text.
+### Sessions
+
+- The session catalogue (`/sessions`, `--resume`) writes a small `<id>.index` metadata sidecar for
+  every session it reads in full; a session with a current sidecar is listed without reading its
+  transcript and is no longer charged against the 256 MiB scan budget, so repeated listings reach
+  older sessions. When the listing is limited it now says that older sessions exist and that
+  `--session <id-or-name>` loads any of them. Sidecars are hints only (selecting a session still
+  reloads and re-validates the real file) and are removed with the session.
+
+- `/btw` tool results now truncate at the configured `tool_result_spill_*` limits, like the main agent.
+
+- Deleting a session (`/sessions delete`, `session_retention_days`) now also removes its private
+  tool-output directory (spills, full command logs, `/rewind` preimages), and startup sweeps
+  tool-output directories that match no saved session and have been idle for 14 days.
+
+### Context compaction
+
+- A headless turn on a provider-native Anthropic replay session whose prompt pressure crosses
+  `mid_turn_compact_threshold` now stops at the tool-batch boundary with an explicit "context is N%
+  full" error and its completed tool results saved, instead of running into a provider context error.
+
+- Anthropic five-minute prompt caching now spends its spare cache breakpoints on earlier
+  message blocks, spaced 18 blocks behind the tail, so a turn that adds 20+ content blocks (for
+  example ten parallel tool calls) still finds the previous request's cache write inside the
+  20-block lookback window.
+
+- The default retry policy is now 6 attempts with 500 ms doubling backoff capped at 30 s (was 3
+  attempts, 10 s), so a short 529/5xx overload burst no longer ends a turn after about 1.5 s.
+  The hard cap of 10 attempts and project-config tightening are unchanged.
+
+- Compaction summary requests are retried when the provider stream fails after the first chunk
+  (only the failed rolling request restarts, keeping the earlier work). The 300 s whole-compaction
+  cap is now a per-request timeout (default scaled with the summarizer input, `compaction_timeout_secs`
+  overrides it), and `compaction_model` names a same-provider `quick_models` entry for a
+  faster or cheaper summarizer.
+
+### Cost tracking
+
+- The global usage ledger no longer has a permanent 65,536-record / 64 MiB wall: a full
+  `usage.jsonl` is archived as `usage.<seq>.archive.jsonl` and folded into `usage.rollup`, so
+  `/cost` and session budgets keep exact all-time totals. A capped run that stops because spend
+  cannot be recorded now says "cost tracking failed (<ledger error>)" instead of only claiming the
+  USD budget ran out.
 
 ### Subagents
 

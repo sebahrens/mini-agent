@@ -17,15 +17,23 @@ pub struct RetryConfig {
     pub max_retry_after_ms: u64,
 }
 
+/// Default attempt budget. Six attempts with 0.5 s doubling to a 30 s ceiling
+/// ride out about 15 s of backoff (plus jitter and any provider hint), enough
+/// for a short 529/5xx/overload burst, while staying well under the
+/// `MAX_RETRY_ATTEMPTS` hard cap of 10.
+pub const DEFAULT_MAX_ATTEMPTS: usize = 6;
+/// Default ceiling for one ordinary (hint-free) backoff sleep.
+pub const DEFAULT_MAX_BACKOFF_MS: u64 = 30_000;
+
 /// Default ceiling for a provider-supplied retry wait: five minutes.
 pub const DEFAULT_MAX_RETRY_AFTER_MS: u64 = 300_000;
 
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_attempts: 3,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
             initial_backoff_ms: 500,
-            max_backoff_ms: 10_000,
+            max_backoff_ms: DEFAULT_MAX_BACKOFF_MS,
             max_retry_after_ms: DEFAULT_MAX_RETRY_AFTER_MS,
         }
     }
@@ -799,9 +807,10 @@ mod tests {
     #[test]
     fn test_retry_config_defaults() {
         let cfg = RetryConfig::default();
-        assert_eq!(cfg.max_attempts, 3);
+        assert_eq!(cfg.max_attempts, 6);
         assert_eq!(cfg.initial_backoff_ms, 500);
-        assert_eq!(cfg.max_backoff_ms, 10_000);
+        assert_eq!(cfg.max_backoff_ms, 30_000);
+        assert!(cfg.max_attempts <= MAX_RETRY_ATTEMPTS);
         assert_eq!(cfg.max_retry_after_ms, DEFAULT_MAX_RETRY_AFTER_MS);
     }
 
@@ -1078,13 +1087,13 @@ mod tests {
         let mut looser = RetryConfig {
             max_attempts: 9,
             initial_backoff_ms: 50,
-            max_backoff_ms: 30_000,
+            max_backoff_ms: 45_000,
             max_retry_after_ms: 0,
         };
         assert_eq!(looser.cap_at(&ceiling), ["max_attempts", "max_backoff_ms"]);
-        assert_eq!(looser.max_attempts, 3);
+        assert_eq!(looser.max_attempts, 6);
         assert_eq!(looser.initial_backoff_ms, 50);
-        assert_eq!(looser.max_backoff_ms, 10_000);
+        assert_eq!(looser.max_backoff_ms, 30_000);
 
         let mut tighter = RetryConfig {
             max_attempts: 1,

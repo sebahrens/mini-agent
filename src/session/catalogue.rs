@@ -5,7 +5,7 @@ use std::io::{BufReader, Read};
 use std::path::{Component, Path};
 
 use compact_str::CompactString;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{SESSION_TITLE_CHARS, Session};
 
@@ -17,6 +17,15 @@ const MAX_SCAN_ENTRIES: usize = 50_000;
 pub(crate) const MAX_ROWS: usize = 100;
 pub(crate) const MAX_FILE_BYTES: u64 = super::storage::MAX_SESSION_BYTES as u64;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+/// Per-session metadata sidecar (`<id>.index`): the header fields the listing
+/// needs, validated against the session file's length and modification time.
+/// A session with a current sidecar is listed without reading its transcript,
+/// so it is not charged against `MAX_TOTAL_BYTES`.
+const INDEX_EXTENSION: &str = "index";
+const INDEX_VERSION: u32 = 1;
+const MAX_INDEX_BYTES: u64 = 64 * 1024;
+/// Sidecars written per listing, bounding the extra work of the first pass.
+const MAX_INDEX_WRITES: usize = 256;
 
 #[derive(Clone, Copy)]
 struct ScanLimits {
@@ -58,6 +67,105 @@ pub(crate) struct Catalogue {
     pub rows: Vec<SessionRow>,
     pub truncated: bool,
     pub skipped: usize,
+}
+
+impl Catalogue {
+    /// What a limited listing hides and how to reach it, for every frontend.
+    pub(crate) fn notice(&self) -> Option<String> {
+        if !self.truncated && self.skipped == 0 {
+            return None;
+        }
+        let mut notice = String::new();
+        if self.truncated {
+            notice.push_str(&format!(
+                "Older saved sessions exist but are not listed: the listing shows at most {MAX_ROWS} \
+                 of the newest sessions within a bounded scan budget. Load any session directly with \
+                 `--session <id-or-name>`; sessions are indexed as they are listed, so repeated \
+                 listings reach further back."
+            ));
+        }
+        if self.skipped > 0 {
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&format!(
+                "{} unsafe, invalid or oversized entries were skipped.",
+                self.skipped
+            ));
+        }
+        Some(notice)
+    }
+}
+
+/// The sidecar contents. Only a hint: selecting a session reloads and
+/// re-validates the real file, so a stale or forged sidecar cannot widen scope.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexRecord {
+    version: u32,
+    json_len: u64,
+    json_modified_secs: u64,
+    json_modified_nanos: u32,
+    id: CompactString,
+    name: String,
+    generated_title: Option<String>,
+    updated_at: CompactString,
+    working_dir: CompactString,
+    provider: CompactString,
+    model: CompactString,
+    message_count: usize,
+    first_user: String,
+}
+
+fn modified_stamp(metadata: &std::fs::Metadata) -> Option<(u64, u32)> {
+    let elapsed = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((elapsed.as_secs(), elapsed.subsec_nanos()))
+}
+
+impl IndexRecord {
+    fn for_header(header: &Header, metadata: &std::fs::Metadata) -> Option<Self> {
+        let (json_modified_secs, json_modified_nanos) = modified_stamp(metadata)?;
+        Some(Self {
+            version: INDEX_VERSION,
+            json_len: metadata.len(),
+            json_modified_secs,
+            json_modified_nanos,
+            id: header.id.clone(),
+            name: header.name.clone(),
+            generated_title: header.generated_title.clone(),
+            updated_at: header.updated_at.clone(),
+            working_dir: header.working_dir.clone(),
+            provider: header.provider.clone(),
+            model: header.model.clone(),
+            message_count: header.messages.count,
+            first_user: header.messages.first_user.clone(),
+        })
+    }
+
+    /// The header, when this record describes the file exactly as it is now.
+    fn into_header(self, metadata: &std::fs::Metadata) -> Option<Header> {
+        let (secs, nanos) = modified_stamp(metadata)?;
+        (self.version == INDEX_VERSION
+            && self.json_len == metadata.len()
+            && (self.json_modified_secs, self.json_modified_nanos) == (secs, nanos))
+            .then(|| Header {
+                id: self.id,
+                name: self.name,
+                generated_title: self.generated_title,
+                updated_at: self.updated_at,
+                working_dir: self.working_dir,
+                provider: self.provider,
+                model: self.model,
+                messages: MessageSummary {
+                    count: self.message_count,
+                    first_user: self.first_user,
+                },
+            })
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -338,6 +446,51 @@ fn short_text(value: &str) -> String {
     }
 }
 
+/// The sidecar header for `stem` when it describes `metadata` exactly.
+fn read_index(
+    retained: &crate::paths::WorkspaceBinding,
+    readonly: bool,
+    json_path: &Path,
+    stem: &str,
+    metadata: &std::fs::Metadata,
+) -> Option<Header> {
+    let file = if readonly {
+        let file = retained
+            .open_regular_relative(Path::new(&format!("{stem}.{INDEX_EXTENSION}")))
+            .ok()?;
+        crate::fs::validate_private_file(&file).ok()?;
+        file
+    } else {
+        open_catalogue_file(&json_path.with_extension(INDEX_EXTENSION)).ok()?
+    };
+    if file.metadata().ok()?.len() > MAX_INDEX_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_INDEX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_INDEX_BYTES {
+        return None;
+    }
+    let header = serde_json::from_slice::<IndexRecord>(&bytes)
+        .ok()?
+        .into_header(metadata)?;
+    (header.id == stem).then_some(header)
+}
+
+fn write_index(json_path: &Path, header: &Header, metadata: &std::fs::Metadata) -> bool {
+    let Some(record) = IndexRecord::for_header(header, metadata) else {
+        return false;
+    };
+    let Ok(bytes) = serde_json::to_vec(&record) else {
+        return false;
+    };
+    bytes.len() as u64 <= MAX_INDEX_BYTES
+        && crate::fs::private_atomic_write_sync(&json_path.with_extension(INDEX_EXTENSION), &bytes)
+            .is_ok()
+}
+
 pub(crate) fn same_workspace(saved: &str, workspace: &crate::paths::WorkspaceBinding) -> bool {
     let saved = Path::new(saved);
     saved.is_absolute()
@@ -447,6 +600,7 @@ fn list_with_limits(
     entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let mut total = 0_u64;
     let mut header_reads = 0_usize;
+    let mut index_writes = 0_usize;
     for (_, path) in entries {
         retained.validate().map_err(anyhow::Error::msg)?;
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -474,6 +628,12 @@ fn list_with_limits(
                 .then(|| crate::fs::checked_file_metadata(&file))
                 .transpose()?;
             retained.validate().map_err(anyhow::Error::msg)?;
+            // A current sidecar answers without touching the transcript.
+            let before = file.metadata()?;
+            if let Some(header) = read_index(&retained, readonly, &path, stem, &before) {
+                retained.validate().map_err(anyhow::Error::msg)?;
+                return Ok(Some(header));
+            }
             if !all {
                 // Another workspace's session must not spend this listing's
                 // byte or header budget: peek its working directory first.
@@ -524,6 +684,18 @@ fn list_with_limits(
             );
             let header = header?;
             anyhow::ensure!(header.id == stem, "session filename/id mismatch");
+            // Index the session for later listings: it was read completely
+            // and did not change while it was read. Best effort.
+            if !readonly
+                && index_writes < MAX_INDEX_WRITES
+                && consumed == before.len()
+                && let Ok(after) = file.metadata()
+                && after.len() == before.len()
+                && modified_stamp(&after) == modified_stamp(&before)
+                && write_index(&path, &header, &after)
+            {
+                index_writes += 1;
+            }
             Ok(Some(header))
         })();
         let header = match candidate {
@@ -1126,5 +1298,112 @@ mod tests {
         assert!(selected(&row, &binding, true).is_err());
         assert!(list(&binding, true).is_err());
         std::fs::remove_file(root.path()).unwrap();
+    }
+
+    fn padded_session(directory: &Path, workspace: &Path, size: usize) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let header = serde_json::json!({
+            "id": id, "working_dir": workspace.to_string_lossy(),
+            "messages": [{"role": "user", "content": "indexed hello"}]
+        })
+        .to_string();
+        let mut payload = header.trim_end_matches('}').to_owned();
+        payload.push_str(",\"padding\":\"");
+        let room = size - payload.len() - 2;
+        payload.extend(std::iter::repeat_n('x', room));
+        payload.push_str("\"}");
+        assert_eq!(payload.len(), size);
+        super::super::storage::atomic_write(&directory.join(format!("{id}.json")), &payload)
+            .unwrap();
+        id
+    }
+
+    // mini-agent-byavr: listed sessions are indexed, so a later listing no
+    // longer charges their transcripts against the byte budget and reaches the
+    // older sessions the first pass could not; the truncation notice says how
+    // to reach what is hidden.
+    #[test]
+    fn byavr_indexed_sessions_are_not_charged_and_hidden_ones_become_reachable() {
+        let root = crate::tests::OwnedTestDirectory::new("session-catalogue-index");
+        let _env = environment(&root);
+        let binding = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let directory = super::super::storage::session_path(&uuid::Uuid::new_v4().to_string())
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        crate::paths::ensure_private_directory(&directory).unwrap();
+        let ids: Vec<String> = (0..9)
+            .map(|_| padded_session(&directory, root.path(), 1_024))
+            .collect();
+        let limits = ScanLimits {
+            file_bytes: 1_024,
+            total_bytes: 8_192,
+            ..SCAN_LIMITS
+        };
+        let first = list_with_limits(&binding, true, false, limits).unwrap();
+        assert_eq!(first.rows.len(), 8);
+        assert!(first.truncated);
+        let notice = first.notice().unwrap();
+        assert!(notice.contains("--session"), "{notice}");
+        assert!(notice.contains("Older saved sessions"), "{notice}");
+        assert!(
+            directory
+                .join(format!("{}.index", first.rows[0].id))
+                .exists()
+        );
+        // Eight sessions are indexed now: only the ninth is charged.
+        let second = list_with_limits(&binding, true, false, limits).unwrap();
+        assert_eq!(second.rows.len(), 9);
+        assert!(!second.truncated, "the budget now reaches every session");
+        assert!(second.notice().is_none());
+        assert_eq!(second.rows[0].message_count, 1);
+        assert_eq!(second.rows[0].title, "indexed hello");
+        // A read-only listing uses the sidecars too.
+        assert_eq!(
+            list_with_limits(&binding, true, true, limits)
+                .unwrap()
+                .rows
+                .len(),
+            9
+        );
+
+        // A changed session file invalidates its sidecar; a forged sidecar for
+        // another id is ignored; neither changes what the real file says.
+        let changed = &ids[0];
+        let path = directory.join(format!("{changed}.json"));
+        let mut body = std::fs::read_to_string(&path).unwrap();
+        body = body.replace("indexed hello", "rewritten!!!");
+        super::super::storage::atomic_write(&path, &body).unwrap();
+        let forged = &ids[1];
+        std::fs::copy(
+            directory.join(format!("{changed}.index")),
+            directory.join(format!("{forged}.index")),
+        )
+        .unwrap();
+        let third = list_with_limits(&binding, true, false, limits).unwrap();
+        let title = |id: &str| {
+            third
+                .rows
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.title.to_string())
+                .unwrap()
+        };
+        assert_eq!(title(changed), "rewritten!!!");
+        assert_eq!(title(forged), "indexed hello");
+
+        // Corrupt and oversized sidecars fall back to the real file.
+        std::fs::write(directory.join(format!("{}.index", ids[2])), b"{not json").unwrap();
+        std::fs::write(
+            directory.join(format!("{}.index", ids[3])),
+            vec![b' '; MAX_INDEX_BYTES as usize + 1],
+        )
+        .unwrap();
+        let fourth = list_with_limits(&binding, true, false, limits).unwrap();
+        assert_eq!(fourth.rows.len(), 9);
+        // Deleting a session removes its sidecar.
+        super::super::storage::delete_session(&ids[4]).unwrap();
+        assert!(!directory.join(format!("{}.index", ids[4])).exists());
     }
 }

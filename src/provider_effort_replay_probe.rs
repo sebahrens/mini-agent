@@ -4386,6 +4386,132 @@ async fn effort46_live_headless_resume_uses_persisted_main_override() {
     );
 }
 
+/// mini-agent-q3ki6: a provider-native replay turn whose real prompt pressure
+/// crosses `mid_turn_compact_threshold` at a tool-batch boundary ends cleanly
+/// with an explicit, non-provider error and a saved unfinished reply, instead
+/// of issuing the next (oversized) request.
+#[tokio::test]
+async fn native_replay_headless_pressure_ends_the_turn_at_the_tool_boundary() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = crate::tests::OwnedTestDirectory::new("native-mid-turn-headless");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "MINI_AGENT_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
+    ]);
+    #[cfg(feature = "hooks")]
+    let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
+    let first = start()
+        + &thinking(0, "", "NATIVE_MID_TURN_SIGNATURE")
+        + &event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_mid","name":"read","input":{}}}),
+        )
+        + &event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"held.txt\"}"}}),
+        )
+        + &event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":1}),
+        )
+        + &event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":2}}),
+        )
+        + &event("message_stop", json!({"type":"message_stop"}));
+    // Exactly one response: a second request would have nothing to answer it.
+    let wire = Wire::new(vec![(true, first)]);
+    let cfg: crate::config::Config = serde_json::from_value(json!({
+        "session_title_model":"off","compact_enabled":true,"mid_turn_compact_threshold":0.00001,
+        "custom_providers":{"native-mid":{"provider_type":"anthropic","base_url":wire.base}},
+        "quick_models":{"native-mid-model":{"provider":"native-mid","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
+    })).unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
+    std::fs::write(roots.path().join("held.txt"), "boundary read").unwrap();
+    let paths = crate::paths::process_paths_ref().unwrap();
+    let mut seed = crate::session::Session::new("native-mid", "claude-opus-5-5", 128_000, "");
+    seed.working_dir = workspace.root().to_string_lossy().into_owned().into();
+    seed.set_input_output_prices(Some((2.0, 4.0)));
+    let sid = seed.id.to_string();
+    crate::session::storage::save_session(&seed).unwrap();
+    crate::session::lock::release_session(&sid);
+    let cli = crate::cli::Cli {
+        api_key: Some("owned-native-key".into()),
+        quick_model: Some("native-mid-model".into()),
+        session: Some(sid.clone()),
+        print: true,
+        quiet: true,
+        no_context_files: true,
+        tools: vec!["read".into()],
+        no_sandbox: true,
+        message: vec!["read the held file".into()],
+        ..Default::default()
+    };
+    let mut startup = crate::startup::heap_future(|| async {
+        Box::new(
+            crate::startup::Startup::init(
+                cli,
+                cfg.clone(),
+                paths.clone(),
+                workspace.clone(),
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap(),
+        )
+    })
+    .await;
+    crate::startup::heap_future(|| startup.init_features())
+        .await
+        .unwrap();
+    crate::startup::heap_future(|| startup.resolve_prompts())
+        .await
+        .unwrap();
+    let error = crate::startup::heap_future(|| startup.dispatch())
+        .await
+        .expect_err("pressure ends the native turn at the boundary");
+    crate::session::lock::release_session(&sid);
+    let full = error
+        .downcast_ref::<crate::agent::runner::NativeContextFull>()
+        .unwrap_or_else(|| panic!("not a clean context-full stop: {error:#}"));
+    assert!(full.pressure > 0.00001);
+    assert!(error.to_string().contains(&sid), "{error}");
+    assert!(
+        !format!("{error:#}").contains("ProviderError")
+            && error.to_string().contains("Start a fresh context"),
+        "an explicit stop, not a provider error: {error}"
+    );
+    assert_eq!(wire.finish().len(), 1, "no request after the boundary");
+    let sessions = crate::paths::WorkspaceBinding::capture(&paths.sessions_dir()).unwrap();
+    let saved = crate::session::storage::load_session_exact_read_only(&sessions, &sid, &workspace)
+        .unwrap()
+        .unwrap();
+    assert!(
+        saved
+            .messages
+            .iter()
+            .any(|row| row.content.contains("boundary read")),
+        "the completed tool result is saved"
+    );
+}
+
 #[tokio::test]
 async fn effort46_live_gateway_uses_gateway_reasoning_and_native_unsupported_has_zero_http() {
     #[cfg(feature = "hooks")]

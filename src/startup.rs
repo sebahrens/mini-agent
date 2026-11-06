@@ -847,6 +847,20 @@ async fn compact_headless_session(
 ) -> anyhow::Result<(crate::event::UsageDelta, bool)> {
     let spend =
         crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Compaction);
+    // `compaction_model` swaps the summarizer model and its price profile.
+    let compaction_model = cfg.resolve_compaction_model(&session.provider);
+    let spend = match &compaction_model {
+        Some((alias, model)) => spend.for_model(
+            &session.provider,
+            model,
+            cfg,
+            Some(alias),
+            None,
+            crate::spend::RequestKind::Compaction,
+        ),
+        None => spend,
+    };
+    let compaction_model = compaction_model.map(|(_, model)| model);
     let observed = crate::spend::run::UsageObserver::with_run(spend.clone());
     let request_observer = observed.clone();
     let compacted = compact_headless_session_with_force(
@@ -862,8 +876,9 @@ async fn compact_headless_session(
                 crate::extras::hooks::dispatch_pre_compact(true, instructions)
             })
             .await;
+            let model = compaction_model.unwrap_or(model);
             client
-                .compress_messages_observed(
+                .compress_messages_observed_with_timeout(
                     &model,
                     &messages,
                     previous_summary.as_deref(),
@@ -872,6 +887,7 @@ async fn compact_headless_session(
                     response_token_budget,
                     &cfg.retry,
                     request_observer,
+                    cfg.resolve_compaction_timeout(),
                 )
                 .await
         },
@@ -3061,17 +3077,26 @@ impl Startup {
         } = self;
 
         crate::update::spawn_startup_notice(&cli, &cfg, is_interactive, &paths.state_dir);
-        if let Some(days) = cfg.session_retention_days.filter(|days| *days > 0) {
-            // The current session is already claimed, so it is never pruned.
-            std::thread::spawn(move || {
-                if let Err(error) = crate::session::storage::prune_sessions_older_than(
+        let retention_days = cfg.session_retention_days.filter(|days| *days > 0);
+        // The current session is already claimed, so it is never pruned.
+        std::thread::spawn(move || {
+            if let Some(days) = retention_days
+                && let Err(error) = crate::session::storage::prune_sessions_older_than(
                     days,
                     std::time::SystemTime::now(),
-                ) {
-                    tracing::warn!("session retention skipped: {error:#}");
-                }
-            });
-        }
+                )
+            {
+                tracing::warn!("session retention skipped: {error:#}");
+            }
+            // Directories of deleted/never-saved sessions are not covered by
+            // retention; sweep those that have been idle for a long time.
+            if let Err(error) = crate::session::storage::sweep_orphan_tool_outputs(
+                std::time::SystemTime::now(),
+                crate::session::storage::ORPHAN_TOOL_OUTPUT_GRACE,
+            ) {
+                tracing::warn!("orphan tool-output sweep skipped: {error:#}");
+            }
+        });
         // Creating a context-file template is a filesystem setup action, not
         // permission to start an agent turn. Only an explicit CLI message may
         // auto-trigger interactive execution.
@@ -3475,17 +3500,45 @@ async fn run_bound_headless_round(
     }
     let history = binding.history();
     owner.binding = Some(binding);
+    // Provider-native replay history cannot be summarized in place (its signed
+    // thinking blocks and tool_use/tool_result pairing must replay verbatim),
+    // so pressure at a tool-batch boundary ends the turn cleanly instead of
+    // running into a provider context error (mini-agent-q3ki6).
+    let mid_turn = (cfg.resolve_compact_enabled() && session.context_window > 0)
+        .then(|| cfg.resolve_mid_turn_compact_threshold())
+        .flatten()
+        .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
+            window: session.context_window,
+            threshold,
+            anthropic_native: cfg.is_anthropic_native(&session.provider),
+        });
     let mut turn = heap_future(|| {
-        agent.run_print_with_output(
-            message,
-            output,
-            &cfg.retry,
-            history,
-            #[cfg(feature = "hooks")]
-            loop_info,
+        crate::agent::runner::with_headless_mid_turn(
+            mid_turn,
+            agent.run_print_with_output(
+                message,
+                output,
+                &cfg.retry,
+                history,
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
         )
     })
     .await;
+    if let Some(boundary) = turn.failure.as_ref().and_then(|error| {
+        error
+            .downcast_ref::<crate::agent::runner::MidTurnCompactionBoundary>()
+            .copied()
+    }) {
+        turn.failure = Some(
+            crate::agent::runner::NativeContextFull {
+                pressure: boundary.pressure,
+                session_id: session.id.to_string(),
+            }
+            .into(),
+        );
+    }
     // The producer returned only after its exact model and scoped effects joined.
     owner.outcome = if turn.failure.is_none() {
         RetiredNativeOutcome::Completed
@@ -3493,7 +3546,12 @@ async fn run_bound_headless_round(
         error
             .downcast_ref::<crate::question::QuestionRequired>()
             .is_some()
+            || error
+                .downcast_ref::<crate::agent::runner::NativeContextFull>()
+                .is_some()
     }) {
+        // A question or a context-full stop both end exactly at a complete
+        // tool reply, which the native history keeps verbatim.
         RetiredNativeOutcome::LiveToolReply
     } else {
         RetiredNativeOutcome::Incomplete

@@ -278,6 +278,16 @@ pub struct Config {
     /// named entry's endpoint (mini-agent-3wsib).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_title_model: Option<CompactString>,
+    /// A `quick_models` entry (same provider as the session) whose model runs
+    /// context compaction summaries instead of the session model, e.g. a
+    /// faster or cheaper one. Unset uses the session model. Sensitive like any
+    /// model selection: the conversation is summarized by that model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<CompactString>,
+    /// Seconds one compaction summarizer request may run (1-7200). Unset
+    /// scales a 300 s base with the summarizer input size, up to 1800 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_timeout_secs: Option<u64>,
     /// Wall-clock bound for one verification attempt. Default: 300 seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_timeout_secs: Option<u64>,
@@ -1289,6 +1299,32 @@ impl Config {
     pub fn resolve_max_edit_file_size(&self) -> u64 {
         self.max_edit_file_size
             .unwrap_or_else(|| DEFAULT_MAX_EDIT_FILE_SIZE.max(self.max_text_file_size.unwrap_or(0)))
+    }
+
+    /// Per-request compaction summarizer timeout: `compaction_timeout_secs`
+    /// (clamped to 1-7200) or `None` for the input-size-scaled default.
+    pub fn resolve_compaction_timeout(&self) -> Option<std::time::Duration> {
+        self.compaction_timeout_secs
+            .map(|secs| std::time::Duration::from_secs(secs.clamp(1, 7200)))
+    }
+
+    /// The `(alias, model)` configured by `compaction_model` when it names a
+    /// `quick_models` entry on the session's provider. Another provider's
+    /// entry cannot reuse the session's client, so it is ignored with a warning.
+    pub fn resolve_compaction_model(&self, provider: &str) -> Option<(String, String)> {
+        let alias = self.compaction_model.as_deref()?.trim();
+        if alias.is_empty() {
+            return None;
+        }
+        let Some(entry) = load::quick_models_map(self).get(alias) else {
+            tracing::warn!(model = %alias, "unknown compaction_model; compacting with the session model");
+            return None;
+        };
+        if entry.provider.as_str() != provider {
+            tracing::warn!(model = %alias, "compaction_model must use the session's provider; compacting with the session model");
+            return None;
+        }
+        Some((alias.to_owned(), entry.model.to_string()))
     }
 
     /// Post-edit formatter timeout, clamped to 1-600 seconds.
@@ -2740,5 +2776,29 @@ mod agent_mention_tool_choice_tests {
         ] {
             assert!(toml::from_str::<Config>(source).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn compaction_timeout_and_model_resolve_with_bounds_and_provider_check() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.resolve_compaction_timeout(), None);
+        assert_eq!(cfg.resolve_compaction_model("openai"), None);
+        let cfg: Config = toml::from_str(
+            "compaction_timeout_secs = 99999\ncompaction_model = 'fast'\n\
+             [quick_models.fast]\nprovider = 'openai'\nmodel = 'small'\n\
+             [quick_models.other]\nprovider = 'anthropic'\nmodel = 'x'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_compaction_timeout(),
+            Some(std::time::Duration::from_secs(7200))
+        );
+        assert_eq!(
+            cfg.resolve_compaction_model("openai"),
+            Some(("fast".into(), "small".into()))
+        );
+        assert_eq!(cfg.resolve_compaction_model("anthropic"), None);
+        let cfg: Config = toml::from_str("compaction_model = 'missing'").unwrap();
+        assert_eq!(cfg.resolve_compaction_model("openai"), None);
     }
 }

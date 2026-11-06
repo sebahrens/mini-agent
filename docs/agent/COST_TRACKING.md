@@ -194,7 +194,16 @@ receipt or return a successful summary. Append acknowledgement still follows
 fsync and retained-identity validation. This changes neither the contention
 budget nor the owned blocking-I/O boundary.
 
-Reads are limited to 64 MiB, 65,536 records and 4 KiB per record. Pending receipts
+Reads of one segment are limited to 64 MiB, 65,536 records and 4 KiB per record.
+A full active segment is rotated, not refused: under the writer lock `usage.jsonl` is
+renamed to `usage.<10-digit sequence>.archive.jsonl` and its all-time, per-model,
+per-session (up to 4,096 sessions) and last-day totals are folded into the private
+sidecar `usage.rollup`, which every summary (`/cost`, session budget reconciliation)
+adds back, so all-time totals stay exact. A rotation that crashed between the rename
+and the rollup write is completed by the next writer. Archives are an audit trail only
+and may be deleted or moved; deleting `usage.rollup` forgets rolled-up history. Receipt
+IDs are only de-duplicated within a segment. If rotation itself fails, the error names
+the ledger (not the budget) and the remediation. Pending receipts
 are limited to 1,024; detailed model aggregates to 128 identities. Receipt token
 counts are capped at 10^15 per field and cost/aggregate amounts at 10^18 USD.
 Corrupt rows, duplicate IDs, crash tails, identity conflicts and capacity failures

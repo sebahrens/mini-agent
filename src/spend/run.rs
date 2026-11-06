@@ -30,6 +30,9 @@ pub(crate) struct Run {
     cache_ttl: crate::config::PromptCacheTtl,
     cap_required: bool,
     refused: Arc<std::sync::atomic::AtomicBool>,
+    /// Why the last ledger flush failed, so a capped run that stops because
+    /// spend cannot be recorded says so instead of claiming the budget ran out.
+    tracking_detail: Arc<std::sync::Mutex<Option<String>>>,
     sdk_request: Arc<std::sync::Mutex<std::sync::Weak<SdkRequest>>>,
     accepted_usage: Arc<std::sync::Mutex<UsageDelta>>,
     #[cfg(feature = "subagents")]
@@ -63,6 +66,7 @@ impl Run {
             cache_ttl: Default::default(),
             cap_required,
             refused: Default::default(),
+            tracking_detail: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
             #[cfg(feature = "subagents")]
@@ -169,6 +173,7 @@ impl Run {
             setup_error: initialization_error.or(setup_error),
             cap_required: cfg.max_budget_usd.is_some(),
             refused: Default::default(),
+            tracking_detail: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
             #[cfg(feature = "subagents")]
@@ -218,6 +223,7 @@ impl Run {
             setup_error,
             cap_required: cfg.max_budget_usd.is_some(),
             refused: Default::default(),
+            tracking_detail: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
             #[cfg(feature = "subagents")]
@@ -251,6 +257,7 @@ impl Run {
             cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(provider),
             refused: Default::default(),
+            tracking_detail: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
             ..self.clone()
@@ -264,6 +271,7 @@ impl Run {
     pub(crate) fn for_invocation(&self) -> Self {
         Self {
             refused: Default::default(),
+            tracking_detail: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
             ..self.clone()
@@ -333,6 +341,7 @@ impl Run {
             cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(provider),
             refused: Default::default(),
+            tracking_detail: Default::default(),
             sdk_request: Default::default(),
             accepted_usage: Default::default(),
             ..self.clone()
@@ -379,6 +388,22 @@ impl Run {
     pub(crate) fn current() -> Option<Self> {
         CURRENT.try_with(Clone::clone).ok().flatten()
     }
+    /// `BudgetStopped`, with the ledger failure spelled out when spend could
+    /// not be recorded (the downcast and the budget text are unchanged).
+    fn stopped(&self) -> anyhow::Error {
+        let detail = self
+            .tracking_detail
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        match detail {
+            Some(detail) if self.account.snapshot().tracking_error => anyhow::Error::from(BudgetStopped)
+                .context(format!(
+                    "cost tracking failed ({detail}), so a capped run cannot continue; no budget was necessarily spent ({BUDGET_STOP})"
+                )),
+            _ => BudgetStopped.into(),
+        }
+    }
     pub(crate) fn admit(&self) -> anyhow::Result<()> {
         if self.cap_required && self.setup_error.is_some() {
             self.refused
@@ -388,7 +413,7 @@ impl Run {
         self.account.admit(self.prices).map_err(|_| {
             self.refused
                 .store(true, std::sync::atomic::Ordering::Release);
-            anyhow::Error::from(BudgetStopped)
+            self.stopped()
         })
     }
     pub(crate) fn admit_effect(&self) -> anyhow::Result<()> {
@@ -400,7 +425,7 @@ impl Run {
         self.account.admit_effect().map_err(|_| {
             self.refused
                 .store(true, std::sync::atomic::Ordering::Release);
-            anyhow::Error::from(BudgetStopped)
+            self.stopped()
         })
     }
     pub(crate) async fn admit_effect_ready(&self) -> anyhow::Result<()> {
@@ -474,7 +499,15 @@ impl Run {
         .await;
         if !matches!(result, Ok(Ok(()))) {
             self.account.tracking_failed();
-            tracing::warn!("cost tracking incomplete: observed usage remains in memory");
+            let detail = match &result {
+                Ok(Err(error)) => error.to_string(),
+                _ => "usage ledger write did not complete".to_owned(),
+            };
+            tracing::warn!(%detail, "cost tracking incomplete: observed usage remains in memory");
+            *self
+                .tracking_detail
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(detail);
         }
     }
     pub(crate) async fn prepare(&self) -> anyhow::Result<()> {

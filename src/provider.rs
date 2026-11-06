@@ -148,7 +148,6 @@ use crate::session::SessionMessage;
 
 const MAX_COMPACTION_REQUESTS: usize = 16;
 const MAX_ROLLING_SUMMARY_BYTES: usize = 16 * 1024;
-const COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
 const PROVIDER_ENVELOPE_TOKEN_RESERVE: u64 = 512;
 const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 256;
 const MAX_SUMMARY_OUTPUT_TOKENS: u64 = 4_096;
@@ -1340,6 +1339,41 @@ impl AnyClient {
         retry_config: &RetryConfig,
         observed: crate::spend::run::UsageObserver,
     ) -> anyhow::Result<CompactionOutput> {
+        self.compress_messages_observed_with_timeout(
+            model_name,
+            messages,
+            previous_summary,
+            instructions,
+            input_token_budget,
+            response_token_budget,
+            retry_config,
+            observed,
+            None,
+        )
+        .await
+    }
+
+    /// As [`Self::compress_messages_observed`], with an explicit per-request
+    /// timeout (`compaction_timeout_secs`); `None` scales the default with the
+    /// summarizer input size.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Preserves existing compaction inputs and adds the per-request timeout"
+    )]
+    pub(crate) async fn compress_messages_observed_with_timeout(
+        &self,
+        model_name: &str,
+        messages: &[SessionMessage],
+        previous_summary: Option<&str>,
+        instructions: Option<&str>,
+        input_token_budget: u64,
+        response_token_budget: u64,
+        retry_config: &RetryConfig,
+        observed: crate::spend::run::UsageObserver,
+        request_timeout: Option<Duration>,
+    ) -> anyhow::Result<CompactionOutput> {
+        let request_timeout = request_timeout
+            .unwrap_or_else(|| default_compaction_request_timeout(input_token_budget));
         let preamble = summarizer_preamble();
         // Without a provider tokenizer, one UTF-8 byte per configured token is
         // the provider-neutral conservative fallback. `input_token_budget`
@@ -1351,23 +1385,26 @@ impl AnyClient {
         let summary_byte_cap =
             rolling_summary_byte_cap(input_token_budget.saturating_add(response_token_budget));
 
-        tokio::time::timeout(
-            COMPACTION_TIMEOUT,
-            compress_messages_with_capped(
-                messages,
-                previous_summary,
-                instructions,
-                prompt_budget,
-                summary_byte_cap,
-                |summary_prompt| {
-                    let preamble = preamble.clone();
-                    let retry_config = retry_config.clone();
-                    let observed = observed.clone();
-                    async move {
-                        let model = self.completion_model_with_cache_ttl(
-                            model_name.to_string(),
-                            observed.cache_ttl(),
-                        );
+        // The timeout bounds each rolling request, not the whole reduction: a
+        // large window needs many long requests, and a slow model must not make
+        // compaction fail at exactly the moment it is needed.
+        compress_messages_with_capped(
+            messages,
+            previous_summary,
+            instructions,
+            prompt_budget,
+            summary_byte_cap,
+            |summary_prompt| {
+                let preamble = preamble.clone();
+                let retry_config = retry_config.clone();
+                let observed = observed.clone();
+                async move {
+                    let model = self.completion_model_with_cache_ttl(
+                        model_name.to_string(),
+                        observed.cache_ttl(),
+                    );
+                    tokio::time::timeout(
+                        request_timeout,
                         summarize_with_model(
                             model,
                             summary_prompt,
@@ -1375,16 +1412,27 @@ impl AnyClient {
                             max_output_tokens,
                             retry_config,
                             observed,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Compression request timed out after {} seconds; raise `compaction_timeout_secs`",
+                            request_timeout.as_secs()
                         )
-                        .await
-                        .map(|(summary, usage)| (summary, usage.into()))
-                    }
-                },
-            ),
+                    })?
+                    .map(|(summary, usage)| (summary, usage.into()))
+                }
+            },
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Compression timed out after 300 seconds"))?
     }
+}
+
+/// Default per-request compaction timeout: 300 s plus one second per 2,000
+/// tokens of summarizer input, so a 1M-token window gets 800 s; at most 1800 s.
+fn default_compaction_request_timeout(input_token_budget: u64) -> Duration {
+    Duration::from_secs((300 + input_token_budget / 2_000).min(1_800))
 }
 
 /// What one compaction produced: the summary, how many leading messages of the
@@ -2053,6 +2101,23 @@ async fn summarize_with_model(
     }
 }
 
+/// A summarizer request that failed after its stream began: how long to wait
+/// before restarting just that request, or a failure that is not retried.
+enum SummarizerFailure {
+    Retry(Duration, anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SummarizerFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+/// One rolling summarizer request. Errors that arrive after the first stream
+/// item are retried within `retry_config` by restarting only this request
+/// (the prompt already carries the prior rolling summary), so a transient
+/// reset late in a long summary does not discard the earlier requests' work.
 async fn run_summarizer<M>(
     model: M,
     prompt: String,
@@ -2065,6 +2130,61 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    let config = retry_config.bounded();
+    let max_backoff = Duration::from_millis(config.max_backoff_ms);
+    let mut backoff = Duration::from_millis(config.initial_backoff_ms);
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match run_summarizer_attempt(
+            &model,
+            &prompt,
+            &preamble,
+            max_output_tokens,
+            retry_config,
+            &observed,
+            |error| {
+                (attempt < config.max_attempts && retry::is_retryable(error)).then(|| {
+                    retry::retry_delay_for_error_with_hint_ceiling(
+                        backoff,
+                        max_backoff,
+                        config.hint_ceiling(),
+                        error,
+                    )
+                })
+            },
+        )
+        .await
+        {
+            Ok(done) => return Ok(done),
+            Err(SummarizerFailure::Fatal(error)) => return Err(error),
+            Err(SummarizerFailure::Retry(delay, error)) => {
+                tracing::warn!(
+                    "compaction request retry {attempt}/{} in {:.1}s after mid-stream error: {error}",
+                    config.max_attempts,
+                    delay.as_secs_f64()
+                );
+                tokio::time::sleep(delay).await;
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+async fn run_summarizer_attempt<M>(
+    model: &M,
+    prompt: &str,
+    preamble: &str,
+    max_output_tokens: u64,
+    retry_config: &RetryConfig,
+    observed: &crate::spend::run::UsageObserver,
+    midstream_delay: impl Fn(&rig::completion::CompletionError) -> Option<Duration>,
+) -> Result<(String, rig::completion::Usage), SummarizerFailure>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    let (prompt, preamble, observed) = (prompt.to_owned(), preamble.to_owned(), observed.clone());
     use futures::{StreamExt, TryStreamExt};
     use rig::completion::GetTokenUsage;
     use rig::streaming::StreamedAssistantContent;
@@ -2131,10 +2251,9 @@ where
     while let Some(item) = stream.next().await {
         match item {
             Ok(StreamedAssistantContent::Text(text)) => {
-                anyhow::ensure!(
-                    response.len().saturating_add(text.text.len()) <= 64 * 1024,
-                    "Compression output exceeds byte budget"
-                );
+                if response.len().saturating_add(text.text.len()) > 64 * 1024 {
+                    return Err(anyhow::anyhow!("Compression output exceeds byte budget").into());
+                }
                 response.push_str(&text.text);
             }
             Ok(StreamedAssistantContent::Final(raw)) => {
@@ -2149,19 +2268,25 @@ where
                 StreamedAssistantContent::ToolCall { .. }
                 | StreamedAssistantContent::ToolCallDelta { .. },
             ) => unexpected_tool = true,
-            Err(error) => return Err(anyhow::anyhow!("Compression failed: {error}")),
+            Err(error) => {
+                let failure = anyhow::anyhow!("Compression failed: {error}");
+                return Err(match midstream_delay(&error) {
+                    Some(delay) => SummarizerFailure::Retry(delay, failure),
+                    None => SummarizerFailure::Fatal(failure),
+                });
+            }
             _ => {}
         }
     }
-    anyhow::ensure!(
-        finished,
-        "Compression stream ended without a final response"
-    );
-    anyhow::ensure!(
-        !unexpected_tool,
-        "Compression returned an unexpected tool call"
-    );
-    anyhow::ensure!(!response.is_empty(), "Compression returned empty response");
+    if !finished {
+        return Err(anyhow::anyhow!("Compression stream ended without a final response").into());
+    }
+    if unexpected_tool {
+        return Err(anyhow::anyhow!("Compression returned an unexpected tool call").into());
+    }
+    if response.is_empty() {
+        return Err(anyhow::anyhow!("Compression returned empty response").into());
+    }
     Ok((response, usage))
 }
 

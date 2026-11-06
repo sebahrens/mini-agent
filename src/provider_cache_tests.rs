@@ -736,3 +736,85 @@ async fn memoized_tool_definitions_are_shared_across_requests_with_identical_wir
         serde_json::to_string(&legacy).unwrap()
     );
 }
+
+/// mini-agent-ql5pg: a turn that adds 20+ content blocks outruns Anthropic's
+/// 20-block cache lookback, so five-minute caching adds breakpoints behind the
+/// tail (within the 4-marker budget) instead of a single moving tail marker.
+#[tokio::test]
+async fn cache_ql5pg_long_tool_turns_keep_a_breakpoint_inside_the_lookback_window() {
+    use crate::config::PromptCacheTtl;
+    use rig::message::{AssistantContent, Message, ToolCall, ToolFunction, UserContent};
+    let response = json!({"id":"msg_bp","type":"message","role":"assistant","content":[{"type":"text","text":"done"}],"model":"claude-opus-5-5","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":2}}).to_string();
+    let wire = Wire::new(vec![(false, response)]);
+    let AnyModel::Anthropic(model) = wire
+        .client()
+        .completion_model_with_cache_ttl("claude-opus-5-5", PromptCacheTtl::FiveMinutes)
+    else {
+        unreachable!()
+    };
+    // Two earlier turns of ten parallel calls: 2 * (1 + 10 + 10) = 42 blocks.
+    let mut history = Vec::new();
+    for turn in 0..2 {
+        history.push(Message::user(format!("prompt {turn}")));
+        let calls = (0..10).map(|call| {
+            AssistantContent::ToolCall(ToolCall::new(
+                format!("call-{turn}-{call}"),
+                ToolFunction::new("read".into(), json!({})),
+            ))
+        });
+        history.push(Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::many(calls).unwrap(),
+        });
+        let results = (0..10).map(|call| {
+            UserContent::tool_result(
+                format!("call-{turn}-{call}"),
+                rig::OneOrMany::one(rig::message::ToolResultContent::text("ok")),
+            )
+        });
+        history.push(Message::User {
+            content: rig::OneOrMany::many(results).unwrap(),
+        });
+    }
+    let request = model
+        .completion_request("next prompt")
+        .preamble("stable system".to_string())
+        .messages(history)
+        .max_tokens(1000)
+        .build();
+    model.completion(request).await.unwrap();
+    let requests = wire.finish();
+    let messages = requests[0]["messages"].as_array().unwrap();
+    let mut flat = 0usize;
+    let mut marked = Vec::new();
+    for message in messages {
+        for block in message["content"].as_array().unwrap() {
+            if block.get("cache_control").is_some() {
+                marked.push(flat);
+            }
+            flat += 1;
+        }
+    }
+    // System takes one of the four markers, leaving three for messages.
+    assert_eq!(
+        requests[0]["system"][0]["cache_control"],
+        json!({"type":"ephemeral"})
+    );
+    assert_eq!(
+        *marked.last().unwrap(),
+        flat - 1,
+        "tail breakpoint stays: {marked:?}"
+    );
+    assert!(
+        marked.len() >= 2,
+        "a second breakpoint behind the tail: {marked:?}"
+    );
+    assert!(
+        marked.len() <= 3,
+        "never more than the 4-marker budget: {marked:?}"
+    );
+    assert!(
+        marked.windows(2).all(|pair| pair[1] - pair[0] <= 20),
+        "breakpoints are within the 20-block lookback of each other: {marked:?}"
+    );
+}

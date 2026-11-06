@@ -80,6 +80,40 @@ impl Totals {
         );
         Ok(())
     }
+    /// Fold another accumulator (a rolled-up archive segment) into this one.
+    fn merge(&mut self, other: &Totals) -> anyhow::Result<()> {
+        macro_rules! add {
+            ($field:ident) => {
+                self.$field = self
+                    .$field
+                    .checked_add(other.$field)
+                    .ok_or_else(|| anyhow::anyhow!("usage ledger token total exceeds limits"))?;
+            };
+        }
+        add!(input_tokens);
+        add!(output_tokens);
+        add!(cached_input_tokens);
+        self.cache_creation = rig::completion::CacheCreationUsage::add_optional(
+            self.cache_creation_input_tokens,
+            self.cache_creation,
+            other.cache_creation_input_tokens,
+            other.cache_creation,
+        );
+        add!(cache_creation_input_tokens);
+        self.records = self.records.saturating_add(other.records);
+        self.unpriced_records = self.unpriced_records.saturating_add(other.unpriced_records);
+        self.unreported_records = self
+            .unreported_records
+            .saturating_add(other.unreported_records);
+        self.unpriced_tokens = self.unpriced_tokens.saturating_add(other.unpriced_tokens);
+        self.missing_usage |= other.missing_usage;
+        self.known_cost += other.known_cost;
+        anyhow::ensure!(
+            self.known_cost.is_finite() && self.known_cost <= MAX_RECEIPT_USD,
+            "usage ledger cost total exceeds limits"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -217,6 +251,9 @@ pub(crate) struct Ledger {
     /// file identity, length and modification time it was taken at. Read and
     /// replaced under the writer lock only.
     flush_cache: Mutex<Option<FlushCache>>,
+    /// Set once this process has folded any archive segment a crashed
+    /// rotation left unrolled (see [`Ledger::recover_unrolled`]).
+    recovered: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pre_sync_gate: Option<Arc<PreSyncGate>>,
     #[cfg(test)]
@@ -296,6 +333,7 @@ impl Ledger {
             directory: Mutex::new(None),
             io: Mutex::new(()),
             flush_cache: Mutex::new(None),
+            recovered: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             pre_sync_gate: PRE_SYNC_GATE.try_with(Clone::clone).ok(),
             #[cfg(test)]
@@ -460,7 +498,7 @@ impl Ledger {
             .lock()
             .map_err(|_| anyhow::anyhow!("usage ledger serialization failed"))?;
         let Some((file, binding)) = self.open(false)? else {
-            return Ok(LedgerSummary::default());
+            return self.with_rollup(LedgerSummary::default(), Some(session_id));
         };
         file.try_lock_shared()
             .map_err(|_| anyhow::anyhow!("usage ledger is busy"))?;
@@ -510,7 +548,7 @@ impl Ledger {
                 .recv_timeout(std::time::Duration::from_secs(3))
                 .expect("bounded summary test gate release");
         }
-        Ok(state.into_summary(session_id))
+        self.with_rollup(state.into_summary(session_id), Some(session_id))
     }
     /// The full session-only scan the checkpointed path must equal.
     #[cfg(test)]
@@ -530,7 +568,7 @@ impl Ledger {
             .lock()
             .map_err(|_| anyhow::anyhow!("usage ledger serialization failed"))?;
         let Some((file, binding)) = self.open(false)? else {
-            return Ok(LedgerSummary::default());
+            return self.with_rollup(LedgerSummary::default(), session_id);
         };
         file.try_lock_shared()
             .map_err(|_| anyhow::anyhow!("usage ledger is busy"))?;
@@ -551,7 +589,7 @@ impl Ledger {
                 .recv_timeout(std::time::Duration::from_secs(3))
                 .expect("bounded summary test gate release");
         }
-        Ok(scan.summary)
+        self.with_rollup(scan.summary, session_id)
     }
     /// Persist only parent-minted new receipts. A repeated flush observes each
     /// matching ID once; a conflicting ID or crash tail fails without repair.
@@ -655,6 +693,22 @@ impl Ledger {
         scan(file, None)
     }
     fn flush_rows(&self, account: &Account, pending: &[Arc<Row>]) -> anyhow::Result<()> {
+        // A full active segment is rotated away once; the batch is then
+        // appended to the fresh segment.
+        match self.flush_rows_once(account, pending, true)? {
+            FlushOutcome::Flushed => Ok(()),
+            FlushOutcome::Rotated => match self.flush_rows_once(account, pending, false)? {
+                FlushOutcome::Flushed => Ok(()),
+                FlushOutcome::Rotated => anyhow::bail!("usage ledger capacity reached"),
+            },
+        }
+    }
+    fn flush_rows_once(
+        &self,
+        account: &Account,
+        pending: &[Arc<Row>],
+        may_rotate: bool,
+    ) -> anyhow::Result<FlushOutcome> {
         let (file, binding) = self
             .open(true)?
             .ok_or_else(|| anyhow::anyhow!("usage ledger unavailable"))?;
@@ -663,6 +717,11 @@ impl Ledger {
         #[cfg(all(test, unix))]
         self.pause_lock_for_test(&file);
         Self::revalidate(&binding, &file)?;
+        if !self.recovered.load(std::sync::atomic::Ordering::Acquire) {
+            recover_unrolled(binding.root())?;
+            self.recovered
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let mut scanned = self.flush_scan(&binding, &mut file)?;
         // A receipt already in the checkpointed prefix has no fingerprint yet:
         // rescan fully so a conflicting duplicate fails exactly as before.
@@ -688,10 +747,18 @@ impl Ledger {
             }
             scanned.records += 1;
             scanned.bytes += bytes.len() + 1;
-            anyhow::ensure!(
-                scanned.records <= MAX_LEDGER_RECORDS && scanned.bytes <= MAX_LEDGER_BYTES,
-                "usage ledger capacity reached"
-            );
+            if scanned.records > MAX_LEDGER_RECORDS || scanned.bytes > MAX_LEDGER_BYTES {
+                anyhow::ensure!(may_rotate, "usage ledger capacity reached");
+                let records = scanned.records - 1;
+                self.rotate(&binding, &mut file).map_err(|error| {
+                    anyhow::anyhow!(
+                        "usage ledger is full ({records} records) and could not be rotated: {error}; \
+                         move usage.jsonl aside in the state directory (all-time totals are kept in \
+                         usage.rollup once rotated) and retry"
+                    )
+                })?;
+                return Ok(FlushOutcome::Rotated);
+            }
             scanned.summary.all_time.add(row)?;
             scanned.identities.insert(row.id, fingerprint);
             additions.push((row.id, bytes));
@@ -733,8 +800,397 @@ impl Ledger {
         if let Some(gate) = &self.pre_sync_gate {
             gate.completed();
         }
+        Ok(FlushOutcome::Flushed)
+    }
+    /// Archive the full, locked active segment as `usage.<seq>.archive.jsonl`
+    /// and fold its totals into `usage.rollup`, so all-time totals survive.
+    /// The rename happens before the rollup write; a crash in between leaves
+    /// an archive newer than the rollup, which [`recover_unrolled`] folds in
+    /// at the next writer's start (never double counted: the sequence stored
+    /// in the rollup names the last folded archive).
+    fn rotate(
+        &self,
+        binding: &crate::paths::WorkspaceBinding,
+        file: &mut File,
+    ) -> anyhow::Result<()> {
+        let root = binding.root();
+        let mut state = load_rollup(root)?.unwrap_or_default();
+        fold_segment(file, &mut state)?;
+        state.sequence = state
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("usage ledger archive sequence exhausted"))?;
+        let archive = root.join(archive_name(state.sequence));
+        anyhow::ensure!(
+            matches!(
+                std::fs::symlink_metadata(&archive),
+                Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "archive segment already exists"
+        );
+        Self::revalidate(binding, file)?;
+        std::fs::rename(root.join("usage.jsonl"), &archive)
+            .map_err(|error| anyhow::anyhow!("archive rename failed ({})", error.kind()))?;
+        *self
+            .flush_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        // The checkpoint is identity-bound to the archived file; drop it.
+        let _ = std::fs::remove_file(root.join(CHECKPOINT_FILE));
+        if let Err(error) = store_rollup(root, &state) {
+            // Leave the archive for recovery by the next flush.
+            self.recovered
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Err(error);
+        }
         Ok(())
     }
+    /// Merge the rolled-up totals of rotated segments into a summary.
+    fn with_rollup(
+        &self,
+        mut summary: LedgerSummary,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<LedgerSummary> {
+        let Some(parent) = self.path.parent() else {
+            return Ok(summary);
+        };
+        let Some(rollup) = load_rollup(parent)? else {
+            return Ok(summary);
+        };
+        rollup.apply(&mut summary, session_id)?;
+        Ok(summary)
+    }
+}
+
+enum FlushOutcome {
+    Flushed,
+    Rotated,
+}
+
+const ROLLUP_FILE: &str = "usage.rollup";
+const ROLLUP_VERSION: u32 = 1;
+const MAX_ROLLUP_BYTES: u64 = 16 * 1024 * 1024;
+
+fn archive_name(sequence: u64) -> String {
+    format!("usage.{sequence:010}.archive.jsonl")
+}
+
+fn archive_sequence(name: &str) -> Option<u64> {
+    let digits = name
+        .strip_prefix("usage.")?
+        .strip_suffix(".archive.jsonl")?;
+    (digits.len() == 10 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Totals of every rotated-away segment: enough to keep `/cost` all-time,
+/// per-model, per-session and "today" figures exact across rotations.
+#[derive(Debug, Default)]
+struct RollupState {
+    /// Highest archive sequence folded in.
+    sequence: u64,
+    all_time: Totals,
+    by_model: BTreeMap<(String, String), Totals>,
+    model_details_capped: bool,
+    sessions: BTreeMap<String, SessionTotals>,
+    /// More sessions than are tracked (or than fit the size limit): the
+    /// totals of the untracked ones are only in `all_time`.
+    sessions_dropped: bool,
+    last_day: Option<(chrono::NaiveDate, Totals)>,
+}
+
+impl RollupState {
+    fn add(&mut self, row: &Row) -> anyhow::Result<()> {
+        self.all_time.add(row)?;
+        let key = (row.provider.clone(), row.model.clone());
+        if self.by_model.contains_key(&key) || self.by_model.len() < MAX_MODEL_DETAILS {
+            self.by_model.entry(key).or_default().add(row)?;
+        } else {
+            self.model_details_capped = true;
+        }
+        if self.sessions.contains_key(&row.session_id)
+            || self.sessions.len() < MAX_CHECKPOINT_SESSIONS
+        {
+            self.sessions
+                .entry(row.session_id.clone())
+                .or_default()
+                .add(row)?;
+        } else {
+            self.sessions_dropped = true;
+        }
+        let day = row.ts.date_naive();
+        match &mut self.last_day {
+            Some((current, totals)) if *current == day => totals.add(row)?,
+            Some((current, _)) if *current > day => {}
+            _ => {
+                let mut totals = Totals::default();
+                totals.add(row)?;
+                self.last_day = Some((day, totals));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply(&self, summary: &mut LedgerSummary, session_id: Option<&str>) -> anyhow::Result<()> {
+        summary.all_time.merge(&self.all_time)?;
+        if let Some((day, totals)) = &self.last_day
+            && *day == chrono::Utc::now().date_naive()
+        {
+            summary.today.merge(totals)?;
+        }
+        summary.model_details_capped |= self.model_details_capped;
+        for (key, totals) in &self.by_model {
+            if summary.by_model.contains_key(key) || summary.by_model.len() < MAX_MODEL_DETAILS {
+                summary
+                    .by_model
+                    .entry(key.clone())
+                    .or_default()
+                    .merge(totals)?;
+            } else {
+                summary.model_details_capped = true;
+            }
+        }
+        if let Some(session) = session_id.and_then(|id| self.sessions.get(id)) {
+            summary.session.merge(&session.totals)?;
+            summary.session_model_details_capped |= session.capped;
+            for (key, totals) in &session.by_model {
+                if summary.session_by_model.contains_key(key)
+                    || summary.session_by_model.len() < MAX_MODEL_DETAILS
+                {
+                    summary
+                        .session_by_model
+                        .entry(key.clone())
+                        .or_default()
+                        .merge(totals)?;
+                } else {
+                    summary.session_model_details_capped = true;
+                }
+            }
+            if let Some(last) = &session.last
+                && summary
+                    .last_session_request
+                    .as_ref()
+                    .is_none_or(|previous| {
+                        (last.timestamp, last.id) > (previous.timestamp, previous.id)
+                    })
+            {
+                summary.last_session_request = Some(last.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollupRecord {
+    version: u32,
+    sequence: u64,
+    all_time: TotalsRecord,
+    by_model: Vec<(String, String, TotalsRecord)>,
+    model_details_capped: bool,
+    sessions: Vec<SessionRecord>,
+    sessions_dropped: bool,
+    last_day: Option<(chrono::NaiveDate, TotalsRecord)>,
+}
+
+fn totals_by_model(
+    records: Vec<(String, String, TotalsRecord)>,
+) -> anyhow::Result<BTreeMap<(String, String), Totals>> {
+    let mut by_model = BTreeMap::new();
+    for (provider, model, totals) in records {
+        let totals = totals
+            .into_totals()
+            .ok_or_else(|| anyhow::anyhow!("usage ledger rollup is invalid"))?;
+        by_model.insert((provider, model), totals);
+    }
+    anyhow::ensure!(
+        by_model.len() <= MAX_MODEL_DETAILS,
+        "usage ledger rollup is invalid"
+    );
+    Ok(by_model)
+}
+
+fn load_rollup(dir: &Path) -> anyhow::Result<Option<RollupState>> {
+    let path = dir.join(ROLLUP_FILE);
+    let file = match crate::fs::open_private_file_checked(&path, crate::fs::PrivateFileAccess::Read)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("usage ledger rollup private validation failed"),
+    };
+    crate::fs::validate_private_file(&file)
+        .map_err(|_| anyhow::anyhow!("usage ledger rollup private validation failed"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_ROLLUP_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("usage ledger rollup is unreadable"))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_ROLLUP_BYTES,
+        "usage ledger rollup is invalid"
+    );
+    let record: RollupRecord = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("usage ledger rollup is invalid"))?;
+    anyhow::ensure!(
+        record.version == ROLLUP_VERSION && record.sessions.len() <= MAX_CHECKPOINT_SESSIONS,
+        "usage ledger rollup is invalid"
+    );
+    let invalid = || anyhow::anyhow!("usage ledger rollup is invalid");
+    let mut sessions = BTreeMap::new();
+    for record in record.sessions {
+        let session = SessionTotals {
+            totals: record.totals.into_totals().ok_or_else(invalid)?,
+            by_model: totals_by_model(record.by_model)?,
+            capped: record.capped,
+            last: record.last,
+        };
+        anyhow::ensure!(
+            sessions.insert(record.session_id, session).is_none(),
+            "usage ledger rollup is invalid"
+        );
+    }
+    Ok(Some(RollupState {
+        sequence: record.sequence,
+        all_time: record.all_time.into_totals().ok_or_else(invalid)?,
+        by_model: totals_by_model(record.by_model)?,
+        model_details_capped: record.model_details_capped,
+        sessions,
+        sessions_dropped: record.sessions_dropped,
+        last_day: match record.last_day {
+            Some((day, totals)) => Some((day, totals.into_totals().ok_or_else(invalid)?)),
+            None => None,
+        },
+    }))
+}
+
+fn rollup_record(state: &RollupState, with_sessions: bool) -> RollupRecord {
+    RollupRecord {
+        version: ROLLUP_VERSION,
+        sequence: state.sequence,
+        all_time: TotalsRecord::from(&state.all_time),
+        by_model: state
+            .by_model
+            .iter()
+            .map(|((provider, model), totals)| {
+                (provider.clone(), model.clone(), TotalsRecord::from(totals))
+            })
+            .collect(),
+        model_details_capped: state.model_details_capped,
+        sessions: if with_sessions {
+            state
+                .sessions
+                .iter()
+                .map(|(session_id, totals)| SessionRecord {
+                    session_id: session_id.clone(),
+                    totals: TotalsRecord::from(&totals.totals),
+                    by_model: totals
+                        .by_model
+                        .iter()
+                        .map(|((provider, model), totals)| {
+                            (provider.clone(), model.clone(), TotalsRecord::from(totals))
+                        })
+                        .collect(),
+                    capped: totals.capped,
+                    last: totals.last.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        sessions_dropped: state.sessions_dropped || !with_sessions,
+        last_day: state
+            .last_day
+            .as_ref()
+            .map(|(day, totals)| (*day, TotalsRecord::from(totals))),
+    }
+}
+
+fn store_rollup(dir: &Path, state: &RollupState) -> anyhow::Result<()> {
+    let mut bytes = serde_json::to_vec(&rollup_record(state, true))?;
+    if bytes.len() as u64 > MAX_ROLLUP_BYTES {
+        // Per-session detail is the only unbounded part; all-time stays exact.
+        bytes = serde_json::to_vec(&rollup_record(state, false))?;
+    }
+    crate::fs::private_atomic_write_sync(&dir.join(ROLLUP_FILE), &bytes)
+        .map_err(|_| anyhow::anyhow!("usage ledger rollup write failed"))?;
+    Ok(())
+}
+
+/// Parse and validate every row of a (locked or archived) segment into `state`.
+fn fold_segment(file: &mut File, state: &mut RollupState) -> anyhow::Result<()> {
+    let length = file.metadata()?.len();
+    anyhow::ensure!(
+        length <= MAX_LEDGER_BYTES as u64,
+        "usage ledger exceeds byte limit"
+    );
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LEDGER_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_LEDGER_BYTES,
+        "usage ledger exceeds byte limit"
+    );
+    anyhow::ensure!(
+        bytes.is_empty() || bytes.last() == Some(&b'\n'),
+        "usage ledger has an incomplete tail"
+    );
+    let mut seen = std::collections::HashSet::new();
+    let mut records = 0usize;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        records += 1;
+        anyhow::ensure!(
+            records <= MAX_LEDGER_RECORDS && line.len() <= MAX_ROW_BYTES && line.len() > 1,
+            "usage ledger record exceeds limits"
+        );
+        let row: Row = serde_json::from_slice(&line[..line.len() - 1])
+            .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
+        row.validate()
+            .map_err(|_| anyhow::anyhow!("usage ledger record is invalid"))?;
+        anyhow::ensure!(
+            seen.insert(row.id),
+            "usage ledger contains duplicate receipts"
+        );
+        state.add(&row)?;
+    }
+    Ok(())
+}
+
+/// Fold archive segments newer than the rollup (left by a rotation that
+/// crashed between the rename and the rollup write) into the rollup.
+fn recover_unrolled(dir: &Path) -> anyhow::Result<()> {
+    let mut found = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => anyhow::bail!("usage ledger directory unreadable"),
+    };
+    for entry in entries.flatten() {
+        if let Some(sequence) = entry.file_name().to_str().and_then(archive_sequence) {
+            found.push(sequence);
+        }
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    found.sort_unstable();
+    let mut state = load_rollup(dir)?.unwrap_or_default();
+    let mut changed = false;
+    let rolled = state.sequence;
+    for sequence in found.into_iter().filter(|sequence| *sequence > rolled) {
+        let path = dir.join(archive_name(sequence));
+        let mut file =
+            crate::fs::open_private_file_checked(&path, crate::fs::PrivateFileAccess::Read)
+                .map_err(|_| anyhow::anyhow!("usage ledger archive private validation failed"))?;
+        fold_segment(&mut file, &mut state)?;
+        state.sequence = sequence;
+        changed = true;
+    }
+    if changed {
+        store_rollup(dir, &state)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2033,5 +2489,96 @@ mod tests {
         std::fs::create_dir(&ledger.path).unwrap();
         assert!(ledger.summary().is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"private");
+    }
+
+    fn synthetic_full_ledger(state: &Path, rows: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for index in 0..rows {
+            let session = if index % 2 == 0 { "a" } else { "b" };
+            let receipt = one_receipt(session, 10 + (index as u64 % 7));
+            bytes.extend_from_slice(&serde_json::to_vec(receipt.row.as_ref()).unwrap());
+            bytes.push(b'\n');
+        }
+        crate::fs::private_atomic_create_sync(&state.join("usage.jsonl"), &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn full_ledger_rotates_and_keeps_all_time_session_and_model_totals() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-rotation");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let original = synthetic_full_ledger(&state, MAX_LEDGER_RECORDS);
+        let ledger = Ledger::new(&state);
+        let before = ledger.summary().unwrap();
+        assert_eq!(before.all_time.records, MAX_LEDGER_RECORDS);
+
+        // The 65,537th record no longer hits a permanent wall.
+        flush_receipt(&ledger, &one_receipt("a", 5)).unwrap();
+        assert_eq!(line_count(&ledger), 1, "fresh active segment");
+        assert_eq!(
+            std::fs::read(state.join(archive_name(1))).unwrap(),
+            original,
+            "the full segment is archived verbatim"
+        );
+        let after = ledger.summary().unwrap();
+        assert_eq!(after.all_time.records, MAX_LEDGER_RECORDS + 1);
+        assert_eq!(
+            after.all_time.input_tokens,
+            before.all_time.input_tokens + 5
+        );
+        assert!((after.all_time.known_cost - before.all_time.known_cost) > 0.0);
+        assert_eq!(
+            after.by_model[&("provider".into(), "model".into())].records,
+            MAX_LEDGER_RECORDS + 1
+        );
+        let session = ledger.summary_for_session("a").unwrap();
+        assert_eq!(session.session.records, MAX_LEDGER_RECORDS / 2 + 1);
+        let startup = ledger.session_summary("b").unwrap();
+        assert_eq!(startup.session.records, MAX_LEDGER_RECORDS / 2);
+        assert_eq!(startup.all_time.records, MAX_LEDGER_RECORDS + 1);
+        assert_eq!(after.today.records, MAX_LEDGER_RECORDS + 1);
+
+        // Appending keeps working, and a second ledger instance agrees.
+        flush_receipt(&ledger, &one_receipt("a", 6)).unwrap();
+        let fresh = Ledger::new(&state).summary().unwrap();
+        assert_eq!(fresh.all_time.records, MAX_LEDGER_RECORDS + 2);
+    }
+
+    #[test]
+    fn rotation_that_crashed_before_the_rollup_write_is_recovered_without_double_counting() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-rotation-recovery");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
+        let mut rng = Rng(7);
+        append_random_rows(&ledger, &mut rng, 12);
+        let before = ledger.summary().unwrap();
+        // Crash window: archive renamed, rollup never written.
+        std::fs::rename(state.join("usage.jsonl"), state.join(archive_name(1))).unwrap();
+        let fresh = Ledger::new(&state);
+        flush_receipt(&fresh, &one_receipt("a", 1)).unwrap();
+        flush_receipt(&fresh, &one_receipt("a", 1)).unwrap();
+        let after = fresh.summary().unwrap();
+        assert_eq!(after.all_time.records, before.all_time.records + 2);
+        assert_eq!(
+            Ledger::new(&state).summary().unwrap().all_time.records,
+            before.all_time.records + 2,
+            "recovered exactly once"
+        );
+    }
+
+    #[test]
+    fn corrupt_rollup_fails_closed_instead_of_dropping_history() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-rollup-corrupt");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
+        flush_receipt(&ledger, &one_receipt("a", 1)).unwrap();
+        crate::fs::private_atomic_write_sync(&state.join(ROLLUP_FILE), b"{\"version\":1").unwrap();
+        assert!(ledger.summary().is_err());
+        assert_eq!(archive_sequence("usage.0000000001.archive.jsonl"), Some(1));
+        assert_eq!(archive_sequence("usage.1.archive.jsonl"), None);
+        assert_eq!(archive_sequence("usage.00000000x1.archive.jsonl"), None);
     }
 }

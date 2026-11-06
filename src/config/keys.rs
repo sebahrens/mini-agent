@@ -180,6 +180,8 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("goal", "goal_checks").described("Commands that must exit zero before a goal may be reported complete.").shaped(ConfigShape::Strings),
     gated("goal", "goal_judge_model").described("A `quick_models` entry name to judge goal completion claims.").shaped(ConfigShape::String),
     key("session_title_model").described("A `quick_models` entry name that titles sessions for `--resume` and `/sessions` after their first exchange.").shaped(ConfigShape::String),
+    key("compaction_model").described("A `quick_models` entry (same provider as the session) that runs compaction summaries instead of the session model. Unset uses the session model.").shaped(ConfigShape::String),
+    key("compaction_timeout_secs").described("Seconds one compaction summarizer request may run (1-7200). Default: 300 scaled up with the summarizer input size, max 1800.").shaped(ConfigShape::Integer),
     key("verify_timeout_secs").described("Wall-clock bound for one verification attempt. Default: 300 seconds.").shaped(ConfigShape::Integer),
     key("verify_max_attempts").described("Total verification attempts within one agent turn. Default: 3; capped at 8 so a persistently failing command cannot loop indefinitely.").shaped(ConfigShape::Integer),
     key("max_text_file_size").shaped(ConfigShape::Integer),
