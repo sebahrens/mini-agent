@@ -1084,6 +1084,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let max_find_results = cfg.resolve_max_find_results();
         let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
         tools::limits::install(tools::limits::ToolLimits::from_config(cfg));
+        tools::concurrency::install_tool_concurrency(cfg.tool_concurrency);
         tools::limits::install_skip_dirs(
             cfg.tool_limits
                 .as_ref()

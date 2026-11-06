@@ -30,6 +30,8 @@ Notable changes to mini-agent are documented in this file. The format follows
   any stream it still cannot decode (`[page 3: content stream uses JBIG2Decode, not supported]`),
   and calls a PDF scanned only when its pages paint images and run no text operators
   (mini-agent-7qbtw).
+- New `tool_concurrency` setting (default 4, clamped to 1..=16) sets how many tool calls of one
+  model turn run at once; read/write lanes still serialize conflicting calls (mini-agent-poi3o).
 - `list_dir` pages through every entry of a flat directory (the 10,000-entry cap now applies only to
   depth 2-3 trees); `find_files` accepts `offset`/`limit` and names `continue with offset=N`.
 - `git` diff/show pages and `job_status` polls are self-bounded (git pages scale under

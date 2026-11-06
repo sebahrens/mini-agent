@@ -361,6 +361,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("session_retention_days").described("Delete saved sessions not modified for this many days at interactive startup (default 0: keep forever). Sessions open in a live process are never removed.").shaped(ConfigShape::Integer),
     gated("lsp", "lsp").shaped(ConfigShape::Object),
     gated("advisor", "advisor").shaped(ConfigShape::Object),
+    key("tool_concurrency").described("Tool calls of one model turn that run at once (default 4, clamped to 1..=16); reads and searches share, writes stay exclusive.").shaped(ConfigShape::Integer),
     key("tool_limits").described("Output and traversal bounds for built-in tools: result character backstop, read line width, search budgets.").shaped(ConfigShape::Object),
 ];
 
