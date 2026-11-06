@@ -599,24 +599,8 @@ impl GitTool {
         } else {
             command_result("status", STATUS_LIMITS, output).map_err(ToolError::Msg)?
         };
-        let mut stdout: &[u8] = &output.stdout;
-        if truncated {
-            // Keep only complete NUL-terminated records.
-            stdout = &stdout[..stdout
-                .iter()
-                .rposition(|byte| *byte == 0)
-                .map_or(0, |i| i + 1)];
-        }
-        let records = stdout
-            .split(|byte| *byte == 0)
-            .filter(|record| !record.is_empty())
-            .map(|record| String::from_utf8_lossy(record).into_owned())
-            .collect::<Vec<_>>();
-        let untracked_count = records.iter().filter(|r| r.starts_with("? ")).count();
-        let changed_count = records
-            .iter()
-            .filter(|r| matches!(r.as_bytes().first(), Some(b'1' | b'2' | b'u')))
-            .count();
+        let (records, changed_count, untracked_count) =
+            parse_status_records(&output.stdout, truncated);
         let mut value = serde_json::json!({
             "records": records,
             "truncated": truncated,
@@ -2000,6 +1984,52 @@ fn mutation_status(
     }
 }
 
+/// Split `git status --porcelain=v2 -z` output into entries. A rename/copy
+/// (`2 ...`) record is followed by its origin path as a separate NUL field
+/// with no type prefix; it is attached to the record as `\torig: <path>`
+/// rather than counted or listed as an entry of its own. When `truncated`,
+/// output is cut only at entry boundaries: an incomplete trailing field, or a
+/// rename record whose origin field is missing, is dropped.
+/// Returns `(entries, changed_count, untracked_count)`.
+fn parse_status_records(stdout: &[u8], truncated: bool) -> (Vec<String>, usize, usize) {
+    let mut fields: Vec<&[u8]> = stdout.split(|byte| *byte == 0).collect();
+    // The final element is what follows the last NUL: empty for complete
+    // output, a partial field when the output was cut.
+    let tail = fields.pop().unwrap_or(&[]);
+    if !truncated && !tail.is_empty() {
+        fields.push(tail);
+    }
+    let mut records = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let field = fields[index];
+        index += 1;
+        if field.is_empty() {
+            continue;
+        }
+        let mut record = String::from_utf8_lossy(field).into_owned();
+        if field.starts_with(b"2 ") {
+            match fields.get(index) {
+                Some(origin) => {
+                    record.push_str("\torig: ");
+                    record.push_str(&String::from_utf8_lossy(origin));
+                    index += 1;
+                }
+                // Origin field lost to truncation: drop the incomplete entry.
+                None if truncated => break,
+                None => {}
+            }
+        }
+        records.push(record);
+    }
+    let untracked = records.iter().filter(|r| r.starts_with("? ")).count();
+    let changed = records
+        .iter()
+        .filter(|r| matches!(r.as_bytes().first(), Some(b'1' | b'2' | b'u')))
+        .count();
+    (records, changed, untracked)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -2380,6 +2410,50 @@ mod tests {
 
         assert!(text.contains("Binary files"), "{text}");
         assert!(!text.contains("GIT binary patch"), "{text}");
+    }
+
+    #[test]
+    fn status_parser_attaches_rename_origin_and_cuts_at_entry_boundaries() {
+        use super::parse_status_records;
+        let out = b"1 .M N... 100644 100644 100644 a b x.txt\02 R. N... 100644 100644 100644 a b R100 new.txt\0u.rs\0? untracked\0";
+        let (records, changed, untracked) = parse_status_records(out, false);
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert!(records[1].ends_with("new.txt\torig: u.rs"), "{records:?}");
+        assert_eq!((changed, untracked), (2, 1));
+        // Cut between a rename record and its origin: the entry is dropped.
+        let cut = b"1 .M N... 100644 100644 100644 a b x.txt\02 R. N... 100644 100644 100644 a b R100 new.txt\0";
+        let (records, changed, _) = parse_status_records(cut, true);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(changed, 1);
+        // Cut inside a field: the partial field is dropped.
+        let (records, _, _) = parse_status_records(b"? a.txt\0? b.t", true);
+        assert_eq!(records, vec!["? a.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn status_does_not_count_rename_origin_paths_as_entries() {
+        for old in ["1.txt", "2024-report.md", "utils.rs"] {
+            let repo = TestRepo::new();
+            repo.write(old, "some content that is long enough to detect a rename\n");
+            repo.git(["add", "."]);
+            repo.git(["commit", "--quiet", "-m", "base"]);
+            repo.git(["mv", old, "renamed.txt"]);
+            let status = repo
+                .tool()
+                .call(args(GitOperation::Status, &[], None))
+                .await
+                .expect("status");
+            let records = status["records"].as_array().unwrap();
+            // Two `# branch.*` headers plus exactly one entry.
+            assert_eq!(records.len(), 3, "{old}: {status}");
+            assert_eq!(status["counts"]["changed"], 1, "{old}: {status}");
+            let record = records[2].as_str().unwrap();
+            assert!(record.starts_with("2 "), "{record}");
+            assert!(
+                record.ends_with(&format!("renamed.txt\torig: {old}")),
+                "{record}"
+            );
+        }
     }
 
     #[tokio::test]
