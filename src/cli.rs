@@ -997,6 +997,15 @@ pub struct Cli {
     )]
     pub mcp_server_allow_model_override: bool,
 
+    /// With `--mcp-server`: let each `run` call pick a `cwd` inside the workspace.
+    #[cfg(feature = "mcp")]
+    #[arg(
+        long = "mcp-server-allow-cwd-override",
+        requires = "mcp_server",
+        help = "With --mcp-server: let `run` calls choose a working directory inside the server's workspace (default: the workspace root only)"
+    )]
+    pub mcp_server_allow_cwd_override: bool,
+
     #[cfg(any(feature = "acp", feature = "loop"))]
     #[arg(
         long = "idle-exit",

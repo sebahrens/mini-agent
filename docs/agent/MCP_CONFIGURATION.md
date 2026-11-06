@@ -235,7 +235,13 @@ fifth is refused with error `-32000`. A persisted run reports its session id
 (`structuredContent.session_id` and a trailing `[session_id: …]` line); pass it
 back as `session_id` to continue that conversation (`--session` on the child).
 `--mcp-server-allow-model-override` (default off) adds a per-call `model`
-argument; without it `model` is rejected. The server owns the child's
+argument; without it `model` is rejected. `--mcp-server-allow-cwd-override`
+(default off) adds a per-call `cwd`: a directory inside the server's workspace
+(relative to its root). The path is canonicalised first, so `..` traversal,
+symlinks leaving the workspace, files and missing paths are refused; without
+the flag `cwd` is rejected. The child runs in that directory with the server's
+sandbox and permission flags unchanged (the sandbox is not narrowed to the
+subdirectory; relative paths in forwarded flags then resolve from it). The server owns the child's
 `--output`, so a forwarded `--output` is dropped. The server process itself runs no tools and opens no connections.
 `--mcp-server` cannot be combined with `-p`, a prompt, `--acp` or `--loop`.
 

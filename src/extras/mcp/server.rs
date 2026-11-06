@@ -17,7 +17,9 @@
 //! `progressToken` receive periodic `notifications/progress` heartbeats.
 //! `run` returns the child's session id and accepts it back (`session_id`) to
 //! continue that conversation. A per-call `model` override exists only when
-//! the server was started with `--mcp-server-allow-model-override`.
+//! the server was started with `--mcp-server-allow-model-override`, and a
+//! per-call `cwd` (a directory inside the server's workspace) only with
+//! `--mcp-server-allow-cwd-override`.
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -57,6 +59,11 @@ pub(crate) struct RunCommand {
     pub(crate) progress_interval: Duration,
     /// Whether `run` may select a model per call (default closed).
     pub(crate) allow_model_override: bool,
+    /// Whether `run` may select a working directory inside the workspace
+    /// per call (default closed).
+    pub(crate) allow_cwd_override: bool,
+    /// The server's own workspace; a per-call `cwd` must stay inside it.
+    pub(crate) workspace_root: PathBuf,
 }
 
 impl RunCommand {
@@ -69,7 +76,9 @@ impl RunCommand {
             args: forwarded_args(args.clone()),
             timeout: RUN_TIMEOUT,
             progress_interval: PROGRESS_INTERVAL,
-            allow_model_override: allows_model_override(&args),
+            allow_model_override: has_flag(&args, "--mcp-server-allow-model-override"),
+            allow_cwd_override: has_flag(&args, "--mcp-server-allow-cwd-override"),
+            workspace_root: std::env::current_dir()?,
         })
     }
 
@@ -99,15 +108,33 @@ pub(crate) fn forwarded_args(args: impl IntoIterator<Item = OsString>) -> Vec<Os
             .filter(|arg| {
                 arg.as_os_str() != "--mcp-server"
                     && arg.as_os_str() != "--mcp-server-allow-model-override"
+                    && arg.as_os_str() != "--mcp-server-allow-cwd-override"
             })
             .collect(),
         "--output",
     )
 }
 
-fn allows_model_override(args: &[OsString]) -> bool {
-    args.iter()
-        .any(|arg| arg.as_os_str() == "--mcp-server-allow-model-override")
+fn has_flag(args: &[OsString], flag: &str) -> bool {
+    args.iter().any(|arg| arg.as_os_str() == flag)
+}
+
+/// Resolve a per-call `cwd` to an existing directory inside `root`.
+/// Relative paths are taken from `root`; symlinks and `..` are resolved
+/// first, so a link or traversal that leaves the workspace is refused.
+fn resolve_cwd(root: &std::path::Path, requested: &str) -> Result<PathBuf, String> {
+    let refuse =
+        || "`cwd` must name an existing directory inside the server's workspace".to_string();
+    if requested.is_empty() || requested.len() > 4096 || requested.contains('\0') {
+        return Err(refuse());
+    }
+    let root = root.canonicalize().map_err(|_| refuse())?;
+    let resolved = root.join(requested).canonicalize().map_err(|_| refuse())?;
+    if resolved.is_dir() && resolved.starts_with(&root) {
+        Ok(resolved)
+    } else {
+        Err(refuse())
+    }
 }
 
 /// Remove `--flag value` and `--flag=value` occurrences.
@@ -138,6 +165,7 @@ struct RunRequest {
     prompt: String,
     session_id: Option<String>,
     model: Option<String>,
+    cwd: Option<PathBuf>,
 }
 
 fn valid_token(value: &str) -> bool {
@@ -180,10 +208,22 @@ fn parse_run_request(
                 .into(),
         );
     }
+    let cwd = match arguments.and_then(|args| args.get("cwd")) {
+        None | Some(Value::Null) => None,
+        Some(_) if !command.allow_cwd_override => {
+            return Err(
+                "per-call `cwd` is disabled; start the server with --mcp-server-allow-cwd-override"
+                    .into(),
+            );
+        }
+        Some(Value::String(value)) => Some(resolve_cwd(&command.workspace_root, value)?),
+        Some(_) => return Err("`cwd` must be a string".into()),
+    };
     Ok(RunRequest {
         prompt: prompt.to_owned(),
         session_id,
         model,
+        cwd,
     })
 }
 
@@ -194,6 +234,9 @@ fn run_tool_definition(command: &RunCommand) -> Value {
     });
     if command.allow_model_override {
         properties["model"] = json!({"type": "string", "description": "Model name for this call, overriding the server's"});
+    }
+    if command.allow_cwd_override {
+        properties["cwd"] = json!({"type": "string", "description": "Directory inside the server's workspace to run in (relative to the workspace root); defaults to the workspace root"});
     }
     json!({
         "name": "run",
@@ -329,6 +372,9 @@ async fn run_prompt(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if let Some(cwd) = &run.cwd {
+        child.current_dir(cwd);
+    }
     #[cfg(unix)]
     child.process_group(0);
     let mut child = match child.spawn_guarded() {
@@ -683,6 +729,8 @@ mod tests {
             timeout: Duration::from_secs(10),
             progress_interval: Duration::from_secs(60),
             allow_model_override: false,
+            allow_cwd_override: false,
+            workspace_root: std::env::temp_dir(),
         }
     }
 
@@ -900,6 +948,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cwd_override_is_default_closed_and_confined_to_the_workspace() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-mcp-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("ws");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("file"), "x").unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        // Default closed: not advertised, and any `cwd` is refused.
+        let mut closed = shell("pwd");
+        closed.workspace_root = root.clone();
+        let closed_replies = exchange(
+            closed,
+            &[
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                call(2, json!({"prompt":"p","cwd":"sub"})),
+            ],
+        )
+        .await;
+        assert!(
+            closed_replies[0]["result"]["tools"][0]["inputSchema"]["properties"]
+                .get("cwd")
+                .is_none()
+        );
+        assert_eq!(closed_replies[1]["error"]["code"], -32602);
+
+        // Opt-in: a subdirectory works; escapes, files and links are refused.
+        let mut open = shell("pwd");
+        open.allow_cwd_override = true;
+        open.workspace_root = root.clone();
+        let mut calls = vec![call(1, json!({"prompt":"p","cwd":"sub"}))];
+        let mut bad = vec![
+            json!("../outside"),
+            json!(outside.to_str().unwrap()),
+            json!("file"),
+            json!("missing"),
+            json!("sub/../../outside"),
+            json!(""),
+            json!(7),
+        ];
+        if cfg!(unix) {
+            bad.push(json!("link"));
+        }
+        let bad_count = bad.len();
+        for (i, cwd) in bad.into_iter().enumerate() {
+            calls.push(call(i as i64 + 2, json!({"prompt":"p","cwd":cwd})));
+        }
+        let replies = exchange(open, &calls).await;
+        let text = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            std::path::Path::new(text.trim()),
+            root.join("sub").canonicalize().unwrap()
+        );
+        assert_eq!(replies.len(), bad_count + 1);
+        assert!(
+            replies[1..].iter().all(|r| r["error"]["code"] == -32602),
+            "{replies:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
     async fn concurrent_runs_beyond_the_limit_are_refused_not_queued() {
         let requests: Vec<Value> = (1..=(MAX_CONCURRENT_RUNS as i64 + 1))
             .map(|i| call(i, json!({"prompt":"x"})))
@@ -920,6 +1039,7 @@ mod tests {
                 "text",
                 "--mcp-server",
                 "--mcp-server-allow-model-override",
+                "--mcp-server-allow-cwd-override",
                 "--output=json",
                 "--read-only",
             ]

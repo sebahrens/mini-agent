@@ -112,7 +112,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   `notifications/progress` heartbeats every 15 s, and up to 4 runs may overlap (a fifth is refused,
   not queued). `run` now returns the child's session id (also as `structuredContent.session_id`) and
   accepts `session_id` to continue that conversation; `--mcp-server-allow-model-override` (default
-  off) lets a call pick `model`.
+  off) lets a call pick `model`, and `--mcp-server-allow-cwd-override` (default off) lets a call
+  pick a `cwd` inside the server's workspace (canonicalised; traversal and escaping symlinks are
+  refused).
 ### ACP, IDE and headless
 
 - VS Code: opt-in `mini-agent.clientFileAccess` (machine scope, default off) advertises ACP
