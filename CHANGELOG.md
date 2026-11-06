@@ -6,6 +6,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Cost tracking
+
+- The global usage ledger no longer has a permanent 65,536-record / 64 MiB wall: a full
+  `usage.jsonl` is archived as `usage.<seq>.archive.jsonl` and folded into `usage.rollup`, so
+  `/cost` and session budgets keep exact all-time totals. A capped run that stops because spend
+  cannot be recorded now says "cost tracking failed (<ledger error>)" instead of only claiming the
+  USD budget ran out.
+
 ### Subagents
 
 - A failed `task` child no longer cancels its siblings: the other children run to completion and

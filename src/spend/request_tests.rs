@@ -2151,3 +2151,22 @@ fn fallback_route_requires_the_session_provider_and_names_both_models() {
     assert_eq!(route.model, "raw-model-id");
     assert!(crate::provider::resolve_fallback_route(&Config::default(), &session).is_none());
 }
+
+#[tokio::test]
+async fn capped_run_stopped_by_an_unwritable_ledger_names_the_ledger_failure() {
+    let root = crate::tests::OwnedTestDirectory::new("cost-ledger-failure-message");
+    crate::fs::private_atomic_create_sync(&root.path().join("usage.jsonl"), b"not json\n").unwrap();
+    let cfg = Config::default();
+    let (run, _ledger) = profile(&root, &cfg, RequestKind::Turn, Some(100.0));
+    run.observe(crate::event::UsageDelta {
+        input_tokens: 1,
+        ..Default::default()
+    });
+    run.flush().await;
+    let error = run.admit().expect_err("tracking failure stops a capped run");
+    assert!(error.is::<super::run::BudgetStopped>());
+    let text = error.to_string();
+    assert!(text.contains("cost tracking failed"), "{text}");
+    assert!(text.contains("usage ledger"), "{text}");
+    assert!(text.contains(super::run::BUDGET_STOP), "{text}");
+}
