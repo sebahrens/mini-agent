@@ -969,7 +969,107 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
+    remove_tool_output_dir(id);
     Ok(())
+}
+
+/// Remove a real (non-symlink) directory tree under the tool-output root.
+/// `remove_dir_all` does not follow symlinks inside the tree, and a symlink
+/// or non-directory at the top is refused rather than followed.
+fn remove_private_tree(dir: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(dir)?;
+            Ok(true)
+        }
+        Ok(_) => Err(std::io::Error::other("refusing non-directory tool-output entry")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Delete the session's private tool-output directory (spilled results, full
+/// command logs, file-checkpoint preimages). Best effort: a failure is logged
+/// and never blocks deleting the session itself.
+fn remove_tool_output_dir(id: &str) {
+    if disabled("tool outputs") || crate::paths::process_paths_ref().is_err() {
+        return;
+    }
+    if let Err(error) = remove_private_tree(&tool_output_dir(id)) {
+        tracing::warn!("could not remove tool outputs of session {id}: {error}");
+    }
+}
+
+/// How long a tool-output directory with no matching saved session must have
+/// been untouched before [`sweep_orphan_tool_outputs`] removes it. Unsaved
+/// live sessions (no snapshot yet) own such directories too.
+pub(crate) const ORPHAN_TOOL_OUTPUT_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(14 * 86_400);
+
+/// Remove tool-output directories that belong to no saved session and have
+/// not been modified within `grace`: leftovers of sessions deleted before
+/// deletion cleaned up after itself, or of sessions that never saved.
+/// Directory names are opaque digests of the session id, so ownership is
+/// decided by recomputing the name of every saved session. Returns the number
+/// of directories removed; an unreadable session directory removes nothing.
+pub(crate) fn sweep_orphan_tool_outputs(
+    now: std::time::SystemTime,
+    grace: std::time::Duration,
+) -> anyhow::Result<usize> {
+    if disabled("sessions") || disabled("tool outputs") {
+        return Ok(0);
+    }
+    let root = app_paths().tool_outputs_dir();
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(cutoff) = now.checked_sub(grace) else {
+        return Ok(0);
+    };
+    let mut known = std::collections::HashSet::new();
+    if let Some(sessions) = existing_session_dir()? {
+        for entry in std::fs::read_dir(&sessions)?.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|extension| extension == "json")
+                && let Some(id) = path.file_stem().and_then(|stem| stem.to_str())
+            {
+                known.insert(tool_output_dir(id));
+            }
+        }
+    }
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if known.contains(&path) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        // Newest of the directory and its checkpoint subdirectory: writes add
+        // entries to one of them.
+        let newest = [path.clone(), path.join("checkpoints")]
+            .iter()
+            .filter_map(|dir| std::fs::symlink_metadata(dir).ok()?.modified().ok())
+            .max();
+        if newest.is_none_or(|modified| modified >= cutoff) {
+            continue;
+        }
+        match remove_private_tree(&path) {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(error) => tracing::warn!("orphan tool-output sweep skipped {}: {error}", path.display()),
+        }
+    }
+    if removed > 0 {
+        tracing::info!("removed {removed} orphaned session tool-output directories");
+    }
+    Ok(removed)
 }
 
 /// Delete saved session snapshots whose mtime is older than `days` days

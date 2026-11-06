@@ -3077,17 +3077,26 @@ impl Startup {
         } = self;
 
         crate::update::spawn_startup_notice(&cli, &cfg, is_interactive, &paths.state_dir);
-        if let Some(days) = cfg.session_retention_days.filter(|days| *days > 0) {
-            // The current session is already claimed, so it is never pruned.
-            std::thread::spawn(move || {
-                if let Err(error) = crate::session::storage::prune_sessions_older_than(
+        let retention_days = cfg.session_retention_days.filter(|days| *days > 0);
+        // The current session is already claimed, so it is never pruned.
+        std::thread::spawn(move || {
+            if let Some(days) = retention_days
+                && let Err(error) = crate::session::storage::prune_sessions_older_than(
                     days,
                     std::time::SystemTime::now(),
-                ) {
-                    tracing::warn!("session retention skipped: {error:#}");
-                }
-            });
-        }
+                )
+            {
+                tracing::warn!("session retention skipped: {error:#}");
+            }
+            // Directories of deleted/never-saved sessions are not covered by
+            // retention; sweep those that have been idle for a long time.
+            if let Err(error) = crate::session::storage::sweep_orphan_tool_outputs(
+                std::time::SystemTime::now(),
+                crate::session::storage::ORPHAN_TOOL_OUTPUT_GRACE,
+            ) {
+                tracing::warn!("orphan tool-output sweep skipped: {error:#}");
+            }
+        });
         // Creating a context-file template is a filesystem setup action, not
         // permission to start an agent turn. Only an explicit CLI message may
         // auto-trigger interactive execution.

@@ -6,6 +6,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Sessions
+
+- Deleting a session (`/sessions delete`, `session_retention_days`) now also removes its private
+  tool-output directory (spills, full command logs, `/rewind` preimages), and startup sweeps
+  tool-output directories that match no saved session and have been idle for 14 days.
+
 ### Context compaction
 
 - Compaction summary requests are retried when the provider stream fails after the first chunk

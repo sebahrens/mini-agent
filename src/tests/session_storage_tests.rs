@@ -1849,3 +1849,82 @@ fn session_retention_prunes_only_stale_unowned_sessions() {
     crate::session::lock::release_session(&owned.id);
     drop(env);
 }
+
+// mini-agent-923of: deleting or retention-pruning a session removes its private
+// tool-output directory; an orphan sweep removes idle directories that match no
+// saved session and never follows a symlink.
+#[test]
+fn deleting_and_pruning_sessions_remove_their_tool_output_directories() {
+    let env = setup_test_env();
+    let deleted = Session::new("openai", "gpt-4", 128_000, "deleted");
+    save_session(&deleted).unwrap();
+    let stale = Session::new("openai", "gpt-4", 128_000, "stale");
+    save_session(&stale).unwrap();
+    let kept = Session::new("openai", "gpt-4", 128_000, "kept");
+    save_session(&kept).unwrap();
+    for session in [&deleted, &stale, &kept] {
+        save_tool_output(&session.id, "bash", "spilled output").unwrap();
+        let checkpoints = tool_output_dir(&session.id).join("checkpoints");
+        std::fs::create_dir_all(&checkpoints).unwrap();
+        std::fs::write(checkpoints.join("preimage"), b"old file").unwrap();
+    }
+    delete_session(&deleted.id).unwrap();
+    assert!(!tool_output_dir(&deleted.id).exists(), "delete cleans the directory");
+    assert!(tool_output_dir(&kept.id).exists());
+
+    std::fs::File::options()
+        .write(true)
+        .open(crate::session::storage::session_path(&stale.id).unwrap())
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400))
+        .unwrap();
+    crate::session::lock::release_session(&stale.id);
+    crate::session::lock::release_session(&deleted.id);
+    crate::session::lock::release_session(&kept.id);
+    assert_eq!(
+        crate::session::storage::prune_sessions_older_than(30, std::time::SystemTime::now())
+            .unwrap(),
+        1
+    );
+    assert!(!tool_output_dir(&stale.id).exists(), "retention cleans the directory");
+    assert!(tool_output_dir(&kept.id).exists());
+    drop(env);
+}
+
+#[test]
+fn orphan_tool_output_sweep_removes_only_idle_unowned_directories() {
+    let env = setup_test_env();
+    let saved = Session::new("openai", "gpt-4", 128_000, "saved");
+    save_session(&saved).unwrap();
+    save_tool_output(&saved.id, "bash", "kept").unwrap();
+    let orphan = uuid::Uuid::new_v4().to_string();
+    let recent = uuid::Uuid::new_v4().to_string();
+    save_tool_output(&orphan, "bash", "orphaned").unwrap();
+    save_tool_output(&recent, "bash", "recent unsaved").unwrap();
+    let grace = std::time::Duration::from_secs(14 * 86_400);
+    // Everything is fresh: nothing is removed, saved or not.
+    let now = std::time::SystemTime::now();
+    assert_eq!(crate::session::storage::sweep_orphan_tool_outputs(now, grace).unwrap(), 0);
+    // Age only the orphan's directory.
+    std::fs::File::open(tool_output_dir(&orphan))
+        .unwrap()
+        .set_modified(now - std::time::Duration::from_secs(30 * 86_400))
+        .unwrap();
+    // A symlinked entry pointing at precious data is skipped, never followed.
+    #[cfg(unix)]
+    let precious = {
+        let target = env.dir.join("precious");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("data"), b"do not delete").unwrap();
+        let link = tool_output_dir(&uuid::Uuid::new_v4().to_string());
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        target
+    };
+    assert_eq!(crate::session::storage::sweep_orphan_tool_outputs(now, grace).unwrap(), 1);
+    assert!(!tool_output_dir(&orphan).exists());
+    assert!(tool_output_dir(&recent).exists(), "recent unsaved session is protected");
+    assert!(tool_output_dir(&saved.id).exists(), "saved session is protected");
+    #[cfg(unix)]
+    assert_eq!(std::fs::read(precious.join("data")).unwrap(), b"do not delete");
+    drop(env);
+}
