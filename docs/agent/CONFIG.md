@@ -735,7 +735,7 @@ Accepted top-level keys:
 | `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Headless, loop, and ACP modes skip it. Requires project trust when set locally. No automatic download or installation. |
 | `max_grep_results`        | integer | Maximum grep matches returned to the main agent. Default: `150`. |
 | `max_find_results`        | integer | Maximum file matches returned to the main agent. Default: `150`. |
-| `max_list_dir_entries`    | integer | Maximum directory entries returned to the main agent. Default: `150`. |
+| `max_list_dir_entries`    | integer | Maximum directory entries returned to the main agent per call. Default: `150`. `list_dir` pages past it with `offset` (named in the truncation notice) and may lower it with `limit`. |
 | `subagent_max_read_lines` | integer | Per-subagent read-line cap. Default: `2000`; requires `subagents`. |
 | `subagent_max_grep_results` | integer | Per-subagent grep-result cap. Default: `200`; requires `subagents`. |
 | `subagent_max_find_results` | integer | Per-subagent file-result cap. Default: `200`; requires `subagents`. |

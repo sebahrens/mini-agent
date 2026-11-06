@@ -11796,6 +11796,7 @@ mod workspace_tests {
             .with_workspace_binding(second_workspace.clone())
             .call(ListDirArgs {
                 path: Some(".".into()),
+                ..Default::default()
             })
             .await
             .unwrap();

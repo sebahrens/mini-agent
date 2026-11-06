@@ -51,7 +51,10 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
     {
         let listing = ListDirTool::new(None, None, None)
             .with_workspace(&root)
-            .call(ListDirArgs { path: None })
+            .call(ListDirArgs {
+                path: None,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert!(listing.contains("src"), "{listing}");
@@ -95,6 +98,7 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
             .with_workspace(&root)
             .call(ListDirArgs {
                 path: Some(".git".into()),
+                ..Default::default()
             })
             .await
             .unwrap();

@@ -322,7 +322,14 @@ were found; narrow the path or pattern to continue. These bounds leave path,
 read-deny, external-directory approval, ignore, and no-follow traversal policy
 unchanged.
 `list_dir` keeps only actual directories in its directory-first sort group and
-renders symbolic links as `name -> target`. Read windows size their line-number
+renders symbolic links as `name -> target`. It accepts `offset` (entries to skip),
+`limit` (lowers the configured `max_list_dir_entries` cap) and `depth` (1 by
+default, at most 3). A capped listing ends with `continue with offset=N`, and a
+paged header names the window (`entries 151-160 of 160`). Depth 2-3 expands
+subdirectories into an indented, directory-first tree of relative paths that
+shares the same cap and paging; subdirectories are opened no-follow relative to
+their parent descriptor with the same ignore, skip and deny filters, and a tree
+stops collecting at 10,000 entries with a notice. Read windows size their line-number
 column from the actual range and report an offset past EOF directly instead of
 showing an inverted range. When edit's bounded fuzzy search is too expensive,
 the error says that no closest-match suggestion was computed.

@@ -36,6 +36,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `read` extracts the text layer of PDF files in every build, with `--- page N ---` markers and a
   `pages` selection (at most 20 per call, required above 20 pages), instead of the UTF-8 error;
   scanned PDFs report that they have no text layer and suggest exporting pages as images.
+- `list_dir` accepts `offset`, `limit` and `depth` (up to 3): entries past the cap are reachable
+  through the `continue with offset=N` notice, and depth renders a bounded indented tree.
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

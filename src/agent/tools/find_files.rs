@@ -947,6 +947,15 @@ impl BoundDirectory {
         Ok(entries)
     }
 
+    /// Open the named child directory no-follow, relative to this
+    /// descriptor, keeping the hidden filter (used by `list_dir` depth).
+    pub(super) fn child_directory(&self, name: &std::ffi::OsStr) -> std::io::Result<Self> {
+        let child = bound_platform::open_child(&self.root, name)?;
+        let mut bound = Self::from_file(&self.approved_root.join(name), child)?;
+        bound.hidden = self.hidden.clone();
+        Ok(bound)
+    }
+
     #[cfg(feature = "js")]
     pub(crate) fn list_entries_bounded(
         &self,

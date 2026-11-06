@@ -25,6 +25,80 @@ pub(crate) fn format_size(bytes: u64) -> String {
 const NOT_A_DIRECTORY_HINT: &str =
     "Use read to view the file, or pass its parent directory as path.";
 
+/// Deepest tree `depth` accepts.
+const MAX_LIST_DEPTH: usize = 3;
+/// Rows collected for one call before the listing is reported incomplete.
+const MAX_TREE_ROWS: usize = 10_000;
+
+struct Row {
+    level: usize,
+    name: String,
+    kind: String,
+    size: String,
+    link_target: Option<String>,
+}
+
+fn collect_level(
+    directory: &BoundDirectory,
+    prefix: &str,
+    level: usize,
+    max_depth: usize,
+    rows: &mut Vec<Row>,
+    incomplete: &mut bool,
+) -> std::io::Result<()> {
+    let mut entries = directory.list_entries()?;
+    entries.sort_by(|a, b| {
+        b.is_directory
+            .cmp(&a.is_directory)
+            .then_with(|| a.file_name.cmp(&b.file_name))
+    });
+    for entry in entries {
+        if rows.len() >= MAX_TREE_ROWS {
+            *incomplete = true;
+            return Ok(());
+        }
+        let name = format!("{prefix}{}", entry.file_name.to_string_lossy());
+        let kind = if entry.is_directory {
+            format!("dir({})", entry.child_count)
+        } else if entry.is_link {
+            "link".to_string()
+        } else {
+            "file".to_string()
+        };
+        let size = if !entry.is_directory && !entry.is_link {
+            format_size(entry.size)
+        } else {
+            String::new()
+        };
+        let link_target = entry
+            .link_target
+            .as_ref()
+            .map(|target| target.to_string_lossy().into_owned());
+        rows.push(Row {
+            level,
+            name: name.clone(),
+            kind,
+            size,
+            link_target,
+        });
+        if entry.is_directory
+            && level < max_depth
+            && let Ok(child) = directory.child_directory(&entry.file_name)
+        {
+            // An unreadable subdirectory keeps its own row and is skipped.
+            let _ = collect_level(
+                &child,
+                &format!("{name}/"),
+                level + 1,
+                max_depth,
+                rows,
+                incomplete,
+            );
+        }
+    }
+    Ok(())
+}
+
 pub struct ListDirTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -70,7 +144,13 @@ impl Tool for ListDirTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "List files and directories in a directory. Respects .gitignore and hides dependency/build directories and VCS metadata unless requested explicitly. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.".to_string()
+        format!(
+            "List files and directories in a directory. Respects .gitignore and hides dependency/build directories and VCS metadata unless requested explicitly. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.{} Page with offset (the truncation notice names the next offset); depth 2-3 expands subdirectories into an indented tree under the same cap.",
+            match self.max_entries {
+                Some(cap) => format!(" Returns at most {cap} entries per call."),
+                None => String::new(),
+            }
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -80,6 +160,22 @@ impl Tool for ListDirTool {
                 "path": {
                     "type": "string",
                     "description": "Directory path (defaults to current working directory)"
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Entries to skip, to continue a truncated listing (default 0)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Return at most this many entries (never more than the configured cap)"
+                },
+                "depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_LIST_DEPTH,
+                    "description": "Levels to list: 1 (default) lists this directory, 2-3 also expand subdirectories"
                 }
             },
             "required": []
@@ -87,6 +183,16 @@ impl Tool for ListDirTool {
     }
 
     async fn call(&self, args: ListDirArgs) -> Result<String, ToolError> {
+        let depth = args.depth.unwrap_or(1);
+        if depth == 0 || depth > MAX_LIST_DEPTH {
+            return Err(ToolError::Msg(format!(
+                "list_dir depth must be between 1 and {MAX_LIST_DEPTH}"
+            )));
+        }
+        if args.limit == Some(0) {
+            return Err(ToolError::Msg("list_dir limit must be at least 1".into()));
+        }
+        let offset = args.offset.unwrap_or(0);
         crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
         let target = crate::agent::tools::resolve_tool_target(
             self.workspace.as_ref(),
@@ -154,47 +260,16 @@ impl Tool for ListDirTool {
             (bound, coaching)
         };
 
-        let mut entries: Vec<(String, String, String, Option<String>)> = Vec::new();
-        let bound_entries =
-            crate::agent::runner::spawn_blocking_scoped(move || bound_directory.list_entries())
-                .await
-                .map_err(|error| {
-                    ToolError::Msg(format!("list_dir directory reader failed: {error}"))
-                })??;
+        let (rows, incomplete) = crate::agent::runner::spawn_blocking_scoped(move || {
+            let mut rows = Vec::new();
+            let mut incomplete = false;
+            collect_level(&bound_directory, "", 1, depth, &mut rows, &mut incomplete)
+                .map(|()| (rows, incomplete))
+        })
+        .await
+        .map_err(|error| ToolError::Msg(format!("list_dir directory reader failed: {error}")))??;
 
-        for entry in bound_entries {
-            let name = entry.file_name.to_string_lossy().to_string();
-            let kind = if entry.is_directory {
-                format!("dir({})", entry.child_count)
-            } else if entry.is_link {
-                "link".to_string()
-            } else {
-                "file".to_string()
-            };
-
-            let size = if !entry.is_directory && !entry.is_link {
-                format_size(entry.size)
-            } else {
-                String::new()
-            };
-
-            let link_target = entry
-                .link_target
-                .map(|target| target.to_string_lossy().into_owned());
-            entries.push((name, kind, size, link_target));
-        }
-
-        entries.sort_by(|a, b| {
-            let a_is_dir = a.1.starts_with("dir");
-            let b_is_dir = b.1.starts_with("dir");
-            if a_is_dir != b_is_dir {
-                b_is_dir.cmp(&a_is_dir)
-            } else {
-                a.0.cmp(&b.0)
-            }
-        });
-
-        if entries.is_empty() {
+        if rows.is_empty() {
             let msg = format!("Listing {}:\n(empty directory)", path);
             return Ok(match coaching {
                 Some(c) => format!("{}\n\n{}", c, msg),
@@ -202,35 +277,78 @@ impl Tool for ListDirTool {
             });
         }
 
-        let total_entries = entries.len();
-        let cap = self.max_entries.map(|c| c as usize);
-        let shown = cap.map(|c| total_entries.min(c)).unwrap_or(total_entries);
-        let max_name = entries[..shown]
+        let total_entries = rows.len();
+        let cap = match (self.max_entries.map(|c| c as usize), args.limit) {
+            (Some(cap), Some(limit)) => Some(cap.min(limit)),
+            (None, limit) => limit,
+            (cap, None) => cap,
+        };
+        let start = offset.min(total_entries);
+        let end = cap.map_or(total_entries, |cap| {
+            total_entries.min(start.saturating_add(cap))
+        });
+        let page = &rows[start..end];
+        let total_label = if incomplete {
+            format!("at least {total_entries}")
+        } else {
+            total_entries.to_string()
+        };
+        let mut result = match (depth, start) {
+            (1, 0) => format!("Listing {}:\n", path),
+            (1, _) => format!(
+                "Listing {} (entries {}-{} of {total_label}):\n",
+                path,
+                start + 1,
+                end
+            ),
+            (_, _) => format!(
+                "Listing {} (depth {depth}; entries {}-{} of {total_label}):\n",
+                path,
+                start + 1,
+                end
+            ),
+        };
+        if page.is_empty() {
+            result.push_str(&format!(
+                "(no entries at offset {offset}; the listing has {total_label} entries)\n"
+            ));
+        }
+        let max_name = page
             .iter()
-            .map(|e| e.0.chars().count())
+            .map(|row| row.name.chars().count() + 2 * (row.level - 1))
             .max()
             .unwrap_or(0);
-        let mut result = format!("Listing {}:\n", path);
-        for (name, kind, size, link_target) in &entries[..shown] {
-            let padded = format!("{:width$}", name, width = max_name);
-            let size_str = if size.is_empty() {
+        for row in page {
+            let indent = "  ".repeat(row.level - 1);
+            let padded = format!(
+                "{:width$}",
+                row.name,
+                width = max_name.saturating_sub(2 * (row.level - 1))
+            );
+            let size_str = if row.size.is_empty() {
                 String::new()
             } else {
-                format!("  {}", size)
+                format!("  {}", row.size)
             };
-            let target = link_target
+            let target = row
+                .link_target
                 .as_ref()
                 .map(|target| format!(" -> {target}"))
                 .unwrap_or_default();
-            result.push_str(&format!("  [{}]  {}{}{}\n", kind, padded, target, size_str));
-        }
-        if let Some(cap) = cap
-            && total_entries > cap
-        {
             result.push_str(&format!(
-                "\n[truncated after {} entries — {} more; list a subdirectory or use find_files with a narrower pattern]",
-                cap,
-                total_entries - cap,
+                "  {indent}[{}]  {}{}{}\n",
+                row.kind, padded, target, size_str
+            ));
+        }
+        if end < total_entries {
+            result.push_str(&format!(
+                "\n[truncated after {} entries — {} more; continue with offset={end}, list a subdirectory, or use find_files with a narrower pattern]",
+                end - start,
+                total_entries - end,
+            ));
+        } else if incomplete {
+            result.push_str(&format!(
+                "\n[listing stopped at {MAX_TREE_ROWS} entries; use a smaller depth or list a subdirectory]"
             ));
         }
         tracing::debug!(
@@ -271,7 +389,10 @@ mod tests {
         std::os::unix::fs::symlink("target.txt", temp.join("link.txt")).unwrap();
         let listing = ListDirTool::new(None, None, None)
             .with_workspace(&temp)
-            .call(ListDirArgs { path: None })
+            .call(ListDirArgs {
+                path: None,
+                ..Default::default()
+            })
             .await
             .unwrap();
 
@@ -293,7 +414,10 @@ mod tests {
 
         let listing = ListDirTool::new(None, None, None)
             .with_workspace(&temp)
-            .call(ListDirArgs { path: None })
+            .call(ListDirArgs {
+                path: None,
+                ..Default::default()
+            })
             .await
             .unwrap();
         let dir = listing.find("z-dir").unwrap();
@@ -334,6 +458,7 @@ mod tests {
 
         let call = tool.call(ListDirArgs {
             path: Some(link.to_string_lossy().into_owned()),
+            ..Default::default()
         });
         let swap = async {
             let request = ask_rx
@@ -387,6 +512,7 @@ mod tests {
             let error = tool
                 .call(ListDirArgs {
                     path: Some(path.to_string()),
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err()

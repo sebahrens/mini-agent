@@ -222,6 +222,7 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
         .with_workspace(fixture.workspace.clone())
         .call(ListDirArgs {
             path: Some("$HOME/project".into()),
+            ..Default::default()
         })
         .await
         .unwrap();

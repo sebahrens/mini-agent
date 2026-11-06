@@ -798,9 +798,18 @@ pub struct FindFilesArgs {
     pub sort: FindFilesSort,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct ListDirArgs {
     pub path: Option<String>,
+    /// Entries to skip (0-based) for paging past the entry cap.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Lower the configured entry cap for this call.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Levels to expand (1 = this directory only; at most 3).
+    #[serde(default)]
+    pub depth: Option<usize>,
 }
 
 /// Turns a diagnosed permission verdict into the tool-facing result: coaching
