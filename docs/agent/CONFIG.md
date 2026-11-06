@@ -38,6 +38,17 @@ mini-agent does not silently fall back to a more distant file. This discovery
 never changes the execution workspace or loads an ancestor `.mcp.json`, prompts,
 instructions, or skills.
 
+**Starting in a repository subdirectory**: by default only the launch directory supplies project
+assets, so starting in `packages/app` skips the repository root's `.mcp.json`, agents, skills,
+`AGENTS.md`/`CLAUDE.md` and project memory. Startup prints one notice naming the root assets that
+were skipped. Set `project_root_discovery = true` (user config file or `--config`; a project file
+cannot enable it) to move the whole session to the nearest `.git` ancestor instead: the process
+changes into that directory before anything is loaded, so the workspace binding, project-config
+trust (bound to the root files' content, exactly as for a launch from the root), MCP servers,
+agents, skills, instructions and the memory store are those of the root. The search never selects
+the filesystem root, the home directory or a parent of it, a `.git` that is a symlink, or a launch
+directory that is already a repository root.
+
 Precedence is global config → selected `config.toml` → selected
 `config.local.toml` → repeated `--config key=value` → existing dedicated flags.
 Tables merge by key; scalars and arrays replace. Each project file has its own
@@ -762,6 +773,7 @@ Accepted top-level keys:
 | `hooks_mcp_tool_unprompted` | boolean | Let `mcp_tool` hooks call any tool of their server without a per-call prompt. Default: `false`: a hook may only call a tool the server annotates `readOnlyHint: true` (and not `destructiveHint: true`). Needs `hooks_mcp_tool_enabled`. Needs project trust when set in a project file. |
 | `hooks_agent_read_files` | boolean | Let `agent` hooks read workspace files and send their text to the model. Default: `false` (tool-free verdict). Needs `hooks_model_enabled`. Needs project trust when set in a project file. |
 | `skills_extra_dirs` | string array | Added skill directories (like `--add-dir DIR`, repeatable): each is searched for `.claude/skills` and `.agents/skills`. Default: none. Lowest-precedence roots, user authority, read-permission checked, at most 16. `~` and `~user` are expanded; a relative entry resolves against the directory of the config file that set it (the launch directory for `--add-dir`). An entry that is over the cap, missing, not a directory or has an unknown `~user` is reported as a startup warning and in the `/skills` output. Needs project trust when set in a project file. |
+| `project_root_discovery` | boolean | Start at the nearest `.git` ancestor when launched below it, so project config, MCP servers, agents, skills, instructions and memory come from the repository root (see *Starting in a repository subdirectory*). Default: `false` (a startup notice names the root assets that were skipped). Only the user config file and `--config` are honoured. |
 | `add_dir_tool_access` | boolean | Let the file tools reach the `--add-dir` directories under the normal permission rules (an `external_directory` allow for each existing directory; `read`/`edit` rules, protected paths and any `external_directory` deny still apply, and the shell sandbox roots are unchanged). Default: `false`: `--add-dir` only adds skill roots and file access to the directory is prompted or denied as for any outside directory. Needs project trust when set in a project file. |
 | `skills_plugin_dirs` | string array | Plugin directories: each is searched for `skills/` (`<plugin>/skills/<name>/SKILL.md`). Default: none. Same rules as `skills_extra_dirs`. |
 | `skills_max_selected` | integer | Agent Skills injected per turn by prompt relevance. Default: `3` (at most 16). Requires `agent-skills`. See [SKILLS.md](SKILLS.md#selection-limits-and-the-always-visible-catalog). |

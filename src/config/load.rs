@@ -4432,6 +4432,7 @@ mod project_config_trust_tests {
             "skills_extra_dirs",
             "skills_plugin_dirs",
             "add_dir_tool_access",
+            "project_root_discovery",
             "claude_user_agents",
         ] {
             assert!(
