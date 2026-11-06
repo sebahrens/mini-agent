@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { MAX_REFERENCES, type ReferenceInput } from './references';
 
 interface UriLike { readonly scheme: string; readonly fsPath: string }
+interface BinaryLike { readonly mimeType: string; data(): PromiseLike<Uint8Array> }
 interface LocationLike {
   readonly uri: UriLike;
   readonly range: { readonly start: { readonly line: number }; readonly end: { readonly line: number } };
@@ -10,6 +11,15 @@ interface LocationLike {
 function isUri(value: unknown): value is UriLike {
   return typeof value === 'object' && value !== null
     && typeof (value as UriLike).scheme === 'string' && typeof (value as UriLike).fsPath === 'string';
+}
+
+function isBinary(value: unknown): value is BinaryLike {
+  return typeof value === 'object' && value !== null
+    && typeof (value as BinaryLike).mimeType === 'string' && typeof (value as BinaryLike).data === 'function';
+}
+
+function unsupported(name: string, reason: string): ReferenceInput {
+  return { kind: 'unsupported', name, reason };
 }
 
 function isLocation(value: unknown): value is LocationLike {
@@ -32,8 +42,9 @@ export async function collectReferences(
     const value: unknown = reference.value;
     const name: unknown = (reference as { name?: unknown }).name;
     const named = typeof name === 'string' && name ? { name } : {};
+    const display = typeof name === 'string' && name ? name : 'reference';
     if (isLocation(value)) {
-      if (value.uri.scheme !== 'file') { continue; }
+      if (value.uri.scheme !== 'file') { out.push(unsupported(display, `only local files can be sent, not ${value.uri.scheme}: references`)); continue; }
       const document = await vscode.workspace.openTextDocument(value.uri as vscode.Uri);
       out.push({
         kind: 'snippet', fsPath: value.uri.fsPath, text: document.getText(value.range as vscode.Range),
@@ -41,13 +52,25 @@ export async function collectReferences(
       });
     } else if (isUri(value)) {
       if (value.scheme === 'file') { out.push({ kind: 'file', fsPath: value.fsPath, ...named }); }
-    } else if (typeof value === 'string' && value.length > 0) {
-      out.push({ kind: 'text', text: value, ...named });
+      else { out.push(unsupported(display, `only local files can be sent, not ${value.scheme}: references`)); }
+    } else if (typeof value === 'string') {
+      if (value.length > 0) { out.push({ kind: 'text', text: value, ...named }); }
+    } else if (isBinary(value)) {
+      if (!value.mimeType.startsWith('image/')) { out.push(unsupported(display, `${value.mimeType.slice(0, 60)} attachments are not supported`)); continue; }
+      try {
+        out.push({ kind: 'image', mimeType: value.mimeType, bytes: await value.data(), ...named });
+      } catch {
+        out.push(unsupported(display, 'the image data could not be read'));
+      }
+    } else {
+      out.push(unsupported(display, 'this kind of reference is not supported'));
     }
   }
   if (includeSelection) {
     const editor = vscode.window.activeTextEditor;
-    if (editor && editor.document.uri.scheme === 'file' && !editor.selection.isEmpty) {
+    if (editor && editor.document.uri.scheme !== 'file' && !editor.selection.isEmpty) {
+      out.push(unsupported('selection', `only local files can be sent, not ${editor.document.uri.scheme}: documents`));
+    } else if (editor && !editor.selection.isEmpty) {
       out.push({
         kind: 'snippet', fsPath: editor.document.uri.fsPath, text: editor.document.getText(editor.selection),
         startLine: editor.selection.start.line, endLine: editor.selection.end.line,

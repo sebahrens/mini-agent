@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  MAX_REFERENCES, MAX_SNIPPET_BYTES, buildPromptBlocks, type PromptBuildOptions, type ReferenceInput,
+  MAX_IMAGE_BYTES, MAX_REFERENCES, MAX_SNIPPET_BYTES, buildPromptBlocks, type PromptBuildOptions, type ReferenceInput,
 } from '../src/references';
 
 const root = '/work/space';
@@ -79,5 +79,35 @@ describe('buildPromptBlocks', () => {
   it('passes plain text references through without a path', async () => {
     const built = await buildPromptBlocks(options([{ kind: 'text', text: 'value', name: 'var' }]));
     expect(built.blocks[1]).toEqual({ type: 'text', text: 'Reference var:\nvalue' });
+  });
+});
+
+describe('buildPromptBlocks images and unsupported references', () => {
+  const png = new Uint8Array([1, 2, 3]);
+  it('names every unsupported reference in the notes', async () => {
+    const built = await buildPromptBlocks(options([
+      { kind: 'unsupported', name: 'Untitled-1', reason: 'only local files can be sent, not untitled: references' },
+    ]));
+    expect(built.blocks).toHaveLength(1);
+    expect(built.notes).toEqual(['Skipped "Untitled-1": only local files can be sent, not untitled: references.']);
+  });
+
+  it('forwards an image as an ACP image block only when the agent advertises image support', async () => {
+    const image: ReferenceInput = { kind: 'image', mimeType: 'image/png', bytes: png };
+    const on = await buildPromptBlocks(options([image], { image: true }));
+    expect(on.blocks[1]).toEqual({ type: 'image', mimeType: 'image/png', data: 'AQID' });
+    const off = await buildPromptBlocks(options([image]));
+    expect(off.blocks).toHaveLength(1);
+    expect(off.notes[0]).toMatch(/does not accept images/);
+  });
+
+  it('refuses oversize, empty and unsupported-mime images with a note', async () => {
+    const built = await buildPromptBlocks(options([
+      { kind: 'image', mimeType: 'image/png', bytes: new Uint8Array(MAX_IMAGE_BYTES + 1) },
+      { kind: 'image', mimeType: 'image/png', bytes: new Uint8Array(0) },
+      { kind: 'image', mimeType: 'image/tiff', bytes: png },
+    ], { image: true }));
+    expect(built.blocks).toHaveLength(1);
+    expect(built.notes).toHaveLength(3);
   });
 });

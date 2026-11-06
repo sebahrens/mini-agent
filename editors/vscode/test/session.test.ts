@@ -84,6 +84,37 @@ describe('AgentSession saved-session public adapter', () => {
     } finally { await session.stop(); session.dispose(); }
   });
 
+  it('follows session/list nextCursor across pages so every row is offered', async () => {
+    successfulProbe();
+    spawnMock.mockReturnValueOnce(new FakeProtocolProcess());
+    const cursors: unknown[] = [];
+    const agent = {
+      request: vi.fn(async (method: string, params: Record<string, unknown>) => {
+        switch (method) {
+          case 'initialize': return { protocolVersion: 1, agentCapabilities: { loadSession: true } };
+          case 'session/new': return { sessionId: 'current' };
+          case 'session/list': {
+            cursors.push(params.cursor);
+            if (!params.cursor) { return { sessions: [{ sessionId: 's1', cwd: '/w' }, { sessionId: 's2', cwd: '/w' }], nextCursor: 'c2' }; }
+            if (params.cursor === 'c2') { return { sessions: [{ sessionId: 's3', cwd: '/w' }], nextCursor: 'c3' }; }
+            return { sessions: [{ sessionId: 's4', cwd: '/w' }] };
+          }
+          default: return {};
+        }
+      }),
+      notify: vi.fn(async () => undefined),
+    };
+    protocol.connect.mockReturnValue({ agent, close: vi.fn() });
+    let offered: string[] = [];
+    ui.showQuickPick.mockImplementationOnce(async (items: { sessionId: string }[]) => { offered = items.map(i => i.sessionId); return undefined; });
+    const session = makeSession();
+    try {
+      await session.resumeSavedSession();
+      expect(offered).toEqual(['s1', 's2', 's3', 's4']);
+      expect(cursors).toEqual([undefined, 'c2', 'c3']);
+    } finally { await session.stop(); session.dispose(); }
+  });
+
   it('does not list or load while the current prompt owns retirement', async () => {
     successfulProbe();
     const child = new FakeProtocolProcess();

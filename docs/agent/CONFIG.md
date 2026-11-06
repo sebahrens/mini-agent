@@ -3239,9 +3239,20 @@ requests with exact session-ID update routing. An active prompt blocks switching
 **Mini Agent: Select Persona** lists the `mode` session config option that new and loaded
 sessions advertise and sends `session/set_config_option`; the persona and its
 `[prompt_to_model]` route apply from the next prompt, and an active prompt blocks the switch.
+Sessions also advertise a `model` option (category `model`: `default` plus every `[quick_models]`
+alias, which carries its provider) and an `effort` option (category `thought_level`: `default`,
+`low`, `medium`, `high`, `xhigh`, `max`); **Mini Agent: Select Model** and **Select Reasoning
+Effort** set them, as do `/model` and `/effort`. A selection lasts for the ACP session only (it
+is never written to config), overrides the persona's route, applies from the next prompt, and is
+refused while a prompt is active, for an unknown alias, for a provider whose credential does not
+resolve, for an effort the routed model rejects, and for provider-native history. After each
+prompt the agent sends `usage_update` (tokens in context, the routed model's window, cumulative
+USD cost) and `session_info_update` when the session title changes; with `session_title_model`
+set, a model-written title is generated once after the first completed turn (never for native
+history).
 
-Available commands are `/compact`, `/undo`, `/rename` and, with the goal feature,
-`/goal`. Only one original Text block can select a local command; resources,
+Available commands are `/compact`, `/undo`, `/rename`, `/cost`, `/model [alias|default]`,
+`/effort [low|medium|high|xhigh|max|default]` and, with the goal feature, `/goal`. Only one original Text block can select a local command; resources,
 images and model output remain data. Undo removes conversation context, not files
 or billed usage. Native signed-history compatibility changes remain visibly
 refused until an explicit supported recovery boundary is available.

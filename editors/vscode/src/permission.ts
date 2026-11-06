@@ -1,7 +1,7 @@
 import type * as acp from '@agentclientprotocol/sdk';
 import { diffSummaryLines } from './toolcontent';
 
-/** Upper bound for the input text rendered in the permission modal. */
+/** Upper bound for the input text rendered in the permission modal `detail`. */
 export const PERMISSION_DETAIL_LIMIT = 800;
 /** Upper bound for the pattern echoed in the allow-always button label. */
 export const PERMISSION_LABEL_LIMIT = 60;

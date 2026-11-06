@@ -4,6 +4,7 @@ const state = vi.hoisted(() => ({
   isTrusted: true,
   gatedFolderPick: vi.fn(),
   showQuickPick: vi.fn(),
+  showWarning: vi.fn(),
   instances: [] as Array<{
     workspaceFolder: unknown;
     start: ReturnType<typeof vi.fn>;
@@ -23,7 +24,7 @@ vi.mock('vscode', () => ({
     onDidChangeWorkspaceFolders: vi.fn(() => ({ dispose: vi.fn() })),
   },
   window: {
-    showWarningMessage: vi.fn(),
+    showWarningMessage: state.showWarning,
     showQuickPick: state.showQuickPick,
     showInformationMessage: vi.fn(),
     showErrorMessage: vi.fn(),
@@ -184,8 +185,24 @@ describe('permission cancellation', () => {
     ],
   } as never;
 
-  it('resolves cancelled and cancels the picker when the turn aborts', async () => {
-    state.showQuickPick.mockReturnValueOnce(new Promise(() => undefined));
+  it('shows the full command in the modal detail, never as a QuickPick placeHolder', async () => {
+    const long = 'echo one\n' + 'x'.repeat(700) + '\necho last-line';
+    state.showWarning.mockResolvedValueOnce('Allow once');
+    const extension = await import('../src/extension');
+    const result = await extension.requestPermission({
+      ...(request as object), toolCall: { toolCallId: 'call-2', title: 'bash', rawInput: long },
+    } as never, new AbortController().signal);
+
+    expect(result).toEqual({ outcome: { outcome: 'selected', optionId: 'allow_once' } });
+    const [, options] = state.showWarning.mock.calls.at(-1) ?? [];
+    expect(options.modal).toBe(true);
+    expect(options.detail).toContain('echo last-line');
+    expect(options.detail).toContain('\n');
+    expect(state.showQuickPick).not.toHaveBeenCalled();
+  });
+
+  it('resolves cancelled when the turn aborts', async () => {
+    state.showWarning.mockReturnValueOnce(new Promise(() => undefined));
     const extension = await import('../src/extension');
     const cancellation = new AbortController();
     const result = extension.requestPermission(request, cancellation.signal);
@@ -193,19 +210,16 @@ describe('permission cancellation', () => {
     cancellation.abort();
 
     await expect(result).resolves.toEqual({ outcome: { outcome: 'cancelled' } });
-    expect(state.showQuickPick).toHaveBeenCalledOnce();
-    const token = state.showQuickPick.mock.calls[0]?.[2];
-    expect(token?.isCancellationRequested).toBe(true);
   });
 
   it('rejects an approval selected after workspace trust is revoked', async () => {
-    const pick = deferred<{ optionIndex: number }>();
-    state.showQuickPick.mockReturnValueOnce(pick.promise);
+    const pick = deferred<string>();
+    state.showWarning.mockReturnValueOnce(pick.promise);
     const extension = await import('../src/extension');
     const result = extension.requestPermission(request, new AbortController().signal);
 
     state.isTrusted = false;
-    pick.resolve({ optionIndex: 0 });
+    pick.resolve('Allow once');
 
     await expect(result).resolves.toEqual({ outcome: { outcome: 'cancelled' } });
   });
