@@ -3018,6 +3018,358 @@ mod windows {
         let _ = unsafe { CloseHandle(handle) };
         result
     }
+
+    /// mini-agent-wh1gq: configs another writer (the VS Code extension's
+    /// `ensureConfigFile`, an editor, a test fixture) created inside the
+    /// config directory before the agent first privatized it. Storage-root
+    /// preparation and the config reader both repair the parent directory
+    /// before opening the child; these drive that actual path natively.
+    #[cfg(test)]
+    mod inherited_config_tests {
+        use super::*;
+        use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+        use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
+
+        const ERROR_INVALID_OWNER: i32 = 1307;
+        const CONFIG: &str = "model = \"inherited-writer\"\n";
+
+        fn object_flags(directory: bool) -> Dword {
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | if directory {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    FILE_ATTRIBUTE_NORMAL
+                }
+        }
+
+        /// Install a fixture owner and/or DACL on one test-owned object. This
+        /// is fixture setup only; it never calls the production repair path.
+        fn set_fixture_security(
+            path: &Path,
+            directory: bool,
+            sddl: &str,
+            information: Dword,
+        ) -> std::io::Result<()> {
+            let text = wide(OsStr::new(sddl));
+            let mut raw = null_mut();
+            // SAFETY: NUL-terminated SDDL and the out pointer stay live through
+            // the conversion; SecurityDescriptor frees the LocalAlloc result.
+            if unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut raw,
+                    null_mut(),
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let descriptor = SecurityDescriptor(raw);
+            let mut owner = null_mut();
+            if information & OWNER_SECURITY_INFORMATION != 0 {
+                let mut defaulted = 0;
+                // SAFETY: the descriptor is live; the owner SID it returns is
+                // borrowed from that allocation for the SetSecurityInfo call.
+                if unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut defaulted) }
+                    == 0
+                    || owner.is_null()
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            let dacl = if information & DACL_SECURITY_INFORMATION != 0 {
+                descriptor.dacl()?
+            } else {
+                null_mut()
+            };
+            let handle = open_handle(
+                path,
+                READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+                OPEN_EXISTING,
+                object_flags(directory),
+                None,
+            )?;
+            // SAFETY: open_handle returned a unique owned handle; File closes it.
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            // SAFETY: the handle carries WRITE_DAC | WRITE_OWNER; owner and
+            // DACL borrow the live descriptor; null pointers leave the rest.
+            let status = unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    information,
+                    owner,
+                    null_mut(),
+                    dacl,
+                    null_mut(),
+                )
+            };
+            drop(file);
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(status as i32))
+            }
+        }
+
+        fn set_owner(path: &Path, directory: bool, owner: &str) -> std::io::Result<()> {
+            set_fixture_security(
+                path,
+                directory,
+                &format!("O:{owner}"),
+                OWNER_SECURITY_INFORMATION,
+            )
+        }
+
+        fn set_protected_dacl(path: &Path, directory: bool, dacl: &str) {
+            set_fixture_security(
+                path,
+                directory,
+                &format!("D:P{dacl}"),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            )
+            .unwrap();
+        }
+
+        fn current_owner(path: &Path, directory: bool) -> bool {
+            let handle = open_handle(
+                path,
+                READ_CONTROL,
+                OPEN_EXISTING,
+                object_flags(directory),
+                None,
+            )
+            .unwrap();
+            // SAFETY: open_handle returned a unique owned handle; File closes it.
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            let owned = ensure_current_owner(handle).is_ok();
+            drop(file);
+            owned
+        }
+
+        /// The DACL control prefix (`P` = protected) and each ACE's fields.
+        fn parsed_dacl(path: &Path, directory: bool) -> (String, Vec<Vec<String>>) {
+            let sddl = dacl_sddl(path, directory).unwrap();
+            let body = sddl.strip_prefix("D:").unwrap_or(&sddl);
+            let (control, aces) = body.split_once('(').unwrap_or((body, ""));
+            let aces = format!("({aces}")
+                .split('(')
+                .filter(|ace| !ace.is_empty())
+                .map(|ace| {
+                    ace.trim_end_matches(')')
+                        .split(';')
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .collect();
+            (control.to_owned(), aces)
+        }
+
+        fn assert_inherited_only(path: &Path, directory: bool) {
+            let (control, aces) = parsed_dacl(path, directory);
+            assert!(
+                !control.contains('P'),
+                "fixture leaf must not be protected: {control}"
+            );
+            assert!(!aces.is_empty(), "fixture leaf has an empty DACL");
+            assert!(
+                aces.iter().all(|ace| ace[1].contains("ID")),
+                "fixture leaf must carry only inherited ACEs: {aces:?}"
+            );
+        }
+
+        fn assert_no_broad_grant(path: &Path, directory: bool) {
+            let (_, aces) = parsed_dacl(path, directory);
+            for ace in &aces {
+                let trustee = ace[5].as_str();
+                assert!(
+                    !matches!(
+                        trustee,
+                        "WD" | "BU" | "AU" | "BA" | "S-1-1-0" | "S-1-5-32-545" | "S-1-5-32-544"
+                    ),
+                    "private repair left a broad grant: {aces:?}"
+                );
+            }
+        }
+
+        fn checked_leaf(path: &Path) {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .unwrap();
+            validate_checked(&file).unwrap();
+        }
+
+        fn checked_directory(path: &Path) {
+            let handle = open_handle(
+                path,
+                GENERIC_READ | READ_CONTROL,
+                OPEN_EXISTING,
+                object_flags(true),
+                None,
+            )
+            .unwrap();
+            // SAFETY: open_handle returned a unique owned handle; File closes it.
+            let directory = unsafe { std::fs::File::from_raw_handle(handle) };
+            validate_directory_checked(&directory).unwrap();
+        }
+
+        /// Config directory whose owner is the current user and whose
+        /// inheritable grants include a broad principal, then an owned leaf
+        /// created without an explicit descriptor (inherited ACEs only).
+        fn inherited_fixture(root: &Path, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+            let user = current_user_sid_string().unwrap();
+            let directory = root.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            set_owner(&directory, true, &user).unwrap();
+            set_protected_dacl(
+                &directory,
+                true,
+                &format!("(A;OICI;FA;;;SY)(A;OICI;FA;;;{user})(A;OICI;FR;;;BU)"),
+            );
+            let config = directory.join("config.toml");
+            std::fs::write(&config, CONFIG).unwrap();
+            // Elevated tokens may default new owners to Administrators; this
+            // fixture models an owned import, so pin the owner explicitly.
+            set_owner(&config, false, &user).unwrap();
+            assert!(current_owner(&config, false));
+            assert_inherited_only(&config, false);
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), CONFIG);
+            (directory, config)
+        }
+
+        #[test]
+        fn config_persistence_permissions_windows_inherited_only_owned_config_survives_parent_repair()
+         {
+            let root = crate::tests::OwnedTestDirectory::new("wh1gq-inherited-config");
+            let user = current_user_sid_string().unwrap();
+
+            // Control: a non-inheritable protected parent DACL (the pre-fix
+            // directory policy) strips an inherited-only child to nothing, so
+            // even its owner can no longer open it (os error 5): the product
+            // failure this regression guards against.
+            let (control_dir, control) = inherited_fixture(root.path(), "control");
+            set_protected_dacl(&control_dir, true, &format!("(A;;FA;;;SY)(A;;FA;;;{user})"));
+            assert_eq!(
+                std::fs::read(&control).unwrap_err().raw_os_error(),
+                Some(ERROR_ACCESS_DENIED as i32),
+                "control: a non-inheritable parent must strip the inherited-only child"
+            );
+            // Cleanup aid only; the regression below does not depend on it.
+            if let Err(error) = set_fixture_security(
+                &control_dir,
+                true,
+                &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{user})"),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ) {
+                eprintln!("control cleanup could not restore inheritable grants: {error}");
+            }
+
+            // Storage-root preparation repairs the parent before the reader.
+            let (config_dir, config) = inherited_fixture(root.path(), "config");
+            crate::paths::ensure_private_directory(&config_dir).unwrap();
+            checked_directory(&config_dir);
+            assert_no_broad_grant(&config_dir, true);
+            assert!(current_owner(&config, false));
+            assert_inherited_only(&config, false);
+            assert_no_broad_grant(&config, false);
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), CONFIG);
+
+            // The actual config reader repairs the parent again, then the leaf.
+            for _ in 0..2 {
+                assert_eq!(
+                    crate::config::load::read_config_content(&config).unwrap(),
+                    CONFIG
+                );
+            }
+            assert!(current_owner(&config, false));
+            checked_leaf(&config);
+            checked_directory(&config_dir);
+            assert_no_broad_grant(&config, false);
+        }
+
+        #[test]
+        fn config_persistence_permissions_windows_protected_explicit_leaf_survives_parent_repair() {
+            let root = crate::tests::OwnedTestDirectory::new("wh1gq-protected-leaf");
+            let user = current_user_sid_string().unwrap();
+            let (config_dir, config) = inherited_fixture(root.path(), "config");
+            set_protected_dacl(&config, false, &format!("(A;;FA;;;SY)(A;;FA;;;{user})"));
+            checked_leaf(&config);
+            let leaf = dacl_sddl(&config, false).unwrap();
+
+            crate::paths::ensure_private_directory(&config_dir).unwrap();
+            checked_directory(&config_dir);
+            assert_eq!(dacl_sddl(&config, false).unwrap(), leaf);
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), CONFIG);
+
+            assert_eq!(
+                crate::config::load::read_config_content(&config).unwrap(),
+                CONFIG
+            );
+            assert_eq!(dacl_sddl(&config, false).unwrap(), leaf);
+            assert!(current_owner(&config, false));
+            checked_leaf(&config);
+        }
+
+        #[test]
+        fn config_persistence_permissions_windows_protected_save_survives_parent_repair() {
+            let root = crate::tests::OwnedTestDirectory::new("wh1gq-protected-save");
+            let config_dir = root.path().join("config");
+            let config = config_dir.join("config.toml");
+            crate::config::load::atomic_config_write(&config, CONFIG).unwrap();
+            checked_directory(&config_dir);
+            checked_leaf(&config);
+            let directory = dacl_sddl(&config_dir, true).unwrap();
+            let leaf = dacl_sddl(&config, false).unwrap();
+
+            for _ in 0..2 {
+                crate::paths::ensure_private_directory(&config_dir).unwrap();
+                assert_eq!(
+                    crate::config::load::read_config_content(&config).unwrap(),
+                    CONFIG
+                );
+                assert_eq!(dacl_sddl(&config_dir, true).unwrap(), directory);
+                assert_eq!(dacl_sddl(&config, false).unwrap(), leaf);
+                checked_leaf(&config);
+            }
+            crate::config::load::atomic_config_write(&config, "model = \"replaced\"\n").unwrap();
+            assert_eq!(
+                crate::config::load::read_config_content(&config).unwrap(),
+                "model = \"replaced\"\n"
+            );
+            checked_leaf(&config);
+        }
+
+        #[test]
+        fn config_persistence_permissions_windows_inherited_foreign_owner_config_is_rejected() {
+            let root = crate::tests::OwnedTestDirectory::new("wh1gq-foreign-owner");
+            let (config_dir, config) = inherited_fixture(root.path(), "config");
+            match set_owner(&config, false, "BA") {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_OWNER) => {
+                    eprintln!(
+                        "skipping foreign-owner case: this token cannot assign Administrators as owner"
+                    );
+                    return;
+                }
+                Err(error) => panic!("set fixture owner: {error}"),
+            }
+            assert!(!current_owner(&config, false));
+
+            crate::paths::ensure_private_directory(&config_dir).unwrap();
+            checked_directory(&config_dir);
+            let before = dacl_sddl(&config, false).unwrap();
+            let error = crate::config::load::read_config_content(&config).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            // Rejection must not adopt or normalize the foreign leaf.
+            assert!(!current_owner(&config, false));
+            assert_eq!(dacl_sddl(&config, false).unwrap(), before);
+            assert!(!parsed_dacl(&config, false).0.contains('P'));
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), CONFIG);
+        }
+    }
 }
 
 #[cfg(test)]
