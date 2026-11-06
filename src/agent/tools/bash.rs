@@ -883,13 +883,37 @@ pub struct JobStatusTool {
 }
 
 /// The first byte `job_status` input may not carry: C0 controls other than
-/// tab, LF and CR, and DEL. The terminal's line discipline and readline act
-/// on them (kill line, erase, signal), so the typed text would no longer be
-/// the command that was judged.
+/// LF and CR, and DEL. The terminal's line discipline and readline act on
+/// them (kill line, erase, signal, and TAB completion, which rewrites the
+/// word before the shell runs it), so the typed text would no longer be the
+/// command that was judged.
 fn disallowed_input_control(input: &str) -> Option<char> {
     input
         .chars()
-        .find(|c| (c.is_control() && !matches!(c, '\n' | '\r' | '\t')) || *c == '\u{7f}')
+        .find(|c| (c.is_control() && !matches!(c, '\n' | '\r')) || *c == '\u{7f}')
+}
+
+/// Text an interactive shell's history expansion would rewrite before running
+/// it: a `!` that starts an event designator, or `^old^new` quick substitution
+/// at the start of a line. The typed text would then not be the command that
+/// was judged, so such input is refused.
+fn history_expansion_trigger(typed: &str) -> Option<&'static str> {
+    for line in typed.split(['\n', '\r']) {
+        if line.starts_with('^') {
+            return Some("a line starting with ^ (history quick substitution)");
+        }
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '!'
+                && let Some(next) = chars.peek()
+                && !next.is_whitespace()
+                && *next != '='
+            {
+                return Some("! followed by text (history expansion)");
+            }
+        }
+    }
+    None
 }
 
 impl JobStatusTool {
@@ -974,7 +998,7 @@ impl Tool for JobStatusTool {
                 "input": {
                     "type": "string",
                     "maxLength": 16384,
-                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command, together with any unterminated line already typed. C0 control characters other than tab, newline and carriage return (Ctrl-U, Ctrl-C, backspace, ESC, DEL) are refused. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
+                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command, together with any unterminated line already typed. C0 control characters other than newline and carriage return (Tab, Ctrl-U, Ctrl-C, backspace, ESC, DEL) are refused because a terminal would act on them (completion, line editing, signals); so are history expansions (`!` followed by text, a line starting with `^`). Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -1063,6 +1087,11 @@ impl Tool for JobStatusTool {
                     return Err(ToolError::Msg(format!(
                         "job_status input contains the control character U+{:04X}, which the terminal would interpret (erase, kill-line, signal, escape) instead of typing it, so the command could differ from what was permission-checked. Send plain text with \\n only; stop the job to interrupt it.",
                         control as u32
+                    )));
+                }
+                if let Some(trigger) = history_expansion_trigger(input) {
+                    return Err(ToolError::Msg(format!(
+                        "job_status input contains {trigger}, which an interactive shell rewrites before running it, so the command could differ from what was permission-checked. Avoid ! and a leading ^, or quote them out of the typed text."
                     )));
                 }
                 // Typed text can run anything the terminal's program accepts,
@@ -2796,8 +2825,68 @@ mod tests {
     }
 
     #[test]
-    fn disallowed_input_control_allows_only_tab_lf_cr() {
-        assert_eq!(disallowed_input_control("a\tb\r\nc é"), None);
+    fn history_expansion_triggers_are_detected() {
+        assert!(history_expansion_trigger("^ls^touch f\n").is_some());
+        assert!(history_expansion_trigger("ls\n^a^b\n").is_some());
+        assert!(history_expansion_trigger("echo !!\n").is_some());
+        assert!(history_expansion_trigger("echo !$").is_some());
+        assert!(history_expansion_trigger("x != 1\nnot ! x\nwow!\n").is_none());
+        assert!(history_expansion_trigger("a ^ b\n").is_none());
+    }
+
+    /// An interactive bash rewrites the line (TAB completion, history
+    /// expansion) before running it, so the judged text must be refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_input_cannot_bypass_deny_rules_through_bash_completion_or_history() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        if !std::path::Path::new("/bin/bash").exists() {
+            return;
+        }
+        let dir = std::env::current_dir().unwrap();
+        let tab = dir.join(format!("job-input-tab-{}", std::process::id()));
+        let hist = dir.join(format!("job-input-hist-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tab);
+        let _ = std::fs::remove_file(&hist);
+        let shell = test_tool();
+        let id = start_pty_job(&shell, "/bin/bash --norc --noprofile -i").await;
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("touch *".to_string(), Action::Deny),
+                        ("*".to_string(), Action::Allow),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Yolo,
+        );
+        let status =
+            JobStatusTool::new(shell.sandbox.clone(), None).with_permission(Some(permission), None);
+        let name = |path: &std::path::Path| path.file_name().unwrap().to_string_lossy().to_string();
+        let error = job_input(&status, &id, &format!("touc\t {}\n", name(&tab)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("control character"), "{error}");
+        job_input(&status, &id, "ls\n").await.unwrap();
+        let error = job_input(&status, &id, &format!("^ls^touch {}\n", name(&hist)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("history"), "{error}");
+        let error = job_input(&status, &id, "!!\n").await.unwrap_err();
+        assert!(error.to_string().contains("history"), "{error}");
+        job_input(&status, &id, "echo alive\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!tab.exists() && !hist.exists(), "rewritten input ran");
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    #[test]
+    fn disallowed_input_control_allows_only_lf_cr() {
+        assert_eq!(disallowed_input_control("ab\r\nc é"), None);
+        assert_eq!(disallowed_input_control("a\tb"), Some('\t'));
         assert_eq!(disallowed_input_control("a\u{15}"), Some('\u{15}'));
         assert_eq!(disallowed_input_control("\u{7f}"), Some('\u{7f}'));
     }
