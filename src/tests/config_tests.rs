@@ -1616,3 +1616,19 @@ fn quick_model_context_window_applies_to_main_session_and_subagents() {
         None
     );
 }
+
+#[test]
+fn edit_file_size_limit_is_separate_from_read_size_and_defaults_to_16_mib() {
+    let mut cfg = Config::default();
+    assert_eq!(cfg.resolve_max_edit_file_size(), 16 * 1024 * 1024);
+    // Raising the read cap above the default also raises the edit cap.
+    cfg.max_text_file_size = Some(32 * 1024 * 1024);
+    assert_eq!(cfg.resolve_max_edit_file_size(), 32 * 1024 * 1024);
+    // A small read cap does not shrink the edit cap.
+    cfg.max_text_file_size = Some(1024 * 1024);
+    assert_eq!(cfg.resolve_max_edit_file_size(), 16 * 1024 * 1024);
+    cfg.max_edit_file_size = Some(4096);
+    assert_eq!(cfg.resolve_max_edit_file_size(), 4096);
+    let parsed: Config = toml::from_str("max_edit_file_size = 5000000").unwrap();
+    assert_eq!(parsed.resolve_max_edit_file_size(), 5_000_000);
+}

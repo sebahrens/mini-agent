@@ -629,7 +629,7 @@ fn configure_file_checkpoints(cfg: &Config) {
         checkpoints.max_file_bytes,
         checkpoints.max_total_bytes,
         checkpoints.max_records,
-        cfg.max_text_file_size,
+        Some(cfg.resolve_max_edit_file_size()),
     );
     #[cfg(not(test))]
     crate::session::file_checkpoints::configure(limits);
@@ -1063,6 +1063,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         None
     } else {
         let max_text_file_size = cfg.max_text_file_size;
+        // Edits never return the file, so they use their own, larger limit.
+        let max_edit_file_size = Some(cfg.resolve_max_edit_file_size());
         configure_file_checkpoints(cfg);
         let max_read_lines = cfg.resolve_max_read_lines();
         let max_bash_output_lines = cfg.resolve_max_bash_output_lines();
@@ -1075,7 +1077,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let write_tool = tools::WriteTool::new_with_tracker(
             permission.clone(),
             ask_tx.clone(),
-            max_text_file_size,
+            max_edit_file_size,
             read_tracker.clone(),
         )
         .with_workspace_binding(workspace.clone())
@@ -1086,7 +1088,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let edit_tool = tools::EditTool::new_with_tracker(
             permission.clone(),
             ask_tx.clone(),
-            max_text_file_size,
+            max_edit_file_size,
             read_tracker.clone(),
         )
         .with_workspace_binding(workspace.clone())
@@ -1155,7 +1157,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             ask_tx.clone(),
             workspace.clone(),
             read_tracker.clone(),
-            cfg.max_text_file_size,
+            max_edit_file_size,
             cfg.mutation_diff_options(),
         )));
         base_tools.push(Box::new(
@@ -1245,7 +1247,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     write_enabled: cli.tool_is_eligible(cfg, "write"),
                     edit_enabled: cli.tool_is_eligible(cfg, "edit"),
                     shell_enabled: shell_tool_enabled,
-                    max_text_file_size,
+                    max_text_file_size: max_edit_file_size,
                     max_shell_output_lines: max_bash_output_lines,
                     shell_timeout_secs: cfg.resolve_shell_timeout_secs(),
                     diff_options: cfg.mutation_diff_options(),

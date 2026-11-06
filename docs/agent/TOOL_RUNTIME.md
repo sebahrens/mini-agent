@@ -766,8 +766,8 @@ unique IDs and receives a new ID on insertion.
 Untouched JSON field payloads remain validated raw JSON, preserving large
 integers and opaque metadata. Opaque nesting is not recursively traversed;
 byte caps, rather than an assumed semantic nesting limit, bound its handling.
-Notebook input and resulting serialization must fit `max_text_file_size`
-(default 1 MiB), with an absolute 8 MiB ceiling. There are at most 4,096 cells,
+Notebook input and resulting serialization must fit `max_edit_file_size`
+(default 16 MiB), with an absolute 8 MiB ceiling. There are at most 4,096 cells,
 256 interpreted fields per notebook/cell/output object, 1,024 bytes per field
 name and 1 MiB of decoded source per cell. Duplicate interpreted object fields,
 invalid UTF-8 and ambiguous cell IDs are rejected. Unselected unknown cell

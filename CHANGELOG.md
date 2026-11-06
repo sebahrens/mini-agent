@@ -159,6 +159,14 @@ Notable changes to mini-agent are documented in this file. The format follows
   result URIs back to workspace paths (outside locations are counted, not named) and caps results
   at 100 entries and hover text at 8 KiB (mini-agent-8v84r).
 
+### Changed
+
+- `edit`, `write` and `notebook_edit` use a separate `max_edit_file_size` limit (default 16 MiB, or
+  `max_text_file_size` when larger) instead of the 1 MiB read limit, so large generated files and
+  lockfiles can be edited natively without enlarging read windows; the `/rewind` per-file
+  checkpoint limit follows it, and the size errors name `max_edit_file_size` instead of suggesting
+  `sed`/`awk` (mini-agent-p8c8z).
+
 **Fork release 1.14.1 (2026-10-26)**
 
 ### Fixed

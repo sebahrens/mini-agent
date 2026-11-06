@@ -12,7 +12,7 @@ use crate::agent::tools::{
 #[cfg(feature = "lsp")]
 use crate::extras::lsp::LspManager;
 
-const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
+const DEFAULT_MAX_TEXT_SIZE: u64 = crate::config::DEFAULT_MAX_EDIT_FILE_SIZE;
 
 fn full_text_fingerprint(bytes: &[u8]) -> Result<(u32, usize), ToolError> {
     std::str::from_utf8(bytes).map_err(|_| {
@@ -278,7 +278,7 @@ impl WriteTool {
                 self.max_text_file_size,
             );
             return Err(ToolError::Msg(format!(
-                "File too large ({} bytes). Maximum allowed file size is {} bytes.",
+                "File too large ({} bytes). Maximum allowed file size is {} bytes (max_edit_file_size).",
                 bytes, self.max_text_file_size
             )));
         }

@@ -1305,22 +1305,36 @@ async fn edit_accepts_a_file_at_the_size_limit_and_rejects_one_above_it() {
 }
 
 #[tokio::test]
-async fn edit_rejects_a_large_file_under_the_default_limit() {
+async fn edit_default_limit_admits_a_5_mib_file_and_rejects_above_16_mib() {
     select_edit_system(EditSystem::Similarity);
     let root = edit_temp_root("default-limit");
+    let filler = "generated line of a large lockfile or bundle\n";
+    let five_mib = format!("needle\n{}", filler.repeat(5 * 1024 * 1024 / filler.len()));
+    std::fs::write(root.join("large.txt"), &five_mib).unwrap();
+    // No read (and no raised read limit) is needed to edit a unique SEARCH.
+    let tool = edit::EditTool::new(None, None).with_workspace(root.clone());
+    let output = tool
+        .call(block_args("large.txt", "needle", "replacement", false))
+        .await
+        .expect("a 5 MiB file is within the default edit limit");
+    assert!(output.len() < 64 * 1024, "edit must not return the file");
+    let after = std::fs::read_to_string(root.join("large.txt")).unwrap();
+    assert!(after.starts_with("replacement\n"));
+    assert_eq!(
+        after.len(),
+        five_mib.len() + "replacement".len() - "needle".len()
+    );
+
     std::fs::write(
-        root.join("large.txt"),
-        format!("needle\n{}", "x".repeat(2 * 1024 * 1024)),
+        root.join("huge.txt"),
+        format!("needle\n{}", "x".repeat(16 * 1024 * 1024)),
     )
     .unwrap();
-    let tool = edit::EditTool::new(None, None).with_workspace(root.clone());
-    let result = tool
-        .call(block_args("large.txt", "needle", "replacement", false))
-        .await;
-    assert!(
-        result.is_err(),
-        "the default 1 MiB budget must apply to edit: {result:?}"
-    );
+    let error = tool
+        .call(block_args("huge.txt", "needle", "replacement", false))
+        .await
+        .expect_err("the default 16 MiB edit budget must apply");
+    assert!(error.to_string().contains("max_edit_file_size"), "{error}");
     std::fs::remove_dir_all(root).unwrap();
 }
 

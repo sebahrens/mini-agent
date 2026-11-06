@@ -14,10 +14,11 @@ use crate::config::types::EditSystem;
 #[cfg(feature = "lsp")]
 use crate::extras::lsp::LspManager;
 
-/// Same default as the read and write tools: an edit that would have to
-/// materialize more than this many bytes in the unsandboxed parent is refused
-/// before the file is opened.
-const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
+/// Same default as the write tool and `max_edit_file_size`: an edit that
+/// would have to materialize more than this many bytes in the unsandboxed
+/// parent is refused before the file is opened. Independent of read limits:
+/// an edit never returns the file.
+const DEFAULT_MAX_TEXT_SIZE: u64 = crate::config::DEFAULT_MAX_EDIT_FILE_SIZE;
 
 pub struct EditTool {
     pub permission: Option<PermCheck>,
@@ -1281,7 +1282,7 @@ fn reject_overlapping_ranges(
 
 fn file_too_large(path: &str, size: u64, limit: u64) -> ToolError {
     ToolError::Msg(format!(
-        "Cannot edit '{}': the file is {} bytes, above the {}-byte limit. Use bash (sed/awk) for very large files or raise max_text_file_size.",
+        "Cannot edit '{}': the file is {} bytes, above the {}-byte limit. Raise max_edit_file_size to edit it natively (shell edits bypass /rewind checkpoints and the diff preview).",
         path, size, limit
     ))
 }
@@ -1635,7 +1636,7 @@ impl EditTool {
         let output_bytes = output.len() as u64;
         if output_bytes > limit {
             return Err(ToolError::Msg(format!(
-                "Edit rejected: the result would be {output_bytes} bytes, above the {limit}-byte limit for '{expanded}'. Split the change or raise max_text_file_size."
+                "Edit rejected: the result would be {output_bytes} bytes, above the {limit}-byte limit for '{expanded}'. Split the change or raise max_edit_file_size."
             )));
         }
         let excerpts = if disclose_source {
