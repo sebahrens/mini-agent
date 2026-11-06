@@ -12,7 +12,7 @@ use crate::extras::js::skills::embed::Embedder;
 use crate::paths::{AppPaths, portable};
 
 use super::index::{AgentSkillIndex, AgentSkillRecord};
-use super::manifest::parse_skill_markdown;
+use super::manifest::parse_skill_markdown_lenient;
 use super::retention::SessionLease;
 
 // A tree whose SKILL.md is larger than one turn's instruction budget can never
@@ -358,7 +358,11 @@ fn scan_record(
     }
     *bytes_left = bytes_left.saturating_sub(metadata.len());
     let markdown = super::import::read_stable_file(&markdown_path, MAX_SKILL_MD_BYTES, false)?;
-    let manifest = parse_skill_markdown(&markdown)?;
+    // Packages in the catalog were validated when published (strictly, or with
+    // Claude Code defaults for a compatibility root); the lenient reading is a
+    // superset and resolves those defaults the same way.
+    let manifest =
+        parse_skill_markdown_lenient(&markdown, &name_entry.file_name().to_string_lossy())?;
     if name_entry.file_name().to_string_lossy() != manifest.name {
         return Ok(None);
     }

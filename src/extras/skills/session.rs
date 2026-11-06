@@ -1728,6 +1728,67 @@ mod discovery_tests {
     }
 
     #[tokio::test]
+    async fn bare_and_partial_claude_skills_load_with_directory_and_body_defaults() {
+        let fixture = Fixture::new(false);
+        let write = |source: &str, dir: &str, text: &str| {
+            let package = fixture.root.path().join(source).join(dir);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("SKILL.md"), text).unwrap();
+        };
+        write(
+            ".claude/skills",
+            "bare-skill",
+            "\n# Bare heading\nBody text\n",
+        );
+        write(
+            ".claude/skills",
+            "no-description",
+            "---\nuser-invocable: yes\n---\nDoes the thing.\n",
+        );
+        write(
+            ".claude/skills",
+            "broken-yaml",
+            "---\nname: broken-yaml\ndescription: use it: now [oops\n  bad: : :\n---\nBody\n",
+        );
+        let long = "x".repeat(2000);
+        write(
+            ".claude/skills",
+            "long-desc",
+            &format!("---\ndescription: {long}\n---\nBody\n"),
+        );
+        // Strict roots keep the Agent Skills requirements.
+        write(".agents/skills", "strict-bare", "no frontmatter\n");
+        let snapshot = fixture.services.refresh(false).await.unwrap();
+        let text = snapshot.diagnostics.join("\n");
+        for name in ["bare-skill", "no-description", "broken-yaml", "long-desc"] {
+            assert!(snapshot.packages.contains_key(name), "{name}: {text}");
+        }
+        assert_eq!(
+            snapshot.packages["bare-skill"].record.description,
+            "Bare heading"
+        );
+        assert_eq!(
+            snapshot.packages["no-description"].record.description,
+            "Does the thing."
+        );
+        assert!(
+            snapshot.packages["broken-yaml"]
+                .record
+                .description
+                .starts_with("use it")
+        );
+        assert_eq!(
+            snapshot.packages["long-desc"]
+                .record
+                .description
+                .chars()
+                .count(),
+            1024
+        );
+        assert!(!snapshot.packages.contains_key("strict-bare"), "{text}");
+    }
+
+    #[tokio::test]
     async fn disable_model_invocation_skill_is_not_selected_or_listed_but_stays_pinnable() {
         let fixture = Fixture::new(false);
         let deploy = fixture.skill(
