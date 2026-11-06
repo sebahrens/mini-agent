@@ -1767,6 +1767,21 @@ async fn mcp_enabled_and_disabled_tools_apply_before_the_cap_and_enabled_false_s
         unreachable!()
     };
     options.disabled_tools = (0..50).map(|index| format!("t{index}")).collect();
+    // A deferrable (default `auto`) server keeps all 150 remaining tools.
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .unwrap();
+    let listed = handle.cached_tools().await.unwrap();
+    assert_eq!(listed.entries.len(), 150);
+    assert!(!listed.reached_tool_cap);
+    let pid = wait_for_pid(&lease).await;
+    shutdown(McpClientManager::from_handles(vec![handle])).await;
+    assert_process_reaped(pid).await;
+    // An eager server keeps the 128-tool cap and names what it omitted.
+    let McpServerConfig::Command { defer, .. } = &mut config else {
+        unreachable!()
+    };
+    *defer = crate::extras::mcp::config::McpDefer::Eager;
     let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
         .await
         .unwrap();
@@ -1774,6 +1789,8 @@ async fn mcp_enabled_and_disabled_tools_apply_before_the_cap_and_enabled_false_s
     assert_eq!(listed.entries.len(), 128);
     assert_eq!(listed.entries[0].definition.name, "t50");
     assert!(listed.reached_tool_cap);
+    assert_eq!(listed.over_cap.count, 22);
+    assert!(listed.over_cap.exact && listed.over_cap.names.len() == 16);
     let pid = wait_for_pid(&lease).await;
     shutdown(McpClientManager::from_handles(vec![handle])).await;
     assert_process_reaped(pid).await;

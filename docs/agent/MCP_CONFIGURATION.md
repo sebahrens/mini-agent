@@ -176,9 +176,10 @@ Command and URL entries also accept:
 | `enabled_tools` | omitted | Only these exact server tool names are registered. |
 | `disabled_tools` | `[]` | These exact server tool names are never registered (applied after `enabled_tools`). |
 
-Selection runs on each `tools/list` page before the 128-tool per-server cap, so
-the cap counts only admitted tools and a selected tool past index 128 is still
-reached. `/mcp <server>` shows how many listed tools the selection excluded.
+Selection runs on each `tools/list` page before the per-server tool cap (128
+with `defer = false`, 1024 with `true`/`auto`), so the cap counts only admitted
+tools and a selected tool past the cap's index is still reached. When the cap
+omits tools, the startup notice counts them and names the first 16. `/mcp <server>` shows how many listed tools the selection excluded.
 Selection only narrows the registered set; it grants no permission.
 
 ## Resource tools (`list_mcp_resources`, `read_mcp_resource`)
@@ -285,8 +286,10 @@ returns at most eight names, descriptions and schemas, limited to 128 KiB total,
 and publishes those exact schemas for subsequent model requests. Queries are
 limited to 2 KiB and 32 words; invalid or oversized input fails explicitly. The
 names index is limited to 64 KiB and labels omitted names; search still considers
-the complete bounded catalogue. Existing 4 KiB description/16 KiB schema limits
-remain unchanged.
+the complete bounded catalogue. The 4 KiB description limit is unchanged; an input
+schema over 16 KiB is reduced (examples, then descriptions/titles/defaults, are
+removed) or, as a last resort, replaced by a permissive object schema with a
+note in the description, instead of the tool being dropped.
 
 Search changes no permissions. Enabled tools retain the original captured
 client, ordinary Ask/deny policy, hook invocation identity, cost admission,

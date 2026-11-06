@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### MCP
 
+- MCP tools whose input schema exceeds 16 KiB are no longer dropped: examples and then prose are
+  stripped, and a schema that is still too large becomes a permissive object schema (the server
+  validates), with a startup notice. Servers using `defer = true`/`auto` may list up to 1024 tools
+  (eager servers keep 128), and the tool-cap notice now counts and names the omitted tools.
 - `list_mcp_resources` skips malformed or duplicate entries individually instead of dropping a
   server's whole resource catalogue, reports how many were skipped or fell past the 128-entry /
   256 KiB bound, and accepts `query`, `offset` and `limit`. `read_mcp_resource` pages long text

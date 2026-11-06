@@ -2737,9 +2737,13 @@ to stderr. Every server must complete the MCP initialization handshake within
 10 seconds; for URL servers that budget also covers the TCP/TLS connect and,
 with OAuth, restoring (and refreshing) the stored token. Each server's
 `tools/list` enumeration is bounded to 30 seconds, 64 pages, and 128 tools per
-server. Each model-facing tool description is limited to 4 KiB and each input
-schema to 16 KiB; descriptions are safely truncated, while tools with invalid
-or oversized schemas are omitted. Startup notices report each applied bound.
+server (1024 when the server's `defer` is `true` or `auto`, because deferred
+schemas load on demand). Each model-facing tool description is limited to 4 KiB
+and each input schema to 16 KiB; descriptions are safely truncated, and an
+oversized schema is reduced (examples, then descriptions/titles/defaults,
+removed) or, if still too large, replaced by a permissive object schema rather
+than dropping the tool. Startup notices report each applied bound and name the
+tools a tool-count cap omitted.
 A server that exceeds the time or page budget is skipped without delaying the
 others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
 (default 120); on expiry mini-agent cancels the request and returns a tool error
