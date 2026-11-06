@@ -5090,11 +5090,26 @@ async fn relay_prompt_events(
                     tracing::warn!("ACP failed to send tool-loop notification: {}", e);
                 }
             }
-            AgentEvent::Retrying { attempt, max } => {
+            AgentEvent::OutputTruncated { message } => {
+                let chunk =
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(message.to_string())));
+                let notif = SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentThoughtChunk(chunk),
+                );
+                if let Err(e) = cx.send_notification(notif) {
+                    tracing::warn!("ACP failed to send truncation notification: {}", e);
+                }
+            }
+            AgentEvent::Retrying {
+                attempt,
+                max,
+                delay_ms,
+            } => {
                 // ACP has no status bar, so surface the retry as an agent
                 // thought. This keeps the client from going silent during the
                 // backoff delay and mirrors how `Reasoning` is forwarded.
-                let text = format!("retrying... ({}/{})", attempt, max);
+                let text = crate::event::retry_notice_text(attempt, max, delay_ms);
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
                 let notif = SessionNotification::new(
                     session_id.clone(),

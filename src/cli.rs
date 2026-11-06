@@ -748,6 +748,13 @@ pub struct Cli {
     #[arg(long = "max-tokens", help = "Maximum tokens in response")]
     pub max_tokens: Option<u64>,
 
+    #[arg(
+        long = "fallback-model",
+        value_name = "MODEL",
+        help = "Headless: same-provider model (id or quick-model alias) to use for a turn whose primary model fails with retries exhausted (overload, rate limit, 5xx)"
+    )]
+    pub fallback_model: Option<String>,
+
     #[arg(long, value_name = "USD", value_parser = parse_usd_budget,
         help = "Stop new model requests/effects once recorded session spend reaches this USD estimate")]
     pub max_budget_usd: Option<f64>,
@@ -1293,8 +1300,11 @@ impl Cli {
         Ok(self.resolve_max_budget_usd(cfg)?.is_some() || cfg.has_session_token_ceiling())
     }
 
+    /// The per-response output cap for the configured provider/model. See
+    /// [`resolve_response_max_tokens`].
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
-        self.max_tokens.or(cfg.max_tokens).unwrap_or(16384)
+        let (provider, model) = self.resolve_provider_and_model(cfg);
+        resolve_response_max_tokens(self.max_tokens.or(cfg.max_tokens), &provider, &model)
     }
 
     pub fn resolve_max_agent_turns(&self, cfg: &config::Config) -> usize {
@@ -1565,6 +1575,62 @@ pub fn write_completions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn response_max_tokens_follows_the_catalog_output_ceiling() {
+        use super::{DEFAULT_MAX_TOKENS_CEILING, FALLBACK_MAX_TOKENS, resolve_response_max_tokens};
+        let (provider, model, ceiling) = crate::models_catalog::catalog_entries("anthropic")
+            .unwrap()
+            .iter()
+            .find_map(|entry| {
+                crate::models_catalog::model_max_output("anthropic", &entry.id)
+                    .filter(|&tokens| tokens > DEFAULT_MAX_TOKENS_CEILING)
+                    .map(|tokens| ("anthropic", entry.id.clone(), tokens))
+            })
+            .expect("a catalog model with a large output ceiling");
+        // Unset: the model's own ceiling, bounded by the 32k default.
+        assert_eq!(
+            resolve_response_max_tokens(None, provider, &model),
+            DEFAULT_MAX_TOKENS_CEILING
+        );
+        // Explicit values are honoured but clamped to what the model accepts.
+        assert_eq!(
+            resolve_response_max_tokens(Some(1_000), provider, &model),
+            1_000
+        );
+        assert_eq!(
+            resolve_response_max_tokens(Some(u64::MAX), provider, &model),
+            ceiling
+        );
+        // A model with a small ceiling gets that ceiling, not a 400.
+        let (small_provider, small_model, small) = ["anthropic", "openai", "gemini"]
+            .into_iter()
+            .flat_map(|provider| {
+                crate::models_catalog::catalog_entries(provider)
+                    .unwrap()
+                    .iter()
+                    .map(move |entry| (provider, entry.id.clone()))
+            })
+            .find_map(|(provider, id)| {
+                crate::models_catalog::model_max_output(provider, &id)
+                    .filter(|&tokens| tokens < DEFAULT_MAX_TOKENS_CEILING)
+                    .map(|tokens| (provider, id, tokens))
+            })
+            .expect("a catalog model with a small output ceiling");
+        assert_eq!(
+            resolve_response_max_tokens(None, small_provider, &small_model),
+            small
+        );
+        // Unknown models keep the historical fallback.
+        assert_eq!(
+            resolve_response_max_tokens(None, "ollama", "llama-local"),
+            FALLBACK_MAX_TOKENS
+        );
+        assert_eq!(
+            resolve_response_max_tokens(Some(100_000), "ollama", "llama-local"),
+            100_000
+        );
+    }
+
     #[test]
     fn long_version_reports_exact_build_identity_without_startup() {
         use clap::Parser;
@@ -2779,5 +2845,26 @@ mod idle_exit_tests {
         assert!(Cli::try_parse_from(["mini-agent", "--loop", "--idle-exit", "2"]).is_ok());
         #[cfg(feature = "acp")]
         assert!(Cli::try_parse_from(["mini-agent", "--acp", "--idle-exit", "2"]).is_ok());
+    }
+}
+
+/// Response cap used when neither `--max-tokens` nor `max_tokens` is set and
+/// the model's own output ceiling is unknown (custom gateways, Ollama).
+pub const FALLBACK_MAX_TOKENS: u64 = 16_384;
+/// Upper bound of the implicit default for models whose catalog output
+/// ceiling is known; matches Claude Code's default of 32k output tokens.
+pub const DEFAULT_MAX_TOKENS_CEILING: u64 = 32_000;
+
+/// The per-response output-token cap. An explicit value is honoured but never
+/// above the model's catalog output ceiling (which the provider would reject);
+/// otherwise the default is `min(model ceiling, 32000)`, or 16384 when the
+/// model is not in the catalog.
+pub fn resolve_response_max_tokens(explicit: Option<u64>, provider: &str, model: &str) -> u64 {
+    let model_max = crate::models_catalog::model_max_output(provider, model);
+    match (explicit, model_max) {
+        (Some(explicit), Some(model_max)) => explicit.min(model_max),
+        (Some(explicit), None) => explicit,
+        (None, Some(model_max)) => model_max.min(DEFAULT_MAX_TOKENS_CEILING),
+        (None, None) => FALLBACK_MAX_TOKENS,
     }
 }

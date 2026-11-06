@@ -103,6 +103,7 @@ build does not know parks it.
 | `/model <alias\|id>` | Switch model: a `[quick_models]` alias first (which may also switch provider and pricing), otherwise a raw model id on the current provider. Raw ids resolve pricing from the live listing, baked catalog, then a matching quick model, as at startup. Unknown prices reset both rates to zero and show a yellow note explaining that costs are not tracked. |
 | `/models` | List quick models and the provider's available models. |
 | `/models refresh` | Re-fetch the provider's model list (also retries a listing that failed recently). |
+| `/models catalog-refresh` | Fetch the latest model catalog (context windows, output limits, prices, long-context tiers) from models.dev into the user cache; it overlays the embedded snapshot from the next start. `/models` shows which catalog is in use and its age. |
 | `/models <name>` | Same as `/model <name>`, kept for compatibility. |
 | `/models-add <name> <provider> <model>` | Save a new quick model to the config file. |
 | `/login openai [new\|<number>]` | Sign in to a ChatGPT subscription in the browser. `new` registers another account or workspace; a number reauthorizes a registration listed by `/provider`. See [PROVIDERS.md](PROVIDERS.md). |

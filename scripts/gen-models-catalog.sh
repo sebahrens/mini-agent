@@ -43,7 +43,10 @@ api="$(curl -fsSL --max-time 120 "$SRC")"
 # jq program:
 #  - `entry`  : project a models.dev model into our compact {id,name,context}.
 #  - `priced_entry` : `entry` plus input_price/output_price (USD per million
-#               tokens) straight from models.dev's `cost.input`/`cost.output`,
+#               tokens) and, when models.dev lists a prompt-size tier, a
+#               `long_context` {threshold, input_price, output_price,
+#               cache_read_price} premium. Base prices come straight from
+#               models.dev's `cost.input`/`cost.output`,
 #               when present. Used for the direct-API providers (anthropic,
 #               openai, gemini), which have no other source of pricing at
 #               runtime. Direct entries without both prices are omitted rather
@@ -68,13 +71,20 @@ echo "$api" | jq --argjson orv "$OPENROUTER_VENDORS" --argjson cut "$CUTOFFS" '
     select(.value.modalities.output | index("text"))
     | select((.key | ascii_downcase) as $id | (deny | any(. as $d | $id | contains($d))) | not)
     | recent($c);
-  def entry: {id: .value.id, name: .value.name, context: (.value.limit.context // null), image_input: (.value.modalities.input | if type == "array" then index("image") != null else null end)};
+  def entry: {id: .value.id, name: .value.name, context: (.value.limit.context // null), max_output: (.value.limit.output // null), image_input: (.value.modalities.input | if type == "array" then index("image") != null else null end)};
   def priced_entry: entry + {
     input_price: (.value.cost.input // null),
     output_price: (.value.cost.output // null),
     cache_read_price: (.value.cost.cache_read // null),
     cache_write_price: (.value.cost.cache_write // null)
-  };
+  } + (
+    # First prompt-size tier (models.dev `cost.tiers[]` with tier.type
+    # "context"): the long-context premium applied per request above
+    # `threshold` prompt tokens. Omitted when the model has none.
+    [(.value.cost.tiers // [])[] | select(.tier.type == "context" and .input != null and .output != null)]
+    | first
+    | if . == null then {} else {long_context: ({threshold: .tier.size, input_price: .input, output_price: .output} + (if .cache_read != null then {cache_read_price: .cache_read} else {} end))} end
+  );
   def models_of($p; $c; e): ($p.models // {}) | to_entries | map(chat($c) | e) | sort_by(.id);
   def priced_models_of($p; $c):
     ($p.models // {})
@@ -96,6 +106,10 @@ echo "$api" | jq --argjson orv "$OPENROUTER_VENDORS" --argjson cut "$CUTOFFS" '
     )
   }
 ' > "$OUT"
+
+# Generation instant, embedded as the snapshot's age (src/models_catalog.rs)
+# and compared against a newer user-cache overlay.
+date -u +%Y-%m-%dT%H:%M:%SZ > "$SCRIPT_DIR/../data/models.generated"
 
 echo "Wrote $OUT" >&2
 jq -r 'to_entries[] | "  \(.key): \(.value | length) models"' "$OUT" >&2

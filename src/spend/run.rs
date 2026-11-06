@@ -21,6 +21,9 @@ pub(crate) struct Run {
     provider: String,
     model: String,
     pub(crate) prices: PriceSnapshot,
+    /// Prompt-size premium for this model, applied per request in
+    /// [`Self::receipt`] (mini-agent-7r0be).
+    long_context: Option<crate::pricing::LongContextPrices>,
     kind: RequestKind,
     setup_error: Option<Arc<str>>,
     reasoning_exclusive: bool,
@@ -53,6 +56,7 @@ impl Run {
             provider: "openai".into(),
             model: "fixture".into(),
             prices,
+            long_context: None,
             kind: RequestKind::Turn,
             setup_error: None,
             reasoning_exclusive: false,
@@ -156,6 +160,11 @@ impl Run {
             provider: session.provider.to_string(),
             model: session.model.to_string(),
             prices: PriceSnapshot::from_session(session, cfg),
+            long_context: crate::pricing::LongContextPrices::for_model(
+                &session.provider,
+                &session.model,
+                session.known_input_output_prices().map(|(input, _)| input),
+            ),
             kind,
             setup_error: initialization_error.or(setup_error),
             cap_required: cfg.max_budget_usd.is_some(),
@@ -204,6 +213,7 @@ impl Run {
             provider: provider.into(),
             model: model.into(),
             prices: PriceSnapshot::capture(None, Default::default(), false),
+            long_context: None,
             kind: RequestKind::Turn,
             setup_error,
             cap_required: cfg.max_budget_usd.is_some(),
@@ -232,6 +242,11 @@ impl Run {
             provider: provider.into(),
             model: model.into(),
             prices: prices.with_cache_policy(cfg, model),
+            long_context: crate::pricing::LongContextPrices::for_model(
+                provider,
+                model,
+                prices.input,
+            ),
             kind,
             cache_ttl: cfg.cache_ttl.unwrap_or_default(),
             reasoning_exclusive: cfg.reasoning_tokens_are_exclusive_of_output(provider),
@@ -282,12 +297,6 @@ impl Run {
         }
     }
 
-    #[cfg(any(
-        feature = "goal",
-        feature = "subagents",
-        feature = "advisor",
-        feature = "acp"
-    ))]
     pub(crate) fn for_model(
         &self,
         provider: &str,
@@ -313,6 +322,11 @@ impl Run {
         let mut run = Self {
             provider: provider.into(),
             model: model.into(),
+            long_context: crate::pricing::LongContextPrices::for_model(
+                provider,
+                model,
+                prices.map(|(input, _)| input),
+            ),
             prices: PriceSnapshot::capture(prices, cache, cfg.is_anthropic_native(provider))
                 .with_cache_policy(cfg, model),
             kind,
@@ -418,13 +432,16 @@ impl Run {
         if self.reasoning_exclusive {
             usage.output_tokens = usage.output_tokens.saturating_add(usage.reasoning_tokens);
         }
+        let prices = self.long_context.map_or(self.prices, |tier| {
+            self.prices.with_long_context(tier, usage)
+        });
         let receipt = Receipt::new(
             &self.session_id,
             &self.provider,
             &self.model,
             self.kind,
             usage,
-            self.prices,
+            prices,
         );
         #[cfg(feature = "subagents")]
         let receipt = receipt.with_background_observation(self.background_observation.clone());

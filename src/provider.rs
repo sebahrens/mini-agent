@@ -942,6 +942,7 @@ impl AnyClient {
             AnyModel::Copilot(model) => copilot::reasoning_protocol(model),
             AnyModel::OpenAI(OpenAiModel::Responses(_)) => effort::Protocol::OpenAiResponses,
             AnyModel::OpenAI(OpenAiModel::Completions(_)) => effort::Protocol::OpenAiCompletions,
+            AnyModel::Gemini(_) => effort::Protocol::Gemini,
             _ => effort::Protocol::Other,
         };
         let raw = crate::config::resolve_extra_body(cfg, &session.model);
@@ -2432,6 +2433,47 @@ pub enum AnyAgentInner {
     Ollama(Agent<ollama::CompletionModel<ProviderHttpClient>>),
 }
 
+impl AnyAgentInner {
+    /// The model id this agent sends.
+    pub(crate) fn model_id(&self) -> String {
+        match self {
+            AnyAgentInner::OpenRouter(a) => a.model.model.clone(),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => a.model.model.clone(),
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => a.model.model.clone(),
+            AnyAgentInner::Anthropic(a) => a.model.model.clone(),
+            AnyAgentInner::Gemini(a) => a.model.model.clone(),
+            AnyAgentInner::Copilot(a) => a.model.model.clone(),
+            AnyAgentInner::Ollama(a) => a.model.model.clone(),
+        }
+    }
+
+    /// The same agent (tools, preamble, hooks, parameters) sending `model`
+    /// instead, with its response cap clamped to that model's ceiling.
+    pub(crate) fn with_model_id(&self, provider: &str, model: &str) -> AnyAgentInner {
+        let mut inner = self.clone();
+        macro_rules! swap {
+            ($agent:expr) => {{
+                let mut completion = (*$agent.model).clone();
+                completion.model = model.to_string();
+                $agent.model = std::sync::Arc::new(completion);
+                $agent.max_tokens = $agent.max_tokens.map(|tokens| {
+                    crate::cli::resolve_response_max_tokens(Some(tokens), provider, model)
+                });
+            }};
+        }
+        match &mut inner {
+            AnyAgentInner::OpenRouter(a) => swap!(a),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => swap!(a),
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => swap!(a),
+            AnyAgentInner::Anthropic(a) => swap!(a),
+            AnyAgentInner::Gemini(a) => swap!(a),
+            AnyAgentInner::Copilot(a) => swap!(a),
+            AnyAgentInner::Ollama(a) => swap!(a),
+        }
+        inner
+    }
+}
+
 #[cfg(feature = "subagents")]
 impl AnyAgentInner {
     /// Why this provider path cannot honour a forced `tool_choice` on its
@@ -2708,6 +2750,119 @@ impl NativeHostGuard {
     }
 }
 
+/// A resolved `fallback_model` / `--fallback-model` for the main session.
+pub(crate) struct FallbackRoute {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    /// The quick-model alias it was selected through, for its prices.
+    pub(crate) alias: Option<String>,
+    pub(crate) cfg: std::sync::Arc<Config>,
+    pub(crate) controls: effort::SessionReasoning,
+}
+
+impl FallbackRoute {
+    fn notice(&self, primary: &str, turn: &runner::HeadlessTurn) -> String {
+        let reason = turn
+            .failure
+            .as_ref()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        let reason = reason.lines().next().unwrap_or_default();
+        let reason: String = reason.chars().take(200).collect();
+        format!(
+            "notice: model {primary} failed after retries ({reason}); falling back to {} for this turn",
+            self.model
+        )
+    }
+}
+
+static CLI_FALLBACK_MODEL: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Record `--fallback-model`, which takes precedence over `fallback_model`.
+pub(crate) fn set_cli_fallback_model(model: Option<String>) {
+    *CLI_FALLBACK_MODEL
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = model;
+}
+
+/// Resolve the fallback for `session`: `--fallback-model`, else
+/// `fallback_model`; a quick-model alias or a model id on the session's
+/// provider. A fallback on another provider is refused with a warning (the
+/// turn's client, credentials and history protocol belong to the primary).
+pub(crate) fn resolve_fallback_route(
+    cfg: &Config,
+    session: &crate::session::Session,
+) -> Option<std::sync::Arc<FallbackRoute>> {
+    let cli = CLI_FALLBACK_MODEL
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let name = cli.or_else(|| cfg.fallback_model.as_ref().map(|name| name.to_string()))?;
+    resolve_fallback_route_named(cfg, session, &name)
+}
+
+fn resolve_fallback_route_named(
+    cfg: &Config,
+    session: &crate::session::Session,
+    name: &str,
+) -> Option<std::sync::Arc<FallbackRoute>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let (provider, model, alias) = match crate::config::quick_models_map(cfg).get(name) {
+        Some(quick) => (
+            quick.provider.to_string(),
+            quick.model.to_string(),
+            Some(name.to_string()),
+        ),
+        None => (session.provider.to_string(), name.to_string(), None),
+    };
+    if provider != session.provider.as_str() {
+        tracing::warn!(
+            fallback = name,
+            provider,
+            "fallback model ignored: it must use the session's provider ({})",
+            session.provider
+        );
+        return None;
+    }
+    if model == session.model.as_str() {
+        return None;
+    }
+    Some(std::sync::Arc::new(FallbackRoute {
+        provider,
+        model,
+        alias,
+        cfg: std::sync::Arc::new(cfg.clone()),
+        controls: session.reasoning_controls,
+    }))
+}
+
+/// A headless turn may move to the fallback model only when the primary
+/// failed before any progress (no streamed text, no tool effect, nothing to
+/// replay) with an error that retrying could have fixed: overload, rate
+/// limit, server or transport failure. Context-window, authentication,
+/// budget and other client errors never fall back.
+pub(crate) fn fallback_eligible(turn: &runner::HeadlessTurn) -> bool {
+    let Some(error) = turn.failure.as_ref() else {
+        return false;
+    };
+    if !turn.response.is_empty()
+        || !turn.interactions.is_empty()
+        || error
+            .downcast_ref::<crate::question::QuestionRequired>()
+            .is_some()
+        || error
+            .downcast_ref::<crate::spend::run::BudgetStopped>()
+            .is_some()
+    {
+        return false;
+    }
+    let error: &(dyn std::error::Error + 'static) = error.as_ref();
+    crate::retry::is_retryable(error)
+}
+
 #[derive(Clone)]
 pub struct AnyAgent {
     inner: AnyAgentInner,
@@ -2730,6 +2885,9 @@ pub struct AnyAgent {
     headless_turn_directive: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     completion_verification: Option<runner::CompletionVerification>,
     reasoning_controls: Option<CapturedReasoning>,
+    /// Same-provider model used for the rest of a headless turn whose
+    /// primary request failed with retries exhausted (mini-agent-5gc2c).
+    fallback: Option<std::sync::Arc<FallbackRoute>>,
     #[cfg(feature = "memory")]
     memory_context: Option<Result<std::sync::Arc<str>, &'static str>>,
     context_snapshot: Option<builder::PreambleSnapshot>,
@@ -3463,6 +3621,7 @@ impl AnyAgent {
             headless_turn_directive: None,
             completion_verification: None,
             reasoning_controls: None,
+            fallback: None,
             #[cfg(feature = "memory")]
             memory_context: None,
             context_snapshot: None,
@@ -3479,12 +3638,32 @@ impl AnyAgent {
         }
     }
 
+    /// The configured fallback as a ready agent: the primary's prepared inner
+    /// agent with the fallback model id, its output cap clamped to that
+    /// model and reasoning controls recomputed for it. `None` when the
+    /// fallback cannot honour the session's reasoning controls.
+    fn fallback_agent(&self, inner: &AnyAgentInner, route: &FallbackRoute) -> Option<AnyAgent> {
+        let mut agent = self.clone();
+        agent.inner = inner.with_model_id(&route.provider, &route.model);
+        agent.fallback = None;
+        let agent = agent.with_reasoning_controls(&route.cfg, route.controls);
+        if let Some(error) = agent.reasoning_error() {
+            tracing::warn!(
+                model = route.model,
+                "fallback model skipped: reasoning controls unsupported: {error}"
+            );
+            return None;
+        }
+        Some(agent)
+    }
+
     /// Capture main-session data before restoring a binding or starting work.
     /// Independently built auxiliary agents retain their own context policy.
     pub(crate) fn with_main_session(self, cfg: &Config, session: &crate::session::Session) -> Self {
-        let agent = self
+        let mut agent = self
             .with_reasoning_controls(cfg, session.reasoning_controls)
             .with_ollama_context_window(session.context_window);
+        agent.fallback = resolve_fallback_route(cfg, session);
         #[cfg(feature = "memory")]
         {
             agent.with_memory_placement(session.memory_placement)
@@ -3563,7 +3742,7 @@ impl AnyAgent {
             AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => {
                 (P::OpenAiCompletions, &a.model.model)
             }
-            AnyAgentInner::Gemini(a) => (P::Other, &a.model.model),
+            AnyAgentInner::Gemini(a) => (P::Gemini, &a.model.model),
             AnyAgentInner::Ollama(a) => (P::Other, &a.model.model),
             AnyAgentInner::Copilot(a) => (copilot::reasoning_protocol(&a.model), &a.model.model),
         }
@@ -4089,6 +4268,7 @@ impl AnyAgent {
             headless_turn_directive: None,
             completion_verification: None,
             reasoning_controls: None,
+            fallback: None,
             #[cfg(feature = "memory")]
             memory_context: None,
             context_snapshot: None,
@@ -4306,131 +4486,173 @@ impl AnyAgent {
             let prompt = prompt.with_turn_directive(self.take_headless_turn_directive());
             #[cfg(not(feature = "agent-skills"))]
             let inner = &self.inner;
-            let turn = match &inner {
-                AnyAgentInner::OpenRouter(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
-                AnyAgentInner::OpenAI(a) => match a {
-                    OpenAiAgent::Responses(a) => {
-                        crate::startup::heap_future(|| {
-                            runner::run_print_with_output_and_verification(
-                                a,
-                                &prompt,
-                                output,
-                                retry_config,
-                                self.turn_token_budget,
-                                history,
-                                self.completion_verification.clone(),
-                                crate::agent::native_capture::NativeCaptureHook::default(),
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                            )
-                        })
-                        .await
+            // One provider dispatch, reused for the primary attempt and, when
+            // configured, the fallback model (mini-agent-5gc2c).
+            macro_rules! dispatch {
+                ($inner:expr, $prompt:expr, $history:expr) => {
+                    match $inner {
+                        AnyAgentInner::OpenRouter(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
+                        AnyAgentInner::OpenAI(a) => {
+                            match a {
+                                OpenAiAgent::Responses(a) => crate::startup::heap_future(|| {
+                                    runner::run_print_with_output_and_verification(
+                                        a,
+                                        &$prompt,
+                                        output,
+                                        retry_config,
+                                        self.turn_token_budget,
+                                        $history,
+                                        self.completion_verification.clone(),
+                                        crate::agent::native_capture::NativeCaptureHook::default(),
+                                        #[cfg(feature = "hooks")]
+                                        loop_info,
+                                    )
+                                })
+                                .await,
+                                OpenAiAgent::Completions(a) => crate::startup::heap_future(|| {
+                                    runner::run_print_with_output_and_verification(
+                                        a,
+                                        &$prompt,
+                                        output,
+                                        retry_config,
+                                        self.turn_token_budget,
+                                        $history,
+                                        self.completion_verification.clone(),
+                                        crate::agent::native_capture::NativeCaptureHook::default(),
+                                        #[cfg(feature = "hooks")]
+                                        loop_info,
+                                    )
+                                })
+                                .await,
+                            }
+                        }
+                        AnyAgentInner::Anthropic(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::for_native(
+                                        self.native_capture.clone(),
+                                        &a.model.model,
+                                    ),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
+                        AnyAgentInner::Gemini(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
+                        AnyAgentInner::Ollama(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
+                        AnyAgentInner::Copilot(a) => {
+                            crate::startup::heap_future(|| {
+                                runner::run_print_with_output_and_verification(
+                                    a,
+                                    &$prompt,
+                                    output,
+                                    retry_config,
+                                    self.turn_token_budget,
+                                    $history,
+                                    self.completion_verification.clone(),
+                                    crate::agent::native_capture::NativeCaptureHook::default(),
+                                    #[cfg(feature = "hooks")]
+                                    loop_info,
+                                )
+                            })
+                            .await
+                        }
                     }
-                    OpenAiAgent::Completions(a) => {
-                        crate::startup::heap_future(|| {
-                            runner::run_print_with_output_and_verification(
-                                a,
-                                &prompt,
-                                output,
-                                retry_config,
-                                self.turn_token_budget,
-                                history,
-                                self.completion_verification.clone(),
-                                crate::agent::native_capture::NativeCaptureHook::default(),
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                            )
-                        })
-                        .await
+                };
+            }
+            let fallback_input = self
+                .fallback
+                .as_ref()
+                .map(|route| (route.clone(), prompt.clone(), history.clone()));
+            let turn = dispatch!(&inner, prompt, history);
+            let turn = match fallback_input {
+                Some((route, prompt, history)) if fallback_eligible(&turn) => {
+                    #[cfg(feature = "agent-skills")]
+                    let primary_inner: &AnyAgentInner = &inner;
+                    #[cfg(not(feature = "agent-skills"))]
+                    let primary_inner: &AnyAgentInner = inner;
+                    match self.fallback_agent(primary_inner, &route) {
+                        Some(fallback) => {
+                            let notice = route.notice(&self.inner.model_id(), &turn);
+                            tracing::warn!("{notice}");
+                            let _ =
+                                crate::print::headless_stderr_async(format!("{notice}\n")).await;
+                            let fallback_inner = fallback.inner;
+                            let spend = crate::spend::run::Run::current().map(|run| {
+                                run.for_model(
+                                    &route.provider,
+                                    &route.model,
+                                    &route.cfg,
+                                    route.alias.as_deref(),
+                                    None,
+                                    run.kind(),
+                                )
+                            });
+                            crate::spend::run::scope(spend, async {
+                                dispatch!(&fallback_inner, prompt, history)
+                            })
+                            .await
+                        }
+                        None => turn,
                     }
-                },
-                AnyAgentInner::Anthropic(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::for_native(
-                                self.native_capture.clone(),
-                                &a.model.model,
-                            ),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
                 }
-                AnyAgentInner::Gemini(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
-                AnyAgentInner::Ollama(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
-                AnyAgentInner::Copilot(a) => {
-                    crate::startup::heap_future(|| {
-                        runner::run_print_with_output_and_verification(
-                            a,
-                            &prompt,
-                            output,
-                            retry_config,
-                            self.turn_token_budget,
-                            history,
-                            self.completion_verification.clone(),
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                        )
-                    })
-                    .await
-                }
+                _ => turn,
             };
             #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             let turn = {
@@ -5067,26 +5289,81 @@ pub(crate) const DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// Deadline between successive reads of a provider response. It covers the wait
 /// for headers and the wait between streamed events, and resets on every read,
 /// so a long healthy stream is never interrupted.
-pub(crate) const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+pub(crate) const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 
-/// Connect deadline for `custom`, falling back to the documented default.
+/// Upper bound for either configured provider deadline (one day): a stalled
+/// peer must still fail eventually.
+pub(crate) const MAX_PROVIDER_TIMEOUT_SECS: u64 = 86_400;
+
+/// `[provider_timeouts]`: deadlines applied to every provider client. A
+/// custom provider's own `connect_timeout_secs` / `stream_idle_timeout_secs`
+/// take precedence over these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ProviderTimeouts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout_secs: Option<u64>,
+}
+
+static PROVIDER_TIMEOUTS: std::sync::RwLock<ProviderTimeouts> =
+    std::sync::RwLock::new(ProviderTimeouts {
+        connect_timeout_secs: None,
+        stream_idle_timeout_secs: None,
+    });
+
+/// Install the user's `[provider_timeouts]` for clients built from now on.
+/// Called once at startup after the configuration is loaded.
+pub(crate) fn set_provider_timeouts(timeouts: Option<ProviderTimeouts>) {
+    *PROVIDER_TIMEOUTS
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = timeouts.unwrap_or_default();
+}
+
+fn global_provider_timeouts() -> ProviderTimeouts {
+    *PROVIDER_TIMEOUTS
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn bounded_timeout(secs: u64) -> Duration {
+    Duration::from_secs(secs.clamp(1, MAX_PROVIDER_TIMEOUT_SECS))
+}
+
+/// Connect deadline: the custom provider's value, else `[provider_timeouts]`,
+/// else the documented default.
 pub(crate) fn resolve_connect_timeout(custom: Option<&CustomProviderConfig>) -> Duration {
-    Duration::from_secs(
+    resolve_connect_timeout_with(custom, global_provider_timeouts())
+}
+
+fn resolve_connect_timeout_with(
+    custom: Option<&CustomProviderConfig>,
+    global: ProviderTimeouts,
+) -> Duration {
+    bounded_timeout(
         custom
             .and_then(|cfg| cfg.connect_timeout_secs)
-            .unwrap_or(DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS)
-            .max(1),
+            .or(global.connect_timeout_secs)
+            .unwrap_or(DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS),
     )
 }
 
-/// Stream-inactivity deadline for `custom`, falling back to the documented
-/// default.
+/// Stream-inactivity deadline: the custom provider's value, else
+/// `[provider_timeouts]`, else the documented default.
 pub(crate) fn resolve_stream_idle_timeout(custom: Option<&CustomProviderConfig>) -> Duration {
-    Duration::from_secs(
+    resolve_stream_idle_timeout_with(custom, global_provider_timeouts())
+}
+
+fn resolve_stream_idle_timeout_with(
+    custom: Option<&CustomProviderConfig>,
+    global: ProviderTimeouts,
+) -> Duration {
+    bounded_timeout(
         custom
             .and_then(|cfg| cfg.stream_idle_timeout_secs)
-            .unwrap_or(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS)
-            .max(1),
+            .or(global.stream_idle_timeout_secs)
+            .unwrap_or(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS),
     )
 }
 
@@ -5113,9 +5390,27 @@ fn build_http_client_with_route_policy(
     base_url: Option<&str>,
     fixed_route: bool,
 ) -> anyhow::Result<reqwest::Client> {
+    build_http_client_with_timeouts(
+        provider_name,
+        danger_accept_invalid_certs,
+        custom,
+        base_url,
+        fixed_route,
+        global_provider_timeouts(),
+    )
+}
+
+fn build_http_client_with_timeouts(
+    provider_name: &str,
+    danger_accept_invalid_certs: bool,
+    custom: Option<&CustomProviderConfig>,
+    base_url: Option<&str>,
+    fixed_route: bool,
+    timeouts: ProviderTimeouts,
+) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(resolve_connect_timeout(custom))
-        .read_timeout(resolve_stream_idle_timeout(custom))
+        .connect_timeout(resolve_connect_timeout_with(custom, timeouts))
+        .read_timeout(resolve_stream_idle_timeout_with(custom, timeouts))
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             // Vertex credentials bind an exact publisher/project/location path;
             // following even a same-origin redirect would bypass that owner.
@@ -8103,5 +8398,196 @@ impl Drop for NativeRunOwner {
         if let (Some(cleanup), Some(ticket)) = (&mut self.cleanup, self.ticket.take()) {
             cleanup.retain_until_settled(ticket);
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_timeout_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn custom(connect: Option<u64>, idle: Option<u64>) -> CustomProviderConfig {
+        let mut cfg: CustomProviderConfig =
+            toml::from_str("provider_type = \"openai\"\nbase_url = \"http://127.0.0.1:1\"")
+                .unwrap();
+        cfg.connect_timeout_secs = connect;
+        cfg.stream_idle_timeout_secs = idle;
+        cfg
+    }
+
+    #[test]
+    fn global_timeouts_apply_to_built_in_providers_and_custom_values_win() {
+        let global = ProviderTimeouts {
+            connect_timeout_secs: Some(5),
+            stream_idle_timeout_secs: Some(600),
+        };
+        assert_eq!(
+            resolve_connect_timeout_with(None, global),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            resolve_stream_idle_timeout_with(None, global),
+            Duration::from_secs(600)
+        );
+        let own = custom(Some(2), Some(7));
+        assert_eq!(
+            resolve_connect_timeout_with(Some(&own), global),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            resolve_stream_idle_timeout_with(Some(&own), global),
+            Duration::from_secs(7)
+        );
+        // A custom provider without its own values inherits the global ones.
+        let inherits = custom(None, None);
+        assert_eq!(
+            resolve_stream_idle_timeout_with(Some(&inherits), global),
+            Duration::from_secs(600)
+        );
+        // Unset everywhere: the documented defaults.
+        assert_eq!(
+            resolve_stream_idle_timeout_with(None, ProviderTimeouts::default()),
+            Duration::from_secs(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS)
+        );
+        // Zero and absurd values stay bounded.
+        let extreme = ProviderTimeouts {
+            connect_timeout_secs: Some(0),
+            stream_idle_timeout_secs: Some(u64::MAX),
+        };
+        assert_eq!(
+            resolve_connect_timeout_with(None, extreme),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            resolve_stream_idle_timeout_with(None, extreme),
+            Duration::from_secs(MAX_PROVIDER_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn provider_timeouts_parse_from_config() {
+        let cfg: crate::config::Config = toml::from_str(
+            "[provider_timeouts]\nconnect_timeout_secs = 10\nstream_idle_timeout_secs = 900\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.provider_timeouts,
+            Some(ProviderTimeouts {
+                connect_timeout_secs: Some(10),
+                stream_idle_timeout_secs: Some(900),
+            })
+        );
+        assert_eq!(crate::config::Config::default().provider_timeouts, None);
+    }
+
+    /// Serves one request, staying silent for `gap` before the response.
+    async fn silent_server(gap: Duration) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = socket.read(&mut buffer).await;
+            tokio::time::sleep(gap).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+            let _ = socket.shutdown().await;
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn built_in_client_idle_timeout_follows_provider_timeouts() {
+        // Scaled-down form of "idle=600 survives a 150s silent gap": the
+        // configured idle deadline, not the default, governs a built-in
+        // (non-custom) provider client.
+        let (url, server) = silent_server(Duration::from_millis(1500)).await;
+        let patient = build_http_client_with_timeouts(
+            "ollama",
+            false,
+            None,
+            Some(&url),
+            false,
+            ProviderTimeouts {
+                connect_timeout_secs: None,
+                stream_idle_timeout_secs: Some(4),
+            },
+        )
+        .unwrap();
+        let body = patient
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        server.await.unwrap();
+
+        let (url, server) = silent_server(Duration::from_millis(3000)).await;
+        let impatient = build_http_client_with_timeouts(
+            "anthropic",
+            false,
+            None,
+            Some(&url),
+            false,
+            ProviderTimeouts {
+                connect_timeout_secs: None,
+                stream_idle_timeout_secs: Some(1),
+            },
+        )
+        .unwrap();
+        let error = impatient.get(&url).send().await.unwrap_err();
+        assert!(error.is_timeout(), "{error}");
+        let message = crate::retry::with_provider_error_hint(&error);
+        assert!(
+            message.contains("[provider_timeouts] stream_idle_timeout_secs"),
+            "{message}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn non_timeout_errors_get_no_timeout_hint() {
+        let error = std::io::Error::other("bad request");
+        assert_eq!(
+            crate::retry::with_provider_error_hint(&error),
+            "bad request"
+        );
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        assert!(crate::retry::with_provider_error_hint(&timeout).contains("provider_timeouts"));
+    }
+}
+
+#[cfg(test)]
+mod fallback_notice_tests {
+    #[test]
+    fn fallback_notice_names_both_models_and_the_reason() {
+        let route = super::FallbackRoute {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5-5".into(),
+            alias: None,
+            cfg: std::sync::Arc::new(crate::config::Config::default()),
+            controls: Default::default(),
+        };
+        let mut turn = super::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            "HTTP 529 overloaded\nbody"
+        ));
+        assert!(super::fallback_eligible(&turn));
+        let notice = route.notice("claude-opus-5-5", &turn);
+        assert!(notice.contains("claude-opus-5-5"), "{notice}");
+        assert!(
+            notice.contains("falling back to claude-sonnet-5-5"),
+            "{notice}"
+        );
+        assert!(notice.contains("HTTP 529 overloaded") && !notice.contains("body"));
+        turn.response = "partial".into();
+        assert!(!super::fallback_eligible(&turn), "progress blocks fallback");
+        let auth = super::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            "HTTP status 401 unauthorized"
+        ));
+        assert!(!super::fallback_eligible(&auth));
     }
 }

@@ -230,6 +230,13 @@ reproducing code; focus on structure, relationships, and rationale.
 Both files complement each other: `AGENTS.md` tells the agent how to operate;
 `ARCHITECTURE.md` tells it what it's operating on.
 
+`src/agent/output_truncation.rs` owns per-turn output-truncation recovery. The patched Rig SDK
+flags each `CompletionCall` whose provider stopped at the output-token limit
+(`CompletionCall::output_truncated`) and fails a stream whose tool-call arguments were cut off
+with `rig::completion::OUTPUT_TRUNCATED_ERROR_MARKER` instead of executing the partial call. Both
+turn loops then emit a visible notice (`AgentEvent::OutputTruncated` interactively, stderr
+headless) and continue the turn with an explicit instruction, at most three times per turn.
+
 `src/agent/read_loop.rs` owns the bounded, turn-local inventory of successful read output hashes.
 `ToolLoopGuard` observes completed results and stops only at the next model-request boundary,
 so it never substitutes stale evidence before a read or discards the final observed result.

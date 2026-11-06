@@ -543,7 +543,7 @@ async fn oauth47_actual_sdk_plan_tool_followup_and_auxiliary_use_one_selected_re
             .downcast_ref::<crate::provider_http::ProviderRetryAfterError>()
             .unwrap();
         assert_eq!(hint.status, http::StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(hint.retry_after, "2");
+        assert_eq!(hint.headers[http::header::RETRY_AFTER], "2");
     };
     let (bodies, ()) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(server, operation)

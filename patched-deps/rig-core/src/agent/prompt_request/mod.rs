@@ -222,12 +222,26 @@ pub struct CompletionCall {
     /// from "unreported".
     #[serde(default, deserialize_with = "usage_null_as_default")]
     pub usage: Usage,
+    /// The provider stopped this call at its output-token limit, so the
+    /// response (text or tool-call arguments) is incomplete. (mini-agent patch)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_truncated: bool,
 }
 
 impl CompletionCall {
     /// Create details for one completion request in an agent run.
     pub fn new(call_index: usize, usage: Usage) -> Self {
-        Self { call_index, usage }
+        Self {
+            call_index,
+            usage,
+            output_truncated: false,
+        }
+    }
+
+    /// Mark this call as stopped by the provider's output-token limit.
+    pub fn with_output_truncated(mut self, output_truncated: bool) -> Self {
+        self.output_truncated = output_truncated;
+        self
     }
 }
 

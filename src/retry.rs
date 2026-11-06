@@ -10,7 +10,15 @@ pub struct RetryConfig {
     pub max_attempts: usize,
     pub initial_backoff_ms: u64,
     pub max_backoff_ms: u64,
+    /// Ceiling for a provider-supplied wait (`Retry-After`, `retry-after-ms`,
+    /// rate-limit reset headers). A server hint may extend the sleep beyond
+    /// `max_backoff_ms` up to this value; `0` restores the old behaviour of
+    /// capping hints at `max_backoff_ms`.
+    pub max_retry_after_ms: u64,
 }
+
+/// Default ceiling for a provider-supplied retry wait: five minutes.
+pub const DEFAULT_MAX_RETRY_AFTER_MS: u64 = 300_000;
 
 impl Default for RetryConfig {
     fn default() -> Self {
@@ -18,6 +26,7 @@ impl Default for RetryConfig {
             max_attempts: 3,
             initial_backoff_ms: 500,
             max_backoff_ms: 10_000,
+            max_retry_after_ms: DEFAULT_MAX_RETRY_AFTER_MS,
         }
     }
 }
@@ -29,6 +38,9 @@ pub const MAX_RETRY_ATTEMPTS: usize = 10;
 /// Hard ceiling on either backoff, in milliseconds. A larger value cannot
 /// make a retry more useful, only let one request stall a headless run.
 pub const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
+/// Hard ceiling on `retry.max_retry_after_ms`: a provider hint can never make
+/// one retry sleep longer than ten minutes.
+pub const MAX_RETRY_AFTER_CEILING_MS: u64 = 600_000;
 
 impl RetryConfig {
     /// Clamp to the safety envelope: `max_attempts` in
@@ -50,7 +62,17 @@ impl RetryConfig {
             self.initial_backoff_ms = self.max_backoff_ms;
             changed.push("initial_backoff_ms");
         }
+        if self.max_retry_after_ms > MAX_RETRY_AFTER_CEILING_MS {
+            self.max_retry_after_ms = MAX_RETRY_AFTER_CEILING_MS;
+            changed.push("max_retry_after_ms");
+        }
         changed
+    }
+
+    /// The longest sleep a provider retry hint may request: the configured
+    /// hint ceiling, never below the ordinary backoff ceiling.
+    pub fn hint_ceiling(&self) -> Duration {
+        Duration::from_millis(self.max_retry_after_ms.max(self.max_backoff_ms))
     }
 
     /// Cap every field at `ceiling`, then apply [`Self::clamp_to_limits`].
@@ -70,6 +92,10 @@ impl RetryConfig {
         if self.max_backoff_ms > ceiling.max_backoff_ms {
             self.max_backoff_ms = ceiling.max_backoff_ms;
             changed.push("max_backoff_ms");
+        }
+        if self.max_retry_after_ms > ceiling.max_retry_after_ms {
+            self.max_retry_after_ms = ceiling.max_retry_after_ms;
+            changed.push("max_retry_after_ms");
         }
         for field in self.clamp_to_limits() {
             if !changed.contains(&field) {
@@ -98,26 +124,143 @@ pub fn retry_delay(backoff: Duration, max_backoff: Duration) -> Duration {
 
 /// Retry hints belong to the particular failed HTTP request, carried through
 /// Rig's error source chain. Neither shared clients nor nested agents share a
-/// mutable last-response slot.
+/// mutable last-response slot. Hints are capped at `max_backoff`; production
+/// loops use [`retry_delay_for_error_with_hint_ceiling`].
+#[cfg(test)]
 pub fn retry_delay_for_error(
     backoff: Duration,
     max_backoff: Duration,
     error: &(dyn std::error::Error + 'static),
 ) -> Duration {
+    retry_delay_for_error_with_hint_ceiling(backoff, max_backoff, max_backoff, error)
+}
+
+/// The sleep before the next retry of `error`: backoff plus jitter (capped at
+/// `max_backoff`), extended to a provider retry hint when one is present. A
+/// hint may exceed `max_backoff` up to `hint_ceiling`, so a server that says
+/// "come back in 45s" is honoured instead of being retried early.
+pub fn retry_delay_for_error_with_hint_ceiling(
+    backoff: Duration,
+    max_backoff: Duration,
+    hint_ceiling: Duration,
+    error: &(dyn std::error::Error + 'static),
+) -> Duration {
     let computed = retry_delay(backoff, max_backoff);
-    for candidate in error_sources(error) {
-        if let Some(response) =
-            candidate.downcast_ref::<crate::provider_http::ProviderRetryAfterError>()
-        {
-            return response
-                .retry_after
-                .to_str()
-                .ok()
-                .and_then(|value| parse_retry_after(value, SystemTime::now()))
-                .map_or(computed, |hint| computed.max(hint).min(max_backoff));
-        }
+    let ceiling = hint_ceiling.max(max_backoff);
+    provider_retry_hint(error, SystemTime::now())
+        .map_or(computed, |hint| computed.max(hint).min(ceiling))
+}
+
+/// The provider's own wait hint for this failed request, if any. Precedence:
+/// `retry-after-ms`, then `Retry-After` (seconds or HTTP date).
+pub(crate) fn provider_retry_hint(
+    error: &(dyn std::error::Error + 'static),
+    now: SystemTime,
+) -> Option<Duration> {
+    let response = error_sources(error).find_map(|candidate| {
+        candidate.downcast_ref::<crate::provider_http::ProviderRetryAfterError>()
+    })?;
+    let header = |name: &str| {
+        response
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+    header("retry-after-ms")
+        .and_then(parse_retry_after_ms)
+        .or_else(|| header("retry-after").and_then(|value| parse_retry_after(value, now)))
+        .or_else(|| {
+            // Without an explicit hint, a rate-limited response's reset
+            // headers say when capacity returns. Which limit was hit is not
+            // reported, so wait for the latest reset.
+            (response.status == http::StatusCode::TOO_MANY_REQUESTS)
+                .then(|| rate_limit_reset(&response.headers, now))
+                .flatten()
+        })
+}
+
+/// The latest reset among `anthropic-ratelimit-*-reset` (RFC 3339 instants)
+/// and OpenAI `x-ratelimit-reset-*` (durations such as `1s`, `6m0s`,
+/// `20ms`).
+fn rate_limit_reset(headers: &http::HeaderMap, now: SystemTime) -> Option<Duration> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str();
+            let value = value.to_str().ok()?.trim();
+            if name.starts_with("anthropic-ratelimit-") && name.ends_with("-reset") {
+                let instant = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+                let instant = SystemTime::UNIX_EPOCH
+                    + Duration::from_millis(u64::try_from(instant.timestamp_millis()).ok()?);
+                Some(instant.duration_since(now).unwrap_or_default())
+            } else if name.starts_with("x-ratelimit-reset") {
+                parse_go_duration(value)
+            } else {
+                None
+            }
+        })
+        .max()
+}
+
+/// A Go-style duration (`1h2m3.5s`, `250ms`, `6m0s`) or plain seconds.
+fn parse_go_duration(value: &str) -> Option<Duration> {
+    if let Ok(seconds) = value.parse::<f64>() {
+        return (seconds.is_finite() && seconds >= 0.0)
+            .then(|| Duration::from_secs_f64(seconds.min(1e9)));
     }
-    computed
+    let mut total = 0.0_f64;
+    let mut rest = value;
+    if rest.is_empty() {
+        return None;
+    }
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .filter(|&end| end > 0)?;
+        let number: f64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        let (scale, unit_len) = if rest.starts_with("ms") {
+            (0.001, 2)
+        } else if rest.starts_with('h') {
+            (3600.0, 1)
+        } else if rest.starts_with('m') {
+            (60.0, 1)
+        } else if rest.starts_with('s') {
+            (1.0, 1)
+        } else {
+            return None;
+        };
+        total += number * scale;
+        rest = &rest[unit_len..];
+    }
+    (total.is_finite() && total >= 0.0).then(|| Duration::from_secs_f64(total.min(1e9)))
+}
+
+/// Provider errors that no retry can fix: an exhausted quota, an unpaid
+/// balance or a hard billing limit. They often arrive as HTTP 429, which
+/// would otherwise be retried until the budget is spent.
+pub fn is_quota_exhausted_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error_sources(error).any(|candidate| is_quota_exhausted_message(&candidate.to_string()))
+}
+
+fn is_quota_exhausted_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("insufficient_quota")
+        || lower.contains("billing_hard_limit")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("credit balance is too low")
+        || lower.contains("usage_limit_reached")
+        || lower.contains("billing_not_active")
+}
+
+/// Guidance appended to a quota or billing failure.
+pub const QUOTA_EXHAUSTED_HINT: &str = "The provider reports an exhausted quota, credit balance or billing limit; retrying will not help. Check the account's plan, credits and billing settings, or switch provider/model.";
+
+/// `retry-after-ms`: a non-negative decimal number of milliseconds.
+fn parse_retry_after_ms(value: &str) -> Option<Duration> {
+    let millis: f64 = value.trim_matches([' ', '\t']).parse().ok()?;
+    (millis.is_finite() && millis >= 0.0)
+        .then(|| Duration::from_secs_f64(millis.min(1e12) / 1000.0))
 }
 
 fn error_sources<'a>(
@@ -156,6 +299,18 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
         if is_context_length_error_message(&candidate.to_string()) {
             return false;
         }
+    }
+
+    // Exhausted quota / billing errors never recover by waiting, even when
+    // the provider labels them 429.
+    if is_quota_exhausted_error(error) {
+        return false;
+    }
+
+    // An explicit provider verdict (`x-should-retry`, sent by Anthropic) wins
+    // over status heuristics, as in the official SDKs.
+    if let Some(verdict) = provider_should_retry(error) {
+        return verdict;
     }
 
     // Prefer Rig's preserved provider status over rendered-message heuristics.
@@ -209,6 +364,18 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
         }
     }
     false
+}
+
+fn provider_should_retry(error: &(dyn std::error::Error + 'static)) -> Option<bool> {
+    let response = error_sources(error).find_map(|candidate| {
+        candidate.downcast_ref::<crate::provider_http::ProviderRetryAfterError>()
+    })?;
+    let value = response.headers.get("x-should-retry")?.to_str().ok()?;
+    match value.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn is_retryable_status(code: u16) -> bool {
@@ -274,6 +441,39 @@ pub fn is_context_length_error_message(message: &str) -> bool {
             && (lower.contains("exceed") || lower.contains("too long")))
 }
 
+/// The user-facing text of a terminal provider error: the message plus
+/// recovery guidance for context overflow or a provider deadline.
+pub fn with_provider_error_hint(error: &(dyn std::error::Error + 'static)) -> String {
+    let message = with_context_length_hint(&error.to_string());
+    if is_quota_exhausted_error(error) {
+        return format!("{message}\n{QUOTA_EXHAUSTED_HINT}");
+    }
+    if is_provider_timeout(error) {
+        return format!("{message}\n{PROVIDER_TIMEOUT_HINT}");
+    }
+    match provider_retry_hint(error, SystemTime::now()) {
+        Some(wait) if !wait.is_zero() => format!(
+            "{message}\nThe provider's rate limit resets in about {}s.",
+            wait.as_secs().max(1)
+        ),
+        _ => message,
+    }
+}
+
+/// Guidance appended to a provider deadline failure, naming the keys to raise.
+pub const PROVIDER_TIMEOUT_HINT: &str = "The provider did not respond within the configured deadline. For slow first tokens (large prompts, local model loading, long reasoning) raise `[provider_timeouts] stream_idle_timeout_secs` (default 300) or `connect_timeout_secs` (default 30); a custom provider's own `stream_idle_timeout_secs` takes precedence.";
+
+fn is_provider_timeout(error: &(dyn std::error::Error + 'static)) -> bool {
+    error_sources(error).any(|candidate| {
+        candidate
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+            || candidate
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+    })
+}
+
 pub fn with_context_length_hint(message: &str) -> String {
     if is_context_length_error_message(message) {
         format!(
@@ -337,10 +537,16 @@ where
                 if attempt >= config.max_attempts || !is_retryable(&e) {
                     return Err(e);
                 }
-                let delay = retry_delay_for_error(backoff, max_backoff, &e);
+                let delay = retry_delay_for_error_with_hint_ceiling(
+                    backoff,
+                    max_backoff,
+                    config.hint_ceiling(),
+                    &e,
+                );
                 tracing::warn!(
-                    "retryable error on first stream item (attempt {attempt}/{}): {e}",
-                    config.max_attempts
+                    "retryable error on first stream item (attempt {attempt}/{}), retrying in {:.1}s: {e}",
+                    config.max_attempts,
+                    delay.as_secs_f64()
                 );
                 on_retry(RetryNotice {
                     attempt,
@@ -391,12 +597,212 @@ mod tests {
         );
     }
 
+    fn hinted(
+        status: u16,
+        headers: &[(&str, &str)],
+    ) -> crate::provider_http::ProviderRetryAfterError {
+        crate::provider_http::ProviderRetryAfterError::for_test(status, headers, "provider body")
+    }
+
+    #[test]
+    fn provider_retry_after_may_exceed_max_backoff_up_to_the_hint_ceiling() {
+        let config = RetryConfig {
+            max_backoff_ms: 10_000,
+            ..RetryConfig::default()
+        };
+        let error = hinted(429, &[("retry-after", "45")]);
+        let delay = retry_delay_for_error_with_hint_ceiling(
+            Duration::from_millis(500),
+            Duration::from_millis(config.max_backoff_ms),
+            config.hint_ceiling(),
+            &error,
+        );
+        assert!(delay >= Duration::from_secs(45), "{delay:?}");
+        assert!(delay <= Duration::from_millis(DEFAULT_MAX_RETRY_AFTER_MS));
+
+        // A hint beyond the ceiling is capped at it, never ignored.
+        let error = hinted(429, &[("retry-after", "3600")]);
+        assert_eq!(
+            retry_delay_for_error_with_hint_ceiling(
+                Duration::ZERO,
+                Duration::from_secs(10),
+                config.hint_ceiling(),
+                &error,
+            ),
+            Duration::from_millis(DEFAULT_MAX_RETRY_AFTER_MS)
+        );
+
+        // `max_retry_after_ms = 0` restores capping at max_backoff.
+        let legacy = RetryConfig {
+            max_retry_after_ms: 0,
+            ..config.clone()
+        };
+        let error = hinted(429, &[("retry-after", "45")]);
+        assert_eq!(
+            retry_delay_for_error_with_hint_ceiling(
+                Duration::ZERO,
+                Duration::from_secs(10),
+                legacy.hint_ceiling(),
+                &error,
+            ),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn unhinted_429_keeps_ordinary_backoff() {
+        let error = hinted(429, &[("x-request-id", "ignored")]);
+        let delay = retry_delay_for_error_with_hint_ceiling(
+            Duration::from_millis(500),
+            Duration::from_secs(10),
+            Duration::from_secs(300),
+            &error,
+        );
+        assert!(delay >= Duration::from_millis(500) && delay < Duration::from_secs(1));
+        assert!(is_retryable(&error));
+    }
+
+    #[test]
+    fn retry_after_ms_takes_precedence_over_retry_after() {
+        let error = hinted(429, &[("retry-after-ms", "2500"), ("retry-after", "60")]);
+        assert_eq!(
+            retry_delay_for_error_with_hint_ceiling(
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+                &error,
+            ),
+            Duration::from_millis(2500)
+        );
+        for invalid in ["-5", "NaN", "inf", "soon"] {
+            assert_eq!(parse_retry_after_ms(invalid), None, "{invalid}");
+        }
+        assert_eq!(
+            parse_retry_after_ms(" 1.5 "),
+            Some(Duration::from_micros(1500))
+        );
+    }
+
+    #[test]
+    fn x_should_retry_header_overrides_status_classification() {
+        assert!(!is_retryable(&hinted(529, &[("x-should-retry", "false")])));
+        assert!(is_retryable(&hinted(400, &[("x-should-retry", "true")])));
+        assert!(is_retryable(&hinted(529, &[("x-should-retry", "maybe")])));
+        // Context overflow is never retried, whatever the header says.
+        let overflow = crate::provider_http::ProviderRetryAfterError::for_test(
+            400,
+            &[("x-should-retry", "true")],
+            "prompt is too long",
+        );
+        assert!(!is_retryable(&overflow));
+    }
+
+    #[test]
+    fn retry_after_ceiling_is_clamped_and_project_capped() {
+        let mut cfg = RetryConfig {
+            max_retry_after_ms: u64::MAX,
+            ..RetryConfig::default()
+        };
+        assert_eq!(cfg.clamp_to_limits(), vec!["max_retry_after_ms"]);
+        assert_eq!(cfg.max_retry_after_ms, MAX_RETRY_AFTER_CEILING_MS);
+        let mut project = cfg.clone();
+        assert_eq!(
+            project.cap_at(&RetryConfig::default()),
+            vec!["max_retry_after_ms"]
+        );
+        assert_eq!(project.max_retry_after_ms, DEFAULT_MAX_RETRY_AFTER_MS);
+    }
+
+    #[test]
+    fn retry_notice_text_names_the_actual_wait() {
+        assert_eq!(
+            crate::event::retry_notice_text(1, 3, 45_000),
+            "retrying in 45s... (1/3)"
+        );
+        assert_eq!(
+            crate::event::retry_notice_text(2, 3, 1_250),
+            "retrying in 1.2s... (2/3)"
+        );
+    }
+
+    #[test]
+    fn quota_exhausted_429_is_not_retried_and_says_to_check_billing() {
+        let quota = crate::provider_http::ProviderRetryAfterError::for_test(
+            429,
+            &[("retry-after", "20")],
+            r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+        );
+        assert!(!is_retryable(&quota));
+        let message = with_provider_error_hint(&quota);
+        assert!(message.contains("billing"), "{message}");
+        let anthropic = io::Error::other(
+            "HTTP status 400: Your credit balance is too low to access the Anthropic API",
+        );
+        assert!(!is_retryable(&anthropic));
+        // An ordinary rate limit is still retried.
+        assert!(is_retryable(&hinted(429, &[])));
+    }
+
+    #[test]
+    fn rate_limit_reset_headers_are_used_when_retry_after_is_missing() {
+        let now = SystemTime::now();
+        let reset = chrono::DateTime::<chrono::Utc>::from(now + Duration::from_secs(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let anthropic = hinted(
+            429,
+            &[
+                ("anthropic-ratelimit-requests-reset", reset.as_str()),
+                ("anthropic-ratelimit-tokens-reset", "not-a-date"),
+            ],
+        );
+        let wait = provider_retry_hint(&anthropic, now).unwrap();
+        assert!(
+            wait > Duration::from_secs(28) && wait <= Duration::from_secs(30),
+            "{wait:?}"
+        );
+        let openai = hinted(
+            429,
+            &[
+                ("x-ratelimit-reset-requests", "1s"),
+                ("x-ratelimit-reset-tokens", "6m0s"),
+            ],
+        );
+        assert_eq!(
+            provider_retry_hint(&openai, now),
+            Some(Duration::from_secs(360))
+        );
+        // Retry-After still wins, and non-429 responses ignore reset headers.
+        let explicit = hinted(
+            429,
+            &[("retry-after", "2"), ("x-ratelimit-reset-tokens", "6m0s")],
+        );
+        assert_eq!(
+            provider_retry_hint(&explicit, now),
+            Some(Duration::from_secs(2))
+        );
+        let overloaded = hinted(529, &[("x-ratelimit-reset-tokens", "6m0s")]);
+        assert_eq!(provider_retry_hint(&overloaded, now), None);
+        assert!(with_provider_error_hint(&openai).contains("resets in about 360s"));
+        for (value, expected) in [
+            ("20ms", Some(Duration::from_millis(20))),
+            ("1h2m3s", Some(Duration::from_secs(3723))),
+            ("1.5s", Some(Duration::from_millis(1500))),
+            ("7", Some(Duration::from_secs(7))),
+            ("", None),
+            ("5x", None),
+            ("m", None),
+        ] {
+            assert_eq!(parse_go_duration(value), expected, "{value}");
+        }
+    }
+
     #[test]
     fn test_retry_config_defaults() {
         let cfg = RetryConfig::default();
         assert_eq!(cfg.max_attempts, 3);
         assert_eq!(cfg.initial_backoff_ms, 500);
         assert_eq!(cfg.max_backoff_ms, 10_000);
+        assert_eq!(cfg.max_retry_after_ms, DEFAULT_MAX_RETRY_AFTER_MS);
     }
 
     #[test]
@@ -476,6 +882,7 @@ mod tests {
                 max_attempts: 2,
                 initial_backoff_ms: 1,
                 max_backoff_ms: 1,
+                max_retry_after_ms: 0,
             };
             let mut stream = retry_stream_chat_with(
                 &config,
@@ -637,6 +1044,7 @@ mod tests {
             max_attempts: 4_000_000_000,
             initial_backoff_ms: 9_000_000_000_000_000,
             max_backoff_ms: u64::MAX,
+            max_retry_after_ms: 0,
         };
         let changed = cfg.clamp_to_limits();
         assert_eq!(cfg.max_attempts, MAX_RETRY_ATTEMPTS);
@@ -651,6 +1059,7 @@ mod tests {
             max_attempts: 0,
             initial_backoff_ms: 5_000,
             max_backoff_ms: 1_000,
+            max_retry_after_ms: 0,
         };
         assert_eq!(
             zero.clamp_to_limits(),
@@ -670,6 +1079,7 @@ mod tests {
             max_attempts: 9,
             initial_backoff_ms: 50,
             max_backoff_ms: 30_000,
+            max_retry_after_ms: 0,
         };
         assert_eq!(looser.cap_at(&ceiling), ["max_attempts", "max_backoff_ms"]);
         assert_eq!(looser.max_attempts, 3);
@@ -680,6 +1090,7 @@ mod tests {
             max_attempts: 1,
             initial_backoff_ms: 0,
             max_backoff_ms: 0,
+            max_retry_after_ms: 0,
         };
         assert!(tighter.cap_at(&ceiling).is_empty());
     }
@@ -706,6 +1117,7 @@ mod tests {
             max_attempts: usize::MAX,
             initial_backoff_ms: 0,
             max_backoff_ms: 0,
+            max_retry_after_ms: 0,
         };
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let notices = Arc::new(Mutex::new(Vec::new()));
@@ -749,6 +1161,7 @@ mod tests {
             max_attempts: 2,
             initial_backoff_ms: 9_000_000_000_000_000,
             max_backoff_ms: 9_000_000_000_000_000,
+            max_retry_after_ms: 0,
         };
         let notices = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&notices);
@@ -779,6 +1192,7 @@ mod tests {
             max_attempts: 3,
             initial_backoff_ms: 0,
             max_backoff_ms: 0,
+            max_retry_after_ms: 0,
         };
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let notices = Arc::new(Mutex::new(Vec::new()));

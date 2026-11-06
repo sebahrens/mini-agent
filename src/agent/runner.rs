@@ -1673,6 +1673,12 @@ fn warn_unknown_stream_item<R: serde::Serialize>(item: &MultiTurnStreamItem<R>) 
     tracing::warn!("unknown stream item variant: {detail}");
 }
 
+use crate::agent::output_truncation::{OutputTruncation, TruncationDecision};
+
+fn duration_millis(delay: std::time::Duration) -> u64 {
+    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+}
+
 const MAX_PENDING_TOOL_CALLS: usize = 256;
 pub(crate) const UNKNOWN_TOOL_OUTCOME: &str =
     "[Tool execution outcome is unknown because the agent stream ended before a result.]";
@@ -1684,6 +1690,7 @@ struct CompletionRetryState {
     failures: usize,
     backoff: std::time::Duration,
     max_backoff: std::time::Duration,
+    hint_ceiling: std::time::Duration,
 }
 
 impl CompletionRetryState {
@@ -1693,6 +1700,7 @@ impl CompletionRetryState {
             failures: 0,
             backoff: std::time::Duration::from_millis(config.initial_backoff_ms),
             max_backoff: std::time::Duration::from_millis(config.max_backoff_ms),
+            hint_ceiling: config.hint_ceiling(),
         }
     }
 
@@ -1717,7 +1725,12 @@ impl CompletionRetryState {
             return None;
         }
 
-        let delay = retry::retry_delay_for_error(self.backoff, self.max_backoff, error);
+        let delay = retry::retry_delay_for_error_with_hint_ceiling(
+            self.backoff,
+            self.max_backoff,
+            self.hint_ceiling,
+            error,
+        );
         self.backoff = (self.backoff * 2).min(self.max_backoff);
         Some((self.failures, delay))
     }
@@ -2561,8 +2574,9 @@ fn midstream_retry(
 ) -> Option<(usize, std::time::Duration)> {
     let (attempt, delay) = completion_retry.retry_delay(retry_config, error)?;
     tracing::warn!(
-        "agent retry {attempt}/{max} after mid-stream error: {error}",
+        "agent retry {attempt}/{max} in {secs:.1}s after mid-stream error: {error}",
         max = retry_config.max_attempts,
+        secs = delay.as_secs_f64(),
     );
     Some((attempt, delay))
 }
@@ -4055,6 +4069,7 @@ where
         // `loop`); set when a `Stop` hook forces continuation instead of the
         // default re-injected `retry_prompt`.
         let mut next_instruction: Option<String> = None;
+        let mut output_truncation = OutputTruncation::default();
         #[cfg(feature = "hooks")]
         let mut stop_hook_active = false;
         #[cfg(feature = "hooks")]
@@ -4111,6 +4126,7 @@ where
                             .send(AgentEvent::Retrying {
                                 attempt: notice.attempt,
                                 max: notice.max_attempts,
+                                delay_ms: duration_millis(notice.delay),
                             })
                             .await;
                     }
@@ -4122,7 +4138,7 @@ where
                 Err(error) => {
                     park_question!();
                     tracing::error!("agent stream start failed after retries: {error}");
-                    let error = retry::with_context_length_hint(&error.to_string());
+                    let error = retry::with_provider_error_hint(&error);
                     let _ = event_tx
                         .send(AgentEvent::error_with(
                             CompactString::new(error),
@@ -4449,6 +4465,19 @@ where
                             return;
                         }
 
+                        if let Some(decision) = output_truncation.final_response() {
+                            tracing::warn!("{}", decision.notice());
+                            let _ = event_tx
+                                .send(AgentEvent::OutputTruncated {
+                                    message: CompactString::from(decision.notice()),
+                                })
+                                .await;
+                            if let TruncationDecision::Continue { instruction, .. } = decision {
+                                next_instruction = Some(instruction);
+                                break;
+                            }
+                        }
+
                         // An accepted `goal_report` completes a round even when
                         // no closing text follows it (mini-agent-64qyf).
                         if terminal_was_streamed
@@ -4565,6 +4594,7 @@ where
                         break;
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                        output_truncation.observe_call(&call);
                         let usage = call.usage;
                         let delta = record_completion_call(
                             &mut completion_retry,
@@ -4680,6 +4710,26 @@ where
                         )
                         .await;
                         park_question!();
+                        if let Some(decision) = output_truncation.stream_error(&e.to_string()) {
+                            tracing::warn!("{}: {e}", decision.notice());
+                            let _ = event_tx
+                                .send(AgentEvent::OutputTruncated {
+                                    message: CompactString::from(decision.notice()),
+                                })
+                                .await;
+                            if let TruncationDecision::Continue { instruction, .. } = decision {
+                                next_instruction = Some(instruction);
+                                retrying_interrupted_completion = true;
+                                break;
+                            }
+                            let _ = event_tx
+                                .send(AgentEvent::error_with(
+                                    CompactString::from(decision.notice()),
+                                    completed_so_far!(),
+                                ))
+                                .await;
+                            return;
+                        }
                         if let Some((attempt, delay)) =
                             midstream_retry(&mut completion_retry, &retry_config, &e)
                         {
@@ -4687,6 +4737,7 @@ where
                                 .send(AgentEvent::Retrying {
                                     attempt,
                                     max: retry_config.max_attempts,
+                                    delay_ms: duration_millis(delay),
                                 })
                                 .await;
                             tokio::time::sleep(delay).await;
@@ -4695,7 +4746,7 @@ where
                             break;
                         }
                         tracing::error!("agent stream error: {e}");
-                        let error = retry::with_context_length_hint(&e.to_string());
+                        let error = retry::with_provider_error_hint(&e);
                         let _ = event_tx
                             .send(AgentEvent::error_with(
                                 CompactString::new(error),
@@ -5142,7 +5193,7 @@ where
         Ok(result) => result,
         Err(error) => return HeadlessTurn::failed_before_start(error),
     }
-    .map_err(|e| anyhow::anyhow!(retry::with_context_length_hint(&e.to_string())));
+    .map_err(|e| anyhow::anyhow!(retry::with_provider_error_hint(&e)));
     let stream = match stream {
         Ok(stream) => stream,
         Err(error) => return HeadlessTurn::failed_before_start(error),
@@ -5178,6 +5229,7 @@ where
     let mut workspace_may_have_changed = false;
     let mut verification_attempt = 0u32;
     let mut next_instruction: Option<String> = None;
+    let mut output_truncation = OutputTruncation::default();
     // Every terminal failure below returns through this, so the completed tool
     // records and observed usage of the failed turn survive for persistence.
     macro_rules! turn_failure {
@@ -5371,6 +5423,7 @@ where
                         {
                             mid_turn_pressure = Some(pressure);
                         }
+                        output_truncation.observe_call(&call);
                         let delta = record_completion_call(
                             &mut completion_retry,
                             retry_config,
@@ -5423,6 +5476,22 @@ where
                         park_question!();
                         if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
                             fail_turn!(UNRESOLVED_TOOL_CALLS_ERROR);
+                        }
+                        if let Some(decision) = output_truncation.final_response() {
+                            tracing::warn!("{}", decision.notice());
+                            if let Err(error) = crate::print::headless_stderr_async(format!(
+                                "{}\n",
+                                decision.notice()
+                            ))
+                            .await
+                            {
+                                fail_turn!(error);
+                            }
+                            if let TruncationDecision::Continue { instruction, .. } = decision {
+                                next_instruction = Some(instruction);
+                                continue_turn = true;
+                                return Ok(false);
+                            }
                         }
                         // A round whose work ended in an accepted `goal_report` has
                         // said what it had to say; it is complete, not empty
@@ -5515,6 +5584,23 @@ where
                     Err(e) => {
                         tool_calls.finalize_unresolved(&mut interactions);
                         park_question!();
+                        if let Some(decision) = output_truncation.stream_error(&e.to_string()) {
+                            tracing::warn!("{}: {e}", decision.notice());
+                            let notice = decision.notice().to_string();
+                            if let TruncationDecision::Continue { instruction, .. } = decision {
+                                if let Err(error) =
+                                    crate::print::headless_stderr_async(format!("{notice}\n"))
+                                        .await
+                                {
+                                    fail_turn!(error);
+                                }
+                                next_instruction = Some(instruction);
+                                retrying_interrupted_completion = true;
+                                continue_turn = true;
+                                return Ok(false);
+                            }
+                            fail_turn!(notice);
+                        }
                         if let Some((_, delay)) =
                             midstream_retry(&mut completion_retry, retry_config, &e)
                         {
@@ -5526,7 +5612,7 @@ where
                         }
                         // Propagate an exhausted or non-retryable stream failure
                         // instead of returning `Ok` with a truncated response.
-                        fail_turn!(retry::with_context_length_hint(&e.to_string()));
+                        fail_turn!(retry::with_provider_error_hint(&e));
                     }
                 }
                 Ok(true)
@@ -6718,6 +6804,7 @@ mod tests {
                 max_attempts: 2,
                 initial_backoff_ms: 0,
                 max_backoff_ms: 50,
+                max_retry_after_ms: 0,
             };
             let mut state = super::CompletionRetryState::new(&config);
             assert_eq!(
@@ -6734,6 +6821,7 @@ mod tests {
             max_attempts: 4_000_000_000,
             initial_backoff_ms: 9_000_000_000_000_000,
             max_backoff_ms: 9_000_000_000_000_000,
+            max_retry_after_ms: 0,
         };
         let error = rig::agent::StreamingError::Completion(
             rig::completion::CompletionError::ProviderError("HTTP 429 Too Many Requests".into()),
@@ -6756,6 +6844,7 @@ mod tests {
             max_attempts,
             initial_backoff_ms: 0,
             max_backoff_ms: 0,
+            max_retry_after_ms: 0,
         }
     }
 
@@ -6782,7 +6871,11 @@ mod tests {
 
         assert!(matches!(
             runner.event_rx.recv().await,
-            Some(crate::event::AgentEvent::Retrying { attempt: 1, max: 3 })
+            Some(crate::event::AgentEvent::Retrying {
+                attempt: 1,
+                max: 3,
+                ..
+            })
         ));
         loop {
             match runner.event_rx.recv().await.expect("terminal event") {
@@ -6836,7 +6929,7 @@ mod tests {
         let mut retry_events = 0;
         let interactions = loop {
             match runner.event_rx.recv().await.expect("runner terminal event") {
-                crate::event::AgentEvent::Retrying { attempt, max } => {
+                crate::event::AgentEvent::Retrying { attempt, max, .. } => {
                     retry_events += 1;
                     assert_eq!((attempt, max), (1, 3));
                 }
@@ -7023,7 +7116,7 @@ mod tests {
         let mut retries = Vec::new();
         let error = loop {
             match runner.event_rx.recv().await.expect("runner terminal event") {
-                crate::event::AgentEvent::Retrying { attempt, max } => {
+                crate::event::AgentEvent::Retrying { attempt, max, .. } => {
                     retries.push((attempt, max));
                 }
                 crate::event::AgentEvent::Error { message: error, .. } => break error.to_string(),

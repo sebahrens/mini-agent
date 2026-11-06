@@ -290,8 +290,8 @@ the `custom_providers` key in the config file:
 | `headers`                     | object  | Optional. HTTP headers to include in every request. Values support `${ENV_VAR}` expansion.                                                                                    |
 | `danger_accept_invalid_certs` | boolean | Optional. Disables TLS certificate verification (MITM risk — use with care).                                                                                                  |
 | `timeout_secs`                | integer | Optional. Total deadline for a request, from connect until the response body finishes. Unset by default, because a long streamed turn has no meaningful total bound.           |
-| `connect_timeout_secs`        | integer | Optional. Deadline for establishing the connection. Defaults to 30.                                                                                                           |
-| `stream_idle_timeout_secs`    | integer | Optional. Deadline between successive reads of a response, covering the wait for headers and the wait between streamed events. It resets on every read, so a long healthy stream is never interrupted. Defaults to 120. |
+| `connect_timeout_secs`        | integer | Optional. Deadline for establishing the connection. Defaults to `[provider_timeouts] connect_timeout_secs`, else 30.                                                         |
+| `stream_idle_timeout_secs`    | integer | Optional. Deadline between successive reads of a response, covering the wait for headers and the wait between streamed events. It resets on every read, so a long healthy stream is never interrupted. Defaults to `[provider_timeouts] stream_idle_timeout_secs`, else 300. |
 | `model`                       | string  | Optional. Default model name for this provider. Used when no model is specified via `--model` or `MINI_AGENT_MODEL`.                                                                  |
 
 ### Connection and stream deadlines
@@ -300,9 +300,24 @@ Every provider client — built-in and custom alike — is built with a connect
 deadline and a stream-inactivity deadline. Without them a peer that accepts a
 request and then stalls, before headers or between streamed events, keeps a turn
 alive indefinitely and never produces the error that would trigger a retry. Both
-bounds are overridable per provider with the `connect_timeout_secs` and
-`stream_idle_timeout_secs` entries above; a value of `0` is clamped to one
-second rather than disabling the bound.
+bounds are set for every provider (built-in included) by the top-level
+`[provider_timeouts]` table and overridable per custom provider with the
+`connect_timeout_secs` and `stream_idle_timeout_secs` entries above; a value of
+`0` is clamped to one second rather than disabling the bound, and values above
+one day are clamped to one day. The defaults are 30 s to connect and 300 s of
+inactivity. The inactivity deadline also covers the wait for the first response
+byte, so a slow local model load, a very large prompt prefill or a long silent
+reasoning phase may need a larger value:
+
+```toml
+[provider_timeouts]
+connect_timeout_secs = 30
+stream_idle_timeout_secs = 900
+```
+
+`[provider_timeouts]` is read at startup and is not a benign project setting: a
+repository `.mini-agent/config.toml` value needs the usual project approval. A
+turn that fails on one of these deadlines names the keys to raise.
 
 ### Header variable expansion
 
@@ -489,6 +504,7 @@ OpenRouter models keep their provider-native caching behavior.
 | `--quick-model`     | —             | Use a named quick model from config |
 | `--api-key`         | —             | API key (visible in `ps`)           |
 | `--max-tokens`      | —             | Maximum response tokens             |
+| `--fallback-model`  | —             | Headless: same-provider model (id or quick-model alias) for a turn whose primary fails with retries exhausted; see `fallback_model` in CONFIG.md |
 | `--temperature`     | —             | Model temperature (0.0–2.0)         |
 | `--max-agent-turns` | —             | Maximum agent turns per response    |
 

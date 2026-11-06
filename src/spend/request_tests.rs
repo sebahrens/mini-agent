@@ -2026,3 +2026,128 @@ async fn task_resume_continues_the_stored_child_conversation_and_is_charged() {
     // The resumed turn is an ordinary charged child request.
     assert_eq!(ledger.summary().unwrap().all_time.records, 2);
 }
+
+fn status_response(status: u16, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+async fn fallback_turn(
+    responses: Vec<Option<String>>,
+) -> (
+    crate::agent::runner::HeadlessTurn,
+    Wire,
+    Arc<Ledger>,
+    crate::tests::OwnedTestDirectory,
+) {
+    let root = crate::tests::OwnedTestDirectory::new("fallback-model");
+    let wire = Wire::new(responses).await;
+    let (client, mut cfg) = wire.client();
+    cfg.retry.max_attempts = 2;
+    cfg.retry.initial_backoff_ms = 1;
+    cfg.retry.max_backoff_ms = 1;
+    cfg.retry.max_retry_after_ms = 0;
+    // A priced alias: a capped run fails closed on an unpriced fallback.
+    cfg.quick_models = Some(
+        serde_json::from_value(serde_json::json!({
+            "small": {"provider": "cost-wire", "model": "fixture-small",
+                      "input_token_cost": 1.0, "output_token_cost": 2.0}
+        }))
+        .unwrap(),
+    );
+    cfg.fallback_model = Some("small".into());
+    let (run, ledger) = profile(&root, &cfg, RequestKind::Turn, Some(1.0));
+    let session = crate::session::Session::new("cost-wire", "fixture", 128_000, "");
+    let agent = primary_agent(&client, run).with_main_session(&cfg, &session);
+    let turn = agent
+        .run_print_with_output(
+            "hello",
+            crate::print::HeadlessOutputPolicy::legacy(false, false),
+            &cfg.retry,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await;
+    (turn, wire, ledger, root)
+}
+
+#[tokio::test]
+async fn fallback_model_completes_a_turn_after_primary_overload_exhausts_retries() {
+    let overloaded = status_response(
+        529,
+        r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+    );
+    let (turn, wire, ledger, _root) = fallback_turn(vec![
+        Some(overloaded.clone()),
+        Some(overloaded),
+        Some(response("from fallback", false)),
+    ])
+    .await;
+    assert!(turn.failure.is_none(), "{:?}", turn.failure);
+    assert_eq!(turn.response, "from fallback");
+    assert_eq!(wire.calls.load(Ordering::Acquire), 3);
+    let bodies = wire.bodies.lock().unwrap().clone();
+    assert_eq!(bodies[0]["model"], "fixture");
+    assert_eq!(bodies[1]["model"], "fixture");
+    assert_eq!(bodies[2]["model"], "fixture-small");
+    // Spend is attributed to the model that actually answered.
+    let summary = ledger.summary().unwrap();
+    let fallback = summary
+        .by_model
+        .get(&("cost-wire".to_string(), "fixture-small".to_string()))
+        .expect("fallback usage is attributed to the fallback model");
+    assert_eq!(fallback.input_tokens, 50);
+    assert!(
+        !summary
+            .by_model
+            .contains_key(&("cost-wire".to_string(), "fixture".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn fallback_model_is_not_used_for_auth_or_context_errors() {
+    for body in [
+        status_response(401, r#"{"error":{"message":"invalid api key"}}"#),
+        status_response(
+            400,
+            r#"{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}"#,
+        ),
+    ] {
+        let (turn, wire, _ledger, _root) = fallback_turn(vec![Some(body)]).await;
+        assert!(turn.failure.is_some());
+        assert_eq!(wire.calls.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
+fn fallback_route_requires_the_session_provider_and_names_both_models() {
+    let mut cfg: Config = serde_json::from_value(serde_json::json!({
+        "quick_models": {
+            "small": {"provider": "cost-wire", "model": "fixture-small"},
+            "elsewhere": {"provider": "anthropic", "model": "claude-sonnet-5-5"}
+        }
+    }))
+    .unwrap();
+    let session = crate::session::Session::new("cost-wire", "fixture", 128_000, "");
+    cfg.fallback_model = Some("small".into());
+    let route = crate::provider::resolve_fallback_route(&cfg, &session).unwrap();
+    assert_eq!(
+        (
+            route.provider.as_str(),
+            route.model.as_str(),
+            route.alias.as_deref()
+        ),
+        ("cost-wire", "fixture-small", Some("small"))
+    );
+    cfg.fallback_model = Some("elsewhere".into());
+    assert!(crate::provider::resolve_fallback_route(&cfg, &session).is_none());
+    cfg.fallback_model = Some("fixture".into());
+    assert!(crate::provider::resolve_fallback_route(&cfg, &session).is_none());
+    cfg.fallback_model = Some("raw-model-id".into());
+    let route = crate::provider::resolve_fallback_route(&cfg, &session).unwrap();
+    assert_eq!(route.model, "raw-model-id");
+    assert!(crate::provider::resolve_fallback_route(&Config::default(), &session).is_none());
+}

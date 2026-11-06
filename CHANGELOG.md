@@ -47,6 +47,41 @@ Notable changes to mini-agent are documented in this file. The format follows
   limit), shortened `## Task N:` labels end with `…`, and the display-only `/tasks` bounds are
   documented.
 
+### Providers
+
+- Provider retry hints are honoured beyond `retry.max_backoff_ms`: `retry-after-ms` and
+  `Retry-After` may extend a retry up to the new `retry.max_retry_after_ms` ceiling (default
+  5 minutes, at most 10), `x-should-retry` overrides the status classification, and the retry
+  notice shows the actual wait.
+- Quota and billing errors (`insufficient_quota`, exhausted credit balance, hard billing limits)
+  are no longer retried as transient 429s and now tell the user to check billing; rate-limit
+  reset headers (`anthropic-ratelimit-*-reset`, `x-ratelimit-reset-*`) set the wait when
+  `Retry-After` is missing.
+- The default `max_tokens` now follows each model's catalog output ceiling (capped at 32000;
+  16384 for unlisted models), and explicit values are clamped to it. The catalog records
+  `max_output` per model. Output-limit stops (`max_tokens`, `length`, `max_output_tokens`,
+  `MAX_TOKENS`) are no longer silent: a notice is shown, the turn continues with a resume
+  instruction (up to 3 times), and a cut-off tool call is reported instead of executed.
+- New `[provider_timeouts]` (`connect_timeout_secs`, `stream_idle_timeout_secs`) applies to
+  built-in providers too, not only `custom_providers`; the default stream-idle deadline rises
+  from 120 s to 300 s, and a deadline failure names the keys to raise.
+- Reasoning effort no longer hard-fails on newer or re-spelled Claude ids: official-looking
+  5.x/4.6+ ids (e.g. `claude-opus-5-9`) and Bedrock/Vertex spellings get the native effort and
+  adaptive thinking, other unknown aliases drop a configured effort with a warning. Gemini 2.5/3
+  now map effort to `thinkingConfig` instead of silently ignoring it.
+- `fallback_model` / `--fallback-model`: a headless turn whose primary model fails with retries
+  exhausted (overload, rate limit, 5xx) before any progress is re-sent once to a same-provider
+  fallback model; a notice names both models and spend is attributed to the fallback.
+- Cost tracking prices requests above a model's long-context threshold (catalog
+  `long_context` tier, e.g. Gemini 2.5 Pro over 200k prompt tokens) at the premium rate, so
+  `/cost` and `max_budget_usd` no longer undercount large prompts; `/cost` names the premium and
+  COST_TRACKING.md lists the tiers still unsupported.
+- The model catalog can be refreshed from models.dev into the user cache (`/models catalog-refresh`,
+  or opt-in `models_catalog_refresh_days` at startup); a newer cache overlays the embedded
+  snapshot, a corrupt one is ignored, and `/models` shows the catalog's source and age. Every
+  embedded entry now records `max_output`, and Bedrock/Vertex Claude ids use their native
+  Anthropic metadata (context window, output ceiling, prices).
+
 **Fork release 1.14.2 (2026-10-28)**
 
 ### Changed (context management)

@@ -3,6 +3,7 @@ pub mod builder;
 pub(crate) mod first_tool;
 pub(crate) mod input;
 pub(crate) mod native_capture;
+pub(crate) mod output_truncation;
 pub mod prompt;
 mod read_loop;
 pub mod runner;

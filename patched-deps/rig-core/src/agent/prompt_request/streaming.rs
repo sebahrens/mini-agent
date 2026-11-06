@@ -1059,6 +1059,9 @@ where
             // the terminal error to surface.
             macro_rules! emit_completion_call {
                 ($usage:expr) => {{
+                    emit_completion_call!($usage, false)
+                }};
+                ($usage:expr, $truncated:expr) => {{
                     let usage = $usage;
                     last_usage = usage;
                     if !completion_call_emitted {
@@ -1068,7 +1071,9 @@ where
                         match run.record_streamed_completion_call(usage) {
                             Ok(call) => {
                                 completion_call_emitted = true;
-                                Ok(Some(MultiTurnStreamItem::CompletionCall(call)))
+                                Ok(Some(MultiTurnStreamItem::CompletionCall(
+                                    call.with_output_truncated($truncated),
+                                )))
                             }
                             Err(err) => Err(Box::new(err).into()),
                         }
@@ -1157,9 +1162,9 @@ where
                                 },
                             ));
                         }
-                        StreamedTurnEvent::Completed { usage, emit_final, native_end_turn: reported_native_end_turn } => {
+                        StreamedTurnEvent::Completed { usage, emit_final, native_end_turn: reported_native_end_turn, output_truncated } => {
                             native_end_turn = reported_native_end_turn;
-                            match emit_completion_call!(usage) {
+                            match emit_completion_call!(usage, output_truncated) {
                                 Ok(Some(item)) => yield Ok(item),
                                 Ok(None) => {}
                                 Err(err) => {

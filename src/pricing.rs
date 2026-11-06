@@ -29,6 +29,76 @@ impl Default for CacheMultipliers {
     }
 }
 
+/// A prompt-size premium: requests whose prompt exceeds `threshold` tokens
+/// are billed at these rates instead of the base rates (Gemini Pro above
+/// 200k, GPT-5.x above 272k, ...). Applied per request, never retroactively.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct LongContextPrices {
+    pub threshold: u64,
+    pub input_price: f64,
+    pub output_price: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_price: Option<f64>,
+}
+
+impl LongContextPrices {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.threshold > 0
+            && valid_price(self.input_price)
+            && valid_price(self.output_price)
+            && self.cache_read_price.is_none_or(valid_price)
+    }
+
+    /// Prompt tokens of one request: native Anthropic reports uncached,
+    /// cache-read and cache-write input separately; other protocols report
+    /// the whole prompt (cached tokens included) as input.
+    pub(crate) fn prompt_tokens(anthropic_native: bool, usage: crate::event::UsageDelta) -> u64 {
+        if anthropic_native {
+            usage
+                .input_tokens
+                .saturating_add(usage.cached_input_tokens)
+                .saturating_add(usage.cache_creation_input_tokens)
+        } else {
+            usage.input_tokens
+        }
+    }
+
+    pub(crate) fn applies(&self, anthropic_native: bool, usage: crate::event::UsageDelta) -> bool {
+        Self::prompt_tokens(anthropic_native, usage) > self.threshold
+    }
+
+    /// The tier for `provider/model`, but only while the session is billed
+    /// at that model's catalog base rate: a configured custom price is not
+    /// silently replaced by catalog premiums.
+    pub(crate) fn for_model(provider: &str, model: &str, base_input: Option<f64>) -> Option<Self> {
+        let tier = crate::models_catalog::model_long_context(provider, model)?;
+        let catalog_input = crate::models_catalog::catalog_entry(provider, model)?.input_price?;
+        let base = base_input?;
+        ((base - catalog_input).abs() <= 1e-9).then_some(tier)
+    }
+
+    /// The premium rates replacing `(input, output, cache)`; cache tiers keep
+    /// their ratio to the input price unless the tier lists a cache-read rate.
+    pub(crate) fn reprice(&self, input: f64, cache: CachePrices) -> (f64, f64, CachePrices) {
+        let ratio = if input > 0.0 {
+            self.input_price / input
+        } else {
+            1.0
+        };
+        let scale = |price: Option<f64>| price.map(|price| price * ratio);
+        (
+            self.input_price,
+            self.output_price,
+            CachePrices {
+                read: self.cache_read_price.or_else(|| scale(cache.read)),
+                write: scale(cache.write),
+                write_1h: scale(cache.write_1h),
+                split_required: cache.split_required,
+            },
+        )
+    }
+}
+
 fn valid_price(price: f64) -> bool {
     price.is_finite() && price >= 0.0
 }
@@ -222,8 +292,7 @@ impl CachePrices {
         } else {
             provider
         };
-        crate::models_catalog::catalog_entries(provider)
-            .and_then(|models| models.iter().find(|entry| entry.id == model))
+        crate::models_catalog::catalog_entry(provider, model)
             .map(|entry| {
                 let scale = |cache: Option<f64>| {
                     let base = entry
@@ -917,6 +986,99 @@ mod cache_pricing_tests {
         });
         assert!(
             serde_json::from_value::<crate::config::CustomProviderConfig>(unknown_key).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod long_context_tests {
+    use super::LongContextPrices;
+
+    fn prompt(input_tokens: u64, output_tokens: u64) -> crate::event::UsageDelta {
+        crate::event::UsageDelta {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn long_context_premium_prices_large_prompts_per_request() {
+        let tier = LongContextPrices::for_model("gemini", "gemini-2.5-pro", Some(1.25))
+            .expect("catalog tier for Gemini 2.5 Pro");
+        assert_eq!(tier.threshold, 200_000);
+        let base = crate::spend::PriceSnapshot::capture(
+            Some((1.25, 10.0)),
+            super::CachePrices::default(),
+            false,
+        );
+        // 300k-token prompt above the 200k threshold: premium rates.
+        let large = prompt(300_000, 1_000);
+        let premium = base.with_long_context(tier, large).cost(large).unwrap();
+        assert!(
+            (premium - (0.3 * 2.5 + 0.001 * 15.0)).abs() < 1e-9,
+            "{premium}"
+        );
+        assert!(premium > base.cost(large).unwrap());
+        // At or below the threshold the base rates apply.
+        let small = prompt(200_000, 1_000);
+        assert_eq!(
+            base.with_long_context(tier, small).cost(small),
+            base.cost(small)
+        );
+        // A custom configured price is never replaced by catalog premiums.
+        assert!(LongContextPrices::for_model("gemini", "gemini-2.5-pro", Some(9.0)).is_none());
+        assert!(LongContextPrices::for_model("gemini", "gemini-2.5-pro", None).is_none());
+        assert!(LongContextPrices::for_model("anthropic", "claude-fable-5", Some(10.0)).is_none());
+    }
+
+    #[test]
+    fn native_prompt_size_counts_cached_and_cache_write_input() {
+        let usage = crate::event::UsageDelta {
+            input_tokens: 10,
+            cached_input_tokens: 150_000,
+            cache_creation_input_tokens: 60_000,
+            ..Default::default()
+        };
+        assert_eq!(LongContextPrices::prompt_tokens(true, usage), 210_010);
+        assert_eq!(LongContextPrices::prompt_tokens(false, usage), 10);
+        let tier = LongContextPrices {
+            threshold: 200_000,
+            input_price: 6.0,
+            output_price: 22.5,
+            cache_read_price: None,
+        };
+        let (input, output, cache) = tier.reprice(
+            3.0,
+            super::CachePrices {
+                read: Some(0.3),
+                write: Some(3.75),
+                write_1h: Some(6.0),
+                split_required: false,
+            },
+        );
+        assert_eq!((input, output), (6.0, 22.5));
+        assert_eq!(cache.read, Some(0.6));
+        assert_eq!(cache.write, Some(7.5));
+        assert_eq!(cache.write_1h, Some(12.0));
+    }
+
+    #[test]
+    fn session_cost_and_cost_report_label_the_premium() {
+        let mut session = crate::session::Session::new("gemini", "gemini-2.5-pro", 1_048_576, "");
+        session.input_token_cost = 1.25;
+        session.output_token_cost = 10.0;
+        session.charge_usage_delta(prompt(300_000, 0), false);
+        assert!(
+            (session.total_cost - 0.75).abs() < 1e-9,
+            "{}",
+            session.total_cost
+        );
+        let tier = LongContextPrices::for_model("gemini", "gemini-2.5-pro", Some(1.25)).unwrap();
+        let label = crate::spend::long_context_label(&tier);
+        assert!(
+            label.contains("over 200000 tokens") && label.contains("$2.5/M input"),
+            "{label}"
         );
     }
 }

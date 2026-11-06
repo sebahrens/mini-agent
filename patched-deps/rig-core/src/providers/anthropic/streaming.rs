@@ -256,9 +256,17 @@ pub struct StreamingCompletionResponse {
     // mint a terminal witness, and no untrusted stop string is retained.
     #[serde(skip)]
     native_end_turn: bool,
+    /// `stop_reason: max_tokens` (mini-agent patch); runtime-only like
+    /// `native_end_turn`.
+    #[serde(skip)]
+    output_truncated: bool,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
+    fn output_truncated(&self) -> bool {
+        self.output_truncated
+    }
+
     fn native_anthropic_end_turn(&self) -> bool {
         self.native_end_turn
     }
@@ -429,6 +437,11 @@ where
             let mut accumulated_usage = PartialUsage::default();
             let mut final_usage = None;
             let mut native_end_turn = false;
+            let mut output_truncated = false;
+            // A tool_use block whose JSON input failed to parse. At
+            // `stop_reason: max_tokens` this is truncation, reported as such;
+            // otherwise the original parse error is surfaced. (mini-agent patch)
+            let mut pending_tool_input_error: Option<(String, CompletionError)> = None;
 
             let mut text_content = String::new();
 
@@ -457,6 +470,18 @@ where
                                         }
                                         if delta.stop_reason.is_some() {
                                             native_end_turn = delta.stop_reason.as_deref() == Some("end_turn");
+                                            output_truncated = delta.stop_reason.as_deref() == Some("max_tokens");
+                                            if let Some((tool_name, error)) = pending_tool_input_error.take() {
+                                                if output_truncated {
+                                                    yield Err(CompletionError::ResponseError(format!(
+                                                        "{}: the arguments of tool call `{tool_name}` were cut off and the call was not executed",
+                                                        crate::completion::OUTPUT_TRUNCATED_ERROR_MARKER
+                                                    )));
+                                                } else {
+                                                    yield Err(error);
+                                                }
+                                                break;
+                                            }
                                             let span = tracing::Span::current();
                                             span.record_token_usage(&accumulated_usage);
                                             final_usage = Some(accumulated_usage.clone());
@@ -466,6 +491,12 @@ where
                                     _ => {}
                                 }
 
+                                let stopping_tool = match (&event, &current_tool_call) {
+                                    (StreamingEvent::ContentBlockStop { .. }, Some(tool_call)) => {
+                                        Some(tool_call.name.clone())
+                                    }
+                                    _ => None,
+                                };
                                 if let Some(result) = handle_event(
                                     &event,
                                     &mut current_tool_call,
@@ -475,7 +506,12 @@ where
                                     if let Ok(RawStreamingChoice::Message(ref text)) = result {
                                         text_content += text;
                                     }
-                                    yield result;
+                                    match (result, stopping_tool) {
+                                        (Err(error), Some(tool_name)) => {
+                                            pending_tool_input_error = Some((tool_name, error));
+                                        }
+                                        (result, _) => yield result,
+                                    }
                                 }
                             },
                             Err(_) => {
@@ -500,9 +536,15 @@ where
             // Ensure event source is closed when stream ends
             sse_stream.close();
 
+            if let Some((_, error)) = pending_tool_input_error.take() {
+                yield Err(error);
+                return;
+            }
+
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
                 usage: final_usage.unwrap_or_default(),
                 native_end_turn,
+                output_truncated,
             }))
         }.instrument(span));
 
@@ -1719,6 +1761,7 @@ mod tests {
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
                 native_end_turn: false,
+                output_truncated: false,
                 usage: PartialUsage::default(),
             }));
         };
@@ -1865,6 +1908,7 @@ mod tests {
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
                 native_end_turn: false,
+                output_truncated: false,
                 usage: PartialUsage::default(),
             }));
         };

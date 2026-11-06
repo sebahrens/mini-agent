@@ -1535,8 +1535,8 @@ cap, while `/config subagent_max_tokens 64000` requests a larger response.
 Removing the saved `subagent_context_window` key restores automatic model-based
 sizing on the next startup.
 The selected child's known capacity and an explicitly configured parent
-`max_tokens`/`--max-tokens` ceiling still constrain it; the implicit parent 16K
-fallback alone is not a ceiling on a separately configured child.
+`max_tokens`/`--max-tokens` ceiling still constrain it; the implicit parent default
+(the model's catalog output ceiling up to 32K, else 16K) alone is not a ceiling on a separately configured child.
 Generated config files leave that main response fallback unset. Existing
 `max_tokens` entries remain explicit ceilings; remove or raise that entry when
 you want a child response larger than its value.

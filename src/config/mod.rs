@@ -196,6 +196,21 @@ pub struct Config {
     pub reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Connect and stream-idle deadlines for every provider client, built-in
+    /// or custom (`[provider_timeouts]`). A custom provider's own
+    /// `connect_timeout_secs` / `stream_idle_timeout_secs` take precedence.
+    /// Read at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_timeouts: Option<crate::provider::ProviderTimeouts>,
+    /// Same-provider model (id or quick-model alias) a headless turn switches
+    /// to when the primary model fails with retries exhausted before any
+    /// progress (overload, rate limit, 5xx). `--fallback-model` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<CompactString>,
+    /// Opt-in: refresh the model catalog cache from models.dev at startup
+    /// when it is older than this many days (network access; default off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_catalog_refresh_days: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_tools: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -968,10 +983,7 @@ impl Config {
     /// ignores the config override and the 128k fallback, so callers can tell a
     /// real catalog value apart from the default.
     pub fn catalog_context_window(provider: &str, model_id: &str) -> Option<u64> {
-        let entries = crate::models_catalog::catalog_entries(provider)?;
-        entries
-            .iter()
-            .find(|e| e.id == model_id)
+        crate::models_catalog::catalog_entry(provider, model_id)
             .and_then(|e| e.context_length)
             .map(|cl| cl as u64)
     }
@@ -981,10 +993,7 @@ impl Config {
     /// carries no baked-in pricing (e.g. OpenRouter, which prices live via
     /// `fetch_openrouter_pricing` instead).
     pub fn catalog_input_output_cost(provider: &str, model_id: &str) -> Option<(f64, f64)> {
-        let entries = crate::models_catalog::catalog_entries(provider)?;
-        entries
-            .iter()
-            .find(|e| e.id == model_id)
+        crate::models_catalog::catalog_entry(provider, model_id)
             .and_then(|e| e.input_price.zip(e.output_price))
     }
 
@@ -2308,7 +2317,9 @@ mod subagent_settings127_tests {
     fn subagent130_only_explicit_parent_response_limits_constrain_children() {
         let mut cfg = load::rich_default_config();
         assert_eq!(cfg.max_tokens, None);
-        assert_eq!(crate::cli::Cli::default().resolve_max_tokens(&cfg), 16_384);
+        // The implicit main default follows the model's catalog ceiling.
+        let implicit = crate::cli::Cli::default().resolve_max_tokens(&cfg);
+        assert!(implicit <= crate::cli::DEFAULT_MAX_TOKENS_CEILING);
         assert_eq!(cfg.resolve_subagent_max_tokens(), 32_000);
         // First startup persists these defaults. Loading them again must not
         // convert the implicit main response fallback into a child ceiling.
@@ -2316,7 +2327,10 @@ mod subagent_settings127_tests {
             load::serialize_config_content(std::path::Path::new("config.toml"), &cfg).unwrap();
         cfg = load::parse_config_content(std::path::Path::new("config.toml"), &serialized).unwrap();
         assert_eq!(cfg.max_tokens, None);
-        assert_eq!(crate::cli::Cli::default().resolve_max_tokens(&cfg), 16_384);
+        assert_eq!(
+            crate::cli::Cli::default().resolve_max_tokens(&cfg),
+            implicit
+        );
         assert_eq!(cfg.resolve_subagent_max_tokens(), 32_000);
         cfg = load::merge_config_value_layer(
             &cfg,

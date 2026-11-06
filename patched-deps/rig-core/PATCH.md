@@ -360,3 +360,23 @@ unchanged. The CI-exercised coverage is the application wire test
 `image_tool_results_on_copilot_azure_bedrock_vertex_routes` in
 `src/tests/image_read_tests.rs`, which asserts the header on both Copilot
 routes through a loopback server.
+
+## Output-token truncation reporting (mini-agent-5z0q7)
+
+`GetTokenUsage` gains `output_truncated()` (default `false`). It is implemented for the native
+Anthropic stream (`stop_reason: max_tokens`), the OpenAI-compatible chat stream
+(`finish_reason: length`, used by OpenAI chat completions, OpenRouter and Copilot chat), Gemini
+(`MAX_TOKENS`) and Ollama (`done_reason: length`); the runtime-only flag is `#[serde(skip)]`.
+`StreamedTurnEvent::Completed` carries it to the agent loop, which records it on the emitted
+`CompletionCall::output_truncated` (`#[serde(default)]`, omitted when false; built with
+`CompletionCall::with_output_truncated`). OpenAI Responses already surfaces
+`response.incomplete` as an error and is unchanged.
+
+A tool call cut off by the limit no longer executes or surfaces as an opaque JSON error: the
+Anthropic stream defers a tool-input parse failure until `message_delta`, and at
+`stop_reason: max_tokens` fails the stream with an error starting with
+`completion::OUTPUT_TRUNCATED_ERROR_MARKER` that names the tool (other stop reasons keep the
+original parse error). The compatible chat stream does the same for a still-open tool call at a
+`length` stop. The application tests drive real Anthropic and OpenRouter clients against local
+SSE fixtures.
+

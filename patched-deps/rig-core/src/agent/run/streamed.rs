@@ -283,6 +283,8 @@ pub enum StreamedTurnEvent {
         /// consumer (set when the turn streamed text).
         emit_final: bool,
         native_end_turn: bool,
+        /// The provider stopped at its output-token limit (mini-agent patch).
+        output_truncated: bool,
     },
 }
 
@@ -476,6 +478,7 @@ impl StreamedTurnAssembler {
                     usage,
                     emit_final,
                     native_end_turn: final_response.native_anthropic_end_turn(),
+                    output_truncated: final_response.output_truncated(),
                 }])
             }
             StreamedAssistantContent::Unknown(_) => {

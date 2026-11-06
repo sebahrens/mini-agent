@@ -29,6 +29,8 @@ pub(crate) enum Protocol {
     OpenRouter,
     OpenAiResponses,
     OpenAiCompletions,
+    /// Native Gemini `generateContent`: effort maps to `thinkingConfig`.
+    Gemini,
     Other,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +121,139 @@ fn claude(model: &str) -> Option<Claude> {
             })
         })
 }
+use crate::models_catalog::native_claude_id;
+
+/// Forward-compatible profile for an official-looking Claude id the exact
+/// table does not list yet (`claude-<family>-<major>[-<minor>][-YYYYMMDD]`):
+/// 5.x and 4.6+ share the current adaptive/effort contract. Anything else,
+/// including arbitrary gateway aliases, stays unknown.
+fn inferred_claude(model: &str) -> Option<Claude> {
+    let rest = model.strip_prefix("claude-")?;
+    let (family, version) = rest.split_once('-')?;
+    if !matches!(family, "opus" | "sonnet" | "haiku" | "fable" | "mythos") {
+        return None;
+    }
+    let mut parts = version.split('-');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let mut minor = 0_u32;
+    for (index, part) in parts.enumerate() {
+        let digits = part.bytes().all(|b| b.is_ascii_digit());
+        match (index, part.len()) {
+            (0, 1..=2) if digits => minor = part.parse().ok()?,
+            (_, 8) if digits => {}
+            _ => return None,
+        }
+    }
+    let current = major >= 5 || (major == 4 && minor >= 6);
+    current.then_some(Claude {
+        adaptive: true,
+        effort_supported: true,
+        manual: false,
+        xhigh: true,
+        max: true,
+        off: if major >= 5 { Off::No } else { Off::Yes },
+    })
+}
+
+/// Exact table first, then the forward-compatible inference.
+fn claude_profile(model: &str) -> Option<Claude> {
+    let native = native_claude_id(model);
+    claude(&native).or_else(|| inferred_claude(&native))
+}
+
+/// Gemini `thinkingConfig` for an effort level: `thinkingLevel` on Gemini 3,
+/// `thinkingBudget` on Gemini 2.5. `None` for models without thinking.
+fn gemini_thinking_config(model: &str, level: ReasoningEffort) -> Option<Value> {
+    let name = model.strip_prefix("models/").unwrap_or(model);
+    if name.starts_with("gemini-3") {
+        let level = match level {
+            ReasoningEffort::None | ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
+        };
+        return Some(json!({"thinkingLevel": level}));
+    }
+    if name.starts_with("gemini-2.5") {
+        let pro = name.starts_with("gemini-2.5-pro");
+        let ceiling = if pro { 32_768 } else { 24_576 };
+        let budget: u32 = match level {
+            // Pro cannot disable thinking; its floor is 128 tokens.
+            ReasoningEffort::None => {
+                if pro {
+                    128
+                } else {
+                    0
+                }
+            }
+            ReasoningEffort::Minimal => 512,
+            ReasoningEffort::Low => 2_048,
+            ReasoningEffort::Medium => 8_192,
+            ReasoningEffort::High => 16_384,
+            ReasoningEffort::Xhigh | ReasoningEffort::Max => ceiling,
+        };
+        return Some(json!({"thinkingBudget": budget.min(ceiling)}));
+    }
+    None
+}
+
+fn apply_gemini(
+    model: &str,
+    level: Option<ReasoningEffort>,
+    source: Source,
+    session: SessionReasoning,
+    params: Option<Value>,
+) -> Result<(Option<Value>, Effective), ControlError> {
+    let mut body = params.unwrap_or(Value::Null);
+    if session.thinking.is_some() {
+        return Err(ControlError(
+            "Gemini thinking is controlled with /effort, not /reasoning on|off",
+        ));
+    }
+    let raw = body.pointer("/generationConfig/thinkingConfig").is_some();
+    let Some(level) = level.filter(|_| !raw) else {
+        return Ok((
+            (!body.is_null()).then_some(body),
+            Effective {
+                effort: None,
+                source: if raw { Source::Raw } else { Source::Provider },
+                adaptive: false,
+            },
+        ));
+    };
+    let Some(thinking) = gemini_thinking_config(model, level) else {
+        if session.effort.is_some() {
+            return Err(ControlError(
+                "this Gemini model has no thinking controls; use a Gemini 2.5 or 3 model",
+            ));
+        }
+        tracing::warn!(
+            model,
+            "configured reasoning effort ignored: this Gemini model has no thinking controls"
+        );
+        return Ok((
+            (!body.is_null()).then_some(body),
+            Effective {
+                effort: None,
+                source: Source::Provider,
+                adaptive: false,
+            },
+        ));
+    };
+    if body.is_null() {
+        body = json!({});
+    }
+    object(&mut body, "generationConfig")?.insert("thinkingConfig".into(), thinking);
+    Ok((
+        Some(body),
+        Effective {
+            effort: Some(level),
+            source,
+            adaptive: false,
+        },
+    ))
+}
+
 fn effort(value: &Value) -> Result<ReasoningEffort, ControlError> {
     serde_json::from_value(value.clone())
         .map_err(|_| ControlError("invalid reasoning effort; use low, medium, high, xhigh or max"))
@@ -167,7 +302,7 @@ pub(crate) fn apply(
         Protocol::Anthropic => "output_config",
         Protocol::OpenRouter => "reasoning",
         Protocol::OpenAiResponses | Protocol::OpenAiCompletions => "reasoning",
-        Protocol::Other => "",
+        Protocol::Gemini | Protocol::Other => "",
     };
     let raw = if matches!(
         protocol,
@@ -190,6 +325,15 @@ pub(crate) fn apply(
         (None, Source::Provider)
     };
     let explicit = session != SessionReasoning::default();
+    if protocol == Protocol::Gemini {
+        return apply_gemini(
+            model,
+            level,
+            source,
+            session,
+            (!body.is_null()).then_some(body),
+        );
+    }
     if native_model.is_none() {
         if matches!(
             protocol,
@@ -240,7 +384,7 @@ pub(crate) fn apply(
         ));
     }
     let native_model = native_model.unwrap();
-    let profile = claude(native_model);
+    let profile = claude_profile(native_model);
     let raw_thinking = body.get("thinking").is_some();
     if level.is_none() && !explicit && !raw_thinking {
         return Ok((
@@ -252,7 +396,36 @@ pub(crate) fn apply(
             },
         ));
     }
-    let profile=profile.ok_or(ControlError("this Claude model has no verified effort/thinking compatibility; clear the session override or use a supported model"))?;
+    let Some(profile) = profile else {
+        // Unknown id (custom alias, unreleased naming): a session override is
+        // an explicit request and fails loudly; an effort written into
+        // extra_body passes through untouched; a global configured level is
+        // dropped with a warning instead of failing every turn.
+        if explicit {
+            return Err(ControlError(
+                "this Claude model has no verified effort/thinking compatibility; clear the session override or use a supported model",
+            ));
+        }
+        if source != Source::Raw && level.is_some() {
+            tracing::warn!(
+                model = native_model,
+                "configured reasoning effort ignored: unknown Claude model id"
+            );
+        }
+        let raw_kept = source == Source::Raw || raw_thinking;
+        return Ok((
+            (!body.is_null()).then_some(body),
+            Effective {
+                effort: if source == Source::Raw { level } else { None },
+                source: if raw_kept {
+                    Source::Raw
+                } else {
+                    Source::Provider
+                },
+                adaptive: false,
+            },
+        ));
+    };
     if let Some(level) = level {
         if !profile.effort_supported {
             return Err(ControlError("effort is unsupported by this Claude model"));
@@ -415,7 +588,8 @@ pub(crate) fn thinking_enabled(
         }
         _ => return None,
     };
-    let profile = claude(name)?;
+    let profile = claude_profile(name)?;
+    let native = native_claude_id(name);
     if protocol == Protocol::OpenRouter {
         if let Some(enabled) = params
             .and_then(|v| v.pointer("/reasoning/enabled"))
@@ -439,8 +613,8 @@ pub(crate) fn thinking_enabled(
         Some(_) => None,
         None => Some(
             profile.adaptive
-                && !name.starts_with("claude-opus-4")
-                && !name.starts_with("claude-sonnet-4"),
+                && !native.starts_with("claude-opus-4")
+                && !native.starts_with("claude-sonnet-4"),
         ),
     }
 }
@@ -448,6 +622,161 @@ pub(crate) fn thinking_enabled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreleased_claude_ids_get_forward_compatible_effort() {
+        for model in [
+            "claude-opus-5-9",
+            "claude-sonnet-6",
+            "claude-opus-5-9-20270101",
+            "claude-sonnet-4-9",
+        ] {
+            let (params, eff) = apply(
+                Protocol::Anthropic,
+                model,
+                Some(ReasoningEffort::High),
+                SessionReasoning::default(),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{model}: {error}"));
+            let params = params.unwrap();
+            assert_eq!(params["output_config"]["effort"], "high", "{model}");
+            assert_eq!(params["thinking"], json!({"type":"adaptive"}), "{model}");
+            assert_eq!(eff.effort, Some(ReasoningEffort::High));
+        }
+        // Old or malformed ids are not guessed.
+        for model in [
+            "claude-opus-4-1",
+            "claude-3-7-sonnet",
+            "claude-opus-5-9-beta",
+        ] {
+            assert!(inferred_claude(model).is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn bedrock_and_vertex_claude_ids_honour_effort_like_direct_anthropic() {
+        assert_eq!(
+            native_claude_id("us.anthropic.claude-sonnet-5-v1:0"),
+            "claude-sonnet-5"
+        );
+        assert_eq!(
+            native_claude_id("anthropic.claude-opus-4-8-20260101-v2"),
+            "claude-opus-4-8-20260101"
+        );
+        assert_eq!(
+            native_claude_id("claude-sonnet-4-5@20250929"),
+            "claude-sonnet-4-5-20250929"
+        );
+        for model in [
+            "us.anthropic.claude-opus-5-5",
+            "global.anthropic.claude-opus-5-5-v1:0",
+            "claude-opus-5-5@20261001",
+        ] {
+            let (params, eff) = apply(
+                Protocol::Anthropic,
+                model,
+                Some(ReasoningEffort::Xhigh),
+                SessionReasoning::default(),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{model}: {error}"));
+            assert_eq!(
+                params.unwrap()["output_config"]["effort"],
+                "xhigh",
+                "{model}"
+            );
+            assert!(eff.adaptive);
+        }
+        assert_eq!(
+            thinking_enabled(Protocol::Anthropic, "us.anthropic.claude-opus-4-8", None),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn gemini_effort_emits_thinking_config() {
+        let (params, eff) = apply(
+            Protocol::Gemini,
+            "gemini-3-pro-preview",
+            Some(ReasoningEffort::High),
+            SessionReasoning::default(),
+            Some(json!({"generationConfig":{"temperature":0.2}})),
+        )
+        .unwrap();
+        let params = params.unwrap();
+        assert_eq!(
+            params["generationConfig"]["thinkingConfig"],
+            json!({"thinkingLevel":"high"})
+        );
+        assert_eq!(params["generationConfig"]["temperature"], 0.2);
+        assert_eq!(eff.effort, Some(ReasoningEffort::High));
+        assert_eq!(eff.source, Source::Config);
+
+        let (params, _) = apply(
+            Protocol::Gemini,
+            "gemini-2.5-flash",
+            None,
+            SessionReasoning {
+                effort: Some(ReasoningEffort::High),
+                thinking: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params.unwrap()["generationConfig"]["thinkingConfig"],
+            json!({"thinkingBudget":16384})
+        );
+        let (params, _) = apply(
+            Protocol::Gemini,
+            "gemini-2.5-pro",
+            Some(ReasoningEffort::None),
+            SessionReasoning::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params.unwrap()["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            128
+        );
+        // An explicit thinkingConfig in extra_body wins.
+        let raw = json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":64}}});
+        let (params, eff) = apply(
+            Protocol::Gemini,
+            "gemini-2.5-flash",
+            Some(ReasoningEffort::High),
+            SessionReasoning::default(),
+            Some(raw.clone()),
+        )
+        .unwrap();
+        assert_eq!(params, Some(raw));
+        assert_eq!(eff.source, Source::Raw);
+        // Models without thinking: configured effort is dropped, a session
+        // override fails.
+        let (params, eff) = apply(
+            Protocol::Gemini,
+            "gemini-2.0-flash",
+            Some(ReasoningEffort::High),
+            SessionReasoning::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!((params, eff.effort), (None, None));
+        assert!(
+            apply(
+                Protocol::Gemini,
+                "gemini-2.0-flash",
+                None,
+                SessionReasoning {
+                    effort: Some(ReasoningEffort::High),
+                    thinking: None
+                },
+                None
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn effort_native_levels_and_schema_preserve_defaults_and_exact_routes() {
         let (params, eff) = apply(
@@ -474,12 +803,28 @@ mod tests {
             assert_eq!(p["thinking"], json!({"type":"adaptive"}));
             assert!(e.adaptive);
         }
+        // A configured (global) effort on an unknown alias is dropped with a
+        // warning rather than failing every turn; a session override still
+        // fails loudly.
+        let (params, eff) = apply(
+            Protocol::Anthropic,
+            "custom-claude-opus-5-5",
+            Some(ReasoningEffort::High),
+            SessionReasoning::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(params, None);
+        assert_eq!(eff.effort, None);
         assert!(
             apply(
                 Protocol::Anthropic,
                 "custom-claude-opus-5-5",
-                Some(ReasoningEffort::High),
-                SessionReasoning::default(),
+                None,
+                SessionReasoning {
+                    effort: Some(ReasoningEffort::High),
+                    thinking: None
+                },
                 None
             )
             .is_err()

@@ -499,6 +499,12 @@ pub struct CompletionResponse<T> {
     pub message_id: Option<String>,
 }
 
+/// Stable prefix of the stream error raised when the provider's output-token
+/// limit cut off a tool call's arguments, so applications can recognise the
+/// truncation without parsing provider payloads. (mini-agent patch)
+pub const OUTPUT_TRUNCATED_ERROR_MARKER: &str =
+    "model output truncated at the output-token limit (max_tokens)";
+
 /// A trait for grabbing the token usage of a completion response.
 ///
 /// Primarily designed for streamed completion responses in streamed multi-turn, as otherwise it would be impossible to do.
@@ -512,6 +518,14 @@ pub trait GetTokenUsage {
     /// responses and missing/unknown reasons. This is not permission or billing
     /// authority; consumers must also prove their actual native invocation.
     fn native_anthropic_end_turn(&self) -> bool {
+        false
+    }
+
+    /// The provider stopped this response because it reached the output-token
+    /// limit (Anthropic `stop_reason: max_tokens`, OpenAI `finish_reason:
+    /// length`, Responses `incomplete: max_output_tokens`, Gemini
+    /// `MAX_TOKENS`). False when unknown. (mini-agent patch)
+    fn output_truncated(&self) -> bool {
         false
     }
 }
@@ -532,6 +546,10 @@ where
         } else {
             crate::completion::Usage::new()
         }
+    }
+
+    fn output_truncated(&self) -> bool {
+        self.as_ref().is_some_and(GetTokenUsage::output_truncated)
     }
 }
 

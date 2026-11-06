@@ -86,6 +86,10 @@ impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> crate::completion::Usage {
         self.usage_metadata.token_usage()
     }
+
+    fn output_truncated(&self) -> bool {
+        matches!(self.finish_reason, Some(FinishReason::MaxTokens))
+    }
 }
 
 fn tool_protocol_finish_reason_error(choice: &ContentCandidate) -> Option<CompletionError> {

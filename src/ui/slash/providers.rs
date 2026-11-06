@@ -811,6 +811,24 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
 
     let refresh = parts.get(1).map(|s| s.trim()) == Some("refresh");
 
+    // /models catalog-refresh — fetch models.dev into the catalog cache.
+    if parts.get(1).map(|s| s.trim()) == Some("catalog-refresh") {
+        match crate::models_catalog::refresh_cache().await {
+            Ok((path, count)) => write_ok(
+                ctx.renderer,
+                format!(
+                    "model catalog cache refreshed: {count} models written to {}; it is used from the next start",
+                    path.display()
+                ),
+            ),
+            Err(error) => write_error(
+                ctx.renderer,
+                format!("model catalog refresh failed (the current catalog stays in use): {error}"),
+            ),
+        }
+        return Ok(());
+    }
+
     // /models <name-or-id> — same as /model <name-or-id>.
     if parts.len() >= 2 && !refresh {
         return switch_model(ctx, parts[1].trim()).await;
@@ -833,6 +851,10 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                         provider,
                         models.len()
                     ),
+                );
+                write_result(
+                    ctx.renderer,
+                    crate::models_catalog::catalog_age_line(chrono::Utc::now()),
                 );
             } else {
                 // Full listing: quick models, then the provider's available models.
@@ -908,6 +930,10 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                         );
                     }
                 }
+                write_result(
+                    ctx.renderer,
+                    crate::models_catalog::catalog_age_line(chrono::Utc::now()),
+                );
             }
         }
         Err(e) => {

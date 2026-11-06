@@ -44,6 +44,9 @@ fn provider_response_from_compatible_sse_data(data: &str) -> Option<CompletionEr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompatibleFinishReason {
     ToolCalls,
+    /// `finish_reason: length`: the output-token limit was reached
+    /// (mini-agent patch).
+    Length,
     Other,
 }
 
@@ -164,6 +167,13 @@ pub(crate) trait CompatibleStreamProfile: WasmCompatSend {
 
     fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse;
 
+    /// Record that a choice finished with `finish_reason: length`. Profiles
+    /// whose final response cannot carry the flag keep it unchanged.
+    /// (mini-agent patch)
+    fn mark_output_truncated(&self, response: Self::FinalResponse) -> Self::FinalResponse {
+        response
+    }
+
     fn uses_distinct_tool_call_eviction(&self) -> bool {
         false
     }
@@ -231,6 +241,7 @@ where
     let stream = stream! {
         let mut tool_calls: HashMap<usize, RawStreamingToolCall> = HashMap::new();
         let mut final_usage = None;
+        let mut output_truncated = false;
         let mut terminated_with_error = false;
 
         while let Some(event_result) = event_source.next().await {
@@ -351,6 +362,7 @@ where
                         yield Ok(RawStreamingChoice::Message(content));
                     }
 
+                    output_truncated |= choice.finish_reason == CompatibleFinishReason::Length;
                     if choice.finish_reason == CompatibleFinishReason::ToolCalls {
                         for tool_call in take_finalized_tool_calls(
                             &mut tool_calls,
@@ -378,6 +390,17 @@ where
             return;
         }
 
+        if output_truncated && let Some(tool_call) = tool_calls.values().next() {
+            // The length stop cut a still-open tool call: its arguments are
+            // incomplete, so it must not execute. (mini-agent patch)
+            yield Err(CompletionError::ResponseError(format!(
+                "{}: the arguments of tool call `{}` were cut off and the call was not executed",
+                crate::completion::OUTPUT_TRUNCATED_ERROR_MARKER,
+                tool_call.name
+            )));
+            return;
+        }
+
         for tool_call in
             take_finalized_tool_calls(&mut tool_calls, DroppedToolCallContext::EndOfStream)
         {
@@ -386,9 +409,13 @@ where
 
         let final_usage = final_usage.unwrap_or_default();
         record_usage(&span, &final_usage);
-        yield Ok(RawStreamingChoice::FinalResponse(
-            profile.build_final_response(final_usage),
-        ));
+        let final_response = profile.build_final_response(final_usage);
+        let final_response = if output_truncated {
+            profile.mark_output_truncated(final_response)
+        } else {
+            final_response
+        };
+        yield Ok(RawStreamingChoice::FinalResponse(final_response));
     }
     .instrument(instrument_span);
 

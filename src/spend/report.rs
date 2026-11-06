@@ -75,6 +75,13 @@ pub(crate) async fn cost_lines(session: &Session, ledger: Ledger) -> anyhow::Res
             "Legacy/imported estimate: ${estimate:.6} (excluded from daily ledger)"
         ));
     }
+    if let Some(tier) = crate::pricing::LongContextPrices::for_model(
+        &session.provider,
+        &session.model,
+        session.known_input_output_prices().map(|(input, _)| input),
+    ) {
+        lines.push(long_context_label(&tier));
+    }
     if let Some(cap) = snapshot.cap {
         lines.push(format!(
             "Session USD ceiling: ${cap:.6} (reported usage estimate; not a provider billing limit)"
@@ -115,6 +122,14 @@ pub(crate) async fn cost_lines(session: &Session, ledger: Ledger) -> anyhow::Res
     lines.push(total("Today (UTC)", &summary.today));
     lines.push(total("All time", &summary.all_time));
     Ok(lines)
+}
+
+/// `/cost` line naming the active model's long-context premium.
+pub(crate) fn long_context_label(tier: &crate::pricing::LongContextPrices) -> String {
+    format!(
+        "Long-context premium: requests with prompts over {} tokens are priced at ${}/M input, ${}/M output",
+        tier.threshold, tier.input_price, tier.output_price
+    )
 }
 
 #[cfg(test)]
