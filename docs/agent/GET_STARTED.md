@@ -435,7 +435,12 @@ With `--stream-json-control`, stdin is read while a turn runs and these lines ac
 - `{"type":"control_request","request_id":"x","request":{"subtype":"set_permission_mode","mode":"readonly"}}`
   switches the mode but can only narrow it, like a prompt `%%mode=` directive; raising privilege is refused.
 - A tool `Ask` emits `{"type":"control_request","request_id":"perm_N","request":{"subtype":"can_use_tool","tool_name":...,"input":...,"truncated":bool}}`
-  and waits up to 60 s for `{"type":"control_response","response":{"subtype":"success","request_id":"perm_N","response":{"behavior":"allow"|"deny","message":"..."}}}`.
+  and waits up to `--stream-json-ask-timeout` seconds (default 60, range 0-86400, `0` = no deadline: wait for the answer, stdin EOF or an interrupt) for `{"type":"control_response","response":{"subtype":"success","request_id":"perm_N","response":{"behavior":"allow"|"deny","message":"..."}}}`.
+  `input` is the complete text being approved, never clipped, with deceptive format characters (bidi
+  overrides etc.) shown as visible `<U+XXXX>` markers; `input_bytes` is its length and `truncated` is always
+  `false`. An input over 1 MiB is denied as too large to review without being asked. Sandbox escalation
+  (`tool_name` `sandbox_escalation`, input = reason and full command) and an unlisted sandbox network
+  `host:port` (`sandbox_network`) are asked the same way; those allows are once-only too.
   Only an explicit `allow` approves (once; never an allow-always grant). A `deny`, an `error` reply, the
   timeout, a closed stdin or an interrupted turn all deny, and a reply with an unknown id is an `input_error`.
 

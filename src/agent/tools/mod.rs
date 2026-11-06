@@ -1054,6 +1054,15 @@ pub(crate) async fn request_sandbox_escalation_approval(
     justification: &str,
 ) -> Result<(), ToolError> {
     let Some(tx) = ask_tx else {
+        // Headless with `--stream-json-control`: the driver answers (once-only).
+        if let Some(control) = crate::headless_control::state() {
+            return match control.ask_escalation(command, justification).await {
+                crate::headless_control::Reply::Allow => Ok(()),
+                crate::headless_control::Reply::Deny(reason) => Err(ToolError::Msg(format!(
+                    "Sandbox escalation denied by the stream-json control channel: {reason}; the command was not run"
+                ))),
+            };
+        }
         return Err(ToolError::Msg(
             "sandbox escalation needs interactive approval and none is available (non-interactive run)"
                 .to_string(),

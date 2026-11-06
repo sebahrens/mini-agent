@@ -2385,7 +2385,13 @@ impl Startup {
         let mut queued = self
             .cli
             .stream_json_control
-            .then(|| crate::print::spawn_control_reader(output, self.permission.clone()));
+            .then(|| {
+            crate::print::spawn_control_reader(
+                output,
+                self.permission.clone(),
+                std::time::Duration::from_secs(self.cli.stream_json_ask_timeout),
+            )
+        });
         loop {
             let prompt = match pending.take() {
                 Some(prompt) => prompt,
