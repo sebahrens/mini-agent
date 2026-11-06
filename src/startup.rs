@@ -861,6 +861,11 @@ async fn compact_headless_session(
         None => spend,
     };
     let compaction_model = compaction_model.map(|(_, model)| model);
+    let budget_cap = cfg.compaction_budget_cap(
+        &session.provider,
+        compaction_model.as_deref(),
+        session.context_window,
+    );
     let observed = crate::spend::run::UsageObserver::with_run(spend.clone());
     let request_observer = observed.clone();
     let compacted = compact_headless_session_with_force(
@@ -877,6 +882,12 @@ async fn compact_headless_session(
             })
             .await;
             let model = compaction_model.unwrap_or(model);
+            let (input_token_budget, response_token_budget) =
+                crate::config::CompactionBudgetCap::apply(
+                    budget_cap,
+                    input_token_budget,
+                    response_token_budget,
+                );
             client
                 .compress_messages_observed_with_timeout(
                     &model,

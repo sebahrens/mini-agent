@@ -539,6 +539,11 @@ pub async fn handle_compress(
         None => compaction_run,
     };
     let compaction_model = compaction_model.map(|(_, model)| model);
+    let budget_cap = ui.cfg.compaction_budget_cap(
+        &ui.session.provider,
+        compaction_model.as_deref(),
+        ui.session.context_window,
+    );
     let compaction_timeout = ui.cfg.resolve_compaction_timeout();
     let observed = crate::spend::run::UsageObserver::with_run(compaction_run);
     let request_observer = observed.clone();
@@ -556,6 +561,11 @@ pub async fn handle_compress(
         restore_read_tokens,
         |model, messages, previous_summary, input_budget, response_budget| async move {
             let model = compaction_model.unwrap_or(model);
+            let (input_budget, response_budget) = crate::config::CompactionBudgetCap::apply(
+                budget_cap,
+                input_budget,
+                response_budget,
+            );
             client
                 .compress_messages_observed_with_timeout(
                     &model,

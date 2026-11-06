@@ -1584,9 +1584,9 @@ fn default_compaction_request_timeout(input_token_budget: u64) -> Duration {
 ///
 /// `usage` is the raw sum of the provider reports, one per request. Callers
 /// normalize it once for the session's provider (`Config::normalize_usage`)
-/// and charge it at the session model's prices: compaction always runs on the
-/// session model, and up to `MAX_COMPACTION_REQUESTS` full-context requests
-/// are real spend.
+/// and charge it at the price profile of the model that ran them: the session
+/// model, or the configured `compaction_model`. Up to `MAX_COMPACTION_REQUESTS`
+/// full-context requests are real spend.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionOutput {
     pub summary: String,

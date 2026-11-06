@@ -4730,6 +4730,18 @@ async fn execute_prompt(
             .as_ref()
             .map_or(model_str.as_str(), |(_, model)| model.as_str());
         let compaction_model = &compaction_model_name;
+        let (compaction_input_budget, compaction_response_budget) =
+            crate::config::CompactionBudgetCap::apply(
+                state.cfg.compaction_budget_cap(
+                    &provider_str,
+                    configured_compaction
+                        .as_ref()
+                        .map(|(_, model)| model.as_str()),
+                    context_window,
+                ),
+                context_window.saturating_sub(reserve),
+                reserve,
+            );
         let compaction_timeout = state.cfg.resolve_compaction_timeout();
         let compaction_retry = &state.cfg.retry;
         let observed = crate::spend::run::Run::current().map_or_else(Default::default, |run| {
@@ -4768,8 +4780,8 @@ async fn execute_prompt(
                                 &messages,
                                 previous_summary.as_deref(),
                                 None,
-                                context_window.saturating_sub(reserve),
-                                reserve,
+                                compaction_input_budget,
+                                compaction_response_budget,
                                 compaction_retry,
                                 observed,
                                 compaction_timeout,
