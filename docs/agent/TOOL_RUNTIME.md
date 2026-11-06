@@ -67,7 +67,7 @@ call is interrupted before either happens, the job is stopped.
 |---------------|----------|
 | `shell` foreground | `shell_timeout_secs` (default 120 s, 1..=600); call `timeout` can only lower it; optional promotion to a job |
 | `shell` background job | 24 h, call `timeout` can lower it |
-| `!` commands (TUI and headless) | `command_timeout_secs` (default 30 s, 1..=600) |
+| `!` commands (TUI and headless) | `command_timeout_secs` (default 120 s, 1..=600); a leading `!timeout=<s>` sets one command's deadline |
 | Loop and goal validation commands | Their own configured validation limits |
 | Hooks | Their own hook timeouts |
 | Brokered JS `spawn` | Remaining `js-step-timeout-secs` deadline (default 30 s) |
