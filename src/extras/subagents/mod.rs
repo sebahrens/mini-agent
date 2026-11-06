@@ -15,6 +15,7 @@ pub(crate) mod inline_images;
 pub(crate) mod isolation;
 pub(crate) mod partial;
 pub(crate) mod prompt;
+pub(crate) mod resume;
 pub(crate) mod task_tool;
 
 #[derive(Clone)]

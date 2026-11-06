@@ -23,6 +23,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `task` accepts per-call `max_turns` and `timeout_secs`, and personas accept `max_turns` and
   `timeout_secs` frontmatter; values above `[subagents] task_max_turns_ceiling` (default 100) or
   `task_timeout_ceiling_secs` (default 3600) are rejected instead of clamped.
+- `task {"resume": "<child id>", "prompts": ["…"]}` continues an earlier child's conversation
+  (tool results included) with a follow-up turn, re-authorized and charged like any task call. Each
+  report prints its child id; the 16 most recent conversations are kept in memory.
 
 **Fork release 1.14.2 (2026-10-28)**
 

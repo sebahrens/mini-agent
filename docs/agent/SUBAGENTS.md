@@ -165,6 +165,32 @@ the current ceilings.
 - The complete request is rejected before permission checking or execution if
   it is empty, contains a blank prompt, or exceeds `task_max_prompts`.
 
+### Resuming a child (`resume`)
+
+After a child returns a report, the host keeps its conversation (prompt, tool
+calls, tool results and final text) and prints, after the child's closing
+`[subagent output ends]` fence:
+
+```text
+[child id: <uuid>; continue this child's conversation with task {"resume": "<uuid>", "prompts": ["<follow-up>"]}]
+```
+
+A later `task {"resume": "<uuid>", "prompts": ["follow-up"]}` continues that
+conversation with the single prompt as its next user turn, so the child keeps
+what it already read. The call is otherwise ordinary: it passes the `task`
+permission check again, runs as the stored `agent_type` (a different
+`agent_type` is rejected; omit it), uses the current persona, tools,
+deadlines and report contract, and its requests are charged to the call's
+`task_max_cost_units` and the session spend account. A resumed child gets a
+new child id. Exactly one prompt is accepted.
+
+The conversations are bounded and in memory only: the session keeps the 16
+most recent (8 MiB of serialized conversation each; larger ones get no id),
+owned by the session's task pool (or the task tool without one). They do not
+survive a restart. An unknown or expired id is rejected with an explicit
+error. Worktree-isolated children are not resumable (their worktree ends with
+them); failed children get no id.
+
 ## Specialist Agent Types
 
 `task` also accepts an optional `agent_type`. When set, the named definition is
@@ -1172,7 +1198,8 @@ subagent_provider = "openrouter"
 
 ## Current structured handoff contract
 
-- The child receives no conversation history. Callers can provide a
+- The child receives no conversation history, except a `resume` call, which
+  continues one earlier child's own conversation. Callers can provide a
   structured brief (`objective`, `files`, `constraints`, `expected_sections`),
   and every successful return is checked against the Findings, Unverified, and
   Coverage skeleton (mini-agent-nfd7, mini-agent-sux9).

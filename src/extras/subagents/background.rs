@@ -442,6 +442,8 @@ pub(crate) struct Pool {
     recent: Mutex<std::collections::VecDeque<RecentTask>>,
     /// Host-minted child evidence stores (foreground and background).
     evidence: crate::extras::subagents::evidence::EvidenceIndex,
+    /// Child conversations a later `task {"resume": id}` can continue.
+    resumable: Arc<crate::extras::subagents::resume::ResumeStore>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -686,6 +688,7 @@ impl Pool {
             write_lane: Arc::new(tokio::sync::Semaphore::new(1)),
             recent: Mutex::default(),
             evidence: Default::default(),
+            resumable: Default::default(),
         });
         session.background_pool = Some(pool.clone());
         Ok(pool)
@@ -1022,6 +1025,9 @@ impl Pool {
     }
     pub(crate) fn evidence(&self) -> &crate::extras::subagents::evidence::EvidenceIndex {
         &self.evidence
+    }
+    pub(crate) fn resumable(&self) -> &Arc<crate::extras::subagents::resume::ResumeStore> {
+        &self.resumable
     }
     pub(crate) fn recent_foreground(&self) -> Vec<RecentTask> {
         self.recent

@@ -73,6 +73,8 @@ pub struct TaskCallOptions {
     pub max_turns: Option<usize>,
     /// Whole-call deadline in seconds, overriding the persona and config.
     pub timeout_secs: Option<u64>,
+    /// Continue the stored conversation of an earlier child (its child id).
+    pub resume: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -238,12 +240,15 @@ impl<'de> Deserialize<'de> for TaskArgs {
             max_turns: Option<usize>,
             #[serde(default)]
             timeout_secs: Option<u64>,
+            #[serde(default)]
+            resume: Option<String>,
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
         let options = TaskCallOptions {
             max_turns: raw.max_turns,
             timeout_secs: raw.timeout_secs,
+            resume: raw.resume,
         };
         let mut raw_briefs = raw.briefs.map(|briefs| briefs.0);
         let mut agent_type = raw.agent_type;
@@ -873,6 +878,8 @@ pub struct TaskTool {
     /// The parent model's captured image support: decides whether attached
     /// child images are inlined or degrade to evidence rows.
     parent_image_support: super::inline_images::ParentSupport,
+    /// Resumable child conversations when no session pool owns them.
+    local_resume: Arc<super::resume::ResumeStore>,
 }
 
 impl TaskTool {
@@ -958,7 +965,19 @@ impl TaskTool {
             #[cfg(feature = "js")]
             read_only_js: None,
             parent_image_support: None,
+            local_resume: Default::default(),
         }
+    }
+
+    /// The session pool's resumable conversations, or this tool's own.
+    fn resume_store(&self) -> Arc<super::resume::ResumeStore> {
+        crate::spend::run::Run::current()
+            .as_ref()
+            .and_then(crate::spend::run::Run::background_pool)
+            .map_or_else(
+                || self.local_resume.clone(),
+                |pool| pool.resumable().clone(),
+            )
     }
 
     /// The parent model's image support, as captured for its own `read`.
@@ -1147,6 +1166,10 @@ editing in a known location, grepping for a literal you will act on immediately.
                     "maximum": timeout_ceiling,
                     "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs 300 in the foreground or task_background_timeout_secs 3600 in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
                 },
+                "resume": {
+                    "type": "string",
+                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids are in memory only and expire after the 16 most recent children or a restart."
+                },
                 "run_in_background": {
                     "type": "boolean",
                     "default": false,
@@ -1214,7 +1237,36 @@ editing in a known location, grepping for a literal you will act on immediately.
         }
         let prompts = prepare_task_prompts(&args, limits)?;
 
-        let agent_type = args.agent_type.clone();
+        // `resume` continues one stored child conversation as the same
+        // agent type; the call is otherwise an ordinary, re-authorized task.
+        let resume_store = self.resume_store();
+        let resumed = match args.options.resume.as_deref() {
+            None => None,
+            Some(id) => {
+                if prompts.len() != 1 {
+                    return Err(ToolError::Msg(
+                        "task: resume continues one child; send exactly one prompt with the follow-up message".into(),
+                    ));
+                }
+                let stored = resume_store.get(id).ok_or_else(|| {
+                    ToolError::Msg(format!(
+                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the {} most recent children of this session and do not survive a restart; start a new task instead",
+                        super::resume::MAX_RESUMABLE_CHILDREN
+                    ))
+                })?;
+                if args.agent_type.is_some() && args.agent_type != stored.agent_type {
+                    return Err(ToolError::Msg(format!(
+                        "task: resume id '{id}' belongs to agent_type {}; omit agent_type or pass the same one",
+                        stored.agent_type.as_deref().unwrap_or("(default explorer)")
+                    )));
+                }
+                Some(stored)
+            }
+        };
+        let agent_type = match &resumed {
+            Some(stored) => stored.agent_type.clone(),
+            None => args.agent_type.clone(),
+        };
         let permission_source = agent_type.as_deref().map(|agent_type| {
             crate::context::agents::source_hint_for_workspace(agent_type, self.workspace.as_deref())
         });
@@ -1257,6 +1309,11 @@ editing in a known location, grepping for a literal you will act on immediately.
             isolated = specialization
                 .as_ref()
                 .is_some_and(|persona| persona.isolation_worktree);
+            if isolated && resumed.is_some() {
+                return Err(ToolError::Msg(
+                    "task: a worktree-isolated child cannot be resumed: its worktree ended with it; merge its branch and start a new task".into(),
+                ));
+            }
             if isolated && self.permission.is_none() {
                 return Err(ToolError::Msg(
                     "task: worktree isolation requires permission checks; none are active".into(),
@@ -1484,8 +1541,13 @@ editing in a known location, grepping for a literal you will act on immediately.
                 head.split_whitespace().collect::<Vec<_>>().join(" ")
             })
             .unwrap_or_default();
+        let resume_history = resumed.map(|stored| Arc::new(stored.history));
+        let resume_agent_type = agent_type.clone();
         let executor: TaskExecutor = Arc::new(move |index, prompt_text| {
             let details_sink = executor_sink.clone();
+            let resume_history = resume_history.clone();
+            let resume_store = resume_store.clone();
+            let resume_agent_type = resume_agent_type.clone();
             let task_budget = executor_budget.clone();
             let repair_budget = LiveTaskBudget::new(repair_max_cost_units);
             let child_budget = LiveTaskBudget::new(u64::MAX);
@@ -1659,16 +1721,35 @@ editing in a known location, grepping for a literal you will act on immediately.
                 };
                 // Live task/repair admission bounds every provider call, so
                 // no separate per-run token reservation is passed.
-                let result = agent
-                    .run_subagent(
-                        &execution_prompt,
-                        max_turns,
-                        event_tx.as_ref(),
-                        &config.retry,
-                        initial_usage.clone(),
-                        None,
-                    )
-                    .await;
+                let result = match resume_history {
+                    // A resumed child continues its stored conversation with
+                    // the follow-up prompt as its next user turn.
+                    Some(history) => {
+                        agent
+                            .run_subagent_with_history(
+                                &execution_prompt,
+                                history.as_ref().clone(),
+                                max_turns,
+                                event_tx.as_ref(),
+                                &config.retry,
+                                initial_usage.clone(),
+                                None,
+                            )
+                            .await
+                    }
+                    None => {
+                        agent
+                            .run_subagent(
+                                &execution_prompt,
+                                max_turns,
+                                event_tx.as_ref(),
+                                &config.retry,
+                                initial_usage.clone(),
+                                None,
+                            )
+                            .await
+                    }
+                };
                 #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
                 let mut run = result;
                 // Host-minted evidence comes from the child's actual tool
@@ -1706,6 +1787,13 @@ editing in a known location, grepping for a literal you will act on immediately.
                     run = merge_forced_continuation_run(run, retried);
                 }
 
+                // The conversation a later `resume` continues (an isolated
+                // child's worktree does not outlive it, so it is not kept).
+                let conversation = if !isolated && run.response.is_ok() {
+                    run.history.clone()
+                } else {
+                    Vec::new()
+                };
                 // Budget write-up and report repair are tool-free continuations
                 // of this child's own conversation (tool results included).
                 let continuation_agent = agent.clone();
@@ -1818,6 +1906,17 @@ editing in a known location, grepping for a literal you will act on immediately.
                         &selection.notes,
                     ),
                     _ => None,
+                };
+                let resume_id = output
+                    .is_ok()
+                    .then(|| resume_store.insert(resume_agent_type, conversation))
+                    .flatten();
+                let host_suffix = match (resume_id, host_suffix) {
+                    (Some(id), Some(evidence)) => {
+                        Some(format!("{}{evidence}", super::resume::resume_line(&id)))
+                    }
+                    (Some(id), None) => Some(super::resume::resume_line(&id)),
+                    (None, suffix) => suffix,
                 };
                 inline_sink.record(index, selection.images);
                 let output = match isolated_worktree {
@@ -5524,6 +5623,7 @@ mod tests {
         let call = TaskCallOptions {
             max_turns: Some(40),
             timeout_secs: Some(1200),
+            ..Default::default()
         };
         assert_eq!(
             run(call.clone(), Some(persona), &config).unwrap(),
@@ -5572,6 +5672,7 @@ mod tests {
         let raised = TaskCallOptions {
             max_turns: Some(400),
             timeout_secs: Some(7200),
+            ..Default::default()
         };
         assert_eq!(run(raised, None, &config).unwrap(), (400, 7200));
     }
