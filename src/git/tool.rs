@@ -166,6 +166,80 @@ pub(crate) struct GitArgs {
     /// commit: allow a commit that records no change.
     #[serde(default)]
     pub allow_empty: Option<bool>,
+    /// branches: which refs to list (default `local`; no network access).
+    #[serde(default)]
+    pub scope: Option<RefScope>,
+    /// log, blame, branches, stash_list: time budget in seconds for this call
+    /// (default 30, at most 120). Retry with a larger value after a timeout.
+    #[serde(default)]
+    pub timeout_secs: Option<u16>,
+}
+
+/// Which refs `branches` lists.
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RefScope {
+    /// `refs/heads`.
+    #[default]
+    Local,
+    /// Remote-tracking branches (`refs/remotes`); nothing is fetched.
+    Remote,
+    /// Local and remote-tracking branches.
+    All,
+    /// Tags (`refs/tags`).
+    Tags,
+}
+
+/// Default time budget of log, blame, branches and stash_list.
+const QUERY_TIMEOUT_DEFAULT_SECS: u16 = 30;
+/// Largest `timeout_secs` a call may request.
+const QUERY_TIMEOUT_MAX_SECS: u16 = 120;
+/// Most refs one `branches` call returns, and its default page size.
+const REF_PAGE_MAX: u16 = 1000;
+const REF_PAGE_DEFAULT: u16 = 100;
+
+/// Bounds for ref listings: generous output (thousands of refs), caller-chosen
+/// time budget. Output beyond the cap is reported as truncated.
+fn ref_limits(timeout: std::time::Duration) -> crate::sandbox::CommandLimits {
+    crate::sandbox::CommandLimits {
+        timeout,
+        stdout_bytes: 8 * 1024 * 1024,
+        stderr_bytes: 64 * 1024,
+        combined_bytes: 8 * 1024 * 1024 + 64 * 1024,
+    }
+}
+
+/// The per-call query deadline from `timeout_secs`.
+fn query_timeout(args: &GitArgs) -> Result<std::time::Duration, ToolError> {
+    match args.timeout_secs {
+        None => Ok(std::time::Duration::from_secs(
+            QUERY_TIMEOUT_DEFAULT_SECS.into(),
+        )),
+        Some(secs) if (1..=QUERY_TIMEOUT_MAX_SECS).contains(&secs) => {
+            Ok(std::time::Duration::from_secs(secs.into()))
+        }
+        Some(_) => Err(ToolError::Msg(format!(
+            "timeout_secs must be between 1 and {QUERY_TIMEOUT_MAX_SECS}"
+        ))),
+    }
+}
+
+fn with_timeout(
+    mut limits: crate::sandbox::CommandLimits,
+    timeout: std::time::Duration,
+) -> crate::sandbox::CommandLimits {
+    limits.timeout = timeout;
+    limits
+}
+
+/// Adds the retry guidance to a timeout error.
+fn timeout_guidance(error: ToolError) -> ToolError {
+    match error {
+        ToolError::Msg(message) if message.contains("timed out") => ToolError::Msg(format!(
+            "{message}; retry with a larger timeout_secs (at most {QUERY_TIMEOUT_MAX_SECS}) or narrow the query (revision range, paths, skip)"
+        )),
+        other => other,
+    }
 }
 
 /// Disclosure attached to commit and tag results: the tool hardens every Git
@@ -395,6 +469,47 @@ impl GitTool {
         identity: &str,
     ) -> Result<Option<String>, ToolError> {
         check_perm(&self.permission, &self.ask_tx, verb, identity).await
+    }
+
+    /// Runs a read-only query and returns every observed outcome, including a
+    /// timeout with the output captured so far. Callers decide how to report
+    /// `TimedOut`/`OutputLimitExceeded`; other failures are errors.
+    async fn run_query(
+        &self,
+        operation: &'static str,
+        args: Vec<String>,
+        limits: crate::sandbox::CommandLimits,
+    ) -> Result<CommandOutput, ToolError> {
+        let args = hardened_args(args);
+        #[cfg(test)]
+        let output = if self.test_uncontained {
+            self.runner
+                .run_observed(self.workspace.root(), operation, args, limits)
+                .await
+        } else {
+            self.runner
+                .run_contained_observed(&self.workspace, &self.sandbox, operation, args, limits)
+                .await
+        };
+        #[cfg(not(test))]
+        let output = self
+            .runner
+            .run_contained_observed(&self.workspace, &self.sandbox, operation, args, limits)
+            .await;
+        let output = output.map_err(ToolError::Msg)?;
+        match output.status {
+            CommandStatus::TimedOut | CommandStatus::OutputLimitExceeded(_) => Ok(output),
+            CommandStatus::Completed
+                if output.exit_status.is_some_and(|status| status.success())
+                    || !output.stdout.is_empty() =>
+            {
+                Ok(output)
+            }
+            _ => {
+                command_result(operation, limits, output).map_err(ToolError::Msg)?;
+                Err(ToolError::Msg(format!("git {operation} failed")))
+            }
+        }
     }
 
     async fn run_mutation(
@@ -1081,43 +1196,94 @@ impl GitTool {
     }
 
     async fn branches(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
-        reject_irrelevant_fields(&args, false, false, false)?;
+        reject_irrelevant_fields(&args, false, false, true)?;
         if !args.paths.is_empty() {
             return Err(ToolError::Msg("branches takes no paths".to_string()));
         }
-        let coaching = self.permission("git/status", "branches").await?;
+        let scope = args.scope.unwrap_or_default();
+        let timeout = query_timeout(&args)?;
+        let max = args
+            .max_count
+            .unwrap_or(REF_PAGE_DEFAULT)
+            .clamp(1, REF_PAGE_MAX) as usize;
+        let skip = args.skip.unwrap_or(0) as usize;
+        let identity = match scope {
+            RefScope::Local => "branches".to_string(),
+            RefScope::Remote => "branches remote".to_string(),
+            RefScope::All => "branches all".to_string(),
+            RefScope::Tags => "branches tags".to_string(),
+        };
+        let coaching = self.permission("git/status", &identity).await?;
+        let namespaces: &[&str] = match scope {
+            RefScope::Local => &["refs/heads"],
+            RefScope::Remote => &["refs/remotes"],
+            RefScope::All => &["refs/heads", "refs/remotes"],
+            RefScope::Tags => &["refs/tags"],
+        };
+        let mut command = vec![
+            "for-each-ref".into(),
+            // One more than the page tells whether anything follows it.
+            format!("--count={}", skip.saturating_add(max).saturating_add(1)),
+            "--format=%(HEAD)%00%(refname)%00%(objectname)%00%(upstream:short)%00%(contents:subject)%00%(objecttype)%00%(*objectname)%00%(symref)".into(),
+        ];
+        command.extend(namespaces.iter().map(|ns| (*ns).to_string()));
         let output = self
-            .run(
-                "branches",
-                vec![
-                    "for-each-ref".into(),
-                    "--format=%(HEAD)%00%(refname:short)%00%(objectname)%00%(upstream:short)%00%(contents:subject)".into(),
-                    "refs/heads".into(),
-                ],
-                QUERY_LIMITS,
-                false,
-            )
+            .run_query("branches", command, ref_limits(timeout))
             .await?;
-        let branches = String::from_utf8_lossy(&output.stdout)
+        let timed_out = output.status == CommandStatus::TimedOut;
+        let limit_hit = matches!(output.status, CommandStatus::OutputLimitExceeded(_));
+        let mut stdout: &[u8] = &output.stdout;
+        if timed_out || limit_hit {
+            // Keep only complete lines.
+            stdout = &stdout[..stdout
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |i| i + 1)];
+        }
+        let entries = String::from_utf8_lossy(stdout)
             .lines()
-            .filter_map(|line| {
-                let fields: Vec<&str> = line.split('\0').collect();
-                (fields.len() == 5).then(|| {
-                    serde_json::json!({
-                        "current": fields[0] == "*",
-                        "name": fields[1],
-                        "id": fields[2],
-                        "upstream": fields[3],
-                        "subject": fields[4],
-                    })
-                })
-            })
+            .filter_map(|line| parse_ref_line(line, scope))
             .collect::<Vec<_>>();
-        Ok(serde_json::json!({
+        let more = entries.len() > skip.saturating_add(max);
+        let page: Vec<serde_json::Value> = entries.into_iter().skip(skip).take(max).collect();
+        let truncated = more || timed_out || limit_hit;
+        let next_skip = (more || ((timed_out || limit_hit) && !page.is_empty()))
+            .then(|| (skip + page.len()) as u64);
+        let key = if scope == RefScope::Tags {
+            "tags"
+        } else {
+            "branches"
+        };
+        let mut value = serde_json::json!({
             "operation": "branches",
-            "branches": branches,
+            "scope": match scope {
+                RefScope::Local => "local",
+                RefScope::Remote => "remote",
+                RefScope::All => "all",
+                RefScope::Tags => "tags",
+            },
+            key: page,
+            "skip": skip,
+            "next_skip": next_skip,
+            "truncated": truncated,
             "coaching": coaching,
-        }))
+        });
+        if timed_out {
+            value["timed_out"] = serde_json::json!(true);
+            value["note"] = serde_json::json!(format!(
+                "git branches timed out after {}s; the refs listed so far are shown. Retry with a larger timeout_secs (at most {QUERY_TIMEOUT_MAX_SECS}) or continue with skip.",
+                timeout.as_secs()
+            ));
+        } else if limit_hit {
+            value["note"] = serde_json::json!(
+                "git branches output reached its size cap; continue with skip (next_skip)."
+            );
+        } else if more {
+            value["note"] = serde_json::json!(
+                "more refs follow; pass skip=next_skip (and optionally max_count up to 1000) to continue."
+            );
+        }
+        Ok(value)
     }
 
     async fn branch_create(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
@@ -1201,10 +1367,11 @@ impl GitTool {
                         "list".into(),
                         "--format=%gd%x00%H%x00%gs".into(),
                     ],
-                    QUERY_LIMITS,
+                    with_timeout(QUERY_LIMITS, query_timeout(&args)?),
                     false,
                 )
-                .await?;
+                .await
+                .map_err(timeout_guidance)?;
             let entries = String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .filter_map(|line| {
@@ -1394,9 +1561,33 @@ impl GitTool {
                 "revision_to and staged are supported only by diff".to_string(),
             ));
         }
-        if !is_log && (args.skip.is_some() || args.author.is_some() || args.grep.is_some()) {
+        let is_branches = args.operation == GitOperation::Branches;
+        if !(is_log || is_branches) && args.skip.is_some() {
             return Err(ToolError::Msg(
-                "skip, author and grep are supported only by log".to_string(),
+                "skip is supported only by log and branches".to_string(),
+            ));
+        }
+        if !is_log && (args.author.is_some() || args.grep.is_some()) {
+            return Err(ToolError::Msg(
+                "author and grep are supported only by log".to_string(),
+            ));
+        }
+        if !is_branches && args.scope.is_some() {
+            return Err(ToolError::Msg(
+                "scope is supported only by branches".to_string(),
+            ));
+        }
+        if args.timeout_secs.is_some()
+            && !matches!(
+                args.operation,
+                GitOperation::Log
+                    | GitOperation::Blame
+                    | GitOperation::Branches
+                    | GitOperation::StashList
+            )
+        {
+            return Err(ToolError::Msg(
+                "timeout_secs is supported only by log, blame, branches and stash_list".to_string(),
             ));
         }
         if !is_blame && (args.start_line.is_some() || args.end_line.is_some()) {
@@ -1485,6 +1676,7 @@ impl GitTool {
                 reject_irrelevant_fields(&args, false, true, true)?;
                 let paths = self.validate_paths(&args.paths, None).await?;
                 let count = args.max_count.unwrap_or(20).clamp(1, 100);
+                let timeout = query_timeout(&args)?;
                 if let Some(revision) = args.revision.as_deref() {
                     self.validate_revision_or_range(revision).await?;
                 }
@@ -1528,19 +1720,10 @@ impl GitTool {
                 }
                 command.push("--".into());
                 command.extend(paths);
-                let output = self.run("log", command, TEXT_LIMITS, true).await?;
-                let commits = parse_log_records(&output.stdout)?;
-                // A full page may have more behind it: say how to continue.
-                let next_skip = (commits.len() == usize::from(count))
-                    .then(|| u64::from(skip) + commits.len() as u64);
-                Ok(serde_json::json!({
-                    "operation": "log",
-                    "skip": skip,
-                    "next_skip": next_skip,
-                    "commits": commits,
-                    "truncated": matches!(output.status, CommandStatus::OutputLimitExceeded(_)),
-                    "coaching": coaching,
-                }))
+                let output = self
+                    .run_query("log", command, with_timeout(TEXT_LIMITS, timeout))
+                    .await?;
+                render_log_result(&output, skip, count, timeout, coaching)
             }
             GitOperation::Show => {
                 reject_irrelevant_fields(&args, false, true, false)?;
@@ -1574,6 +1757,7 @@ impl GitTool {
                 )
             }
             GitOperation::Blame => {
+                let timeout = query_timeout(&args)?;
                 reject_irrelevant_fields(&args, false, true, false)?;
                 if args.paths.len() != 1 {
                     return Err(ToolError::Msg(
@@ -1616,8 +1800,14 @@ impl GitTool {
                 render_paged_text_result(
                     "blame",
                     coaching,
-                    self.run("blame", guarded(&guard, command), PAGED_TEXT_LIMITS, true)
-                        .await?,
+                    self.run(
+                        "blame",
+                        guarded(&guard, command),
+                        with_timeout(PAGED_TEXT_LIMITS, timeout),
+                        true,
+                    )
+                    .await
+                    .map_err(timeout_guidance)?,
                     args.offset,
                 )
             }
@@ -1677,7 +1867,7 @@ impl Tool for GitTool {
     type Output = serde_json::Value;
 
     fn description(&self) -> String {
-        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; author/grep are fixed strings), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches, branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; reset, revert, cherry-pick, merge, rebase, fetch, pull and push are intentionally not offered.".to_string()
+        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; author/grep are fixed strings; a query that exceeds its 30 s budget returns the commits found so far, and log, blame, branches and stash_list accept timeout_secs up to 120), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches (scope local|remote|all|tags lists remote-tracking branches or tags without network access; page with skip/max_count and next_skip), branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; reset, revert, cherry-pick, merge, rebase, fetch, pull and push are intentionally not offered.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1700,13 +1890,15 @@ impl Tool for GitTool {
                 "revision": { "type": "string", "description": "Revision for diff, log, show, blame, branch_create (start point), tag (target) or restore (source); diff and log also accept a range a..b or a...b" },
                 "revision_to": { "type": "string", "description": "diff only: second revision, comparing revision with revision_to" },
                 "staged": { "type": "boolean", "description": "diff only: compare the index (git diff --cached) instead of the working tree" },
-                "skip": { "type": "integer", "minimum": 0, "description": "log only: commits to skip; pass the previous next_skip for the next page" },
+                "skip": { "type": "integer", "minimum": 0, "description": "log, branches: entries to skip; pass the previous next_skip for the next page" },
                 "author": { "type": "string", "maxLength": 512, "description": "log only: fixed-string author filter" },
                 "grep": { "type": "string", "maxLength": 512, "description": "log only: fixed-string message filter" },
                 "start_line": { "type": "integer", "minimum": 1, "description": "blame only: first line" },
                 "end_line": { "type": "integer", "minimum": 1, "description": "blame only: last line (default start_line)" },
                 "message": { "type": "string", "maxLength": 16384, "description": "Commit message (required for commit), stash_push message, or annotated tag message" },
-                "max_count": { "type": "integer", "minimum": 1, "maximum": 100 },
+                "max_count": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "log: commits per page (at most 100); branches: refs per page (default 100, at most 1000)" },
+                "scope": { "type": "string", "enum": ["local", "remote", "all", "tags"], "description": "branches only: local branches (default), remote-tracking branches, both, or tags; page with skip/next_skip; nothing is fetched" },
+                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 120, "description": "log, blame, branches, stash_list: time budget for this call (default 30); retry with a larger value after a timeout" },
                 "amend": { "type": "boolean", "description": "commit only: amend the HEAD commit if it is not in any remote-tracking ref (separate git/amend permission)" },
                 "signoff": { "type": "boolean", "description": "commit only: add a Signed-off-by trailer" },
                 "allow_empty": { "type": "boolean", "description": "commit only: allow a commit with no changes" }
@@ -1937,7 +2129,7 @@ fn reject_irrelevant_fields(
     }
     if !allow_max_count && args.max_count.is_some() {
         return Err(ToolError::Msg(
-            "max_count is supported only by log".to_string(),
+            "max_count is supported only by log and branches".to_string(),
         ));
     }
     Ok(())
@@ -1982,6 +2174,80 @@ fn mutation_status(
         CommandStatus::OutputLimitExceeded(_) => "output_limit_exceeded",
         CommandStatus::Failed => "failed",
     }
+}
+
+/// Renders a `log` run. A timed-out query returns the commits found so far
+/// with a continuation (`next_skip`) and a narrowing note.
+fn render_log_result(
+    output: &CommandOutput,
+    skip: u32,
+    count: u16,
+    timeout: std::time::Duration,
+    coaching: Option<String>,
+) -> Result<serde_json::Value, ToolError> {
+    let timed_out = output.status == CommandStatus::TimedOut;
+    let commits = parse_log_records(&output.stdout)?;
+    // A full page may have more behind it: say how to continue. A timed-out
+    // query always offers a continuation.
+    let next_skip = (commits.len() == usize::from(count) || (timed_out && !commits.is_empty()))
+        .then(|| u64::from(skip) + commits.len() as u64);
+    let mut value = serde_json::json!({
+        "operation": "log",
+        "skip": skip,
+        "next_skip": next_skip,
+        "commits": commits,
+        "truncated": timed_out || matches!(output.status, CommandStatus::OutputLimitExceeded(_)),
+        "coaching": coaching,
+    });
+    if timed_out {
+        value["timed_out"] = serde_json::json!(true);
+        value["note"] = serde_json::json!(format!(
+            "git log timed out after {}s; the commits found so far are shown. Narrow with a revision range, paths or skip (next_skip), or retry with a larger timeout_secs (at most {QUERY_TIMEOUT_MAX_SECS}).",
+            timeout.as_secs()
+        ));
+    }
+    Ok(value)
+}
+
+/// One `for-each-ref` line of the `branches` listing as a JSON entry.
+fn parse_ref_line(line: &str, scope: RefScope) -> Option<serde_json::Value> {
+    let fields: Vec<&str> = line.split('\0').collect();
+    if fields.len() != 8 {
+        return None;
+    }
+    let refname = fields[1];
+    let (kind, name) = if let Some(name) = refname.strip_prefix("refs/heads/") {
+        ("local", name)
+    } else if let Some(name) = refname.strip_prefix("refs/remotes/") {
+        ("remote", name)
+    } else if let Some(name) = refname.strip_prefix("refs/tags/") {
+        ("tag", name)
+    } else {
+        return None;
+    };
+    if scope == RefScope::Tags {
+        let annotated = fields[5] == "tag";
+        return Some(serde_json::json!({
+            "name": name,
+            "id": fields[2],
+            "annotated": annotated,
+            // The commit an annotated tag points at; the id itself otherwise.
+            "target": if annotated && !fields[6].is_empty() { fields[6] } else { fields[2] },
+            "subject": fields[4],
+        }));
+    }
+    let mut entry = serde_json::json!({
+        "current": fields[0] == "*",
+        "name": name,
+        "kind": kind,
+        "id": fields[2],
+        "upstream": fields[3],
+        "subject": fields[4],
+    });
+    if !fields[7].is_empty() {
+        entry["symref"] = serde_json::json!(fields[7]);
+    }
+    Some(entry)
 }
 
 /// Split `git status --porcelain=v2 -z` output into entries. A rename/copy
@@ -3270,6 +3536,182 @@ mod tests {
         repo.write(path, contents);
         repo.git(["add", "--", path]);
         repo.git(["commit", "--quiet", "-m", message]);
+    }
+
+    fn branches_args(scope: super::RefScope, skip: Option<u32>, max: Option<u16>) -> GitArgs {
+        GitArgs {
+            operation: GitOperation::Branches,
+            scope: Some(scope),
+            skip,
+            max_count: max,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn branches_lists_remote_tracking_refs_and_tags_without_network() {
+        use super::RefScope;
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        repo.git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        repo.git(["update-ref", "refs/remotes/origin/topic", "HEAD"]);
+        repo.git([
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        repo.git(["tag", "v1-light"]);
+        repo.git(["tag", "-a", "v2-annotated", "-m", "release two"]);
+        let tool = repo.tool();
+        let names = |value: &serde_json::Value, key: &str| -> Vec<String> {
+            value[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let local = tool
+            .call(branches_args(RefScope::Local, None, None))
+            .await
+            .unwrap();
+        assert!(
+            !names(&local, "branches")
+                .iter()
+                .any(|n| n.starts_with("origin/")),
+            "{local}"
+        );
+        let remote = tool
+            .call(branches_args(RefScope::Remote, None, None))
+            .await
+            .unwrap();
+        let remote_names = names(&remote, "branches");
+        assert!(
+            remote_names.contains(&"origin/main".to_string()),
+            "{remote}"
+        );
+        assert!(
+            remote_names.contains(&"origin/topic".to_string()),
+            "{remote}"
+        );
+        let head = remote["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["name"] == "origin/HEAD")
+            .unwrap();
+        assert_eq!(head["symref"], "refs/remotes/origin/main", "{remote}");
+        assert_eq!(head["kind"], "remote");
+        let all = tool
+            .call(branches_args(RefScope::All, None, None))
+            .await
+            .unwrap();
+        let all_names = names(&all, "branches");
+        assert!(
+            all_names.contains(&"origin/main".to_string()) && all_names.len() > remote_names.len(),
+            "{all}"
+        );
+        let tags = tool
+            .call(branches_args(RefScope::Tags, None, None))
+            .await
+            .unwrap();
+        let listed = tags["tags"].as_array().unwrap();
+        assert_eq!(listed.len(), 2, "{tags}");
+        let light = listed.iter().find(|t| t["name"] == "v1-light").unwrap();
+        let annotated = listed.iter().find(|t| t["name"] == "v2-annotated").unwrap();
+        assert_eq!(light["annotated"], false);
+        assert_eq!(annotated["annotated"], true);
+        let head_id = repo.git(["rev-parse", "HEAD"]).trim().to_string();
+        assert_eq!(annotated["target"], head_id.as_str(), "{tags}");
+        assert_eq!(annotated["subject"], "release two");
+        assert_eq!(tags["truncated"], false);
+        // Scope and timeout belong to specific operations.
+        let bad = GitArgs {
+            operation: GitOperation::Status,
+            scope: Some(RefScope::Tags),
+            ..Default::default()
+        };
+        assert!(tool.call(bad).await.is_err());
+        let bad = GitArgs {
+            operation: GitOperation::Status,
+            timeout_secs: Some(60),
+            ..Default::default()
+        };
+        assert!(tool.call(bad).await.is_err());
+        let bad = GitArgs {
+            operation: GitOperation::Log,
+            timeout_secs: Some(500),
+            ..Default::default()
+        };
+        assert!(tool.call(bad).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn branches_pages_through_thousands_of_refs() {
+        use super::RefScope;
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        let id = repo.git(["rev-parse", "HEAD"]).trim().to_string();
+        let mut packed = String::from("# pack-refs with: peeled fully-peeled sorted \n");
+        for i in 0..3000 {
+            packed.push_str(&format!("{id} refs/heads/bulk/b{i:05}\n"));
+        }
+        std::fs::write(repo.path().join(".git/packed-refs"), packed).unwrap();
+        let tool = repo.tool();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut skip = 0u32;
+        let mut pages = 0;
+        loop {
+            let page = tool
+                .call(branches_args(RefScope::Local, Some(skip), Some(1000)))
+                .await
+                .unwrap();
+            pages += 1;
+            for entry in page["branches"].as_array().unwrap() {
+                assert!(seen.insert(entry["name"].as_str().unwrap().to_string()));
+            }
+            if page["truncated"] == false {
+                assert!(page["next_skip"].is_null(), "{page}");
+                break;
+            }
+            assert!(page["note"].as_str().unwrap().contains("skip"), "{page}");
+            skip = page["next_skip"].as_u64().unwrap() as u32;
+            assert!(pages < 10);
+        }
+        // 3000 bulk branches plus the current one.
+        assert_eq!(seen.len(), 3001);
+        assert_eq!(pages, 4);
+    }
+
+    #[test]
+    fn timed_out_log_returns_partial_commits_with_a_continuation() {
+        let record = |n: u32| {
+            format!(
+                "{n:040x}\0\0A\0a@example.invalid\02026-01-01T00:00:00+00:00\0subject {n}\x1e\n"
+            )
+        };
+        let mut stdout = record(1).into_bytes();
+        stdout.extend_from_slice(record(2).as_bytes());
+        stdout.extend_from_slice(b"0000000000000000000000000000000000000003\0par");
+        let output = crate::sandbox::CommandOutput {
+            exit_status: None,
+            stdout,
+            stderr: vec![],
+            status: crate::sandbox::CommandStatus::TimedOut,
+            descendants_escaped: false,
+        };
+        let value =
+            super::render_log_result(&output, 10, 20, std::time::Duration::from_secs(30), None)
+                .unwrap();
+        assert_eq!(value["commits"].as_array().unwrap().len(), 2, "{value}");
+        assert_eq!(value["timed_out"], true);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["next_skip"], 12);
+        let note = value["note"].as_str().unwrap();
+        assert!(
+            note.contains("timed out") && note.contains("timeout_secs"),
+            "{note}"
+        );
     }
 
     #[tokio::test]

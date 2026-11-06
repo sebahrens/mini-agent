@@ -746,11 +746,18 @@ The model-facing `git` tool (`src/git/tool.rs`) runs fixed, hardened Git argv
 inside the workspace-service sandbox, where refs, `HEAD`, objects and the index
 are writable but `.git` config, hooks, info and modules stay protected. Besides
 `status`, `diff`, `log`, `show`, `stage`, `unstage` and `commit` it offers
-`branches` (list), `branch_create` (`name`, optional start `revision`), `switch`
+`branches` (local branches by default; `scope` `remote`, `all` or `tags` lists
+remote-tracking branches or tags from the local ref database without any network
+access, paged with `skip`/`max_count` up to 1000 and `next_skip`, with a
+`truncated` flag), `branch_create` (`name`, optional start `revision`), `switch`
 (existing local branch `name`), `stash_push` (optional `message` and `paths`),
 `stash_pop`, `stash_list`, `tag` (`name`, optional `revision`; `message` makes it
 annotated) and `restore` (discard working-tree changes of `paths`, from the
-index or a `revision`). Each mutation has its own permission key
+index or a `revision`). `status` attaches the origin path of a rename/copy record
+to that record (`\torig: <path>`) and counts it as one entry. `log`, `blame`,
+`branches` and `stash_list` run with a 30 s budget; a call may pass
+`timeout_secs` (1-120) to retry larger, and a timed-out `log` returns the commits
+found so far with `timed_out`, `next_skip` and a narrowing note. Each mutation has its own permission key
 (`git/branch`, `git/switch`, `git/stash`, `git/tag`, `git/restore`; restore and
 stash paths additionally need `write`); listing reuses `git/status`. Names are
 validated with `git check-ref-format`; stashes and annotated tags receive the
