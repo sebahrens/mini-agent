@@ -7282,11 +7282,13 @@ mod protocol_tests {
         let mut output = String::new();
         futures::executor::block_on(wide.read_to_string(&mut output)).unwrap();
         assert_eq!(output.len(), two_images.len());
-        assert!(
-            MAX_ACP_FRAME_BYTES
-                >= crate::session::user::MAX_USER_ENCODED_BYTES
-                    + crate::session::user::MAX_USER_TEXT_BYTES
-        );
+        const {
+            assert!(
+                MAX_ACP_FRAME_BYTES
+                    >= crate::session::user::MAX_USER_ENCODED_BYTES
+                        + crate::session::user::MAX_USER_TEXT_BYTES
+            );
+        }
 
         let input = format!("{}\n{}\n", "a".repeat(32), "b".repeat(32));
         let mut bounded = BoundedLineReader::new(futures::io::Cursor::new(input.clone()), 32);
