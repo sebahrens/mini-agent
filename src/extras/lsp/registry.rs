@@ -19,6 +19,7 @@ fn server(command: &str, args: &[&str], extensions: &[&str]) -> LspServerConfig 
         network: Default::default(),
         initialization: None,
         disabled: false,
+        wait_ms: None,
     }
 }
 

@@ -2208,23 +2208,28 @@ async fn edit_wait_shortens_after_a_missed_publish_and_recovers_after_a_late_one
     }
     let uri = crate::extras::lsp::client::file_uri(&file).unwrap();
 
-    // First edit: the server never publishes, so the full window elapses.
+    // First edit: the server never publishes, so the full window elapses and
+    // the timeout is reported instead of looking like a clean file.
     let started = Instant::now();
+    let timed_out = manager
+        .diagnostics_block_for_edit(&file, Some(0))
+        .await
+        .unwrap();
     assert!(
-        manager
-            .diagnostics_block_for_edit(&file, Some(0))
-            .await
-            .is_none()
+        timed_out.contains("no diagnostics received within 1000 ms"),
+        "{timed_out}"
     );
     assert!(started.elapsed() >= Duration::from_millis(900));
 
     // Later edits do not repeat the full second of waiting.
     let started = Instant::now();
+    let shortened = manager
+        .diagnostics_block_for_edit(&file, Some(0))
+        .await
+        .unwrap();
     assert!(
-        manager
-            .diagnostics_block_for_edit(&file, Some(0))
-            .await
-            .is_none()
+        shortened.contains("no diagnostics received within 50 ms"),
+        "{shortened}"
     );
     assert!(
         started.elapsed() < Duration::from_millis(150),
@@ -2239,6 +2244,18 @@ async fn edit_wait_shortens_after_a_missed_publish_and_recovers_after_a_late_one
     let started = Instant::now();
     let _ = manager.diagnostics_block_for_edit(&file, Some(1)).await;
     assert!(started.elapsed() >= Duration::from_millis(900));
+}
+
+#[test]
+fn edit_wait_defaults_to_one_second_and_is_clamped() {
+    let mut cfg = LspServerConfig::default();
+    assert_eq!(cfg.edit_wait(), Duration::from_millis(1000));
+    cfg.wait_ms = Some(5000);
+    assert_eq!(cfg.edit_wait(), Duration::from_millis(5000));
+    cfg.wait_ms = Some(u64::MAX);
+    assert_eq!(cfg.edit_wait(), Duration::from_secs(60));
+    let parsed: LspServerConfig = toml::from_str("command = \"x\"\nwait_ms = 2500").unwrap();
+    assert_eq!(parsed.edit_wait(), Duration::from_millis(2500));
 }
 
 #[test]

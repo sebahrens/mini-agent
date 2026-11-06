@@ -3690,6 +3690,7 @@ extensions = [".my"]
 # network = "deny"           # requires a sandbox that enforces denial
 # initialization = { ... }   # server-specific initializationOptions
 # disabled = false           # true removes a same-named built-in
+# wait_ms = 1000             # post-edit diagnostics wait (default 1000, max 60000)
 ```
 
 ### YAML
@@ -3746,6 +3747,17 @@ Behavior notes:
   diagnostics", never a failed edit.
 - Post-edit diagnostics are capped (errors first, ~20 lines); nothing is
   appended when the file is clean.
+- After an edit or write, the tool waits up to the server's `wait_ms`
+  (default 1000 ms, clamped to 60000 ms) for the `publishDiagnostics` that
+  answers the synchronized version. Slow checkers (rust-analyzer flycheck,
+  tsserver on large projects, a cold pyright) usually need a larger value,
+  e.g. `wait_ms = 10000` for `[lsp.servers.rust]`; the wait ends as soon as
+  the publish arrives. When the window elapses without a publish the result
+  says so explicitly (`LSP (<server>): no diagnostics received within N ms;
+  ...`), so a timeout is never mistaken for a clean file. After such a miss
+  later edits on that server wait only 50 ms until the server is seen
+  publishing again (including late, after a wait gave up); the full window is
+  re-probed at most 30 s after the last full-window miss.
 - The client advertises `textDocument/didSave` support. A server that
   registers for it in its `initialize` result (`textDocumentSync.save`)
   receives `didSave` right after each synchronized `didOpen`/`didChange`

@@ -357,6 +357,7 @@ impl FixtureBuild {
             network: LspNetwork::Inherit,
             initialization: None,
             disabled: false,
+            wait_ms: None,
         }
     }
 
@@ -1251,6 +1252,43 @@ async fn lsp_process_did_save_delivers_save_only_diagnostics_to_edit_results() {
     assert!(
         !quiet_exists,
         "didSave sent to a server that did not register"
+    );
+}
+
+#[tokio::test]
+async fn lsp_process_configured_wait_admits_slow_publish_and_timeout_is_reported() {
+    let fixture = FixtureBuild::compile("slow-publish");
+    // Publishes 3 s after each sync: beyond the 1 s default, within 5 s.
+    let (written, _) = write_then_edit_with_fixture(&fixture, "delayed-diagnostics", |server| {
+        server
+            .env
+            .insert("LSP_FIXTURE_PUBLISH_DELAY_MS".into(), "3000".into());
+        server.wait_ms = Some(5000);
+    })
+    .await;
+    let workspace = fixture.workspace("workspace");
+    fs::remove_file(workspace.join("delayed-diagnostics.rs")).unwrap();
+    let (timed_out, _) = write_then_edit_with_fixture(&fixture, "delayed-diagnostics", |server| {
+        server
+            .env
+            .insert("LSP_FIXTURE_PUBLISH_DELAY_MS".into(), "1500".into());
+        server.wait_ms = Some(200);
+    })
+    .await;
+    fixture.cleanup().await;
+    let written = written.unwrap();
+    assert!(
+        written.contains("fixture delayed diagnostic version 1"),
+        "{written}"
+    );
+    let timed_out = timed_out.unwrap();
+    assert!(
+        timed_out.contains("LSP (fixture): no diagnostics received within 200 ms"),
+        "{timed_out}"
+    );
+    assert!(
+        !timed_out.contains("fixture delayed diagnostic"),
+        "{timed_out}"
     );
 }
 

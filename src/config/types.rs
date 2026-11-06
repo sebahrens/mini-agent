@@ -857,6 +857,26 @@ pub struct LspServerConfig {
     /// Server-specific `initializationOptions` sent during `initialize`.
     pub initialization: Option<serde_json::Value>,
     pub disabled: bool,
+    /// Milliseconds an edit/write waits for this server's post-edit
+    /// `publishDiagnostics`. Absent selects
+    /// [`LspServerConfig::DEFAULT_WAIT_MS`]; values are clamped to
+    /// [`LspServerConfig::MAX_WAIT_MS`].
+    pub wait_ms: Option<u64>,
+}
+
+#[cfg(feature = "lsp")]
+impl LspServerConfig {
+    pub const DEFAULT_WAIT_MS: u64 = 1_000;
+    pub const MAX_WAIT_MS: u64 = 60_000;
+
+    /// The effective post-edit diagnostics wait.
+    pub fn edit_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.wait_ms
+                .unwrap_or(Self::DEFAULT_WAIT_MS)
+                .min(Self::MAX_WAIT_MS),
+        )
+    }
 }
 
 #[cfg(feature = "lsp")]

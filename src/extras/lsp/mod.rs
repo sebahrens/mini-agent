@@ -25,15 +25,18 @@ use tokio::sync::Notify;
 use crate::config::types::LspConfig;
 use client::{DiagStore, LspClient};
 
-/// How long to wait for the `publishDiagnostics` that follows an edit before
-/// falling back to whatever is already stored. Kept short so clean edits
-/// stay fast; servers that don't republish identical diagnostics just time
-/// out and reuse the previous (identical) set.
-const DIAG_WAIT: Duration = Duration::from_millis(1000);
+// The full post-edit wait for the `publishDiagnostics` that follows an edit
+// is per server: `[lsp.servers.<name>] wait_ms`, default
+// `LspServerConfig::DEFAULT_WAIT_MS` (1000 ms). Kept short by default so clean
+// edits stay fast; slow checkers (rust-analyzer flycheck, tsserver on large
+// projects) should raise it.
 /// Wait used after a server missed its publish window: long enough to notice a
 /// server that republishes promptly again, short enough that a server which
 /// never republishes (indexing, identical-diagnostics dedupe) costs ~nothing.
 const DIAG_WAIT_AFTER_MISS: Duration = Duration::from_millis(50);
+/// After a miss, the full window is retried once this much time has passed,
+/// so a server that was only slow while indexing is not shortened forever.
+const DIAG_REPROBE_AFTER: Duration = Duration::from_secs(30);
 const SERVER_RETRY_BASE: Duration = Duration::from_secs(1);
 const SERVER_RETRY_MAX: Duration = Duration::from_secs(60);
 const SERVER_FAILURE_COUNT_MAX: u32 = 7;
@@ -129,6 +132,8 @@ struct PublishWaitState {
     /// Cache uri and publish counter at that miss; a later counter increase
     /// means the server published after we stopped waiting.
     missed_at: Option<(String, u64)>,
+    /// When the last full-window wait missed; drives the periodic re-probe.
+    full_miss_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -805,9 +810,8 @@ impl LspManager {
         path: &Path,
         baseline: Option<u64>,
     ) -> Option<String> {
-        let server = registry::server_for_path(&self.inner.servers, path)?
-            .0
-            .clone();
+        let (server, full_wait) = registry::server_for_path(&self.inner.servers, path)
+            .map(|(name, cfg)| (name.clone(), cfg.edit_wait()))?;
         let uri = client::file_uri(path)?;
         let missed = {
             let mut waits = self
@@ -826,11 +830,14 @@ impl LspManager {
                 *state = PublishWaitState::default();
             }
             state.missed
+                && state
+                    .full_miss_at
+                    .is_some_and(|at| at.elapsed() < DIAG_REPROBE_AFTER)
         };
         let wait = if missed {
-            DIAG_WAIT_AFTER_MISS
+            DIAG_WAIT_AFTER_MISS.min(full_wait)
         } else {
-            DIAG_WAIT
+            full_wait
         };
         let (output, published) = self
             .diagnostics_block_wait(uri.clone(), wait, baseline)
@@ -840,11 +847,14 @@ impl LspManager {
             .publish_waits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = waits.entry(server).or_default();
+        let state = waits.entry(server.clone()).or_default();
         if published {
             *state = PublishWaitState::default();
         } else {
             state.missed = true;
+            if !missed {
+                state.full_miss_at = Some(Instant::now());
+            }
             let version = self
                 .inner
                 .diags
@@ -853,6 +863,17 @@ impl LspManager {
                 .get(&uri)
                 .map_or(0, |diagnostics| diagnostics.version);
             state.missed_at = Some((uri, version));
+            if baseline.is_none() {
+                // Nothing was synchronized, so no publish was owed.
+                return output;
+            }
+            // Without this marker a timeout is indistinguishable from a
+            // clean file.
+            let notice = diagnostics_timeout_notice(&server, wait);
+            return Some(match output {
+                Some(block) => format!("{block}{notice}"),
+                None => notice,
+            });
         }
         output
     }
@@ -1325,6 +1346,16 @@ fn diagnostic_identity_is_current(uri: &str, file: &client::FileDiags) -> bool {
         && file
             .content
             .is_none_or(|content| content.matches_file(approved.handle()).unwrap_or(false))
+}
+
+/// Appended when an edit's diagnostics wait elapsed without a publish.
+fn diagnostics_timeout_notice(server: &str, wait: Duration) -> String {
+    format!(
+        "\n\nLSP ({server}): no diagnostics received within {} ms; the file's \
+         status is unknown (the server may still be checking). Call \
+         lsp_diagnostics for this file to re-check.",
+        wait.as_millis()
+    )
 }
 
 /// "LSP diagnostics (server):" header + one line per error/warning, capped.

@@ -61,6 +61,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   servers that register for it (`textDocumentSync.save`, with text only for `includeText`), so
   save-triggered checkers such as rust-analyzer's `cargo check` can report compiler errors in the
   edit result. Servers that do not register never receive it (mini-agent-ehqci).
+- The post-edit LSP diagnostics wait is configurable per server (`[lsp.servers.<name>] wait_ms`,
+  default 1000, max 60000). A wait that elapses without a publish now appends
+  `LSP (<server>): no diagnostics received within N ms` instead of looking like a clean file, and
+  the shortened 50 ms wait used after a miss re-probes the full window after 30 s
+  (mini-agent-zoq2d).
 
 ### Added
 
