@@ -1850,6 +1850,46 @@ fn session_retention_prunes_only_stale_unowned_sessions() {
     drop(env);
 }
 
+// mini-agent-5gfko: headless and ACP startup also apply retention, but only
+// when `session_retention_days` is set and the run persists sessions.
+#[test]
+fn noninteractive_housekeeping_prunes_only_when_retention_is_set_and_persisting() {
+    let env = setup_test_env();
+    let stale = Session::new("openai", "gpt-4", 128_000, "stale");
+    save_session(&stale).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(crate::session::storage::session_path(&stale.id).unwrap())
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400))
+        .unwrap();
+    crate::session::lock::release_session(&stale.id);
+
+    let unset = crate::config::Config::default();
+    assert!(crate::startup::spawn_noninteractive_housekeeping(&unset, false).is_none());
+    let zero = crate::config::Config {
+        session_retention_days: Some(0),
+        ..Default::default()
+    };
+    assert!(crate::startup::spawn_noninteractive_housekeeping(&zero, false).is_none());
+    let set = crate::config::Config {
+        session_retention_days: Some(30),
+        ..Default::default()
+    };
+    assert!(
+        crate::startup::spawn_noninteractive_housekeeping(&set, true).is_none(),
+        "--no-session runs never touch stored sessions"
+    );
+    assert!(load_session_exact(&stale.id).unwrap().is_some());
+
+    crate::startup::spawn_noninteractive_housekeeping(&set, false)
+        .expect("retention set")
+        .join()
+        .unwrap();
+    assert!(load_session_exact(&stale.id).unwrap().is_none());
+    drop(env);
+}
+
 // mini-agent-923of: deleting or retention-pruning a session removes its private
 // tool-output directory; an orphan sweep removes idle directories that match no
 // saved session and never follows a symlink.

@@ -1438,6 +1438,12 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
     {
         tracing::warn!("{warning}");
     }
+    // Retention applies to IDE sessions too (mini-agent-5gfko); best effort in
+    // the background, only when `session_retention_days` is set.
+    drop(crate::startup::spawn_noninteractive_housekeeping(
+        &cfg,
+        cli.no_session,
+    ));
     // Keep direct callers fail-closed too. The normal binary path has already
     // validated in `Startup::init`, before provider/client construction.
     let (authority, _) = crate::permission::resolve_configured_execution_authority(&cli, &cfg)?;
