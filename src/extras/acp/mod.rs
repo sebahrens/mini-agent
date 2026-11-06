@@ -549,7 +549,11 @@ impl SessionHistory {
 
 fn acp_capabilities() -> AgentCapabilities {
     AgentCapabilities::new()
-        .prompt_capabilities(PromptCapabilities::new().image(cfg!(feature = "multimodal")))
+        .prompt_capabilities(
+            PromptCapabilities::new()
+                .image(cfg!(feature = "multimodal"))
+                .embedded_context(true),
+        )
         .load_session(true)
         .session_capabilities(
             SessionCapabilities::new()
@@ -6724,6 +6728,23 @@ mod protocol_tests {
         // An import that fails before insertion releases both identity and slot.
         drop(leases.reserve(extra.clone()).unwrap());
         assert!(leases.reserve(extra).is_ok());
+    }
+
+    #[test]
+    fn capabilities_advertise_embedded_text_context_only() {
+        let capabilities = acp_capabilities().prompt_capabilities;
+        assert!(capabilities.embedded_context);
+        assert!(!capabilities.audio);
+        // Binary embedded resources stay refused by the prompt renderer.
+        assert!(
+            render_prompt_blocks(&[ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::BlobResourceContents(BlobResourceContents::new(
+                    "AAAA",
+                    "file:///w/a.bin"
+                ))
+            ))])
+            .is_err()
+        );
     }
 
     #[test]
