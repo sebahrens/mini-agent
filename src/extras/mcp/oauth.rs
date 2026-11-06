@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use rmcp::transport::auth::{
     AuthClient, AuthError, AuthorizationManager, AuthorizationSession, CredentialStore,
-    StoredCredentials,
+    OAuthClientConfig, StoredCredentials,
 };
 
 use super::config::OAuthSettings;
@@ -1361,6 +1361,15 @@ pub(crate) async fn build_auth_client(
     if !restored {
         anyhow::bail!("no OAuth token stored; run `/mcp login {server_name}`");
     }
+    // Restoring knows only the stored client id; a confidential pre-registered
+    // client also needs its secret to refresh the token.
+    if settings.client_id.is_some()
+        && let Some(secret) = client_secret_from_env(server_name)
+    {
+        manager
+            .configure_client(pre_registered_config(settings, Some(&secret))?)
+            .map_err(|e| anyhow::anyhow!("OAuth client setup failed: {e}"))?;
+    }
 
     Ok(AuthClient::new(transport_client, manager))
 }
@@ -1397,6 +1406,91 @@ async fn authorization_manager_bound(
     manager.map_err(|e| anyhow::anyhow!("OAuth init failed: {e}"))
 }
 
+/// Environment variable holding the client secret of a pre-registered
+/// confidential client: `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>`, with the
+/// server name upper-cased and every other character replaced by `_`. The
+/// secret is never read from configuration files, so a project config cannot
+/// name an arbitrary variable to be sent to its authorization server.
+pub(crate) fn client_secret_env_name(server_name: &str) -> String {
+    let suffix: String = server_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_{suffix}")
+}
+
+fn client_secret_from_env(server_name: &str) -> Option<String> {
+    std::env::var(client_secret_env_name(server_name))
+        .ok()
+        .filter(|secret| !secret.is_empty())
+}
+
+/// The client configuration for a pre-registered `oauth.client_id`. Without a
+/// secret this is a public client (PKCE only).
+fn pre_registered_config(
+    settings: &OAuthSettings,
+    secret: Option<&str>,
+) -> anyhow::Result<OAuthClientConfig> {
+    let client_id = settings
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "oauth.client_id must be a non-empty client id of at most 512 characters without control characters"
+            )
+        })?;
+    let mut config = OAuthClientConfig::new(client_id, settings.redirect_uri());
+    config.scopes = settings.scopes.clone();
+    if let Some(secret) = secret {
+        config = config.with_client_secret(secret);
+    }
+    Ok(config)
+}
+
+/// Build the authorization session. With `oauth.client_id` the pre-registered
+/// client is configured directly and no registration request is made (so
+/// servers without dynamic registration work); otherwise the client registers
+/// dynamically, and a server that offers no registration says how to proceed.
+async fn authorization_session(
+    mut manager: AuthorizationManager,
+    settings: &OAuthSettings,
+    client_secret: Option<&str>,
+    has_registration: bool,
+    scopes: &[&str],
+    redirect_uri: &str,
+) -> anyhow::Result<AuthorizationSession> {
+    if settings.client_id.is_some() {
+        let config = pre_registered_config(settings, client_secret)?;
+        manager
+            .configure_client(config)
+            .map_err(|e| anyhow::anyhow!("OAuth client setup failed: {e}"))?;
+        let auth_url = manager
+            .get_authorization_url(scopes)
+            .await
+            .map_err(|e| anyhow::anyhow!("OAuth authorization setup failed: {e}"))?;
+        return Ok(AuthorizationSession::for_scope_upgrade(
+            manager,
+            auth_url,
+            redirect_uri,
+        ));
+    }
+    anyhow::ensure!(
+        has_registration,
+        "the authorization server offers no dynamic client registration; register {CLIENT_NAME} with it and set `oauth.client_id` (for a confidential client also set the client secret in the environment variable named by the server, see MCP OAuth in CONFIG.md)"
+    );
+    AuthorizationSession::new(manager, scopes, redirect_uri, Some(CLIENT_NAME), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("OAuth authorization setup failed: {e}"))
+}
+
 /// Result of starting an interactive login: the URL to open and the live session.
 pub struct LoginSession {
     pub auth_url: String,
@@ -1428,15 +1522,21 @@ pub(crate) async fn begin_login_bound(
         .discover_metadata()
         .await
         .map_err(|e| anyhow::anyhow!("OAuth metadata discovery failed: {e}"))?;
+    let has_registration = metadata.registration_endpoint.is_some();
     manager.set_metadata(metadata);
 
     let redirect_uri = settings.redirect_uri();
     let scope_refs: Vec<&str> = settings.scopes.iter().map(|s| s.as_str()).collect();
 
-    let session =
-        AuthorizationSession::new(manager, &scope_refs, &redirect_uri, Some(CLIENT_NAME), None)
-            .await
-            .map_err(|e| anyhow::anyhow!("OAuth authorization setup failed: {e}"))?;
+    let session = authorization_session(
+        manager,
+        settings,
+        client_secret_from_env(server_name).as_deref(),
+        has_registration,
+        &scope_refs,
+        &redirect_uri,
+    )
+    .await?;
 
     anyhow::ensure!(source(), "MCP OAuth source changed");
     let auth_url = session.get_authorization_url().to_string();
@@ -2105,5 +2205,156 @@ mod product_identity_tests {
         let error = super::read_request_line(&mut accepted).unwrap_err();
         assert!(error.to_string().contains("exceeds"), "{error}");
         drop(client.join().unwrap());
+    }
+
+    #[tokio::test]
+    async fn pre_registered_client_logs_in_without_a_registration_endpoint() {
+        use rmcp::transport::auth::{AuthorizationManager, AuthorizationMetadata};
+        use std::io::Read as _;
+        // Mock token endpoint: records the request, returns a token.
+        let token_server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let token_port = token_server.local_addr().unwrap().port();
+        let recorded = std::thread::spawn(move || {
+            let (mut stream, _) = token_server.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                request.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let body = r#"{"access_token":"at","token_type":"Bearer","expires_in":3600}"#;
+            stream
+                .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())
+                .unwrap();
+            String::from_utf8_lossy(&request).to_string()
+        });
+        let mut metadata: AuthorizationMetadata = serde_json::from_value(serde_json::json!({
+            "authorization_endpoint": "http://127.0.0.1:1/authorize",
+            "token_endpoint": format!("http://127.0.0.1:{token_port}/token"),
+            "code_challenge_methods_supported": ["S256"]
+        }))
+        .unwrap();
+        assert!(metadata.registration_endpoint.is_none());
+        let settings = super::OAuthSettings {
+            client_id: Some("pre-registered-id".into()),
+            scopes: vec!["read".into()],
+            ..Default::default()
+        };
+        let mut manager = AuthorizationManager::new("http://127.0.0.1:9/mcp")
+            .await
+            .unwrap();
+        manager.set_metadata(std::mem::take(&mut metadata));
+        let session = super::authorization_session(
+            manager,
+            &settings,
+            Some("s3cret"),
+            false,
+            &["read"],
+            &settings.redirect_uri(),
+        )
+        .await
+        .expect("login setup needs no registration endpoint");
+        let url = reqwest::Url::parse(&session.auth_url).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(pairs["client_id"], "pre-registered-id");
+        assert_eq!(pairs["code_challenge_method"], "S256");
+        session
+            .handle_callback("the-code", &pairs["state"])
+            .await
+            .expect("token exchange with the pre-registered client");
+        let request = recorded.join().unwrap();
+        assert!(
+            request.contains("grant_type=authorization_code"),
+            "{request}"
+        );
+        assert!(request.contains("code=the-code"), "{request}");
+        // The confidential client authenticates (Basic or body), the id is sent.
+        // base64("pre-registered-id:s3cret")
+        assert!(
+            request.contains("authorization: Basic cHJlLXJlZ2lzdGVyZWQtaWQ6czNjcmV0"),
+            "{request}"
+        );
+        assert!(!session.auth_url.contains("s3cret"));
+        assert!(
+            super::OAuthSettings::default().client_id.is_none(),
+            "default stays dynamic registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_client_id_or_registration_endpoint_login_fails_with_guidance() {
+        use rmcp::transport::auth::AuthorizationManager;
+        let manager = AuthorizationManager::new("http://127.0.0.1:9/mcp")
+            .await
+            .unwrap();
+        let settings = super::OAuthSettings::default();
+        let error = super::authorization_session(
+            manager,
+            &settings,
+            None,
+            false,
+            &[],
+            "http://127.0.0.1:1/callback",
+        )
+        .await
+        .err()
+        .expect("no way to obtain a client id")
+        .to_string();
+        assert!(
+            error.contains("oauth.client_id") && error.contains("dynamic client registration"),
+            "{error}"
+        );
+        // A blank or hostile client id is rejected with the rule.
+        for bad in ["", "  ", "a\nb", &"x".repeat(600)] {
+            let settings = super::OAuthSettings {
+                client_id: Some(bad.to_string()),
+                ..Default::default()
+            };
+            let error = super::pre_registered_config(&settings, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("oauth.client_id must be"), "{error}");
+        }
+    }
+
+    #[test]
+    fn client_secret_comes_only_from_a_server_derived_environment_name() {
+        assert_eq!(
+            super::client_secret_env_name("my-server.v2"),
+            "MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_MY_SERVER_V2"
+        );
+        let settings = super::OAuthSettings {
+            client_id: Some("id".into()),
+            ..Default::default()
+        };
+        assert!(
+            super::pre_registered_config(&settings, None)
+                .unwrap()
+                .client_secret
+                .is_none()
+        );
+        // The settings type has no secret field, so config files cannot carry one.
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(!json.contains("secret"), "{json}");
     }
 }

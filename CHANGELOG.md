@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- MCP `oauth.client_id` now works: login uses the pre-registered client without dynamic registration
+  (public client by default; a confidential client reads its secret from
+  `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>`), and a server without registration and without a
+  client id fails with guidance (mini-agent-sgg3v).
 - The `instructions` from each MCP server's `initialize` result are added to the system prompt as
   bounded (2 KiB per server, 8 KiB total), fenced untrusted text with a truncation notice
   (mini-agent-l6u7o).

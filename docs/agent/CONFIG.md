@@ -2930,9 +2930,18 @@ OAuth fields (all optional):
 | Field           | Default                        | Description                                                              |
 | --------------- | ------------------------------ | ------------------------------------------------------------------------ |
 | `scopes`        | none                           | Scopes to request during authorization.                                  |
-| `client_id`     | dynamic registration           | Pre-registered client id. When omitted, the client registers on the fly. |
+| `client_id`     | dynamic registration           | Pre-registered client id. When set, login configures that client directly and sends no registration request, so servers without dynamic registration work; with no secret it is a public client (PKCE). When omitted, the client registers on the fly, and a server that offers no registration fails with a message naming this key. |
 | `redirect_host` | `"127.0.0.1"`                  | Exact host spelling registered for the callback; only `"127.0.0.1"` or `"localhost"`. The listener always binds IPv4 loopback. |
 | `redirect_port` | `8970`                         | Loopback port for the redirect URI `http://<redirect_host>:<port>/callback`. |
+
+A confidential pre-registered client takes its secret only from the environment
+variable `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>` (server name upper-cased,
+every character other than a letter or digit replaced by `_`; for example
+`my-server` reads `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_MY_SERVER`). It is read at
+login and when a stored token is restored, sent to the token endpoint
+(`client_secret_basic`), and never written to configuration or the credential
+file. There is deliberately no config key for it, so a project config cannot
+point at another variable. It is ignored without `client_id`.
 
 The first time you connect, run `/mcp login <server>` inside the TUI. mini-agent
 prints an authorization URL, attempts to open it in the desktop browser, and
