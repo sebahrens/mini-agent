@@ -12,6 +12,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   advertises `fs.readTextFile`/`fs.writeTextFile`, `read`, `edit` and overwrite `write` use the
   editor's live text and publish through it, still behind the workspace and permission checks
   (mini-agent-oapz6).
+- Headless/CLI: opt-in `--include-partial-messages` (`text_delta`/`reasoning_delta` stream-json
+  events) and `--stream-json-control` (interrupt, tool permission answers and mode narrowing over
+  stdin); Ctrl+Z suspends the TUI on Unix; `mini-agent update` verifies build provenance with
+  `gh attestation verify`, honours `HTTPS_PROXY`, needs `--allow-downgrade` for older releases, and
+  the update notice follows the install channel (mini-agent-skgg9, -zml6o, -x6nc9, -w7046, -17mth,
+  -nfj5h, -t5ybs, -gwx1b, -e3bor).
 ### Security
 
 - `read` of a PDF parses in linear time and within node, font and ToUnicode-entry budgets, with a
