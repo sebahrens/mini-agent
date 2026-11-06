@@ -234,6 +234,21 @@ fn main() {
                 let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
                 writeln!(file, "{body}").unwrap();
             }
+            if mode.starts_with("flood-") {
+                let uri = body.split_once("\"uri\":").unwrap().1.split('"').nth(1).unwrap();
+                let version: i64 = body.split_once("\"version\":").unwrap().1
+                    .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+                let count: usize = mode["flood-".len()..].parse().unwrap();
+                // Warnings first, one error last: a correct cap keeps the error.
+                let items: Vec<String> = (0..count).map(|i| {
+                    let severity = if i + 1 == count { 1 } else { 2 };
+                    format!("{{\"range\":{{\"start\":{{\"line\":{i},\"character\":0}},\"end\":{{\"line\":{i},\"character\":1}}}},\"severity\":{severity},\"message\":\"flood item {i} version {version}\"}}")
+                }).collect();
+                write_frame(&mut stdout, &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{uri}\",\"version\":{version},\"diagnostics\":[{}]}}}}",
+                    items.join(",")
+                ));
+            }
             if mode == "save-diagnostics" || mode == "delayed-diagnostics" {
                 let uri = body.split_once("\"uri\":").unwrap().1.split('"').nth(1).unwrap();
                 let version: i64 = body.split_once("\"version\":").unwrap().1
@@ -1300,6 +1315,37 @@ async fn lsp_process_did_save_delivers_save_only_diagnostics_to_edit_results() {
         !quiet_exists,
         "didSave sent to a server that did not register"
     );
+}
+
+#[tokio::test]
+async fn lsp_process_oversized_publish_is_truncated_and_keeps_server_alive() {
+    let fixture = FixtureBuild::compile("flood-publish");
+    for (count, omitted) in [(51_usize, 1_usize), (500, 450)] {
+        let mode = format!("flood-{count}");
+        let (written, edited) = write_then_edit_with_fixture(&fixture, &mode, |server| {
+            server.wait_ms = Some(10_000);
+        })
+        .await;
+        // Both the first publish (write) and the second (edit) must arrive:
+        // the second proves the same server connection survived the first.
+        let written = written.unwrap();
+        let edited = edited.unwrap();
+        for (label, output, version) in [("write", &written, 1), ("edit", &edited, 2)] {
+            assert!(
+                output.contains(&format!("flood item {} version {version}", count - 1)),
+                "{count}/{label}: the error must survive the cap: {output}"
+            );
+            assert!(
+                output.contains(&format!("{omitted} more diagnostics not shown")),
+                "{count}/{label}: {output}"
+            );
+            assert!(
+                !output.contains("timed out") && !output.contains("no diagnostics received"),
+                "{count}/{label}: {output}"
+            );
+        }
+    }
+    fixture.cleanup().await;
 }
 
 #[tokio::test]

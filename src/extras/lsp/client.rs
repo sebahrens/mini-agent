@@ -237,6 +237,10 @@ const STDERR_LIMIT: usize = 64 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIAGNOSTIC_FILES_PER_SERVER: usize = 128;
 pub(crate) const MAX_DIAGNOSTICS_PER_FILE: usize = 50;
+/// Abuse ceiling for one publish. Larger lists are still data to truncate to
+/// [`MAX_DIAGNOSTICS_PER_FILE`], but a frame claiming more than this many
+/// entries is treated as a protocol violation and closes the transport.
+const MAX_DIAGNOSTICS_PER_PUBLISH: usize = 10_000;
 const MAX_DIAGNOSTIC_URI_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1024;
 const LSP_WORKSPACE_FD: i32 = 198;
@@ -304,6 +308,9 @@ pub struct FileDiags {
     /// wait for the publish that follows their `didChange`.
     pub version: u64,
     pub diagnostics: Vec<lsp_types::Diagnostic>,
+    /// Diagnostics the server published beyond [`MAX_DIAGNOSTICS_PER_FILE`]
+    /// (lowest severity dropped first). Surfaced as "N more not shown".
+    pub omitted: usize,
     /// Identity and text digest from synchronization. Reads reject replaced
     /// files, symlinks and same-inode content changes.
     pub identity: Option<crate::fs::CheckedMetadata>,
@@ -1641,7 +1648,7 @@ fn validate_diagnostic_envelope(workspace_uri: &str, params: &Value) -> Diagnost
     let Some(diagnostics) = params.get("diagnostics").and_then(Value::as_array) else {
         return DiagnosticStoreOutcome::LimitExceeded;
     };
-    if diagnostics.len() > MAX_DIAGNOSTICS_PER_FILE {
+    if diagnostics.len() > MAX_DIAGNOSTICS_PER_PUBLISH {
         return DiagnosticStoreOutcome::LimitExceeded;
     }
     DiagnosticStoreOutcome::Stored
@@ -1748,7 +1755,7 @@ pub(crate) fn commit_diagnostics(
     identity: Option<crate::fs::CheckedMetadata>,
     content: Option<crate::fs::ContentDigest>,
 ) -> bool {
-    let diagnostics = sanitize_diagnostics(diagnostics);
+    let (diagnostics, omitted) = sanitize_diagnostics(diagnostics);
     let cached_bytes = retained_diagnostic_bytes(&uri, server, &diagnostics);
     let mut store = diags.lock().unwrap();
     if !store.contains_key(&uri)
@@ -1784,6 +1791,7 @@ pub(crate) fn commit_diagnostics(
         }
         entry.version = entry.version.saturating_add(1);
         entry.diagnostics.clear();
+        entry.omitted = 0;
         entry.identity = identity;
         entry.content = content;
         entry.cached_bytes = tombstone_bytes;
@@ -1793,6 +1801,7 @@ pub(crate) fn commit_diagnostics(
         server: server.to_string(),
         version: 0,
         diagnostics: Vec::new(),
+        omitted: 0,
         identity: None,
         content: None,
         cached_bytes: 0,
@@ -1801,14 +1810,23 @@ pub(crate) fn commit_diagnostics(
     entry.server.push_str(server);
     entry.version = entry.version.saturating_add(1);
     entry.diagnostics = diagnostics;
+    entry.omitted = omitted;
     entry.identity = identity;
     entry.content = content;
     entry.cached_bytes = cached_bytes;
     true
 }
 
-fn sanitize_diagnostics(diagnostics: Vec<lsp_types::Diagnostic>) -> Vec<lsp_types::Diagnostic> {
-    diagnostics
+/// Keep the [`MAX_DIAGNOSTICS_PER_FILE`] most severe diagnostics (errors
+/// first, stable within a severity) and report how many were dropped.
+fn sanitize_diagnostics(
+    mut diagnostics: Vec<lsp_types::Diagnostic>,
+) -> (Vec<lsp_types::Diagnostic>, usize) {
+    let omitted = diagnostics.len().saturating_sub(MAX_DIAGNOSTICS_PER_FILE);
+    if omitted > 0 {
+        diagnostics.sort_by_key(|diagnostic| diagnostic.severity);
+    }
+    let kept = diagnostics
         .into_iter()
         .take(MAX_DIAGNOSTICS_PER_FILE)
         .map(|diagnostic| lsp_types::Diagnostic {
@@ -1817,7 +1835,8 @@ fn sanitize_diagnostics(diagnostics: Vec<lsp_types::Diagnostic>) -> Vec<lsp_type
             message: truncate_utf8_bytes(&diagnostic.message, MAX_DIAGNOSTIC_MESSAGE_BYTES),
             ..Default::default()
         })
-        .collect()
+        .collect();
+    (kept, omitted)
 }
 
 fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
