@@ -829,7 +829,8 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
         .add_hook(crate::agent::runner::ToolLoopGuard)
         .add_hook(ChildContextGuard {
             window: context_window,
-        });
+        })
+        .add_hook(crate::extras::subagents::image_cost::ChildImageCeiling::default());
     builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
         uuid::Uuid::new_v4().to_string(),
         None,

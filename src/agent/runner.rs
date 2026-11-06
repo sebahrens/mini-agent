@@ -1973,6 +1973,9 @@ struct CacheEntry {
     hash: u64,
     wide: u64,
     narrow: u64,
+    /// Patch-formula tokens of the message's images, whose base64 payload is
+    /// excluded from `narrow`.
+    image_tokens: u64,
 }
 
 /// Memoized character counts of the request shell. The tool `Arc`s are held so
@@ -2096,8 +2099,10 @@ fn shell_char_counts(
     Some((wide, narrow))
 }
 
-/// Exactly `Session::estimate_tokens(&serde_json::to_string(request))`,
-/// serializing only the history messages not seen on an earlier call.
+/// Exactly `Session::estimate_tokens(&serde_json::to_string(request))` for an
+/// image-free request, serializing only the history messages not seen on an
+/// earlier call. Literal image payloads are charged by the patch-formula token
+/// estimate instead of their base64 length (mini-agent-kj8mn).
 #[cfg(feature = "subagents")]
 pub(crate) fn incremental_request_estimate(
     ctx: &rig::agent::HookContext,
@@ -2128,19 +2133,24 @@ pub(crate) fn incremental_request_estimate(
     for message in request.chat_history.iter().skip(keep) {
         let json = serde_json::to_string(message).ok()?;
         let (message_wide, message_narrow) = crate::session::Session::char_counts(&json);
+        let images = crate::extras::subagents::image_cost::message_image_cost(message);
         measured.push(CacheEntry {
             hash: serde_fingerprint(message)?,
             wide: message_wide,
-            narrow: message_narrow,
+            narrow: message_narrow.saturating_sub(images.encoded_chars),
+            image_tokens: images.tokens,
         });
     }
+    let mut image_tokens = 0u64;
     for entry in measured.iter() {
         wide += entry.wide;
         narrow += entry.narrow;
+        image_tokens = image_tokens.saturating_add(entry.image_tokens);
     }
-    Some(crate::session::Session::estimate_tokens_from_counts(
-        wide, narrow,
-    ))
+    Some(
+        crate::session::Session::estimate_tokens_from_counts(wide, narrow)
+            .saturating_add(image_tokens),
+    )
 }
 
 #[cfg(feature = "subagents")]
@@ -5579,15 +5589,19 @@ where
     .await
 }
 
-/// Messages of text in a tool result, in bytes.
+/// Payload bytes of a tool result: text plus literal (base64) image data, so
+/// an image-only result is not logged as zero bytes.
 #[cfg(feature = "subagents")]
-fn tool_result_text_bytes(result: &rig::message::ToolResult) -> u64 {
+fn tool_result_payload_bytes(result: &rig::message::ToolResult) -> u64 {
     result
         .content
         .iter()
         .map(|content| match content {
             ToolResultContent::Text(text) => text.text.len() as u64,
-            _ => 0,
+            ToolResultContent::Image(image) => match &image.data {
+                rig::message::DocumentSourceKind::Base64(data) => data.len() as u64,
+                _ => 0,
+            },
         })
         .sum()
 }
@@ -5712,7 +5726,7 @@ where
                     .remove(&internal_call_id)
                     .and_then(|row| tool_log.get_mut(row))
                 {
-                    entry.result_bytes = Some(tool_result_text_bytes(&tool_result));
+                    entry.result_bytes = Some(tool_result_payload_bytes(&tool_result));
                     if failed {
                         let text = tool_result
                             .content

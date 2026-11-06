@@ -575,7 +575,8 @@ If that turn yields nothing, the child's narration is returned under the same
 header. Both continuations are charged to the repair allocation.
 
 Each child also records a bounded tool log (tool name, truncated arguments,
-result size, error; at most 24 rows per child, extra calls only counted).
+result size including base64 image bytes, error; at most 24 rows per child,
+extra calls only counted).
 `/tasks <id>` shows it for background tasks (stored with the task result and
 persisted with the session) and for the eight most recent foreground calls
 (in memory, listed by `/tasks`). When the host replaces a child's text with a
@@ -1057,7 +1058,11 @@ share. This prevents concurrent children from each spending the full aggregate
 budget before the scheduler observes their usage. A provider response can
 report usage beyond its reservation because usage arrives after that response;
 such an overrun stops the call immediately and is charged only to the reserved
-share in the bounded aggregate report.
+share in the bounded aggregate report. Images a child reads are charged too: through
+provider-reported usage, or, when a route omits usage, through the local
+estimate's patch-formula image charge. A child's history admits at most 4 MiB
+of encoded image data; see [IMAGE_READ.md](IMAGE_READ.md) for the formula and
+the omission behaviour.
 
 The first child failure stops new launches and cancels in-flight siblings.
 Aggregate output exhaustion, aggregate cost exhaustion, and the whole-call

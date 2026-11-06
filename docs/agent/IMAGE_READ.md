@@ -74,6 +74,19 @@ retains accepted accounting and refuses unsafe replay through the existing
 native failure path. Canonical save validates image rows before artifact
 creation and refuses an oversized snapshot.
 
+Subagent children account for images separately from text. Provider-reported
+usage, which already includes image tokens, remains authoritative for
+`task_max_cost_units`. When a provider omits usage, and for the child context
+guard, the local request estimate charges each literal image by Claude's patch
+formula `ceil(w/28) * ceil(h/28)` from its header dimensions (capped at 4,784
+tokens, the high-resolution tier) instead of its base64 length; an image whose
+header cannot be read is charged at four pixels per decoded byte under the
+same formula and cap, and an image reference without bytes at the cap. A child
+also admits at most 4 MiB of encoded image data into its history in total, the
+same aggregate as the native capture ceiling: a later image result past that
+ceiling keeps its text summary and replaces its image with an omission notice.
+The implementation is `src/extras/subagents/image_cost.rs`.
+
 Provider references: [Anthropic tool results](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls),
 [OpenAI function outputs](https://developers.openai.com/api/reference/resources/responses/methods/create),
 [OpenAI image inputs](https://developers.openai.com/api/docs/guides/images-vision),
