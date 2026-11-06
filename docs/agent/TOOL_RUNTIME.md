@@ -316,9 +316,15 @@ once. Every registered tool shares a fair reader/writer lane: `read`, `grep`,
 read-only tools use shared access. `job_status` chooses per call: `poll`,
 `wait` and `list` only read the session job registry and share the lane, so a
 60-second wait does not stall parallel reads; `stop` and malformed arguments
-take exclusive access. Mutating tools (`write`, `edit`, `shell`,
-`git`, `js`, `task`, and state writers), MCP tools, and unknown extension tools
-use exclusive access. Consequently independent reads overlap, results remain
+take exclusive access. `git` shares the lane for `status`, `diff`, `log`,
+`show`, `branches` and `stash_list` only; `task` shares it for the default
+read-only explorer (no `agent_type`, `resume`, `isolation` or `base_ref`), so
+several such calls in one message overlap; `lsp_navigate`, `list_mcp_resources`,
+`read_mcp_resource` and `task_evidence` always share. An MCP tool shares the
+lane only when its server sets `parallel_read_only = true` and the tool
+advertises `readOnlyHint: true`. Other mutating tools (`write`, `edit`,
+`shell`, `js`, and state writers), all other MCP tools, and unknown extension
+tools use exclusive access. Consequently independent reads overlap, results remain
 in the model's original call order, mutations remain serialized, and reads do
 not observe a concurrent mutation. Tool hooks are inside the same lane so a
 guard-rail command cannot race another tool operation.

@@ -186,6 +186,12 @@ pub struct McpServerOptions {
     /// Server tool names never registered. Applied after `enabled_tools`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_tools: Vec<String>,
+    /// Opt in to running this server's tools that advertise
+    /// `readOnlyHint: true` on the shared (parallel) tool lane. Off by
+    /// default: a server's hint is its own claim, so by default every MCP tool
+    /// takes the exclusive lane.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parallel_read_only: bool,
 }
 
 fn clamp_timeout(secs: u64) -> std::time::Duration {
@@ -351,6 +357,23 @@ fn is_false(value: &bool) -> bool {
 mod options_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn parallel_read_only_is_default_closed_and_opt_in() {
+        let plain: McpServerConfig =
+            serde_json::from_value(serde_json::json!({"command": "server"})).unwrap();
+        assert!(!plain.options().parallel_read_only);
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("parallel_read_only")
+        );
+        let opted: McpServerConfig = serde_json::from_value(
+            serde_json::json!({"url": "https://mcp.example/mcp", "parallel_read_only": true}),
+        )
+        .unwrap();
+        assert!(opted.options().parallel_read_only);
+    }
 
     #[test]
     fn mcp_server_options_deserialize_flattened_and_clamp() {
