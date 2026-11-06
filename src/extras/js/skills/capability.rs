@@ -542,9 +542,14 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
             "paths": paths,
             "truncated": truncated,
         }),
-        EffectResult::Grep { matches, truncated } => serde_json::json!({
+        EffectResult::Grep {
+            matches,
+            truncated,
+            skipped,
+        } => serde_json::json!({
             "matches": matches,
             "truncated": truncated,
+            "skipped": skipped,
         }),
         EffectResult::WriteFile => serde_json::Value::Null,
         EffectResult::Fetch { status, body } => {

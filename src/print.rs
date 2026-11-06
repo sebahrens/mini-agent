@@ -2218,7 +2218,12 @@ pub(crate) fn print_sessions(
 fn sandbox_network_entry(cfg: &config::Config) -> (&'static str, String) {
     (
         "sandbox-network",
-        cfg.sandbox_network.unwrap_or_default().to_string(),
+        match cfg.sandbox_network.unwrap_or_default() {
+            crate::sandbox::SandboxNetwork::Allowlist => {
+                format!("allowlist [{}]", cfg.sandbox_network_hosts.join(", "))
+            }
+            other => other.to_string(),
+        },
     )
 }
 
@@ -2301,6 +2306,12 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         cfg.sandbox_home_masks.clone(),
     )
     .with_network(cfg.sandbox_network.unwrap_or_default())
+    .with_network_hosts(cfg.sandbox_network_hosts.clone())
+    .with_shell_env(cfg.shell_env_policy())
+    .with_max_background_jobs(
+        cfg.shell_max_background_jobs
+            .unwrap_or(crate::sandbox::DEFAULT_MAX_BACKGROUND_JOBS),
+    )
     .with_shell(&shell)
     .with_windows_appcontainer_roots(
         cli.resolve_windows_appcontainer_read_roots(cfg),
@@ -2453,6 +2464,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
             ("sandbox", sandbox.to_string()),
             sandbox_profile_entry(cli, cfg),
             sandbox_network_entry(cfg),
+            ("shell-env", cfg.shell_env_policy().summary()),
             ("no-tools", no_tools.to_string()),
             ("tools", tools_allowlist),
             ("no-context-files", no_context_files.to_string()),

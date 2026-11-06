@@ -253,8 +253,26 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .described("HOME-relative dot paths hidden in every sandbox profile, added to the built-in masks")
         .shaped(ConfigShape::Strings),
     aliased("sandbox-network", &["sandbox_network"])
-        .described("Network access for contained shell commands: deny (default) or allow. Project layers need trust.")
+        .described("Network access for contained shell commands: deny (default), allow, or allowlist (filtering proxy, hosts from sandbox-network-hosts). Project layers need trust.")
         .shaped(ConfigShape::Enum(crate::sandbox::SandboxNetwork::NAMES)),
+    aliased("shell-inherit-env", &["shell_inherit_env"])
+        .described("Parent-process variable names (or * globs) passed to contained shell commands in addition to the fixed allowlist. Credential-looking names are refused. Project layers need trust.")
+        .shaped(ConfigShape::Strings),
+    aliased("shell-env", &["shell_env"])
+        .described("Literal environment variables set for contained shell commands. Project layers need trust.")
+        .shaped(ConfigShape::StringMap),
+    aliased("shell-max-background-jobs", &["shell_max_background_jobs"])
+        .described("Running background shell jobs allowed at once (1..=64, default 8). A full table makes auto_background calls run in the foreground.")
+        .shaped(ConfigShape::Integer),
+    aliased("shell-allow-escalation", &["shell_allow_escalation"])
+        .described("Offer the shell escalate parameter: retry one sandbox-blocked command without the sandbox after interactive approval. Default false; ignored under sandbox-required. Project layers need trust.")
+        .shaped(ConfigShape::Bool),
+    aliased("shell-env-allow-secrets", &["shell_env_allow_secrets"])
+        .described("Global-only: permit credential-looking names (GH_TOKEN, *_API_KEY) in shell-inherit-env and shell-env.")
+        .shaped(ConfigShape::Bool),
+    aliased("sandbox-network-hosts", &["sandbox_network_hosts"])
+        .described("Hosts shell commands may reach when sandbox-network = allowlist (example.com, *.example.com, optional :port). Other hosts prompt. Project layers need trust.")
+        .shaped(ConfigShape::Strings),
     aliased(
         "windows-appcontainer-read-roots",
         &["windows_appcontainer_read_roots"],

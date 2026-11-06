@@ -61,7 +61,27 @@ exit code, log footer) and the job record is dropped; if it reaches the
 deadline it is not killed but returned as `[status: promoted_to_background;
 job_id: ...]` with the output so far, and keeps running as an ordinary
 background job whose next `job_status` poll continues after that output. If the
-call is interrupted before either happens, the job is stopped.
+call is interrupted before either happens, the job is stopped. At most
+`shell-max-background-jobs` (default 8, maximum 64) jobs run at once; when the
+table is full an explicit `background = true` call fails naming the key, while
+an `auto_background` call simply runs as an ordinary foreground command.
+
+`job_status action=input` refuses C0 control bytes other than tab, LF and CR
+(Ctrl-U, backspace, ESC, DEL, ...) and judges each chunk together with the
+unterminated line typed so far, so permission rules see the command the
+terminal will run.
+
+Shell commands start from a cleared environment plus a fixed allowlist.
+`shell-inherit-env` / `shell-env` add named variables (never credential-looking
+names unless the global-only `shell-env-allow-secrets` is set, never loader
+hooks such as `LD_PRELOAD`). With `shell-allow-escalation = true` the `shell`
+schema gains `escalate` and `justification`: one command may then run without
+the sandbox after a fresh interactive approval in every mode (deny rules still
+win, nothing is remembered, headless runs refuse, the use is logged to the
+`mini_agent::audit::sandbox_escalation` target). `sandbox-network = "allowlist"`
+routes contained shell traffic through a loopback filtering proxy
+(`src/sandbox/net_proxy.rs`) limited to `sandbox-network-hosts` plus prompted
+hosts, on Seatbelt. See CONFIG.md for the rules.
 
 | Command class | Deadline |
 |---------------|----------|

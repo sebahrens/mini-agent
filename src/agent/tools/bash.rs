@@ -251,7 +251,13 @@ pub struct ShellTool {
     /// `shell_auto_background`: promote a foreground command that reaches
     /// its deadline to a background job instead of killing it.
     auto_background: bool,
+    /// `shell-allow-escalation`: offer the per-call `escalate` parameter.
+    /// Default closed.
+    allow_escalation: bool,
 }
+
+/// Longest `justification` shown in the escalation approval.
+const MAX_ESCALATION_JUSTIFICATION_CHARS: usize = 400;
 
 impl ShellTool {
     pub fn new(
@@ -270,7 +276,15 @@ impl ShellTool {
             ),
             output_log_dir: None,
             auto_background: false,
+            allow_escalation: false,
         }
+    }
+
+    /// Offer the `escalate` parameter (`shell-allow-escalation`, never when
+    /// `sandbox-required`). Each use still needs interactive approval.
+    pub fn with_escalation(mut self, enabled: bool) -> Self {
+        self.allow_escalation = enabled;
+        self
     }
 
     /// Default for the per-call `auto_background` flag.
@@ -320,6 +334,11 @@ impl Tool for ShellTool {
                 alias.display()
             ));
         }
+        if self.allow_escalation {
+            description.push_str(
+                " If the sandbox blocks a command that must run (network, a write outside the workspace), retry that one command with escalate=true and a justification: the user is asked to approve it every time, and only that command runs without the sandbox.",
+            );
+        }
         description
     }
 
@@ -329,7 +348,7 @@ impl Tool for ShellTool {
             .shell_capability()
             .map(|capability| capability.dialect().name())
             .unwrap_or("configured shell");
-        serde_json::json!({
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": format!("{dialect} command to execute") },
@@ -357,7 +376,27 @@ impl Tool for ShellTool {
                 }
             },
             "required": ["command"]
-        })
+        });
+        if self.allow_escalation
+            && let Some(properties) = schema["properties"].as_object_mut()
+        {
+            properties.insert(
+                "escalate".into(),
+                serde_json::json!({
+                    "type": "boolean",
+                    "description": "Run this single command WITHOUT the sandbox after the user approves it interactively (default false). Use only after a sandboxed attempt failed because of the sandbox; requires justification."
+                }),
+            );
+            properties.insert(
+                "justification".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "maxLength": MAX_ESCALATION_JUSTIFICATION_CHARS,
+                    "description": "Only with escalate=true: why the command must leave the sandbox, shown to the user in the approval prompt."
+                }),
+            );
+        }
+        schema
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
@@ -380,10 +419,88 @@ impl Tool for ShellTool {
 }
 
 impl ShellTool {
+    /// `escalate = true`: validate, judge deny rules, require a fresh
+    /// interactive approval, audit, then run this one command on a clone whose
+    /// sandbox is off (environment still cleared). The clone shares the job
+    /// table, so background jobs stay visible to `job_status`.
+    async fn execute_escalated(
+        &self,
+        mut args: BashArgs,
+    ) -> Result<(String, Option<ForegroundResult>), ToolError> {
+        if !self.allow_escalation {
+            return Err(ToolError::Msg(
+                "sandbox escalation is disabled: shell-allow-escalation is off (or sandbox-required is set)"
+                    .into(),
+            ));
+        }
+        if !self.sandbox.containment_requested() {
+            return Err(ToolError::Msg(
+                "escalate is unnecessary: the sandbox is already off for this session".into(),
+            ));
+        }
+        let justification = args.justification.take().unwrap_or_default();
+        let justification = justification.trim();
+        if justification.is_empty()
+            || justification.chars().count() > MAX_ESCALATION_JUSTIFICATION_CHARS
+        {
+            return Err(ToolError::Msg(format!(
+                "escalate=true requires a justification of 1 to {MAX_ESCALATION_JUSTIFICATION_CHARS} characters explaining why the command must leave the sandbox"
+            )));
+        }
+        // Deny rules still win; allow rules and modes cannot waive the prompt.
+        if let Some(permission) = &self.permission {
+            let (result, _) = permission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .check_diagnosed(|guard| guard.check("shell", &args.command));
+            if let crate::permission::checker::CheckResult::Denied(reason) = result {
+                return Err(ToolError::Msg(format!("Permission denied: {reason}")));
+            }
+        }
+        let (approval, _released) = super::concurrency::prompt_unlocked(
+            super::request_sandbox_escalation_approval(&self.ask_tx, &args.command, justification),
+        )
+        .await;
+        approval?;
+        tracing::warn!(
+            target: "mini_agent::audit::sandbox_escalation",
+            command = %args.command,
+            justification,
+            background = args.background,
+            "user approved running a shell command without the sandbox"
+        );
+        let mut escalated = Sandbox::clone(&self.sandbox);
+        escalated.disable_for_escalation();
+        let tool = ShellTool {
+            permission: None,
+            ask_tx: None,
+            sandbox: escalated,
+            max_output_lines: self.max_output_lines,
+            foreground_timeout: self.foreground_timeout,
+            output_log_dir: self.output_log_dir.clone(),
+            auto_background: self.auto_background,
+            allow_escalation: false,
+        };
+        args.escalate = false;
+        let (text, metadata) = Box::pin(tool.execute(args)).await?;
+        Ok((
+            format!("[sandbox escalated: ran without the sandbox after user approval]\n{text}"),
+            metadata,
+        ))
+    }
+
     async fn execute(
         &self,
         args: BashArgs,
     ) -> Result<(String, Option<ForegroundResult>), ToolError> {
+        if args.escalate || args.justification.is_some() {
+            if !args.escalate {
+                return Err(ToolError::Msg(
+                    "justification is only valid with escalate=true".into(),
+                ));
+            }
+            return self.execute_escalated(args).await;
+        }
         tracing::debug!(
             "tool shell start: cmd_len={}, timeout={:?}, background={}",
             args.command.len(),
@@ -466,14 +583,17 @@ impl ShellTool {
             limits.timeout = std::time::Duration::from_millis(timeout_ms);
         }
         if args.auto_background.unwrap_or(self.auto_background) {
-            let result = self.run_auto_background(&args, limits.timeout).await?;
-            return Ok((
-                match coaching {
-                    Some(message) => format!("{message}\n\n{result}"),
-                    None => result,
-                },
-                None,
-            ));
+            // A full job table must not fail an ordinary short command: run it
+            // in the foreground (without promotion at the deadline) instead.
+            if let Some(result) = self.run_auto_background(&args, limits.timeout).await? {
+                return Ok((
+                    match coaching {
+                        Some(message) => format!("{message}\n\n{result}"),
+                        None => result,
+                    },
+                    None,
+                ));
+            }
         }
         // Retention never stops the child; only this ceiling does.
         limits.combined_bytes = usize::try_from(SHELL_HARD_OUTPUT_BYTES).unwrap_or(usize::MAX);
@@ -608,9 +728,9 @@ impl ShellTool {
         &self,
         args: &BashArgs,
         deadline: std::time::Duration,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Option<String>, ToolError> {
         let progress = CommandProgress::new();
-        let id = self
+        let id = match self
             .sandbox
             .start_background_command_logged(
                 args.command.clone(),
@@ -620,7 +740,12 @@ impl ShellTool {
                 args.separate_streams,
                 Some(progress.clone()),
             )
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(error) if error.kind() == std::io::ErrorKind::QuotaExceeded => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let mut pending = PendingAutoJob {
             sandbox: &self.sandbox,
             id: id.clone(),
@@ -657,9 +782,9 @@ impl ShellTool {
                 .map_err(ToolError::Msg)?;
             let rendered = render_background_job(so_far, self.max_output_lines);
             let deadline_ms = deadline.as_millis();
-            return Ok(format!(
+            return Ok(Some(format!(
                 "[status: promoted_to_background; job_id: {id}; the command reached its {deadline_ms} ms foreground deadline and keeps running as a background job. Use job_status with this id to poll (only new output), wait or stop it]\n{rendered}"
-            ));
+            )));
         }
         let transcript = snapshot.transcript.clone();
         self.sandbox.forget_background_job(&id);
@@ -702,7 +827,7 @@ impl ShellTool {
         }
         let mut result = bound_output_lines(result, self.max_output_lines);
         push_log_footer(&mut result, &transcript);
-        Ok(result)
+        Ok(Some(result))
     }
 }
 
@@ -751,6 +876,20 @@ pub struct JobStatusTool {
     max_output_lines: Option<u64>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    /// Per job, the typed text of the line not yet ended by Enter. Permission
+    /// is judged on this plus the next chunk, so a command split across calls
+    /// is seen whole.
+    pending_input: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+/// The first byte `job_status` input may not carry: C0 controls other than
+/// tab, LF and CR, and DEL. The terminal's line discipline and readline act
+/// on them (kill line, erase, signal), so the typed text would no longer be
+/// the command that was judged.
+fn disallowed_input_control(input: &str) -> Option<char> {
+    input
+        .chars()
+        .find(|c| (c.is_control() && !matches!(c, '\n' | '\r' | '\t')) || *c == '\u{7f}')
 }
 
 impl JobStatusTool {
@@ -760,6 +899,7 @@ impl JobStatusTool {
             max_output_lines,
             permission: None,
             ask_tx: None,
+            pending_input: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -798,6 +938,8 @@ impl JobStatusTool {
     }
 }
 
+/// Longest unterminated typed line remembered for permission judging.
+const MAX_PENDING_INPUT_LINE_BYTES: usize = 16 * 1024;
 /// Output must be silent this long after typed input before the result is
 /// returned.
 const INPUT_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
@@ -832,7 +974,7 @@ impl Tool for JobStatusTool {
                 "input": {
                     "type": "string",
                     "maxLength": 16384,
-                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
+                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command, together with any unterminated line already typed. C0 control characters other than tab, newline and carriage return (Ctrl-U, Ctrl-C, backspace, ESC, DEL) are refused. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -900,7 +1042,13 @@ impl Tool for JobStatusTool {
         ))?;
         match args.action {
             JobAction::Poll => self.sandbox.background_job_snapshot(id).map(drop),
-            JobAction::Stop => self.sandbox.stop_background_job(id).await.map(drop),
+            JobAction::Stop => {
+                self.pending_input
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(id);
+                self.sandbox.stop_background_job(id).await.map(drop)
+            }
             JobAction::Wait => self
                 .sandbox
                 .wait_background_job(
@@ -911,6 +1059,12 @@ impl Tool for JobStatusTool {
                 .map(drop),
             JobAction::Input => {
                 let input = args.input.as_deref().unwrap_or_default();
+                if let Some(control) = disallowed_input_control(input) {
+                    return Err(ToolError::Msg(format!(
+                        "job_status input contains the control character U+{:04X}, which the terminal would interpret (erase, kill-line, signal, escape) instead of typing it, so the command could differ from what was permission-checked. Send plain text with \\n only; stop the job to interrupt it.",
+                        control as u32
+                    )));
+                }
                 // Typed text can run anything the terminal's program accepts,
                 // so it is judged exactly like a shell script: deny rules
                 // apply, and manual mode prompts. Unknown or finished jobs are
@@ -919,13 +1073,33 @@ impl Tool for JobStatusTool {
                     .background_job_input_handle(id, input.len())
                     .map(drop)
                     .map_err(ToolError::Msg)?;
+                // The line being typed spans calls: judge it with the unterminated
+                // text already sent, so `to` then `uch x\n` is `touch x`.
+                let pending = self
+                    .pending_input
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default();
+                let combined = format!("{pending}{input}");
+                let tail = combined
+                    .rsplit(['\n', '\r'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if tail.len() > MAX_PENDING_INPUT_LINE_BYTES {
+                    return Err(ToolError::Msg(
+                        "job_status input: the unterminated line is too long; end it with \\n".into(),
+                    ));
+                }
                 let (checked, _released) = super::concurrency::prompt_unlocked(check_perm(
                     &self.permission,
                     &self.ask_tx,
                     "shell",
                     // Typing Enter is not part of the command text a rule
                     // would name.
-                    input.trim_end_matches(['\n', '\r']),
+                    combined.trim_end_matches(['\n', '\r']),
                 ))
                 .await;
                 checked?;
@@ -935,6 +1109,10 @@ impl Tool for JobStatusTool {
                     .await
                 {
                     Ok(()) => {
+                        self.pending_input
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert(id.to_string(), tail);
                         // Give the program time to echo and answer.
                         self.settle_after_input(id).await;
                         Ok(())
@@ -2557,6 +2735,73 @@ mod tests {
         job_input(&status, &id, "exit\n").await.unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_input_refuses_control_bytes_and_judges_split_lines_whole() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        let dir = std::env::current_dir().unwrap();
+        let kill = dir.join(format!("job-input-kill-{}", std::process::id()));
+        let split = dir.join(format!("job-input-split-{}", std::process::id()));
+        let _ = std::fs::remove_file(&kill);
+        let _ = std::fs::remove_file(&split);
+        let shell = test_tool();
+        let id = start_pty_job(&shell, "sh").await;
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("touch *".to_string(), Action::Deny),
+                        ("*".to_string(), Action::Allow),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Yolo,
+        );
+        let status =
+            JobStatusTool::new(shell.sandbox.clone(), None).with_permission(Some(permission), None);
+        // `ls` + Ctrl-U + `touch ...` is judged as one allowed word without the guard.
+        for byte in [
+            "\u{15}", "\u{8}", "\u{7f}", "\u{17}", "\u{3}", "\u{4}", "\u{1b}",
+        ] {
+            let error = job_input(
+                &status,
+                &id,
+                &format!(
+                    "ls{byte}touch {}\n",
+                    kill.file_name().unwrap().to_string_lossy()
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("control character"), "{error}");
+        }
+        // The deny still holds when the command is split over two calls.
+        job_input(&status, &id, "to").await.unwrap();
+        let error = job_input(
+            &status,
+            &id,
+            &format!("uch {}\n", split.file_name().unwrap().to_string_lossy()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("denied"),
+            "{error}"
+        );
+        job_input(&status, &id, "echo alive\n").await.unwrap();
+        assert!(!kill.exists() && !split.exists(), "refused input ran");
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    #[test]
+    fn disallowed_input_control_allows_only_tab_lf_cr() {
+        assert_eq!(disallowed_input_control("a\tb\r\nc é"), None);
+        assert_eq!(disallowed_input_control("a\u{15}"), Some('\u{15}'));
+        assert_eq!(disallowed_input_control("\u{7f}"), Some('\u{7f}'));
+    }
+
     /// Default closed: with an ask policy and nobody to ask, typed input is
     /// refused rather than written.
     #[cfg(unix)]
@@ -2874,6 +3119,209 @@ mod tests {
     }
 
     #[cfg(unix)]
+    type EscalationPrompts = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// Answers every escalation prompt with `decision`, recording the prompts.
+    #[cfg(unix)]
+    fn escalation_responder(
+        decision: crate::permission::ask::UserDecision,
+    ) -> (crate::permission::ask::AskSender, EscalationPrompts) {
+        use crate::permission::ask::UserRequest;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UserRequest>(4);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                if let UserRequest::Permission(ask) = request {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((ask.tool.to_string(), ask.input.clone()));
+                    let _ = ask.reply.send(decision.clone());
+                }
+            }
+        });
+        (tx, seen)
+    }
+
+    /// mini-agent-a1ive: escalation is default closed, always needs a fresh
+    /// interactive approval, honours deny rules and runs only that command
+    /// unsandboxed. the command is only asserted to run after approval.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escalation_is_default_closed_and_needs_approval_every_time() {
+        use crate::permission::ask::UserDecision;
+        use crate::permission::{Action, PermissionConfig, SecurityMode, ToolPerm};
+        let dir = std::env::current_dir().unwrap();
+        let marker = dir.join(format!("escalation-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let command = format!("touch {}", marker.file_name().unwrap().to_string_lossy());
+        async fn call(
+            tool: &ShellTool,
+            command: &str,
+            escalate: bool,
+            justification: Option<&str>,
+        ) -> Result<String, ToolError> {
+            tool.call(BashArgs {
+                command: command.to_string(),
+                escalate,
+                justification: justification.map(str::to_string),
+                ..Default::default()
+            })
+            .await
+        }
+        let sandboxed = || Sandbox::new(true, "bwrap");
+
+        // Default closed: not in the schema, refused when sent anyway.
+        let closed = ShellTool::new(None, None, sandboxed(), None);
+        assert!(closed.parameters()["properties"].get("escalate").is_none());
+        assert!(!closed.description().contains("escalate"));
+        let error = call(&closed, &command, true, Some("why"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disabled"), "{error}");
+        assert!(!marker.exists());
+
+        // Offered when enabled; nobody to ask means refusal, not a silent run.
+        let open = || ShellTool::new(None, None, sandboxed(), None).with_escalation(true);
+        assert!(open().parameters()["properties"].get("escalate").is_some());
+        let error = call(&open(), &command, true, Some("needs it"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("interactive approval"), "{error}");
+        let error = call(&open(), &command, true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("justification"), "{error}");
+        assert!(!marker.exists());
+
+        // The user says no.
+        let (deny_tx, denied) = escalation_responder(UserDecision::Deny);
+        let tool = ShellTool::new(None, Some(deny_tx), sandboxed(), None).with_escalation(true);
+        let error = call(&tool, &command, true, Some("install deps"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("denied by user"), "{error}");
+        assert!(!marker.exists());
+        assert_eq!(denied.lock().unwrap()[0].0, "sandbox_escalation");
+        assert!(denied.lock().unwrap()[0].1.contains("install deps"));
+
+        // Allow-all permission rules do not waive the prompt, and an
+        // always-grant is not remembered: both escalations prompt.
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Simple(Action::Allow)),
+                ..Default::default()
+            },
+            SecurityMode::Yolo,
+        );
+        let (allow_tx, asked) = escalation_responder(UserDecision::AllowAlways("*".into()));
+        let tool = ShellTool::new(Some(permission), Some(allow_tx), sandboxed(), None)
+            .with_escalation(true);
+        let output = call(&tool, &command, true, Some("write outside root"))
+            .await
+            .unwrap();
+        assert!(output.contains("sandbox escalated"), "{output}");
+        assert!(marker.exists(), "approved command did not run");
+        std::fs::remove_file(&marker).unwrap();
+        call(&tool, &command, true, Some("again")).await.unwrap();
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            2,
+            "always-grant must not stick"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        // Deny rules win before any prompt.
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("touch *".to_string(), Action::Deny),
+                        ("*".to_string(), Action::Allow),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            SecurityMode::Yolo,
+        );
+        let (allow_tx, asked) = escalation_responder(UserDecision::AllowOnce);
+        let tool = ShellTool::new(Some(permission), Some(allow_tx), sandboxed(), None)
+            .with_escalation(true);
+        let error = call(&tool, &command, true, Some("x"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.to_lowercase().contains("denied"), "{error}");
+        assert!(asked.lock().unwrap().is_empty() && !marker.exists());
+
+        // An unsandboxed session has nothing to escalate from.
+        let off =
+            ShellTool::new(None, None, Sandbox::new(false, "bwrap"), None).with_escalation(true);
+        let error = call(&off, &command, true, Some("x"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already off"), "{error}");
+    }
+
+    /// mini-agent-tb3zw: the cap is configurable and a full job table runs an
+    /// auto_background call in the foreground instead of failing it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_background_runs_in_the_foreground_when_the_job_table_is_full() {
+        let shell = BashTool::new(
+            None,
+            None,
+            Sandbox::new(false, "bwrap").with_max_background_jobs(2),
+            None,
+        )
+        .with_auto_background(true);
+        assert_eq!(shell.sandbox.max_background_jobs(), 2);
+        for _ in 0..2 {
+            shell
+                .call(BashArgs {
+                    command: "while :; do sleep 1; done".to_string(),
+                    background: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let explicit = shell
+            .call(BashArgs {
+                command: "echo nope".to_string(),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(explicit.contains("maximum 2 running jobs"), "{explicit}");
+        let output = shell
+            .call(BashArgs {
+                command: "echo short-foreground".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(output.contains("short-foreground"), "{output}");
+        assert!(!output.contains("promoted_to_background"), "{output}");
+        assert_eq!(shell.sandbox.running_background_job_count(), 2);
+        shell.sandbox.cancel_background_jobs();
+        assert_eq!(
+            Sandbox::new(false, "bwrap")
+                .with_max_background_jobs(1000)
+                .max_background_jobs(),
+            crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn background_job_capacity_is_bounded_and_global_cancel_reaps_every_job() {
         let shell = test_tool();
@@ -2905,7 +3353,7 @@ mod tests {
             .to_string();
         assert_eq!(
             overflow,
-            "background job capacity is full (maximum 8 running jobs)"
+            "background job capacity is full (maximum 8 running jobs; raise shell-max-background-jobs, at most 64)"
         );
 
         // Interrupting a turn kills foreground groups only; jobs survive.

@@ -1144,7 +1144,8 @@ impl Tool for JsTool {
                  'file'|'directory', size: number}}[], truncated: boolean}}`, and \
                  `grep(pattern: string, options?: {{path?: string, include?: string, \
                  case_sensitive?: boolean}}): {{matches: {{path: string, line: number, text: \
-                 string}}[], truncated: boolean}}`, plus `splitLines`, `json_exact`, and \
+                 string}}[], truncated: boolean, skipped: {{large: number, binary: number, \
+                 non_utf8: number, unreadable: number}}}}`, plus `splitLines`, `json_exact`, and \
                  `read_lines`. {} `console.log` is available for bounded diagnostics. {} Writer, network, process, session-state, proposal, batch-read, and \
                  glob globals are absent. Return a string, finite number, boolean, or \
                  accessor-free plain JSON value. Limits per call: {} s total, {} MiB JavaScript \
@@ -1172,7 +1173,7 @@ impl Tool for JsTool {
             helper_globals_doc().join(" "),
             "`list_dir(path?: string): {entries: {name: string, kind: 'file'|'directory', size: number}[], truncated: boolean}` (synchronous; defaults to '.').".to_string(),
             "`glob(pattern: string, options?: {path?: string}): {paths: string[], truncated: boolean}` (synchronous, recursive, respects ignore files). Example: `const files = glob('**/*.rs').paths;`".to_string(),
-            "`grep(pattern: string, options?: {path?: string, include?: string, case_sensitive?: boolean}): {matches: {path: string, line: number, text: string}[], truncated: boolean}` (synchronous Rust regex search; case-sensitive by default; matched lines only).".to_string(),
+            "`grep(pattern: string, options?: {path?: string, include?: string, case_sensitive?: boolean}): {matches: {path: string, line: number, text: string}[], truncated: boolean, skipped: {large: number, binary: number, non_utf8: number, unreadable: number}}` (synchronous Rust regex search; case-sensitive by default; matched lines only; invalid UTF-8 decoded lossily; `skipped` counts files NOT searched (large >10 MiB, binary, unreadable) and non_utf8 files searched lossily: no matches with skipped>0 is not proof of absence).".to_string(),
             format!(
                 "`write_file(path: string, content: string): void` (synchronous; max {} MiB). Example: `write_file('out.txt', 'done\\n');`",
                 WRITE_FILE_MAX_BYTES / (1024 * 1024)
@@ -3617,11 +3618,12 @@ mod js_permission_bridge {
         // The bound later absorbed other work (4956 bytes before the help() sentence) and rises
         // by exactly the 43 bytes of " Other pure helpers are listed by `help()`." (4999 measured).
         // The oversized-result note " (excess is cut with a size note)" adds 33 bytes.
+        // The grep `skipped` counts (mini-agent-azgi7) add 290 bytes.
         let full = helper_tool(ModelEffectProfile::Full, &root)
             .description()
             .len();
         assert!(
-            full < 3384 + 1350 + 230 + 43 + 33,
+            full < 3384 + 1350 + 230 + 43 + 33 + 290,
             "full description is {full} bytes"
         );
     }

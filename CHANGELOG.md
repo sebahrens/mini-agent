@@ -34,6 +34,14 @@ Notable changes to mini-agent are documented in this file. The format follows
   by `skills_search` (still pinnable with `/name`); `user-invocable: false` hides a skill from
   the `/` picker (mini-agent-glikt).
 
+- Shell: opt-in `shell-inherit-env` / `shell-env` (credential-looking and loader-injection names
+  refused, global-only `shell-env-allow-secrets`), `shell-max-background-jobs` (an
+  `auto_background` call now runs in the foreground when the job table is full),
+  `shell-allow-escalation` (per-command `escalate` with forced approval and audit) and
+  `sandbox-network = "allowlist"` with `sandbox-network-hosts` (filtering proxy, macOS Seatbelt)
+  (mini-agent-wr6xh, mini-agent-tb3zw, mini-agent-a1ive, mini-agent-yz1hr).
+- JS `grep` returns `skipped: {large, binary, non_utf8, unreadable}` and decodes lossily like the
+  native tool (mini-agent-azgi7).
 - ACP: with the new default-off `acp_client_file_access` (project-trust gated) and a client that
   advertises `fs.readTextFile`/`fs.writeTextFile`, `read`, `edit` and overwrite `write` use the
   editor's live text and publish through it, still behind the workspace and permission checks
@@ -54,6 +62,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   so other workspaces' saved sessions cannot be resumed by prefix or name (mini-agent-uibxw,
   mini-agent-ksl5z).
 
+- `job_status action=input` refuses C0 control bytes (Ctrl-U, backspace, ESC, DEL, ...) and judges
+  the cumulative unterminated line, so a permission rule cannot be evaded by line editing or by
+  splitting a command over calls (mini-agent-u4nat).
 - `read` of a PDF parses in linear time and within node, font and ToUnicode-entry budgets, with a
   20 s deadline, so crafted unterminated objects or compressed array bombs fail fast instead of
   hanging a blocking thread (mini-agent-ys23r, mini-agent-itjui).

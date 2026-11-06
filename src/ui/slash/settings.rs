@@ -333,6 +333,13 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
             format!("sandbox profile: {}", ctx.sandbox.profile()),
         );
         write_result(ctx.renderer, shell_network_line(ctx.sandbox));
+        write_result(
+            ctx.renderer,
+            format!(
+                "  shell environment: {}",
+                ctx.sandbox.shell_env_policy().summary()
+            ),
+        );
         for profile in [
             SandboxProfile::Workspace,
             SandboxProfile::HostRead,
@@ -389,12 +396,19 @@ fn shell_network_line(sandbox: &crate::sandbox::Sandbox) -> String {
         "sandbox disabled: shells use the host network"
     } else if sandbox.shell_network_effective() {
         "shell commands may reach the network; hooks and JS spawn stay denied"
-    } else if network.allows() {
+    } else if sandbox.shell_network_proxied() {
+        "shell commands reach only sandbox-network-hosts and prompted hosts, through a local proxy"
+    } else if network.is_allowlist() || network.allows() {
         "not supported by this backend; shell network stays denied"
     } else {
         "shell commands have no network; set sandbox-network = \"allow\" in config to opt in"
     };
-    format!("  shell network: {network} ({effect})")
+    let hosts = if network.is_allowlist() {
+        format!(" [{}]", sandbox.network_hosts().join(", "))
+    } else {
+        String::new()
+    };
+    format!("  shell network: {network}{hosts} ({effect})")
 }
 
 async fn handle_mode(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {

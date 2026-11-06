@@ -213,6 +213,16 @@ pub(crate) fn validate_responses_extra_body(
 /// OpenAI Responses API, stripping `previous_response_id` and warning about
 /// keys that would be dropped in silence.
 pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, String> {
+    cfg.shell_env_policy().validate()?;
+    crate::sandbox::net_proxy::parse_rules(&cfg.sandbox_network_hosts)?;
+    if let Some(max) = cfg.shell_max_background_jobs
+        && !(1..=crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT).contains(&max)
+    {
+        return Err(format!(
+            "shell-max-background-jobs must be between 1 and {}",
+            crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT
+        ));
+    }
     #[cfg(feature = "subagents")]
     cfg.validate_subagent_settings()?;
     let global_is_responses = cfg
@@ -2171,6 +2181,8 @@ fn split_project_override_with_sensitive_fields(
                 | "sandbox_required"
                 | "permission-checks-required"
                 | "permission_checks_required"
+                | "shell-env-allow-secrets"
+                | "shell_env_allow_secrets"
         ) {
             tracing::warn!("project config: {key} is global-only and was ignored");
             continue;
@@ -3822,6 +3834,70 @@ mod project_config_trust_tests {
             cfg.sandbox_network,
             Some(crate::sandbox::SandboxNetwork::Allow)
         );
+    }
+
+    #[test]
+    fn shell_env_keys_are_default_closed_trust_gated_and_refuse_credentials() {
+        let root = crate::tests::OwnedTestDirectory::new("shell-env-project-trust");
+        let path = root.path().join("project/.mini-agent/config.toml");
+        let trust = root.path().join("state/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "shell-inherit-env = ['JAVA_HOME']\nshell-env = { FOO = 'bar' }\nshell-env-allow-secrets = true\nshell-allow-escalation = true\nshell-max-background-jobs = 3\nsandbox-network = 'allowlist'\nsandbox-network-hosts = ['a.example.com']\nchat_left_margin = 3\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        assert!(cfg.shell_env_policy().is_empty(), "default closed");
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| {
+            panic!("no headless prompt")
+        })
+        .unwrap();
+        assert!(cfg.shell_inherit_env.is_empty() && cfg.shell_env.is_empty());
+        assert_eq!(
+            cfg.shell_allow_escalation, None,
+            "untrusted project cannot offer escalation"
+        );
+        assert_eq!(cfg.shell_max_background_jobs, None);
+        assert!(cfg.sandbox_network.is_none() && cfg.sandbox_network_hosts.is_empty());
+        assert_eq!(cfg.chat_left_margin, Some(3));
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
+        assert_eq!(cfg.shell_inherit_env, vec!["JAVA_HOME".to_string()]);
+        assert_eq!(cfg.shell_allow_escalation, Some(true));
+        assert_eq!(cfg.shell_max_background_jobs, Some(3));
+        assert_eq!(
+            cfg.sandbox_network,
+            Some(crate::sandbox::SandboxNetwork::Allowlist)
+        );
+        assert_eq!(cfg.sandbox_network_hosts, vec!["a.example.com".to_string()]);
+        let mut bad_host =
+            toml::from_str::<Config>("sandbox-network-hosts = ['https://a.com/x']").unwrap();
+        assert!(super::validate_extra_body(&mut bad_host).is_err());
+        assert_eq!(cfg.shell_env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(
+            cfg.shell_env_allow_secrets, None,
+            "a project cannot enable credential passthrough"
+        );
+
+        let alias =
+            toml::from_str::<Config>("shell_inherit_env = ['A']\nshell_env = { B = 'c' }").unwrap();
+        assert_eq!(alias.shell_inherit_env, vec!["A".to_string()]);
+        let mut secret = toml::from_str::<Config>("shell-inherit-env = ['GH_TOKEN']").unwrap();
+        assert!(
+            super::validate_extra_body(&mut secret)
+                .unwrap_err()
+                .contains("GH_TOKEN")
+        );
+        let mut allowed = toml::from_str::<Config>(
+            "shell-inherit-env = ['GH_TOKEN']\nshell-env-allow-secrets = true",
+        )
+        .unwrap();
+        super::validate_extra_body(&mut allowed).unwrap();
+        let mut injected = toml::from_str::<Config>(
+            "shell-env = { LD_PRELOAD = '/x.so' }\nshell-env-allow-secrets = true",
+        )
+        .unwrap();
+        assert!(super::validate_extra_body(&mut injected).is_err());
     }
 
     #[test]

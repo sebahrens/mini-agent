@@ -507,6 +507,64 @@ pub struct Config {
         alias = "sandbox_network"
     )]
     pub sandbox_network: Option<crate::sandbox::SandboxNetwork>,
+    /// `sandbox-network-hosts`: host allowlist for
+    /// `sandbox-network = "allowlist"`. Sensitive in project layers.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "sandbox-network-hosts",
+        alias = "sandbox_network_hosts"
+    )]
+    pub sandbox_network_hosts: Vec<String>,
+    /// `shell-inherit-env`: variable names (or `*` globs) copied from the
+    /// parent process into contained shell commands, on top of the fixed
+    /// allowlist. Credential-looking names are refused. Sensitive in project
+    /// layers.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "shell-inherit-env",
+        alias = "shell_inherit_env"
+    )]
+    pub shell_inherit_env: Vec<String>,
+    /// `shell-env`: literal variables set for contained shell commands.
+    /// Sensitive in project layers.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty",
+        rename = "shell-env",
+        alias = "shell_env"
+    )]
+    pub shell_env: std::collections::BTreeMap<String, String>,
+    /// Global-only: permit credential-looking names in `shell-inherit-env`
+    /// and `shell-env`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "shell-env-allow-secrets",
+        alias = "shell_env_allow_secrets"
+    )]
+    pub shell_env_allow_secrets: Option<bool>,
+    /// `shell-max-background-jobs`: running background shell jobs allowed at
+    /// once (1..=64; default 8). A full table makes `auto_background`
+    /// foreground calls run in the foreground instead of failing.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "shell-max-background-jobs",
+        alias = "shell_max_background_jobs"
+    )]
+    pub shell_max_background_jobs: Option<usize>,
+    /// `shell-allow-escalation`: offer the shell `escalate` parameter that
+    /// runs one command outside the sandbox after interactive approval.
+    /// Default false; never offered under `sandbox-required`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "shell-allow-escalation",
+        alias = "shell_allow_escalation"
+    )]
+    pub shell_allow_escalation: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -1016,6 +1074,15 @@ pub(crate) enum PromptRoute<'a> {
 }
 
 impl Config {
+    /// The shell environment policy these keys configure.
+    pub fn shell_env_policy(&self) -> crate::sandbox::ShellEnvPolicy {
+        crate::sandbox::ShellEnvPolicy {
+            inherit: self.shell_inherit_env.clone(),
+            set: self.shell_env.clone(),
+            allow_secrets: self.shell_env_allow_secrets.unwrap_or(false),
+        }
+    }
+
     pub(crate) fn mutation_diff_options(&self) -> crate::agent::tools::mutation_diff::DiffOptions {
         crate::agent::tools::mutation_diff::DiffOptions {
             context: self.diff_context_lines.unwrap_or(3).min(20),

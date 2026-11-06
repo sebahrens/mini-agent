@@ -440,6 +440,7 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
         EffectOperation::Grep { .. } => EffectResult::Grep {
             matches: Vec::new(),
             truncated: false,
+            skipped: Default::default(),
         },
         EffectOperation::WriteFile { .. } => EffectResult::WriteFile,
         EffectOperation::Result { json } => EffectResult::ResultAccepted { json: json.clone() },
