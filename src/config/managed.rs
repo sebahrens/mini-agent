@@ -11,6 +11,7 @@
 //! allowed_modes = ["standard", "guarded", "readonly"]   # selectable security modes
 //! disable_yolo = true                                   # shorthand: drop `yolo` from the modes
 //! require_permission_checks = true                      # refuse --dangerously-skip-permissions
+//!                                                       # (implied by deny, allowed_modes, disable_yolo)
 //!
 //! [sandbox]
 //! required = true                                       # force the sandbox on
@@ -320,8 +321,15 @@ impl ManagedPolicy {
         self.file.sandbox.required
     }
 
+    /// True when `--dangerously-skip-permissions` must be refused: either the
+    /// file says so, or it sets deny rules or mode limits, which only a live
+    /// permission checker can enforce (skipping checks would void them).
     pub(crate) fn permission_checks_required(&self) -> bool {
-        self.file.permissions.require_permission_checks
+        let permissions = &self.file.permissions;
+        permissions.require_permission_checks
+            || permissions.deny.values().any(|patterns| !patterns.is_empty())
+            || permissions.allowed_modes.is_some()
+            || permissions.disable_yolo
     }
 
     pub(crate) fn provider_allowed(&self, name: &str) -> bool {
@@ -384,7 +392,7 @@ impl ManagedPolicy {
                 .collect::<Vec<_>>()
                 .join(","),
             self.file.sandbox.required,
-            self.file.permissions.require_permission_checks,
+            self.permission_checks_required(),
             if self.file.mcp.disabled {
                 "disabled".to_string()
             } else if self.file.mcp.allowed_servers.is_some() {
@@ -416,7 +424,7 @@ impl ManagedPolicy {
             cfg.sandbox = Some(true);
             cfg.sandbox_required = Some(true);
         }
-        if self.file.permissions.require_permission_checks {
+        if self.permission_checks_required() {
             cfg.permission_checks_required = Some(true);
         }
         if !self.mode_allowed(SecurityMode::Yolo) {
@@ -666,6 +674,31 @@ mod tests {
                 .unwrap_err()
                 .contains("managed-config.toml")
         );
+    }
+
+    #[test]
+    fn deny_rules_and_mode_limits_imply_refusing_skip_permissions() {
+        let cfg: super::super::Config = toml::from_str("").unwrap();
+        for text in [
+            "[permissions]\ndeny = { shell = [\"rm -rf *\"] }\n",
+            "[permissions]\ndisable_yolo = true\n",
+            "[permissions]\nallowed_modes = [\"standard\"]\n",
+        ] {
+            let policy = policy(text);
+            assert!(policy.permission_checks_required(), "{text}");
+            let error = authority(&policy, &["--dangerously-skip-permissions"], &cfg).unwrap_err();
+            assert!(error.contains("managed-config.toml"), "{text}: {error}");
+            assert!(authority(&policy, &[], &cfg).is_ok(), "{text}");
+        }
+        // Policies without permission rules keep the flag usable.
+        let unrelated = policy("[sandbox]\nrequired = true\n");
+        assert!(!unrelated.permission_checks_required());
+        // An empty deny table does not count as a rule.
+        let empty = policy("[permissions]\ndeny = { shell = [] }\n");
+        assert!(!empty.permission_checks_required());
+        let mut applied: super::super::Config = toml::from_str("").unwrap();
+        policy("[permissions]\ndisable_yolo = true\n").apply(&mut applied);
+        assert_eq!(applied.permission_checks_required, Some(true));
     }
 
     #[test]

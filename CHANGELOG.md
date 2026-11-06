@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- A managed policy that sets `permissions.deny`, `allowed_modes` or `disable_yolo` now also refuses
+  `--dangerously-skip-permissions`, since skipping checks would void those rules (mini-agent-khizh).
 - Relative `--add-dir`, `--image`, `--output-schema`, `--loop-plan` and `--log-file` paths keep
   resolving against the launch directory under `project_root_discovery` (mini-agent-k8w51). The
   `--stream-json-control` sandbox network ask is per `host:port` (concurrent connections share one
