@@ -1329,8 +1329,9 @@ Automatic compaction is off by default. With `compact_enabled = true`, mini-agen
 only compacts the conversation *between* turns unless mid-turn compaction is also
 configured: after a response finishes, when the accumulated session history exceeds
 `context_window - reserve_tokens`. Tools with their own output limits (`read`,
-`shell`, `grep`, `find_files`, `list_dir`, and `js`) retain their documented
-line, byte, and result limits in both live and replayed history. Their
+`shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
+and the subagent `task` tool) retain their documented line, byte, and result
+limits in both live and replayed history. Their
 continuation hints remain intact, and a completed read window remains available
 when repeated-read protection asks the model to reuse it. Other textual tool
 results, including MCP results, are independently bounded before Rig commits

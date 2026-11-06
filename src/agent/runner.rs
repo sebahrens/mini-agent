@@ -7163,6 +7163,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Stands in for the subagent `task` tool: a 30 KB rendered report is
+    /// inside the default per-child (32 KiB) and per-call (128 KiB) caps.
+    #[derive(Clone)]
+    struct TaskReportStub;
+
+    impl Tool for TaskReportStub {
+        const NAME: &'static str = "task";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return a large but task-capped subagent report".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok(task_report_stub_output())
+        }
+    }
+
+    fn task_report_stub_output() -> String {
+        format!(
+            "{}{}{}",
+            "H".repeat(crate::session::TOOL_RESULT_HEAD_CHARS),
+            "M".repeat(20_000),
+            "T".repeat(crate::session::TOOL_RESULT_TAIL_CHARS),
+        )
+    }
+
+    /// mini-agent-3mgd5: `task` enforces its own report caps, so the parent's
+    /// generic 12k-char spill hook must not cut a report the caps admitted.
+    #[tokio::test]
+    async fn task_output_within_its_own_caps_is_not_spilled_by_the_parent_hook() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mini-agent-task-spill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("MINI_AGENT_DATA_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_CONFIG_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_STATE_DIR", Some(root.clone().into_os_string())),
+        ]);
+
+        let session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("task-id", TaskReportStub::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(TaskReportStub)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        while stream.next().await.is_some() {}
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let history: Vec<Message> = requests[1].chat_history.iter().cloned().collect();
+        let live_output = tool_result_texts(&history)
+            .first()
+            .map(|text| (*text).to_owned())
+            .expect("the next request must contain the task result");
+        assert!(
+            !live_output.contains("[tool output truncated:"),
+            "task output was spilled by the generic hook"
+        );
+        assert_eq!(live_output, task_report_stub_output());
+
+        drop(_environment);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn tool_result_texts(interactions: &[Message]) -> Vec<&str> {
         interactions
             .iter()

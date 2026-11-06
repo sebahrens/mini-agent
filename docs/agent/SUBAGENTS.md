@@ -1139,7 +1139,11 @@ limits apply to the next delegation. The cost policy keys `task_cost_weighting`,
 `/config task_cost_weights { input = 1.0, output = 5.0 }` persist validated
 settings. Use object forms in JSON configuration files and inline tables in
 `/config` or `--config` TOML literals. Reports are capped at 32 KiB per child and 128 KiB per batch, roughly 8K
-and 32K tokens respectively (actual token counts vary). This keeps batch reports
+and 32K tokens respectively (actual token counts vary). These caps are what the
+parent sees inline: `task` is a self-bounded tool, so the parent's generic
+12,000-character tool-result spill (head/tail plus spill path) never cuts a
+rendered task result, live or on replay. Lower `task_max_report_bytes` or
+`task_max_output_bytes` to make reports shorter. This keeps batch reports
 near 3% of a 1M-token parent context by default; a large child context
 is not permission to return an equally large report. Read/write authorization,
 write serialization, cancellation, and the session spend ceiling are unchanged.
