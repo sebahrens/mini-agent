@@ -3840,7 +3840,7 @@ mod project_config_trust_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "shell-inherit-env = ['JAVA_HOME']\nshell-env = { FOO = 'bar' }\nshell-env-allow-secrets = true\nchat_left_margin = 3\n",
+            "shell-inherit-env = ['JAVA_HOME']\nshell-env = { FOO = 'bar' }\nshell-env-allow-secrets = true\nshell-allow-escalation = true\nshell-max-background-jobs = 3\nchat_left_margin = 3\n",
         )
         .unwrap();
         let mut cfg = Config::default();
@@ -3850,9 +3850,16 @@ mod project_config_trust_tests {
         })
         .unwrap();
         assert!(cfg.shell_inherit_env.is_empty() && cfg.shell_env.is_empty());
+        assert_eq!(
+            cfg.shell_allow_escalation, None,
+            "untrusted project cannot offer escalation"
+        );
+        assert_eq!(cfg.shell_max_background_jobs, None);
         assert_eq!(cfg.chat_left_margin, Some(3));
         apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
         assert_eq!(cfg.shell_inherit_env, vec!["JAVA_HOME".to_string()]);
+        assert_eq!(cfg.shell_allow_escalation, Some(true));
+        assert_eq!(cfg.shell_max_background_jobs, Some(3));
         assert_eq!(cfg.shell_env.get("FOO").map(String::as_str), Some("bar"));
         assert_eq!(
             cfg.shell_env_allow_secrets, None,

@@ -260,6 +260,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("shell-max-background-jobs", &["shell_max_background_jobs"])
         .described("Running background shell jobs allowed at once (1..=64, default 8). A full table makes auto_background calls run in the foreground.")
         .shaped(ConfigShape::Integer),
+    aliased("shell-allow-escalation", &["shell_allow_escalation"])
+        .described("Offer the shell escalate parameter: retry one sandbox-blocked command without the sandbox after interactive approval. Default false; ignored under sandbox-required. Project layers need trust.")
+        .shaped(ConfigShape::Bool),
     aliased("shell-env-allow-secrets", &["shell_env_allow_secrets"])
         .described("Global-only: permit credential-looking names (GH_TOKEN, *_API_KEY) in shell-inherit-env and shell-env.")
         .shaped(ConfigShape::Bool),

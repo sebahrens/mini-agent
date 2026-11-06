@@ -762,6 +762,13 @@ pub struct BashArgs {
     /// Promote the foreground command to a background job at its deadline.
     #[serde(default)]
     pub auto_background: Option<bool>,
+    /// Retry this one command outside the sandbox after interactive user
+    /// approval. Only offered when `shell-allow-escalation` is on.
+    #[serde(default)]
+    pub escalate: bool,
+    /// Why the command needs to leave the sandbox; shown in the approval.
+    #[serde(default)]
+    pub justification: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1003,6 +1010,67 @@ async fn handle_ask_inner(
             Ok(())
         }
         _ => Err(ToolError::Msg("Permission denied by user".to_string())),
+    }
+}
+
+/// Forced interactive approval for leaving the sandbox. Unlike an `Ask`
+/// verdict it is required in every permission mode, ignores allow rules and
+/// opt-in permission hooks, never records an allow-always grant, and fails
+/// closed when nobody can be asked.
+pub(crate) async fn request_sandbox_escalation_approval(
+    ask_tx: &Option<AskSender>,
+    command: &str,
+    justification: &str,
+) -> Result<(), ToolError> {
+    let Some(tx) = ask_tx else {
+        return Err(ToolError::Msg(
+            "sandbox escalation needs interactive approval and none is available (non-interactive run)"
+                .to_string(),
+        ));
+    };
+    crate::spend::run::admit_current_effect()
+        .await
+        .map_err(|error| ToolError::Msg(error.to_string()))?;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let suspended = concurrency::suspend_for_prompt();
+    let sent = tx
+        .send(
+            AskRequest {
+                diagnostic: None,
+                #[cfg(feature = "subagents")]
+                background: crate::spend::run::Run::current()
+                    .and_then(|run| run.background_ask_origin()),
+                agent_name: crate::permission::ask::subagent_name(),
+                tool: CompactString::new("sandbox_escalation"),
+                input: format!("run WITHOUT the sandbox\nreason: {justification}\n$ {command}"),
+                #[cfg(feature = "acp")]
+                tool_call_id: crate::permission::ask::current_tool_call_id(),
+                suggested_pattern: None,
+                additional_allow_patterns: Vec::new(),
+                reply: reply_tx,
+            }
+            .into(),
+        )
+        .await;
+    let decision = match sent {
+        Ok(()) => Some(reply_rx.await),
+        Err(_) => None,
+    };
+    if let Some(suspended) = suspended {
+        suspended.resume().await;
+    }
+    let Some(decision) = decision else {
+        return Err(ToolError::Msg("Permission system unavailable".to_string()));
+    };
+    if let Some(required) = crate::question::required() {
+        return Err(ToolError::Msg(required.to_string()));
+    }
+    match decision {
+        // An always-grant is deliberately not recorded: every escalation asks.
+        Ok(UserDecision::AllowOnce | UserDecision::AllowAlways(_)) => Ok(()),
+        _ => Err(ToolError::Msg(
+            "Sandbox escalation denied by user; the command was not run".to_string(),
+        )),
     }
 }
 

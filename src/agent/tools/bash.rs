@@ -251,7 +251,13 @@ pub struct ShellTool {
     /// `shell_auto_background`: promote a foreground command that reaches
     /// its deadline to a background job instead of killing it.
     auto_background: bool,
+    /// `shell-allow-escalation`: offer the per-call `escalate` parameter.
+    /// Default closed.
+    allow_escalation: bool,
 }
+
+/// Longest `justification` shown in the escalation approval.
+const MAX_ESCALATION_JUSTIFICATION_CHARS: usize = 400;
 
 impl ShellTool {
     pub fn new(
@@ -270,7 +276,15 @@ impl ShellTool {
             ),
             output_log_dir: None,
             auto_background: false,
+            allow_escalation: false,
         }
+    }
+
+    /// Offer the `escalate` parameter (`shell-allow-escalation`, never when
+    /// `sandbox-required`). Each use still needs interactive approval.
+    pub fn with_escalation(mut self, enabled: bool) -> Self {
+        self.allow_escalation = enabled;
+        self
     }
 
     /// Default for the per-call `auto_background` flag.
@@ -320,6 +334,11 @@ impl Tool for ShellTool {
                 alias.display()
             ));
         }
+        if self.allow_escalation {
+            description.push_str(
+                " If the sandbox blocks a command that must run (network, a write outside the workspace), retry that one command with escalate=true and a justification: the user is asked to approve it every time, and only that command runs without the sandbox.",
+            );
+        }
         description
     }
 
@@ -329,7 +348,7 @@ impl Tool for ShellTool {
             .shell_capability()
             .map(|capability| capability.dialect().name())
             .unwrap_or("configured shell");
-        serde_json::json!({
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": format!("{dialect} command to execute") },
@@ -357,7 +376,27 @@ impl Tool for ShellTool {
                 }
             },
             "required": ["command"]
-        })
+        });
+        if self.allow_escalation
+            && let Some(properties) = schema["properties"].as_object_mut()
+        {
+            properties.insert(
+                "escalate".into(),
+                serde_json::json!({
+                    "type": "boolean",
+                    "description": "Run this single command WITHOUT the sandbox after the user approves it interactively (default false). Use only after a sandboxed attempt failed because of the sandbox; requires justification."
+                }),
+            );
+            properties.insert(
+                "justification".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "maxLength": MAX_ESCALATION_JUSTIFICATION_CHARS,
+                    "description": "Only with escalate=true: why the command must leave the sandbox, shown to the user in the approval prompt."
+                }),
+            );
+        }
+        schema
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
@@ -380,10 +419,88 @@ impl Tool for ShellTool {
 }
 
 impl ShellTool {
+    /// `escalate = true`: validate, judge deny rules, require a fresh
+    /// interactive approval, audit, then run this one command on a clone whose
+    /// sandbox is off (environment still cleared). The clone shares the job
+    /// table, so background jobs stay visible to `job_status`.
+    async fn execute_escalated(
+        &self,
+        mut args: BashArgs,
+    ) -> Result<(String, Option<ForegroundResult>), ToolError> {
+        if !self.allow_escalation {
+            return Err(ToolError::Msg(
+                "sandbox escalation is disabled: shell-allow-escalation is off (or sandbox-required is set)"
+                    .into(),
+            ));
+        }
+        if !self.sandbox.containment_requested() {
+            return Err(ToolError::Msg(
+                "escalate is unnecessary: the sandbox is already off for this session".into(),
+            ));
+        }
+        let justification = args.justification.take().unwrap_or_default();
+        let justification = justification.trim();
+        if justification.is_empty()
+            || justification.chars().count() > MAX_ESCALATION_JUSTIFICATION_CHARS
+        {
+            return Err(ToolError::Msg(format!(
+                "escalate=true requires a justification of 1 to {MAX_ESCALATION_JUSTIFICATION_CHARS} characters explaining why the command must leave the sandbox"
+            )));
+        }
+        // Deny rules still win; allow rules and modes cannot waive the prompt.
+        if let Some(permission) = &self.permission {
+            let (result, _) = permission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .check_diagnosed(|guard| guard.check("shell", &args.command));
+            if let crate::permission::checker::CheckResult::Denied(reason) = result {
+                return Err(ToolError::Msg(format!("Permission denied: {reason}")));
+            }
+        }
+        let (approval, _released) = super::concurrency::prompt_unlocked(
+            super::request_sandbox_escalation_approval(&self.ask_tx, &args.command, justification),
+        )
+        .await;
+        approval?;
+        tracing::warn!(
+            target: "mini_agent::audit::sandbox_escalation",
+            command = %args.command,
+            justification,
+            background = args.background,
+            "user approved running a shell command without the sandbox"
+        );
+        let mut escalated = Sandbox::clone(&self.sandbox);
+        escalated.disable_for_escalation();
+        let tool = ShellTool {
+            permission: None,
+            ask_tx: None,
+            sandbox: escalated,
+            max_output_lines: self.max_output_lines,
+            foreground_timeout: self.foreground_timeout,
+            output_log_dir: self.output_log_dir.clone(),
+            auto_background: self.auto_background,
+            allow_escalation: false,
+        };
+        args.escalate = false;
+        let (text, metadata) = Box::pin(tool.execute(args)).await?;
+        Ok((
+            format!("[sandbox escalated: ran without the sandbox after user approval]\n{text}"),
+            metadata,
+        ))
+    }
+
     async fn execute(
         &self,
         args: BashArgs,
     ) -> Result<(String, Option<ForegroundResult>), ToolError> {
+        if args.escalate || args.justification.is_some() {
+            if !args.escalate {
+                return Err(ToolError::Msg(
+                    "justification is only valid with escalate=true".into(),
+                ));
+            }
+            return self.execute_escalated(args).await;
+        }
         tracing::debug!(
             "tool shell start: cmd_len={}, timeout={:?}, background={}",
             args.command.len(),
@@ -2999,6 +3116,157 @@ mod tests {
             .await
             .unwrap();
         assert!(stopped.contains("Status: completed"), "{stopped}");
+    }
+
+    /// Answers every escalation prompt with `decision`, recording the prompts.
+    #[cfg(unix)]
+    fn escalation_responder(
+        decision: crate::permission::ask::UserDecision,
+    ) -> (
+        crate::permission::ask::AskSender,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        use crate::permission::ask::UserRequest;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UserRequest>(4);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                if let UserRequest::Permission(ask) = request {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((ask.tool.to_string(), ask.input.clone()));
+                    let _ = ask.reply.send(decision.clone());
+                }
+            }
+        });
+        (tx, seen)
+    }
+
+    /// mini-agent-a1ive: escalation is default closed, always needs a fresh
+    /// interactive approval, honours deny rules and runs only that command
+    /// unsandboxed. the command is only asserted to run after approval.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escalation_is_default_closed_and_needs_approval_every_time() {
+        use crate::permission::ask::UserDecision;
+        use crate::permission::{Action, PermissionConfig, SecurityMode, ToolPerm};
+        let dir = std::env::current_dir().unwrap();
+        let marker = dir.join(format!("escalation-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let command = format!("touch {}", marker.file_name().unwrap().to_string_lossy());
+        async fn call(
+            tool: &ShellTool,
+            command: &str,
+            escalate: bool,
+            justification: Option<&str>,
+        ) -> Result<String, ToolError> {
+            tool.call(BashArgs {
+                command: command.to_string(),
+                escalate,
+                justification: justification.map(str::to_string),
+                ..Default::default()
+            })
+            .await
+        }
+        let sandboxed = || Sandbox::new(true, "bwrap");
+
+        // Default closed: not in the schema, refused when sent anyway.
+        let closed = ShellTool::new(None, None, sandboxed(), None);
+        assert!(closed.parameters()["properties"].get("escalate").is_none());
+        assert!(!closed.description().contains("escalate"));
+        let error = call(&closed, &command, true, Some("why"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disabled"), "{error}");
+        assert!(!marker.exists());
+
+        // Offered when enabled; nobody to ask means refusal, not a silent run.
+        let open = || ShellTool::new(None, None, sandboxed(), None).with_escalation(true);
+        assert!(open().parameters()["properties"].get("escalate").is_some());
+        let error = call(&open(), &command, true, Some("needs it"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("interactive approval"), "{error}");
+        let error = call(&open(), &command, true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("justification"), "{error}");
+        assert!(!marker.exists());
+
+        // The user says no.
+        let (deny_tx, denied) = escalation_responder(UserDecision::Deny);
+        let tool = ShellTool::new(None, Some(deny_tx), sandboxed(), None).with_escalation(true);
+        let error = call(&tool, &command, true, Some("install deps"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("denied by user"), "{error}");
+        assert!(!marker.exists());
+        assert_eq!(denied.lock().unwrap()[0].0, "sandbox_escalation");
+        assert!(denied.lock().unwrap()[0].1.contains("install deps"));
+
+        // Allow-all permission rules do not waive the prompt, and an
+        // always-grant is not remembered: both escalations prompt.
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Simple(Action::Allow)),
+                ..Default::default()
+            },
+            SecurityMode::Yolo,
+        );
+        let (allow_tx, asked) = escalation_responder(UserDecision::AllowAlways("*".into()));
+        let tool = ShellTool::new(Some(permission), Some(allow_tx), sandboxed(), None)
+            .with_escalation(true);
+        let output = call(&tool, &command, true, Some("write outside root"))
+            .await
+            .unwrap();
+        assert!(output.contains("sandbox escalated"), "{output}");
+        assert!(marker.exists(), "approved command did not run");
+        std::fs::remove_file(&marker).unwrap();
+        call(&tool, &command, true, Some("again")).await.unwrap();
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            2,
+            "always-grant must not stick"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        // Deny rules win before any prompt.
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("touch *".to_string(), Action::Deny),
+                        ("*".to_string(), Action::Allow),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            SecurityMode::Yolo,
+        );
+        let (allow_tx, asked) = escalation_responder(UserDecision::AllowOnce);
+        let tool = ShellTool::new(Some(permission), Some(allow_tx), sandboxed(), None)
+            .with_escalation(true);
+        let error = call(&tool, &command, true, Some("x"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.to_lowercase().contains("denied"), "{error}");
+        assert!(asked.lock().unwrap().is_empty() && !marker.exists());
+
+        // An unsandboxed session has nothing to escalate from.
+        let off =
+            ShellTool::new(None, None, Sandbox::new(false, "bwrap"), None).with_escalation(true);
+        let error = call(&off, &command, true, Some("x"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already off"), "{error}");
     }
 
     /// mini-agent-tb3zw: the cap is configurable and a full job table runs an

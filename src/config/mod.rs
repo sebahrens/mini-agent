@@ -541,6 +541,16 @@ pub struct Config {
         alias = "shell_max_background_jobs"
     )]
     pub shell_max_background_jobs: Option<usize>,
+    /// `shell-allow-escalation`: offer the shell `escalate` parameter that
+    /// runs one command outside the sandbox after interactive approval.
+    /// Default false; never offered under `sandbox-required`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "shell-allow-escalation",
+        alias = "shell_allow_escalation"
+    )]
+    pub shell_allow_escalation: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

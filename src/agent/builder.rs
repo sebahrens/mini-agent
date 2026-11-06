@@ -1171,6 +1171,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 )
                 .with_foreground_timeout_secs(cfg.resolve_shell_timeout_secs())
                 .with_auto_background(cfg.shell_auto_background.unwrap_or(false))
+                .with_escalation(
+                    cfg.shell_allow_escalation.unwrap_or(false)
+                        && !cfg.sandbox_required.unwrap_or(false),
+                )
                 .with_output_log_dir(crate::session::storage::command_log_dir(
                     tool_output_session_id,
                 )),

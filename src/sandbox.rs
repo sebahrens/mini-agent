@@ -2460,6 +2460,12 @@ impl Sandbox {
         self.max_background_jobs
     }
 
+    /// Turn OS containment off for one approved escalation. Callers hold a
+    /// private clone; the environment allowlist still applies.
+    pub(crate) fn disable_for_escalation(&mut self) {
+        self.enabled = false;
+    }
+
     pub fn shell_env_policy(&self) -> &ShellEnvPolicy {
         &self.shell_env
     }
