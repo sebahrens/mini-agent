@@ -101,6 +101,17 @@ describe('buildPromptBlocks images and unsupported references', () => {
     expect(off.notes[0]).toMatch(/does not accept images/);
   });
 
+  it('enforces the total image budget and count, reporting skipped images', async () => {
+    const big = (name: string): ReferenceInput => ({ kind: 'image', mimeType: 'image/png', bytes: new Uint8Array(MAX_IMAGE_BYTES), name });
+    const result = await buildPromptBlocks(options([big('a'), big('b'), big('c')], { image: true }));
+    expect(result.blocks.filter(block => block.type === 'image')).toHaveLength(2);
+    expect(result.notes.join('\n')).toMatch(/Skipped image "c".*total image budget/);
+    const many = Array.from({ length: 10 }, (_, i): ReferenceInput => ({ kind: 'image', mimeType: 'image/png', bytes: png, name: `i${i}` }));
+    const capped = await buildPromptBlocks(options(many, { image: true }));
+    expect(capped.blocks.filter(block => block.type === 'image')).toHaveLength(8);
+    expect(capped.notes.join('\n')).toMatch(/at most 8 images/);
+  });
+
   it('refuses oversize, empty and unsupported-mime images with a note', async () => {
     const built = await buildPromptBlocks(options([
       { kind: 'image', mimeType: 'image/png', bytes: new Uint8Array(MAX_IMAGE_BYTES + 1) },

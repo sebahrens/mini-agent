@@ -121,8 +121,9 @@ const CONTROL_QUEUE_LINES: usize = 64;
 pub(crate) fn spawn_control_reader(
     output: HeadlessOutputPolicy,
     permission: Option<crate::permission::checker::PermCheck>,
+    ask_timeout: std::time::Duration,
 ) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
-    crate::headless_control::enable(output, permission);
+    crate::headless_control::enable(output, permission, ask_timeout);
     let (tx, rx) = tokio::sync::mpsc::channel(CONTROL_QUEUE_LINES);
     tokio::spawn(async move {
         loop {

@@ -279,6 +279,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(false, "  /retry                 retry last prompt");
     emit(
         false,
+        "  /copy [N]              copy the last reply (or its Nth code block)",
+    );
+    emit(
+        false,
         "  /queue                 list input queued while agent is busy",
     );
     emit(

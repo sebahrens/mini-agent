@@ -213,9 +213,19 @@ pub struct Cli {
     #[arg(
         long = "stream-json-control",
         requires_all = ["print", "input_format"],
-        help = "With -p --input-format stream-json --output stream-json: let stdin control_request/control_response lines interrupt the running turn, answer tool permission asks (denied after 60 s) and narrow the permission mode (default off)"
+        help = "With -p --input-format stream-json --output stream-json: let stdin control_request/control_response lines interrupt the running turn, answer tool permission asks (denied after --stream-json-ask-timeout, default 60 s) and narrow the permission mode (default off)"
     )]
     pub stream_json_control: bool,
+
+    #[arg(
+        long = "stream-json-ask-timeout",
+        value_name = "SECS",
+        requires = "stream_json_control",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(0..=86_400),
+        help = "With --stream-json-control: seconds a can_use_tool ask waits for the driver before it is denied (0 = wait until answered, stdin closes or the turn is interrupted; max 86400; default 60)"
+    )]
+    pub stream_json_ask_timeout: u64,
 
     #[arg(
         long = "max-stdin-bytes",

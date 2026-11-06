@@ -5,7 +5,10 @@ import type * as acp from '@agentclientprotocol/sdk';
 import { ChatUpdateRenderer, stopResult } from './chat';
 import { ensureConfigFile, resolveConfigDirectory } from './config';
 import { resolveConfiguredExecutable } from './executable';
-import { buildPermissionDetail, permissionOptionTitle } from './permission';
+import {
+  SHOW_FULL_COMMAND_LABEL, buildPermissionDetail, permissionFullText, permissionOmittedChars,
+  permissionOptionTitle,
+} from './permission';
 import { AgentSession } from './session';
 import { buildPromptBlocks } from './references';
 import { collectReferences } from './vscodeReferences';
@@ -261,6 +264,16 @@ async function createSession(
   return created;
 }
 
+let permissionChannel: vscode.OutputChannel | undefined;
+
+/** Opens the complete permission input in a read-only output channel. */
+function showFullPermissionText(text: string): void {
+  permissionChannel ??= vscode.window.createOutputChannel('Mini Agent: permission request');
+  permissionChannel.clear();
+  permissionChannel.appendLine(text);
+  permissionChannel.show(false);
+}
+
 export async function requestPermission(
   request: acp.RequestPermissionRequest,
   signal: AbortSignal,
@@ -273,23 +286,33 @@ export async function requestPermission(
   // not just the tool name, so the allow-always option never grants an unseen rule.
   // It goes in a modal `detail`, which wraps and keeps multi-line commands intact;
   // a QuickPick placeHolder is a one-line input hint that clips and vanishes on typing.
-  const titles = request.options.map(option => permissionOptionTitle(request, option));
+  const optionTitles = request.options.map(option => permissionOptionTitle(request, option));
+  // A clipped input gets an extra non-approving button that shows all of it.
+  const clipped = permissionOmittedChars(request) > 0;
+  const titles = clipped ? [...optionTitles, SHOW_FULL_COMMAND_LABEL] : optionTitles;
   let resolveAbort!: (value: undefined) => void;
   const aborted = new Promise<undefined>(resolve => { resolveAbort = resolve; });
   const onAbort = (): void => { resolveAbort(undefined); };
   signal.addEventListener('abort', onAbort, { once: true });
   let selectedIndex: number | undefined;
   try {
-    const picked = await Promise.race([
-      vscode.window.showWarningMessage(
-        `Mini Agent requests permission: ${request.toolCall.title ?? 'tool call'}`,
-        { modal: true, detail: buildPermissionDetail(request) },
-        ...titles,
-      ),
-      aborted,
-    ]);
-    const index = typeof picked === 'string' ? titles.indexOf(picked) : -1;
-    selectedIndex = index >= 0 ? index : undefined;
+    for (;;) {
+      const picked = await Promise.race([
+        vscode.window.showWarningMessage(
+          `Mini Agent requests permission: ${request.toolCall.title ?? 'tool call'}`,
+          { modal: true, detail: buildPermissionDetail(request) },
+          ...titles,
+        ),
+        aborted,
+      ]);
+      if (picked === SHOW_FULL_COMMAND_LABEL && clipped) {
+        showFullPermissionText(permissionFullText(request));
+        continue;
+      }
+      const index = typeof picked === 'string' ? optionTitles.indexOf(picked) : -1;
+      selectedIndex = index >= 0 ? index : undefined;
+      break;
+    }
   } finally {
     signal.removeEventListener('abort', onAbort);
   }

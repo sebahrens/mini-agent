@@ -8,6 +8,9 @@ export const PERMISSION_LABEL_LIMIT = 60;
 
 const META_PATTERN_KEYS = ['suggestedPattern', 'suggested_pattern', 'pattern'] as const;
 
+/** Button that opens the complete, unclipped input before anything is approved. */
+export const SHOW_FULL_COMMAND_LABEL = 'Show full command';
+
 export function truncate(value: string, limit: number): string {
   const text = value.trim();
   if (text.length <= limit) { return text; }
@@ -78,6 +81,36 @@ export function toolCallInputLines(toolCall: acp.ToolCallUpdate): string[] {
   return lines.map(line => line.trim()).filter(Boolean);
 }
 
+/** The complete input text of the tool call (what an allow authorises). */
+export function permissionInputText(request: acp.RequestPermissionRequest): string {
+  return toolCallInputLines(request.toolCall).join('\n');
+}
+
+/** The allow-always session rule, if the server advertised one. */
+function allowAlwaysPattern(request: acp.RequestPermissionRequest): string | undefined {
+  const always = request.options.find(option => option.kind === 'allow_always');
+  return always ? suggestedPattern(request, always) : undefined;
+}
+
+/** Characters of the input (and allow-always pattern) the modal detail cannot show. */
+export function permissionOmittedChars(
+  request: acp.RequestPermissionRequest,
+  limit: number = PERMISSION_DETAIL_LIMIT,
+): number {
+  const input = permissionInputText(request).trim();
+  const pattern = allowAlwaysPattern(request)?.trim() ?? '';
+  return Math.max(0, input.length - limit) + Math.max(0, pattern.length - limit);
+}
+
+/** Text for the read-only full view: the whole input and the whole allow-always rule. */
+export function permissionFullText(request: acp.RequestPermissionRequest): string {
+  const pattern = allowAlwaysPattern(request);
+  return [
+    permissionInputText(request) || '(no input details provided)',
+    ...(pattern ? [`--- allow-always session rule ---\n${pattern}`] : []),
+  ].join('\n\n');
+}
+
 /**
  * Compose the modal `detail` text: the command/input the tool wants to run,
  * bounded to a sane length, what the allow-always option grants for this session, and the id.
@@ -89,6 +122,10 @@ export function buildPermissionDetail(
   const input = toolCallInputLines(request.toolCall).join('\n');
   const sections: string[] = [];
   sections.push(input.length > 0 ? truncate(input, limit) : '(no input details provided)');
+  const omitted = permissionOmittedChars(request, limit);
+  if (omitted > 0) {
+    sections.push(`WARNING: ${omitted} more characters are not shown above. Choose "${SHOW_FULL_COMMAND_LABEL}" and read all of it before approving.`);
+  }
 
   const always = request.options.find(option => option.kind === 'allow_always');
   if (always) {

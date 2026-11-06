@@ -1056,7 +1056,7 @@ pub(crate) async fn handle_slash(
             settings::handle(&parts, &mut ctx).await
         }
         "/sessions" | "/fork" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind"
-        | "/retry" | "/quit" | "/exit" | "/history" => {
+        | "/retry" | "/copy" | "/quit" | "/exit" | "/history" => {
             crate::startup::heap_future(|| session::handle(&parts, &mut ctx)).await
         }
         #[cfg(feature = "export")]

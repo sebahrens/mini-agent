@@ -55,7 +55,11 @@ const MAX_ACP_HISTORY_TURNS: usize = 128;
 /// window (`acp_history_max_bytes`, default max(2 MiB, 4 bytes per token)).
 const MAX_ACP_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACP_SESSIONS: usize = 64;
-const MAX_ACP_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// One JSON-RPC line. Must exceed the largest prompt the agent accepts: 6 MiB
+/// of encoded images plus 1 MiB of text (up to 6x larger once JSON-escaped is
+/// still rejected per request with -32602), so an oversized-but-valid
+/// multi-image prompt never closes the connection.
+const MAX_ACP_FRAME_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ACP_PROMPT_BYTES: usize = 2 * 1024 * 1024;
 const MIN_ACP_TCP_API_KEY_BYTES: usize = 32;
 #[cfg(feature = "mcp")]
@@ -7266,6 +7270,25 @@ mod protocol_tests {
         let mut output = Vec::new();
         let error = futures::executor::block_on(oversized.read_to_end(&mut output)).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        // Two 2 MiB images are ~5.6 MiB of base64 in one line: the largest
+        // accepted prompt must pass the reader instead of killing the transport.
+        let two_images = format!("{}\n", "A".repeat(2 * (2 * 1024 * 1024 * 4 / 3 + 4)));
+        assert!(two_images.len() > 4 * 1024 * 1024);
+        let mut wide = BoundedLineReader::new(
+            futures::io::Cursor::new(two_images.clone()),
+            MAX_ACP_FRAME_BYTES,
+        );
+        let mut output = String::new();
+        futures::executor::block_on(wide.read_to_string(&mut output)).unwrap();
+        assert_eq!(output.len(), two_images.len());
+        const {
+            assert!(
+                MAX_ACP_FRAME_BYTES
+                    >= crate::session::user::MAX_USER_ENCODED_BYTES
+                        + crate::session::user::MAX_USER_TEXT_BYTES
+            );
+        }
 
         let input = format!("{}\n{}\n", "a".repeat(32), "b".repeat(32));
         let mut bounded = BoundedLineReader::new(futures::io::Cursor::new(input.clone()), 32);

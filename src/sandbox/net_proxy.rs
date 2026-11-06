@@ -596,6 +596,14 @@ impl Shared {
             )
         };
         let Some(sender) = sender else {
+            // Headless with `--stream-json-control`: the driver answers; an
+            // allow is for this connection only.
+            if let Some(control) = crate::headless_control::state() {
+                return match control.ask_network(&key).await {
+                    crate::headless_control::Reply::Allow => Ok(()),
+                    crate::headless_control::Reply::Deny(_) => Err(denied()),
+                };
+            }
             return Err(denied());
         };
         let (reply, answer) = tokio::sync::oneshot::channel();

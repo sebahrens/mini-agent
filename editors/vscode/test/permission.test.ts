@@ -7,6 +7,8 @@ import {
   suggestedPattern,
   toolCallInputLines,
   truncate,
+  permissionFullText,
+  permissionOmittedChars,
 } from '../src/permission';
 
 const options: acp.PermissionOption[] = [
@@ -106,6 +108,15 @@ describe('buildPermissionDetail', () => {
     const [input] = detail.split('\n\n');
     expect(input).toHaveLength(120);
     expect(input?.endsWith('…')).toBe(true);
+  });
+
+  it('states how much was clipped and the full text carries all of it', () => {
+    const request = serverRequest('a'.repeat(2000));
+    const detail = buildPermissionDetail(request);
+    expect(detail).toContain('1200 more characters are not shown');
+    expect(permissionOmittedChars(request)).toBe(1200);
+    expect(permissionFullText(request)).toContain('a'.repeat(2000));
+    expect(permissionOmittedChars(serverRequest('ls'))).toBe(0);
   });
 
   it('names the session rule when the server provides one', () => {
