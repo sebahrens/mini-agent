@@ -96,6 +96,7 @@ fn parse_image_source(block: &serde_json::Value) -> Result<ImageSource, String> 
 pub(crate) type Attachment = crate::extras::multimodal::MediaAttachment;
 /// Without the `multimodal` feature no attachment can exist.
 #[cfg(not(feature = "multimodal"))]
+#[derive(Debug)]
 pub(crate) enum Attachment {}
 
 #[cfg(not(feature = "multimodal"))]
