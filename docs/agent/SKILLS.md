@@ -42,7 +42,14 @@ and `~/.agents/skills`), `--add-dir DIR` (repeatable) and `skills_extra_dirs` ad
 `.claude/skills` and `.agents/skills`, and `skills_plugin_dirs` add `<plugin>/skills`. They are
 off by default, rank below every other root for name clashes (added dirs before plugins), carry
 user authority with the normal read-permission check, and cannot be set by an untrusted project
-config. Discovery from the launch directory up to the workspace root covers monorepo packages;
+config. Entries expand `~`/`~user`, resolve relative to their config file (or the launch directory
+for `--add-dir`), and each dropped one (over the 16 cap, missing, not a directory) is a startup
+warning and a line in `/skills`. `--add-dir` does not by itself let the file tools read DIR; set
+`add_dir_tool_access = true` for that (see CONFIG.md). Skills under `.claude/skills` (any
+location) also load without frontmatter: `name` defaults to the directory name, `description` to
+the first non-empty body line (cut at 1,024 characters), malformed YAML falls back to its simple
+`key: value` lines, and `yes/no/on/off/1/0` work for the boolean flags; other roots keep the
+strict Agent Skills rules. Discovery from the launch directory up to the workspace root covers monorepo packages;
 skills are not re-scanned per touched file.
 
 ### Selection limits and the always-visible catalog

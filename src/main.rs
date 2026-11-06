@@ -644,18 +644,33 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     #[cfg(feature = "agent-skills")]
     {
         extras::skills::index::AgentSkillSearchPolicy::configure(&cfg);
-        let path_list = |list: &Option<Vec<String>>| -> Vec<std::path::PathBuf> {
+        // Config entries resolve against the directory of the config file that
+        // set them, command-line entries against the launch directory.
+        let launch = std::env::current_dir().unwrap_or_default();
+        let entries = |key: &str,
+                       list: &Option<Vec<String>>|
+         -> Vec<extras::skills::session::ExtraDirEntry> {
+            let base = cfg
+                .provenance
+                .base_dir_for(key)
+                .unwrap_or_else(|| launch.clone());
             list.iter()
                 .flatten()
-                .map(std::path::PathBuf::from)
+                .map(|entry| (entry.clone(), base.clone()))
                 .collect()
         };
-        let mut add_dirs = path_list(&cfg.skills_extra_dirs);
-        add_dirs.extend(cli.add_dir.iter().cloned());
-        extras::skills::session::configure_extra_roots(
-            add_dirs,
-            path_list(&cfg.skills_plugin_dirs),
+        let mut add_dirs = entries("skills_extra_dirs", &cfg.skills_extra_dirs);
+        add_dirs.extend(
+            cli.add_dir
+                .iter()
+                .map(|dir| (dir.to_string_lossy().into_owned(), launch.clone())),
         );
+        for note in extras::skills::session::configure_extra_roots(
+            add_dirs,
+            entries("skills_plugin_dirs", &cfg.skills_plugin_dirs),
+        ) {
+            eprintln!("warning: {note}");
+        }
     }
     // ── Hooks: load settings.json config, apply trust, install dispatcher ──
     // Done this early (before provider/API-key resolution) so `--hooks-test`
