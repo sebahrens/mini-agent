@@ -60,7 +60,7 @@ fn pdf_page_count(data: &[u8]) -> u64 {
             cursor += 1;
         }
         if data[cursor..].starts_with(b"/Page")
-            && !data.get(cursor + 5).is_some_and(|byte| *byte == b's')
+            && data.get(cursor + 5).is_none_or(|byte| *byte != b's')
         {
             pages += 1;
         }

@@ -658,6 +658,7 @@ struct HeadlessCompactionPlan {
 
 // `pending_tokens`: estimated tokens in the pending request payload (user
 // prompt + media) to include in the compaction decision.
+#[cfg(test)]
 fn headless_compaction_plan(
     session: &Session,
     cfg: &Config,

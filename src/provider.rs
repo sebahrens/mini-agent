@@ -1323,6 +1323,7 @@ pub struct CompactionOutput {
 /// prefix that fits is summarized and its length is returned; the caller must
 /// drain exactly that prefix from the front of the session and may compact the
 /// remainder on a later pass with the returned summary as `previous_summary`.
+#[cfg(test)]
 pub(crate) async fn compress_messages_with<F, Fut>(
     messages: &[SessionMessage],
     previous_summary: Option<&str>,
@@ -1582,6 +1583,7 @@ fn bounded_recent_conversation<'a>(
 /// reduction. Every request has a fixed history and summary partition, and the
 /// total number of provider calls is capped. Returns the final summary and the
 /// sum of the usage `summarize` reported for every request it made.
+#[cfg(test)]
 pub(crate) async fn summarize_conversation_bounded<F, Fut>(
     conversation: &str,
     previous_summary: Option<&str>,

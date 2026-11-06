@@ -2751,10 +2751,12 @@ impl Session {
         (None, 0)
     }
 
+    #[cfg(any(test, feature = "acp"))]
     pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
         self.apply_compaction(summary, first_kept_index, token_savings, 16 * 1024, 0);
     }
 
+    #[cfg(test)]
     pub(crate) fn compress_with_budget(
         &mut self,
         summary: String,
@@ -2975,6 +2977,7 @@ pub(crate) fn format_truncated_tool_output(
 
 /// Preserve the live context bound even when artifact persistence fails. The
 /// head and tail remain useful, while the notice makes the loss explicit.
+#[cfg(test)]
 pub(crate) fn format_unpersisted_truncated_tool_output(
     output: &str,
     output_chars: usize,

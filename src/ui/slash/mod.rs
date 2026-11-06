@@ -671,6 +671,7 @@ pub(crate) fn plan_tui_compaction(
 /// to re-trigger compaction. `stage_summary` observes the summary and drain
 /// length before the session is mutated. Returns the drain length and the
 /// estimated tokens it removed.
+#[cfg(test)]
 pub(crate) async fn compact_session_with<S, F>(
     session: &mut Session,
     cut_idx: usize,
