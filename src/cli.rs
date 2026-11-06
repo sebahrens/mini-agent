@@ -1599,7 +1599,9 @@ impl Cli {
     /// Makes the relative file arguments absolute against `base` (the
     /// directory the command was launched from). Called before
     /// `project_root_discovery` changes the process directory, so `--add-dir
-    /// ./x`, `--image a.png`, `--output-schema`, `--loop-plan` and `--log-file`
+    /// ./x`, `--image a.png`, `--output-schema`, `--loop-plan`, `--log-file`,
+    /// `--import-agent-skill`, `--import-learned-skill`,
+    /// `--distill-learned-skill-out` and `--sandbox-toolchain-root`
     /// keep meaning "relative to where I typed the command". `~`-prefixed
     /// entries are left for their own home expansion.
     pub fn absolutize_launch_paths(&mut self, base: &std::path::Path) {
@@ -1612,6 +1614,21 @@ impl Cli {
         self.image.iter_mut().for_each(|p| fix(p, base));
         self.output_schema.iter_mut().for_each(|p| fix(p, base));
         self.log_file.iter_mut().for_each(|p| fix(p, base));
+        #[cfg(feature = "agent-skills")]
+        self.import_agent_skill
+            .iter_mut()
+            .for_each(|p| fix(p, base));
+        #[cfg(feature = "skills")]
+        self.import_learned_skill
+            .iter_mut()
+            .for_each(|p| fix(p, base));
+        #[cfg(feature = "skills")]
+        self.distill_learned_skill_out
+            .iter_mut()
+            .for_each(|p| fix(p, base));
+        self.sandbox_toolchain_roots
+            .iter_mut()
+            .for_each(|p| fix(p, base));
         #[cfg(feature = "loop")]
         self.loop_plan.iter_mut().for_each(|p| fix(p, base));
     }
@@ -1768,6 +1785,8 @@ mod tests {
             "a.png",
             "--output-schema",
             "s.json",
+            "--sandbox-toolchain-root",
+            "tools",
             "q",
         ])
         .unwrap();
@@ -1783,6 +1802,38 @@ mod tests {
         );
         assert_eq!(cli.image, vec![base.join("a.png")]);
         assert_eq!(cli.output_schema, Some(base.join("s.json")));
+        assert_eq!(cli.sandbox_toolchain_roots, vec![base.join("tools")]);
+    }
+
+    #[cfg(feature = "agent-skills")]
+    #[test]
+    fn launch_paths_cover_agent_skill_import() {
+        let mut cli =
+            Cli::try_parse_from(["mini-agent", "--import-agent-skill", "./my-skill"]).unwrap();
+        let base = std::path::Path::new("/launch/sub");
+        cli.absolutize_launch_paths(base);
+        assert_eq!(cli.import_agent_skill, Some(base.join("./my-skill")));
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn launch_paths_cover_learned_skill_options() {
+        let mut cli =
+            Cli::try_parse_from(["mini-agent", "--import-learned-skill", "learned"]).unwrap();
+        let base = std::path::Path::new("/launch/sub");
+        cli.absolutize_launch_paths(base);
+        assert_eq!(cli.import_learned_skill, Some(base.join("learned")));
+        let mut cli = Cli::try_parse_from([
+            "mini-agent",
+            "--distill-learned-skill",
+            "s",
+            "t",
+            "--distill-learned-skill-out",
+            "out.json",
+        ])
+        .unwrap();
+        cli.absolutize_launch_paths(base);
+        assert_eq!(cli.distill_learned_skill_out, Some(base.join("out.json")));
     }
 
     #[test]

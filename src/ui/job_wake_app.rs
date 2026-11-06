@@ -51,11 +51,11 @@ impl App<'_> {
         let prompt = crate::sandbox::job_notices::wake_prompt(&notices);
         self.renderer.write_line(
             &format!(
-                "⟳ background job{} finished: {}",
+                "⟳ background job{} reported: {}",
                 if notices.len() == 1 { "" } else { "s" },
                 notices
                     .iter()
-                    .map(|notice| format!("{} {}", notice.id, notice.status.as_str()))
+                    .map(crate::sandbox::job_notices::JobNotice::headline)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),

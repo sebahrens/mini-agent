@@ -428,6 +428,11 @@ impl Tool for ShellTool {
                     "type": "boolean",
                     "description": "Start a session-scoped background job and return its id (default false)"
                 },
+                "monitor": {
+                    "type": "string",
+                    "maxLength": MAX_UNTIL_PATTERN_BYTES,
+                    "description": "Only with background=true: a regex (Rust syntax) watched against each new output line while the job runs. Matching lines queue a bounded notice (first matching line, match count, log path) delivered like a completion notice: with the next tool result, the next model request, or by waking an idle session. At most one notice per 5 seconds and 20 per job (then use job_status until=); the full output stays in the job log."
+                },
                 "auto_background": {
                     "type": "boolean",
                     "description": "Foreground only: if the command reaches its deadline, keep it running as a background job (returning its job id and output so far) instead of killing it. Defaults to the shell_auto_background setting."
@@ -577,6 +582,22 @@ impl ShellTool {
             args.background,
         );
         let mut args = args;
+        let monitor = match args.monitor.take() {
+            None => None,
+            Some(_) if !args.background => {
+                return Err(ToolError::Msg(
+                    "shell monitor requires background=true. Example: {\"command\":\"npm run dev\",\"background\":true,\"monitor\":\"ERROR|ready\"}".into(),
+                ));
+            }
+            Some(pattern) => Some(compile_until_pattern(&pattern).map_err(
+                |error| match error {
+                    ToolError::Msg(text) => {
+                        ToolError::Msg(text.replace("job_status until", "shell monitor"))
+                    }
+                    other => other,
+                },
+            )?),
+        };
         if let Some(workdir) = args.workdir.take() {
             let plain = args.command.clone();
             args.command = self
@@ -647,6 +668,18 @@ impl ShellTool {
             if let Some(scope) = &self.job_scope {
                 scope.record(&id);
             }
+            let monitor_note = match monitor {
+                Some(regex) if self.sandbox.job_notice_queue().enabled() => {
+                    let note = format!(
+                        "\nMonitor: output lines matching /{}/ queue notices (at most 1 per 5 s, 20 per job).",
+                        regex.as_str()
+                    );
+                    super::job_monitor::spawn_monitor(&self.sandbox, &id, regex);
+                    note
+                }
+                Some(_) => "\nMonitor not started: shell-job-notifications is off.".to_string(),
+                None => String::new(),
+            };
             let log = self
                 .output_log_dir
                 .as_ref()
@@ -658,7 +691,7 @@ impl ShellTool {
                 })
                 .unwrap_or_default();
             let result = format!(
-                "Background job started: {id}\nUse job_status with this id to poll output or stop it; each poll returns only output not returned before.{log}"
+                "Background job started: {id}\nUse job_status with this id to poll output or stop it; each poll returns only output not returned before.{log}{monitor_note}"
             );
             return Ok((
                 match coaching {
@@ -1474,31 +1507,44 @@ impl JobStatusTool {
                                 .map_err(ToolError::Msg)?,
                         };
                         let mut found: Option<UntilMatch> = None;
+                        let mut unscanned: u64 = 0;
+                        let mut scan = || {
+                            while found.is_none() {
+                                let Ok(window) = self.sandbox.peek_background_job_window(
+                                    id,
+                                    scan_from,
+                                    UNTIL_SCAN_BYTES,
+                                ) else {
+                                    break;
+                                };
+                                let (hit, next, lost) = scan_for_pattern_chunked(regex, &window);
+                                unscanned += lost;
+                                found = hit;
+                                if next <= scan_from && found.is_none() {
+                                    break;
+                                }
+                                scan_from = next;
+                                if window.next <= scan_from && found.is_none() {
+                                    break;
+                                }
+                            }
+                            found.is_some()
+                        };
                         let snapshot = self
                             .sandbox
-                            .wait_background_job_until(id, wait, Some(UNTIL_POLL_INTERVAL), || {
-                                while found.is_none() {
-                                    let Ok(window) = self.sandbox.peek_background_job_window(
-                                        id,
-                                        scan_from,
-                                        UNTIL_SCAN_BYTES,
-                                    ) else {
-                                        break;
-                                    };
-                                    let (hit, next) = scan_for_pattern(regex, &window);
-                                    found = hit;
-                                    if next <= scan_from && found.is_none() {
-                                        break;
-                                    }
-                                    scan_from = next;
-                                    if window.next <= scan_from && found.is_none() {
-                                        break;
-                                    }
-                                }
-                                found.is_some()
-                            })
+                            .wait_background_job_until(id, wait, Some(UNTIL_POLL_INTERVAL), &mut scan)
                             .await
                             .map_err(ToolError::Msg)?;
+                        // The wait may end on job exit or the deadline between
+                        // polls with output never scanned: scan once more.
+                        scan();
+                        let skipped_note = if found.is_none() && unscanned > 0 {
+                            format!(
+                                " {unscanned} bytes of output were not available to scan (not retained or logged)."
+                            )
+                        } else {
+                            String::new()
+                        };
                         wait_note = Some(match &found {
                             Some(hit) => format!(
                                 "Wait: output matched /{}/ (in bytes {}..{}): {}",
@@ -1508,11 +1554,11 @@ impl JobStatusTool {
                                 hit.line
                             ),
                             None if snapshot.status.is_terminal() => format!(
-                                "Wait: the job ended without output matching /{}/; any unread output follows.",
+                                "Wait: the job ended without output matching /{}/; any unread output follows.{skipped_note}",
                                 regex.as_str()
                             ),
                             None => format!(
-                                "Wait: output did not match /{}/ within {} ms; the job is still running.",
+                                "Wait: output did not match /{}/ within {} ms; the job is still running.{skipped_note}",
                                 regex.as_str(),
                                 wait.as_millis()
                             ),
@@ -1693,6 +1739,41 @@ fn scan_for_pattern(regex: &regex::Regex, window: &OutputWindow) -> (Option<Unti
         None => offset,
     };
     (None, next.max(window.start))
+}
+
+/// [`scan_for_pattern`] that also covers the middle of a window the capture
+/// had to split (`skipped > 0`): it scans only the head and resumes after it,
+/// so the whole backlog is examined in `UNTIL_SCAN_BYTES` chunks. The third
+/// value counts bytes that could not be read at all (neither retained nor
+/// logged) and were therefore jumped over.
+fn scan_for_pattern_chunked(
+    regex: &regex::Regex,
+    window: &OutputWindow,
+) -> (Option<UntilMatch>, u64, u64) {
+    if window.skipped == 0 || window.head.is_empty() {
+        let (hit, next) = scan_for_pattern(regex, window);
+        let lost = if hit.is_none() { window.skipped } else { 0 };
+        return (hit, next, lost);
+    }
+    let head_only = OutputWindow {
+        start: window.start,
+        head: window.head.clone(),
+        skipped: 0,
+        tail: Vec::new(),
+        next: window.start + window.head.len() as u64,
+    };
+    let (hit, next) = scan_for_pattern(regex, &head_only);
+    if hit.is_some() {
+        return (hit, next, 0);
+    }
+    // Resume at the start of the head's last line so a match split across the
+    // chunk boundary is still found; always make progress.
+    let resume = if next > window.start {
+        next
+    } else {
+        head_only.next
+    };
+    (None, resume, 0)
 }
 
 /// Source-compatibility alias for integrations that still construct the old
@@ -3381,6 +3462,105 @@ mod tests {
             assert!(status.call(bad).await.is_err());
         }
         shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_until_scans_output_of_a_job_that_already_ended() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: "echo ready; exit 0".to_string(),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        // Let the job exit before the first wait so the regex is never
+        // evaluated while it is still running.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let waited = status
+            .call(JobStatusArgs {
+                id: Some(id),
+                action: JobAction::Wait,
+                timeout_ms: Some(5_000),
+                until: Some("ready".into()),
+                since: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(waited.contains("Wait: output matched /ready/"), "{waited}");
+        assert!(
+            !waited.contains("ended without output matching"),
+            "{waited}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_until_matches_a_marker_in_the_middle_of_a_large_backlog() {
+        let dir = crate::tests::support::temp::TempDir::new("until-backlog");
+        let shell = test_tool().with_output_log_dir(Some(dir.path().join("logs")));
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: "yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c 300000; \
+                          echo MIDDLE_MARKER_7; \
+                          yes yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy | head -c 800000; sleep 30"
+                    .to_string(),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let waited = status
+            .call(JobStatusArgs {
+                id: Some(id.clone()),
+                action: JobAction::Wait,
+                timeout_ms: Some(20_000),
+                until: Some("MIDDLE_MARKER_7".into()),
+                since: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            waited.contains("Wait: output matched /MIDDLE_MARKER_7/"),
+            "{}",
+            &waited[..waited.len().min(400)]
+        );
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    #[test]
+    fn chunked_until_scan_walks_the_head_of_a_split_window_and_resumes() {
+        let regex = compile_until_pattern("needle").unwrap();
+        let split = OutputWindow {
+            start: 0,
+            head: b"aaa\nbbb needle\nccc".to_vec(),
+            skipped: 1000,
+            tail: b"zzz\n".to_vec(),
+            next: 1024,
+        };
+        assert!(scan_for_pattern_chunked(&regex, &split).0.is_some());
+        let no_hit = OutputWindow {
+            head: b"aaa\nbbb\nccc".to_vec(),
+            ..split
+        };
+        let (hit, next, lost) = scan_for_pattern_chunked(&regex, &no_hit);
+        assert!(hit.is_none());
+        assert_eq!((next, lost), (8, 0), "resume at the head's last line");
+        let unreadable = OutputWindow {
+            head: Vec::new(),
+            ..no_hit
+        };
+        let (_, _, lost) = scan_for_pattern_chunked(&regex, &unreadable);
+        assert_eq!(lost, 1000, "unreadable bytes are reported, not hidden");
     }
 
     #[cfg(unix)]

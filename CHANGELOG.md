@@ -15,6 +15,7 @@ Notable changes to mini-agent are documented in this file. The format follows
   `[lsp.servers.<name>]` entry in user config still opts in explicitly (mini-agent-xb0h3).
 - A managed policy that sets `permissions.deny`, `allowed_modes` or `disable_yolo` now also refuses
   `--dangerously-skip-permissions`, since skipping checks would void those rules (mini-agent-khizh).
+- `job_status` `wait` with `until=` scans unread output once more after the job ends or the deadline hits, and walks backlogs larger than 256 KiB in chunks (reporting bytes that were neither retained nor logged) instead of skipping the middle (mini-agent-d1v5g, mini-agent-kjdud). `--import-agent-skill`, `--import-learned-skill`, `--distill-learned-skill-out` and `--sandbox-toolchain-root` resolve against the launch directory (mini-agent-zn9i2). The bwrap network forwarder answers connections beyond its relay cap with an HTTP 503 and a one-line stderr notice, and the cap is configurable with `MINI_AGENT_NET_MAX_RELAYS` (mini-agent-tgmxc).
 - Relative `--add-dir`, `--image`, `--output-schema`, `--loop-plan` and `--log-file` paths keep
   resolving against the launch directory under `project_root_discovery` (mini-agent-k8w51). The
   `--stream-json-control` sandbox network ask is per `host:port` (concurrent connections share one
@@ -34,6 +35,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Managed policy `[sandbox]` gains `max_profile`, `max_network`, `allowed_hosts` and `forbid_home_mounts`: user, project
   and CLI settings can no longer widen the sandbox beyond them; `--sandbox-profile` above the ceiling is refused
   and `/doctor` lists the pins (mini-agent-hjg3d).
+- `shell` `background=true` accepts `monitor=<regex>`: matching lines of the running job queue rate-limited notices (first line, match count, log path; at most 1 per 5 s and 20 per job) delivered like completion notices, including the idle wake (mini-agent-1cg19).
 - Built-in language servers for Java (`jdtls`), C# (`csharp-ls`), Ruby (`ruby-lsp`), PHP (`intelephense`), Kotlin
   (`kotlin-language-server`), Swift (`sourcekit-lsp`) and Zig (`zls`), used only when on PATH (mini-agent-f8tdh).
 - `job_status action=wait` takes `until=<regex>` and returns as soon as new output matches, reporting the

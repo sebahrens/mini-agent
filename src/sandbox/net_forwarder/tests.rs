@@ -104,13 +104,15 @@ fn connections_beyond_the_cap_are_refused_and_slots_are_freed() {
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
     let mut rest = Vec::new();
-    // Refused: closed at once (EOF or reset), not held open until timeout.
+    // Refused: answered with a reason and closed at once, not held open.
     let result = second.read_to_end(&mut rest);
-    assert!(rest.is_empty());
     assert!(
         result.is_ok() || result.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset,
         "the extra connection must be closed, not left hanging"
     );
+    let text = String::from_utf8_lossy(&rest);
+    assert!(text.starts_with("HTTP/1.1 503"), "{text}");
+    assert!(text.contains(MAX_RELAYS_ENV), "{text}");
     // Closing the first frees the slot for a new connection.
     drop(first);
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -128,5 +130,52 @@ fn connections_beyond_the_cap_are_refused_and_slots_are_freed() {
         ),
         "accepted connection stays open: {error:?}"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn relay_cap_env_value_is_parsed_and_clamped() {
+    assert_eq!(parse_max_relays(None), MAX_CONCURRENT_RELAYS);
+    assert_eq!(parse_max_relays(Some("")), MAX_CONCURRENT_RELAYS);
+    assert_eq!(parse_max_relays(Some("0")), MAX_CONCURRENT_RELAYS);
+    assert_eq!(parse_max_relays(Some("junk")), MAX_CONCURRENT_RELAYS);
+    assert_eq!(parse_max_relays(Some(" 512 ")), 512);
+    assert_eq!(parse_max_relays(Some("999999")), MAX_RELAYS_LIMIT);
+}
+
+#[test]
+fn a_refused_streak_writes_one_notice_line_to_the_command_stderr() {
+    let dir = std::env::temp_dir().join(format!("ma-fwd-notice-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let socket = dir.join("p.sock");
+    let upstream = UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || {
+        for stream in upstream.incoming() {
+            let mut stream = stream.unwrap();
+            std::thread::spawn(move || {
+                let mut sink = Vec::new();
+                let _ = stream.read_to_end(&mut sink);
+            });
+        }
+    });
+    let sink_path = dir.join("stderr.txt");
+    let sink = std::fs::File::create(&sink_path).unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let socket_for_bridge = socket.clone();
+    std::thread::spawn(move || serve_capped_notify(&listener, &socket_for_bridge, 1, Some(sink)));
+    let mut first = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    first.write_all(b"x").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for _ in 0..3 {
+        let mut refused = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let mut rest = Vec::new();
+        let _ = refused.read_to_end(&mut rest);
+    }
+    let logged = std::fs::read_to_string(&sink_path).unwrap();
+    assert_eq!(logged.lines().count(), 1, "once per streak: {logged}");
+    assert!(logged.contains("more than 1 concurrent"), "{logged}");
+    drop(first);
     let _ = std::fs::remove_dir_all(dir);
 }

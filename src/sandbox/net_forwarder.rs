@@ -53,9 +53,13 @@ fn run(args: &[OsString]) -> Result<std::convert::Infallible, String> {
     match unsafe { libc::fork() } {
         -1 => return Err(format!("fork failed: {}", std::io::Error::last_os_error())),
         0 => {
+            // Keep a private copy of the command's stderr so a refused
+            // connection can be reported to it once the std streams are nulled.
+            let notice = dup_stderr();
             detach_bridge();
-            close_other_descriptors(listener.as_raw_fd());
-            serve(&listener, &socket);
+            let keep = notice.as_ref().map(AsRawFd::as_raw_fd);
+            close_other_descriptors(listener.as_raw_fd(), keep);
+            serve_capped_notify(&listener, &socket, max_concurrent_relays(), notice);
             // `serve` only returns if accepting fails for good.
             std::process::exit(0);
         }
@@ -109,9 +113,9 @@ fn detach_bridge() {
 
 /// Drop every inherited descriptor (notably the workspace-authority fd) except
 /// the listener.
-fn close_other_descriptors(keep: i32) {
+fn close_other_descriptors(keep: i32, also_keep: Option<i32>) {
     for fd in 3..4096 {
-        if fd != keep {
+        if fd != keep && Some(fd) != also_keep {
             // SAFETY: closing an arbitrary descriptor number; EBADF is fine.
             unsafe {
                 libc::close(fd);
@@ -120,9 +124,40 @@ fn close_other_descriptors(keep: i32) {
     }
 }
 
-/// Most connections relayed at once; each costs two threads, so extra
-/// connections are refused (closed) instead of exhausting the namespace.
+/// Default most connections relayed at once; each costs two threads, so extra
+/// connections are refused instead of exhausting the namespace.
 const MAX_CONCURRENT_RELAYS: usize = 256;
+/// Environment variable (read on the host when the command is launched)
+/// that overrides the relay cap; clamped to `1..=MAX_RELAYS_LIMIT`.
+pub const MAX_RELAYS_ENV: &str = "MINI_AGENT_NET_MAX_RELAYS";
+const MAX_RELAYS_LIMIT: usize = 4096;
+
+/// Relay cap from a raw `MINI_AGENT_NET_MAX_RELAYS` value; invalid or empty
+/// values fall back to the default.
+pub(crate) fn parse_max_relays(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map_or(MAX_CONCURRENT_RELAYS, |value| value.min(MAX_RELAYS_LIMIT))
+}
+
+fn max_concurrent_relays() -> usize {
+    parse_max_relays(std::env::var(MAX_RELAYS_ENV).ok().as_deref())
+}
+
+fn dup_stderr() -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: duplicating a descriptor this process owns; the new fd is
+    // wrapped exactly once.
+    let fd = unsafe { libc::dup(2) };
+    // SAFETY: `fd` is a fresh descriptor owned by nothing else.
+    (fd >= 0).then(|| unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn refusal_message(cap: usize) -> String {
+    format!(
+        "mini-agent sandbox network: more than {cap} concurrent connections; extra connections are refused until others close (raise the cap with {MAX_RELAYS_ENV} on the host)"
+    )
+}
 
 /// Frees a relay slot when the connection ends, however it ends.
 struct RelaySlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -133,13 +168,43 @@ impl Drop for RelaySlot {
     }
 }
 
-/// Relay every loopback connection to the proxy socket.
+/// Relay every loopback connection to the proxy socket (test entry point;
+/// production uses [`serve_capped_notify`] with the stderr notice sink).
+#[cfg(test)]
 pub(crate) fn serve(listener: &TcpListener, socket: &Path) {
-    serve_capped(listener, socket, MAX_CONCURRENT_RELAYS);
+    serve_capped(listener, socket, max_concurrent_relays());
 }
 
+#[cfg(test)]
 fn serve_capped(listener: &TcpListener, socket: &Path, cap: usize) {
+    serve_capped_notify(listener, socket, cap, None);
+}
+
+/// Tell a refused client why, as an HTTP 503 (the sandbox proxy protocol), so
+/// the command sees a reason instead of a bare reset. Best effort, never blocks.
+fn reject_over_cap(client: TcpStream, cap: usize) {
+    let body = refusal_message(cap);
+    let response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut client = client;
+    if client.set_nonblocking(true).is_ok() {
+        let _ = client.write_all(response.as_bytes());
+    }
+    let _ = client.shutdown(std::net::Shutdown::Both);
+}
+
+/// [`serve`] with an explicit cap and an optional sink (the command's stderr)
+/// that receives one line per streak of refused connections.
+fn serve_capped_notify(
+    listener: &TcpListener,
+    socket: &Path,
+    cap: usize,
+    mut notice: Option<std::fs::File>,
+) {
     use std::sync::atomic::Ordering;
+    let mut refusing = false;
     let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut backoff = super::net_proxy::AcceptBackoff::default();
     for client in listener.incoming() {
@@ -151,9 +216,16 @@ fn serve_capped(listener: &TcpListener, socket: &Path, cap: usize) {
         backoff.succeeded();
         if active.fetch_add(1, Ordering::AcqRel) >= cap {
             active.fetch_sub(1, Ordering::AcqRel);
-            drop(client);
+            if !refusing {
+                refusing = true;
+                if let Some(sink) = notice.as_mut() {
+                    let _ = writeln!(sink, "{}", refusal_message(cap));
+                }
+            }
+            reject_over_cap(client, cap);
             continue;
         }
+        refusing = false;
         let slot = RelaySlot(active.clone());
         let socket = socket.to_path_buf();
         let spawned = std::thread::Builder::new()
