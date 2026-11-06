@@ -404,7 +404,8 @@ paged header names the window (`entries 151-160 of 160`). Depth 2-3 expands
 subdirectories into an indented, directory-first tree of relative paths that
 shares the same cap and paging; subdirectories are opened no-follow relative to
 their parent descriptor with the same ignore, skip and deny filters, and a tree
-stops collecting at 10,000 entries with a notice. Read windows size their line-number
+stops collecting at 10,000 entries with a notice; a flat depth-1 listing is
+pageable through every entry (safety ceiling 1,000,000, named in the notice). Read windows size their line-number
 column from the actual range and report an offset past EOF directly instead of
 showing an inverted range.
 
