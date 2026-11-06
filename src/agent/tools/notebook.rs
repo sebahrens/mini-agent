@@ -663,6 +663,9 @@ impl NotebookTool {
             },
             args.path
         );
+        if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
+            output.push_str(&notice);
+        }
         if let Some(coaching) = coaching {
             output = format!("{coaching}\n\n{output}");
         }

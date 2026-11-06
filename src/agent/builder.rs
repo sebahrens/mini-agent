@@ -621,6 +621,22 @@ fn compose_registered_preamble(
     composition
 }
 
+/// Installs the `/rewind` checkpoint limits from configuration. Tests keep
+/// the process-wide defaults so concurrent checkpoint tests are not affected.
+fn configure_file_checkpoints(cfg: &Config) {
+    let checkpoints = cfg.file_checkpoints.unwrap_or_default();
+    let limits = crate::session::file_checkpoints::Limits::resolve(
+        checkpoints.max_file_bytes,
+        checkpoints.max_total_bytes,
+        checkpoints.max_records,
+        cfg.max_text_file_size,
+    );
+    #[cfg(not(test))]
+    crate::session::file_checkpoints::configure(limits);
+    #[cfg(test)]
+    let _ = limits;
+}
+
 fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec<&'static str> {
     if cli.resolve_no_tools(cfg) {
         return Vec::new();
@@ -1047,6 +1063,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         None
     } else {
         let max_text_file_size = cfg.max_text_file_size;
+        configure_file_checkpoints(cfg);
         let max_read_lines = cfg.resolve_max_read_lines();
         let max_bash_output_lines = cfg.resolve_max_bash_output_lines();
         let max_grep_results = cfg.resolve_max_grep_results();

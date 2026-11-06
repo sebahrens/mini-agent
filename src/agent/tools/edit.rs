@@ -1825,6 +1825,9 @@ impl EditTool {
                 private_fallback.expect("configured formatting retains an input-only fallback");
             diff = None;
         }
+        if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
+            result.push_str(&notice);
+        }
         Ok(MutationOutcome {
             output: result,
             diff,

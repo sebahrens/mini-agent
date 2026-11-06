@@ -74,6 +74,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `notebook_edit` changes are now captured by file checkpoints, so `/rewind` "restore files" lists
   and restores the exact pre-edit `.ipynb` bytes instead of silently skipping them
   (mini-agent-qs5dg).
+- File checkpoints no longer stop silently: the first mutation a session cannot capture (record,
+  per-file or session byte limit, read policy, outside workspace) appends a one-time notice with
+  the reason to the tool result, `/rewind` reports `N edits not restorable (<reason>)`, and the
+  limits are configurable under `[file_checkpoints]` (`max_file_bytes` defaulting to the edit/write
+  size limit, `max_total_bytes` 64 MiB, `max_records` 2048; previously fixed at 1 MiB / 16 MiB /
+  512) (mini-agent-m4au3).
 
 ### Added
 

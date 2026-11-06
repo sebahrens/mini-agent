@@ -1063,3 +1063,17 @@ mod running_input_tests {
         assert!(toml::from_str::<crate::config::Config>("running_input = 'replace'").is_err());
     }
 }
+
+/// `[file_checkpoints]`: limits for the exact preimages `/rewind` restores.
+/// Absent fields use the documented defaults; values are clamped to hard
+/// ceilings (1 GiB per file, 4 GiB per session, 100000 records).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileCheckpointsConfig {
+    /// Largest file (pre- or postimage) that is checkpointed.
+    pub max_file_bytes: Option<u64>,
+    /// Total preimage bytes retained per session.
+    pub max_total_bytes: Option<u64>,
+    /// Mutation records (and distinct preimages) retained per session.
+    pub max_records: Option<u64>,
+}

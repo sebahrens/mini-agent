@@ -263,6 +263,9 @@ pub struct Config {
     pub verify_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_text_file_size: Option<u64>,
+    /// `/rewind` file checkpoint limits (`[file_checkpoints]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_checkpoints: Option<crate::config::types::FileCheckpointsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_read_lines: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -542,6 +542,9 @@ impl WriteTool {
                 result = private_fallback.expect("configured formatting retains a static fallback");
                 diff = None;
             }
+            if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
+                result.push_str(&notice);
+            }
             return Ok(MutationOutcome {
                 output: result,
                 diff,
@@ -720,6 +723,9 @@ impl WriteTool {
         {
             result = private_fallback.expect("configured formatting retains a static fallback");
             diff = None;
+        }
+        if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
+            result.push_str(&notice);
         }
         Ok(MutationOutcome {
             output: result,

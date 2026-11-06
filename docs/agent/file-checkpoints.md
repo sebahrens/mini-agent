@@ -24,11 +24,19 @@ agents. Shell commands and arbitrary external processes are not checkpointed.
 
 Preimages are SHA-256 addressed private `.bin` files in the session's existing
 `tool-outputs/<opaque-session-directory>/checkpoints` directory. The private
-session JSON contains only the bounded turn/path/digest inventory. Each file is
-limited to 1 MiB, the session to 16 MiB of preimages and 512 mutation records.
-Oversized, unreadable, external-workspace or READ-disallowed preimages are not
-captured; missing checkpoints visibly prevent file restoration for the affected
-range. Content blobs may remain after an interrupted write, count against the
+session JSON contains only the bounded turn/path/digest inventory. Limits are
+configurable under `[file_checkpoints]`: `max_file_bytes` (largest pre- or
+postimage; default follows the edit/write size limit), `max_total_bytes`
+(preimage bytes per session, default 64 MiB) and `max_records` (mutation records
+and distinct preimages per session, default 2048), clamped to 1 GiB, 4 GiB and
+100000. Saved inventories are validated against those hard ceilings, so a
+session written under larger limits still loads. Oversized, unreadable,
+external-workspace or READ-disallowed preimages and mutations past a limit are
+not captured. The first uncaptured mutation of a session appends a one-time
+notice with the reason to that tool's result (so both the model and the
+transcript see it at once); the `/rewind` picker then reports
+`N edits not restorable (<reason>)` for the affected range, and missing
+checkpoints prevent file restoration for it. Content blobs may remain after an interrupted write, count against the
 same recorded byte budget, and are never interpreted as executable instructions.
 `--no-session` uses an in-memory preimage store and creates no checkpoint files.
 
