@@ -691,6 +691,168 @@ async fn image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlat
     }
 }
 
+/// mini-agent-yegs4: the four routes the original image audit skipped. Each
+/// reuses a stock converter: Copilot Chat bridges, Copilot Responses and Azure
+/// Responses send native `input_image`, Azure Chat bridges, and Bedrock/Vertex
+/// are native Anthropic Messages. Copilot must also flag the request as vision
+/// when the only image is inside a tool result.
+#[cfg(all(feature = "multimodal", feature = "bedrock", feature = "vertex"))]
+#[tokio::test]
+async fn image_tool_results_on_copilot_azure_bedrock_vertex_routes() {
+    use crate::agent::tools::read_image::ImageFormat;
+    use crate::provider::{AnyModel, OpenAiModel};
+    use crate::tests::support::loopback_http::asynchronous::{accept_request, bind, respond};
+    use rig::completion::{CompletionModel, CompletionRequest};
+    let encoded = base64::engine::general_purpose::STANDARD.encode(PNG);
+    for (route, style, model_name) in [
+        ("copilot", "completions", "owned-chat"),
+        ("copilot", "responses", "owned-codex"),
+        ("azure", "responses", "owned-deployment"),
+        ("azure", "completions", "owned-deployment"),
+        ("bedrock", "native", "us.anthropic.claude-owned-v1:0"),
+        ("vertex", "native", "claude-owned@20260101"),
+    ] {
+        let (listener, base) = bind().await;
+        let (provider, custom) = match route {
+            "copilot" => (
+                "owned-copilot",
+                serde_json::json!({"provider_type":"copilot","base_url":base,"api_key_env":"OWN_TOKEN"}),
+            ),
+            "azure" => (
+                "azure",
+                serde_json::json!({"provider_type":"azure","base_url":base,"api_style":style,"inherit_builtin_key":true}),
+            ),
+            "bedrock" => (
+                "owned-bedrock",
+                serde_json::json!({"provider_type":"bedrock","base_url":format!("{base}/anthropic"),"inherit_builtin_key":true}),
+            ),
+            _ => (
+                "owned-vertex",
+                serde_json::json!({"provider_type":"vertex","base_url":base,"inherit_builtin_key":true}),
+            ),
+        };
+        let customs = std::collections::HashMap::from([(
+            provider.to_string(),
+            serde_json::from_value::<crate::config::CustomProviderConfig>(custom).unwrap(),
+        )]);
+        let client =
+            crate::provider::create_client_with_env(provider, None, &customs, None, |name| {
+                match name {
+                    "OWN_TOKEN"
+                    | "AZURE_OPENAI_API_KEY"
+                    | "AWS_BEARER_TOKEN_BEDROCK"
+                    | "VERTEX_ACCESS_TOKEN" => Ok("owned-fixture-key".into()),
+                    "AZURE_OPENAI_ENDPOINT" => Ok(base.clone()),
+                    "AWS_REGION" => Ok("us-east-1".into()),
+                    "GOOGLE_CLOUD_PROJECT" => Ok("owned-project".into()),
+                    "GOOGLE_CLOUD_LOCATION" => Ok("us-east5".into()),
+                    _ => Err(std::env::VarError::NotPresent),
+                }
+            })
+            .unwrap_or_else(|error| panic!("{route}/{style}: {error}"));
+        let model = client.completion_model(model_name);
+        // Unknown catalogue capability: the read is admitted and the provider
+        // remains the authority, as for any custom model.
+        assert!(
+            model
+                .image_read_support(None)
+                .check(ImageFormat::Png)
+                .is_ok(),
+            "{route}/{style}"
+        );
+        let request = CompletionRequest {
+            model: None,
+            preamble: Some("immutable image policy".into()),
+            chat_history: OneOrMany::many(interactions()).unwrap(),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(64),
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        };
+        let send = async {
+            match &model {
+                AnyModel::Anthropic(model) => model.completion(request).await.map(|_| ()),
+                AnyModel::OpenAI(OpenAiModel::Completions(model)) => {
+                    model.completion(request).await.map(|_| ())
+                }
+                AnyModel::OpenAI(OpenAiModel::Responses(model)) => {
+                    model.completion(request).await.map(|_| ())
+                }
+                AnyModel::Copilot(model) => model.completion(request).await.map(|_| ()),
+                _ => panic!("{route}/{style}: unexpected converter"),
+            }
+        };
+        let receive = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut socket, request) = accept_request(&listener).await;
+            respond(&mut socket, "400 Bad Request", "application/json", "{}").await;
+            request
+        });
+        let (result, captured) = tokio::join!(send, receive);
+        assert!(result.is_err());
+        let captured =
+            captured.unwrap_or_else(|_| panic!("{route}/{style} never reached HTTP: {result:?}"));
+        let body = captured.json();
+        let text = body.to_string();
+        assert!(text.contains(&encoded), "{route}/{style}: {body}");
+        assert!(
+            text.contains("image-call") && text.contains("notes remain text"),
+            "{route}/{style}: {body}"
+        );
+        if route == "copilot" {
+            assert!(
+                captured.headers.contains("copilot-vision-request: true"),
+                "{style}: {}",
+                captured.headers
+            );
+        }
+        match (route, style) {
+            (_, "responses") => {
+                let output = body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|part| {
+                        part["type"] == "function_call_output" && part["call_id"] == "image-call"
+                    })
+                    .unwrap_or_else(|| panic!("{route}: {body}"));
+                assert!(
+                    output["output"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|part| part["type"] == "input_image"),
+                    "{route}: {body}"
+                );
+            }
+            (_, "completions") => {
+                let last = body["messages"].as_array().unwrap().last().unwrap();
+                assert_eq!(last["role"], "user", "{route}: {body}");
+                assert!(last.to_string().contains(&encoded), "{route}: {body}");
+            }
+            _ => {
+                let native = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|m| m["content"].as_array().into_iter().flatten())
+                    .any(|part| {
+                        part["type"] == "tool_result"
+                            && part["tool_use_id"] == "image-call"
+                            && part["content"].as_array().is_some_and(|parts| {
+                                parts.iter().any(|part| {
+                                    part["type"] == "image" && part["source"]["data"] == encoded
+                                })
+                            })
+                    });
+                assert!(native, "{route}: {body}");
+            }
+        }
+    }
+}
+
 #[cfg(feature = "multimodal")]
 #[tokio::test]
 async fn image_read64_existing_read_deny_and_byte_limit_precede_payload() {

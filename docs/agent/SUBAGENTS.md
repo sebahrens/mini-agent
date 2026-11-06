@@ -575,7 +575,8 @@ If that turn yields nothing, the child's narration is returned under the same
 header. Both continuations are charged to the repair allocation.
 
 Each child also records a bounded tool log (tool name, truncated arguments,
-result size, error; at most 24 rows per child, extra calls only counted).
+result size including base64 image bytes, error; at most 24 rows per child,
+extra calls only counted).
 `/tasks <id>` shows it for background tasks (stored with the task result and
 persisted with the session) and for the eight most recent foreground calls
 (in memory, listed by `/tasks`). When the host replaces a child's text with a
@@ -765,7 +766,7 @@ Only active pure learned-JS exports can be installed in this realm.
 | `memory_write` | Subagent should not persist memory      |
 | `todo`         | Not registered — no planning tool in child context |
 | `task`         | Nested subagents are deliberately unsupported |
-| `mcp_tool`     | External, unpredictable — out of scope  |
+| MCP tools      | Not inherited from the parent; a persona opts in per server and tool through its `mcp_servers` allowlist (persona frontmatter, described above: at most 8 servers and 32 tools, child-only, no fallback to the parent's connections) |
 
 ## Security & Permissions
 
@@ -778,7 +779,8 @@ same path-containment and approval rules as the parent:
   through the parent approval channel, exactly as they would be for the main
   agent.
 - **Default profile has no mutation tools**: the child has no `write`, `edit`, `bash`, or
-  `mcp_tool`. Its optional JS realm has no writer, network, process, or
+  MCP tools; a persona's exact `mcp_servers` allowlist is the only way a child
+  gets MCP access. Its optional JS realm has no writer, network, process, or
   session-state globals and its broker grant contains only read authority, so
   it cannot modify files, run commands, or reach external services regardless
   of permissions.
@@ -1057,7 +1059,11 @@ share. This prevents concurrent children from each spending the full aggregate
 budget before the scheduler observes their usage. A provider response can
 report usage beyond its reservation because usage arrives after that response;
 such an overrun stops the call immediately and is charged only to the reserved
-share in the bounded aggregate report.
+share in the bounded aggregate report. Images a child reads are charged too: through
+provider-reported usage, or, when a route omits usage, through the local
+estimate's patch-formula image charge. A child's history admits at most 4 MiB
+of encoded image data; see [IMAGE_READ.md](IMAGE_READ.md) for the formula and
+the omission behaviour.
 
 The first child failure stops new launches and cancels in-flight siblings.
 Aggregate output exhaustion, aggregate cost exhaustion, and the whole-call
@@ -1139,7 +1145,11 @@ limits apply to the next delegation. The cost policy keys `task_cost_weighting`,
 `/config task_cost_weights { input = 1.0, output = 5.0 }` persist validated
 settings. Use object forms in JSON configuration files and inline tables in
 `/config` or `--config` TOML literals. Reports are capped at 32 KiB per child and 128 KiB per batch, roughly 8K
-and 32K tokens respectively (actual token counts vary). This keeps batch reports
+and 32K tokens respectively (actual token counts vary). These caps are what the
+parent sees inline: `task` is a self-bounded tool, so the parent's generic
+12,000-character tool-result spill (head/tail plus spill path) never cuts a
+rendered task result, live or on replay. Lower `task_max_report_bytes` or
+`task_max_output_bytes` to make reports shorter. This keeps batch reports
 near 3% of a 1M-token parent context by default; a large child context
 is not permission to return an equally large report. Read/write authorization,
 write serialization, cancellation, and the session spend ceiling are unchanged.

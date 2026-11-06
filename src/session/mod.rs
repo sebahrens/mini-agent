@@ -28,10 +28,21 @@ pub const TOOL_RESULT_TAIL_CHARS: usize = 8_000;
 
 /// These built-ins enforce their own documented line, byte, or result caps.
 /// Applying the generic spill cap again would lose their continuation contract.
+/// `task` renders its reports within `task_max_report_bytes` per child and
+/// `task_max_output_bytes` per call; those caps, not this generic threshold,
+/// decide what the parent sees inline.
 pub(crate) fn tool_result_is_self_bounded(name: &str) -> bool {
     matches!(
         name,
-        "read" | "shell" | "grep" | "find_files" | "list_dir" | "js" | "web_fetch" | "web_search"
+        "read"
+            | "shell"
+            | "grep"
+            | "find_files"
+            | "list_dir"
+            | "js"
+            | "web_fetch"
+            | "web_search"
+            | "task"
     )
 }
 /// Count-only pruning is opt-in. The normal context-budget compactor decides
@@ -3472,6 +3483,7 @@ mod preflight_tests {
             "js",
             "web_fetch",
             "web_search",
+            "task",
         ] {
             let (content, replay, artifact) = session.tool_result_content("id", tool, &output);
             assert_eq!(content, format!("{tool}:\n{output}"));

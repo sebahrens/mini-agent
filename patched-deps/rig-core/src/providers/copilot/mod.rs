@@ -549,11 +549,19 @@ fn request_initiator(request: &completion::CompletionRequest) -> &'static str {
     "user"
 }
 
+/// Images nested in tool results (native Responses `input_image` parts, or
+/// the user image the Chat Completions bridge appends) also need the vision
+/// header; mini-agent patch, see PATCH.md.
 fn request_has_vision(request: &completion::CompletionRequest) -> bool {
     request.chat_history.iter().any(|message| match message {
-        crate::completion::Message::User { content } => content
-            .iter()
-            .any(|item| matches!(item, crate::message::UserContent::Image(_))),
+        crate::completion::Message::User { content } => content.iter().any(|item| match item {
+            crate::message::UserContent::Image(_) => true,
+            crate::message::UserContent::ToolResult(result) => result
+                .content
+                .iter()
+                .any(|part| matches!(part, crate::message::ToolResultContent::Image(_))),
+            _ => false,
+        }),
         _ => false,
     })
 }

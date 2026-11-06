@@ -1973,6 +1973,9 @@ struct CacheEntry {
     hash: u64,
     wide: u64,
     narrow: u64,
+    /// Patch-formula tokens of the message's images, whose base64 payload is
+    /// excluded from `narrow`.
+    image_tokens: u64,
 }
 
 /// Memoized character counts of the request shell. The tool `Arc`s are held so
@@ -2096,8 +2099,10 @@ fn shell_char_counts(
     Some((wide, narrow))
 }
 
-/// Exactly `Session::estimate_tokens(&serde_json::to_string(request))`,
-/// serializing only the history messages not seen on an earlier call.
+/// Exactly `Session::estimate_tokens(&serde_json::to_string(request))` for an
+/// image-free request, serializing only the history messages not seen on an
+/// earlier call. Literal image payloads are charged by the patch-formula token
+/// estimate instead of their base64 length (mini-agent-kj8mn).
 #[cfg(feature = "subagents")]
 pub(crate) fn incremental_request_estimate(
     ctx: &rig::agent::HookContext,
@@ -2128,19 +2133,24 @@ pub(crate) fn incremental_request_estimate(
     for message in request.chat_history.iter().skip(keep) {
         let json = serde_json::to_string(message).ok()?;
         let (message_wide, message_narrow) = crate::session::Session::char_counts(&json);
+        let images = crate::extras::subagents::image_cost::message_image_cost(message);
         measured.push(CacheEntry {
             hash: serde_fingerprint(message)?,
             wide: message_wide,
-            narrow: message_narrow,
+            narrow: message_narrow.saturating_sub(images.encoded_chars),
+            image_tokens: images.tokens,
         });
     }
+    let mut image_tokens = 0u64;
     for entry in measured.iter() {
         wide += entry.wide;
         narrow += entry.narrow;
+        image_tokens = image_tokens.saturating_add(entry.image_tokens);
     }
-    Some(crate::session::Session::estimate_tokens_from_counts(
-        wide, narrow,
-    ))
+    Some(
+        crate::session::Session::estimate_tokens_from_counts(wide, narrow)
+            .saturating_add(image_tokens),
+    )
 }
 
 #[cfg(feature = "subagents")]
@@ -5579,15 +5589,19 @@ where
     .await
 }
 
-/// Messages of text in a tool result, in bytes.
+/// Payload bytes of a tool result: text plus literal (base64) image data, so
+/// an image-only result is not logged as zero bytes.
 #[cfg(feature = "subagents")]
-fn tool_result_text_bytes(result: &rig::message::ToolResult) -> u64 {
+fn tool_result_payload_bytes(result: &rig::message::ToolResult) -> u64 {
     result
         .content
         .iter()
         .map(|content| match content {
             ToolResultContent::Text(text) => text.text.len() as u64,
-            _ => 0,
+            ToolResultContent::Image(image) => match &image.data {
+                rig::message::DocumentSourceKind::Base64(data) => data.len() as u64,
+                _ => 0,
+            },
         })
         .sum()
 }
@@ -5712,7 +5726,7 @@ where
                     .remove(&internal_call_id)
                     .and_then(|row| tool_log.get_mut(row))
                 {
-                    entry.result_bytes = Some(tool_result_text_bytes(&tool_result));
+                    entry.result_bytes = Some(tool_result_payload_bytes(&tool_result));
                     if failed {
                         let text = tool_result
                             .content
@@ -7161,6 +7175,219 @@ mod tests {
 
         drop(_environment);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Stands in for the subagent `task` tool: a 30 KB rendered report is
+    /// inside the default per-child (32 KiB) and per-call (128 KiB) caps.
+    #[derive(Clone)]
+    struct TaskReportStub;
+
+    impl Tool for TaskReportStub {
+        const NAME: &'static str = "task";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return a large but task-capped subagent report".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok(task_report_stub_output())
+        }
+    }
+
+    fn task_report_stub_output() -> String {
+        format!(
+            "{}{}{}",
+            "H".repeat(crate::session::TOOL_RESULT_HEAD_CHARS),
+            "M".repeat(20_000),
+            "T".repeat(crate::session::TOOL_RESULT_TAIL_CHARS),
+        )
+    }
+
+    /// mini-agent-3mgd5: `task` enforces its own report caps, so the parent's
+    /// generic 12k-char spill hook must not cut a report the caps admitted.
+    #[tokio::test]
+    async fn task_output_within_its_own_caps_is_not_spilled_by_the_parent_hook() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mini-agent-task-spill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("MINI_AGENT_DATA_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_CONFIG_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_STATE_DIR", Some(root.clone().into_os_string())),
+        ]);
+
+        let session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("task-id", TaskReportStub::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(TaskReportStub)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        while stream.next().await.is_some() {}
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let history: Vec<Message> = requests[1].chat_history.iter().cloned().collect();
+        let live_output = tool_result_texts(&history)
+            .first()
+            .map(|text| (*text).to_owned())
+            .expect("the next request must contain the task result");
+        assert!(
+            !live_output.contains("[tool output truncated:"),
+            "task output was spilled by the generic hook"
+        );
+        assert_eq!(live_output, task_report_stub_output());
+
+        drop(_environment);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Stands in for `task` emitting the `read` image envelope
+    /// (`ImageRead::output`) from its `type Output = String`.
+    #[derive(Clone)]
+    struct TaskImageEnvelopeStub;
+
+    fn task_image_envelope() -> String {
+        use base64::Engine;
+        let png = include_bytes!("tools/fixtures/read-image64/3x2.png");
+        serde_json::json!({
+            "response": "[subagent 1 report]\nScreenshot attached.",
+            "parts": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": base64::engine::general_purpose::STANDARD.encode(png),
+            }],
+        })
+        .to_string()
+    }
+
+    impl Tool for TaskImageEnvelopeStub {
+        const NAME: &'static str = "task";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return a subagent report carrying the image envelope".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok(task_image_envelope())
+        }
+    }
+
+    /// mini-agent-lmik7: a `String` task output carrying the image envelope is
+    /// parsed by rig into text + image content, survives the parent spill hook,
+    /// reaches the next model request as an image, and is lifted into
+    /// persisted session images by `tool_image::from_result`.
+    #[tokio::test]
+    async fn task_string_output_image_envelope_is_lifted_into_image_content() {
+        let session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "task-image-id",
+                    TaskImageEnvelopeStub::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(TaskImageEnvelopeStub)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        let mut streamed_result = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(MultiTurnStreamItem::StreamUserItem(
+                rig::streaming::StreamedUserContent::ToolResult { tool_result, .. },
+            )) = item
+            {
+                streamed_result = Some(tool_result);
+            }
+        }
+
+        let tool_result = streamed_result.expect("stream surfaces the task result");
+        let texts: Vec<&str> = tool_result
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ToolResultContent::Text(text) => Some(text.text.as_str()),
+                ToolResultContent::Image(_) => None,
+            })
+            .collect();
+        assert_eq!(texts, ["[subagent 1 report]\nScreenshot attached."]);
+        let images = crate::session::tool_image::from_result(&tool_result)
+            .expect("the envelope image is a valid literal tool image");
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            images[0].to_rig().media_type,
+            Some(rig::message::ImageMediaType::PNG)
+        );
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let next_request_images = requests[1]
+            .chat_history
+            .iter()
+            .flat_map(|message| match message {
+                Message::User { content } => content.iter().collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .filter_map(|content| match content {
+                UserContent::ToolResult(result) => Some(
+                    result
+                        .content
+                        .iter()
+                        .filter(|part| matches!(part, ToolResultContent::Image(_)))
+                        .count(),
+                ),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(
+            next_request_images, 1,
+            "the parent model must see the image"
+        );
     }
 
     fn tool_result_texts(interactions: &[Message]) -> Vec<&str> {

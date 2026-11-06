@@ -347,3 +347,16 @@ own test suite. The verified, CI-exercised coverage for this change is the
 application's "production consumer tests" in `src/provider_prompt_caching_tests.rs`,
 which drive a real loopback HTTP server through `create_client` and
 `completion_model_with_cache_ttl` and assert on the captured wire JSON body.
+
+## Copilot vision header for tool-result images (mini-agent-yegs4)
+
+`providers/copilot/mod.rs` `request_has_vision` now also returns `true` when a
+user message carries a `ToolResult` whose content includes an image. Upstream
+only matched top-level `UserContent::Image`, and it runs before the Chat
+Completions image bridge, so a request whose only images came from a tool
+(for example `read` of a PNG) was sent without `copilot-vision-request: true`
+on both the Responses and Chat Completions routes. Request bodies are
+unchanged. The CI-exercised coverage is the application wire test
+`image_tool_results_on_copilot_azure_bedrock_vertex_routes` in
+`src/tests/image_read_tests.rs`, which asserts the header on both Copilot
+routes through a loopback server.

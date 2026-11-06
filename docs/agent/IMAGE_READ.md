@@ -53,6 +53,40 @@ and does not mutate the canonical Session history. Gemini uses this ordinary
 image-input path because native multimodal function responses require newer
 models.
 
+### Image tool results by route
+
+Every route reuses one of the converters above; none has its own image path.
+The wire shapes are covered by `image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlation`
+and `image_tool_results_on_copilot_azure_bedrock_vertex_routes` in
+`src/tests/image_read_tests.rs`, which capture each request body on a loopback
+server without network access.
+
+| Route | Converter | Image tool result on the wire | `image_read_support` capability lookup |
+|---|---|---|---|
+| Anthropic | Anthropic Messages | native `tool_result` image block | `anthropic` catalogue |
+| OpenAI Responses | Responses | native `input_image` in `function_call_output` | `openai` catalogue |
+| OpenAI Chat Completions, OpenRouter, Ollama, Gemini | Chat / Gemini | bridged user image after the tool batch | provider catalogue (Ollama: none) |
+| Copilot, model name containing `codex` | Responses | native `input_image`, with `copilot-vision-request: true` | none (`copilot` is not catalogued): unknown, admitted |
+| Copilot, other models (Claude included) | Chat Completions | bridged user image, with `copilot-vision-request: true` | none: unknown, admitted |
+| Azure OpenAI v1, default `responses` | Responses | native `input_image` | `openai` catalogue, keyed by the deployment name |
+| Azure OpenAI v1, `api_style: completions` | Chat Completions | bridged user image | `openai` catalogue, keyed by the deployment name |
+| Bedrock (`/anthropic` native Messages) | Anthropic Messages | native `tool_result` image block | `anthropic` catalogue; Bedrock IDs such as `us.anthropic.claude-…-v1:0` do not match, so unknown and admitted |
+| Vertex (Claude `rawPredict`) | Anthropic Messages | native `tool_result` image block | `anthropic` catalogue; `claude-…@date` IDs do not match, so unknown and admitted |
+
+Copilot requires the vision header for any image input. Before
+mini-agent-yegs4 it was sent only for top-level user images, not for images
+inside tool results (patched in `patched-deps/rig-core`, see its `PATCH.md`).
+There is no Gemini-on-Vertex route and no Anthropic Messages mode on Copilot or
+Azure. Unknown capability keeps the normal provider error path; it is the
+right outcome for Bedrock and Vertex because every catalogued Claude model
+accepts images. An Azure deployment that is literally named after a text-only
+OpenAI model (`gpt-4`, `gpt-3.5-turbo`, `o3-mini`) is refused as text-only,
+because the deployment name is the only model identity the route has.
+Per-image provider limits are enforced by the provider, not here: `read`
+admits up to 5 MiB of raw image bytes (about 6.7 MiB of base64), while
+Anthropic documents a 5 MB per-image API limit, which Bedrock may set lower.
+An image over the provider limit is rejected by that provider's request error.
+
 The image summary and image bytes share one canonical tool-result row. JSONL
 sessions retain literal, validated base64/MIME/detail data; ordinary history
 conversion restores image blocks. Terminal, Markdown, HTML and compacted text
@@ -73,6 +107,19 @@ limit does not promise native replay of a 5 MiB image. Oversized native capture
 retains accepted accounting and refuses unsafe replay through the existing
 native failure path. Canonical save validates image rows before artifact
 creation and refuses an oversized snapshot.
+
+Subagent children account for images separately from text. Provider-reported
+usage, which already includes image tokens, remains authoritative for
+`task_max_cost_units`. When a provider omits usage, and for the child context
+guard, the local request estimate charges each literal image by Claude's patch
+formula `ceil(w/28) * ceil(h/28)` from its header dimensions (capped at 4,784
+tokens, the high-resolution tier) instead of its base64 length; an image whose
+header cannot be read is charged at four pixels per decoded byte under the
+same formula and cap, and an image reference without bytes at the cap. A child
+also admits at most 4 MiB of encoded image data into its history in total, the
+same aggregate as the native capture ceiling: a later image result past that
+ceiling keeps its text summary and replaces its image with an omission notice.
+The implementation is `src/extras/subagents/image_cost.rs`.
 
 Provider references: [Anthropic tool results](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls),
 [OpenAI function outputs](https://developers.openai.com/api/reference/resources/responses/methods/create),
