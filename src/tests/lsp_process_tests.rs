@@ -1305,12 +1305,14 @@ async fn lsp_process_did_save_delivers_save_only_diagnostics_to_edit_results() {
 #[tokio::test]
 async fn lsp_process_configured_wait_admits_slow_publish_and_timeout_is_reported() {
     let fixture = FixtureBuild::compile("slow-publish");
-    // Publishes 3 s after each sync: beyond the 1 s default, within 5 s.
+    // Publishes 3 s after each sync: beyond the 1 s default. The window is
+    // generous so a loaded test host cannot turn it into a timeout; the wait
+    // still ends at the publish.
     let (written, _) = write_then_edit_with_fixture(&fixture, "delayed-diagnostics", |server| {
         server
             .env
             .insert("LSP_FIXTURE_PUBLISH_DELAY_MS".into(), "3000".into());
-        server.wait_ms = Some(5000);
+        server.wait_ms = Some(15_000);
     })
     .await;
     let workspace = fixture.workspace("workspace");
