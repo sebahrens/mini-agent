@@ -1404,7 +1404,10 @@ fn visible_sources(request: &CompletionRequest, receipts: &[Receipt]) -> BTreeSe
                             tool_result.content.len() == 2
                                 && matches!(
                                     tool_result.content.iter().nth(1),
-                                    Some(ToolResultContent::Image(_))
+                                    Some(
+                                        ToolResultContent::Image(_)
+                                            | ToolResultContent::Document(_)
+                                    )
                                 )
                         } else {
                             tool_result.content.len() == 1

@@ -256,6 +256,9 @@ impl TryFrom<RigMessage> for Vec<Message> {
                                 .into_iter()
                                 .map(|tc| match tc {
                                     ToolResultContent::Text(t) => Ok(t.text),
+                                    ToolResultContent::Document(_) => {
+                                        Ok(ToolResultContent::DOCUMENT_OMITTED_NOTICE.to_string())
+                                    }
                                     ToolResultContent::Image(_) => {
                                         Err(CompletionError::RequestError(
                                             "xAI does not support images in tool results".into(),

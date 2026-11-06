@@ -13,6 +13,8 @@ pub(crate) struct ImageReadSupport {
     known_image_input: Option<bool>,
     gemini: bool,
     enabled: bool,
+    /// The transport carries PDF document blocks inside tool results.
+    native_pdf_transport: bool,
 }
 #[cfg(feature = "multimodal")]
 impl ImageReadSupport {
@@ -21,7 +23,22 @@ impl ImageReadSupport {
             known_image_input: crate::models_catalog::model_image_input(provider, model),
             gemini,
             enabled: true,
+            native_pdf_transport: false,
         }
+    }
+    /// Marks a transport whose converter serializes PDF document blocks in
+    /// tool results (Anthropic document blocks, OpenAI Responses `input_file`,
+    /// Gemini inline PDF function-response parts).
+    pub(crate) fn with_native_pdf_transport(mut self) -> Self {
+        self.native_pdf_transport = true;
+        self
+    }
+    /// Whether `read` may return a PDF document block: a capable transport
+    /// and a catalogued model that explicitly accepts image input (PDF input
+    /// is vision-based on every supported provider). Unknown models and
+    /// gateways stay closed and use the page-image path.
+    pub(crate) fn native_pdf(self) -> bool {
+        self.enabled && self.native_pdf_transport && self.known_image_input == Some(true)
     }
     pub(crate) fn check(self, format: ImageFormat) -> Result<(), &'static str> {
         if !self.enabled {
@@ -45,14 +62,35 @@ pub(crate) struct ImageRead {
     pub(crate) data: String,
     /// Further images returned in the same result (PDF page images).
     pub(crate) more: Vec<(&'static str, String)>,
+    /// Base64 of a PDF returned as a provider-native document block. When
+    /// set, `mime`/`data`/`more` hold no images.
+    pub(crate) document: Option<String>,
 }
 #[cfg(feature = "multimodal")]
 impl ImageRead {
+    /// A result carrying one base64 PDF and no images.
+    pub(crate) fn pdf_document(base64: String) -> Self {
+        Self {
+            mime: "",
+            data: String::new(),
+            more: Vec::new(),
+            document: Some(base64),
+        }
+    }
     pub(crate) fn output(self, summary: &str) -> String {
-        let parts: Vec<serde_json::Value> = std::iter::once((self.mime, self.data))
-            .chain(self.more)
-            .map(|(mime, data)| serde_json::json!({"type":"image","mimeType":mime,"data":data}))
-            .collect();
+        let mut parts: Vec<serde_json::Value> = if self.document.is_some() {
+            Vec::new()
+        } else {
+            std::iter::once((self.mime, self.data))
+                .chain(self.more)
+                .map(|(mime, data)| serde_json::json!({"type":"image","mimeType":mime,"data":data}))
+                .collect()
+        };
+        if let Some(data) = self.document {
+            parts.push(serde_json::json!({
+                "type":"document","mimeType":"application/pdf","data":data
+            }));
+        }
         serde_json::json!({"response": summary, "parts": parts}).to_string()
     }
 }

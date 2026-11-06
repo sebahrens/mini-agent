@@ -1026,8 +1026,26 @@ which page, and `continue with pages:"N-M"` for scanned pages left over. Fax (`C
 `JBIG2Decode`, `JPXDecode`, images over 40 million pixels and stencil masks are named in the result
 instead of attached, and the `pdftoppm` hint remains for them. Without image input (no captured
 transport, or a text-only model) the answer is the text-only scanned message and nothing is
-attached. A provider-native PDF document block is not used: tool results carry only text and
-image content, so page images are the transport for vision models. PDFs
+attached.
+
+**Provider-native PDF block.** When the captured transport can carry a document inside a tool
+result (Anthropic `document` blocks, OpenAI Responses `input_file` parts, Gemini inline
+`application/pdf` function-response parts; chat-style transports such as OpenRouter, OpenAI-compatible
+gateways, Ollama and Copilot cannot) and the catalogue says the model accepts image input
+(`ImageReadSupport::native_pdf`; an unknown model or gateway stays closed), `read` replaces the page-image
+path with one PDF block holding only the selected pages that have no text layer: scans, pages with
+undecodable streams and vector-only figure pages alike. The block is a new, self-contained PDF
+(`src/agent/tools/pdf_subset.rs`) carrying each page's content streams and the resources they reach
+and nothing else: catalog, outlines, names, form fields, annotations (links, URI/JavaScript
+actions), `OpenAction`, metadata and references back to other pages are dropped. The result text maps
+`document page K = page N`; text-layer pages stay text. The envelope part is
+`{"type":"document","mimeType":"application/pdf","data":"<base64>"}`; rig accepts only inline base64
+PDFs there, never URLs. Encrypted files (decrypted in memory, never re-emitted), subsets over
+6 MiB, or extraction failures fall back to the page-image path above with the reason named. A
+document counts toward a subagent's image ceiling, is estimated at about 3,000 tokens per page in
+context accounting, and is not persisted in session rows (only the native turn history carries it;
+a resumed text-only replay keeps the mapping text). Other transports serialize it as the text
+`[PDF document omitted: ...]`. PDFs
 protected by the standard security handler open when the user password is empty, which is how
 owner-password-only (permission-restricted) files behave in any viewer: RC4-40/128 (revisions 2-3),
 RC4 or AESV2 (revision 4) and AES-256 (revisions 5 and 6) streams are decrypted in memory

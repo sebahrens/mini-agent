@@ -380,3 +380,20 @@ original parse error). The compatible chat stream does the same for a still-open
 `length` stop. The application tests drive real Anthropic and OpenRouter clients against local
 SSE fixtures.
 
+## Document (PDF) tool results (mini-agent-totd8)
+
+`ToolResultContent` gains a `Document(Document)` variant, with
+`ToolResultContent::pdf_base64` and a `{"type":"document","mimeType":"application/pdf",
+"data":"<base64>"}` part accepted by `from_tool_output` (inline base64 PDFs only; URLs and other
+media types are ignored, so a tool cannot make a provider fetch a file). Providers whose tool-result
+channel carries documents serialize it: Anthropic as a `document` block with a base64 source inside
+`tool_result.content`, OpenAI Responses as an `input_file` part (`data:application/pdf;base64,...`)
+in the function-call output array, Gemini as an `inlineData` `application/pdf` function-response
+part. Chat-style transports (OpenAI Chat Completions, OpenRouter, xAI, and the Chat bridge) replace
+it with `ToolResultContent::DOCUMENT_OMITTED_NOTICE`; Ollama, Cohere and the Gemini Interactions API
+keep their existing non-text handling. The host decides when to emit one (transport and model
+capability gated, see `docs/agent/TOOL_RUNTIME.md`). New unit tests sit beside the converters; the
+SDK's own `cargo test --lib` target did not compile before this change (stale fixtures in the
+Anthropic streaming and OpenAI completion tests), so the application tests in
+`src/tests/pdf_page_image_tests.rs` exercise the Anthropic, Responses and Gemini conversions.
+

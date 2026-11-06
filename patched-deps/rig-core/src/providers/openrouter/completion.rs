@@ -1038,6 +1038,9 @@ fn user_contents_to_messages(
                                 message::ToolResultContent::Image(_) => {
                                     "[Image content not supported in tool results]".to_string()
                                 }
+                                message::ToolResultContent::Document(_) => {
+                                    message::ToolResultContent::DOCUMENT_OMITTED_NOTICE.to_string()
+                                }
                             })
                             .collect::<Vec<_>>()
                             .join("\n"),

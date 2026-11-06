@@ -951,6 +951,8 @@ fn anthropic_document_additional_params(
 pub enum ToolResultContent {
     Text { text: String },
     Image { source: ImageSource },
+    /// A PDF document block inside a tool result.
+    Document { source: DocumentSource },
     ToolReference { tool_name: String },
 }
 
@@ -1258,6 +1260,22 @@ impl TryFrom<message::Message> for Message {
                                         "Invalid native tool reference replay data".into())),
                                 }
                             }
+                            message::ToolResultContent::Document(document) => {
+                                let (DocumentSourceKind::Base64(data), Some(DocumentMediaType::PDF)) =
+                                    (document.data, document.media_type)
+                                else {
+                                    return Err(MessageError::ConversionError(
+                                        "Only base64 PDF documents can be used in Anthropic tool results"
+                                            .to_string(),
+                                    ));
+                                };
+                                Ok(ToolResultContent::Document {
+                                    source: DocumentSource::Base64 {
+                                        data,
+                                        media_type: DocumentFormat::PDF,
+                                    },
+                                })
+                            }
                             message::ToolResultContent::Image(image) => {
                                 let DocumentSourceKind::Base64(data) = image.data else {
                                     return Err(MessageError::ConversionError(
@@ -1483,6 +1501,15 @@ impl From<ToolResultContent> for message::ToolResultContent {
                     message::ToolResultContent::image_base64(data, Some(media_type.into()), None)
                 }
                 ImageSource::Url { url } => message::ToolResultContent::image_url(url, None, None),
+            },
+            ToolResultContent::Document { source } => match source {
+                DocumentSource::Base64 { data, .. } => message::ToolResultContent::pdf_base64(data),
+                DocumentSource::Text { data, .. } => message::ToolResultContent::text(data),
+                DocumentSource::Url { .. } | DocumentSource::File { .. } => {
+                    message::ToolResultContent::text(
+                        message::ToolResultContent::DOCUMENT_OMITTED_NOTICE,
+                    )
+                }
             },
         }
     }
@@ -2920,6 +2947,24 @@ enum ApiResponse<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pdf_document_tool_result_serializes_as_a_document_block() {
+        let message = message::Message::User {
+            content: OneOrMany::one(message::UserContent::ToolResult(message::ToolResult {
+                id: "toolu_1".into(),
+                call_id: None,
+                content: OneOrMany::one(message::ToolResultContent::pdf_base64("JVBERg==")),
+            })),
+        };
+        let converted: Message = message.try_into().unwrap();
+        let json = serde_json::to_value(&converted).unwrap();
+        assert_eq!(
+            json["content"][0]["content"][0],
+            serde_json::json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERg=="}})
+        );
+    }
+
+
     use super::*;
     use serde_json::json;
     use serde_path_to_error::deserialize;

@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `read` hands scanned and figure-only PDF pages to Anthropic, OpenAI Responses and Gemini models as
+  one provider-native PDF document block holding only those pages (catalogued vision models only;
+  encrypted, oversized or unextractable files fall back to page images). rig's `ToolResultContent`
+  gained a `Document` variant for it (mini-agent-totd8).
 - MCP `oauth.client_id` now works: login uses the pre-registered client without dynamic registration
   (public client by default; a confidential client reads its secret from
   `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>`), and a server without registration and without a

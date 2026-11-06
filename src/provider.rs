@@ -2780,7 +2780,21 @@ impl AnyModel {
             .and_then(|params| params.get("model"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or(model);
-        crate::agent::tools::read_image::ImageReadSupport::captured(provider, model, gemini)
+        let support =
+            crate::agent::tools::read_image::ImageReadSupport::captured(provider, model, gemini);
+        // Tool-result document blocks: Anthropic document blocks, OpenAI
+        // Responses `input_file` and Gemini inline PDF parts. Chat-style
+        // transports (OpenRouter, OpenAI-compatible gateways, Ollama,
+        // Copilot) have no such channel and keep the page-image path.
+        let native_pdf = matches!(
+            self,
+            Self::Anthropic(_) | Self::Gemini(_) | Self::OpenAI(OpenAiModel::Responses(_))
+        );
+        if native_pdf {
+            support.with_native_pdf_transport()
+        } else {
+            support
+        }
     }
 }
 

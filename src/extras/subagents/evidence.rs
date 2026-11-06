@@ -326,6 +326,9 @@ impl ChildEvidence {
                     }
                     None => invalid_images += 1,
                 },
+                // A native PDF block is not retained as evidence; the text
+                // part of the result already maps it to its pages.
+                ToolResultContent::Document(_) => {}
             }
         }
         let text_bytes = text.len() as u64;

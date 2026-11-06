@@ -371,7 +371,11 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                             },
                         ) => {
                             let has_image = tool_content.iter().any(|part| {
-                                matches!(part, crate::message::ToolResultContent::Image(_))
+                                matches!(
+                                    part,
+                                    crate::message::ToolResultContent::Image(_)
+                                        | crate::message::ToolResultContent::Document(_)
+                                )
                             });
                             if has_image {
                                 let mut blocks = Vec::with_capacity(tool_content.len());
@@ -379,6 +383,23 @@ impl TryFrom<crate::completion::Message> for Vec<InputItem> {
                                     match part {
                                         crate::message::ToolResultContent::Text(text) => {
                                             blocks.push(UserContent::InputText { text: text.text })
+                                        }
+                                        crate::message::ToolResultContent::Document(document) => {
+                                            let (DocumentSourceKind::Base64(data), Some(DocumentMediaType::PDF)) =
+                                                (document.data, document.media_type)
+                                            else {
+                                                return Err(CompletionError::ProviderError(
+                                                    "Tool document must be an inline base64 PDF".into(),
+                                                ));
+                                            };
+                                            blocks.push(UserContent::InputFile {
+                                                file_id: None,
+                                                file_url: None,
+                                                file_data: Some(format!(
+                                                    "data:application/pdf;base64,{data}"
+                                                )),
+                                                filename: Some("document.pdf".to_string()),
+                                            });
                                         }
                                         crate::message::ToolResultContent::Image(image) => {
                                             use crate::message::MimeType;

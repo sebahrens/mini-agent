@@ -224,6 +224,10 @@ pub struct ToolResult {
 pub enum ToolResultContent {
     Text(Text),
     Image(Image),
+    /// A provider-native document (PDF) returned by a tool. Only providers
+    /// whose tool-result channel accepts documents serialize it; the others
+    /// replace it with [`ToolResultContent::DOCUMENT_OMITTED_NOTICE`].
+    Document(Document),
 }
 
 /// Describes a tool call with an id and function to call, generally produced by a provider.
@@ -904,6 +908,19 @@ impl ToolResultContent {
         })
     }
 
+    /// Text that stands in for a document on transports that cannot carry one.
+    pub const DOCUMENT_OMITTED_NOTICE: &'static str =
+        "[PDF document omitted: this provider does not accept document tool results]";
+
+    /// Helper constructor for a base64-encoded PDF tool result.
+    pub fn pdf_base64(data: impl Into<String>) -> Self {
+        ToolResultContent::Document(Document {
+            data: DocumentSourceKind::Base64(data.into()),
+            media_type: Some(DocumentMediaType::PDF),
+            additional_params: None,
+        })
+    }
+
     /// Helper constructor to make tool result images from a URL.
     pub fn image_url(
         url: impl Into<String>,
@@ -944,6 +961,10 @@ impl ToolResultContent {
 
                 if let Some(parts) = json.get("parts").and_then(|p| p.as_array()) {
                     for part in parts {
+                        if let Some(document) = pdf_part(part) {
+                            results.push(document);
+                            continue;
+                        }
                         let is_image = part
                             .get("type")
                             .and_then(|t| t.as_str())
@@ -1009,6 +1030,22 @@ impl ToolResultContent {
 
         OneOrMany::one(ToolResultContent::Text(output_str.into()))
     }
+}
+
+/// A `{"type":"document","mimeType":"application/pdf","data":"<base64>"}`
+/// envelope part. Only inline base64 PDFs are accepted: a URL or any other
+/// media type is ignored so a tool cannot make a provider fetch a remote file.
+fn pdf_part(part: &serde_json::Value) -> Option<ToolResultContent> {
+    if part.get("type").and_then(|t| t.as_str()) != Some("document")
+        || part.get("mimeType").and_then(|t| t.as_str()) != Some("application/pdf")
+    {
+        return None;
+    }
+    let data = part.get("data").and_then(|v| v.as_str())?;
+    if data.is_empty() || data.starts_with("http://") || data.starts_with("https://") {
+        return None;
+    }
+    Some(ToolResultContent::pdf_base64(data))
 }
 
 /// Trait for converting between MIME types and media types.
@@ -1378,6 +1415,58 @@ impl From<MessageError> for CompletionError {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_document_parts_parse_only_inline_base64_pdfs() {
+        let envelope = |part: serde_json::Value| {
+            serde_json::json!({"response": "r", "parts": [part]}).to_string()
+        };
+        let parsed = ToolResultContent::from_tool_output(envelope(serde_json::json!(
+            {"type":"document","mimeType":"application/pdf","data":"JVBERg=="}
+        )));
+        assert!(matches!(
+            parsed.iter().nth(1),
+            Some(ToolResultContent::Document(Document {
+                data: DocumentSourceKind::Base64(data),
+                media_type: Some(DocumentMediaType::PDF),
+                ..
+            })) if data == "JVBERg=="
+        ));
+        for forged in [
+            serde_json::json!({"type":"document","mimeType":"application/pdf","data":"https://example.test/a.pdf"}),
+            serde_json::json!({"type":"document","mimeType":"text/html","data":"PGh0bWw+"}),
+            serde_json::json!({"type":"document","mimeType":"application/pdf","data":""}),
+        ] {
+            let parsed = ToolResultContent::from_tool_output(envelope(forged));
+            assert!(parsed.iter().all(|part| matches!(part, ToolResultContent::Text(_))));
+        }
+    }
+
+    #[test]
+    fn bridge_replaces_documents_with_text_for_text_only_tool_roles() {
+        let messages = vec![
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::tool_call("c1", "read", serde_json::json!({}))),
+            },
+            Message::User {
+                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                    id: "c1".into(),
+                    call_id: None,
+                    content: OneOrMany::many(vec![
+                        ToolResultContent::text("x"),
+                        ToolResultContent::pdf_base64("JVBERg=="),
+                    ])
+                    .unwrap(),
+                })),
+            },
+        ];
+        // No image: the bridge is a no-op, and text-only converters replace
+        // the document themselves.
+        assert_eq!(bridge_tool_result_images(messages.clone()).unwrap(), messages);
+    }
+
     use super::{Message, Reasoning, ReasoningContent};
 
     #[test]
@@ -1518,6 +1607,11 @@ pub(crate) fn bridge_tool_result_images(
                                 match item {
                                     ToolResultContent::Text(value) => {
                                         text.push(ToolResultContent::Text(value))
+                                    }
+                                    ToolResultContent::Document(_) => {
+                                        text.push(ToolResultContent::text(
+                                            ToolResultContent::DOCUMENT_OMITTED_NOTICE,
+                                        ));
                                     }
                                     ToolResultContent::Image(image) => {
                                         images.push(UserContent::Text(Text::new(format!(

@@ -301,7 +301,7 @@ fn old_tool_results_are_cleared_without_dropping_calls_or_mutating_the_session()
                 .filter_map(|item| match item {
                     UserContent::ToolResult(result) => match result.content.first() {
                         ToolResultContent::Text(text) => Some(text.text),
-                        ToolResultContent::Image(_) => None,
+                        ToolResultContent::Image(_) | ToolResultContent::Document(_) => None,
                     },
                     _ => None,
                 })

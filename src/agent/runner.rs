@@ -142,7 +142,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
                 value["response"].is_string()
                     && value["parts"].as_array().is_some_and(|parts| {
                         parts.iter().any(|part| {
-                            part["type"] == "image"
+                            (part["type"] == "image" || part["type"] == "document")
                                 && part["data"].is_string()
                                 && part["mimeType"].is_string()
                         })
@@ -1944,7 +1944,9 @@ fn attributed_tool_result(
                 }
                 output.push_str(&text.text);
             }
-            ToolResultContent::Image(_) => non_text_content_count += 1,
+            ToolResultContent::Image(_) | ToolResultContent::Document(_) => {
+                non_text_content_count += 1
+            }
         }
     }
 
@@ -5878,6 +5880,10 @@ fn tool_result_payload_bytes(result: &rig::message::ToolResult) -> u64 {
                 rig::message::DocumentSourceKind::Base64(data) => data.len() as u64,
                 _ => 0,
             },
+            ToolResultContent::Document(document) => match &document.data {
+                rig::message::DocumentSourceKind::Base64(data) => data.len() as u64,
+                _ => 0,
+            },
         })
         .sum()
 }
@@ -7473,7 +7479,7 @@ mod tests {
                     UserContent::ToolResult(result) => {
                         result.content.iter().find_map(|content| match content {
                             ToolResultContent::Text(text) => Some(text.text.clone()),
-                            ToolResultContent::Image(_) => None,
+                            ToolResultContent::Image(_) | ToolResultContent::Document(_) => None,
                         })
                     }
                     _ => None,
@@ -7531,7 +7537,7 @@ mod tests {
                     UserContent::ToolResult(result) => {
                         result.content.iter().find_map(|content| match content {
                             ToolResultContent::Text(text) => Some(text.text.clone()),
-                            ToolResultContent::Image(_) => None,
+                            ToolResultContent::Image(_) | ToolResultContent::Document(_) => None,
                         })
                     }
                     _ => None,
@@ -7640,7 +7646,7 @@ mod tests {
                     UserContent::ToolResult(result) => {
                         result.content.iter().find_map(|content| match content {
                             ToolResultContent::Text(text) => Some(text.text.as_str()),
-                            ToolResultContent::Image(_) => None,
+                            ToolResultContent::Image(_) | ToolResultContent::Document(_) => None,
                         })
                     }
                     _ => None,
@@ -7757,7 +7763,7 @@ mod tests {
                     UserContent::ToolResult(result) => {
                         result.content.iter().find_map(|content| match content {
                             ToolResultContent::Text(text) => Some(text.text.clone()),
-                            ToolResultContent::Image(_) => None,
+                            ToolResultContent::Image(_) | ToolResultContent::Document(_) => None,
                         })
                     }
                     _ => None,
@@ -7964,7 +7970,7 @@ mod tests {
             .iter()
             .filter_map(|part| match part {
                 ToolResultContent::Text(text) => Some(text.text.as_str()),
-                ToolResultContent::Image(_) => None,
+                ToolResultContent::Image(_) | ToolResultContent::Document(_) => None,
             })
             .collect();
         assert_eq!(texts, ["[subagent 1 report]\nScreenshot attached."]);
@@ -8308,7 +8314,7 @@ mod tests {
                     .iter()
                     .find_map(|content| match content {
                         ToolResultContent::Text(text) => Some(text.text.clone()),
-                        ToolResultContent::Image(_) => None,
+                        ToolResultContent::Image(_) | ToolResultContent::Document(_) => None,
                     })
                     .unwrap();
                 session.add_tool_result_with_id(&tool_result.id, OversizedFailTool::NAME, &output);
