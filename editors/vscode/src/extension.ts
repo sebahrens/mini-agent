@@ -266,41 +266,36 @@ export async function requestPermission(
     return { outcome: { outcome: 'cancelled' } };
   }
 
-  interface PermissionItem extends vscode.QuickPickItem { readonly optionIndex: number }
-  const items = request.options.map((option, index): PermissionItem => ({
-    label: permissionOptionTitle(request, option),
-    optionIndex: index,
-  }));
   // The detail shows the actual command/input (content text blocks and rawInput),
   // not just the tool name, so the allow-always option never grants an unseen rule.
-  const cancellation = new vscode.CancellationTokenSource();
+  // It goes in a modal `detail`, which wraps and keeps multi-line commands intact;
+  // a QuickPick placeHolder is a one-line input hint that clips and vanishes on typing.
+  const titles = request.options.map(option => permissionOptionTitle(request, option));
   let resolveAbort!: (value: undefined) => void;
   const aborted = new Promise<undefined>(resolve => { resolveAbort = resolve; });
-  const onAbort = (): void => {
-    cancellation.cancel();
-    resolveAbort(undefined);
-  };
+  const onAbort = (): void => { resolveAbort(undefined); };
   signal.addEventListener('abort', onAbort, { once: true });
-  let selected: PermissionItem | undefined;
+  let selectedIndex: number | undefined;
   try {
-    selected = await Promise.race([
-      vscode.window.showQuickPick(items, {
-        title: `Mini Agent requests permission: ${request.toolCall.title ?? 'tool call'}`,
-        placeHolder: buildPermissionDetail(request),
-        ignoreFocusOut: true,
-      }, cancellation.token),
+    const picked = await Promise.race([
+      vscode.window.showWarningMessage(
+        `Mini Agent requests permission: ${request.toolCall.title ?? 'tool call'}`,
+        { modal: true, detail: buildPermissionDetail(request) },
+        ...titles,
+      ),
       aborted,
     ]);
+    const index = typeof picked === 'string' ? titles.indexOf(picked) : -1;
+    selectedIndex = index >= 0 ? index : undefined;
   } finally {
     signal.removeEventListener('abort', onAbort);
-    cancellation.dispose();
   }
   // Trust can be revoked while the picker is open. Decide against the current
   // workspace state, not the state captured before awaiting the user.
-  if (!selected || signal.aborted || !vscode.workspace.isTrusted) {
+  if (selectedIndex === undefined || signal.aborted || !vscode.workspace.isTrusted) {
     return { outcome: { outcome: 'cancelled' } };
   }
-  const option = request.options[selected.optionIndex];
+  const option = request.options[selectedIndex];
   if (!option) { return { outcome: { outcome: 'cancelled' } }; }
   return { outcome: { outcome: 'selected', optionId: option.optionId } };
 }
