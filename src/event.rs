@@ -17,7 +17,16 @@ pub struct UsageDelta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<rig::completion::CacheCreationUsage>,
     pub tool_use_prompt_tokens: u64,
+    /// Provider-hosted web searches billed on top of tokens (Anthropic
+    /// `server_tool_use.web_search_requests`, OpenAI Responses `web_search_call`
+    /// items). Priced per request, never per token.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hosted_search_requests: u64,
     pub reasoning_tokens: u64,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 impl UsageDelta {
@@ -41,6 +50,9 @@ impl UsageDelta {
             tool_use_prompt_tokens: self
                 .tool_use_prompt_tokens
                 .saturating_sub(previous.tool_use_prompt_tokens),
+            hosted_search_requests: self
+                .hosted_search_requests
+                .saturating_sub(previous.hosted_search_requests),
             reasoning_tokens: self
                 .reasoning_tokens
                 .saturating_sub(previous.reasoning_tokens),
@@ -55,6 +67,7 @@ impl UsageDelta {
             self.cached_input_tokens,
             self.cache_creation_input_tokens,
             self.tool_use_prompt_tokens,
+            self.hosted_search_requests,
             self.reasoning_tokens,
         ]
         .into_iter()
@@ -83,6 +96,9 @@ impl UsageDelta {
             tool_use_prompt_tokens: self
                 .tool_use_prompt_tokens
                 .saturating_add(other.tool_use_prompt_tokens),
+            hosted_search_requests: self
+                .hosted_search_requests
+                .saturating_add(other.hosted_search_requests),
             reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
         }
     }
@@ -314,4 +330,42 @@ pub enum UserEvent {
     /// Leave the TUI in an orderly way (termination signal, lost terminal):
     /// stop any run, save the session and restore the terminal.
     Quit,
+}
+
+#[cfg(test)]
+mod hosted_search_tests {
+    use super::UsageDelta;
+
+    #[test]
+    fn hosted_search_requests_are_counted_diffed_summed_and_serialized_only_when_set() {
+        let usage = UsageDelta {
+            hosted_search_requests: 3,
+            ..Default::default()
+        };
+        assert!(usage.has_values(), "a search alone is reported usage");
+        assert_eq!(
+            usage
+                .nonnegative_difference(UsageDelta {
+                    hosted_search_requests: 1,
+                    ..Default::default()
+                })
+                .hosted_search_requests,
+            2
+        );
+        assert_eq!(
+            usage.saturating_add(usage).hosted_search_requests,
+            6,
+            "separate requests add"
+        );
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"hosted_search_requests\":3"), "{json}");
+        assert_eq!(serde_json::from_str::<UsageDelta>(&json).unwrap(), usage);
+        // Rows written before the field existed still decode; zero is omitted.
+        let plain = serde_json::to_string(&UsageDelta::default()).unwrap();
+        assert!(!plain.contains("hosted_search"), "{plain}");
+        assert_eq!(
+            serde_json::from_str::<UsageDelta>(&plain).unwrap(),
+            UsageDelta::default()
+        );
+    }
 }

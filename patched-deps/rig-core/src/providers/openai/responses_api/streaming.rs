@@ -38,6 +38,10 @@ pub enum StreamingCompletionChunk {
 pub struct StreamingCompletionResponse {
     /// Token usage
     pub usage: ResponsesUsage,
+    /// Completed provider-hosted `web_search_call` output items; each is billed
+    /// per call on top of tokens. (mini-agent patch)
+    #[serde(default)]
+    pub hosted_search_requests: u64,
 }
 
 pub(crate) fn reasoning_choices_from_done_item(
@@ -76,7 +80,9 @@ pub(crate) fn reasoning_choices_from_done_item(
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> crate::completion::Usage {
-        self.usage.token_usage()
+        let mut usage = self.usage.token_usage();
+        usage.hosted_search_requests = self.hosted_search_requests;
+        usage
     }
 }
 
@@ -212,6 +218,7 @@ pub(crate) fn parse_sse_completion_body(
 
 struct RawChoiceAccumulator {
     final_usage: ResponsesUsage,
+    hosted_search_requests: u64,
     tool_calls: Vec<StreamingRawChoice>,
     tool_call_internal_ids: std::collections::HashMap<String, String>,
 }
@@ -220,6 +227,7 @@ impl RawChoiceAccumulator {
     fn new(initial_usage: ResponsesUsage) -> Self {
         Self {
             final_usage: initial_usage,
+            hosted_search_requests: 0,
             tool_calls: Vec::new(),
             tool_call_internal_ids: std::collections::HashMap::new(),
         }
@@ -366,6 +374,10 @@ impl RawChoiceAccumulator {
             // the raw item to stream consumers, mirroring how the non-streaming
             // decode preserves it on `CompletionResponse.output`.
             Output::Unknown(value) => {
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("web_search_call")
+                {
+                    self.hosted_search_requests = self.hosted_search_requests.saturating_add(1);
+                }
                 immediate.push(streaming::RawStreamingChoice::Unknown(value));
             }
         }
@@ -377,6 +389,7 @@ impl RawChoiceAccumulator {
         choices.push(RawStreamingChoice::FinalResponse(
             StreamingCompletionResponse {
                 usage: self.final_usage,
+                hosted_search_requests: self.hosted_search_requests,
             },
         ));
         choices

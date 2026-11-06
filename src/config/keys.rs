@@ -152,6 +152,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("hosted-web-search-allowed-domains", &["hosted_web_search_allowed_domains"]).described("Bare domains hosted web search may use (Anthropic and OpenAI Responses); at most 20; not with the block-list").shaped(ConfigShape::Strings),
     aliased("hosted-web-search-blocked-domains", &["hosted_web_search_blocked_domains"]).described("Bare domains hosted web search must not use (Anthropic only; OpenAI Responses withholds hosted search); at most 20").shaped(ConfigShape::Strings),
     aliased("hosted-web-search-max-uses", &["hosted_web_search_max_uses"]).described("Anthropic hosted web search max_uses per request, 1..=50 (default 5)").shaped(ConfigShape::Integer),
+    aliased("hosted-web-search-cost-per-1k", &["hosted_web_search_cost_per_1k"]).described("USD per 1,000 provider-hosted web searches counted into cost and --max-budget-usd (default 10)").shaped(ConfigShape::Number),
     aliased("web-fetch-timeout-secs", &["web_fetch_timeout_secs"]).described("Total web_fetch deadline in seconds (DNS, approval, redirects, body). Default 30; clamped to 1..=300").shaped(ConfigShape::Integer),
     key("headless_questions").shaped(ConfigShape::Enum(&["error", "fail"])),
     key("headless_agent_mentions").described("Opt-in: resolve @agent:<name> mentions in -p and ACP prompts; an unknown name fails the request (needs the subagents feature)").shaped(ConfigShape::Bool),

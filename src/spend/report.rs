@@ -65,6 +65,13 @@ pub(crate) async fn cost_lines(session: &Session, ledger: Ledger) -> anyhow::Res
             snapshot.recorded_spend()
         }
     )];
+    if session.total_hosted_search_requests > 0 {
+        lines.push(format!(
+            "Hosted web searches: {} (billed per request at ${:.2} per 1,000, included in the spend above)",
+            session.total_hosted_search_requests,
+            crate::pricing::hosted_search_usd_per_1k()
+        ));
+    }
     let estimate = if uninitialised {
         legacy_cost
     } else {

@@ -725,6 +725,7 @@ impl TryFrom<ChatCompletionResponse> for completion::CompletionResponse<ChatComp
                 cache_creation_input_tokens: 0,
                 cache_creation: None,
                 tool_use_prompt_tokens: 0,
+                hosted_search_requests: 0,
                 reasoning_tokens: 0,
             })
             .unwrap_or_default();
@@ -1289,7 +1290,10 @@ where
 
                 yield Ok(RawStreamingChoice::FinalResponse(
                     CopilotStreamingResponse::Responses(
-                        responses_api::streaming::StreamingCompletionResponse { usage: final_usage }
+                        responses_api::streaming::StreamingCompletionResponse {
+                            usage: final_usage,
+                            hosted_search_requests: 0,
+                        }
                     )
                 ));
             },

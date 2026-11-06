@@ -658,6 +658,10 @@ pub async fn handle_compress_with_force(
         crate::extras::hooks::append_context_session(ui.session, &notices.into_notices());
     }
 
+    // A native thinking chain was built over the pre-compaction transcript:
+    // restart it from the compacted one so the next prompt replays cleanly.
+    let native_notice = crate::ui::reconcile_native_chain(run, ui).await;
+
     run.agent = Some(
         ui.agent_build_ctx()
             .rebuild_agent(&ui.session.model, reasoning_enabled)
@@ -665,6 +669,14 @@ pub async fn handle_compress_with_force(
     );
 
     render_session(renderer, ui.session, ui.cli, ui.cfg, ui.context)?;
+    match native_notice {
+        Ok(Some(notice)) => renderer.write_line(notice, C_AGENT)?,
+        Ok(None) => {}
+        Err(error) => renderer.write_line(
+            &format!("Could not restart the native thinking context: {error:#}"),
+            crate::ui::C_ERROR,
+        )?,
+    }
     renderer.write_line(
         &format!(
             "compressed {} messages (saved ~{} tokens)",

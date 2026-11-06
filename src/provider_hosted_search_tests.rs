@@ -237,3 +237,85 @@ fn hosted_web_search_fails_closed_on_unenforceable_or_invalid_filters() {
     closed.hosted_web_search_allowed_domains = Some(vec!["a.example".into()]);
     assert_eq!(tool_for("anthropic", closed), None);
 }
+
+// mini-agent-cq3om: invalid filter configuration is a config-load error, not a
+// silently withheld tool.
+#[test]
+fn invalid_hosted_search_config_is_rejected_at_config_load() {
+    use crate::config::load::validate_extra_body;
+    let mut both = cfg(Some(true));
+    both.hosted_web_search_allowed_domains = Some(vec!["a.example".into()]);
+    both.hosted_web_search_blocked_domains = Some(vec!["b.example".into()]);
+    let error = validate_extra_body(&mut both).unwrap_err();
+    assert!(error.contains("not both"), "{error}");
+    let mut bad_domain = cfg(Some(true));
+    bad_domain.hosted_web_search_allowed_domains = Some(vec!["not a domain".into()]);
+    assert!(validate_extra_body(&mut bad_domain).is_err());
+    for uses in [0, 51] {
+        let mut c = cfg(Some(true));
+        c.hosted_web_search_max_uses = Some(uses);
+        let error = validate_extra_body(&mut c).unwrap_err();
+        assert!(error.contains("hosted-web-search-max-uses"), "{error}");
+    }
+    // Valid values and unset keys stay accepted.
+    let mut ok = cfg(Some(true));
+    ok.hosted_web_search_allowed_domains = Some(vec!["docs.rs".into()]);
+    ok.hosted_web_search_max_uses = Some(50);
+    assert!(validate_extra_body(&mut ok).unwrap().is_empty());
+    assert!(validate_extra_body(&mut cfg(None)).unwrap().is_empty());
+}
+
+#[test]
+fn openai_responses_block_list_is_a_visible_startup_warning() {
+    use crate::config::load::validate_extra_body;
+    let mut c: Config = serde_json::from_value(json!({
+        "provider": "hosted",
+        "hosted_web_search": true,
+        "hosted_web_search_blocked_domains": ["bad.example"],
+        "custom_providers": {"hosted": {"provider_type":"openai","base_url":"http://127.0.0.1:9","api_style":"responses"}}
+    }))
+    .unwrap();
+    let warnings = validate_extra_body(&mut c).unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("hosted-web-search-blocked-domains")),
+        "{warnings:?}"
+    );
+    // The same block-list on Anthropic is supported: no notice.
+    let mut anthropic: Config = serde_json::from_value(json!({
+        "provider": "hosted",
+        "hosted_web_search": true,
+        "hosted_web_search_blocked_domains": ["bad.example"],
+        "custom_providers": {"hosted": {"provider_type":"anthropic","base_url":"http://127.0.0.1:9"}}
+    }))
+    .unwrap();
+    assert!(validate_extra_body(&mut anthropic).unwrap().is_empty());
+}
+
+// mini-agent-zoea5: the per-1,000 search price is validated at config load and
+// is authority-sensitive (a project must not be able to zero the fee).
+#[test]
+fn hosted_search_cost_rate_is_validated_and_needs_project_trust() {
+    use crate::config::load::validate_extra_body;
+    for rate in [-1.0, f64::NAN, f64::INFINITY, 100_000.5] {
+        let mut c = cfg(Some(true));
+        c.hosted_web_search_cost_per_1k = Some(rate);
+        let error = validate_extra_body(&mut c).unwrap_err();
+        assert!(error.contains("hosted-web-search-cost-per-1k"), "{error}");
+    }
+    for rate in [0.0, 10.0, 25.5, 100_000.0] {
+        let mut c = cfg(Some(true));
+        c.hosted_web_search_cost_per_1k = Some(rate);
+        validate_extra_body(&mut c).unwrap();
+    }
+    // Back to the default so concurrent cost tests keep the documented price.
+    validate_extra_body(&mut cfg(None)).unwrap();
+    assert_eq!(crate::pricing::hosted_search_usd_per_1k(), 10.0);
+    let parsed: Config =
+        serde_json::from_value(json!({"hosted-web-search-cost-per-1k": 7.5})).unwrap();
+    assert_eq!(parsed.hosted_web_search_cost_per_1k, Some(7.5));
+    let snake: Config =
+        serde_json::from_value(json!({"hosted_web_search_cost_per_1k": 2.0})).unwrap();
+    assert_eq!(snake.hosted_web_search_cost_per_1k, Some(2.0));
+}

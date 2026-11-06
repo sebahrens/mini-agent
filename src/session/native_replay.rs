@@ -53,6 +53,48 @@ impl std::fmt::Display for RestartReason {
 
 impl std::error::Error for RestartReason {}
 
+impl RestartReason {
+    /// Whether the host may drop the native chain and continue from the display
+    /// transcript. An unfinished (`InFlight`) context may still have a paid
+    /// request open, and raw request overrides would refuse a fresh chain too.
+    pub(crate) fn restartable(self) -> bool {
+        !matches!(self, Self::InFlight | Self::UnsupportedOverride)
+    }
+}
+
+/// Why the host dropped the native thinking chain and started a new epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeRestartCause {
+    /// The replay approached its finite frame or byte bounds.
+    Bounds,
+    /// The session's model no longer matches the chain's.
+    ModelChanged,
+    /// The transcript changed (for example compaction) since the chain was saved.
+    TranscriptChanged,
+    /// A saved refusal made the chain unreplayable.
+    Refused(RestartReason),
+}
+
+impl NativeRestartCause {
+    /// One-line, static notice. Never carries opaque payload or credentials.
+    pub(crate) fn notice(self) -> &'static str {
+        match self {
+            Self::Bounds => {
+                "native thinking context reached its size bounds: started a new context from the transcript (earlier thinking blocks dropped)"
+            }
+            Self::ModelChanged => {
+                "model changed: started a new native thinking context from the transcript (earlier thinking blocks dropped)"
+            }
+            Self::TranscriptChanged => {
+                "conversation was compacted or edited: started a new native thinking context from the transcript"
+            }
+            Self::Refused(_) => {
+                "native thinking context could not be replayed: started a new context from the transcript (earlier thinking blocks dropped)"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReplayBoundary {
@@ -182,6 +224,27 @@ impl NativeFrontier {
         saved.refusal = Some(reason);
         saved.epoch = expected.checked_add(1).ok_or(RestartReason::Limit)?;
         Ok(())
+    }
+
+    /// Start a new replay epoch after the host dropped the native chain: the
+    /// next request replays the display transcript with no signed thinking
+    /// blocks. Allowed over any recoverable refusal (never `InFlight`, an
+    /// unfinished actor, or `UnsupportedOverride`, which a fresh chain would
+    /// hit again) and only while no actor is retiring. The publication cell and
+    /// activation marker are kept, so the exact writer stays the owner.
+    pub(crate) fn restart(&self) -> Result<u64, RestartReason> {
+        let mut saved = self.checkpoint();
+        if saved.retiring {
+            return Err(RestartReason::InFlight);
+        }
+        if let Some(reason) = saved.refusal
+            && !reason.restartable()
+        {
+            return Err(reason);
+        }
+        saved.refusal = None;
+        saved.epoch = saved.epoch.checked_add(1).ok_or(RestartReason::Limit)?;
+        Ok(saved.epoch)
     }
 
     pub(crate) fn begin_retirement(
@@ -687,6 +750,21 @@ impl NativeHistory {
         self.epoch
     }
 
+    /// True once the chain has used half of either finite bound. The host
+    /// restarts here, not at the bound, so one tool-heavy prompt (tens of
+    /// model responses) still fits in the remaining half.
+    pub(crate) fn near_bounds(&self) -> bool {
+        self.frames.len() >= MAX_NATIVE_FRAMES / 2
+            || bounded_serialized(self, MAX_NATIVE_PAYLOAD / 2).is_err()
+    }
+
+    /// The request model of the newest frame, as read from the typed model.
+    pub(crate) fn configured_model(&self) -> Option<&str> {
+        self.frames
+            .last()
+            .map(|frame| frame.configured_model.as_str())
+    }
+
     pub(crate) fn base(&self) -> &[rig::completion::Message] {
         &self.base
     }
@@ -999,23 +1077,31 @@ fn binding_view(
     let mut view = serde_json::json!({
         "system": body.get("system"), "tools": body.get("tools"), "messages": messages
     });
-    // Only the actual manual SDK policy regenerates this one moving marker.
-    // Keep system/tool markers and every nested/data/explicit marker exact.
+    // Only the actual manual SDK policy regenerates message markers: it clears
+    // every message-level marker and places a tail marker plus spare markers
+    // every `MESSAGE_CACHE_STEP` blocks behind it. Those positions move as the
+    // conversation grows, so a stored commitment that kept an older spare
+    // marker mismatched after ~18 blocks (a handful of turns) and refused the
+    // session. Strip them at every top-level block that can carry one. System
+    // and tool markers and every nested/data/explicit marker stay exact.
     if manual_cache_markers
         && body.get("cache_control").is_none()
-        && let Some(last) = view["messages"]
-            .as_array_mut()
-            .and_then(|messages| messages.last_mut())
-        && let Some(block) = last["content"]
-            .as_array_mut()
-            .and_then(|blocks| blocks.last_mut())
-        && matches!(
-            block.get("type").and_then(serde_json::Value::as_str),
-            Some("text" | "image" | "tool_result" | "document")
-        )
-        && let Some(map) = block.as_object_mut()
+        && let Some(messages) = view["messages"].as_array_mut()
     {
-        map.remove("cache_control");
+        for message in messages {
+            let Some(blocks) = message["content"].as_array_mut() else {
+                continue;
+            };
+            for block in blocks {
+                if matches!(
+                    block.get("type").and_then(serde_json::Value::as_str),
+                    Some("text" | "image" | "tool_result" | "document")
+                ) && let Some(map) = block.as_object_mut()
+                {
+                    map.remove("cache_control");
+                }
+            }
+        }
     }
     Ok(view)
 }
@@ -1486,7 +1572,7 @@ mod tests {
             json!({"role":"user","content":[{"type":"text","text":"next","cache_control":marker}]}),
         );
         assert_eq!(commitment.validate(&endpoint, &later), Ok(()));
-        for path in [0, 1, 2, 3, 4, 5] {
+        for path in [0, 1, 2, 3, 4] {
             let mut edited = later.clone();
             match path {
                 0 => {
@@ -1500,16 +1586,25 @@ mod tests {
                 2 => edited["messages"][0]["content"][0]["text"] = "rewritten-user".into(),
                 3 => edited["system"][0]["cache_control"] = json!({"type":"ephemeral","ttl":"1h"}),
                 4 => edited["tools"][0]["cache_control"] = json!({"type":"ephemeral"}),
-                _ => {
-                    edited["messages"][0]["content"][0]["cache_control"] =
-                        json!({"type":"ephemeral"})
-                }
+                _ => unreachable!(),
             }
             assert_eq!(
                 commitment.validate(&endpoint, &edited),
                 Err(RestartReason::ChangedPrefix)
             );
         }
+        // The manual SDK clears and regenerates every message-level marker, so
+        // one on an older block is not data under that policy (and a spare
+        // marker moving as the conversation grows must not refuse the chain)...
+        let mut older_marker = later.clone();
+        older_marker["messages"][0]["content"][0]["cache_control"] = json!({"type":"ephemeral"});
+        assert_eq!(commitment.validate(&endpoint, &older_marker), Ok(()));
+        // ...but without that policy the same marker is explicit data.
+        let unmanaged = NativeCommitment::capture(&endpoint, &original, false).unwrap();
+        assert_eq!(
+            unmanaged.validate(&endpoint, &older_marker),
+            Err(RestartReason::ChangedPrefix)
+        );
         let mut single = original;
         single["messages"][1]["content"]
             .as_array_mut()
@@ -1752,5 +1847,100 @@ mod vertex81_domain_tests {
         ] {
             assert!(NativeDomain::from_native_view(&bad.parse().unwrap(), &body).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    #[test]
+    fn frontier_restart_starts_a_new_epoch_over_recoverable_refusals_only() {
+        let healthy = NativeFrontier::default();
+        assert_eq!(healthy.restart(), Ok(1));
+        assert!(healthy.ready() && healthy.refusal().is_none());
+        for reason in [
+            RestartReason::Limit,
+            RestartReason::ChangedDomain,
+            RestartReason::ChangedPrefix,
+            RestartReason::IncompleteTurn,
+            RestartReason::UnavailableSource,
+        ] {
+            let refused = NativeFrontier::default();
+            refused.refuse_expected(0, reason).unwrap();
+            assert!(!refused.ready());
+            let before = refused.current();
+            assert_eq!(refused.restart(), Ok(before + 1));
+            assert!(refused.ready(), "{reason:?}");
+        }
+        // An unfinished context may still have a paid request open, and raw
+        // request overrides would refuse the fresh chain too.
+        for reason in [RestartReason::InFlight, RestartReason::UnsupportedOverride] {
+            let refused = NativeFrontier::default();
+            refused.refuse_expected(0, reason).unwrap();
+            assert_eq!(refused.restart(), Err(reason));
+            assert_eq!(refused.refusal(), Some(reason));
+        }
+        // Never while an actor is retiring.
+        let active = NativeFrontier::default();
+        let _retirement = active.begin_retirement(0).unwrap();
+        assert_eq!(active.restart(), Err(RestartReason::InFlight));
+    }
+
+    // The manual SDK policy regenerates every message-level marker (tail plus a
+    // spare every 18 blocks), so where they sit must not be part of the commitment.
+    #[test]
+    fn manual_sdk_message_markers_are_not_part_of_the_commitment() {
+        let endpoint: http::Uri = "https://api.example.test/v1/messages".parse().unwrap();
+        let ephemeral = serde_json::json!({"type":"ephemeral"});
+        let body = |first_marked: bool, last_marked: bool| {
+            let mut first = serde_json::json!({"type":"text","text":"a"});
+            let mut last = serde_json::json!({"type":"text","text":"c"});
+            if first_marked {
+                first["cache_control"] = ephemeral.clone();
+            }
+            if last_marked {
+                last["cache_control"] = ephemeral.clone();
+            }
+            serde_json::json!({
+                "model":"m",
+                "system":[{"type":"text","text":"sys","cache_control":ephemeral}],
+                "messages":[
+                    {"role":"user","content":[first]},
+                    {"role":"assistant","content":[
+                        {"type":"thinking","thinking":"","signature":"sig"},
+                        {"type":"text","text":"b"}]},
+                    {"role":"user","content":[last]},
+                ]
+            })
+        };
+        let saved = NativeCommitment::capture(&endpoint, &body(false, true), true).unwrap();
+        assert!(!saved.blocks.is_empty());
+        // A spare marker appeared on an older block, and the tail moved.
+        saved
+            .validate_with_policy(&endpoint, &body(true, true), true)
+            .unwrap();
+        saved
+            .validate_with_policy(&endpoint, &body(true, false), true)
+            .unwrap();
+        // The system marker and the content stay exact.
+        let mut changed_system = body(false, true);
+        changed_system["system"][0]["text"] = "other".into();
+        assert_eq!(
+            saved.validate_with_policy(&endpoint, &changed_system, true),
+            Err(RestartReason::ChangedPrefix)
+        );
+        let mut changed_text = body(false, true);
+        changed_text["messages"][0]["content"][0]["text"] = "edited".into();
+        assert_eq!(
+            saved.validate_with_policy(&endpoint, &changed_text, true),
+            Err(RestartReason::ChangedPrefix)
+        );
+        // Without the manual policy markers are data again.
+        let strict = NativeCommitment::capture(&endpoint, &body(false, true), false).unwrap();
+        assert_eq!(
+            strict.validate_with_policy(&endpoint, &body(true, true), false),
+            Err(RestartReason::ChangedPrefix)
+        );
     }
 }

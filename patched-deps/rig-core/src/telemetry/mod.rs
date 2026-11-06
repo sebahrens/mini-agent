@@ -172,6 +172,7 @@ mod tests {
             cache_creation_input_tokens: 4,
             cache_creation: None,
             tool_use_prompt_tokens: 12,
+            hosted_search_requests: 0,
             reasoning_tokens: 5,
         });
 

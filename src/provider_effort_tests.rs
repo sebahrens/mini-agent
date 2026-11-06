@@ -6,6 +6,12 @@ mod replay_probe;
 #[path = "context/instruction_wire_tests.rs"]
 mod instruction_wire_tests;
 
+#[path = "provider_native_restart_tests.rs"]
+mod native_restart_tests;
+
+#[path = "provider_hosted_search_cost_tests.rs"]
+mod hosted_search_cost_tests;
+
 #[path = "provider_cache_tests.rs"]
 mod cache_tests;
 
@@ -37,7 +43,18 @@ impl Wire {
         Self::at_path(responses, "/v1/messages")
     }
 
+    /// As [`Wire::new`], but a `GET /v1/models` (the TUI's background model
+    /// listing, opened by typing a slash command) is answered `404` without
+    /// consuming a scripted response or being recorded.
+    fn new_tolerating_model_listing(responses: Vec<(bool, String)>) -> Self {
+        Self::spawn(responses, "/v1/messages", true)
+    }
+
     fn at_path(responses: Vec<(bool, String)>, path: &str) -> Self {
+        Self::spawn(responses, path, false)
+    }
+
+    fn spawn(responses: Vec<(bool, String)>, path: &str, tolerate_listing: bool) -> Self {
         let expected_request = format!("POST {path} HTTP/1.1\r\n");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -62,11 +79,16 @@ impl Wire {
                         Err(error) => panic!("native probe accept: {error}"),
                     }
                 };
-                let Some((stream, body)) = responses.next() else {
-                    // Keep even a zero-response endpoint live until finish.
-                    // Drain accepted TCP attempts before honoring cancellation.
-                    requests.push(json!({"unexpected_tcp_attempt": true}));
-                    return requests;
+                let (stream, body) = if tolerate_listing {
+                    (true, String::new())
+                } else {
+                    let Some((stream, body)) = responses.next() else {
+                        // Keep even a zero-response endpoint live until finish.
+                        // Drain accepted TCP attempts before honoring cancellation.
+                        requests.push(json!({"unexpected_tcp_attempt": true}));
+                        return requests;
+                    };
+                    (stream, body)
                 };
                 socket.set_nonblocking(false).unwrap();
                 socket
@@ -76,6 +98,19 @@ impl Wire {
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 let request = blocking::read_request(&mut socket, 512 * 1024);
+                let (stream, body) = if tolerate_listing {
+                    if request.head.starts_with("GET /v1/models") {
+                        blocking::respond(&mut socket, "404 Not Found", "application/json", "{}");
+                        continue;
+                    }
+                    let Some(next) = responses.next() else {
+                        requests.push(json!({"unexpected_tcp_attempt": true}));
+                        return requests;
+                    };
+                    next
+                } else {
+                    (stream, body)
+                };
                 assert!(
                     request.head.starts_with(&expected_request),
                     "{}",

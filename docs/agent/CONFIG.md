@@ -752,7 +752,7 @@ Accepted top-level keys:
 | `no_tools`                | boolean | Disable all tools. Default: `false`.                                                                                                                                        |
 | `no_context_files`        | boolean | Disable loading global/project `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md` (if `archmd` feature enabled) context files. Default: `false`.                               |
 | `context_window`          | integer | Session context-window size used for status and auto-compaction. When unset, auto-detected from the selected model's catalog entry; falls back to `128000` if the model is not in the catalog. Bedrock and Vertex Claude ids (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`, `claude-sonnet-4-5@20250929`) use their native Anthropic catalog entry for the context window, output ceiling and catalog prices (Anthropic list prices; regional surcharges are not modelled). The catalog is the embedded `data/models.json` snapshot, or a newer models.dev cache written by `/models catalog-refresh` or `models_catalog_refresh_days`; a missing, corrupt or older cache file is ignored with a warning. A value of `0` disables auto-compaction. |
-| `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. When unset globally, falls back to the active quick model's `reserve_tokens` field, then to a default that scales with the context window: `window/10`, never below `16384` (so one maximal response cannot overshoot the window) and never above half the window. Examples: 128k window → 16384, 1M window → 100000. |
+| `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. When unset globally, falls back to the active quick model's `reserve_tokens` field, then to a default that scales with the context window: `window/10`, never below the response cap the model is asked for (`max_tokens`, else `min(model max output, 32000)`, else `16384`) plus 8000 tokens of summarizer headroom (so a request sent just under the threshold still fits its own `max_tokens`), and never above half the window. Examples: 200k window with a 64k-output model → 40000, 1M window → 100000. |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. When unset, scales with the context window: `window/20` clamped to `[10000, 50000]` and at most a quarter of the window. Examples: 128k window → 10000, 1M window → 50000.                          |
 | `keep_recent_tool_results` | integer | Optional count-only pruning policy. Omit it (the default) to retain every historical tool result until context-budget compaction. An explicit finite value keeps only that many newest results verbatim and replaces older results with recovery notices; `0` clears all historical results. Calls, durable session records, and spill files remain intact. |
 | `max_text_file_size`      | integer | Maximum raw text returned by one `read` call (edits and writes use `max_edit_file_size`). A larger file can be read only with an explicit `offset` or `limit`, and the selected line window must fit this byte cap. The resolved config default is `1048576` (1 MiB); subagent construction has a defensive `10485760` (10 MiB) fallback only when handed an unresolved config with this field absent. |
@@ -1516,8 +1516,11 @@ and *within* a turn when real prompt pressure crosses `mid_turn_compact_threshol
 prompts. A headless or ACP turn stops at the next complete tool batch, records its progress,
 compacts the session history (in memory under `--no-session`) and continues with a
 continuation prompt, at most three times per turn; ACP also sends a short agent-thought
-notice. Provider-native (Anthropic replay) sessions cannot be compacted in place and are
-not compacted mid-turn. Tools with their own output limits (`read`,
+notice. Between turns a provider-native (Anthropic replay) session compacts like any other (TUI
+auto-compaction and `/compact`, headless pre-turn compaction): its signed thinking chain cannot be
+summarized in place, so the compaction restarts the chain from the compacted transcript as a new
+replay epoch, with a one-line notice (earlier thinking blocks are dropped). It is not compacted
+mid-turn, and ACP refuses to compact one with a visible message before any summarizer spend. Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
 and the subagent `task` tool) retain their documented line, byte, and result
 limits in both live and replayed history. Their
@@ -2969,9 +2972,13 @@ OAuth fields (all optional):
 | `redirect_port` | `8970`                         | Loopback port for the redirect URI `http://<redirect_host>:<port>/callback`. |
 
 A confidential pre-registered client takes its secret only from the environment
-variable `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>` (server name upper-cased,
-every character other than a letter or digit replaced by `_`; for example
-`my-server` reads `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_MY_SERVER`). It is read at
+variable `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>`. The server name is
+encoded injectively, so differently spelled names never share a secret: each
+lowercase ASCII letter becomes its uppercase form, each digit is kept, and every
+other byte of the UTF-8 name (an uppercase letter, `_`, `-`, `.`, any non-ASCII
+byte) becomes `_` plus two uppercase hex digits. For example `my-server` reads
+`MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_MY_2DSERVER`, `my.server` reads
+`..._MY_2ESERVER` and `My_Server` reads `..._4DY_5F_53ERVER`. It is read at
 login and when a stored token is restored, sent to the token endpoint
 (`client_secret_basic`), and never written to configuration or the credential
 file. There is deliberately no config key for it, so a project config cannot
@@ -4578,10 +4585,14 @@ the native domain/recency parameters; the opt-in is the only approval. Optional
 `hosted-web-search-allowed-domains` or `hosted-web-search-blocked-domains` (bare
 domains, at most 20, not both) are sent as Anthropic `allowed_domains` /
 `blocked_domains`; the OpenAI Responses tool takes `filters.allowed_domains`
-only, so a block-list there withholds hosted search (fail closed, with a
-warning) instead of searching unfiltered. `hosted-web-search-max-uses` (1..=50,
-default 5) sets the Anthropic per-request search cap. Invalid filters, both lists,
-or an out-of-range cap also withhold the hosted tool. The filters never enable
+only, so a block-list there withholds hosted search (fail closed) instead of
+searching unfiltered; when the configured provider is OpenAI Responses and
+`hosted-web-search` is on, startup prints a visible config warning for it.
+`hosted-web-search-max-uses` (1..=50, default 5) sets the Anthropic per-request
+search cap. Invalid filters, both lists, or an out-of-range cap are rejected at
+config load (a fatal error in the user config and `--config` overrides, a startup
+warning for an untrusted-values project config, which then withholds the hosted
+tool) rather than only logged. The filters never enable
 hosted search by themselves. The
 setting is ignored when `web-search-provider = "off"`, when any `web_search`
 deny rule exists (a `permission-deny` entry with or without patterns, `web_search
@@ -4600,6 +4611,7 @@ untrusted project config cannot enable it.
 | `web-search-provider` (`web_search_provider`) | `"exa"` | Fixed-endpoint Exa search, or `"off"` to omit the tool. Other provider names fail visibly before I/O. |
 | `hosted-web-search` (`hosted_web_search`) | `false` | Opt in to the Anthropic or OpenAI Responses provider-hosted web search instead of native Exa. Bypasses per-call `web_search` permission; see above. |
 | `hosted-web-search-allowed-domains` / `-blocked-domains` / `-max-uses` | omitted / omitted / `5` | Domain filters and the Anthropic `max_uses` cap for hosted search (see above). Authority-sensitive: need project trust. |
+| `hosted-web-search-cost-per-1k` (`hosted_web_search_cost_per_1k`) | `10` | USD per 1,000 provider-hosted searches, counted into the session cost, `/cost`, the spend ledger and `--max-budget-usd` (0..=100000). Anthropic's published price is $10 per 1,000; OpenAI bills `web_search` per call. Authority-sensitive: needs project trust, so a project cannot zero the fee. |
 | `web-fetch-timeout-secs` (`web_fetch_timeout_secs`) | `30` | Total `web_fetch` deadline in seconds, spanning DNS, approval, redirects and body. Clamped to 1..=300. The idle gap allowed between body reads is half of it (at least 3 s). `web_search` keeps its fixed 10 s deadline. |
 
 These are authority-sensitive project config keys and require existing project

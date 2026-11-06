@@ -509,6 +509,36 @@ fn hosted_search_options(cfg: &Config) -> Result<HostedSearchOptions, String> {
     })
 }
 
+/// Config-load validation of the three `hosted-web-search-*` keys. Returns the
+/// same error the agent build would otherwise only log at `warn` level (which
+/// silently removed hosted search), so a bad value is reported at startup.
+pub(crate) fn validate_hosted_search_config(cfg: &Config) -> Result<(), String> {
+    if let Some(rate) = cfg.hosted_web_search_cost_per_1k
+        && !(rate.is_finite()
+            && (0.0..=crate::pricing::MAX_HOSTED_SEARCH_USD_PER_1K).contains(&rate))
+    {
+        return Err(format!(
+            "hosted-web-search-cost-per-1k must be between 0 and {}",
+            crate::pricing::MAX_HOSTED_SEARCH_USD_PER_1K
+        ));
+    }
+    if cfg.hosted_web_search_allowed_domains.is_none()
+        && cfg.hosted_web_search_blocked_domains.is_none()
+        && cfg.hosted_web_search_max_uses.is_none()
+    {
+        return Ok(());
+    }
+    hosted_search_options(cfg).map(|_| ())
+}
+
+/// Whether a block-list is configured for hosted search (the OpenAI Responses
+/// bridge has no such filter and withholds the tool when one is set).
+pub(crate) fn hosted_search_has_block_list(cfg: &Config) -> bool {
+    cfg.hosted_web_search_blocked_domains
+        .as_ref()
+        .is_some_and(|domains| !domains.is_empty())
+}
+
 /// Hosted web-search tool definition for providers that run search
 /// server-side, or `None` where the provider has no supported bridge. Invalid
 /// filter configuration, or a block-list on a provider that cannot express one,
@@ -3258,6 +3288,14 @@ pub struct AnyAgent {
     /// request, so later goal rounds never repeat it.
     #[cfg(feature = "subagents")]
     headless_turn_directive: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    /// Typed user content (text plus attached images) for the next headless
+    /// turn only, taken by the first `run_print_with_output` that starts a
+    /// request. The provider-native path sends it as one ordered User message
+    /// and records exactly that message in the session feed.
+    #[cfg(feature = "multimodal")]
+    headless_user: Option<
+        std::sync::Arc<std::sync::Mutex<Option<crate::session::user::PersistedUserMessage>>>,
+    >,
     completion_verification: Option<runner::CompletionVerification>,
     reasoning_controls: Option<CapturedReasoning>,
     /// Same-provider model used for the rest of a headless turn whose
@@ -3994,6 +4032,8 @@ impl AnyAgent {
             question_turn: None,
             #[cfg(feature = "subagents")]
             headless_turn_directive: None,
+            #[cfg(feature = "multimodal")]
+            headless_user: None,
             completion_verification: None,
             reasoning_controls: None,
             fallback: None,
@@ -4261,6 +4301,27 @@ impl AnyAgent {
         self.headless_turn_directive =
             directive.map(|directive| std::sync::Arc::new(std::sync::Mutex::new(Some(directive))));
         self
+    }
+
+    /// Send `user` (the turn's text plus its images, in order) instead of a
+    /// text-only prompt for the next headless turn this agent dispatches.
+    #[cfg(feature = "multimodal")]
+    pub(crate) fn with_headless_user(
+        mut self,
+        user: Option<crate::session::user::PersistedUserMessage>,
+    ) -> Self {
+        self.headless_user =
+            user.map(|user| std::sync::Arc::new(std::sync::Mutex::new(Some(user))));
+        self
+    }
+
+    #[cfg(feature = "multimodal")]
+    fn take_headless_user(&self) -> Option<crate::session::user::PersistedUserMessage> {
+        self.headless_user.as_ref().and_then(|cell| {
+            cell.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        })
     }
 
     #[cfg(feature = "subagents")]
@@ -4641,6 +4702,8 @@ impl AnyAgent {
             question_turn: None,
             #[cfg(feature = "subagents")]
             headless_turn_directive: None,
+            #[cfg(feature = "multimodal")]
+            headless_user: None,
             completion_verification: None,
             reasoning_controls: None,
             fallback: None,
@@ -4858,7 +4921,23 @@ impl AnyAgent {
                     return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
                 }
             };
-            let prompt = crate::agent::input::PromptInput::text(prompt.to_string());
+            #[cfg(feature = "multimodal")]
+            let prompt_input = match self.take_headless_user() {
+                Some(user) => {
+                    let typed = crate::agent::input::PromptInput::user(user);
+                    // A UserPromptSubmit hook may not rewrite ordered media content.
+                    if typed.literal_text() != prompt {
+                        return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+                            "a user-prompt hook cannot rewrite ordered media content; submit a text-only prompt or preserve the original text"
+                        ));
+                    }
+                    typed
+                }
+                None => crate::agent::input::PromptInput::text(prompt.to_string()),
+            };
+            #[cfg(not(feature = "multimodal"))]
+            let prompt_input = crate::agent::input::PromptInput::text(prompt.to_string());
+            let prompt = prompt_input;
             #[cfg(feature = "subagents")]
             let prompt = prompt.with_turn_directive(self.take_headless_turn_directive());
             #[cfg(not(feature = "agent-skills"))]
@@ -8669,6 +8748,15 @@ impl NativeSessionEndOwner {
         self.permit
             .update_reasoning(session, self.host.as_ref(), next)
             .await
+    }
+    /// Drop the idle native chain and republish the transcript as a new epoch.
+    /// The host guard is retained: it describes the live permission and
+    /// instruction owners, which a restart does not change.
+    pub(crate) async fn restart_chain(
+        &mut self,
+        session: &mut crate::session::Session,
+    ) -> anyhow::Result<()> {
+        self.permit.restart_chain(session).await
     }
     #[cfg(any(feature = "hooks", feature = "subagents"))]
     pub(crate) async fn run(self, session: &mut crate::session::Session) -> anyhow::Result<()> {

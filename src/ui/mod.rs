@@ -7,7 +7,7 @@ pub(crate) use app::drive_native_stale_session_end_fixture;
 #[cfg(test)]
 pub(crate) use app::{
     drive_native_effort_fixture, drive_native_fixture_turn, drive_native_fixture_turns,
-    drive_native_steer_fixture,
+    drive_native_script, drive_native_steer_fixture,
 };
 mod app;
 #[cfg(feature = "multimodal")]
@@ -1317,6 +1317,11 @@ pub(crate) async fn start_main_run_with_directive(
         run.native_owner.is_none(),
         "the previous native context is still settling"
     );
+    // A chain that cannot be replayed restarts here when nothing earlier did
+    // (an interactive caller shows the notice itself, so this one is a log).
+    if let Some(notice) = reconcile_native_chain(run, ui).await? {
+        tracing::info!("{notice}");
+    }
     if let Some(reason) = run.native_blocked {
         return Err(reason.into());
     }
@@ -1562,6 +1567,44 @@ pub(crate) async fn start_main_run_with_directive(
         }
     }
     Ok(())
+}
+
+/// Drop the Anthropic-native thinking chain when it can no longer be replayed
+/// and continue from the display transcript as a new epoch: it is near its
+/// finite frame/byte bounds, belongs to another model, no longer matches a
+/// compacted transcript, or a recoverable refusal (also an earlier mid-turn
+/// overflow) made it unreplayable. Idle only; an unfinished (`InFlight`)
+/// context is never discarded. Returns the one-line notice to show.
+pub(crate) async fn reconcile_native_chain(
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+) -> anyhow::Result<Option<&'static str>> {
+    if run.is_running || run.native_owner.is_some() {
+        return Ok(None);
+    }
+    let Some(cause) = ui.session.native_restart_cause() else {
+        return Ok(None);
+    };
+    if ui.cli.no_session {
+        // Ephemeral: nothing is published, the in-memory chain simply goes.
+        ui.session.restart_native_chain()?;
+    } else if let Some(owner) = run.native_session_end.as_mut() {
+        crate::startup::heap_future(|| owner.restart_chain(ui.session)).await?;
+    } else if let Some(ticket) = ui.native_ticket.as_mut() {
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        let result =
+            crate::session::native_publication::restart_with_ticket(ui.session, ticket, &scope)
+                .await;
+        cleanup.settle().await;
+        result?;
+    } else {
+        anyhow::bail!(
+            "unfinished native context requires recovery before it can restart; start a fresh context to continue"
+        );
+    }
+    run.native_blocked = None;
+    Ok(Some(cause.notice()))
 }
 
 /// Attaches only the completed capture of the exact retired foreground actor.

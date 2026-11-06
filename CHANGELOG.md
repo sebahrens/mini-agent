@@ -26,7 +26,7 @@ Notable changes to mini-agent are documented in this file. The format follows
   gained a `Document` variant for it (mini-agent-totd8).
 - MCP `oauth.client_id` now works: login uses the pre-registered client without dynamic registration
   (public client by default; a confidential client reads its secret from
-  `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>`), and a server without registration and without a
+  `MINI_AGENT_MCP_OAUTH_CLIENT_SECRET_<SERVER>`, where `<SERVER>` is an injective encoding of the server name so no two names share a secret; mini-agent-ipcr6), and a server without registration and without a
   client id fails with guidance (mini-agent-sgg3v).
 - The `instructions` from each MCP server's `initialize` result are added to the system prompt as
   bounded (2 KiB per server, 8 KiB total), fenced untrusted text with a truncation notice
@@ -172,6 +172,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   text, and hints when a page converts to almost no text.
 ### Sessions
 
+- Headless image attachments (`-i`, stream-json image blocks) and `--input-format stream-json` now
+  work on a persisted provider-native Anthropic session instead of being refused: the images and
+  prompt are one typed user message recorded in the native history, every stream-json turn opens
+  and retires its own native context, and `--continue` resumes the same chain. A `SessionEnd`
+  hook of such a session runs after each turn (mini-agent-siyos).
+
 - The session catalogue (`/sessions`, `--resume`) writes a small `<id>.index` metadata sidecar for
   every session it reads in full; a session with a current sidecar is listed without reading its
   transcript and is no longer charged against the 256 MiB scan budget, so repeated listings reach
@@ -206,7 +212,31 @@ Notable changes to mini-agent are documented in this file. The format follows
   overrides it), and `compaction_model` names a same-provider `quick_models` entry for a
   faster or cheaper summarizer.
 
+- A provider-native Anthropic session no longer dies at its replay bounds or after a compaction or
+  `/model` switch: when the signed thinking chain is near its bounds (64 of 128 frames or 2 of 4 MiB),
+  belongs to another model, no longer matches a compacted transcript, or a recoverable refusal
+  was saved, the host drops it and continues from the transcript as a new epoch with a one-line
+  notice. Between-turn auto-compaction, `/compact` and headless pre-turn compaction now work on such
+  sessions instead of being skipped silently or leaving every later prompt failing (mini-agent-9xucp,
+  mini-agent-ydugt, mini-agent-9szqw). The manual cache policy's moving spare markers no longer count
+  as part of the chain's commitment, which refused the session after about 18 blocks.
+- Context-length rejections worded by Gemini ("input token count ... exceeds the maximum number of
+  tokens allowed"), Amazon Bedrock ("Input is too long for requested model") and GitHub Copilot
+  (`model_max_prompt_tokens_exceeded`, "prompt token count ... exceeds the limit") now get the
+  `/compress` hint, reactive compaction and the single retry (mini-agent-n1dwl).
+- The default `reserve_tokens` is at least the response cap the model is asked for plus 8000 tokens
+  of summarizer headroom (was `window/10` floored at 16,384), so a request sent just under the
+  compaction threshold still fits its own `max_tokens` in a 200k-class window (mini-agent-tzdjw).
+
 ### Cost tracking
+
+- Provider-hosted web search fees are counted: Anthropic `usage.server_tool_use.web_search_requests`
+  and OpenAI Responses `web_search_call` items become `hosted_search_requests` on usage reports and
+  ledger receipts, priced at `hosted-web-search-cost-per-1k` (default $10 per 1,000, needs project
+  trust) into the session cost, `/cost`, the ledger and `--max-budget-usd` (mini-agent-zoea5).
+- Invalid `hosted-web-search-allowed-domains` / `-blocked-domains` / `-max-uses` values are now a
+  config-load error (and the OpenAI Responses block-list limitation a visible startup warning)
+  instead of silently removing hosted search (mini-agent-cq3om).
 
 - The global usage ledger no longer has a permanent 65,536-record / 64 MiB wall: a full
   `usage.jsonl` is archived as `usage.<seq>.archive.jsonl` and folded into `usage.rollup`, so

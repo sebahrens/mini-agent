@@ -674,16 +674,17 @@ async fn handle_agent_done(
         .cfg
         .resolve_reserve_tokens(&ui.session.model, qm, ui.session.context_window);
 
-    if ui.session.native_history_snapshot().is_none()
-        && should_auto_compact_between_turns(
-            ui.cfg.resolve_compact_enabled(),
-            ui.session.needs_compaction_after_tool_result_pruning(
-                reserve,
-                ui.cfg.resolve_keep_recent_tool_results(),
-            ),
-            loop_running,
-        )
-    {
+    // A native (Anthropic) session compacts like any other: the compaction
+    // restarts its thinking chain from the compacted transcript
+    // (`handle_compress` reconciles it), instead of being skipped silently.
+    if should_auto_compact_between_turns(
+        ui.cfg.resolve_compact_enabled(),
+        ui.session.needs_compaction_after_tool_result_pruning(
+            reserve,
+            ui.cfg.resolve_keep_recent_tool_results(),
+        ),
+        loop_running,
+    ) {
         let compress_result = handle_compress(None, true, run, renderer, ui, true).await;
         if let Err(e) = compress_result {
             renderer.write_line(&format!("auto-compact error: {}", e), C_ERROR)?;

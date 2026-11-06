@@ -145,7 +145,12 @@ pub(crate) mod blocking {
             head.push(byte[0]);
         }
         let mut request = Request::parse(head);
-        let length = request.content_length().unwrap();
+        // A bodiless GET carries no Content-Length; every other request must.
+        let length = match request.content_length() {
+            Some(length) => length,
+            None if request.head.starts_with("GET ") => 0,
+            None => panic!("request without Content-Length: {}", request.head),
+        };
         assert!(length <= max_body);
         request.body = vec![0; length];
         socket.read_exact(&mut request.body).unwrap();

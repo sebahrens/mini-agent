@@ -2069,6 +2069,7 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_creation: None,
             tool_use_prompt_tokens: 0,
+            hosted_search_requests: 0,
             reasoning_tokens: 0,
         }
     }
@@ -5250,6 +5251,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_creation: None,
                 tool_use_prompt_tokens: 0,
+                hosted_search_requests: 0,
                 reasoning_tokens: 0,
             }
         );

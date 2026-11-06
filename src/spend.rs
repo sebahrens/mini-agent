@@ -57,6 +57,11 @@ pub(crate) struct PriceSnapshot {
     #[serde(default, skip_serializing_if = "false_value")]
     pub cache_split_required: bool,
     pub anthropic_native: bool,
+    /// USD per 1,000 provider-hosted web searches in force when this receipt
+    /// was written. Recorded only when the usage carries searches, so older
+    /// readers keep decoding every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_search_per_1k: Option<f64>,
 }
 
 fn false_value(value: &bool) -> bool {
@@ -86,6 +91,7 @@ impl PriceSnapshot {
             cache_write_1h: cache.write_1h,
             cache_split_required: cache.split_required,
             anthropic_native,
+            hosted_search_per_1k: None,
         }
     }
     pub(crate) fn from_session(
@@ -147,12 +153,32 @@ impl PriceSnapshot {
             self.cache_read,
             self.cache_write,
             self.cache_write_1h,
+            self.hosted_search_per_1k,
         ]
         .into_iter()
         .flatten()
         .all(|rate| rate.is_finite() && rate >= 0.0)
     }
+    /// Token cost plus the per-request fee of provider-hosted web searches.
     pub(crate) fn cost(self, usage: UsageDelta) -> Option<f64> {
+        let tokens = self.token_cost(usage)?;
+        let fee = crate::pricing::hosted_search_fee_at(
+            usage.hosted_search_requests,
+            self.hosted_search_per_1k
+                .unwrap_or(crate::pricing::DEFAULT_HOSTED_SEARCH_USD_PER_1K),
+        );
+        let total = tokens + fee;
+        total.is_finite().then_some(total)
+    }
+    /// The same snapshot with the hosted-search price in force now, recorded
+    /// when `usage` carries searches (so the receipt stays self-consistent).
+    pub(crate) fn with_hosted_search_rate(mut self, usage: UsageDelta) -> Self {
+        if usage.hosted_search_requests > 0 && self.hosted_search_per_1k.is_none() {
+            self.hosted_search_per_1k = Some(crate::pricing::hosted_search_usd_per_1k());
+        }
+        self
+    }
+    fn token_cost(self, usage: UsageDelta) -> Option<f64> {
         if !self.valid() {
             return None;
         }
@@ -336,6 +362,7 @@ impl From<LegacyPrices> for PriceSnapshot {
             cache_write_1h: None,
             cache_split_required: false,
             anthropic_native: prices.anthropic_native,
+            hosted_search_per_1k: None,
         }
     }
 }
@@ -362,6 +389,7 @@ impl From<LegacyUsage> for UsageDelta {
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
             cache_creation: None,
             tool_use_prompt_tokens: usage.tool_use_prompt_tokens,
+            hosted_search_requests: 0,
             reasoning_tokens: usage.reasoning_tokens,
         }
     }
@@ -377,7 +405,9 @@ impl Row {
             anyhow::ensure!(
                 self.usage.cache_creation.is_none()
                     && self.prices.cache_write_1h.is_none()
-                    && !self.prices.cache_split_required,
+                    && !self.prices.cache_split_required
+                    && self.usage.hosted_search_requests == 0
+                    && self.prices.hosted_search_per_1k.is_none(),
                 "version one usage receipt contains new cache metadata"
             );
         }
@@ -404,6 +434,7 @@ impl Row {
                 usage.cached_input_tokens,
                 usage.cache_creation_input_tokens,
                 usage.tool_use_prompt_tokens,
+                usage.hosted_search_requests,
                 usage.reasoning_tokens
             ]
             .into_iter()
@@ -458,6 +489,7 @@ impl Receipt {
         prices: PriceSnapshot,
     ) -> Self {
         let usage_reported = usage.has_values();
+        let prices = prices.with_hosted_search_rate(usage);
         let cost = (usage_reported || prices.is_free())
             .then(|| prices.cost(usage))
             .flatten();
@@ -1050,6 +1082,70 @@ mod tests {
             false,
         )
     }
+    // mini-agent-zoea5: hosted searches are priced per request, recorded with the
+    // rate in force so a stored receipt stays valid when the configured rate changes.
+    #[test]
+    fn hosted_search_fee_is_in_the_receipt_cost_with_its_own_rate() {
+        let usage = UsageDelta {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            hosted_search_requests: 3,
+            ..Default::default()
+        };
+        let tokens = 10.0 * 2.0 / 1e6 + 2.0 * 2.0 / 1e6;
+        let receipt = Receipt::new("s", "p", "m", RequestKind::Turn, usage, prices(Some(2.0)));
+        let row = (*receipt.row).clone();
+        assert_eq!(
+            row.prices.hosted_search_per_1k,
+            Some(crate::pricing::hosted_search_usd_per_1k())
+        );
+        let expected = tokens + 3.0 * crate::pricing::hosted_search_usd_per_1k() / 1000.0;
+        assert!(
+            (row.cost.unwrap() - expected).abs() < 1e-12,
+            "{:?}",
+            row.cost
+        );
+        let reloaded: Row = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        reloaded.validate().unwrap();
+        assert_eq!(reloaded, row);
+
+        // A receipt written at $5/1,000 stays valid whatever the current rate is.
+        let mut cheap = prices(Some(2.0));
+        cheap.hosted_search_per_1k = Some(5.0);
+        let at_five = Receipt::new("s", "p", "m", RequestKind::Turn, usage, cheap);
+        let at_five = (*at_five.row).clone();
+        assert!((at_five.cost.unwrap() - (tokens + 0.015)).abs() < 1e-12);
+        let reloaded: Row =
+            serde_json::from_str(&serde_json::to_string(&at_five).unwrap()).unwrap();
+        reloaded.validate().unwrap();
+        // A tampered rate or count no longer matches the recorded cost.
+        let mut tampered = at_five.clone();
+        tampered.prices.hosted_search_per_1k = Some(0.0);
+        assert!(tampered.validate().is_err());
+        let mut tampered = at_five.clone();
+        tampered.usage.hosted_search_requests = 4;
+        assert!(tampered.validate().is_err());
+        // Usage with no searches records no rate (older readers keep decoding).
+        let plain = Receipt::new(
+            "s",
+            "p",
+            "m",
+            RequestKind::Turn,
+            UsageDelta {
+                input_tokens: 1,
+                ..Default::default()
+            },
+            prices(Some(2.0)),
+        );
+        assert_eq!(plain.row.prices.hosted_search_per_1k, None);
+        let json = serde_json::to_string(&*plain.row).unwrap();
+        assert!(!json.contains("hosted_search"), "{json}");
+        // An unpriced model has no token cost, so the receipt cost stays unknown.
+        let unknown = Receipt::new("s", "p", "m", RequestKind::Turn, usage, prices(None));
+        assert_eq!(unknown.row.cost, None);
+    }
+
     fn split_usage(five: u64, hour: u64) -> UsageDelta {
         UsageDelta {
             cache_creation_input_tokens: five + hour,

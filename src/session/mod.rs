@@ -986,6 +986,10 @@ pub struct Session {
     /// Provider-normalized prompt tokens, including cached tiers exactly once.
     #[serde(default)]
     pub total_real_input_tokens: u64,
+    /// Provider-hosted web searches billed this session (per request, on top of
+    /// tokens; already included in `total_cost`).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub total_hosted_search_requests: u64,
     pub total_cost: f64,
     /// Goal completion-judge tokens charged to the totals above without a
     /// cost, because the judge model's price is unknown (mini-agent-kfsup).
@@ -1318,6 +1322,44 @@ impl Session {
         Ok(())
     }
 
+    /// Whether the saved native thinking chain should be dropped and restarted
+    /// from the display transcript before the next request (it is near its
+    /// finite bounds, belongs to another model, no longer matches a compacted
+    /// transcript, or a recoverable refusal made it unreplayable). `None` for a
+    /// session without a chain, a healthy chain, and an unfinished (`InFlight`)
+    /// context, which must be recovered rather than discarded.
+    pub(crate) fn native_restart_cause(&self) -> Option<native_replay::NativeRestartCause> {
+        use native_replay::NativeRestartCause as Cause;
+        if let Some(reason) = self.native_frontier.refusal() {
+            return reason.restartable().then_some(Cause::Refused(reason));
+        }
+        let history = self.native_history.as_ref()?;
+        if history.near_bounds() {
+            return Some(Cause::Bounds);
+        }
+        if history
+            .configured_model()
+            .is_some_and(|model| model != self.model.as_str())
+        {
+            return Some(Cause::ModelChanged);
+        }
+        history
+            .validate_feed(&self.messages, &self.compactions)
+            .is_err()
+            .then_some(Cause::TranscriptChanged)
+    }
+
+    /// Drop the native chain: the next request replays the display transcript
+    /// (no signed thinking blocks) as a new epoch. Only the in-memory Session
+    /// changes; a saved-session owner republishes through
+    /// [`native_publication`]. Fails for an unfinished context.
+    pub(crate) fn restart_native_chain(&mut self) -> Result<(), native_replay::RestartReason> {
+        self.native_frontier.restart()?;
+        self.native_history = None;
+        self.retired_native_history.clear();
+        Ok(())
+    }
+
     pub(crate) fn validate_native_persistence(&self) -> Result<(), native_replay::RestartReason> {
         if let Some(history) = &self.native_history {
             history.validate_saved()?;
@@ -1483,6 +1525,7 @@ impl Session {
             total_cache_creation_input_tokens: 0,
             total_cache_creation: None,
             total_real_input_tokens: 0,
+            total_hosted_search_requests: 0,
             total_cost: 0.0,
             unpriced_judge_tokens: 0,
             total_estimated_tokens: 0,
@@ -1949,6 +1992,7 @@ impl Session {
             || self.total_real_input_tokens > 0
             || self.total_cached_input_tokens > 0
             || self.total_cache_creation_input_tokens > 0
+            || self.total_hosted_search_requests > 0
             || self.total_cost > 0.0
             || self.unpriced_judge_tokens > 0
             || !self.compactions.is_empty()
@@ -2147,6 +2191,9 @@ impl Session {
         self.total_cached_input_tokens = self
             .total_cached_input_tokens
             .saturating_add(usage.cached_input_tokens);
+        self.total_hosted_search_requests = self
+            .total_hosted_search_requests
+            .saturating_add(usage.hosted_search_requests);
         self.total_cache_creation = rig::completion::CacheCreationUsage::add_optional(
             self.total_cache_creation_input_tokens,
             self.total_cache_creation,

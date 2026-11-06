@@ -2219,7 +2219,7 @@ impl Startup {
         Ok(())
     }
 
-    async fn join_native_startup(&mut self) -> anyhow::Result<()> {
+    pub(crate) async fn join_native_startup(&mut self) -> anyhow::Result<()> {
         if let Some(mut owner) = self.native_startup.take() {
             owner.save_progress(&mut self.session).await?;
             self.native_ticket = Some(owner.into_model_ticket(&self.session).await?);
@@ -2377,16 +2377,11 @@ impl Startup {
     /// lines emit an `input_error` record and are skipped. Returns the last
     /// turn failure so the exit status stays nonzero when one failed.
     async fn dispatch_print_stream_input(&mut self) -> anyhow::Result<()> {
-        if self.native_ticket.is_some() || self.native_headless.is_some() {
-            anyhow::bail!(
-                "{} Or use --acp for multi-turn native sessions.",
-                crate::headless_media::native_history_refusal("--input-format stream-json turns")
-            );
-        }
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
         let mut pending =
             Some(self.cli.message.join(" ").trim().to_string()).filter(|prompt| !prompt.is_empty());
         let mut last_failure = None;
+        let mut turn_index = 0usize;
         // Opt-in control channel: stdin is read by a task that answers
         // control lines at once (even mid-turn) and queues the rest.
         let mut queued = self.cli.stream_json_control.then(|| {
@@ -2444,6 +2439,15 @@ impl Startup {
             }
             self.cli.message = vec![prompt];
             crate::print::reset_headless_result_emitted();
+            if turn_index > 0
+                && let Err(error) = self.reopen_native_turn().await
+            {
+                // The previous native turn did not retire cleanly, so its
+                // context cannot take another turn; later lines stay unread.
+                last_failure = Some(error);
+                break;
+            }
+            turn_index += 1;
             if let Err(error) = heap_future(|| self.dispatch_print()).await {
                 if crate::print::headless_force_stopped() {
                     return Err(error);
@@ -2457,7 +2461,27 @@ impl Startup {
         }
     }
 
-    async fn dispatch_print(&mut self) -> anyhow::Result<()> {
+    /// Prepare the next turn of a multi-turn headless run on a provider-native
+    /// (Anthropic) session. The previous turn retired its owner and published
+    /// its boundary; a persisted session opens a fresh ticket for the next
+    /// turn (restarting an unreplayable chain first), and `--no-session` keeps
+    /// the in-memory chain. A non-native session has nothing to reopen.
+    pub(crate) async fn reopen_native_turn(&mut self) -> anyhow::Result<()> {
+        let retired = self.native_headless.take();
+        if retired.is_none() && self.native_ticket.is_none() {
+            return Ok(());
+        }
+        if self.native_ticket.is_none() && !self.cli.no_session {
+            let owner = crate::session::native_publication::NativeStartupPublication::begin(
+                &mut self.session,
+            )
+            .await?;
+            self.native_ticket = Some(owner.into_model_ticket(&self.session).await?);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn dispatch_print(&mut self) -> anyhow::Result<()> {
         let output_format = self.cli.output_format();
         let root = self.workspace.root().to_path_buf();
         let identity = (self.session.id.to_string(), self.session.name.to_string());
@@ -2497,11 +2521,6 @@ impl Startup {
             return Ok(media);
         }
         anyhow::ensure!(!is_bang, "images cannot be attached to a `!` shell command");
-        anyhow::ensure!(
-            self.native_ticket.is_none() && self.native_headless.is_none(),
-            "{}",
-            crate::headless_media::native_history_refusal("image attachments")
-        );
         #[cfg(feature = "multimodal")]
         crate::headless_media::ensure_vision(&self.session.provider, &self.session.model)
             .map_err(anyhow::Error::msg)?;
@@ -2681,6 +2700,9 @@ impl Startup {
                     .await);
                 }
             };
+            // A pre-turn compaction (or any earlier change) can leave a native
+            // thinking chain that no longer matches the transcript: restart it.
+            self.reconcile_headless_native_chain().await?;
             let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
             let extra_body = provider::merge_extra_body(
                 config::resolve_extra_body(&self.cfg, &self.model),
@@ -2755,8 +2777,18 @@ impl Startup {
             );
             // Attached images persist as one typed user message and are sent
             // ahead of the prompt, the order a replay produces.
+            // A provider-native turn sends one typed user message (images, then
+            // the prompt) and records exactly that message; the generic path
+            // below adds a separate image message to the history instead.
+            #[cfg(feature = "multimodal")]
+            let native_turn = agent.history_protocol()
+                == crate::session::native_replay::HistoryProtocol::AnthropicMessages
+                || self.session.native_history_snapshot().is_some();
             #[cfg(feature = "multimodal")]
             let history = if media.is_empty() {
+                history
+            } else if native_turn {
+                self.session.pending_media.extend(media);
                 history
             } else {
                 let user = crate::headless_media::images_user_message(&media)?;
@@ -2826,6 +2858,36 @@ impl Startup {
             .await?;
         }
 
+        Ok(())
+    }
+
+    /// Drop an unreplayable Anthropic-native thinking chain (compacted
+    /// transcript, other model, finite bounds, recoverable refusal) and
+    /// continue from the transcript as a new epoch, with a one-line notice on
+    /// stderr. The startup ticket republishes the new epoch.
+    async fn reconcile_headless_native_chain(&mut self) -> anyhow::Result<()> {
+        let Some(cause) = self.session.native_restart_cause() else {
+            return Ok(());
+        };
+        if self.cli.no_session {
+            self.session.restart_native_chain()?;
+        } else if let Some(ticket) = self.native_ticket.as_mut() {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+            let result = crate::session::native_publication::restart_with_ticket(
+                &mut self.session,
+                ticket,
+                &scope,
+            )
+            .await;
+            cleanup.settle().await;
+            result?;
+        } else {
+            anyhow::bail!(
+                "unfinished native context requires recovery before it can restart; start a fresh context to continue"
+            );
+        }
+        eprintln!("{}", cause.notice());
         Ok(())
     }
 
@@ -3587,6 +3649,20 @@ async fn run_bound_headless_round(
         return failed(error);
     }
     session.pending_question = None;
+    // Images attached to this turn travel with its prompt as one typed user
+    // message that the native feed records verbatim.
+    #[cfg(feature = "multimodal")]
+    let typed_user = {
+        let media = session.drain_media();
+        if media.is_empty() {
+            None
+        } else {
+            match crate::headless_media::user_message_with_text(&media, message) {
+                Ok(user) => Some(user),
+                Err(error) => return failed(error),
+            }
+        }
+    };
     if let Err(error) = {
         let result = owner.progress(session).await;
         session::storage::report_pending_save_notices(session, |notice| {
@@ -3657,6 +3733,8 @@ async fn run_bound_headless_round(
     {
         return failed(error);
     }
+    #[cfg(feature = "multimodal")]
+    let agent = agent.with_headless_user(typed_user.clone());
     let history = binding.history();
     owner.binding = Some(binding);
     // Provider-native replay history cannot be summarized in place (its signed
@@ -3722,9 +3800,16 @@ async fn run_bound_headless_round(
         .cloned();
     let usage = cfg.normalize_usage(&session.provider, turn.usage.into());
     let binding = owner.binding.as_ref().unwrap();
-    let committed = binding.commit_canonical_into_with_outcome(
+    #[cfg(feature = "multimodal")]
+    let prompt_input = match typed_user {
+        Some(user) => crate::agent::input::PromptInput::user(user),
+        None => crate::agent::input::PromptInput::text(message.to_owned()),
+    };
+    #[cfg(not(feature = "multimodal"))]
+    let prompt_input = crate::agent::input::PromptInput::text(message.to_owned());
+    let committed = binding.commit_canonical_input_into_with_outcome(
         session,
-        message,
+        &prompt_input,
         &turn.response,
         &turn.interactions,
         usage,
@@ -5123,6 +5208,14 @@ mod tests {
         ))
     }
 
+    fn gemini_context_length_turn() -> crate::agent::runner::HeadlessTurn {
+        crate::agent::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            crate::retry::with_context_length_hint(
+                "400 Bad Request INVALID_ARGUMENT: The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."
+            )
+        ))
+    }
+
     fn ok_turn(text: &str) -> crate::agent::runner::HeadlessTurn {
         crate::agent::runner::HeadlessTurn {
             response: text.to_owned(),
@@ -5174,6 +5267,41 @@ mod tests {
         assert_eq!(prompts, ["do the thing", "do the thing"]);
         assert_eq!(relieved.prompt, "do the thing");
         assert!(!relieved.persisted);
+    }
+
+    // mini-agent-n1dwl: a Gemini-worded 400 gets the same single compact+retry.
+    #[tokio::test]
+    async fn headless_gemini_context_length_rejection_compacts_once_and_retries_once() {
+        let mut session = relief_session();
+        let cfg = crate::config::Config::default();
+        let mut runs = 0;
+        let mut compactions = 0;
+        let relieved = relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, _prompt: &str, _history, _mid_turn| {
+                runs += 1;
+                if runs == 1 {
+                    gemini_context_length_turn()
+                } else {
+                    ok_turn("done")
+                }
+            },
+            async |_session: &mut crate::session::Session, _pending| {
+                compactions += 1;
+                Ok((crate::event::UsageDelta::default(), true))
+            },
+        )
+        .await;
+        assert!(
+            relieved.turn.failure.is_none(),
+            "{:?}",
+            relieved.turn.failure
+        );
+        assert_eq!((runs, compactions), (2, 1));
     }
 
     #[tokio::test]

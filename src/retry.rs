@@ -441,6 +441,16 @@ pub fn is_context_length_error_message(message: &str) -> bool {
         || lower.contains("max context length")
         || lower.contains("prompt is too long")
         || lower.contains("request too large for model")
+        // Amazon Bedrock ValidationException.
+        || lower.contains("input is too long for requested model")
+        // Google Gemini INVALID_ARGUMENT: "The input token count (N)
+        // exceeds the maximum number of tokens allowed (M)".
+        || (lower.contains("input token count")
+            && (lower.contains("exceed") || lower.contains("too long")))
+        // GitHub Copilot: "prompt token count of N exceeds the limit of M"
+        // (code `model_max_prompt_tokens_exceeded`).
+        || lower.contains("model_max_prompt_tokens_exceeded")
+        || (lower.contains("prompt token count") && lower.contains("exceed"))
         || (lower.contains("context window")
             && (lower.contains("exceed")
                 || lower.contains("too long")
@@ -1025,6 +1035,9 @@ mod tests {
             "OpenAI: This model's maximum context length is 128000 tokens",
             "OpenRouter upstream error: context_length_exceeded",
             "input exceeds the context window for this model",
+            "Gemini INVALID_ARGUMENT: The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).",
+            "Bedrock ValidationException: Input is too long for requested model.",
+            "Copilot 400 model_max_prompt_tokens_exceeded: prompt token count of 140000 exceeds the limit of 128000",
         ] {
             assert!(
                 is_context_length_error_message(message),

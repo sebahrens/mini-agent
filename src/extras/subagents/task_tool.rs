@@ -7591,6 +7591,7 @@ mod tests {
             cache_creation: None,
             cache_creation_input_tokens: u64::MAX - 1,
             tool_use_prompt_tokens: u64::MAX - 1,
+            hosted_search_requests: 0,
             reasoning_tokens: u64::MAX - 1,
         };
         let increment = Usage {
@@ -7601,6 +7602,7 @@ mod tests {
             cache_creation: None,
             cache_creation_input_tokens: 10,
             tool_use_prompt_tokens: 10,
+            hosted_search_requests: 0,
             reasoning_tokens: 10,
         };
         let merged = merge_forced_continuation_run(
