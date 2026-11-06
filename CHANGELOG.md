@@ -26,6 +26,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Tool argument structs reject unknown field names (`workdir`, `run_in_background`, `glob`,
   `head_limit`, ...) with an error listing the valid names instead of silently dropping them
   (mini-agent-hj7hy).
+- `read` on a PDF now decodes ASCII85, LZW, RunLength and PNG/TIFF-predicted content streams, names
+  any stream it still cannot decode (`[page 3: content stream uses JBIG2Decode, not supported]`),
+  and calls a PDF scanned only when its pages paint images and run no text operators
+  (mini-agent-7qbtw).
 - `list_dir` pages through every entry of a flat directory (the 10,000-entry cap now applies only to
   depth 2-3 trees); `find_files` accepts `offset`/`limit` and names `continue with offset=N`.
 - `git` diff/show pages and `job_status` polls are self-bounded (git pages scale under

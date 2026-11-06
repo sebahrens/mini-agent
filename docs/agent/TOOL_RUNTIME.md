@@ -932,7 +932,8 @@ layer instead of the UTF-8 error. `src/agent/tools/pdf_text.rs` is a bounded,
 in-process extractor, not a renderer: it locates indirect objects by scanning
 (damaged cross-reference tables are tolerated), expands compressed object
 streams, walks the page tree, inflates `FlateDecode`/`ASCIIHexDecode` content
-streams and collects the strings shown by text operators, placing line breaks
+streams (also `ASCII85Decode`, `LZWDecode` with `/EarlyChange`, `RunLengthDecode`, and the PNG and TIFF
+predictors of `/DecodeParms`, alone or chained) and collects the strings shown by text operators, placing line breaks
 and word spaces from the text and graphics matrices. Fonts with a `ToUnicode`
 CMap decode through it; simple fonts use WinAnsi or MacRoman. Form XObjects and
 annotations are not searched. Nothing executes, renders or touches the network.
@@ -945,9 +946,15 @@ without `pages` returns guidance naming the page count and the next ranges. Line
 refused for other files. Output shares the `[tool_limits] max_result_chars`
 budget: selection stops before the first page that would exceed it with
 `continue with pages:"N-M"`, and an oversized single page is clipped. Pages
-without text show `[no text layer on this page]`; when no selected page has a
-text layer the result says the PDF is probably scanned and suggests exporting
-the pages as PNG (for example with `pdftoppm`) and reading the images. Encrypted
+without text show `[no text layer on this page]`. A content stream that cannot be decoded is never
+dropped silently: the page shows `[page N: content stream uses JBIG2Decode, not supported]` (or
+`exceeds the decode budget`, or `could not be decoded (...)`), and a page that still has text
+adds `[page N: some content was not extracted: ...]`. When no selected page has text the result
+explains why per page: skipped streams are named; only pages that paint images (image XObjects
+or inline images) and run no text operator are called probably scanned, with the `pdftoppm`
+export hint; pages with neither text nor images are called blank or vector-only; pages whose
+text operators decode to nothing say their characters could not be mapped. `web_fetch` PDFs use
+the same classification. Encrypted
 PDFs are refused. Limits: 64 MiB per file, 32 MiB decoded per stream, 256 MiB
 decoded per call, nesting depth 64, 1,000,000 parsed nodes per object and
 4,000,000 per document (work on discarded candidates counts), 1024 fonts and

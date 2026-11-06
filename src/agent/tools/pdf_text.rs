@@ -11,6 +11,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
+use super::pdf_filters;
+
 /// Largest PDF file the read tool loads.
 pub(crate) const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
 /// Pages one read call may return; larger documents require `pages`.
@@ -397,6 +399,50 @@ pub(crate) enum PdfError {
     TimedOut,
 }
 
+/// What one page's content streams yielded.
+#[derive(Debug, Default)]
+pub(crate) struct PageContent {
+    pub(crate) text: String,
+    /// Content streams that were skipped and why, e.g.
+    /// `content stream uses JBIG2Decode, not supported`.
+    pub(crate) notes: Vec<String>,
+    /// The page runs at least one text-showing operator.
+    pub(crate) text_operators: bool,
+    /// Image XObjects and inline images the page paints.
+    pub(crate) images: usize,
+}
+
+/// Why one stream could not be decoded.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamError {
+    Unsupported(String),
+    TooLarge,
+    Corrupt(&'static str),
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::Unsupported(filter) => {
+                write!(f, "content stream uses {filter}, not supported")
+            }
+            StreamError::TooLarge => write!(
+                f,
+                "content stream exceeds the decode budget ({} MiB per stream, {} MiB per call)",
+                MAX_STREAM_DECODED / (1024 * 1024),
+                MAX_TOTAL_DECODED / (1024 * 1024)
+            ),
+            StreamError::Corrupt(why) => write!(f, "content stream could not be decoded ({why})"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ContentFlags {
+    text_operators: bool,
+    images: usize,
+}
+
 impl std::fmt::Display for PdfError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -572,7 +618,7 @@ impl Document {
             })
             .collect();
         for (dict, raw) in streams {
-            let Some(decoded) = self.decode(&dict, &raw) else {
+            let Ok(decoded) = self.decode(&dict, &raw) else {
                 continue;
             };
             let count = dict.get(b"N").and_then(Obj::as_num).unwrap_or(0.0) as usize;
@@ -722,37 +768,88 @@ impl Document {
     }
 
     /// Decode a stream's data through its filters, within the budgets.
-    fn decode(&self, dict: &Dict, raw: &[u8]) -> Option<Vec<u8>> {
-        let filters: Vec<Vec<u8>> = match dict.get(b"Filter").map(|f| self.resolve(f)) {
+    fn decode(&self, dict: &Dict, raw: &[u8]) -> Result<Vec<u8>, StreamError> {
+        let filters: Vec<Vec<u8>> = match dict
+            .get(b"Filter")
+            .or_else(|| dict.get(b"F"))
+            .map(|f| self.resolve(f))
+        {
             None | Some(Obj::Null) => Vec::new(),
             Some(Obj::Name(name)) => vec![name.clone()],
             Some(Obj::Array(names)) => names
                 .iter()
                 .filter_map(|name| self.resolve(name).as_name().map(<[u8]>::to_vec))
                 .collect(),
-            _ => return None,
+            _ => return Err(StreamError::Corrupt("malformed /Filter entry")),
         };
+        let params = dict
+            .get(b"DecodeParms")
+            .or_else(|| dict.get(b"DP"))
+            .map(|p| self.resolve(p));
         let mut data = raw.to_vec();
-        for filter in filters {
-            data = match filter.as_slice() {
-                b"FlateDecode" | b"Fl" => self.inflate(&data)?,
+        for (index, filter) in filters.iter().enumerate() {
+            let parms: Option<&Dict> = match params {
+                Some(Obj::Dict(dict)) if index == 0 => Some(dict),
+                Some(Obj::Array(items)) => items
+                    .get(index)
+                    .and_then(|item| self.resolve(item).as_dict()),
+                _ => None,
+            };
+            let limit = usize::try_from(self.decoded_budget.get().min(MAX_STREAM_DECODED))
+                .unwrap_or(usize::MAX);
+            let name = String::from_utf8_lossy(filter).into_owned();
+            let number = |key: &[u8], default: usize| {
+                parms
+                    .and_then(|parms| parms.get(key))
+                    .map(|value| self.resolve(value))
+                    .and_then(Obj::as_num)
+                    .map_or(default, |value| value.max(0.0) as usize)
+            };
+            let predictor = || pdf_filters::Predictor {
+                predictor: number(b"Predictor", 1).min(u32::MAX as usize) as u32,
+                colors: number(b"Colors", 1),
+                bits: number(b"BitsPerComponent", 8),
+                columns: number(b"Columns", 1),
+            };
+            let step = match filter.as_slice() {
+                b"FlateDecode" | b"Fl" => self
+                    .inflate(&data, limit)
+                    .and_then(|out| pdf_filters::unpredict(out, predictor())),
+                b"LZWDecode" | b"LZW" => {
+                    let early = number(b"EarlyChange", 1) != 0;
+                    pdf_filters::lzw(&data, early, limit)
+                        .and_then(|out| pdf_filters::unpredict(out, predictor()))
+                }
+                b"ASCII85Decode" | b"A85" => pdf_filters::ascii85(&data, limit),
+                b"RunLengthDecode" | b"RL" => pdf_filters::run_length(&data, limit),
                 b"ASCIIHexDecode" | b"AHx" => {
                     let mut text = data.clone();
                     text.retain(|byte| !is_whitespace(*byte));
                     text.insert(0, b'<');
                     match Lexer::new(&text, 0).object(0) {
-                        Some(Obj::Str(bytes)) => bytes,
-                        _ => return None,
+                        Some(Obj::Str(bytes)) => Ok(bytes),
+                        _ => Err(pdf_filters::FilterError::Corrupt("invalid ASCIIHex data")),
                     }
                 }
-                _ => return None,
+                // Encryption is undone before any filter runs.
+                b"Crypt" => Ok(std::mem::take(&mut data)),
+                _ => return Err(StreamError::Unsupported(name)),
             };
+            data = step.map_err(|error| match error {
+                pdf_filters::FilterError::TooLarge => StreamError::TooLarge,
+                pdf_filters::FilterError::Corrupt(why) => StreamError::Corrupt(why),
+                pdf_filters::FilterError::Unsupported(what) => {
+                    StreamError::Unsupported(format!("{name} {what}"))
+                }
+            })?;
+            self.decoded_budget
+                .set(self.decoded_budget.get().saturating_sub(data.len() as u64));
         }
-        Some(data)
+        Ok(data)
     }
 
-    fn inflate(&self, data: &[u8]) -> Option<Vec<u8>> {
-        let budget = self.decoded_budget.get().min(MAX_STREAM_DECODED);
+    fn inflate(&self, data: &[u8], limit: usize) -> Result<Vec<u8>, pdf_filters::FilterError> {
+        let budget = limit as u64;
         let mut out = Vec::new();
         let zlib = flate2::read::ZlibDecoder::new(data)
             .take(budget + 1)
@@ -764,34 +861,77 @@ impl Document {
                 .read_to_end(&mut out);
         }
         if out.len() as u64 > budget {
-            return None;
+            return Err(pdf_filters::FilterError::TooLarge);
         }
-        self.decoded_budget
-            .set(self.decoded_budget.get() - out.len() as u64);
-        (!out.is_empty()).then_some(out)
+        if out.is_empty() && zlib.is_err() {
+            return Err(pdf_filters::FilterError::Corrupt(
+                "FlateDecode data could not be inflated",
+            ));
+        }
+        Ok(out)
     }
 
     /// Extracted text of page `index` (0-based).
     pub(crate) fn page_text(&self, index: usize) -> Result<String, PdfError> {
+        Ok(self.page_content(index)?.text)
+    }
+
+    /// Extracted text of page `index` (0-based) plus what could not be read.
+    pub(crate) fn page_content(&self, index: usize) -> Result<PageContent, PdfError> {
         let Some((page, resources)) = self.pages.get(index) else {
-            return Ok(String::new());
+            return Ok(PageContent::default());
         };
         let mut content = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         let streams: Vec<&Obj> = match page.get(b"Contents").map(|c| self.resolve(c)) {
             Some(Obj::Array(items)) => items.iter().map(|item| self.resolve(item)).collect(),
             Some(other) => vec![other],
             None => Vec::new(),
         };
         for stream in streams {
-            if let Obj::Stream(dict, raw) = stream
-                && let Some(decoded) = self.decode(dict, raw)
-            {
-                content.extend_from_slice(&decoded);
-                content.push(b'\n');
+            if let Obj::Stream(dict, raw) = stream {
+                match self.decode(dict, raw) {
+                    Ok(decoded) => {
+                        content.extend_from_slice(&decoded);
+                        content.push(b'\n');
+                    }
+                    Err(error) => {
+                        let note = error.to_string();
+                        if !notes.contains(&note) {
+                            notes.push(note);
+                        }
+                    }
+                }
             }
         }
         let fonts = self.fonts(resources.as_ref())?;
-        Ok(normalize_text(&extract_text(&content, &fonts)))
+        let images = self.image_names(resources.as_ref());
+        let mut flags = ContentFlags::default();
+        let text = normalize_text(&extract_text(&content, &fonts, &images, &mut flags));
+        Ok(PageContent {
+            text,
+            notes,
+            text_operators: flags.text_operators,
+            images: flags.images,
+        })
+    }
+
+    /// Names in the page's `/XObject` resources that are image XObjects.
+    fn image_names(&self, resources: Option<&Dict>) -> HashSet<Vec<u8>> {
+        let mut names = HashSet::new();
+        if let Some(xobjects) = resources
+            .and_then(|resources| resources.get(b"XObject"))
+            .and_then(|xobjects| self.resolve(xobjects).as_dict())
+        {
+            for (name, object) in xobjects.0.iter().take(MAX_FONTS_PER_PAGE) {
+                if let Obj::Stream(dict, _) = self.resolve(object)
+                    && dict.get(b"Subtype").and_then(Obj::as_name) == Some(b"Image")
+                {
+                    names.insert(name.clone());
+                }
+            }
+        }
+        names
     }
 
     fn fonts(&self, resources: Option<&Dict>) -> Result<HashMap<Vec<u8>, FontDecoder>, PdfError> {
@@ -838,7 +978,7 @@ impl Document {
                 }
                 decoder.map = std::rc::Rc::clone(map);
             } else if let Some(Obj::Stream(dict, raw)) = to_unicode.map(|t| self.resolve(t))
-                && let Some(cmap) = self.decode(dict, raw)
+                && let Ok(cmap) = self.decode(dict, raw)
             {
                 let default_bytes = decoder.code_bytes;
                 let mut map = HashMap::new();
@@ -1139,7 +1279,12 @@ impl TextLayout {
     }
 }
 
-fn extract_text(content: &[u8], fonts: &HashMap<Vec<u8>, FontDecoder>) -> String {
+fn extract_text(
+    content: &[u8],
+    fonts: &HashMap<Vec<u8>, FontDecoder>,
+    images: &HashSet<Vec<u8>>,
+    flags: &mut ContentFlags,
+) -> String {
     let fallback = FontDecoder {
         code_bytes: 1,
         map: std::rc::Rc::default(),
@@ -1211,17 +1356,20 @@ fn extract_text(content: &[u8], fonts: &HashMap<Vec<u8>, FontDecoder>) -> String
                 }
             }
             b"Tj" => {
+                flags.text_operators = true;
                 if let Some(Obj::Str(bytes)) = operands.last() {
                     show(bytes, font, &mut layout, &mut out);
                 }
             }
             b"'" | b"\"" => {
+                flags.text_operators = true;
                 layout.move_line(0.0, -layout.leading);
                 if let Some(Obj::Str(bytes)) = operands.last() {
                     show(bytes, font, &mut layout, &mut out);
                 }
             }
             b"TJ" => {
+                flags.text_operators = true;
                 if let Some(Obj::Array(items)) = operands.last() {
                     for item in items {
                         match item {
@@ -1245,7 +1393,15 @@ fn extract_text(content: &[u8], fonts: &HashMap<Vec<u8>, FontDecoder>) -> String
                     }
                 }
             }
+            b"Do" => {
+                if let Some(Obj::Name(name)) = operands.first()
+                    && images.contains(name)
+                {
+                    flags.images += 1;
+                }
+            }
             b"BI" => {
+                flags.images += 1;
                 // Inline image: skip binary data up to a delimited `EI`.
                 let mut index = lexer.pos;
                 while let Some(found) = find(content, b"EI", index) {
@@ -1364,6 +1520,63 @@ fn page_list(pages: &[usize]) -> String {
     parts.join(", ")
 }
 
+/// Explain why none of the selected pages produced text: undecodable streams
+/// are named, scanned pages (images but no text operators) get the export
+/// hint, and anything else is reported as holding neither text nor images.
+fn no_text_report(path: &str, count: usize, pages: &[(usize, PageContent)]) -> String {
+    let numbers: Vec<usize> = pages.iter().map(|(page, _)| *page).collect();
+    let mut out = format!(
+        "PDF: {path} ({count} pages): no text could be extracted from page(s) {}.",
+        page_list(&numbers)
+    );
+    let undecoded: Vec<String> = pages
+        .iter()
+        .filter(|(_, content)| !content.notes.is_empty())
+        .map(|(page, content)| format!("page {page}: {}", content.notes.join("; ")))
+        .collect();
+    if !undecoded.is_empty() {
+        out.push_str(&format!(
+            " Some content streams were skipped ({}); the text may be present but unreadable by this extractor.",
+            undecoded.join(" | ")
+        ));
+    }
+    let scanned: Vec<usize> = pages
+        .iter()
+        .filter(|(_, c)| c.notes.is_empty() && !c.text_operators && c.images > 0)
+        .map(|(page, _)| *page)
+        .collect();
+    if !scanned.is_empty() {
+        out.push_str(&format!(
+            " Page(s) {} paint images and have no text operators, so they are probably scanned images; export them to images (for example `pdftoppm -png -r 100 -f {first} -l {first} <file> page`) and read the PNG files.",
+            page_list(&scanned),
+            first = scanned[0],
+        ));
+    }
+    let empty: Vec<usize> = pages
+        .iter()
+        .filter(|(_, c)| c.notes.is_empty() && c.images == 0 && !c.text_operators)
+        .map(|(page, _)| *page)
+        .collect();
+    if !empty.is_empty() {
+        out.push_str(&format!(
+            " Page(s) {} contain no text and no images (blank, or drawn only as vector graphics or form XObjects).",
+            page_list(&empty)
+        ));
+    }
+    let text_without_chars: Vec<usize> = pages
+        .iter()
+        .filter(|(_, c)| c.notes.is_empty() && c.text_operators)
+        .map(|(page, _)| *page)
+        .collect();
+    if !text_without_chars.is_empty() {
+        out.push_str(&format!(
+            " Page(s) {} show text whose characters could not be mapped to Unicode.",
+            page_list(&text_without_chars)
+        ));
+    }
+    out
+}
+
 /// Render the selected pages' text layer for the read tool, bounded by
 /// `budget` characters. Errors are model-facing guidance.
 pub(crate) fn render(
@@ -1389,17 +1602,28 @@ pub(crate) fn render(
     let mut body = String::new();
     let mut body_chars = 0;
     let mut shown = Vec::new();
-    let mut without_text = Vec::new();
+    let mut without_text: Vec<(usize, PageContent)> = Vec::new();
     let mut stopped_at = None;
     for &page in &selected {
-        let text = document.page_text(page - 1).map_err(|error| {
+        let content = document.page_content(page - 1).map_err(|error| {
             format!("Cannot read page {page} of '{path}' as PDF text: {error}.")
         })?;
-        let mut block = if text.is_empty() {
-            without_text.push(page);
-            format!("--- page {page} ---\n[no text layer on this page]\n\n")
+        let notes = content.notes.join("; ");
+        let mut block = if content.text.is_empty() {
+            let block = if notes.is_empty() {
+                format!("--- page {page} ---\n[no text layer on this page]\n\n")
+            } else {
+                format!("--- page {page} ---\n[page {page}: {notes}]\n\n")
+            };
+            without_text.push((page, content));
+            block
+        } else if notes.is_empty() {
+            format!("--- page {page} ---\n{}\n\n", content.text)
         } else {
-            format!("--- page {page} ---\n{text}\n\n")
+            format!(
+                "--- page {page} ---\n{}\n[page {page}: some content was not extracted: {notes}]\n\n",
+                content.text
+            )
         };
         let mut block_chars = block.chars().count();
         if !shown.is_empty() && body_chars + block_chars > budget {
@@ -1422,11 +1646,7 @@ pub(crate) fn render(
         shown.push(page);
     }
     if !shown.is_empty() && without_text.len() == shown.len() {
-        return Ok(format!(
-            "PDF: {path} ({count} pages): no text layer found on page(s) {}. The pages are probably scanned images; export them to images (for example `pdftoppm -png -r 100 -f {first} -l {first} <file> page`) and read the PNG files.",
-            page_list(&shown),
-            first = shown[0],
-        ));
+        return Ok(no_text_report(path, count, &without_text));
     }
     let mut out = format!(
         "PDF: {path} ({count} pages; extracted text layer of page(s) {}; no line numbers or edit authorization)\n\n{}",
@@ -1450,11 +1670,32 @@ pub(crate) mod test_pdf {
     pub(crate) enum Content {
         Plain(String),
         Deflated(String),
+        /// Extra stream dictionary entries (for example `/Filter /LZWDecode`)
+        /// and the already-encoded stream bytes.
+        Encoded(String, Vec<u8>),
+    }
+
+    /// Number of the first extra object passed to [`build_with`] for `pages`
+    /// page/content pairs.
+    pub(crate) fn first_extra_object(pages: usize) -> usize {
+        5 + pages * 2
     }
 
     /// Build a PDF whose page `i` shows `pages[i]` with a simple Helvetica
     /// font, or a Type0 font with a ToUnicode CMap when `type0` is set.
     pub(crate) fn build(pages: &[Content], type0: bool) -> Vec<u8> {
+        build_with(pages, type0, "", Vec::new())
+    }
+
+    /// [`build`] with extra page-tree resources (for example
+    /// `/XObject << /Im0 7 0 R >>`) and extra objects numbered from
+    /// [`first_extra_object`].
+    pub(crate) fn build_with(
+        pages: &[Content],
+        type0: bool,
+        extra_resources: &str,
+        extra_objects: Vec<Vec<u8>>,
+    ) -> Vec<u8> {
         let mut objects: Vec<Vec<u8>> = Vec::new();
         // 1: catalog, 2: pages, 3: font, 4: cmap; then page/content pairs.
         let first_page = 5;
@@ -1464,7 +1705,7 @@ pub(crate) mod test_pdf {
         objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
         objects.push(
             format!(
-                "<< /Type /Pages /Kids [{}] /Count {} /Resources << /Font << /F1 3 0 R >> >> >>",
+                "<< /Type /Pages /Kids [{}] /Count {} /Resources << /Font << /F1 3 0 R >> {extra_resources} >> >>",
                 kids.join(" "),
                 pages.len()
             )
@@ -1488,6 +1729,7 @@ pub(crate) mod test_pdf {
             );
             let (dict, data) = match content {
                 Content::Plain(text) => (String::new(), text.clone().into_bytes()),
+                Content::Encoded(dict, data) => (format!(" {dict}"), data.clone()),
                 Content::Deflated(text) => {
                     let mut encoder =
                         flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -1503,6 +1745,7 @@ pub(crate) mod test_pdf {
             object.extend_from_slice(b"\nendstream");
             objects.push(object);
         }
+        objects.extend(extra_objects);
         let mut out = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let mut offsets = Vec::new();
         for (index, object) in objects.iter().enumerate() {
@@ -1531,8 +1774,200 @@ pub(crate) mod test_pdf {
 
 #[cfg(test)]
 mod tests {
-    use super::test_pdf::{Content, build};
+    use super::pdf_filters::{ascii85_encode, lzw_encode};
+    use super::test_pdf::{Content, build, build_with, first_extra_object};
     use super::*;
+
+    const HELLO_PAGE: &str = "BT /F1 12 Tf 72 720 Td (Hello filters) Tj ET";
+
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn page_with(dict: &str, data: Vec<u8>) -> Document {
+        Document::parse(&build(&[Content::Encoded(dict.into(), data)], false)).unwrap()
+    }
+
+    #[test]
+    fn ascii85_then_flate_content_streams_extract_their_text() {
+        let data = ascii85_encode(&deflate(HELLO_PAGE.as_bytes()));
+        let document = page_with("/Filter [/ASCII85Decode /FlateDecode]", data);
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+        let short = page_with("/Filter /A85", ascii85_encode(HELLO_PAGE.as_bytes()));
+        assert_eq!(short.page_text(0).unwrap(), "Hello filters");
+    }
+
+    #[test]
+    fn lzw_content_streams_extract_their_text() {
+        let document = page_with(
+            "/Filter /LZWDecode",
+            lzw_encode(HELLO_PAGE.as_bytes(), true),
+        );
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+        let late = page_with(
+            "/Filter /LZWDecode /DecodeParms << /EarlyChange 0 >>",
+            lzw_encode(HELLO_PAGE.repeat(60).as_bytes(), false),
+        );
+        assert!(late.page_text(0).unwrap().starts_with("Hello filters"));
+    }
+
+    #[test]
+    fn run_length_content_streams_extract_their_text() {
+        let mut encoded = vec![(HELLO_PAGE.len() - 1) as u8];
+        encoded.extend_from_slice(HELLO_PAGE.as_bytes());
+        encoded.push(128);
+        let document = page_with("/Filter /RunLengthDecode", encoded);
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+    }
+
+    #[test]
+    fn flate_with_a_png_predictor_extracts_its_text() {
+        let columns = 8usize;
+        let mut padded = HELLO_PAGE.as_bytes().to_vec();
+        while !padded.len().is_multiple_of(columns) {
+            padded.push(b' ');
+        }
+        // Encode each row with the Up filter (2).
+        let mut rows = Vec::new();
+        let mut previous = vec![0u8; columns];
+        for row in padded.chunks(columns) {
+            rows.push(2);
+            rows.extend(row.iter().zip(&previous).map(|(a, b)| a.wrapping_sub(*b)));
+            previous = row.to_vec();
+        }
+        let document = page_with(
+            &format!("/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns {columns} >>"),
+            deflate(&rows),
+        );
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+    }
+
+    #[test]
+    fn decode_parms_arrays_apply_per_filter() {
+        let data = ascii85_encode(&deflate(HELLO_PAGE.as_bytes()));
+        let document = page_with(
+            "/Filter [/ASCII85Decode /FlateDecode] /DecodeParms [null << /Predictor 1 >>]",
+            data,
+        );
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+    }
+
+    #[test]
+    fn real_reportlab_style_ascii85_flate_fixture_extracts_text() {
+        let pdf = include_bytes!("fixtures/pdf/ascii85-flate.pdf");
+        assert!(find(pdf, b"ASCII85Decode", 0).is_some());
+        let document = Document::parse(pdf).unwrap();
+        let text = document.page_text(0).unwrap();
+        assert!(text.contains("Hello Encrypted World"), "{text}");
+        assert!(text.contains("Second line of text"), "{text}");
+    }
+
+    #[test]
+    fn unsupported_filters_are_named_instead_of_reported_as_scanned() {
+        let pdf = build(
+            &[Content::Encoded(
+                "/Filter /JBIG2Decode".into(),
+                vec![1, 2, 3],
+            )],
+            false,
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let content = document.page_content(0).unwrap();
+        assert!(content.text.is_empty());
+        assert_eq!(
+            content.notes,
+            ["content stream uses JBIG2Decode, not supported"]
+        );
+        let output = render(&pdf, "doc.pdf", None, 10_000).unwrap();
+        assert!(
+            output.contains("page 1: content stream uses JBIG2Decode, not supported"),
+            "{output}"
+        );
+        assert!(!output.contains("probably scanned"), "{output}");
+        assert!(!output.contains("pdftoppm"), "{output}");
+    }
+
+    #[test]
+    fn partially_decoded_pages_keep_text_and_name_the_skipped_stream() {
+        let pdf = build(&[Content::Plain(HELLO_PAGE.into())], false);
+        // Add a second, unsupported stream to the same page.
+        let mut text = String::from_utf8_lossy(&pdf).into_owned();
+        text = text.replacen("/Contents 6 0 R", "/Contents [6 0 R 7 0 R]", 1);
+        let mut bytes = text.into_bytes();
+        bytes.extend_from_slice(
+            b"\n7 0 obj\n<< /Length 3 /Filter /CCITTFaxDecode >>\nstream\nabc\nendstream\nendobj\n",
+        );
+        let output = render(&bytes, "doc.pdf", None, 10_000).unwrap();
+        assert!(output.contains("Hello filters"), "{output}");
+        assert!(
+            output.contains("some content was not extracted: content stream uses CCITTFaxDecode"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn scanned_message_needs_images_and_no_text_operators() {
+        let image = first_extra_object(3);
+        let object = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x00\nendstream".to_vec();
+        let pdf = build_with(
+            &[
+                Content::Plain("q 612 0 0 792 0 0 cm /Im0 Do Q".into()),
+                Content::Plain("0 0 100 100 re S".into()),
+                Content::Plain("BT /F1 12 Tf 72 720 Td <00> Tj ET".into()),
+            ],
+            false,
+            &format!("/XObject << /Im0 {image} 0 R >>"),
+            vec![object],
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let scanned = document.page_content(0).unwrap();
+        assert!(!scanned.text_operators);
+        assert_eq!(scanned.images, 1);
+        assert_eq!(document.page_content(1).unwrap().images, 0);
+        assert!(document.page_content(2).unwrap().text_operators);
+        let output = render(&pdf, "doc.pdf", None, 10_000).unwrap();
+        assert!(
+            output.contains(
+                "Page(s) 1 paint images and have no text operators, so they are probably scanned"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("Page(s) 2 contain no text and no images"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Page(s) 3 show text whose characters"),
+            "{output}"
+        );
+        // A blank page alone is not called scanned.
+        let blank = render(&pdf, "doc.pdf", Some("2"), 10_000).unwrap();
+        assert!(!blank.contains("probably scanned"), "{blank}");
+    }
+
+    #[test]
+    fn stream_over_the_decode_budget_is_reported_not_dropped() {
+        let big = vec![b' '; (MAX_STREAM_DECODED as usize) + 1024];
+        let pdf = build(
+            &[Content::Encoded(
+                "/Filter /FlateDecode".into(),
+                deflate(&big),
+            )],
+            false,
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let content = document.page_content(0).unwrap();
+        assert!(content.text.is_empty());
+        assert!(
+            content.notes[0].contains("exceeds the decode budget"),
+            "{:?}",
+            content.notes
+        );
+    }
 
     #[test]
     fn extracts_plain_and_deflated_pages_in_page_tree_order() {

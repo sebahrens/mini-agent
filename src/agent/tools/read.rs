@@ -1911,11 +1911,14 @@ mod tests {
         assert!(read(Some("1-21")).await.is_err());
 
         let scanned = dir.path().join("scan.pdf");
+        let image_object = crate::agent::tools::pdf_text::test_pdf::first_extra_object(1);
         std::fs::write(
             &scanned,
-            build(
+            crate::agent::tools::pdf_text::test_pdf::build_with(
                 &[Content::Plain("q 612 0 0 792 0 0 cm /Im0 Do Q".into())],
                 false,
+                &format!("/XObject << /Im0 {image_object} 0 R >>"),
+                vec![b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x00\nendstream".to_vec()],
             ),
         )
         .unwrap();
@@ -1924,9 +1927,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            output.contains("no text layer found on page(s) 1"),
+            output.contains("no text could be extracted from page(s) 1"),
             "{output}"
         );
+        assert!(output.contains("probably scanned images"), "{output}");
         assert!(output.contains("pdftoppm -png"), "{output}");
 
         let text = dir.path().join("notes.txt");
