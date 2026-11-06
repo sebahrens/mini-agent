@@ -840,7 +840,39 @@ fi
             self.assertIn("Verified build provenance", result.stdout)
             calls = self.attestation_calls(root)
             self.assertEqual(1, len(calls), calls)
-            self.assertTrue(calls[0].endswith(f"/{self.ARCHIVE} --repo sebahrens/mini-agent"))
+            # Pinned to the release workflow and the requested tag, not any
+            # attestation in the repository.
+            self.assertTrue(
+                calls[0].endswith(
+                    f"/{self.ARCHIVE} --repo sebahrens/mini-agent"
+                    " --signer-workflow sebahrens/mini-agent/.github/workflows/release.yml"
+                    " --source-ref refs/tags/v1.7.2"
+                ),
+                calls[0],
+            )
+
+    def test_latest_attestation_is_pinned_to_the_release_workflow_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+
+            result = self.run_installer(
+                root,
+                release,
+                stub_bin,
+                extra_env=self.gh_env(root),
+                release_version=None,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            calls = self.attestation_calls(root)
+            self.assertEqual(1, len(calls), calls)
+            self.assertIn(
+                "--cert-identity-regex ^https://github\\.com/sebahrens/mini-agent/"
+                "\\.github/workflows/release\\.yml@refs/tags/v[0-9]",
+                calls[0],
+            )
+            self.assertNotIn("--signer-workflow", calls[0])
 
     def test_failed_attestation_aborts_before_install(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

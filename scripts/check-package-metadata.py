@@ -1109,7 +1109,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             "required third-party licence inventory",
             'cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"',
             'cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"',
-            'if gh attestation verify "$ARCHIVE_PATH" --repo "$REPO" >"$log" 2>&1; then',
+            'if gh attestation verify "$ARCHIVE_PATH" --repo "$REPO" "${ATTESTATION_PIN[@]}" >"$log" 2>&1; then',
             'MINI_AGENT_SKIP_ATTESTATION',
         ),
         "NOTICE": (
