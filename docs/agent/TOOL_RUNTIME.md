@@ -925,6 +925,19 @@ wrong-harness name such as `workdir`, `run_in_background`, `glob` or `head_limit
 `unknown field \`workdir\`, expected one of ...` listing the valid parameter names, so the model
 corrects the call instead of running it in the wrong directory, in the foreground, or unfiltered.
 
+### Ignored files in `grep`, `find_files` and `list_dir`
+
+These walkers honour `.gitignore`, `.ignore`, `.git/info/exclude` and the global excludes file.
+Entries they prune for that reason are counted and named in the result, including an empty
+result: `[2 gitignored entries were not searched (.env.local, dist); pass no_ignore=true to
+include ignored and generated files]` (the count is of pruned entries at the point they were
+dropped, so an ignored directory counts once). `no_ignore: true` (default `false`, per call) lifts
+only the ignore-file rules. VCS metadata, the dependency/build directory rule (`node_modules`,
+`target` beside a manifest, `[tool_limits] skip_dirs`) and permission deny rules still hide
+entries, so the option cannot reach anything a deny rule protects. It is a per-call argument with
+no config key, so project configuration cannot enable it. The brokered JS file discovery helpers
+are unchanged and still always honour ignore files.
+
 ### PDF text from `read`
 
 `read` recognises a `%PDF-` header and returns the document's extracted text

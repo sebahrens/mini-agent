@@ -32,6 +32,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   (mini-agent-7qbtw).
 - New `tool_concurrency` setting (default 4, clamped to 1..=16) sets how many tool calls of one
   model turn run at once; read/write lanes still serialize conflicting calls (mini-agent-poi3o).
+- `grep`, `find_files` and `list_dir` accept `no_ignore` (default false) to include gitignored and
+  generated files, and otherwise count and name the ignored entries they skipped
+  (mini-agent-hacmm).
 - `list_dir` pages through every entry of a flat directory (the 10,000-entry cap now applies only to
   depth 2-3 trees); `find_files` accepts `offset`/`limit` and names `continue with offset=N`.
 - `git` diff/show pages and `job_status` polls are self-bounded (git pages scale under

@@ -12556,6 +12556,7 @@ mod workspace_tests {
             GrepTool::new(None, None, 100).with_workspace_binding(second_workspace.clone());
         let (first_grep, second_grep) = tokio::join!(
             first_grep_tool.call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -12568,6 +12569,7 @@ mod workspace_tests {
                 count: false,
             }),
             second_grep_tool.call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -12586,6 +12588,7 @@ mod workspace_tests {
         let first_find = FindFilesTool::new(None, None, 100)
             .with_workspace_binding(first_workspace.clone())
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,

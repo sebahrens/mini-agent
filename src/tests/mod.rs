@@ -332,6 +332,8 @@ mod headless_forced_stop_tests;
 #[cfg(all(test, feature = "hooks"))]
 mod hooks;
 #[cfg(test)]
+mod ignored_discovery_tests;
+#[cfg(test)]
 mod image_read_tests;
 #[cfg(test)]
 mod input_tests;

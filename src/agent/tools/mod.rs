@@ -818,6 +818,9 @@ pub struct GrepArgs {
     /// Result lines (or matching files) to skip, for paging.
     #[serde(default)]
     pub offset: Option<u64>,
+    /// Also search files that `.gitignore`/`.ignore`/global excludes hide.
+    #[serde(default)]
+    pub no_ignore: bool,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -853,6 +856,9 @@ pub struct FindFilesArgs {
     pub mode: FindFilesMode,
     #[serde(default)]
     pub sort: FindFilesSort,
+    /// Also list files that `.gitignore`/`.ignore`/global excludes hide.
+    #[serde(default)]
+    pub no_ignore: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -868,6 +874,9 @@ pub struct ListDirArgs {
     /// Levels to expand (1 = this directory only; at most 3).
     #[serde(default)]
     pub depth: Option<usize>,
+    /// Also list entries that `.gitignore`/`.ignore`/global excludes hide.
+    #[serde(default)]
+    pub no_ignore: bool,
 }
 
 /// Turns a diagnosed permission verdict into the tool-facing result: coaching

@@ -155,7 +155,7 @@ impl Tool for ListDirTool {
 
     fn description(&self) -> String {
         format!(
-            "List files and directories in a directory. Respects .gitignore and hides VCS metadata, node_modules and target directories beside a build manifest unless requested explicitly. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.{} Page with offset (the truncation notice names the next offset); depth 2-3 expands subdirectories into an indented tree under the same cap.",
+            "List files and directories in a directory. Respects .gitignore by default (the listing counts the ignored entries it hid; pass no_ignore=true to show them) and hides VCS metadata, node_modules and target directories beside a build manifest unless requested explicitly. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.{} Page with offset (the truncation notice names the next offset); depth 2-3 expands subdirectories into an indented tree under the same cap.",
             match self.max_entries {
                 Some(cap) => format!(" Returns at most {cap} entries per call."),
                 None => String::new(),
@@ -180,6 +180,11 @@ impl Tool for ListDirTool {
                     "type": "integer",
                     "minimum": 1,
                     "description": "Return at most this many entries (never more than the configured cap)"
+                },
+                "no_ignore": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also list entries hidden by .gitignore/.ignore (generated output, .env.local, vendored copies). Default false; a listing that hid ignored entries says how many. Permission deny rules, VCS metadata and dependency/build directories still apply"
                 },
                 "depth": {
                     "type": "integer",
@@ -229,13 +234,13 @@ impl Tool for ListDirTool {
                         crate::agent::tools::bound_open_error(workspace, relative, error)
                     }
                 })?;
-            let bound = BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(
-                crate::agent::tools::walk_deny_filter(
+            let bound = BoundDirectory::from_file(&logical, directory)?
+                .with_hidden_filter(crate::agent::tools::walk_deny_filter(
                     &self.permission,
                     "list_dir",
                     Some(workspace.root()),
-                ),
-            );
+                ))
+                .with_include_ignored(args.no_ignore);
             let coaching = check_perm_bound_path(
                 &self.permission,
                 &self.ask_tx,
@@ -257,9 +262,13 @@ impl Tool for ListDirTool {
             }
             // Pin the exact authorized directory before an interactive
             // permission wait can race a pathname replacement.
-            let bound = BoundDirectory::open(&resolved, &checked_metadata)?.with_hidden_filter(
-                crate::agent::tools::walk_deny_filter(&self.permission, "list_dir", None),
-            );
+            let bound = BoundDirectory::open(&resolved, &checked_metadata)?
+                .with_hidden_filter(crate::agent::tools::walk_deny_filter(
+                    &self.permission,
+                    "list_dir",
+                    None,
+                ))
+                .with_include_ignored(args.no_ignore);
             let coaching = check_perm_path(
                 &self.permission,
                 &self.ask_tx,
@@ -270,6 +279,8 @@ impl Tool for ListDirTool {
             (bound, coaching)
         };
 
+        let ignore_mode = bound_directory.ignore_mode();
+        let notice_root = bound_directory.approved_root().to_path_buf();
         let (rows, incomplete) = crate::agent::runner::spawn_blocking_scoped(move || {
             let mut rows = Vec::new();
             let mut incomplete = false;
@@ -279,8 +290,9 @@ impl Tool for ListDirTool {
         .await
         .map_err(|error| ToolError::Msg(format!("list_dir directory reader failed: {error}")))??;
 
+        let ignore_notice = ignore_mode.notice(&notice_root);
         if rows.is_empty() {
-            let msg = format!("Listing {}:\n(empty directory)", path);
+            let msg = format!("Listing {}:\n(empty directory){ignore_notice}", path);
             return Ok(match coaching {
                 Some(c) => format!("{}\n\n{}", c, msg),
                 None => msg,
@@ -365,6 +377,7 @@ impl Tool for ListDirTool {
                 "\n[listing stopped at {MAX_TREE_ROWS} entries; use a smaller depth or list a subdirectory]"
             ));
         }
+        result.push_str(&ignore_notice);
         tracing::debug!(
             "tool list_dir done: path={}, entries={}",
             path,
