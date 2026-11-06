@@ -223,11 +223,6 @@ impl McpServerOptions {
             && !self.disabled_tools.iter().any(|tool| tool == name)
     }
 
-    /// Whether any tool selection is configured.
-    pub(crate) fn filters_tools(&self) -> bool {
-        self.enabled_tools.is_some() || !self.disabled_tools.is_empty()
-    }
-
     /// `tools/call` bound: the configured value or `default`.
     pub(crate) fn tool_timeout(&self, default: std::time::Duration) -> std::time::Duration {
         self.tool_timeout_sec.map_or(default, clamp_timeout)
@@ -405,7 +400,6 @@ mod options_tests {
         .unwrap();
         let options = config.options();
         assert!(options.is_enabled());
-        assert!(options.filters_tools());
         assert!(options.admits_tool("a"));
         assert!(!options.admits_tool("b"));
         assert!(!options.admits_tool("c"));

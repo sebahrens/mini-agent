@@ -142,10 +142,12 @@ impl ToolListCache {
         self.changed.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn initialized(&self) -> bool {
         self.current().initialized()
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self) -> Option<Arc<ListedTools>> {
         self.current().get().cloned()
     }
@@ -898,6 +900,7 @@ fn http_client_for(
 /// on the number of pages. A timeout cancels the in-flight request on the
 /// server side (rmcp sends `notifications/cancelled`) and surfaces as
 /// [`ServiceError::Timeout`].
+#[cfg(test)]
 pub(crate) async fn list_all_tools_bounded(
     peer: &Peer<RoleClient>,
     timeout: Duration,
@@ -907,7 +910,7 @@ pub(crate) async fn list_all_tools_bounded(
         .map(|(tools, _)| tools)
 }
 
-/// [`list_all_tools_bounded`] keeping only tools `admit` accepts. Selection
+/// Bounded `tools/list` keeping only tools `admit` accepts. Selection
 /// runs per page before the tool cap, so excluded tools never displace an
 /// admitted one; the second value counts excluded tools.
 pub(crate) async fn list_all_tools_selected(
