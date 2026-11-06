@@ -974,8 +974,9 @@ The default `read` view shows virtual cell/source/output lines. Its existing
 by `max_read_lines`. Returned text is capped at 64 KiB: a window that would exceed
 it stops early and ends with `[view truncated after N line(s) at the 64 KiB notebook
 view cap; continue with offset=M]`, and a single virtual line longer than the cap is
-clipped with a pointer to `raw_notebook:true` character windows. Text outputs have separate 4 KiB per-cell and 16 KiB overall
-limits with explicit omissions, and at most 4,096 output objects per cell.
+clipped with a pointer to `raw_notebook:true` character windows. Text outputs have a 4 KiB per-output-cell limit with explicit omissions (there
+is no notebook-wide output allowance: the 64 KiB view cap applies per window, so any
+cell range is inspectable with offset/limit), and at most 4,096 output objects per cell.
 Stream outputs show their text; `execute_result` and `display_data` outputs show
 their `text/plain` data; `error` outputs show `ename: evalue` and the traceback with
 ANSI colour codes removed (an over-budget traceback keeps the exception line and its
