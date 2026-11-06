@@ -26,6 +26,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `max_agent_turns` now defaults to 1000 model round trips per prompt (was 200), with spend caps as
+  the safety net, and the exhaustion error says that completed work is kept and how to continue.
 - `/import` accepts the persisted-session bounds (100,000 messages; 48 MiB JSONL for the 32 MiB
   snapshot cap plus framing) instead of 10,000 messages / 16 MiB, so every saved session that
   `/export` writes as JSONL can be re-imported.

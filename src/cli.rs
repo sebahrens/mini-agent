@@ -752,7 +752,10 @@ pub struct Cli {
         help = "Stop new model requests/effects once recorded session spend reaches this USD estimate")]
     pub max_budget_usd: Option<f64>,
 
-    #[arg(long = "max-agent-turns", help = "Maximum agent turns")]
+    #[arg(
+        long = "max-agent-turns",
+        help = "Maximum model round trips per prompt (default 1000)"
+    )]
     pub max_agent_turns: Option<usize>,
 
     #[arg(long = "temperature", help = "Model temperature (0.0 to 2.0)")]
@@ -1298,7 +1301,9 @@ impl Cli {
     }
 
     pub fn resolve_max_agent_turns(&self, cfg: &config::Config) -> usize {
-        self.max_agent_turns.or(cfg.max_agent_turns).unwrap_or(200)
+        self.max_agent_turns
+            .or(cfg.max_agent_turns)
+            .unwrap_or(DEFAULT_MAX_AGENT_TURNS)
     }
 
     pub fn resolve_no_context_files(&self, cfg: &config::Config) -> bool {
@@ -2775,5 +2780,30 @@ mod idle_exit_tests {
         assert!(Cli::try_parse_from(["mini-agent", "--loop", "--idle-exit", "2"]).is_ok());
         #[cfg(feature = "acp")]
         assert!(Cli::try_parse_from(["mini-agent", "--acp", "--idle-exit", "2"]).is_ok());
+    }
+}
+
+/// Model round trips per user prompt when neither `--max-agent-turns` nor
+/// `max_agent_turns` is set. Spend (`turn_token_budget`, `max_budget_usd`,
+/// session token ceilings) is the primary safety net; this only stops a
+/// runaway loop. Hitting it keeps completed work (mini-agent-d01h4).
+pub(crate) const DEFAULT_MAX_AGENT_TURNS: usize = 1000;
+
+/// Suffix of the turn-budget exhaustion error: what was kept and how to go on.
+pub(crate) const MAX_AGENT_TURNS_HINT: &str = " Completed tool work and messages are kept in the session; ask the agent to continue (or rerun with --continue), or raise max_agent_turns / --max-agent-turns.";
+
+#[cfg(test)]
+mod d01h4_tests {
+    #[test]
+    fn max_agent_turns_defaults_to_a_thousand_and_explicit_values_win() {
+        let cli = super::Cli::default();
+        let cfg = crate::config::Config::default();
+        assert_eq!(cli.resolve_max_agent_turns(&cfg), 1000);
+        let cfg = crate::config::Config {
+            max_agent_turns: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(cli.resolve_max_agent_turns(&cfg), 7);
+        assert!(super::MAX_AGENT_TURNS_HINT.contains("continue"));
     }
 }
