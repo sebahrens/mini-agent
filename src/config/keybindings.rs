@@ -34,6 +34,7 @@ pub(crate) enum KeyAction {
     Eof,
     CycleMode,
     CycleReasoning,
+    HistorySearch,
     PageUp,
     PageDown,
     TranscriptTop,
@@ -95,7 +96,8 @@ const SPECS: &[ActionSpec] = &[
     app!(Interrupt, "interrupt", "ctrl+c"),
     app!(Eof, "eof", "ctrl+d"),
     app!(CycleMode, "cycle_mode", "shift+tab", "backtab"),
-    app!(CycleReasoning, "cycle_reasoning", "ctrl+r"),
+    app!(CycleReasoning, "cycle_reasoning", "alt+r"),
+    app!(HistorySearch, "history_search", "ctrl+r"),
     app!(PageUp, "page_up", "pageup", "alt+up"),
     app!(PageDown, "page_down", "pagedown", "alt+down"),
     app!(
@@ -484,6 +486,8 @@ fn legacy_default_event(key: KeyEvent, editor: bool, windows: bool) -> Option<Ke
             KeyCode::Char('o' | 'O') if ctrl && !alt => {
                 event(KeyCode::Char('o'), KeyModifiers::CONTROL)
             }
+            // Alt+R (reasoning cycling; Ctrl+R is history search).
+            KeyCode::Char('r') if alt && !ctrl => event(KeyCode::Char('r'), KeyModifiers::ALT),
             code @ (KeyCode::PageUp | KeyCode::PageDown) => event(code, KeyModifiers::NONE),
             // Navigation chords for keyboards without PageUp/PageDown/Home/End
             // (macOS laptops): Option+Up/Down page, Option+Shift+Up/Down and

@@ -308,7 +308,8 @@ Here is some keybindings to speed up your coding experience:
 
 | Keys | Action |
 | ---- | ------ |
-| `Ctrl+R` | Cycle collapsed / full / off reasoning display; click a header to expand one block |
+| `Ctrl+R` | Reverse search the prompt history; Enter inserts the match, Esc restores the draft |
+| `Alt+R` | Cycle collapsed / full / off reasoning display; click a header to expand one block |
 | `Ctrl+G` | Open input in `$EDITOR` |
 | `Ctrl+O` | Launch `lazygit` |
 | `Ctrl+P` / `Ctrl+N` | Move up/down in input; at its boundaries, navigate command history |

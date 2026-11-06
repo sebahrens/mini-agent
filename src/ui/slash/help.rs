@@ -445,7 +445,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  /hooks                 show configured hook events and handlers",
     );
-    emit(false, "  /history               show global chat history");
+    emit(
+        false,
+        "  /history [n|text]      show the last n (default 10) or matching history entries",
+    );
     emit(false, "  /quit [/exit]          exit mini-agent");
     emit(false, "  /welcome               show the quickstart guide");
     emit(

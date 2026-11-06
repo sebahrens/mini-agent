@@ -1793,7 +1793,7 @@ mod reasoning_display_tests {
                 .contains("REASONING_PRIVATE")
         );
         assert!(!app.renderer.selection_active);
-        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
         for expected in [
             ReasoningDisplay::Full,
             ReasoningDisplay::Off,
@@ -4140,6 +4140,16 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
+        if action == Some(KeyAction::HistorySearch) {
+            if self.input.history_search_active() {
+                self.input.history_search_next();
+            } else {
+                self.input.start_history_search();
+            }
+            self.refresh()?;
+            return Ok(());
+        }
+
         if action == Some(KeyAction::CycleReasoning) {
             let current = self.renderer.feed().reasoning_display();
             let display = current.next();
@@ -5653,18 +5663,17 @@ impl<'a> App<'a> {
             return Ok(true);
         }
         // Display-only controls remain available while approval owns input.
-        if (key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL))
-            || matches!(
-                self.keyboard_action(key),
-                Some(
-                    KeyAction::PageUp
-                        | KeyAction::PageDown
-                        | KeyAction::TranscriptTop
-                        | KeyAction::TranscriptBottom
-                )
+        if matches!(
+            self.keyboard_action(key),
+            Some(
+                KeyAction::CycleReasoning
+                    | KeyAction::PageUp
+                    | KeyAction::PageDown
+                    | KeyAction::TranscriptTop
+                    | KeyAction::TranscriptBottom
             )
-            || (self.renderer.selection_active
-                && matches!(key.code, KeyCode::Char('y') | KeyCode::Esc))
+        ) || (self.renderer.selection_active
+            && matches!(key.code, KeyCode::Char('y') | KeyCode::Esc))
         {
             return Ok(false);
         }
@@ -17779,7 +17788,7 @@ mod plan_approval_tests {
         let display = app.renderer.feed().reasoning_display();
         user(
             &mut app,
-            UserEvent::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
         )
         .await;
         assert_eq!(app.renderer.feed().reasoning_display(), display.next());

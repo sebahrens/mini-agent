@@ -27,6 +27,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   subdirectories becomes a namespace (`/deploy:ship`), Claude Code `argument-hint`/`allowed-tools`
   frontmatter is accepted (granting nothing), and `/help` lists every skipped command file with its
   reason.
+- `Ctrl+R` opens an incremental reverse search over the prompt history (rebindable as
+  `history_search`); reasoning-display cycling moves to `Alt+R` (`cycle_reasoning`).
+  `/history [n|text]` shows the last `n` entries or matching ones instead of only the last 10.
 - Agent Skills: optional always-visible name/description catalog (`skills_catalog_bytes`, default
   off) and configurable `skills_max_selected` (3), `skills_score_floor` (0.20) and
   `skills_max_packages` (64).

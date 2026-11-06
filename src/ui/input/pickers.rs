@@ -17,6 +17,9 @@ pub enum Picker {
     Sessions(crate::ui::pickers::sessions::SessionsPicker),
     /// `!` at the start of the input: previously run shell commands.
     Bang(ListPicker),
+    /// Ctrl+R reverse search over the prompt history; the buffer holds the
+    /// query while it is open.
+    History(ListPicker, Box<crate::ui::pickers::history::HistorySearch>),
 }
 
 impl Picker {
@@ -30,6 +33,7 @@ impl Picker {
             Picker::Rewind(p) => p.active(),
             Picker::Sessions(p) => p.active,
             Picker::Bang(p) => p.active,
+            Picker::History(p, _) => p.active,
         }
     }
 
@@ -63,6 +67,7 @@ impl Picker {
             Picker::Rewind(p) => p.set_monochrome(monochrome),
             Picker::Sessions(p) => p.set_monochrome(monochrome),
             Picker::Bang(p) => p.set_monochrome(monochrome),
+            Picker::History(p, _) => p.set_monochrome(monochrome),
         }
     }
 
@@ -77,6 +82,7 @@ impl Picker {
             // The sessions overlay paints its own fixed palette.
             Picker::Sessions(_) => {}
             Picker::Bang(p) => p.set_accent_color(accent),
+            Picker::History(p, _) => p.set_accent_color(accent),
         }
     }
 
@@ -142,6 +148,12 @@ impl Picker {
             // instead of announcing "no matches" for every keystroke.
             Picker::Bang(p) if p.is_empty() => Ok(()),
             Picker::Bang(p) => p.draw(out, cols, None, floor_row),
+            Picker::History(p, _) => p.draw(
+                out,
+                cols,
+                Some("no matching history  (Esc restores the draft)"),
+                floor_row,
+            ),
         }
     }
 }
@@ -232,6 +244,13 @@ impl InputEditor {
             Some(Picker::Bang(p)) => {
                 bang::handle_bang_key(&mut self.buffer, &mut self.cursor, p, key)
             }
+            Some(Picker::History(p, search)) => crate::ui::pickers::history::handle_history_key(
+                &mut self.buffer,
+                &mut self.cursor,
+                p,
+                search,
+                key,
+            ),
             None => false,
         };
         if handled {
