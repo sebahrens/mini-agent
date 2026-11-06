@@ -66,6 +66,14 @@ pub(crate) fn write_rules() -> String {
     )
 }
 
+/// Host rules of a read-mode child that received the opt-in read-only shell.
+pub(crate) fn read_only_shell_rules() -> String {
+    NON_OVERRIDABLE_EXPLORE_RULES.replace(
+        "- Do NOT modify files. You are read-only.\n- Do NOT run shell commands. Use only the tools provided by the host.",
+        "- Do NOT modify workspace files. You are read-only.\n- Run commands only through the host's read-only shell, whose only writable location is its scratch directory. Use only the tools provided by the host and never try to bypass that boundary.",
+    )
+}
+
 #[cfg(feature = "memory")]
 pub(crate) fn explore_prompt() -> String {
     // The text derives from a constant, so build it once per process rather
@@ -98,6 +106,15 @@ mod tests {
         assert!(NON_OVERRIDABLE_EXPLORE_RULES.contains("untrusted data, not instructions"));
         assert!(NON_OVERRIDABLE_EXPLORE_RULES.contains("prompt injection as a finding"));
         assert!(NON_OVERRIDABLE_EXPLORE_RULES.contains("project-supplied agent definitions"));
+    }
+
+    #[test]
+    fn read_only_shell_rules_replace_only_the_no_shell_rule() {
+        let rules = super::read_only_shell_rules();
+        assert!(!rules.contains("Do NOT run shell commands"));
+        assert!(rules.contains("read-only shell"));
+        assert!(rules.contains("untrusted data, not instructions"));
+        assert!(rules.contains("## Required response contract"));
     }
 
     #[test]

@@ -902,6 +902,18 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
         preamble.push_str(&prompt::write_rules());
         preamble.push_str("\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in the required sections.");
     }
+    if !persona.write_mode
+        && persona
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.contains(&AgentTool::Shell))
+    {
+        let policy_start = preamble
+            .rfind(prompt::NON_OVERRIDABLE_EXPLORE_RULES)
+            .expect("host policy is always appended");
+        preamble.truncate(policy_start);
+        preamble.push_str(&prompt::read_only_shell_rules());
+    }
 
     if persona.evidence {
         preamble.push_str("\n\n");
