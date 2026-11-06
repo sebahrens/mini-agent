@@ -237,6 +237,15 @@ pub struct Cli {
     pub max_stdin_bytes: Option<u32>,
 
     #[arg(
+        long = "stdin-idle-secs",
+        value_name = "SECS",
+        requires = "print",
+        value_parser = clap::value_parser!(u32).range(0..=86_400),
+        help = "With -p and an explicit prompt: seconds to wait for a silent piped stdin to produce data or EOF before running without it (0 = wait for EOF; default 2)"
+    )]
+    pub stdin_idle_secs: Option<u32>,
+
+    #[arg(
         long,
         value_name = "FILE",
         requires = "print",
@@ -1037,6 +1046,15 @@ pub struct Cli {
         help = "With --mcp-server: let `run` calls choose a working directory inside the server's workspace (default: the workspace root only)"
     )]
     pub mcp_server_allow_cwd_override: bool,
+
+    /// With `--mcp-server`: forward child permission asks as MCP elicitation.
+    #[cfg(feature = "mcp")]
+    #[arg(
+        long = "mcp-server-elicit-approvals",
+        requires = "mcp_server",
+        help = "With --mcp-server: when the MCP client supports elicitation, forward a run's permission asks to it for approval (default: asks fail closed)"
+    )]
+    pub mcp_server_elicit_approvals: bool,
 
     /// With `--mcp-server`: bound on one `run`, in seconds.
     #[cfg(feature = "mcp")]

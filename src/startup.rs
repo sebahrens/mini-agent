@@ -1261,6 +1261,33 @@ impl Startup {
         {
             anyhow::bail!("--input-format stream-json requires --output stream-json");
         }
+        #[allow(unused_mut)]
+        let mut expand_custom =
+            cli.print && cli.input_format() == crate::cli::InputFormat::Text && !cli.is_loop_mode();
+        #[cfg(feature = "acp")]
+        {
+            expand_custom = expand_custom && !cli.acp_enabled;
+        }
+        if expand_custom {
+            let prompt = cli.message.join(" ");
+            match crate::context::commands::expand_headless(&cli, &cfg, &workspace, &prompt) {
+                Ok(crate::context::commands::HeadlessCommand::Expanded(text)) => {
+                    cli.message = vec![text];
+                }
+                Ok(crate::context::commands::HeadlessCommand::BuiltIn(name)) => {
+                    crate::print::headless_stderr(format_args!(
+                        "Warning: /{name} is an interactive built-in command and does not run with -p; the text is sent to the model literally.\n"
+                    ));
+                }
+                Ok(crate::context::commands::HeadlessCommand::Literal) => {}
+                Err(error) => {
+                    let message = format!("custom command: {error}");
+                    crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message)
+                        .await?;
+                    anyhow::bail!(message);
+                }
+            }
+        }
         use std::io::IsTerminal as _;
         let read_stdin = cli.print
             && cli.input_format() == crate::cli::InputFormat::Text

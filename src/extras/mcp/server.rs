@@ -42,8 +42,9 @@ pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How long a timed-out child gets, after SIGTERM, to persist its partial
 /// transcript before the whole process group is killed.
 const STOP_GRACE: Duration = Duration::from_secs(12);
-/// Most session ids this server remembers having issued.
-const MAX_ISSUED_SESSIONS: usize = 1024;
+/// Most session ids the server remembers having issued (persisted; the
+/// least recently used is dropped first).
+const MAX_ISSUED_SESSIONS: usize = 4096;
 /// Bytes of child stdout captured before the JSON envelope is parsed.
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 /// Default for most `run` calls executing at once (`--mcp-server-max-runs`
@@ -53,7 +54,26 @@ pub(crate) const MAX_CONCURRENT_RUNS: usize = 4;
 const MAX_ARG_BYTES: usize = 256;
 /// Interval between progress heartbeats for requests with a progress token.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
-const PROTOCOL_VERSION: &str = "2025-06-18";
+/// Protocol versions this server implements, newest first. `initialize`
+/// answers the client's version only when listed here, else the newest.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+/// How long a forwarded permission ask waits for the client's elicitation
+/// answer before it is denied.
+const ELICIT_WAIT: Duration = Duration::from_secs(300);
+/// Longest ask text sent to the client; a longer request is denied unreviewed.
+const MAX_ELICIT_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// The version to answer `initialize` with.
+fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|requested| {
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .copied()
+                .find(|supported| *supported == requested)
+        })
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
+}
 
 /// How a `run` call launches its headless child.
 #[derive(Debug, Clone)]
@@ -68,40 +88,143 @@ pub(crate) struct RunCommand {
     /// Whether `run` may select a working directory inside the workspace
     /// per call (default closed).
     pub(crate) allow_cwd_override: bool,
+    /// Whether a run's permission asks are forwarded to the client as MCP
+    /// elicitation requests (default closed: asks fail).
+    pub(crate) elicit_approvals: bool,
     /// The server's own workspace; a per-call `cwd` must stay inside it.
     pub(crate) workspace_root: PathBuf,
     /// Most `run` calls executing at once.
     pub(crate) max_runs: usize,
     /// Grace given to a timed-out child to save its session after SIGTERM.
     pub(crate) stop_grace: Duration,
-    /// Session ids this server process has returned; `run` resumes only these.
+    /// Session ids this server has returned (persisted across restarts per
+    /// workspace); `run` resumes only these.
     pub(crate) issued_sessions: IssuedSessions,
 }
 
-/// Session ids handed to the client by this server process (shared by clones).
+/// Session ids handed to the client by this server (shared by clones). They
+/// persist in a small bounded file in the state directory, keyed by workspace,
+/// so a restarted server still resumes ids it issued earlier.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct IssuedSessions(Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+pub(crate) struct IssuedSessions(Arc<IssuedInner>);
+
+#[derive(Debug, Default)]
+struct IssuedInner {
+    ids: std::sync::Mutex<std::collections::VecDeque<String>>,
+    file: Option<PathBuf>,
+}
+
+/// Most bytes read from the persisted ledger.
+const MAX_LEDGER_BYTES: u64 = 512 * 1024;
 
 impl IssuedSessions {
-    pub(crate) fn record(&self, id: &str) {
-        let mut ids = self.0.lock().expect("issued sessions");
-        if ids.iter().any(|known| known == id) {
-            return;
-        }
-        if ids.len() >= MAX_ISSUED_SESSIONS {
-            ids.pop_front();
-        }
-        ids.push_back(id.to_owned());
+    /// A ledger persisted at `file` (loaded now, rewritten on every change).
+    pub(crate) fn persistent(file: PathBuf) -> Self {
+        let ids = read_ledger(&file);
+        Self(Arc::new(IssuedInner {
+            ids: std::sync::Mutex::new(ids),
+            file: Some(file),
+        }))
     }
 
-    /// Exact match only: never a prefix, name or foreign id.
-    fn contains(&self, id: &str) -> bool {
-        self.0
-            .lock()
-            .expect("issued sessions")
-            .iter()
-            .any(|known| known == id)
+    /// The ledger for `workspace_root` under the process state directory;
+    /// in-memory only when the state directory cannot be resolved.
+    pub(crate) fn for_workspace(workspace_root: &std::path::Path) -> Self {
+        use sha2::{Digest, Sha256};
+        let Ok(paths) = crate::paths::process_paths_ref() else {
+            return Self::default();
+        };
+        let canonical = workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.to_path_buf());
+        let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+        let key: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        Self::persistent(
+            paths
+                .state_dir
+                .join("mcp-server")
+                .join(format!("sessions-{key}.json")),
+        )
     }
+
+    pub(crate) fn record(&self, id: &str) {
+        let mut ids = self.0.ids.lock().expect("issued sessions");
+        self.merge_file(&mut ids);
+        if let Some(at) = ids.iter().position(|known| known == id) {
+            ids.remove(at);
+        }
+        ids.push_back(id.to_owned());
+        while ids.len() > MAX_ISSUED_SESSIONS {
+            ids.pop_front();
+        }
+        self.save(&ids);
+    }
+
+    /// Exact match only: never a prefix, name or foreign id. A hit counts as
+    /// use, so ids a client keeps resuming are the last to be evicted.
+    fn contains(&self, id: &str) -> bool {
+        let mut ids = self.0.ids.lock().expect("issued sessions");
+        if !ids.iter().any(|known| known == id) {
+            // Another server process for the same workspace may have issued it.
+            self.merge_file(&mut ids);
+        }
+        let Some(at) = ids.iter().position(|known| known == id) else {
+            return false;
+        };
+        if at + 1 != ids.len() {
+            let known = ids.remove(at).expect("position is in range");
+            ids.push_back(known);
+            self.save(&ids);
+        }
+        true
+    }
+
+    fn merge_file(&self, ids: &mut std::collections::VecDeque<String>) {
+        let Some(file) = &self.0.file else { return };
+        for id in read_ledger(file) {
+            if !ids.iter().any(|known| *known == id) {
+                ids.push_front(id);
+            }
+        }
+        while ids.len() > MAX_ISSUED_SESSIONS {
+            ids.pop_front();
+        }
+    }
+
+    fn save(&self, ids: &std::collections::VecDeque<String>) {
+        let Some(file) = &self.0.file else { return };
+        let write = || -> std::io::Result<()> {
+            if let Some(parent) = file.parent() {
+                crate::paths::ensure_private_directory(parent)?;
+            }
+            let body = serde_json::to_vec(ids).map_err(std::io::Error::other)?;
+            crate::fs::atomic_write_sync(file, &body)
+        };
+        if let Err(error) = write() {
+            tracing::warn!(%error, "could not persist MCP server session ids");
+        }
+    }
+}
+
+/// Valid ids of a persisted ledger; a missing, oversized or malformed file is
+/// an empty ledger (ids are then simply not resumable).
+fn read_ledger(file: &std::path::Path) -> std::collections::VecDeque<String> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    let read = std::fs::File::open(file)
+        .and_then(|f| f.take(MAX_LEDGER_BYTES + 1).read_to_string(&mut text));
+    if read.is_err() || text.len() as u64 > MAX_LEDGER_BYTES {
+        return Default::default();
+    }
+    let mut ids: std::collections::VecDeque<String> = serde_json::from_str::<Vec<String>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| valid_token(id))
+        .collect();
+    while ids.len() > MAX_ISSUED_SESSIONS {
+        ids.pop_front();
+    }
+    ids
 }
 
 impl RunCommand {
@@ -109,6 +232,7 @@ impl RunCommand {
     /// `--mcp-server` mode flag, so each run honours the same flags.
     pub(crate) fn current(args: impl IntoIterator<Item = OsString>) -> std::io::Result<Self> {
         let args: Vec<OsString> = args.into_iter().collect();
+        let workspace_root = std::env::current_dir()?;
         Ok(Self {
             program: std::env::current_exe()?,
             args: forwarded_args(args.clone()),
@@ -117,21 +241,43 @@ impl RunCommand {
             progress_interval: PROGRESS_INTERVAL,
             allow_model_override: has_flag(&args, "--mcp-server-allow-model-override"),
             allow_cwd_override: has_flag(&args, "--mcp-server-allow-cwd-override"),
-            workspace_root: std::env::current_dir()?,
+            elicit_approvals: has_flag(&args, "--mcp-server-elicit-approvals"),
+            issued_sessions: IssuedSessions::for_workspace(&workspace_root),
+            workspace_root,
             max_runs: valued_flag(&args, "--mcp-server-max-runs")
                 .map_or(MAX_CONCURRENT_RUNS, |runs| runs as usize),
             stop_grace: STOP_GRACE,
-            issued_sessions: IssuedSessions::default(),
         })
     }
 
-    fn argv(&self, run: &RunRequest) -> Vec<OsString> {
+    fn argv(&self, run: &RunRequest, elicit: bool) -> Vec<OsString> {
         let mut argv = self.args.clone();
         if let Some(model) = &run.model {
             argv = strip_valued_flag(argv, "--model");
             argv.extend(["--model".into(), model.into()]);
         }
-        argv.extend(["--output".into(), "json".into()]);
+        if elicit {
+            // The control channel lets the child ask this server to approve
+            // an action; the server owns all of these flags.
+            let mut owned = strip_valued_flag(argv, "--input-format");
+            owned = strip_valued_flag(owned, "--stream-json-ask-timeout");
+            owned.retain(|arg| arg.as_os_str() != "--stream-json-control");
+            argv = owned;
+            argv.extend(
+                [
+                    "--input-format",
+                    "stream-json",
+                    "--output",
+                    "stream-json",
+                    "--stream-json-control",
+                    "--stream-json-ask-timeout",
+                    "330",
+                ]
+                .map(OsString::from),
+            );
+        } else {
+            argv.extend(["--output".into(), "json".into()]);
+        }
         if let Some(session) = &run.session_id {
             argv.extend(["--session".into(), session.into()]);
         }
@@ -152,6 +298,7 @@ pub(crate) fn forwarded_args(args: impl IntoIterator<Item = OsString>) -> Vec<Os
                 arg.as_os_str() != "--mcp-server"
                     && arg.as_os_str() != "--mcp-server-allow-model-override"
                     && arg.as_os_str() != "--mcp-server-allow-cwd-override"
+                    && arg.as_os_str() != "--mcp-server-elicit-approvals"
             })
             .collect(),
         "--output",
@@ -275,7 +422,7 @@ fn parse_run_request(
         && !command.issued_sessions.contains(id)
     {
         return Err(
-            "`session_id` must be an id returned by an earlier `run` call of this server process (exact value; prefixes, names and other sessions are refused)"
+            "`session_id` must be an id returned by an earlier `run` call of this server in this workspace (exact value; prefixes, names and other sessions are refused)"
                 .into(),
         );
     }
@@ -308,7 +455,7 @@ fn parse_run_request(
 fn run_tool_definition(command: &RunCommand) -> Value {
     let mut properties = json!({
         "prompt": {"type": "string", "description": "The task for mini-agent, as plain text (a prompt starting with `!` is refused)"},
-        "session_id": {"type": "string", "description": "Exact session id returned by an earlier `run` of this server process; continues that conversation instead of starting a fresh one"}
+        "session_id": {"type": "string", "description": "Exact session id returned by an earlier `run` of this server in this workspace (valid across server restarts); continues that conversation instead of starting a fresh one"}
     });
     if command.allow_model_override {
         properties["model"] = json!({"type": "string", "description": "Model name for this call, overriding the server's"});
@@ -318,7 +465,7 @@ fn run_tool_definition(command: &RunCommand) -> Value {
     }
     json!({
         "name": "run",
-        "description": format!("Run one mini-agent prompt headlessly in the server's workspace with the server's configured provider, model, sandbox and permission flags, and return its final answer plus a session id that can be passed back as `session_id` to continue. Permission prompts cannot be answered: actions not allowed by those flags are refused. A run is stopped after {} s (--mcp-server-timeout) and at most {} runs execute at once (--mcp-server-max-runs); a timed-out run reports its stderr tail and, when it saved one, its session id.", command.timeout.as_secs(), command.max_runs),
+        "description": format!("Run one mini-agent prompt headlessly in the server's workspace with the server's configured provider, model, sandbox and permission flags, and return its final answer plus a session id that can be passed back as `session_id` to continue. {} A run is stopped after {} s (--mcp-server-timeout) and at most {} runs execute at once (--mcp-server-max-runs); a timed-out run reports its stderr tail and, when it saved one, its session id.", if command.elicit_approvals { "When the client supports elicitation, a permission ask is forwarded to it for approval (declined, cancelled or unanswered asks are refused); other actions not allowed by those flags are refused." } else { "Permission prompts cannot be answered: actions not allowed by those flags are refused." }, command.timeout.as_secs(), command.max_runs),
         "inputSchema": {
             "type": "object",
             "properties": properties,
@@ -431,6 +578,206 @@ fn parse_envelope(raw: &str) -> (String, Option<String>) {
     (text, session)
 }
 
+/// Server-issued requests awaiting a client answer (elicitation), plus whether
+/// the client advertised the capability at `initialize`.
+#[derive(Default)]
+struct ElicitBridge {
+    client_supports: std::sync::atomic::AtomicBool,
+    next: std::sync::atomic::AtomicU64,
+    pending: std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>,
+}
+
+impl ElicitBridge {
+    /// Hands a client response to the request waiting for it.
+    fn resolve(&self, id: &str, response: Value) {
+        if let Some(waiter) = self.pending.lock().expect("elicit map").remove(id) {
+            let _ = waiter.send(response);
+        }
+    }
+}
+
+/// A run's way to ask the client for approval.
+#[derive(Clone)]
+struct Elicit {
+    bridge: Arc<ElicitBridge>,
+    out: tokio::sync::mpsc::UnboundedSender<Value>,
+}
+
+/// Withdraws an unanswered request when its run stops waiting.
+struct PendingAsk<'a> {
+    elicit: &'a Elicit,
+    id: String,
+}
+
+impl Drop for PendingAsk<'_> {
+    fn drop(&mut self) {
+        let removed = self
+            .elicit
+            .bridge
+            .pending
+            .lock()
+            .expect("elicit map")
+            .remove(&self.id)
+            .is_some();
+        if removed {
+            let _ = self.elicit.out.send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": self.id, "reason": "mini-agent run stopped waiting"}
+            }));
+        }
+    }
+}
+
+impl Elicit {
+    /// Asks the client to approve one tool action. Only an explicit `accept`
+    /// with `allow: true` approves; decline, cancel, an error, a malformed
+    /// answer, a timeout or a closed connection all refuse.
+    async fn approve(&self, tool: &str, input: &str) -> Result<(), String> {
+        let message = format!("mini-agent wants to use `{tool}`. Allow this action?\n\n{input}");
+        if message.len() > MAX_ELICIT_MESSAGE_BYTES {
+            return Err("the request is too large to review, so it was refused".into());
+        }
+        let n = self
+            .bridge
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("mini-agent-elicit-{n}");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.bridge
+            .pending
+            .lock()
+            .expect("elicit map")
+            .insert(id.clone(), tx);
+        let guard = PendingAsk {
+            elicit: self,
+            id: id.clone(),
+        };
+        let sent = self.out.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "elicitation/create",
+            "params": {
+                "message": message,
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "allow": {"type": "boolean", "title": "Allow", "description": "Allow this single action"}
+                    },
+                    "required": ["allow"]
+                }
+            }
+        }));
+        if sent.is_err() {
+            return Err("the MCP client connection is closed".into());
+        }
+        let response = match tokio::time::timeout(ELICIT_WAIT, rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Err("the approval request was dropped".into()),
+            Err(_) => return Err("the client did not answer the approval request in time".into()),
+        };
+        drop(guard);
+        let result = response.get("result");
+        let accepted = result.and_then(|r| r.get("action")).and_then(Value::as_str)
+            == Some("accept")
+            && result
+                .and_then(|r| r.get("content"))
+                .and_then(|c| c.get("allow"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        if accepted {
+            Ok(())
+        } else {
+            Err("the client declined the action".into())
+        }
+    }
+}
+
+/// Reads a `--output stream-json` child: answers its `can_use_tool` asks
+/// through `elicit`, closes the child's stdin once the final `result` record
+/// arrives (which ends its run), and returns that record as the captured
+/// output.
+async fn read_control_stream(
+    stdout: impl AsyncRead + Unpin,
+    mut stdin: Option<tokio::process::ChildStdin>,
+    elicit: Elicit,
+) -> (Vec<u8>, bool) {
+    let mut lines = tokio::io::BufReader::new(stdout);
+    let mut result = Vec::new();
+    let mut truncated = false;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = (&mut lines)
+            .take(MAX_CAPTURE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .await;
+        match read {
+            Ok(0) | Err(_) => return (result, truncated),
+            Ok(_) if line.len() > MAX_CAPTURE_BYTES => {
+                truncated = true;
+                // Drain the rest of the oversized line.
+                let mut sink = Vec::new();
+                while !line.ends_with(b"\n") {
+                    sink.clear();
+                    match (&mut lines)
+                        .take(64 * 1024)
+                        .read_until(b'\n', &mut sink)
+                        .await
+                    {
+                        Ok(0) | Err(_) => return (result, truncated),
+                        Ok(_) => line.clone_from(&sink),
+                    }
+                }
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        match record.get("type").and_then(Value::as_str) {
+            Some("result") => {
+                result = line.clone();
+                // Ending stdin lets the child finish and exit.
+                stdin = None;
+            }
+            Some("control_request")
+                if record.pointer("/request/subtype").and_then(Value::as_str)
+                    == Some("can_use_tool") =>
+            {
+                let Some(request_id) = record.get("request_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let tool = record
+                    .pointer("/request/tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("a tool");
+                let input = record
+                    .pointer("/request/input")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let response = match elicit.approve(tool, input).await {
+                    Ok(()) => json!({"behavior": "allow"}),
+                    Err(message) => json!({"behavior": "deny", "message": message}),
+                };
+                let reply = json!({
+                    "type": "control_response",
+                    "response": {"subtype": "success", "request_id": request_id, "response": response}
+                });
+                if let Some(stdin) = stdin.as_mut() {
+                    let mut bytes = serde_json::to_vec(&reply).unwrap_or_default();
+                    bytes.push(b'\n');
+                    if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+                        return (result, truncated);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 struct Progress {
     token: Value,
     out: tokio::sync::mpsc::UnboundedSender<Value>,
@@ -441,12 +788,17 @@ async fn run_prompt(
     run: &RunRequest,
     mut cancel: tokio::sync::oneshot::Receiver<()>,
     progress: Option<Progress>,
+    elicit: Option<Elicit>,
 ) -> RunOutcome {
     use crate::process_creation::TokioCommandCreationExt as _;
     let mut child = tokio::process::Command::new(&command.program);
     child
-        .args(command.argv(run))
-        .stdin(std::process::Stdio::null())
+        .args(command.argv(run, elicit.is_some()))
+        .stdin(if elicit.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -462,6 +814,11 @@ async fn run_prompt(
         }
     };
     let pid = child.id();
+    let control_stdin = if elicit.is_some() {
+        child.stdin.take()
+    } else {
+        None
+    };
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     type Captured = (
@@ -481,7 +838,12 @@ async fn run_prompt(
     let stop = {
         let work = async {
             tokio::join!(
-                read_capped(stdout, MAX_CAPTURE_BYTES),
+                async {
+                    match elicit.clone() {
+                        Some(elicit) => read_control_stream(stdout, control_stdin, elicit).await,
+                        None => read_capped(stdout, MAX_CAPTURE_BYTES).await,
+                    }
+                },
                 read_capped(stderr, MAX_STDERR_BYTES),
                 child.wait()
             )
@@ -632,10 +994,8 @@ async fn run_prompt(
 fn handle_simple(command: &RunCommand, id: &Value, method: &str, params: &Value) -> Value {
     match method {
         "initialize" => {
-            let version = params
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or(PROTOCOL_VERSION);
+            let version =
+                negotiate_protocol_version(params.get("protocolVersion").and_then(Value::as_str));
             result(
                 id,
                 json!({
@@ -692,6 +1052,7 @@ pub(crate) async fn serve(
     });
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Value>();
     let cancels = Arc::new(std::sync::Mutex::new(Cancels::new()));
+    let bridge = Arc::new(ElicitBridge::default());
     let slots = Arc::new(tokio::sync::Semaphore::new(command.max_runs.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     let mut input_open = true;
@@ -718,6 +1079,15 @@ pub(crate) async fn serve(
                             continue;
                         }
                     };
+                    if message.get("method").is_none()
+                        && (message.get("result").is_some() || message.get("error").is_some())
+                    {
+                        // A client answer to a request this server issued.
+                        if let Some(id) = message.get("id").and_then(Value::as_str) {
+                            bridge.resolve(id, message.clone());
+                        }
+                        continue;
+                    }
                     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
                     let params = message.get("params").cloned().unwrap_or(Value::Null);
                     let Some(id) = message.get("id").cloned() else {
@@ -729,6 +1099,12 @@ pub(crate) async fn serve(
                         }
                         continue;
                     };
+                    if method == "initialize" {
+                        bridge.client_supports.store(
+                            params.pointer("/capabilities/elicitation").is_some_and(Value::is_object),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     if method != "tools/call" {
                         write_message(&mut output, &handle_simple(&command, &id, method, &params)).await?;
                         continue;
@@ -756,11 +1132,14 @@ pub(crate) async fn serve(
                         .and_then(|meta| meta.get("progressToken"))
                         .filter(|token| token.is_string() || token.is_number())
                         .map(|token| Progress { token: token.clone(), out: reply_tx.clone() });
+                    let elicit = (command.elicit_approvals
+                        && bridge.client_supports.load(std::sync::atomic::Ordering::Relaxed))
+                    .then(|| Elicit { bridge: bridge.clone(), out: reply_tx.clone() });
                     let command = command.clone();
                     let reply_tx = reply_tx.clone();
                     let cancels = cancels.clone();
                     tasks.spawn(async move {
-                        let outcome = run_prompt(&command, &request, cancel_rx, progress).await;
+                        let outcome = run_prompt(&command, &request, cancel_rx, progress, elicit).await;
                         cancels.lock().expect("cancel map").remove(&key);
                         drop(permit);
                         if let RunOutcome::Finished { text, is_error, session_id } = outcome {
@@ -855,6 +1234,7 @@ mod tests {
             progress_interval: Duration::from_secs(60),
             allow_model_override: false,
             allow_cwd_override: false,
+            elicit_approvals: false,
             workspace_root: std::env::temp_dir(),
             max_runs: MAX_CONCURRENT_RUNS,
             stop_grace: Duration::from_secs(5),
@@ -1405,6 +1785,199 @@ mod tests {
         assert_eq!(
             forwarded,
             ["--sandbox", "bwrap", "--read-only"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn protocol_version_is_negotiated_not_echoed() {
+        assert_eq!(negotiate_protocol_version(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(negotiate_protocol_version(Some("2024-11-05")), "2024-11-05");
+        // Unknown, future, malformed or absent versions get the newest supported one.
+        for requested in [Some("2099-01-01"), Some("garbage"), Some(""), None] {
+            assert_eq!(
+                negotiate_protocol_version(requested),
+                SUPPORTED_PROTOCOL_VERSIONS[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_answers_a_supported_version_or_the_newest() {
+        let init = |id, version: &str| json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"t","version":"0"}}});
+        let replies = exchange(
+            shell("true"),
+            &[init(1, "2025-03-26"), init(2, "2099-12-31"), init(3, "x")],
+        )
+        .await;
+        assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
+        assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(replies[2]["result"]["protocolVersion"], "2025-06-18");
+    }
+
+    #[test]
+    fn issued_session_ids_survive_a_restart_and_eviction_keeps_recent_ones() {
+        let dir = crate::tests::OwnedTestDirectory::new("mcp-issued-sessions");
+        let file = dir.path().join("state/sessions.json");
+        let first = IssuedSessions::persistent(file.clone());
+        first.record("sess-1");
+        first.record("sess-2");
+        // A restarted server (fresh object, same file) still resumes them.
+        let second = IssuedSessions::persistent(file.clone());
+        assert!(second.contains("sess-1") && second.contains("sess-2"));
+        assert!(!second.contains("sess"), "prefixes stay refused");
+        assert!(!second.contains("other"));
+        // Eviction drops the least recently used id; use refreshes an id.
+        let memory = IssuedSessions::default();
+        memory.record("sess-1");
+        memory.record("sess-2");
+        assert!(memory.contains("sess-1"));
+        for index in 0..MAX_ISSUED_SESSIONS - 1 {
+            memory.record(&format!("bulk-{index}"));
+        }
+        assert!(
+            memory.contains("sess-1"),
+            "recently used id survives eviction"
+        );
+        assert!(
+            !memory.contains("sess-2"),
+            "least recently used id is evicted"
+        );
+        // An oversized ledger loads only its newest MAX_ISSUED_SESSIONS ids.
+        let ids: Vec<String> = (0..MAX_ISSUED_SESSIONS + 10)
+            .map(|i| format!("id-{i}"))
+            .collect();
+        std::fs::write(&file, serde_json::to_vec(&ids).unwrap()).unwrap();
+        let loaded = IssuedSessions::persistent(file.clone());
+        assert!(
+            !loaded.contains("id-0") && loaded.contains(&format!("id-{}", MAX_ISSUED_SESSIONS + 9))
+        );
+        // A ledger id that is not a valid token (a flag, a path trick) is never loaded.
+        std::fs::write(&file, r#"["--yolo","ok-1","a b",5]"#).unwrap();
+        assert!(!IssuedSessions::persistent(file.clone()).contains("--yolo"));
+        std::fs::write(&file, "not json").unwrap();
+        assert!(!IssuedSessions::persistent(file.clone()).contains("ok-1"));
+        // Another server process's new id is picked up.
+        let a = IssuedSessions::persistent(dir.path().join("shared.json"));
+        let b = IssuedSessions::persistent(dir.path().join("shared.json"));
+        a.record("from-a");
+        assert!(b.contains("from-a"));
+    }
+
+    /// Drives one `run` against a fake stream-json child while playing the
+    /// MCP client: initialize with `capabilities`, then answer the server's
+    /// `elicitation/create` with `answer` (None = never answer a request).
+    async fn elicit_roundtrip(
+        elicit_approvals: bool,
+        capabilities: Value,
+        answer: Option<Value>,
+    ) -> (Option<Value>, String) {
+        let mut command = shell(
+            r#"case "$*" in *stream-json*) ;; *) printf 'plain:%s' "$*"; exit 0;; esac
+printf '%s\n' '{"type":"control_request","request_id":"perm_1","request":{"subtype":"can_use_tool","tool_name":"bash","input":"rm -rf build","input_bytes":12,"truncated":false}}'
+read reply
+case "$reply" in *'"behavior":"allow"'*) r=allowed;; *) r=denied;; esac
+printf '{"type":"result","result":"%s","session_id":"s-elicit","session_persisted":true}\n' "$r""#,
+        );
+        command.elicit_approvals = elicit_approvals;
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(serve(command, server_in, server_out));
+        let send = |message: Value| {
+            let mut bytes = serde_json::to_vec(&message).unwrap();
+            bytes.push(b'\n');
+            bytes
+        };
+        client_in
+            .write_all(&send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":capabilities,"clientInfo":{"name":"t","version":"0"}}})))
+            .await
+            .unwrap();
+        client_in
+            .write_all(&send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"clean up"}}})))
+            .await
+            .unwrap();
+        let mut lines = tokio::io::BufReader::new(client_out).lines();
+        let mut elicitation = None;
+        let text = loop {
+            let line = tokio::time::timeout(Duration::from_secs(20), lines.next_line())
+                .await
+                .expect("message in time")
+                .unwrap()
+                .expect("server closed early");
+            let message: Value = serde_json::from_str(&line).unwrap();
+            if message["method"] == "elicitation/create" {
+                elicitation = Some(message.clone());
+                if let Some(answer) = &answer {
+                    let reply = json!({"jsonrpc":"2.0","id":message["id"],"result":answer});
+                    client_in.write_all(&send(reply)).await.unwrap();
+                }
+            } else if message["id"] == 2 {
+                break message["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+            }
+        };
+        drop(client_in);
+        server.await.unwrap().unwrap();
+        (elicitation, text)
+    }
+
+    #[tokio::test]
+    async fn a_permission_ask_is_forwarded_as_elicitation_and_only_an_explicit_accept_allows() {
+        let caps = json!({"elicitation":{}});
+        let (request, text) = elicit_roundtrip(
+            true,
+            caps.clone(),
+            Some(json!({"action":"accept","content":{"allow":true}})),
+        )
+        .await;
+        let request = request.expect("an elicitation request was sent");
+        assert!(
+            request["params"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("rm -rf build")
+        );
+        assert_eq!(
+            request["params"]["requestedSchema"]["properties"]["allow"]["type"],
+            "boolean"
+        );
+        assert!(text.starts_with("allowed"), "{text}");
+        assert!(
+            text.contains("s-elicit"),
+            "session id still reported: {text}"
+        );
+        // Everything else refuses: decline, cancel, accept without or with a false allow.
+        for answer in [
+            json!({"action":"decline"}),
+            json!({"action":"cancel"}),
+            json!({"action":"accept"}),
+            json!({"action":"accept","content":{"allow":false}}),
+            json!({"action":"accept","content":{"allow":"true"}}),
+            json!({"action":"allow","content":{"allow":true}}),
+            json!("accept"),
+        ] {
+            let (_, text) = elicit_roundtrip(true, caps.clone(), Some(answer.clone())).await;
+            assert!(text.starts_with("denied"), "{answer}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn approvals_are_not_forwarded_by_default_or_without_client_support() {
+        // Flag off: the child is the ordinary one-shot JSON run even for a
+        // client that supports elicitation.
+        let (request, text) = elicit_roundtrip(false, json!({"elicitation":{}}), None).await;
+        assert!(request.is_none());
+        assert!(
+            text.starts_with("plain:") && !text.contains("stream-json"),
+            "{text}"
+        );
+        // Flag on but the client did not advertise elicitation.
+        let (request, text) = elicit_roundtrip(true, json!({}), None).await;
+        assert!(request.is_none());
+        assert!(
+            text.starts_with("plain:") && !text.contains("control"),
+            "{text}"
         );
     }
 }

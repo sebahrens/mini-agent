@@ -269,7 +269,7 @@ cancellation utility), and a `_meta.progressToken` on the call yields
 `notifications/progress` heartbeats every 15 s. Up to 4 runs may overlap
 (`--mcp-server-max-runs <N>`, 1-64); the next is refused with error `-32000`. A persisted run reports its session id
 (`structuredContent.session_id` and a trailing `[session_id: …]` line); pass it
-back as `session_id` to continue that conversation (`--session` on the child). Only exact ids this server process returned are accepted (the server remembers up to 1024); a prefix, a session name, or any other session, including conversations of other workspaces, is refused with `-32602` naming the rule.
+back as `session_id` to continue that conversation (`--session` on the child). Only exact ids this server returned for this workspace are accepted. The ids persist in a small ledger under the state directory (`mcp-server/sessions-<workspace hash>.json`, at most 4,096 ids, least recently used dropped first, using an id refreshes it), so a restarted server still resumes them; a prefix, a session name, or any other session, including conversations of other workspaces, is refused with `-32602` naming the rule. `initialize` answers the client's `protocolVersion` only when this server implements it (`2025-06-18`, `2025-03-26`, `2024-11-05`); any other version gets `2025-06-18`.
 `--mcp-server-allow-model-override` (default off) adds a per-call `model`
 argument; without it `model` is rejected. `--mcp-server-allow-cwd-override`
 (default off) adds a per-call `cwd`: a directory inside the server's workspace
@@ -279,6 +279,7 @@ the flag `cwd` is rejected. The child runs in that directory with the server's
 sandbox and permission flags unchanged (the sandbox is not narrowed to the
 subdirectory; relative paths in forwarded flags then resolve from it). The server owns the child's
 `--output`, so a forwarded `--output` is dropped. The server process itself runs no tools and opens no connections.
+`--mcp-server-elicit-approvals` (default off) forwards a run's permission asks to the MCP client as `elicitation/create` requests, but only when the client advertised the `elicitation` capability at `initialize`. The child then runs with `--input-format stream-json --output stream-json --stream-json-control` (the server owns those flags) and each `can_use_tool` ask is shown to the client with the complete reviewed input and a boolean `allow` field. Only `action: accept` with `allow: true` approves that single action; decline, cancel, any other answer, an error, a closed connection, an input over 64 KiB or no answer within 300 s deny it. Without the flag, or with a client that does not advertise elicitation, asks fail closed as before and the ordinary one-shot JSON child is used. The flag adds no permission by itself: only actions that would otherwise ask reach the client, and `--mcp-server-elicit-approvals` is not forwarded to the child.
 `--mcp-server` cannot be combined with `-p`, a prompt, `--acp` or `--loop`.
 
 ```json
