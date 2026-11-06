@@ -555,6 +555,15 @@ pub struct Config {
         alias = "shell_max_background_jobs"
     )]
     pub shell_max_background_jobs: Option<usize>,
+    /// `shell-job-notifications`: tell the model (and wake an idle TUI
+    /// session) when a background shell job ends on its own. Default true.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "shell-job-notifications",
+        alias = "shell_job_notifications"
+    )]
+    pub shell_job_notifications: Option<bool>,
     /// `shell-allow-escalation`: offer the shell `escalate` parameter that
     /// runs one command outside the sandbox after interactive approval.
     /// Default false; never offered under `sandbox-required`.

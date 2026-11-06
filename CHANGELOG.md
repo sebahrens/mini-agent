@@ -78,6 +78,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   `left`, `right`, `tab`, `enter`, `backspace`) rendered by the tool. Ctrl-C/Ctrl-D need no
   permission; Enter judges the typed line; cursor/history keys make the next Enter an opaque edited
   line for policy; Tab on a partly typed line is refused (mini-agent-0i1wh).
+- Background shell jobs that end on their own queue one bounded completion notice (id, command,
+  status, exit code, output tail, log path), delivered once with the next `shell`/`job_status`
+  result and the next model request; an idle TUI session is woken (at most 8 in a row). Opt out with
+  `shell-job-notifications = false` (mini-agent-cw4f3).
 
 ### Security
 

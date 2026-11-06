@@ -1165,6 +1165,14 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         if shell_tool_enabled {
             // Unlisted hosts of `sandbox-network = "allowlist"` prompt here.
             sandbox.set_network_prompt(ask_tx.clone());
+            // Background job completion notices reach this session's requests.
+            sandbox
+                .job_notice_queue()
+                .set_enabled(cfg.shell_job_notifications.unwrap_or(true));
+            crate::sandbox::job_notices::register(
+                tool_output_session_id,
+                sandbox.job_notice_queue(),
+            );
             base_tools.push(Box::new(
                 tools::ShellTool::new(
                     permission.clone(),

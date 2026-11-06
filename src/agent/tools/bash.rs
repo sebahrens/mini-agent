@@ -400,7 +400,9 @@ impl Tool for ShellTool {
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
-        self.execute(args).await.map(|(text, _)| text)
+        self.execute(args)
+            .await
+            .map(|(text, _)| append_job_notices(&self.sandbox, text))
     }
     #[cfg(any(feature = "git-worktree", test))]
     async fn call_structured(
@@ -409,7 +411,7 @@ impl Tool for ShellTool {
         _extensions: &rig::tool::ToolCallExtensions,
     ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
         self.execute(args).await.map(|(text, metadata)| {
-            let result = rig::tool::ToolReturn::success(text);
+            let result = rig::tool::ToolReturn::success(append_job_notices(&self.sandbox, text));
             match metadata {
                 Some(metadata) => result.with_extension(metadata),
                 None => result,
@@ -871,6 +873,22 @@ async fn forward_progress<T>(
     }
 }
 
+/// Append the completion notices of background jobs that ended on their own
+/// since the model last heard about them, so a long turn learns of them at
+/// its next tool result (mini-agent-cw4f3). Delivered once.
+const MAX_NOTICES_PER_RESULT: usize = 4;
+
+fn append_job_notices(sandbox: &Sandbox, mut output: String) -> String {
+    let notices = sandbox
+        .job_notice_queue()
+        .take_up_to(MAX_NOTICES_PER_RESULT);
+    for message in crate::sandbox::job_notices::render_all(&notices) {
+        output.push_str("\n\n");
+        output.push_str(&message);
+    }
+    output
+}
+
 pub struct JobStatusTool {
     sandbox: Sandbox,
     max_output_lines: Option<u64>,
@@ -1031,9 +1049,7 @@ impl JobStatusTool {
             .await;
             checked.map_err(|error| error.to_string())?;
         }
-        self.sandbox
-            .write_background_job_input(id, &bytes)
-            .await?;
+        self.sandbox.write_background_job_input(id, &bytes).await?;
         self.pending_input
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1139,6 +1155,13 @@ impl Tool for JobStatusTool {
     }
 
     async fn call(&self, args: JobStatusArgs) -> Result<String, ToolError> {
+        let output = self.call_inner(args).await?;
+        Ok(append_job_notices(&self.sandbox, output))
+    }
+}
+
+impl JobStatusTool {
+    async fn call_inner(&self, args: JobStatusArgs) -> Result<String, ToolError> {
         if let Some(timeout) = args.timeout_ms
             && (args.action != JobAction::Wait
                 || !(1..=MAX_BACKGROUND_JOB_WAIT_MILLIS).contains(&timeout))
@@ -2995,6 +3018,90 @@ mod tests {
             .await
     }
 
+    async fn start_job(shell: &BashTool, command: &str) -> String {
+        let started = shell
+            .call(BashArgs {
+                command: command.to_string(),
+                timeout: Some(30_000),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        background_id(&started)
+    }
+
+    async fn wait_for_notice(shell: &BashTool) {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            shell.sandbox.job_notice_queue().wait_pending(),
+        )
+        .await
+        .expect("a job that ended after the turn must queue a notice");
+    }
+
+    /// A job that finishes after the turn ended queues one bounded notice,
+    /// delivered once with the next tool result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_completion_notice_is_queued_and_delivered_once() {
+        let shell = test_tool();
+        let id = start_job(&shell, "echo build-tail-marker; exit 3").await;
+        wait_for_notice(&shell).await;
+        assert_eq!(shell.sandbox.job_notice_queue().len(), 1);
+        let result = shell
+            .call(BashArgs {
+                command: "echo unrelated".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("unrelated"), "{result}");
+        assert!(
+            result.contains(&format!("Background shell job {id} completed")),
+            "{result}"
+        );
+        assert!(result.contains("exit code 3"), "{result}");
+        assert!(result.contains("build-tail-marker"), "{result}");
+        assert!(result.contains("grants no permission"), "{result}");
+        // Delivered once.
+        let again = shell
+            .call(BashArgs {
+                command: "echo second".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!again.contains("Background shell job"), "{again}");
+    }
+
+    /// Reading the terminal state, stopping a job, or turning notices off
+    /// queues nothing the model already knows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_notices_skip_known_stopped_and_disabled_jobs() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        // Seen through job_status wait: the notice is withdrawn.
+        let seen = start_job(&shell, "echo seen").await;
+        let terminal = wait_for_terminal_job(&status, &seen).await;
+        assert!(terminal.contains("Status: completed"), "{terminal}");
+        assert!(!terminal.contains("Background shell job"), "{terminal}");
+        assert_eq!(shell.sandbox.job_notice_queue().len(), 0);
+        // Stopped by the model: no notice.
+        let stopped = start_job(&shell, "sleep 300").await;
+        shell.sandbox.stop_background_job(&stopped).await.unwrap();
+        assert_eq!(shell.sandbox.job_notice_queue().len(), 0);
+        // Opt-out.
+        shell.sandbox.job_notice_queue().set_enabled(false);
+        let quiet = start_job(&shell, "echo quiet").await;
+        let _ = wait_for_terminal_job(&status, &quiet).await;
+        shell.sandbox.job_notice_queue().set_enabled(true);
+        start_job(&shell, "echo loud").await;
+        wait_for_notice(&shell).await;
+        assert_eq!(shell.sandbox.job_notice_queue().len(), 1);
+    }
+
     #[test]
     fn job_keys_render_fixed_bytes_and_reject_text_mixing() {
         assert_eq!(JobKey::CtrlC.bytes(), b"\x03");
@@ -3035,8 +3142,13 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(wrong_action.to_string().contains("only valid"), "{wrong_action}");
-        let too_many = job_keys(&status, "job-x", &[JobKey::Left; 65]).await.unwrap_err();
+        assert!(
+            wrong_action.to_string().contains("only valid"),
+            "{wrong_action}"
+        );
+        let too_many = job_keys(&status, "job-x", &[JobKey::Left; 65])
+            .await
+            .unwrap_err();
         assert!(too_many.to_string().contains("1 to 64"), "{too_many}");
     }
 
@@ -3059,7 +3171,9 @@ mod tests {
         job_input(&status, &id, "sleep 300\n").await.unwrap();
         let started = Instant::now();
         job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
-        let seen = job_input(&status, &id, "echo after-$((20+1))\n").await.unwrap();
+        let seen = job_input(&status, &id, "echo after-$((20+1))\n")
+            .await
+            .unwrap();
         assert!(seen.contains("after-21"), "{seen}");
         assert!(started.elapsed() < Duration::from_secs(20));
         shell.sandbox.stop_background_job(&id).await.unwrap();
@@ -3097,14 +3211,24 @@ mod tests {
         job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
         // Typed text then Enter is judged as the typed line.
         let name = typed.file_name().unwrap().to_string_lossy().to_string();
-        job_input(&status, &id, &format!("touch {name}")).await.unwrap_err();
+        job_input(&status, &id, &format!("touch {name}"))
+            .await
+            .unwrap_err();
         job_input(&status, &id, "echo hi").await.unwrap();
         let tab = job_keys(&status, &id, &[JobKey::Tab]).await.unwrap_err();
-        assert!(tab.to_string().contains("tab on a partly typed line"), "{tab}");
+        assert!(
+            tab.to_string().contains("tab on a partly typed line"),
+            "{tab}"
+        );
         // History recall then Enter would run an unjudged line: refused.
-        job_keys(&status, &id, &[JobKey::CtrlC, JobKey::Up]).await.unwrap();
+        job_keys(&status, &id, &[JobKey::CtrlC, JobKey::Up])
+            .await
+            .unwrap();
         let error = job_keys(&status, &id, &[JobKey::Enter]).await.unwrap_err();
-        assert!(error.to_string().to_lowercase().contains("denied"), "{error}");
+        assert!(
+            error.to_string().to_lowercase().contains("denied"),
+            "{error}"
+        );
         job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
         job_input(&status, &id, "echo fine\n").await.unwrap();
         assert!(!typed.exists());

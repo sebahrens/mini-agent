@@ -1,5 +1,7 @@
 #[path = "cron_app.rs"]
 mod cron_app;
+#[path = "job_wake_app.rs"]
+mod job_wake_app;
 #[cfg(feature = "mcp")]
 #[path = "mcp_admin_app.rs"]
 mod mcp_admin_app;
@@ -2740,6 +2742,8 @@ impl<'a> App<'a> {
                 .filter(|_| !self.git_status_in_flight);
             let cron_wakeup = self.cron_wakeup();
             let cron_repaint = self.cron_label_repaint_at();
+            let job_wake = self.job_wake_armed();
+            let job_queue = self.ui.sandbox.job_notice_queue().clone();
 
             #[cfg(feature = "subagents")]
             let background_pool = self.ui.session.background_pool.clone();
@@ -2864,6 +2868,10 @@ impl<'a> App<'a> {
                     cron_wakeup.unwrap_or_else(tokio::time::Instant::now)
                 ), if cron_wakeup.is_some() => {
                     crate::startup::heap_future(|| self.fire_due_cron()).await?;
+                }
+                // A background shell job ended while the session is idle.
+                _ = job_queue.wait_pending(), if job_wake => {
+                    crate::startup::heap_future(|| self.wake_for_job_notices()).await?;
                 }
                 // The `/cron` statusline countdown rolled to its next minute.
                 _ = tokio::time::sleep_until(
@@ -5962,6 +5970,12 @@ impl<'a> App<'a> {
         text: &str,
         question_origin: crate::question::QuestionOrigin,
     ) -> anyhow::Result<()> {
+        if matches!(
+            question_origin,
+            crate::question::QuestionOrigin::NewUserTurn
+        ) {
+            job_wake_app::user_turn_started();
+        }
         let turn_directive = self.run.next_turn_directive.take();
         let first_request_tool = self.run.next_turn_first_request_tool.take();
         #[cfg(feature = "multimodal")]

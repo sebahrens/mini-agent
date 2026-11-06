@@ -264,6 +264,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("shell-max-background-jobs", &["shell_max_background_jobs"])
         .described("Running background shell jobs allowed at once (1..=64, default 8). A full table makes auto_background calls run in the foreground.")
         .shaped(ConfigShape::Integer),
+    aliased("shell-job-notifications", &["shell_job_notifications"])
+        .described("Notify the model when a background shell job ends on its own (bounded notice with status, exit code, output tail and log path, delivered once) and wake an idle TUI session. Default true; false disables.")
+        .shaped(ConfigShape::Bool),
     aliased("shell-allow-escalation", &["shell_allow_escalation"])
         .described("Offer the shell escalate parameter: retry one sandbox-blocked command without the sandbox after interactive approval. Default false; ignored under sandbox-required. Project layers need trust.")
         .shaped(ConfigShape::Bool),

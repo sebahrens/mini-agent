@@ -4797,6 +4797,8 @@ impl AnyAgent {
             if let Some(notice) = &background_notice {
                 context_notices.extend(notice.messages());
             }
+            #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
+            context_notices.extend(crate::sandbox::job_notices::take_messages_for_current_run());
 
             #[cfg(feature = "hooks")]
             let (hook_prompt, hook_context) = {
@@ -5381,6 +5383,9 @@ impl AnyAgent {
                 if let Some(notice) = &background_notice {
                     context_notices.extend(notice.messages());
                 }
+                #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
+                context_notices
+                    .extend(crate::sandbox::job_notices::take_messages_for_current_run());
 
                 #[cfg(feature = "hooks")]
                 let rewritten = match work_scope

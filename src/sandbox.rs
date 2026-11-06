@@ -20,6 +20,7 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod general_profile;
+pub(crate) mod job_notices;
 #[cfg(unix)]
 pub(crate) mod net_forwarder;
 pub(crate) mod net_proxy;
@@ -1013,6 +1014,8 @@ struct BackgroundJobsInner {
     /// Records in `jobs` without a terminal state. Updated only while `jobs`
     /// is locked, so the redraw path can read it without the lock.
     running: AtomicUsize,
+    /// Completion notices of jobs that ended on their own.
+    notices: Arc<job_notices::JobNoticeQueue>,
 }
 
 /// What the output worker launches. A shell command is wrapped by the worker
@@ -5024,6 +5027,9 @@ impl Sandbox {
         if since.is_none() {
             job.delivered = window.next;
         }
+        if snapshot.status.is_terminal() {
+            self.background_jobs.notices.acknowledge(id);
+        }
         Ok(BackgroundJobOutput { snapshot, window })
     }
 
@@ -5235,6 +5241,12 @@ impl Sandbox {
         if jobs.get(id).is_some_and(|job| job.terminal.is_some()) {
             jobs.remove(id);
         }
+        self.background_jobs.notices.acknowledge(id);
+    }
+
+    /// The completion-notice queue of this sandbox's background jobs.
+    pub(crate) fn job_notice_queue(&self) -> &Arc<job_notices::JobNoticeQueue> {
+        &self.background_jobs.notices
     }
 
     /// Stop every running background job: session shutdown and `/quit`.
@@ -6381,8 +6393,30 @@ fn finish_background_job(
         let Some(job) = jobs.get_mut(id) else {
             return;
         };
-        if job.terminal.replace(terminal).is_none() {
+        let first = job.terminal.replace(terminal).is_none();
+        if first {
             owner.running.fetch_sub(1, Ordering::Release);
+        }
+        // A job the model or user stopped is already known to them.
+        if first && !job.stop_requested && owner.notices.enabled() {
+            let snapshot = snapshot_background_job(id, job);
+            let total = snapshot.transcript.total_bytes;
+            let start = total.saturating_sub(job_notices::NOTICE_TAIL_BYTES as u64);
+            let window = job
+                .capture
+                .read_window(start, job_notices::NOTICE_TAIL_BYTES);
+            let mut tail = window.head;
+            tail.extend_from_slice(&window.tail);
+            owner.notices.push(job_notices::JobNotice {
+                id: id.to_string(),
+                command: snapshot.command,
+                status: snapshot.status,
+                exit_code: snapshot.exit_code,
+                pty: snapshot.pty,
+                log_path: job.log_path.clone(),
+                tail,
+                earlier_bytes: start,
+            });
         }
         job.changed.clone()
     };
