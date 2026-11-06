@@ -1187,6 +1187,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 crate::spend::RequestKind::Subagent,
             )
         });
+        let evidence_enabled = super::evidence::enabled(&config);
         let config = Arc::new(config);
         let spend_profile = spend_profile.map(|run| match &observation {
             Some(observation) => run.with_background_observation(observation.clone()),
@@ -1337,6 +1338,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 .map(|services| services.fork_for_read_only_child());
             let specialization = specialization.clone();
             let child_name = child_name.clone();
+            let evidence_pool = pool_weak.clone();
             #[cfg(feature = "hooks")]
             let hook_agent_type = hook_agent_type.clone();
             #[cfg(feature = "hooks")]
@@ -1466,6 +1468,12 @@ editing in a known location, grepping for a literal you will act on immediately.
                     .await;
                 #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
                 let mut run = result;
+                // Host-minted evidence comes from the child's actual tool
+                // results, in call order; the report contract can only cite it.
+                let mut evidence = super::evidence::ChildEvidence::default();
+                if evidence_enabled {
+                    evidence.record_history(&run.history);
+                }
                 #[cfg(feature = "hooks")]
                 if !task_budget.exhausted()
                     && let Ok(response) = run.response.as_ref()
@@ -1489,6 +1497,9 @@ editing in a known location, grepping for a literal you will act on immediately.
                             None,
                         )
                         .await;
+                    if evidence_enabled {
+                        evidence.record_history(&retried.history);
+                    }
                     run = merge_forced_continuation_run(run, retried);
                 }
 
@@ -1529,6 +1540,23 @@ editing in a known location, grepping for a literal you will act on immediately.
                 .await;
                 let mut child_details = finished.details;
                 child_details.index = index;
+                let stored_evidence =
+                    match evidence_pool.as_ref().and_then(std::sync::Weak::upgrade) {
+                        Some(pool) if evidence_enabled => {
+                            let task_id = uuid::Uuid::new_v4().to_string();
+                            let stored = pool
+                                .evidence()
+                                .store(pool.session_id(), task_id, evidence)
+                                .await;
+                            child_details.evidence = Some(super::background::EvidenceSummary {
+                                task_id: stored.task_id.clone(),
+                                records: stored.metas.len(),
+                            });
+                            Some(stored)
+                        }
+                        _ => None,
+                    };
+                let _ = &stored_evidence;
                 details_sink.record(child_details);
                 let known_violations = finished.known_violations;
                 let output = finished.response.map(|response| match known_violations {
@@ -1698,6 +1726,7 @@ where
         tool_calls: run.tool_calls,
         log: std::mem::take(&mut run.tool_log),
         unverified: None,
+        evidence: None,
     };
     if run.turn_budget_exhausted && run.response.is_ok() {
         let mut written_up = false;

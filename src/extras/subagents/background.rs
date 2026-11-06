@@ -91,6 +91,18 @@ pub(crate) struct ChildDetails {
     /// marked unverified; never part of any model-visible result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unverified: Option<String>,
+    /// Host-minted evidence handle for this child's tool results, with the
+    /// number of recorded results (see `task_evidence`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidenceSummary>,
+}
+
+/// User-visible pointer to a child's evidence store.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EvidenceSummary {
+    pub task_id: String,
+    pub records: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +121,11 @@ impl TaskDetails {
                         .unverified
                         .as_ref()
                         .is_none_or(|text| text.len() <= MAX_UNVERIFIED_BYTES)
+                    && child.evidence.as_ref().is_none_or(|evidence| {
+                        evidence.task_id.len() <= 64
+                            && evidence.records
+                                <= crate::extras::subagents::evidence::MAX_EVIDENCE_RECORDS
+                    })
             })
     }
 
@@ -135,6 +152,12 @@ impl TaskDetails {
             let hidden = (child.tool_calls as usize).saturating_sub(child.log.len());
             if hidden > 0 {
                 lines.push(format!("  ... {hidden} more tool calls not logged"));
+            }
+            if let Some(evidence) = &child.evidence {
+                lines.push(format!(
+                    "  evidence: {} records, task_evidence id {}",
+                    evidence.records, evidence.task_id
+                ));
             }
         }
         lines
@@ -407,6 +430,8 @@ pub(crate) struct Pool {
     pub(crate) write_lane: Arc<tokio::sync::Semaphore>,
     /// Bounded, in-memory log of recent foreground `task` calls.
     recent: Mutex<std::collections::VecDeque<RecentTask>>,
+    /// Host-minted child evidence stores (foreground and background).
+    evidence: crate::extras::subagents::evidence::EvidenceIndex,
 }
 
 impl std::fmt::Debug for Pool {
@@ -565,6 +590,7 @@ impl Pool {
             foreground: Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32))),
             write_lane: Arc::new(tokio::sync::Semaphore::new(1)),
             recent: Mutex::default(),
+            evidence: Default::default(),
         });
         session.background_pool = Some(pool.clone());
         Ok(pool)
@@ -847,6 +873,12 @@ impl Pool {
             details,
         });
         Some(id)
+    }
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session
+    }
+    pub(crate) fn evidence(&self) -> &crate::extras::subagents::evidence::EvidenceIndex {
+        &self.evidence
     }
     pub(crate) fn recent_foreground(&self) -> Vec<RecentTask> {
         self.recent
@@ -1195,6 +1227,7 @@ mod tests {
                 tool_calls: 1,
                 log: vec![entry.with_error("boom")],
                 unverified: Some("RAW_UNVERIFIED".into()),
+                evidence: None,
             }],
         }
     }
