@@ -1,0 +1,150 @@
+{
+  "about": "Evidence-handle axis of the deterministic harness eval (mini-agent-g442v). Each case runs twice through the real task executor against a scripted loopback child: once with task_evidence on and once off. Values in {{name}} are drawn per case from a seeded generator, so neither the answer nor whether the child's claim is right can be read from this file; the oracle is recomputed from the generated workspace. The scripted parent applies one fixed verification policy to every case.",
+  "cases": [
+    {
+      "name": "stale_config_value",
+      "values": {"limit": [3, 60], "stale": [3, 60]},
+      "files": {
+        "config/prod.toml": "[service]\nname = \"billing\"\nretry_limit = {{limit}}\ntimeout_ms = 2500\n",
+        "docs/CHANGELOG.md": "# Changelog\n- retry_limit raised from {{stale}} after the incident review.\n"
+      },
+      "question": {"kind": "value", "subject": "config/prod.toml", "key": "retry_limit"},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "config/prod.toml"}}, {"name": "read", "args": {"path": "docs/CHANGELOG.md"}}]},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{stale}} is retry_limit in config/prod.toml. [evidence: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: config/prod.toml, docs/CHANGELOG.md.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "incomplete_call_count",
+      "values": {"noise": [5, 40], "hits": [4, 30], "partial": [1, 30]},
+      "files": {
+        "src/handlers.rs": "{{rep:noise:let helper_# = 0;}}{{rep:hits:audit_log(req_#);}}"
+      },
+      "question": {"kind": "count", "subject": "src/handlers.rs", "needle": "audit_log("},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "grep", "args": {"pattern": "audit_log\\(", "path": "src/handlers.rs"}}]},
+        {"text": "## Findings\n- [confidence: medium] ANSWER: {{partial}} audit_log( call sites in src/handlers.rs. [evidence: E1]\n\n## Unverified\n- Macro-generated call sites were not expanded.\n\n## Coverage\n- Covered: src/handlers.rs.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "correct_value_cited",
+      "values": {"port": [1024, 65000]},
+      "files": {
+        "deploy/service.yaml": "service:\n  name: gateway\n  port: {{port}}\n  replicas: 3\n"
+      },
+      "question": {"kind": "value", "subject": "deploy/service.yaml", "key": "port"},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "deploy/service.yaml"}}]},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{port}} is the gateway port in deploy/service.yaml. [evidence: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: deploy/service.yaml.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "long_log_correct_count",
+      "values": {"head": [250, 380], "hits": [40, 90], "tail": [150, 260]},
+      "files": {
+        "logs/worker.log": "{{rep:head:INFO worker tick seq=# status=ok}}{{rep:hits:ERROR upstream timeout seq=#}}{{rep:tail:INFO worker tick seq=# status=ok}}"
+      },
+      "question": {"kind": "count", "subject": "logs/worker.log", "needle": "ERROR upstream timeout"},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "logs/worker.log", "offset": 1, "limit": 2000}}]},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{hits}} ERROR upstream timeout lines in logs/worker.log. [evidence: E1]\n\n## Unverified\n- Rotated logs were not present.\n\n## Coverage\n- Covered: logs/worker.log.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "distractor_citation",
+      "values": {"prod": [100, 999], "staging": [100, 999]},
+      "files": {
+        "config/staging.env": "MAX_CONNECTIONS={{staging}}\nLOG_LEVEL=debug\n",
+        "config/prod.env": "LOG_LEVEL=warn\nMAX_CONNECTIONS={{prod}}\n"
+      },
+      "question": {"kind": "value", "subject": "config/prod.env", "key": "MAX_CONNECTIONS"},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "config/staging.env"}}, {"name": "read", "args": {"path": "config/prod.env"}}]},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{staging}} is MAX_CONNECTIONS for production. [evidence: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: config/staging.env, config/prod.env.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "unknown_citation_repaired",
+      "values": {"ttl": [30, 3600]},
+      "files": {
+        "cache/policy.ini": "[cache]\nttl_seconds = {{ttl}}\nevict = lru\n"
+      },
+      "question": {"kind": "value", "subject": "cache/policy.ini", "key": "ttl_seconds"},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "cache/policy.ini"}}]},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{ttl}} is ttl_seconds in cache/policy.ini. [evidence: E4]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: cache/policy.ini.\n- Skipped: None."},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{ttl}} is ttl_seconds in cache/policy.ini. [evidence: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: cache/policy.ini.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "withheld_after_failed_repair",
+      "values": {"workers": [2, 64], "guess": [2, 64]},
+      "files": {
+        "ops/runtime.conf": "# tuned for the batch tier\nworker_threads = {{workers}}\nqueue_depth = 512\n"
+      },
+      "question": {"kind": "value", "subject": "ops/runtime.conf", "key": "worker_threads"},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "ops/runtime.conf"}}]},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{guess}} worker threads. [evidence: E3]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: ops/runtime.conf.\n- Skipped: None."},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{guess}} worker threads. [evidence: E5]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: ops/runtime.conf.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "image_dims_vision_parent",
+      "values": {"w": [320, 1500], "h": [200, 1200], "cw": [320, 1500], "ch": [200, 1200]},
+      "images": {"assets/architecture.png": ["w", "h"]},
+      "question": {"kind": "image", "subject": "assets/architecture.png"},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "assets/architecture.png"}}]},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{cw}}x{{ch}} are the pixel dimensions of assets/architecture.png. [evidence: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: assets/architecture.png.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "image_dims_text_only_parent",
+      "values": {"w": [320, 1500], "h": [200, 1200], "cw": [320, 1500], "ch": [200, 1200]},
+      "images": {"screens/login.png": ["w", "h"]},
+      "question": {"kind": "image", "subject": "screens/login.png"},
+      "parent": "text",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "screens/login.png"}}]},
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{cw}}x{{ch}} are the pixel dimensions of screens/login.png. [evidence: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: screens/login.png.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "uncited_correct_claim",
+      "values": {"shards": [2, 48], "other": [2, 48]},
+      "files": {
+        "docs/STYLE.md": "# Style\nPrefer explicit names; shard counts are documented in db/cluster.toml.\n",
+        "db/cluster.toml": "[cluster]\nshard_count = {{shards}}\nreplica_count = {{other}}\n"
+      },
+      "question": {"kind": "value", "subject": "db/cluster.toml", "key": "shard_count"},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "docs/STYLE.md"}}]},
+        {"tools": [{"name": "read", "args": {"path": "db/cluster.toml"}}]},
+        {"text": "## Findings\n- [confidence: medium] ANSWER: {{shards}} is shard_count in db/cluster.toml.\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: docs/STYLE.md, db/cluster.toml.\n- Skipped: None."}
+      ]
+    },
+    {
+      "name": "uncited_wrong_claim",
+      "values": {"budget": [10, 500], "claimed": [10, 500]},
+      "files": {
+        "ci/limits.toml": "[ci]\nminutes_budget = {{budget}}\nparallel_jobs = 4\n"
+      },
+      "question": {"kind": "value", "subject": "ci/limits.toml", "key": "minutes_budget"},
+      "parent": "vision",
+      "turns": [
+        {"tools": [{"name": "read", "args": {"path": "ci/limits.toml"}}]},
+        {"text": "## Findings\n- [confidence: medium] ANSWER: {{claimed}} is minutes_budget in ci/limits.toml.\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: ci/limits.toml.\n- Skipped: None."}
+      ]
+    }
+  ]
+}

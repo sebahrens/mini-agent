@@ -98,8 +98,13 @@ as directional.
 ## Open points
 
 - No published benchmark compares summary-only, summary with references, and raw returns on the same
-  tasks. mini-agent-g442v measures parent accuracy and token cost with `task_evidence` on and off
-  before any inline image lane is enabled.
+  tasks. mini-agent-g442v now measures parent accuracy and token cost with `task_evidence` on and off
+  in the deterministic harness (`harness_regression_eval_evidence_axis`, results in
+  `docs/agent/SUBAGENTS.md`): with a fixed verifying parent policy, accuracy rose from 4/11 to 9/11
+  at about 15x the parent-context tokens, spent almost entirely on records the parent chose to
+  dereference. The parent is a scripted policy, not a model, so this bounds what the handles make
+  available rather than how a model uses them. Verdict for the inline image lane: no-go as a
+  default; it ships opt-in with `task_inline_images = 0`.
 - Image support on the Copilot, Azure, Bedrock and Vertex routes is unverified, so images stay gated on
   the same `image_read_support` capture that `read` uses.
 - The host-authored `## Isolated worktree` section of write children is still appended inside the

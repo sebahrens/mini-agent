@@ -354,7 +354,10 @@ jobs:
 
       # The deterministic five-task suite uses scripted providers and bounded
       # per-fixture turn/tool/token budgets, so it is cheap enough to gate
-      # every push and pull request.
+      # every push and pull request. The `harness_regression_eval` filter also
+      # selects harness_regression_eval_evidence_axis, which drives the real
+      # task executor against a scripted loopback child with task_evidence on
+      # and off and asserts that evidence handles never lower parent accuracy.
       - name: Run bounded deterministic harness evaluation
         run: |
           cargo test --locked harness_regression_eval -- --ignored --nocapture

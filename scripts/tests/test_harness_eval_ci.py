@@ -63,6 +63,13 @@ class HarnessEvalCiTests(unittest.TestCase):
         self.assertIn("--marker PERSONA_EVAL", workflow)
         self.assertIn("--expect 5", workflow)
         self.assertIn("--expect 9", workflow)
+        # Evidence-handle axis: 11 cases x {on, off}, plus one summary.
+        self.assertIn("--marker EVIDENCE_EVAL\n", workflow.replace(" \\\n", "\n"))
+        self.assertIn("--expect 22", workflow)
+        self.assertIn("--require arm=on", workflow)
+        self.assertIn("--require arm=off", workflow)
+        self.assertIn("--marker EVIDENCE_EVAL_SUMMARY", workflow)
+        self.assertIn("evidence-eval.jsonl", workflow)
         self.assertIn("harness-eval.jsonl", workflow)
         self.assertIn("persona-eval.jsonl", workflow)
         self.assertIn("if-no-files-found: error", workflow)
@@ -210,6 +217,44 @@ class HarnessEvalExtractorTests(unittest.TestCase):
         for case in fixture["cases"]:
             self.assertTrue(case["expected_finding"])
             self.assertIn(case["expected_finding"], case["response"])
+
+    def test_evidence_fixture_matches_the_workflow_record_count(self) -> None:
+        fixture_path = REPOSITORY_ROOT / "tests" / "harness_eval" / "evidence" / "fixture.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        names = [case["name"] for case in fixture["cases"]]
+        self.assertEqual(len(names), len(set(names)))
+        # One record per case and arm (task_evidence on and off).
+        self.assertIn(f"--expect {2 * len(names)}", WORKFLOW.read_text(encoding="utf-8"))
+        kinds = {case["question"]["kind"] for case in fixture["cases"]}
+        self.assertEqual(kinds, {"value", "count", "image"})
+        self.assertEqual({case["parent"] for case in fixture["cases"]}, {"vision", "text"})
+
+    def test_the_evidence_summary_is_not_counted_as_an_evidence_record(self) -> None:
+        record = {
+            "case": "c",
+            "arm": "on",
+            "success": True,
+            "correct": True,
+            "parent_bytes": 10,
+            "parent_est_tokens": 3,
+            "evidence_calls": 1,
+            "child_requests": 2,
+        }
+        summary = {
+            "cases": 1,
+            "on_correct": 1,
+            "off_correct": 0,
+            "on_est_tokens": 3,
+            "off_est_tokens": 1,
+        }
+        lines = [
+            "test tests::x ... EVIDENCE_EVAL " + json.dumps(record),
+            "EVIDENCE_EVAL_SUMMARY " + json.dumps(summary),
+        ]
+        self.assertEqual(len(self.extractor.extract_records(lines, "EVIDENCE_EVAL")), 1)
+        self.assertEqual(
+            len(self.extractor.extract_records(lines, "EVIDENCE_EVAL_SUMMARY")), 1
+        )
 
 
 if __name__ == "__main__":

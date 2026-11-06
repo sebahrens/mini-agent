@@ -25,6 +25,24 @@ from typing import Iterable
 REQUIRED_KEYS = {
     "HARNESS_EVAL": ("name", "success", "provider_turns", "tool_calls", "total_tokens"),
     "PERSONA_EVAL": ("agent_type", "success", "expected_finding"),
+    # Evidence-handle axis (mini-agent-g442v): one record per case and arm.
+    "EVIDENCE_EVAL": (
+        "case",
+        "arm",
+        "success",
+        "correct",
+        "parent_bytes",
+        "parent_est_tokens",
+        "evidence_calls",
+        "child_requests",
+    ),
+    "EVIDENCE_EVAL_SUMMARY": (
+        "cases",
+        "on_correct",
+        "off_correct",
+        "on_est_tokens",
+        "off_est_tokens",
+    ),
 }
 
 

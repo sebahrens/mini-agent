@@ -54,6 +54,21 @@ jobs:
             --log "$RUNNER_TEMP/harness-eval.log" \
             --out "$RUNNER_TEMP/persona-eval.jsonl" \
             --expect 9
+          # The evidence-handle axis (harness_regression_eval_evidence_axis,
+          # selected by the same filter) runs 11 cases with task_evidence on
+          # and off: 22 records plus one summary.
+          python3 scripts/harness_eval_metrics.py \
+            --marker EVIDENCE_EVAL \
+            --log "$RUNNER_TEMP/harness-eval.log" \
+            --out "$RUNNER_TEMP/evidence-eval.jsonl" \
+            --expect 22 \
+            --require arm=on \
+            --require arm=off
+          python3 scripts/harness_eval_metrics.py \
+            --marker EVIDENCE_EVAL_SUMMARY \
+            --log "$RUNNER_TEMP/harness-eval.log" \
+            --out "$RUNNER_TEMP/evidence-eval-summary.jsonl" \
+            --expect 1
 
       # The library-axis eval is cfg-gated on `skills` + `sandbox`, and its
       # module on `js` + `subagents`. `skills` is not a default feature, so the
@@ -88,6 +103,8 @@ jobs:
           path: |
             ${{ runner.temp }}/harness-eval.jsonl
             ${{ runner.temp }}/persona-eval.jsonl
+            ${{ runner.temp }}/evidence-eval.jsonl
+            ${{ runner.temp }}/evidence-eval-summary.jsonl
             ${{ runner.temp }}/library-axis-eval.jsonl
           if-no-files-found: error
 

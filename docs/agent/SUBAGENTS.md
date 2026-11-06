@@ -649,6 +649,67 @@ citation rules, no Evidence section and no `task_evidence` tool. Use it for
 on/off comparisons. The rationale is recorded in
 [docs/decisions/2026-11-06-subagent-return-channel.md](../decisions/2026-11-06-subagent-return-channel.md).
 
+#### Evaluation: evidence handles on vs off (mini-agent-g442v)
+
+`tests::harness_eval_tests::harness_regression_eval_evidence_axis` (ignored;
+selected by the `harness_regression_eval` filter in ci.yml and the weekly
+`harness-eval.yml`) runs every case of `tests/harness_eval/evidence/fixture.json`
+through the **real** `TaskTool::call` executor twice, with `task_evidence` on
+and off. The child is a real explore agent whose provider is a scripted
+OpenAI-compatible loopback server, so its `read`/`grep` calls, evidence
+recording, citation validation, repair turn and `## Evidence` section are the
+production ones. File contents, answers and the child's wrong claims are drawn
+from a seeded generator (`HARNESS_EVAL_SEED` overrides the default), so they
+cannot be read from the fixture; the oracle is recomputed from the generated
+workspace.
+
+The parent is one fixed, deterministic policy for every case and both arms:
+take the child's `ANSWER:` claim; if the host lists cited (or, for a withheld
+report, indexed) records, dereference those about the asked subject through
+the real `task_evidence` tool (probing other records in call order when the
+citation points at a different target, at most 4 records and 4 pages each) and
+prefer what the recorded output says. A count is trusted only from a record
+read to its last page; a text-only parent cannot read images. Accuracy is the
+verdict of the final answer against the oracle; cost is bytes entering the
+parent context (task output plus every `task_evidence` call and result),
+estimated as bytes/4 plus the patch-formula image tokens. The policy stands in
+for a careful parent model, so the eval measures what each arm makes available
+and what it costs, not a particular model's behaviour. Each case and arm emits
+one `EVIDENCE_EVAL` record and the run one `EVIDENCE_EVAL_SUMMARY`
+(`scripts/harness_eval_metrics.py`, `--expect 22`).
+
+Results (default seed, 2026-11-06):
+
+| case | child behaviour | off | on | off tokens | on tokens | derefs |
+|---|---|---|---|---|---|---|
+| stale_config_value | wrong value, cites the right record | wrong | right | 66 | 300 | 1 |
+| incomplete_call_count | undercounts grep hits | wrong | right | 73 | 1,245 | 1 |
+| correct_value_cited | right, cited | right | right | 65 | 289 | 1 |
+| long_log_correct_count | right, 2-page evidence | right | right | 70 | 6,185 | 2 |
+| distractor_citation | cites the wrong file's record | wrong | right | 66 | 291 | 1 (probe) |
+| unknown_citation_repaired | cites E4 of 1, repair cites E1 | right | right | 61 | 278 | 1 |
+| withheld_after_failed_repair | unknown citation twice, report withheld | wrong | right | 56 | 374 | 1 |
+| image_dims_vision_parent | wrong image size, vision parent | wrong | right | 68 | 1,606 (1,323 image) | 1 |
+| image_dims_text_only_parent | wrong image size, text-only parent | wrong | wrong | 66 | 294 | 1 |
+| uncited_correct_claim | right, no citation | right | right | 61 | 116 | 0 |
+| uncited_wrong_claim | wrong, no citation | wrong | wrong | 58 | 113 | 0 |
+| **total** | | **4/11** | **9/11** | **710** | **11,091** | 10 |
+
+Evidence handles raised parent accuracy from 4/11 to 9/11 at about 15x the
+parent-context tokens, almost all of it spent where the parent chose to verify
+(the one 2-page log is 56% of the total). An uncited report costs only the
+Evidence header (about 55 tokens). Handles cannot fix an uncited wrong claim or
+let a text-only parent check an image. Child cost rises only by the repair turn
+of an unknown citation (2 to 3 requests in two cases).
+
+**Inline image lane: no-go as a default.** Only one of the 11 cases (a vision
+parent checking an image) could benefit, and dereferencing already gets it
+right for one `task_evidence` round trip (about 160 text tokens on top of the
+image). Inlining would save that round trip but bill the ~1.3k image tokens on
+every later parent turn even when the claim needed no checking, and it does
+nothing for a text-only parent. The lane (mini-agent-6m0om) therefore ships
+opt-in with a default of zero.
+
 ### Designer → implementer → reviewer pipeline
 
 Three models, three profiles: the main loop designs on a strong model,

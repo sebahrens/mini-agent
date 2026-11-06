@@ -18,6 +18,9 @@ use crate::sandbox::Sandbox;
 use crate::session::{MessageRole, Session};
 use crate::tests::fake_model::{MockCompletionModel, MockStreamEvent};
 
+#[cfg(feature = "multimodal")]
+mod evidence_axis;
+
 const FIXTURES: &[&str] = &[
     include_str!("../../tests/harness_eval/fixtures/crlf_edit/fixture.json"),
     include_str!("../../tests/harness_eval/fixtures/js_aggregation/fixture.json"),
@@ -1629,6 +1632,99 @@ async fn harness_regression_eval() {
             metrics.name
         );
     }
+}
+
+/// Evidence-handle axis (mini-agent-g442v): every case of
+/// `tests/harness_eval/evidence/fixture.json` runs through the real task
+/// executor with `task_evidence` on and off, and a fixed parent policy turns
+/// each report into a task-level verdict. One `EVIDENCE_EVAL` record per case
+/// and arm. The name keeps it inside the `harness_regression_eval` filter
+/// that ci.yml and the weekly workflow already run.
+#[cfg(feature = "multimodal")]
+#[tokio::test]
+#[ignore = "deterministic evidence-handle harness eval; run by scheduled CI"]
+async fn harness_regression_eval_evidence_axis() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let seed = evidence_axis::seed();
+    let mut totals = BTreeMap::<&str, (usize, usize, u64)>::new();
+    for case in evidence_axis::cases() {
+        let mut requests = BTreeMap::new();
+        for (arm, enabled) in [("off", false), ("on", true)] {
+            let result = evidence_axis::run_case(&case, seed, enabled).await;
+            let correct = result.parent.answer.as_deref() == Some(result.oracle.as_str());
+            if enabled {
+                if result.child_tool_calls > 0 {
+                    assert!(
+                        result.output.contains("\n## Evidence\n"),
+                        "{}: evidence on must add the host section: {}",
+                        case.name,
+                        result.output
+                    );
+                }
+            } else {
+                assert!(
+                    !result.output.contains("## Evidence") && result.parent.evidence_calls == 0,
+                    "{}: evidence off must not offer handles: {}",
+                    case.name,
+                    result.output
+                );
+            }
+            assert!(
+                result.child_requests > 0,
+                "{} drove no child turn",
+                case.name
+            );
+            requests.insert(arm, result.child_requests);
+            let entry = totals.entry(arm).or_default();
+            entry.0 += 1;
+            entry.1 += usize::from(correct);
+            entry.2 += result.parent.est_tokens();
+            println!(
+                "EVIDENCE_EVAL {}",
+                serde_json::json!({
+                    "case": case.name,
+                    "arm": arm,
+                    "evidence": enabled,
+                    "success": true,
+                    "correct": correct,
+                    "oracle": result.oracle,
+                    "answer": result.parent.answer,
+                    "verified_from_evidence": result.parent.verified_from_evidence,
+                    "parent_bytes": result.parent.context_bytes,
+                    "parent_image_tokens": result.parent.image_tokens,
+                    "parent_est_tokens": result.parent.est_tokens(),
+                    "evidence_calls": result.parent.evidence_calls,
+                    "child_requests": result.child_requests,
+                    "child_tool_calls": result.child_tool_calls,
+                    "seed": seed,
+                })
+            );
+        }
+        // Evidence on can only add host work (a citation repair), never skip it.
+        assert!(
+            requests["on"] >= requests["off"],
+            "{}: {requests:?}",
+            case.name
+        );
+    }
+    let (cases, on_correct, on_tokens) = totals["on"];
+    let (_, off_correct, off_tokens) = totals["off"];
+    println!(
+        "EVIDENCE_EVAL_SUMMARY {}",
+        serde_json::json!({
+            "cases": cases,
+            "on_correct": on_correct,
+            "off_correct": off_correct,
+            "on_est_tokens": on_tokens,
+            "off_est_tokens": off_tokens,
+            "seed": seed,
+        })
+    );
+    assert!(
+        on_correct >= off_correct,
+        "evidence handles must not lower parent accuracy: on {on_correct}/{cases}, off {off_correct}/{cases}"
+    );
 }
 
 #[tokio::test]
