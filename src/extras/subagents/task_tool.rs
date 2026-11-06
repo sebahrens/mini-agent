@@ -1265,7 +1265,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 },
                 "resume": {
                     "type": "string",
-                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids are in memory only and expire after the 16 most recent children or a restart."
+                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids are in memory only and expire after the most recent children (default 16, [subagents] task_resume_max_children) or a restart."
                 },
                 "run_in_background": {
                     "type": "boolean",
@@ -1347,7 +1347,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 }
                 let stored = resume_store.get(id).ok_or_else(|| {
                     ToolError::Msg(format!(
-                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the {} most recent children of this session and do not survive a restart; start a new task instead",
+                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the most recent children of this session ([subagents] task_resume_max_children, default {}), only when under [subagents] task_resume_max_bytes (default 8 MiB), and do not survive a restart; start a new task instead",
                         super::resume::MAX_RESUMABLE_CHILDREN
                     ))
                 })?;
@@ -1897,6 +1897,9 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let evidence_base_dir = authorization
                     .workspace()
                     .map(|workspace| workspace.root().to_path_buf());
+                #[cfg(not(feature = "mcp"))]
+                let evidence_mcp: Vec<(String, String)> = Vec::new();
+                #[cfg(feature = "mcp")]
                 let evidence_mcp: Vec<(String, String)> = persona
                     .mcp_servers
                     .iter()
@@ -2167,10 +2170,18 @@ editing in a known location, grepping for a literal you will act on immediately.
                     ),
                     _ => None,
                 };
-                let resume_id = output
-                    .is_ok()
-                    .then(|| resume_store.insert(resume_agent_type, conversation))
-                    .flatten();
+                let resume_limits = super::resume::ResumeLimits::from_config(&config);
+                let (resume_id, resume_note) = if output.is_ok() {
+                    let outcome =
+                        resume_store.insert_with(resume_limits, resume_agent_type, conversation);
+                    let note = super::resume::insert_note(&outcome, resume_limits);
+                    match outcome {
+                        super::resume::Insert::Stored { id, .. } => (Some(id), note),
+                        _ => (None, note),
+                    }
+                } else {
+                    (None, None)
+                };
                 // Host-authored: images the child's history ceiling dropped.
                 let host_suffix = match (omitted_images, host_suffix) {
                     (0, suffix) => suffix,
@@ -2188,6 +2199,14 @@ editing in a known location, grepping for a literal you will act on immediately.
                         Some(format!("{}{evidence}", super::resume::resume_line(&id)))
                     }
                     (Some(id), None) => Some(super::resume::resume_line(&id)),
+                    (None, suffix) => suffix,
+                };
+                // Say so when a child cannot be resumed or an older one was
+                // dropped, instead of leaving the parent to find an
+                // "unknown or expired" error later.
+                let host_suffix = match (resume_note, host_suffix) {
+                    (Some(note), Some(suffix)) => Some(format!("{note}{suffix}")),
+                    (Some(note), None) => Some(note),
                     (None, suffix) => suffix,
                 };
                 inline_sink.record(index, selection.images);

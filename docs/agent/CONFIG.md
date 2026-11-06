@@ -4297,6 +4297,12 @@ contract entirely and returns the child's text verbatim.
 the host-recorded child evidence store; see
 [Evidence handles](SUBAGENTS.md#evidence-handles) for ceilings and effects.
 
+`[subagents] task_resume_max_children` (default 16, at most 256) and
+`task_resume_max_bytes` (default 8388608, at most 256 MiB) bound the in-memory
+child conversations that `task {"resume": id}` can continue. A child over the
+byte limit is reported with a `child not resumable` host note instead of an id,
+and dropping the oldest child to stay within the count is reported too.
+
 ### Hook event parity
 
 `PreCompact` observes an actual compaction before summarization. Its envelope has

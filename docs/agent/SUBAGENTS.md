@@ -706,6 +706,14 @@ The limits are configurable in `[subagents]` (each clamped to 1..ceiling):
 | `evidence_max_child_bytes` | 16 MiB | 256 MiB | Content per child; later records keep metadata only, marked over ceiling (`MAX_CHILD_EVIDENCE_BYTES`) |
 | `evidence_max_children` | 64 | 1024 | Child stores per session; the oldest is evicted and its files deleted (`MAX_EVIDENCE_TASKS`) |
 
+Resumable child conversations (`task {"resume": id}`) have two more `[subagents]`
+limits: `task_resume_max_children` (default 16, ceiling 256) and
+`task_resume_max_bytes` (default 8 MiB serialized, ceiling 256 MiB). A child
+over the byte limit gets a `[host note: child not resumable: conversation
+exceeds 8 MiB ...]` line instead of a resume id, and a child dropped to make
+room is named in a host note, so a resume id is never silently missing or
+expired.
+
 Handles are in memory only: they do not survive a restart. `task_evidence`
 for a handle whose store was evicted, or whose task was saved before a
 restart, fails with an explicit `evidence task <id> expired: ...` message (the
