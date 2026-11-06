@@ -37,6 +37,13 @@ const PAGED_TEXT_LIMITS: crate::sandbox::CommandLimits = crate::sandbox::Command
 /// Bytes of diff/show text one call returns; `offset` pages through the rest.
 const TEXT_PAGE_BYTES: usize = 192 * 1024;
 
+/// Page size actually used: the diff/show page is delivered inline by the
+/// self-bounded tool-result path, so it must stay under the
+/// `[tool_limits] max_result_chars` backstop (with room for JSON escaping).
+fn text_page_bytes() -> usize {
+    TEXT_PAGE_BYTES.min((crate::agent::tools::limits::current().max_result_chars / 4) * 3)
+}
+
 #[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GitOperation {
@@ -1482,6 +1489,16 @@ fn render_paged_text_result(
     output: CommandOutput,
     offset: Option<u64>,
 ) -> Result<serde_json::Value, ToolError> {
+    render_paged_text_result_with(operation, coaching, output, offset, text_page_bytes())
+}
+
+fn render_paged_text_result_with(
+    operation: &str,
+    coaching: Option<String>,
+    output: CommandOutput,
+    offset: Option<u64>,
+    page_bytes: usize,
+) -> Result<serde_json::Value, ToolError> {
     let CommandOutput {
         exit_status,
         stdout,
@@ -1496,7 +1513,7 @@ fn render_paged_text_result(
             "{operation} offset {start} is beyond the {total}-byte output"
         )));
     }
-    let mut end = total.min(start + TEXT_PAGE_BYTES);
+    let mut end = total.min(start.saturating_add(page_bytes));
     if end < total {
         if let Some(newline) = stdout[start..end].iter().rposition(|byte| *byte == b'\n') {
             end = start + newline + 1;
@@ -2591,7 +2608,7 @@ mod tests {
             pages += 1;
             assert_eq!(page["truncated"], false);
             let chunk = page["text"].as_str().unwrap();
-            assert!(chunk.len() <= super::TEXT_PAGE_BYTES);
+            assert!(chunk.len() <= super::text_page_bytes());
             text.push_str(chunk);
             match page["next_offset"].as_u64() {
                 Some(next) => offset = Some(next),
@@ -2808,6 +2825,41 @@ mod tests {
         assert_eq!(identity.author_email, "mini-agent@example.invalid");
         assert_eq!(identity.committer_name, "Mini Agent Test");
         assert_eq!(identity.committer_email, "committer@example.invalid");
+    }
+
+    #[test]
+    fn a_large_diff_page_is_delivered_whole_with_a_working_next_offset() {
+        let stdout: Vec<u8> = (0..8_000)
+            .flat_map(|line| format!("+changed line {line:06} padding\n").into_bytes())
+            .collect();
+        let output = || crate::sandbox::CommandOutput {
+            exit_status: None,
+            stdout: stdout.clone(),
+            stderr: Vec::new(),
+            status: crate::sandbox::CommandStatus::Completed,
+            descendants_escaped: false,
+        };
+        let page =
+            super::render_paged_text_result_with("diff", None, output(), None, 150 * 1024).unwrap();
+        let text = page["text"].as_str().unwrap();
+        assert!(text.len() > 140 * 1024 && text.len() <= 150 * 1024);
+        let next = page["next_offset"].as_u64().unwrap();
+        assert_eq!(next as usize, text.len());
+        let rest =
+            super::render_paged_text_result_with("diff", None, output(), Some(next), 150 * 1024)
+                .unwrap();
+        assert!(rest["next_offset"].is_null());
+        assert_eq!(
+            text.len() + rest["text"].as_str().unwrap().len(),
+            stdout.len()
+        );
+    }
+
+    #[test]
+    fn page_size_stays_below_the_default_result_backstop() {
+        let bytes = super::text_page_bytes();
+        assert!(bytes <= crate::agent::tools::limits::DEFAULT_MAX_RESULT_CHARS * 3 / 4);
+        assert!(crate::session::tool_result_is_self_bounded("git"));
     }
 
     #[tokio::test]
