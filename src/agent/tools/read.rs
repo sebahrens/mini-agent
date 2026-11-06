@@ -220,7 +220,7 @@ impl Tool for ReadTool {
             ),
         };
         format!(
-            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB or 8000 px per side are downscaled to at most 2000 px and re-encoded; the summary names the new size); line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per output cell and the whole view at most 64 KiB, so choose offset/limit to reach later cells; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); scanned PDFs without a text layer are reported as such.",
+            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB or 8000 px per side are downscaled to at most 2000 px and re-encoded; the summary names the new size); line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per output cell and the whole view at most 64 KiB, so choose offset/limit to reach later cells; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); pages without a text layer that paint images (scans) come back as image blocks, at most 4 per call and only when the captured model accepts images (the result maps image N to its page and names the pages to continue with); otherwise they are reported as scanned.",
             super::limits::current().max_result_chars,
             super::limits::current().max_read_line_chars
         )
@@ -292,6 +292,36 @@ impl Tool for ReadTool {
             result
         };
         Ok(result)
+    }
+}
+
+/// Inspect an image and downscale it when it exceeds the size limits.
+#[cfg(feature = "multimodal")]
+async fn fit_for_model(
+    bytes: Vec<u8>,
+) -> Result<(Vec<u8>, super::read_image::ImageMetadata, Option<String>), ToolError> {
+    match super::read_image::inspect(&bytes) {
+        Ok(Some(info)) => Ok((bytes, info, None)),
+        Ok(None) => Err(ToolError::Msg(
+            "Image signature changed during the read".into(),
+        )),
+        Err(_) => {
+            let fitted = crate::agent::runner::spawn_blocking_scoped(move || {
+                super::image_fit::fit(
+                    &bytes,
+                    super::read_image::MAX_IMAGE_BYTES,
+                    super::read_image::MAX_IMAGE_SIDE,
+                )
+            })
+            .await
+            .map_err(|_| ToolError::Msg("Image resize job failed".into()))?
+            .map_err(ToolError::Msg)?;
+            let note = fitted.note();
+            let info = super::read_image::inspect(&fitted.data)
+                .map_err(|message| ToolError::Msg(message.into()))?
+                .ok_or_else(|| ToolError::Msg("Resized image is invalid".into()))?;
+            Ok((fitted.data, info, Some(note)))
+        }
     }
 }
 
@@ -512,31 +542,7 @@ impl ReadTool {
             if bytes.len() > cap {
                 return Err(ToolError::Msg("Image grew beyond the input limit".into()));
             }
-            let (bytes, info, note) = match super::read_image::inspect(&bytes) {
-                Ok(Some(info)) => (bytes, info, None),
-                Ok(None) => {
-                    return Err(ToolError::Msg(
-                        "Image signature changed during the read".into(),
-                    ));
-                }
-                Err(_) => {
-                    let fitted = crate::agent::runner::spawn_blocking_scoped(move || {
-                        super::image_fit::fit(
-                            &bytes,
-                            super::read_image::MAX_IMAGE_BYTES,
-                            super::read_image::MAX_IMAGE_SIDE,
-                        )
-                    })
-                    .await
-                    .map_err(|_| ToolError::Msg("Image resize job failed".into()))?
-                    .map_err(ToolError::Msg)?;
-                    let note = fitted.note();
-                    let info = super::read_image::inspect(&fitted.data)
-                        .map_err(|message| ToolError::Msg(message.into()))?
-                        .ok_or_else(|| ToolError::Msg("Resized image is invalid".into()))?;
-                    (fitted.data, info, Some(note))
-                }
-            };
+            let (bytes, info, note) = fit_for_model(bytes).await?;
             self.read_tracker.untrack_read_path(&permission_path);
             let summary = format!(
                 "Image: {path} ({}; {} x {}; {} bytes{})",
@@ -549,6 +555,7 @@ impl ReadTool {
             *image = Some(super::read_image::ImageRead {
                 mime: info.format.mime(),
                 data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                more: Vec::new(),
             });
             return Ok(match coaching {
                 Some(coaching) => format!("{coaching}\n\n{summary}"),
@@ -585,12 +592,54 @@ impl ReadTool {
                 .saturating_sub(READ_RESULT_RESERVE_CHARS);
             let render_path = path.clone();
             let pages = args.pages.clone();
-            let text = crate::agent::runner::spawn_blocking_scoped(move || {
-                super::pdf_text::render(&bytes, &render_path, pages.as_deref(), budget)
+            // Scanned pages (images, no text layer) are handed over as page
+            // images when the captured model can take images.
+            #[cfg(feature = "multimodal")]
+            let max_images = if self
+                .read_tracker
+                .image_support
+                .check(super::read_image::ImageFormat::Png)
+                .is_ok()
+            {
+                super::pdf_text::MAX_PDF_IMAGES_PER_READ
+            } else {
+                0
+            };
+            #[cfg(not(feature = "multimodal"))]
+            let max_images = 0;
+            let rendered = crate::agent::runner::spawn_blocking_scoped(move || {
+                super::pdf_text::render_with_images(
+                    &bytes,
+                    &render_path,
+                    pages.as_deref(),
+                    budget,
+                    max_images,
+                )
             })
             .await
             .map_err(|_| ToolError::Msg("PDF text extraction job failed".into()))?
             .map_err(ToolError::Msg)?;
+            #[cfg(feature = "multimodal")]
+            {
+                use base64::Engine;
+                let mut encoded = Vec::new();
+                for page_image in rendered.images {
+                    let (data, info, _) = fit_for_model(page_image.data).await?;
+                    encoded.push((
+                        info.format.mime(),
+                        base64::engine::general_purpose::STANDARD.encode(&data),
+                    ));
+                }
+                if !encoded.is_empty() {
+                    let (mime, data) = encoded.remove(0);
+                    *image = Some(super::read_image::ImageRead {
+                        mime,
+                        data,
+                        more: encoded,
+                    });
+                }
+            }
+            let text = rendered.text;
             // Extracted text never authorizes an overwrite of the PDF.
             self.read_tracker.untrack_read_path(&permission_path);
             return Ok(match coaching {
@@ -1911,11 +1960,14 @@ mod tests {
         assert!(read(Some("1-21")).await.is_err());
 
         let scanned = dir.path().join("scan.pdf");
+        let image_object = crate::agent::tools::pdf_text::test_pdf::first_extra_object(1);
         std::fs::write(
             &scanned,
-            build(
+            crate::agent::tools::pdf_text::test_pdf::build_with(
                 &[Content::Plain("q 612 0 0 792 0 0 cm /Im0 Do Q".into())],
                 false,
+                &format!("/XObject << /Im0 {image_object} 0 R >>"),
+                vec![b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x00\nendstream".to_vec()],
             ),
         )
         .unwrap();
@@ -1924,9 +1976,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            output.contains("no text layer found on page(s) 1"),
+            output.contains("no text could be extracted from page(s) 1"),
             "{output}"
         );
+        assert!(output.contains("probably scanned images"), "{output}");
         assert!(output.contains("pdftoppm -png"), "{output}");
 
         let text = dir.path().join("notes.txt");

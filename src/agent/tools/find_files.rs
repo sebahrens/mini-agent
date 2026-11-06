@@ -666,10 +666,79 @@ pub(crate) struct BoundDirectory {
     approved_root: PathBuf,
     root: File,
     hidden: Option<PathFilter>,
+    ignore: Arc<IgnoreMode>,
 }
 
 #[derive(Clone, Default)]
-struct IgnoreChain(Option<Arc<IgnoreChainNode>>);
+struct IgnoreChain {
+    node: Option<Arc<IgnoreChainNode>>,
+    mode: Arc<IgnoreMode>,
+}
+
+/// Whether a walk honours `.gitignore`/`.ignore`/global excludes, and what it
+/// pruned because of them. Shared by every chain and walker of one bound
+/// directory so the tool can say that ignored entries were hidden.
+#[derive(Default)]
+pub(crate) struct IgnoreMode {
+    include_ignored: bool,
+    pruned: std::sync::atomic::AtomicUsize,
+    examples: Mutex<Vec<PathBuf>>,
+}
+
+impl IgnoreMode {
+    pub(crate) fn including() -> Arc<Self> {
+        Arc::new(Self {
+            include_ignored: true,
+            ..Self::default()
+        })
+    }
+
+    fn note(&self, path: &Path) {
+        self.pruned
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut examples) = self.examples.lock()
+            && examples.len() < 3
+        {
+            examples.push(path.to_path_buf());
+        }
+    }
+
+    /// One-line notice for results of a walk that skipped ignored entries;
+    /// empty when nothing was pruned or ignore rules were not applied.
+    pub(crate) fn notice(&self, root: &Path) -> String {
+        let count = self.pruned.load(std::sync::atomic::Ordering::Relaxed);
+        if count == 0 || self.include_ignored {
+            return String::new();
+        }
+        let mut names: Vec<String> = self
+            .examples
+            .lock()
+            .map(|examples| {
+                examples
+                    .iter()
+                    .map(|path| {
+                        path.strip_prefix(root)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if count > names.len() {
+            names.push(format!("+{} more", count - names.len()));
+        }
+        format!(
+            "\n[{count} gitignored {} not searched ({}); pass no_ignore=true to include ignored and generated files]",
+            if count == 1 {
+                "entry was"
+            } else {
+                "entries were"
+            },
+            names.join(", ")
+        )
+    }
+}
 
 struct IgnoreChainNode {
     parent: Option<Arc<IgnoreChainNode>>,
@@ -682,10 +751,13 @@ impl IgnoreChain {
         if matchers.is_empty() {
             return self;
         }
-        Self(Some(Arc::new(IgnoreChainNode {
-            parent: self.0,
-            matchers,
-        })))
+        Self {
+            node: Some(Arc::new(IgnoreChainNode {
+                parent: self.node,
+                matchers,
+            })),
+            mode: self.mode,
+        }
     }
 }
 
@@ -743,7 +815,22 @@ impl BoundDirectory {
             approved_root: approved_root.to_path_buf(),
             root,
             hidden: None,
+            ignore: Arc::default(),
         })
+    }
+
+    /// Search ignored and generated files too (`no_ignore`). Permission
+    /// hiding and the dependency/build directory rule still apply.
+    pub(crate) fn with_include_ignored(mut self, include: bool) -> Self {
+        if include {
+            self.ignore = IgnoreMode::including();
+        }
+        self
+    }
+
+    /// The shared record of entries this directory's walks pruned as ignored.
+    pub(crate) fn ignore_mode(&self) -> Arc<IgnoreMode> {
+        Arc::clone(&self.ignore)
     }
 
     /// Hide every entry for which `filter` returns true from `walker` and
@@ -764,11 +851,15 @@ impl BoundDirectory {
             self.root.try_clone()?,
             self.approved_root.clone(),
             self.hidden.clone(),
+            Arc::clone(&self.ignore),
         )
     }
 
     pub(super) fn list_entries(&self) -> std::io::Result<Vec<BoundListEntry>> {
-        let mut chain = IgnoreChain::default();
+        let mut chain = IgnoreChain {
+            node: None,
+            mode: Arc::clone(&self.ignore),
+        };
         chain = chain.append(global_ignore_matchers(&self.approved_root));
         chain = chain.append(parent_ignore_matchers(&self.approved_root));
         let mut local_matchers = Vec::new();
@@ -797,7 +888,7 @@ impl BoundDirectory {
             match kind {
                 EntryKind::Symlink => {
                     let path = self.approved_root.join(&name);
-                    if !is_ignored(&chain, &path, false) && !self.is_hidden(&path, false) {
+                    if !prune_ignored(&chain, &path, false) && !self.is_hidden(&path, false) {
                         entries.push(BoundListEntry {
                             link_target: bound_platform::read_link(
                                 &self.root,
@@ -823,7 +914,7 @@ impl BoundDirectory {
                     if is_directory && skip_directory(&self.root, &name) {
                         continue;
                     }
-                    if is_ignored(&chain, &path, is_directory)
+                    if prune_ignored(&chain, &path, is_directory)
                         || self.is_hidden(&path, is_directory)
                     {
                         continue;
@@ -878,7 +969,7 @@ impl BoundDirectory {
                 Ok(child) => child,
                 Err(_) if bound_platform::is_link(&self.root, &name) => {
                     let path = self.approved_root.join(&name);
-                    if !is_ignored(&chain, &path, false) && !self.is_hidden(&path, false) {
+                    if !prune_ignored(&chain, &path, false) && !self.is_hidden(&path, false) {
                         entries.push(BoundListEntry {
                             link_target: bound_platform::read_link(
                                 &self.root,
@@ -900,7 +991,7 @@ impl BoundDirectory {
             let metadata = match child.metadata() {
                 Ok(metadata) if bound_platform::is_link_metadata(&metadata) => {
                     let path = self.approved_root.join(&name);
-                    if !is_ignored(&chain, &path, false) && !self.is_hidden(&path, false) {
+                    if !prune_ignored(&chain, &path, false) && !self.is_hidden(&path, false) {
                         entries.push(BoundListEntry {
                             link_target: bound_platform::read_link(
                                 &self.root,
@@ -925,7 +1016,7 @@ impl BoundDirectory {
             if is_directory && skip_directory(&self.root, &name) {
                 continue;
             }
-            if is_ignored(&chain, &path, is_directory) || self.is_hidden(&path, is_directory) {
+            if prune_ignored(&chain, &path, is_directory) || self.is_hidden(&path, is_directory) {
                 continue;
             }
             let child_count = if is_directory {
@@ -953,6 +1044,7 @@ impl BoundDirectory {
         let child = bound_platform::open_child(&self.root, name)?;
         let mut bound = Self::from_file(&self.approved_root.join(name), child)?;
         bound.hidden = self.hidden.clone();
+        bound.ignore = Arc::clone(&self.ignore);
         Ok(bound)
     }
 
@@ -961,7 +1053,10 @@ impl BoundDirectory {
         &self,
         max_entries: usize,
     ) -> std::io::Result<(Vec<BoundDiscoveryEntry>, bool)> {
-        let mut chain = IgnoreChain::default();
+        let mut chain = IgnoreChain {
+            node: None,
+            mode: Arc::clone(&self.ignore),
+        };
         chain = chain.append(global_ignore_matchers(&self.approved_root));
         chain = chain.append(parent_ignore_matchers(&self.approved_root));
         let mut local_matchers = Vec::new();
@@ -991,7 +1086,7 @@ impl BoundDirectory {
                     let is_directory = kind == EntryKind::Directory;
                     let path = self.approved_root.join(&name);
                     if (is_directory && skip_directory(&self.root, &name))
-                        || is_ignored(&chain, &path, is_directory)
+                        || prune_ignored(&chain, &path, is_directory)
                         || self.is_hidden(&path, is_directory)
                     {
                         continue;
@@ -1018,7 +1113,7 @@ impl BoundDirectory {
                     let is_directory = metadata.is_dir();
                     if (!is_directory && !metadata.is_file())
                         || (is_directory && skip_directory(&self.root, &name))
-                        || is_ignored(&chain, &path, is_directory)
+                        || prune_ignored(&chain, &path, is_directory)
                         || self.is_hidden(&path, is_directory)
                     {
                         continue;
@@ -1183,8 +1278,12 @@ impl BoundWalker {
         root: File,
         approved_root: PathBuf,
         hidden: Option<PathFilter>,
+        ignore: Arc<IgnoreMode>,
     ) -> std::io::Result<Self> {
-        let mut matchers = IgnoreChain::default();
+        let mut matchers = IgnoreChain {
+            node: None,
+            mode: ignore,
+        };
         matchers = matchers.append(global_ignore_matchers(&approved_root));
         matchers = matchers.append(parent_ignore_matchers(&approved_root));
         if let Some(matcher) = root_exclude_matcher(&root, &approved_root) {
@@ -1306,15 +1405,16 @@ impl Iterator for BoundWalker {
             let mut file_filter = self.file_filter.as_mut();
             let skipped_directories = &mut self.skipped_directories;
             let mut dropped = |is_directory: bool| {
-                if is_directory
-                    && !is_ignored(&frame.matchers, approved_path, is_directory)
-                    && skip_directory(&frame.directory, &name)
-                {
+                let ignored = is_ignored(&frame.matchers, approved_path, is_directory);
+                if is_directory && !ignored && skip_directory(&frame.directory, &name) {
                     skipped_directories.record(relative_path);
                     return true;
                 }
-                is_ignored(&frame.matchers, approved_path, is_directory)
-                    || hidden.is_some_and(|hidden| hidden(approved_path, is_directory))
+                if ignored {
+                    frame.matchers.mode.note(approved_path);
+                    return true;
+                }
+                hidden.is_some_and(|hidden| hidden(approved_path, is_directory))
                     || (!is_directory
                         && file_filter
                             .as_mut()
@@ -1692,8 +1792,21 @@ fn ignore_matcher(mut file: File, root: &Path, source: PathBuf) -> Option<Gitign
     builder.build().ok()
 }
 
+/// [`is_ignored`] that also records the entry as pruned when it is ignored.
+/// Use it only where an ignored entry is certainly dropped.
+fn prune_ignored(matchers: &IgnoreChain, path: &Path, is_directory: bool) -> bool {
+    let ignored = is_ignored(matchers, path, is_directory);
+    if ignored {
+        matchers.mode.note(path);
+    }
+    ignored
+}
+
 fn is_ignored(matchers: &IgnoreChain, path: &Path, is_directory: bool) -> bool {
-    let mut node = matchers.0.as_deref();
+    if matchers.mode.include_ignored {
+        return false;
+    }
+    let mut node = matchers.node.as_deref();
     while let Some(current) = node {
         for matcher in current.matchers.iter().rev() {
             let matched = matcher.matched(path, is_directory);
@@ -1829,7 +1942,7 @@ impl Tool for FindFilesTool {
 
     fn description(&self) -> String {
         format!(
-            "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore. Sorts by name by default, or newest modification time with sort `mtime`; ties use path order, unavailable times sort last. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. A call visits at most {} directory entries and depth {}; a partial result names the first unsearched path.",
+            "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore by default (the result counts ignored entries it skipped; pass no_ignore=true to include them). Sorts by name by default, or newest modification time with sort `mtime`; ties use path order, unavailable times sort last. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. A call visits at most {} directory entries and depth {}; a partial result names the first unsearched path.",
             super::limits::current().search_max_entries,
             super::limits::current().search_max_depth
         )
@@ -1862,6 +1975,11 @@ impl Tool for FindFilesTool {
                     "type": "integer",
                     "minimum": 1,
                     "description": "Lower the configured result cap for this call"
+                },
+                "no_ignore": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also list files hidden by .gitignore/.ignore (generated output, .env.local, vendored copies). Default false; a result that skipped ignored entries says how many. Permission deny rules, VCS metadata and dependency/build directories still apply"
                 },
                 "mode": {
                     "type": "string",
@@ -1917,13 +2035,13 @@ impl Tool for FindFilesTool {
                         crate::agent::tools::bound_open_error(workspace, relative, error)
                     }
                 })?;
-            let bound = BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(
-                crate::agent::tools::walk_deny_filter(
+            let bound = BoundDirectory::from_file(&logical, directory)?
+                .with_hidden_filter(crate::agent::tools::walk_deny_filter(
                     &self.permission,
                     "find_files",
                     Some(workspace.root()),
-                ),
-            );
+                ))
+                .with_include_ignored(args.no_ignore);
             let coaching = check_perm_bound_path(
                 &self.permission,
                 &self.ask_tx,
@@ -1943,10 +2061,13 @@ impl Tool for FindFilesTool {
                     NOT_A_DIRECTORY_HINT,
                 ));
             }
-            let bound =
-                BoundDirectory::open(&traversal_root, &authorized_metadata)?.with_hidden_filter(
-                    crate::agent::tools::walk_deny_filter(&self.permission, "find_files", None),
-                );
+            let bound = BoundDirectory::open(&traversal_root, &authorized_metadata)?
+                .with_hidden_filter(crate::agent::tools::walk_deny_filter(
+                    &self.permission,
+                    "find_files",
+                    None,
+                ))
+                .with_include_ignored(args.no_ignore);
             let coaching = check_perm_path(
                 &self.permission,
                 &self.ask_tx,
@@ -1972,6 +2093,8 @@ impl Tool for FindFilesTool {
             crate::agent::runner::spawn_blocking_scoped(move || -> Result<_, ToolError> {
                 // The pattern is evaluated on the name before a file is
                 // opened, so only matching files cost an open and fstat.
+                let ignore_mode = bound_directory.ignore_mode();
+                let notice_root = bound_directory.approved_root().to_path_buf();
                 let mut walker = bound_directory
                     .walker()?
                     .with_search_limits(limits.search_max_entries, limits.search_max_depth)
@@ -2010,7 +2133,11 @@ impl Tool for FindFilesTool {
                     first_results,
                     total_matches,
                     walker.work_limit_hit(),
-                    walker.skipped_directories().notice(),
+                    format!(
+                        "{}{}",
+                        walker.skipped_directories().notice(),
+                        ignore_mode.notice(&notice_root)
+                    ),
                     walker.stop_path().map(Path::to_path_buf),
                 ))
             })
@@ -2181,6 +2308,7 @@ mod tests {
         );
 
         let call = tool.call(FindFilesArgs {
+            no_ignore: false,
             offset: None,
             limit: None,
             sort: crate::agent::tools::FindFilesSort::Name,
@@ -2222,6 +2350,7 @@ mod tests {
         let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
             .with_workspace(workspace.path())
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2239,6 +2368,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2265,6 +2395,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2296,6 +2427,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2321,6 +2453,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(workspace.path()),
             FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2351,6 +2484,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2385,6 +2519,7 @@ mod tests {
         let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
+            no_ignore: false,
             offset: None,
             limit: None,
             sort: crate::agent::tools::FindFilesSort::Name,
@@ -2427,6 +2562,7 @@ mod tests {
         let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
+            no_ignore: false,
             offset: None,
             limit: None,
             sort: crate::agent::tools::FindFilesSort::Name,
@@ -2495,6 +2631,7 @@ mod tests {
 
         let output = FindFilesTool::new(Some(standard_permission(&workspace)), None, 10)
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2521,6 +2658,7 @@ mod tests {
         let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
             .with_workspace(workspace.path())
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2537,6 +2675,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2557,6 +2696,7 @@ mod tests {
 
         let result = tool
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2588,6 +2728,7 @@ mod tests {
 
         let result = tool
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2612,6 +2753,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 100)
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2698,6 +2840,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 100)
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2722,6 +2865,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 10)
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -2832,6 +2976,7 @@ mod tests {
         ] {
             let output = FindFilesTool::new(None, None, 10)
                 .call(FindFilesArgs {
+                    no_ignore: false,
                     offset: None,
                     limit: None,
                     sort: crate::agent::tools::FindFilesSort::Name,
@@ -2850,6 +2995,7 @@ mod tests {
         ] {
             let error = FindFilesTool::new(None, None, 10)
                 .call(FindFilesArgs {
+                    no_ignore: false,
                     offset: None,
                     limit: None,
                     sort: crate::agent::tools::FindFilesSort::Name,
@@ -2872,6 +3018,7 @@ mod tests {
 
         let output = FindFilesTool::new(None, None, 2)
             .call(FindFilesArgs {
+                no_ignore: false,
                 offset: None,
                 limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
@@ -3285,6 +3432,7 @@ mod tests {
         ] {
             let listing = tool
                 .call(FindFilesArgs {
+                    no_ignore: false,
                     offset: None,
                     limit: None,
                     sort: crate::agent::tools::FindFilesSort::Name,
@@ -3317,6 +3465,7 @@ mod tests {
         ] {
             let error = tool
                 .call(FindFilesArgs {
+                    no_ignore: false,
                     offset: None,
                     limit: None,
                     pattern: "*".to_string(),

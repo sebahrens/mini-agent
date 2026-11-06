@@ -107,6 +107,7 @@ pub(crate) enum DiffFormat {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GitArgs {
     pub operation: GitOperation,
     #[serde(default)]

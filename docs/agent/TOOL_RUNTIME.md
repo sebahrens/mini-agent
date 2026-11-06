@@ -916,6 +916,28 @@ an owned Unix child held before exec. Explicit unlock ends the lock's ownership
 before receipt acknowledgement; inherited descriptors cannot extend it after
 the ledger operation completes. Corrupt-tail failures retain bytes and charges.
 
+### Unknown tool arguments
+
+Every model-facing tool argument struct (`shell`, `job_status`, `read`, `write`, `edit` and its
+nested edit ops, `grep`, `find_files`, `list_dir`, `lsp_*`, `git`, `todo`, `js`, `advisor`,
+`skills_search` and the memory tools) is `deny_unknown_fields`. A call that carries a
+wrong-harness name such as `workdir`, `run_in_background`, `glob` or `head_limit` fails with
+`unknown field \`workdir\`, expected one of ...` listing the valid parameter names, so the model
+corrects the call instead of running it in the wrong directory, in the foreground, or unfiltered.
+
+### Ignored files in `grep`, `find_files` and `list_dir`
+
+These walkers honour `.gitignore`, `.ignore`, `.git/info/exclude` and the global excludes file.
+Entries they prune for that reason are counted and named in the result, including an empty
+result: `[2 gitignored entries were not searched (.env.local, dist); pass no_ignore=true to
+include ignored and generated files]` (the count is of pruned entries at the point they were
+dropped, so an ignored directory counts once). `no_ignore: true` (default `false`, per call) lifts
+only the ignore-file rules. VCS metadata, the dependency/build directory rule (`node_modules`,
+`target` beside a manifest, `[tool_limits] skip_dirs`) and permission deny rules still hide
+entries, so the option cannot reach anything a deny rule protects. It is a per-call argument with
+no config key, so project configuration cannot enable it. The brokered JS file discovery helpers
+are unchanged and still always honour ignore files.
+
 ### PDF text from `read`
 
 `read` recognises a `%PDF-` header and returns the document's extracted text
@@ -923,7 +945,8 @@ layer instead of the UTF-8 error. `src/agent/tools/pdf_text.rs` is a bounded,
 in-process extractor, not a renderer: it locates indirect objects by scanning
 (damaged cross-reference tables are tolerated), expands compressed object
 streams, walks the page tree, inflates `FlateDecode`/`ASCIIHexDecode` content
-streams and collects the strings shown by text operators, placing line breaks
+streams (also `ASCII85Decode`, `LZWDecode` with `/EarlyChange`, `RunLengthDecode`, and the PNG and TIFF
+predictors of `/DecodeParms`, alone or chained) and collects the strings shown by text operators, placing line breaks
 and word spaces from the text and graphics matrices. Fonts with a `ToUnicode`
 CMap decode through it; simple fonts use WinAnsi or MacRoman. Form XObjects and
 annotations are not searched. Nothing executes, renders or touches the network.
@@ -936,10 +959,36 @@ without `pages` returns guidance naming the page count and the next ranges. Line
 refused for other files. Output shares the `[tool_limits] max_result_chars`
 budget: selection stops before the first page that would exceed it with
 `continue with pages:"N-M"`, and an oversized single page is clipped. Pages
-without text show `[no text layer on this page]`; when no selected page has a
-text layer the result says the PDF is probably scanned and suggests exporting
-the pages as PNG (for example with `pdftoppm`) and reading the images. Encrypted
-PDFs are refused. Limits: 64 MiB per file, 32 MiB decoded per stream, 256 MiB
+without text show `[no text layer on this page]`. A content stream that cannot be decoded is never
+dropped silently: the page shows `[page N: content stream uses JBIG2Decode, not supported]` (or
+`exceeds the decode budget`, or `could not be decoded (...)`), and a page that still has text
+adds `[page N: some content was not extracted: ...]`. When no selected page has text the result
+explains why per page: skipped streams are named; only pages that paint images (image XObjects
+or inline images) and run no text operator are called probably scanned, with the `pdftoppm`
+export hint; pages with neither text nor images are called blank or vector-only; pages whose
+text operators decode to nothing say their characters could not be mapped. `web_fetch` PDFs use
+the same classification.
+
+**Scanned pages as images.** When the captured model accepts images (`ImageReadSupport`, the same
+gate as image reads) and a selected page has no text layer, no skipped streams and paints image
+XObjects, `read` lifts the page image (`src/agent/tools/pdf_images.rs`) and returns it as an image
+block beside the text: JPEG (`DCTDecode`) data passes through unchanged, and Flate, LZW, ASCII85 or
+RunLength image data in gray, RGB, CMYK or indexed colour with 1, 2, 4 or 8 bits per component is
+repacked as PNG; all images then go through the ordinary 5 MiB / 8000 px fit. At most 4 images are
+attached per call (largest image on each page first); the text names which image block belongs to
+which page, and `continue with pages:"N-M"` for scanned pages left over. Fax (`CCITTFaxDecode`),
+`JBIG2Decode`, `JPXDecode`, images over 40 million pixels and stencil masks are named in the result
+instead of attached, and the `pdftoppm` hint remains for them. Without image input (no captured
+transport, or a text-only model) the answer is the text-only scanned message and nothing is
+attached. A provider-native PDF document block is not used: tool results carry only text and
+image content, so page images are the transport for vision models. PDFs
+protected by the standard security handler open when the user password is empty, which is how
+owner-password-only (permission-restricted) files behave in any viewer: RC4-40/128 (revisions 2-3),
+RC4 or AESV2 (revision 4) and AES-256 (revisions 5 and 6) streams are decrypted in memory
+(`src/agent/tools/pdf_crypt.rs`; strings are not, since text lives in streams). A file that needs
+a real user password fails with `password required` (mini-agent never asks for or guesses one),
+and other handlers or revisions fail naming the unsupported scheme. Nothing is written back to
+the PDF. Limits: 64 MiB per file, 32 MiB decoded per stream, 256 MiB
 decoded per call, nesting depth 64, 1,000,000 parsed nodes per object and
 4,000,000 per document (work on discarded candidates counts), 1024 fonts and
 262,144 ToUnicode entries per page (streams shared by several fonts decode

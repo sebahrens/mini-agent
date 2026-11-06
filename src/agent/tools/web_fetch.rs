@@ -293,16 +293,31 @@ async fn extract_pdf_text(bytes: Vec<u8>) -> Result<String, ToolError> {
         let count = document.page_count();
         let mut out = format!("PDF ({count} pages; extracted text layer)\n\n");
         let mut without_text = 0usize;
+        let mut scanned = 0usize;
+        let mut undecoded = 0usize;
         let mut shown = 0usize;
         for page in 1..=count.min(PDF_MAX_PAGES) {
-            let text = document.page_text(page - 1).map_err(|error| {
+            let content = document.page_content(page - 1).map_err(|error| {
                 ToolError::Msg(format!("web_fetch could not read the PDF text: {error}."))
             })?;
+            let text = &content.text;
+            let notes = content.notes.join("; ");
             if text.is_empty() {
                 without_text += 1;
+                if !notes.is_empty() {
+                    undecoded += 1;
+                } else if !content.text_operators && content.images > 0 {
+                    scanned += 1;
+                }
             }
-            let block = if text.is_empty() {
+            let block = if text.is_empty() && !notes.is_empty() {
+                format!("--- page {page} ---\n[page {page}: {notes}]\n\n")
+            } else if text.is_empty() {
                 format!("--- page {page} ---\n[no text layer on this page]\n\n")
+            } else if !notes.is_empty() {
+                format!(
+                    "--- page {page} ---\n{text}\n[page {page}: some content was not extracted: {notes}]\n\n"
+                )
             } else {
                 format!("--- page {page} ---\n{text}\n\n")
             };
@@ -321,7 +336,13 @@ async fn extract_pdf_text(bytes: Vec<u8>) -> Result<String, ToolError> {
             ));
         }
         if shown > 0 && without_text == shown {
-            out.push_str("[no text layer found; the pages are probably scanned images]\n");
+            if undecoded > 0 {
+                out.push_str("[no text extracted; some content streams use unsupported filters (see the page notes)]\n");
+            } else if scanned > 0 {
+                out.push_str("[no text layer found; the pages paint images and are probably scanned]\n");
+            } else {
+                out.push_str("[no text found; the pages contain no text operators]\n");
+            }
         }
         Ok(out)
     })

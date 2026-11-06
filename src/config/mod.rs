@@ -892,6 +892,9 @@ pub struct Config {
     /// (mini-agent-59sgr).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_files_max_bytes: Option<u64>,
+    /// Tool calls of one model turn that run at once (default 4, clamped to 1..=16).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_concurrency: Option<usize>,
     /// Output and traversal bounds for built-in tools (`[tool_limits]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_limits: Option<types::ToolLimitsConfig>,

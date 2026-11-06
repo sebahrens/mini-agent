@@ -232,6 +232,7 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
     let grep = GrepTool::new(None, None, 100)
         .with_workspace(fixture.workspace.clone())
         .call(GrepArgs {
+            no_ignore: false,
             offset: None,
             max_results: None,
             multiline: false,
@@ -251,6 +252,7 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
     let found = FindFilesTool::new(None, None, 100)
         .with_workspace(fixture.workspace.clone())
         .call(FindFilesArgs {
+            no_ignore: false,
             offset: None,
             limit: None,
             sort: crate::agent::tools::FindFilesSort::Name,
@@ -266,6 +268,7 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
     let found_dollar = FindFilesTool::new(None, None, 100)
         .with_workspace(fixture.workspace.clone())
         .call(FindFilesArgs {
+            no_ignore: false,
             offset: None,
             limit: None,
             sort: crate::agent::tools::FindFilesSort::Name,

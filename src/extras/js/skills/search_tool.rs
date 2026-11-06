@@ -11,6 +11,7 @@ use crate::agent::tools::ToolError;
 const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsSearchArgs {
     pub query: String,
 }

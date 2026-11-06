@@ -641,6 +641,7 @@ fn search_target(
     match target {
         SearchTarget::Directory(bound_directory) => {
             let include_root = bound_directory.approved_root().to_path_buf();
+            let ignore_mode = bound_directory.ignore_mode();
             let mut walker = bound_directory
                 .walker()?
                 .with_search_limits(limits.search_max_entries, limits.search_max_depth)
@@ -666,7 +667,11 @@ fn search_target(
             }
             Ok(search.finish(
                 walker.work_limit_hit(),
-                walker.skipped_directories().notice(),
+                format!(
+                    "{}{}",
+                    walker.skipped_directories().notice(),
+                    ignore_mode.notice(&include_root)
+                ),
                 walker.stop_path().map(Path::to_path_buf),
             ))
         }
@@ -751,7 +756,7 @@ impl Tool for GrepTool {
 
     fn description(&self) -> String {
         format!(
-            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. A call visits at most {} directory entries, depth {} and {} MiB of file bytes; a partial result names the first unsearched path. Respects .gitignore. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. `path` may name a single file to search only that file.",
+            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. A call visits at most {} directory entries, depth {} and {} MiB of file bytes; a partial result names the first unsearched path. Respects .gitignore by default (the result counts ignored entries it skipped; pass no_ignore=true to search them too). Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. `path` may name a single file to search only that file.",
             self.max_results,
             MAX_OUTPUT_LINE_CHARS,
             super::limits::current().search_max_entries,
@@ -802,6 +807,11 @@ impl Tool for GrepTool {
                 "count": {
                     "type": "boolean",
                     "description": "Return each matching path and its match count (default false)"
+                },
+                "no_ignore": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also search files hidden by .gitignore/.ignore (generated output, .env.local, vendored copies). Default false; a result that skipped ignored entries says how many. Permission deny rules, VCS metadata and dependency/build directories still apply"
                 },
                 "offset": {
                     "type": "integer",
@@ -867,7 +877,9 @@ impl Tool for GrepTool {
             );
             let target = match workspace.open_relative_directory_file(relative) {
                 Ok(directory) => SearchTarget::Directory(
-                    BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(hidden),
+                    BoundDirectory::from_file(&logical, directory)?
+                        .with_hidden_filter(hidden)
+                        .with_include_ignored(args.no_ignore),
                 ),
                 // A regular file named as `path` is searched on its own
                 // rather than failing with a raw "Not a directory".
@@ -911,7 +923,8 @@ impl Tool for GrepTool {
             } else {
                 SearchTarget::Directory(
                     BoundDirectory::open(&traversal_root, &authorized_metadata)?
-                        .with_hidden_filter(hidden),
+                        .with_hidden_filter(hidden)
+                        .with_include_ignored(args.no_ignore),
                 )
             };
             let coaching = check_perm_path(
@@ -1148,6 +1161,7 @@ mod tests {
                     .run(async move {
                         GrepTool::new(None, None, 10)
                             .call(GrepArgs {
+                                no_ignore: false,
                                 offset: None,
                                 max_results: None,
                                 multiline: false,
@@ -1351,6 +1365,7 @@ mod tests {
         );
 
         let call = tool.call(GrepArgs {
+            no_ignore: false,
             offset: None,
             max_results: None,
             multiline: false,
@@ -1385,6 +1400,7 @@ mod tests {
 
     fn grep_args(pattern: &str, path: Option<&str>, include: Option<&str>) -> GrepArgs {
         GrepArgs {
+            no_ignore: false,
             offset: None,
             max_results: None,
             multiline: false,
@@ -1438,6 +1454,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1492,6 +1509,7 @@ mod tests {
 
         let result = GrepTool::new(Some(permission), None, 10)
             .call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1524,6 +1542,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1553,6 +1572,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(workspace.path()),
             GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1587,6 +1607,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1629,6 +1650,7 @@ mod tests {
         let tool = GrepTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(GrepArgs {
+            no_ignore: false,
             offset: None,
             max_results: None,
             multiline: false,
@@ -1675,6 +1697,7 @@ mod tests {
         let tool = GrepTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(GrepArgs {
+            no_ignore: false,
             offset: None,
             max_results: None,
             multiline: false,
@@ -1751,6 +1774,7 @@ mod tests {
 
         let output = GrepTool::new(Some(standard_permission(&workspace)), None, 10)
             .call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1799,6 +1823,7 @@ mod tests {
 
         let result = tool
             .call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1834,6 +1859,7 @@ mod tests {
 
         let result = tool
             .call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1862,6 +1888,7 @@ mod tests {
 
         let output = tool
             .call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1889,6 +1916,7 @@ mod tests {
 
         let output = tool
             .call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1916,6 +1944,7 @@ mod tests {
 
         let output = GrepTool::new(None, None, 10)
             .call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -1957,6 +1986,7 @@ mod tests {
 
         let output = GrepTool::new(None, None, 10)
             .call(GrepArgs {
+                no_ignore: false,
                 offset: None,
                 max_results: None,
                 multiline: false,
@@ -2020,6 +2050,7 @@ mod tests {
 
     fn ergonomic_args(path: &Path, include: Option<&str>) -> GrepArgs {
         GrepArgs {
+            no_ignore: false,
             offset: None,
             max_results: None,
             multiline: false,

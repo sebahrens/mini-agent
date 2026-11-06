@@ -2156,6 +2156,7 @@ fn js_error_code(code: JsErrorCode) -> &'static str {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsArgs {
     pub code: String,
 }

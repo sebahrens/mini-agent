@@ -11,6 +11,15 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
+use super::pdf_crypt;
+use super::pdf_filters;
+
+#[cfg(feature = "multimodal")]
+#[path = "pdf_images.rs"]
+mod pdf_images;
+#[cfg(feature = "multimodal")]
+pub(crate) use pdf_images::PdfImage;
+
 /// Largest PDF file the read tool loads.
 pub(crate) const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
 /// Pages one read call may return; larger documents require `pages`.
@@ -391,18 +400,227 @@ pub(crate) struct Document {
 /// Why a PDF could not be read as text.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PdfError {
+    /// Encryption settings that could not be read at all.
     Encrypted,
+    /// The standard security handler needs a non-empty user password.
+    PasswordRequired,
+    /// A security handler or revision this reader does not implement.
+    UnsupportedEncryption(String),
     Malformed(&'static str),
     TooLarge,
     TimedOut,
 }
 
+/// First string of a trailer `/ID` array.
+fn first_id(dict: &Dict) -> Vec<u8> {
+    match dict.get(b"ID") {
+        Some(Obj::Array(items)) => match items.first() {
+            Some(Obj::Str(bytes)) => bytes.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn follow<'a>(objects: &'a HashMap<u32, Obj>, mut object: &'a Obj) -> &'a Obj {
+    for _ in 0..8 {
+        match object {
+            Obj::Ref(number) => match objects.get(number) {
+                Some(next) => object = next,
+                None => return &Obj::Null,
+            },
+            _ => break,
+        }
+    }
+    object
+}
+
+/// Open the standard security handler with the empty user password and
+/// decrypt every stream in place. Strings are left alone: the text this
+/// extractor reads lives in streams.
+fn decrypt_streams(
+    objects: &mut HashMap<u32, Obj>,
+    generations: &HashMap<u32, u16>,
+    entry: &Obj,
+    id0: Vec<u8>,
+) -> Result<(), PdfError> {
+    let decryptor = {
+        let Some(dict) = follow(objects, entry).as_dict() else {
+            return Err(PdfError::Encrypted);
+        };
+        let get = |key: &[u8]| dict.get(key).map(|value| follow(objects, value));
+        let integer = |key: &[u8], default: i64| {
+            get(key)
+                .and_then(Obj::as_num)
+                .map_or(default, |value| value as i64)
+        };
+        let bytes = |key: &[u8]| match get(key) {
+            Some(Obj::Str(bytes)) => bytes.clone(),
+            _ => Vec::new(),
+        };
+        let version = integer(b"V", 0);
+        let stream_method = if version >= 4 {
+            let name = get(b"StmF")
+                .and_then(Obj::as_name)
+                .unwrap_or(b"Identity")
+                .to_vec();
+            if name == b"Identity" {
+                pdf_crypt::Method::Identity
+            } else {
+                let cfm = get(b"CF")
+                    .and_then(Obj::as_dict)
+                    .and_then(|filters| filters.get(&name))
+                    .map(|filter| follow(objects, filter))
+                    .and_then(Obj::as_dict)
+                    .and_then(|filter| filter.get(b"CFM"))
+                    .and_then(Obj::as_name);
+                match cfm {
+                    Some(b"V2") => pdf_crypt::Method::Rc4,
+                    Some(b"AESV2") => pdf_crypt::Method::AesV2,
+                    Some(b"AESV3") => pdf_crypt::Method::AesV3,
+                    Some(b"None") => pdf_crypt::Method::Identity,
+                    other => {
+                        return Err(PdfError::UnsupportedEncryption(format!(
+                            "crypt filter method {}",
+                            other.map_or_else(
+                                || "(missing)".to_owned(),
+                                |name| String::from_utf8_lossy(name).into_owned()
+                            )
+                        )));
+                    }
+                }
+            }
+        } else {
+            pdf_crypt::Method::Rc4
+        };
+        let params = pdf_crypt::EncryptParams {
+            filter: get(b"Filter")
+                .and_then(Obj::as_name)
+                .unwrap_or_default()
+                .to_vec(),
+            version,
+            revision: integer(b"R", 0),
+            length_bits: integer(b"Length", 40),
+            owner: bytes(b"O"),
+            user: bytes(b"U"),
+            user_key: bytes(b"UE"),
+            permissions: integer(b"P", 0) as u32 as i32,
+            id0,
+            encrypt_metadata: !matches!(get(b"EncryptMetadata"), Some(Obj::Bool(false))),
+            stream_method,
+        };
+        pdf_crypt::Decryptor::open(&params).map_err(|error| match error {
+            pdf_crypt::CryptError::PasswordRequired => PdfError::PasswordRequired,
+            pdf_crypt::CryptError::Unsupported(what) => PdfError::UnsupportedEncryption(what),
+        })?
+    };
+    let encrypt_object = match entry {
+        Obj::Ref(number) => Some(*number),
+        _ => None,
+    };
+    for (number, object) in objects.iter_mut() {
+        if Some(*number) == encrypt_object {
+            continue;
+        }
+        let Obj::Stream(dict, data) = object else {
+            continue;
+        };
+        if decryptor.leaves_clear(dict.get(b"Type").and_then(Obj::as_name))
+            || has_identity_crypt_filter(dict)
+        {
+            continue;
+        }
+        let generation = generations.get(number).copied().unwrap_or(0);
+        *data = decryptor
+            .decrypt_stream(*number, generation, data)
+            .unwrap_or_default();
+    }
+    Ok(())
+}
+
+/// A stream whose first filter is `/Crypt` with the Identity filter is stored
+/// unencrypted even in an encrypted document.
+fn has_identity_crypt_filter(dict: &Dict) -> bool {
+    let first = match dict.get(b"Filter") {
+        Some(Obj::Name(name)) => Some(name.as_slice()),
+        Some(Obj::Array(items)) => items.first().and_then(Obj::as_name),
+        _ => None,
+    };
+    if first != Some(b"Crypt") {
+        return false;
+    }
+    let params = match dict.get(b"DecodeParms") {
+        Some(Obj::Dict(params)) => Some(params),
+        Some(Obj::Array(items)) => items.first().and_then(Obj::as_dict),
+        _ => None,
+    };
+    params
+        .and_then(|params| params.get(b"Name"))
+        .and_then(Obj::as_name)
+        .is_none_or(|name| name == b"Identity")
+}
+
+/// What one page's content streams yielded.
+#[derive(Debug, Default)]
+pub(crate) struct PageContent {
+    pub(crate) text: String,
+    /// Content streams that were skipped and why, e.g.
+    /// `content stream uses JBIG2Decode, not supported`.
+    pub(crate) notes: Vec<String>,
+    /// The page runs at least one text-showing operator.
+    pub(crate) text_operators: bool,
+    /// Image XObjects and inline images the page paints.
+    pub(crate) images: usize,
+    /// Resource names of the image XObjects the page paints, in paint order.
+    #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
+    pub(crate) image_names: Vec<Vec<u8>>,
+}
+
+/// Why one stream could not be decoded.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamError {
+    Unsupported(String),
+    TooLarge,
+    Corrupt(&'static str),
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::Unsupported(filter) => {
+                write!(f, "content stream uses {filter}, not supported")
+            }
+            StreamError::TooLarge => write!(
+                f,
+                "content stream exceeds the decode budget ({} MiB per stream, {} MiB per call)",
+                MAX_STREAM_DECODED / (1024 * 1024),
+                MAX_TOTAL_DECODED / (1024 * 1024)
+            ),
+            StreamError::Corrupt(why) => write!(f, "content stream could not be decoded ({why})"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ContentFlags {
+    text_operators: bool,
+    images: usize,
+    image_names: Vec<Vec<u8>>,
+}
+
 impl std::fmt::Display for PdfError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PdfError::Encrypted => {
-                f.write_str("the PDF is encrypted; text extraction is not supported")
-            }
+            PdfError::Encrypted => f.write_str(
+                "the PDF is encrypted and its encryption dictionary could not be read",
+            ),
+            PdfError::PasswordRequired => f.write_str(
+                "password required: the PDF is protected by a non-empty user password, which mini-agent cannot supply",
+            ),
+            PdfError::UnsupportedEncryption(what) => write!(
+                f,
+                "the PDF is encrypted with an unsupported scheme ({what}); only the standard security handler with an empty user password is supported"
+            ),
             PdfError::Malformed(reason) => write!(f, "the PDF could not be parsed ({reason})"),
             PdfError::TooLarge => f.write_str(
                 "the PDF exceeds the parsing budget (too many objects, nested nodes, fonts or ToUnicode entries, or too many decoded bytes)",
@@ -421,7 +639,10 @@ impl Document {
 
     fn parse_until(data: &[u8], deadline: std::time::Instant) -> Result<Self, PdfError> {
         let mut objects: HashMap<u32, Obj> = HashMap::new();
-        let mut encrypted = false;
+        let mut generations: HashMap<u32, u16> = HashMap::new();
+        // The last `/Encrypt` entry (object dictionary or trailer) and the
+        // first `/ID` string beside it.
+        let mut encrypt: Option<(Obj, Vec<u8>)> = None;
         let mut position = 0;
         let mut nodes = 0usize;
         // Once one stream lacks `endstream`, no later one can have it either.
@@ -446,7 +667,7 @@ impl Document {
             {
                 continue;
             }
-            let Some(number) = object_number_before(data, found) else {
+            let Some((number, generation)) = object_number_before(data, found) else {
                 continue;
             };
             let mut lexer = Lexer::new(data, found + 3);
@@ -512,10 +733,11 @@ impl Document {
                 other => other,
             };
             if let Some(dict) = object.as_dict()
-                && dict.get(b"Encrypt").is_some()
+                && let Some(entry) = dict.get(b"Encrypt")
             {
-                encrypted = true;
+                encrypt = Some((entry.clone(), first_id(dict)));
             }
+            generations.insert(number, generation);
             objects.insert(number, object);
         }
         // Classic trailers are not objects; check them separately.
@@ -536,13 +758,13 @@ impl Document {
             // Never rescan the bytes this trailer consumed.
             position = position.max(lexer.pos);
             if let Some(Obj::Dict(dict)) = parsed
-                && dict.get(b"Encrypt").is_some()
+                && let Some(entry) = dict.get(b"Encrypt")
             {
-                encrypted = true;
+                encrypt = Some((entry.clone(), first_id(&dict)));
             }
         }
-        if encrypted {
-            return Err(PdfError::Encrypted);
+        if let Some((entry, id0)) = encrypt {
+            decrypt_streams(&mut objects, &generations, &entry, id0)?;
         }
         let mut document = Self {
             objects,
@@ -572,7 +794,7 @@ impl Document {
             })
             .collect();
         for (dict, raw) in streams {
-            let Some(decoded) = self.decode(&dict, &raw) else {
+            let Ok(decoded) = self.decode(&dict, &raw) else {
                 continue;
             };
             let count = dict.get(b"N").and_then(Obj::as_num).unwrap_or(0.0) as usize;
@@ -722,37 +944,107 @@ impl Document {
     }
 
     /// Decode a stream's data through its filters, within the budgets.
-    fn decode(&self, dict: &Dict, raw: &[u8]) -> Option<Vec<u8>> {
-        let filters: Vec<Vec<u8>> = match dict.get(b"Filter").map(|f| self.resolve(f)) {
+    fn decode(&self, dict: &Dict, raw: &[u8]) -> Result<Vec<u8>, StreamError> {
+        self.decode_inner(dict, raw, false).map(|(data, _)| data)
+    }
+
+    /// [`Self::decode`], optionally stopping at a trailing `DCTDecode`: the
+    /// flag reports that the returned bytes are a JPEG, not decoded pixels.
+    fn decode_inner(
+        &self,
+        dict: &Dict,
+        raw: &[u8],
+        stop_at_dct: bool,
+    ) -> Result<(Vec<u8>, bool), StreamError> {
+        let filters: Vec<Vec<u8>> = match dict
+            .get(b"Filter")
+            .or_else(|| dict.get(b"F"))
+            .map(|f| self.resolve(f))
+        {
             None | Some(Obj::Null) => Vec::new(),
             Some(Obj::Name(name)) => vec![name.clone()],
             Some(Obj::Array(names)) => names
                 .iter()
                 .filter_map(|name| self.resolve(name).as_name().map(<[u8]>::to_vec))
                 .collect(),
-            _ => return None,
+            _ => return Err(StreamError::Corrupt("malformed /Filter entry")),
         };
+        let params = dict
+            .get(b"DecodeParms")
+            .or_else(|| dict.get(b"DP"))
+            .map(|p| self.resolve(p));
         let mut data = raw.to_vec();
-        for filter in filters {
-            data = match filter.as_slice() {
-                b"FlateDecode" | b"Fl" => self.inflate(&data)?,
+        let mut jpeg = false;
+        for (index, filter) in filters.iter().enumerate() {
+            if jpeg {
+                return Err(StreamError::Corrupt("filters follow DCTDecode"));
+            }
+            let parms: Option<&Dict> = match params {
+                Some(Obj::Dict(dict)) if index == 0 => Some(dict),
+                Some(Obj::Array(items)) => items
+                    .get(index)
+                    .and_then(|item| self.resolve(item).as_dict()),
+                _ => None,
+            };
+            let limit = usize::try_from(self.decoded_budget.get().min(MAX_STREAM_DECODED))
+                .unwrap_or(usize::MAX);
+            let name = String::from_utf8_lossy(filter).into_owned();
+            let number = |key: &[u8], default: usize| {
+                parms
+                    .and_then(|parms| parms.get(key))
+                    .map(|value| self.resolve(value))
+                    .and_then(Obj::as_num)
+                    .map_or(default, |value| value.max(0.0) as usize)
+            };
+            let predictor = || pdf_filters::Predictor {
+                predictor: number(b"Predictor", 1).min(u32::MAX as usize) as u32,
+                colors: number(b"Colors", 1),
+                bits: number(b"BitsPerComponent", 8),
+                columns: number(b"Columns", 1),
+            };
+            let step = match filter.as_slice() {
+                b"FlateDecode" | b"Fl" => self
+                    .inflate(&data, limit)
+                    .and_then(|out| pdf_filters::unpredict(out, predictor())),
+                b"LZWDecode" | b"LZW" => {
+                    let early = number(b"EarlyChange", 1) != 0;
+                    pdf_filters::lzw(&data, early, limit)
+                        .and_then(|out| pdf_filters::unpredict(out, predictor()))
+                }
+                b"ASCII85Decode" | b"A85" => pdf_filters::ascii85(&data, limit),
+                b"RunLengthDecode" | b"RL" => pdf_filters::run_length(&data, limit),
                 b"ASCIIHexDecode" | b"AHx" => {
                     let mut text = data.clone();
                     text.retain(|byte| !is_whitespace(*byte));
                     text.insert(0, b'<');
                     match Lexer::new(&text, 0).object(0) {
-                        Some(Obj::Str(bytes)) => bytes,
-                        _ => return None,
+                        Some(Obj::Str(bytes)) => Ok(bytes),
+                        _ => Err(pdf_filters::FilterError::Corrupt("invalid ASCIIHex data")),
                     }
                 }
-                _ => return None,
+                b"DCTDecode" | b"DCT" if stop_at_dct => {
+                    jpeg = true;
+                    Ok(std::mem::take(&mut data))
+                }
+                // Encryption is undone before any filter runs.
+                b"Crypt" => Ok(std::mem::take(&mut data)),
+                _ => return Err(StreamError::Unsupported(name)),
             };
+            data = step.map_err(|error| match error {
+                pdf_filters::FilterError::TooLarge => StreamError::TooLarge,
+                pdf_filters::FilterError::Corrupt(why) => StreamError::Corrupt(why),
+                pdf_filters::FilterError::Unsupported(what) => {
+                    StreamError::Unsupported(format!("{name} {what}"))
+                }
+            })?;
+            self.decoded_budget
+                .set(self.decoded_budget.get().saturating_sub(data.len() as u64));
         }
-        Some(data)
+        Ok((data, jpeg))
     }
 
-    fn inflate(&self, data: &[u8]) -> Option<Vec<u8>> {
-        let budget = self.decoded_budget.get().min(MAX_STREAM_DECODED);
+    fn inflate(&self, data: &[u8], limit: usize) -> Result<Vec<u8>, pdf_filters::FilterError> {
+        let budget = limit as u64;
         let mut out = Vec::new();
         let zlib = flate2::read::ZlibDecoder::new(data)
             .take(budget + 1)
@@ -764,34 +1056,79 @@ impl Document {
                 .read_to_end(&mut out);
         }
         if out.len() as u64 > budget {
-            return None;
+            return Err(pdf_filters::FilterError::TooLarge);
         }
-        self.decoded_budget
-            .set(self.decoded_budget.get() - out.len() as u64);
-        (!out.is_empty()).then_some(out)
+        if out.is_empty() && zlib.is_err() {
+            return Err(pdf_filters::FilterError::Corrupt(
+                "FlateDecode data could not be inflated",
+            ));
+        }
+        Ok(out)
     }
 
     /// Extracted text of page `index` (0-based).
+    #[cfg(test)]
     pub(crate) fn page_text(&self, index: usize) -> Result<String, PdfError> {
+        Ok(self.page_content(index)?.text)
+    }
+
+    /// Extracted text of page `index` (0-based) plus what could not be read.
+    pub(crate) fn page_content(&self, index: usize) -> Result<PageContent, PdfError> {
         let Some((page, resources)) = self.pages.get(index) else {
-            return Ok(String::new());
+            return Ok(PageContent::default());
         };
         let mut content = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         let streams: Vec<&Obj> = match page.get(b"Contents").map(|c| self.resolve(c)) {
             Some(Obj::Array(items)) => items.iter().map(|item| self.resolve(item)).collect(),
             Some(other) => vec![other],
             None => Vec::new(),
         };
         for stream in streams {
-            if let Obj::Stream(dict, raw) = stream
-                && let Some(decoded) = self.decode(dict, raw)
-            {
-                content.extend_from_slice(&decoded);
-                content.push(b'\n');
+            if let Obj::Stream(dict, raw) = stream {
+                match self.decode(dict, raw) {
+                    Ok(decoded) => {
+                        content.extend_from_slice(&decoded);
+                        content.push(b'\n');
+                    }
+                    Err(error) => {
+                        let note = error.to_string();
+                        if !notes.contains(&note) {
+                            notes.push(note);
+                        }
+                    }
+                }
             }
         }
         let fonts = self.fonts(resources.as_ref())?;
-        Ok(normalize_text(&extract_text(&content, &fonts)))
+        let images = self.image_names(resources.as_ref());
+        let mut flags = ContentFlags::default();
+        let text = normalize_text(&extract_text(&content, &fonts, &images, &mut flags));
+        Ok(PageContent {
+            text,
+            notes,
+            text_operators: flags.text_operators,
+            images: flags.images,
+            image_names: flags.image_names,
+        })
+    }
+
+    /// Names in the page's `/XObject` resources that are image XObjects.
+    fn image_names(&self, resources: Option<&Dict>) -> HashSet<Vec<u8>> {
+        let mut names = HashSet::new();
+        if let Some(xobjects) = resources
+            .and_then(|resources| resources.get(b"XObject"))
+            .and_then(|xobjects| self.resolve(xobjects).as_dict())
+        {
+            for (name, object) in xobjects.0.iter().take(MAX_FONTS_PER_PAGE) {
+                if let Obj::Stream(dict, _) = self.resolve(object)
+                    && dict.get(b"Subtype").and_then(Obj::as_name) == Some(b"Image")
+                {
+                    names.insert(name.clone());
+                }
+            }
+        }
+        names
     }
 
     fn fonts(&self, resources: Option<&Dict>) -> Result<HashMap<Vec<u8>, FontDecoder>, PdfError> {
@@ -838,7 +1175,7 @@ impl Document {
                 }
                 decoder.map = std::rc::Rc::clone(map);
             } else if let Some(Obj::Stream(dict, raw)) = to_unicode.map(|t| self.resolve(t))
-                && let Some(cmap) = self.decode(dict, raw)
+                && let Ok(cmap) = self.decode(dict, raw)
             {
                 let default_bytes = decoder.code_bytes;
                 let mut map = HashMap::new();
@@ -863,7 +1200,7 @@ impl Document {
     }
 }
 
-fn object_number_before(data: &[u8], obj_at: usize) -> Option<u32> {
+fn object_number_before(data: &[u8], obj_at: usize) -> Option<(u32, u16)> {
     let mut index = obj_at;
     let skip_ws = |index: &mut usize| {
         while *index > 0 && is_whitespace(data[*index - 1]) {
@@ -881,7 +1218,7 @@ fn object_number_before(data: &[u8], obj_at: usize) -> Option<u32> {
     if index == obj_at {
         return None;
     }
-    digits(&mut index)?;
+    let (generation_start, generation_end) = digits(&mut index)?;
     let before_generation = index;
     skip_ws(&mut index);
     if index == before_generation {
@@ -891,7 +1228,12 @@ fn object_number_before(data: &[u8], obj_at: usize) -> Option<u32> {
     if index > 0 && !is_whitespace(data[index - 1]) && !is_delimiter(data[index - 1]) {
         return None;
     }
-    std::str::from_utf8(&data[start..end]).ok()?.parse().ok()
+    let number = std::str::from_utf8(&data[start..end]).ok()?.parse().ok()?;
+    let generation = std::str::from_utf8(&data[generation_start..generation_end])
+        .ok()?
+        .parse()
+        .unwrap_or(0);
+    Some((number, generation))
 }
 
 /// A decoded ToUnicode map shared by every font pointing at its stream, with
@@ -1139,7 +1481,12 @@ impl TextLayout {
     }
 }
 
-fn extract_text(content: &[u8], fonts: &HashMap<Vec<u8>, FontDecoder>) -> String {
+fn extract_text(
+    content: &[u8],
+    fonts: &HashMap<Vec<u8>, FontDecoder>,
+    images: &HashSet<Vec<u8>>,
+    flags: &mut ContentFlags,
+) -> String {
     let fallback = FontDecoder {
         code_bytes: 1,
         map: std::rc::Rc::default(),
@@ -1211,17 +1558,20 @@ fn extract_text(content: &[u8], fonts: &HashMap<Vec<u8>, FontDecoder>) -> String
                 }
             }
             b"Tj" => {
+                flags.text_operators = true;
                 if let Some(Obj::Str(bytes)) = operands.last() {
                     show(bytes, font, &mut layout, &mut out);
                 }
             }
             b"'" | b"\"" => {
+                flags.text_operators = true;
                 layout.move_line(0.0, -layout.leading);
                 if let Some(Obj::Str(bytes)) = operands.last() {
                     show(bytes, font, &mut layout, &mut out);
                 }
             }
             b"TJ" => {
+                flags.text_operators = true;
                 if let Some(Obj::Array(items)) = operands.last() {
                     for item in items {
                         match item {
@@ -1245,7 +1595,18 @@ fn extract_text(content: &[u8], fonts: &HashMap<Vec<u8>, FontDecoder>) -> String
                     }
                 }
             }
+            b"Do" => {
+                if let Some(Obj::Name(name)) = operands.first()
+                    && images.contains(name)
+                {
+                    flags.images += 1;
+                    if flags.image_names.len() < 64 {
+                        flags.image_names.push(name.clone());
+                    }
+                }
+            }
             b"BI" => {
+                flags.images += 1;
                 // Inline image: skip binary data up to a delimited `EI`.
                 let mut index = lexer.pos;
                 while let Some(found) = find(content, b"EI", index) {
@@ -1364,14 +1725,156 @@ fn page_list(pages: &[usize]) -> String {
     parts.join(", ")
 }
 
-/// Render the selected pages' text layer for the read tool, bounded by
-/// `budget` characters. Errors are model-facing guidance.
+/// Explain why none of the selected pages produced text: undecodable streams
+/// are named, scanned pages (images but no text operators) get the export
+/// hint, and anything else is reported as holding neither text nor images.
+fn no_text_report(
+    path: &str,
+    count: usize,
+    pages: &[(usize, PageContent)],
+    attached: &Attached,
+) -> String {
+    let numbers: Vec<usize> = pages.iter().map(|(page, _)| *page).collect();
+    let mut out = format!(
+        "PDF: {path} ({count} pages): no text could be extracted from page(s) {}.",
+        page_list(&numbers)
+    );
+    let undecoded: Vec<String> = pages
+        .iter()
+        .filter(|(_, content)| !content.notes.is_empty())
+        .map(|(page, content)| format!("page {page}: {}", content.notes.join("; ")))
+        .collect();
+    if !undecoded.is_empty() {
+        out.push_str(&format!(
+            " Some content streams were skipped ({}); the text may be present but unreadable by this extractor.",
+            undecoded.join(" | ")
+        ));
+    }
+    let scanned: Vec<usize> = pages
+        .iter()
+        .filter(|(_, c)| c.notes.is_empty() && !c.text_operators && c.images > 0)
+        .map(|(page, _)| *page)
+        .collect();
+    out.push_str(&attached.sentence());
+    let scanned: Vec<usize> = scanned
+        .into_iter()
+        .filter(|page| !attached.images.iter().any(|image| image.page == *page))
+        .collect();
+    if !scanned.is_empty() {
+        out.push_str(&format!(
+            " Page(s) {} paint images and have no text operators, so they are probably scanned images; export them to images (for example `pdftoppm -png -r 100 -f {first} -l {first} <file> page`) and read the PNG files.",
+            page_list(&scanned),
+            first = scanned[0],
+        ));
+    }
+    let empty: Vec<usize> = pages
+        .iter()
+        .filter(|(_, c)| c.notes.is_empty() && c.images == 0 && !c.text_operators)
+        .map(|(page, _)| *page)
+        .collect();
+    if !empty.is_empty() {
+        out.push_str(&format!(
+            " Page(s) {} contain no text and no images (blank, or drawn only as vector graphics or form XObjects).",
+            page_list(&empty)
+        ));
+    }
+    let text_without_chars: Vec<usize> = pages
+        .iter()
+        .filter(|(_, c)| c.notes.is_empty() && c.text_operators)
+        .map(|(page, _)| *page)
+        .collect();
+    if !text_without_chars.is_empty() {
+        out.push_str(&format!(
+            " Page(s) {} show text whose characters could not be mapped to Unicode.",
+            page_list(&text_without_chars)
+        ));
+    }
+    out
+}
+
+/// Images a read may attach for scanned pages.
+#[cfg(feature = "multimodal")]
+pub(crate) const MAX_PDF_IMAGES_PER_READ: usize = 4;
+
+/// One page image handed to the model beside the text result.
+#[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
+struct AttachedImage {
+    page: usize,
+    /// 1-based position among the result's image blocks.
+    number: usize,
+    width: u32,
+    height: u32,
+    mime: &'static str,
+}
+
+/// Page images attached to a result, and pages that could not be.
+#[derive(Default)]
+struct Attached {
+    images: Vec<AttachedImage>,
+    /// Why other scanned pages have no image.
+    problems: Vec<String>,
+}
+
+impl Attached {
+    /// Model-facing sentence mapping image blocks to pages; empty when none.
+    fn sentence(&self) -> String {
+        let mut out = String::new();
+        if !self.images.is_empty() {
+            let items: Vec<String> = self
+                .images
+                .iter()
+                .map(|image| {
+                    format!(
+                        "image {} = page {} ({} x {}, {})",
+                        image.number, image.page, image.width, image.height, image.mime
+                    )
+                })
+                .collect();
+            out.push_str(&format!(
+                " The scanned page image(s) are attached as image blocks: {}; read the text from them.",
+                items.join(", ")
+            ));
+        }
+        if !self.problems.is_empty() {
+            out.push_str(&format!(
+                " Page image(s) not attached: {}.",
+                self.problems.join("; ")
+            ));
+        }
+        out
+    }
+}
+
+/// What [`render_with_images`] produced.
+pub(crate) struct Rendered {
+    pub(crate) text: String,
+    #[cfg(feature = "multimodal")]
+    pub(crate) images: Vec<PdfImage>,
+}
+
+/// [`render_with_images`] without page images.
+#[cfg(test)]
 pub(crate) fn render(
     bytes: &[u8],
     path: &str,
     pages: Option<&str>,
     budget: usize,
 ) -> Result<String, String> {
+    render_with_images(bytes, path, pages, budget, 0).map(|rendered| rendered.text)
+}
+
+/// Render the selected pages' text layer for the read tool, bounded by
+/// `budget` characters. With `max_images > 0`, selected pages that have no
+/// text layer but paint images get their page images lifted (at most
+/// `max_images` blocks) so a vision model can read them. Errors are
+/// model-facing guidance.
+pub(crate) fn render_with_images(
+    bytes: &[u8],
+    path: &str,
+    pages: Option<&str>,
+    budget: usize,
+    max_images: usize,
+) -> Result<Rendered, String> {
     let document = Document::parse(bytes)
         .map_err(|error| format!("Cannot read '{path}' as PDF text: {error}."))?;
     let count = document.page_count();
@@ -1389,17 +1892,28 @@ pub(crate) fn render(
     let mut body = String::new();
     let mut body_chars = 0;
     let mut shown = Vec::new();
-    let mut without_text = Vec::new();
+    let mut without_text: Vec<(usize, PageContent)> = Vec::new();
     let mut stopped_at = None;
     for &page in &selected {
-        let text = document.page_text(page - 1).map_err(|error| {
+        let content = document.page_content(page - 1).map_err(|error| {
             format!("Cannot read page {page} of '{path}' as PDF text: {error}.")
         })?;
-        let mut block = if text.is_empty() {
-            without_text.push(page);
-            format!("--- page {page} ---\n[no text layer on this page]\n\n")
+        let notes = content.notes.join("; ");
+        let mut block = if content.text.is_empty() {
+            let block = if notes.is_empty() {
+                format!("--- page {page} ---\n[no text layer on this page]\n\n")
+            } else {
+                format!("--- page {page} ---\n[page {page}: {notes}]\n\n")
+            };
+            without_text.push((page, content));
+            block
+        } else if notes.is_empty() {
+            format!("--- page {page} ---\n{}\n\n", content.text)
         } else {
-            format!("--- page {page} ---\n{text}\n\n")
+            format!(
+                "--- page {page} ---\n{}\n[page {page}: some content was not extracted: {notes}]\n\n",
+                content.text
+            )
         };
         let mut block_chars = block.chars().count();
         if !shown.is_empty() && body_chars + block_chars > budget {
@@ -1421,12 +1935,57 @@ pub(crate) fn render(
         body.push_str(&block);
         shown.push(page);
     }
+    #[cfg_attr(not(feature = "multimodal"), allow(unused_mut))]
+    let mut attached = Attached::default();
+    #[cfg(feature = "multimodal")]
+    let mut images: Vec<PdfImage> = Vec::new();
+    #[cfg(feature = "multimodal")]
+    {
+        let mut skipped_for_limit = Vec::new();
+        for (page, content) in &without_text {
+            if !content.notes.is_empty() || content.text_operators || content.images == 0 {
+                continue;
+            }
+            let remaining = max_images.saturating_sub(images.len());
+            if max_images == 0 {
+                break;
+            }
+            if remaining == 0 {
+                skipped_for_limit.push(*page);
+                continue;
+            }
+            match document.page_images(*page, content, remaining) {
+                Ok(lifted) => {
+                    for image in lifted {
+                        attached.images.push(AttachedImage {
+                            page: *page,
+                            number: images.len() + 1,
+                            width: image.width,
+                            height: image.height,
+                            mime: image.mime,
+                        });
+                        images.push(image);
+                    }
+                }
+                Err(reason) => attached.problems.push(format!("page {page}: {reason}")),
+            }
+        }
+        if !skipped_for_limit.is_empty() {
+            let list = page_list(&skipped_for_limit);
+            attached.problems.push(format!(
+                "page(s) {list} (limit of {max_images} images per read; continue with pages:\"{}\")",
+                list.replace(", ", ",")
+            ));
+        }
+    }
+    #[cfg(not(feature = "multimodal"))]
+    let _ = max_images;
     if !shown.is_empty() && without_text.len() == shown.len() {
-        return Ok(format!(
-            "PDF: {path} ({count} pages): no text layer found on page(s) {}. The pages are probably scanned images; export them to images (for example `pdftoppm -png -r 100 -f {first} -l {first} <file> page`) and read the PNG files.",
-            page_list(&shown),
-            first = shown[0],
-        ));
+        return Ok(Rendered {
+            text: no_text_report(path, count, &without_text, &attached),
+            #[cfg(feature = "multimodal")]
+            images,
+        });
     }
     let mut out = format!(
         "PDF: {path} ({count} pages; extracted text layer of page(s) {}; no line numbers or edit authorization)\n\n{}",
@@ -1439,7 +1998,15 @@ pub(crate) fn render(
             "\n\n[truncated before page {next}: the output reached the {budget} character read budget; continue with pages:\"{next}-{last}\"]"
         ));
     }
-    Ok(out)
+    let attached_note = attached.sentence();
+    if !attached_note.is_empty() {
+        out.push_str(&format!("\n\n[{}]", attached_note.trim()));
+    }
+    Ok(Rendered {
+        text: out,
+        #[cfg(feature = "multimodal")]
+        images,
+    })
 }
 
 #[cfg(test)]
@@ -1450,11 +2017,32 @@ pub(crate) mod test_pdf {
     pub(crate) enum Content {
         Plain(String),
         Deflated(String),
+        /// Extra stream dictionary entries (for example `/Filter /LZWDecode`)
+        /// and the already-encoded stream bytes.
+        Encoded(String, Vec<u8>),
+    }
+
+    /// Number of the first extra object passed to [`build_with`] for `pages`
+    /// page/content pairs.
+    pub(crate) fn first_extra_object(pages: usize) -> usize {
+        5 + pages * 2
     }
 
     /// Build a PDF whose page `i` shows `pages[i]` with a simple Helvetica
     /// font, or a Type0 font with a ToUnicode CMap when `type0` is set.
     pub(crate) fn build(pages: &[Content], type0: bool) -> Vec<u8> {
+        build_with(pages, type0, "", Vec::new())
+    }
+
+    /// [`build`] with extra page-tree resources (for example
+    /// `/XObject << /Im0 7 0 R >>`) and extra objects numbered from
+    /// [`first_extra_object`].
+    pub(crate) fn build_with(
+        pages: &[Content],
+        type0: bool,
+        extra_resources: &str,
+        extra_objects: Vec<Vec<u8>>,
+    ) -> Vec<u8> {
         let mut objects: Vec<Vec<u8>> = Vec::new();
         // 1: catalog, 2: pages, 3: font, 4: cmap; then page/content pairs.
         let first_page = 5;
@@ -1464,7 +2052,7 @@ pub(crate) mod test_pdf {
         objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
         objects.push(
             format!(
-                "<< /Type /Pages /Kids [{}] /Count {} /Resources << /Font << /F1 3 0 R >> >> >>",
+                "<< /Type /Pages /Kids [{}] /Count {} /Resources << /Font << /F1 3 0 R >> {extra_resources} >> >>",
                 kids.join(" "),
                 pages.len()
             )
@@ -1488,6 +2076,7 @@ pub(crate) mod test_pdf {
             );
             let (dict, data) = match content {
                 Content::Plain(text) => (String::new(), text.clone().into_bytes()),
+                Content::Encoded(dict, data) => (format!(" {dict}"), data.clone()),
                 Content::Deflated(text) => {
                     let mut encoder =
                         flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -1503,6 +2092,7 @@ pub(crate) mod test_pdf {
             object.extend_from_slice(b"\nendstream");
             objects.push(object);
         }
+        objects.extend(extra_objects);
         let mut out = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let mut offsets = Vec::new();
         for (index, object) in objects.iter().enumerate() {
@@ -1531,8 +2121,310 @@ pub(crate) mod test_pdf {
 
 #[cfg(test)]
 mod tests {
-    use super::test_pdf::{Content, build};
+    use super::pdf_filters::{ascii85_encode, lzw_encode};
+    use super::test_pdf::{Content, build, build_with, first_extra_object};
     use super::*;
+
+    const HELLO_PAGE: &str = "BT /F1 12 Tf 72 720 Td (Hello filters) Tj ET";
+
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn page_with(dict: &str, data: Vec<u8>) -> Document {
+        Document::parse(&build(&[Content::Encoded(dict.into(), data)], false)).unwrap()
+    }
+
+    #[test]
+    fn ascii85_then_flate_content_streams_extract_their_text() {
+        let data = ascii85_encode(&deflate(HELLO_PAGE.as_bytes()));
+        let document = page_with("/Filter [/ASCII85Decode /FlateDecode]", data);
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+        let short = page_with("/Filter /A85", ascii85_encode(HELLO_PAGE.as_bytes()));
+        assert_eq!(short.page_text(0).unwrap(), "Hello filters");
+    }
+
+    #[test]
+    fn lzw_content_streams_extract_their_text() {
+        let document = page_with(
+            "/Filter /LZWDecode",
+            lzw_encode(HELLO_PAGE.as_bytes(), true),
+        );
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+        let late = page_with(
+            "/Filter /LZWDecode /DecodeParms << /EarlyChange 0 >>",
+            lzw_encode(HELLO_PAGE.repeat(60).as_bytes(), false),
+        );
+        assert!(late.page_text(0).unwrap().starts_with("Hello filters"));
+    }
+
+    #[test]
+    fn run_length_content_streams_extract_their_text() {
+        let mut encoded = vec![(HELLO_PAGE.len() - 1) as u8];
+        encoded.extend_from_slice(HELLO_PAGE.as_bytes());
+        encoded.push(128);
+        let document = page_with("/Filter /RunLengthDecode", encoded);
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+    }
+
+    #[test]
+    fn flate_with_a_png_predictor_extracts_its_text() {
+        let columns = 8usize;
+        let mut padded = HELLO_PAGE.as_bytes().to_vec();
+        while !padded.len().is_multiple_of(columns) {
+            padded.push(b' ');
+        }
+        // Encode each row with the Up filter (2).
+        let mut rows = Vec::new();
+        let mut previous = vec![0u8; columns];
+        for row in padded.chunks(columns) {
+            rows.push(2);
+            rows.extend(row.iter().zip(&previous).map(|(a, b)| a.wrapping_sub(*b)));
+            previous = row.to_vec();
+        }
+        let document = page_with(
+            &format!("/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns {columns} >>"),
+            deflate(&rows),
+        );
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+    }
+
+    #[test]
+    fn decode_parms_arrays_apply_per_filter() {
+        let data = ascii85_encode(&deflate(HELLO_PAGE.as_bytes()));
+        let document = page_with(
+            "/Filter [/ASCII85Decode /FlateDecode] /DecodeParms [null << /Predictor 1 >>]",
+            data,
+        );
+        assert_eq!(document.page_text(0).unwrap(), "Hello filters");
+    }
+
+    #[test]
+    fn real_reportlab_style_ascii85_flate_fixture_extracts_text() {
+        let pdf = include_bytes!("fixtures/pdf/ascii85-flate.pdf");
+        assert!(find(pdf, b"ASCII85Decode", 0).is_some());
+        let document = Document::parse(pdf).unwrap();
+        let text = document.page_text(0).unwrap();
+        assert!(text.contains("Hello Encrypted World"), "{text}");
+        assert!(text.contains("Second line of text"), "{text}");
+    }
+
+    #[test]
+    fn unsupported_filters_are_named_instead_of_reported_as_scanned() {
+        let pdf = build(
+            &[Content::Encoded(
+                "/Filter /JBIG2Decode".into(),
+                vec![1, 2, 3],
+            )],
+            false,
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let content = document.page_content(0).unwrap();
+        assert!(content.text.is_empty());
+        assert_eq!(
+            content.notes,
+            ["content stream uses JBIG2Decode, not supported"]
+        );
+        let output = render(&pdf, "doc.pdf", None, 10_000).unwrap();
+        assert!(
+            output.contains("page 1: content stream uses JBIG2Decode, not supported"),
+            "{output}"
+        );
+        assert!(!output.contains("probably scanned"), "{output}");
+        assert!(!output.contains("pdftoppm"), "{output}");
+    }
+
+    #[test]
+    fn partially_decoded_pages_keep_text_and_name_the_skipped_stream() {
+        let pdf = build(&[Content::Plain(HELLO_PAGE.into())], false);
+        // Add a second, unsupported stream to the same page.
+        let mut text = String::from_utf8_lossy(&pdf).into_owned();
+        text = text.replacen("/Contents 6 0 R", "/Contents [6 0 R 7 0 R]", 1);
+        let mut bytes = text.into_bytes();
+        bytes.extend_from_slice(
+            b"\n7 0 obj\n<< /Length 3 /Filter /CCITTFaxDecode >>\nstream\nabc\nendstream\nendobj\n",
+        );
+        let output = render(&bytes, "doc.pdf", None, 10_000).unwrap();
+        assert!(output.contains("Hello filters"), "{output}");
+        assert!(
+            output.contains("some content was not extracted: content stream uses CCITTFaxDecode"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn scanned_message_needs_images_and_no_text_operators() {
+        let image = first_extra_object(3);
+        let object = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x00\nendstream".to_vec();
+        let pdf = build_with(
+            &[
+                Content::Plain("q 612 0 0 792 0 0 cm /Im0 Do Q".into()),
+                Content::Plain("0 0 100 100 re S".into()),
+                Content::Plain("BT /F1 12 Tf 72 720 Td <00> Tj ET".into()),
+            ],
+            false,
+            &format!("/XObject << /Im0 {image} 0 R >>"),
+            vec![object],
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let scanned = document.page_content(0).unwrap();
+        assert!(!scanned.text_operators);
+        assert_eq!(scanned.images, 1);
+        assert_eq!(document.page_content(1).unwrap().images, 0);
+        assert!(document.page_content(2).unwrap().text_operators);
+        let output = render(&pdf, "doc.pdf", None, 10_000).unwrap();
+        assert!(
+            output.contains(
+                "Page(s) 1 paint images and have no text operators, so they are probably scanned"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("Page(s) 2 contain no text and no images"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Page(s) 3 show text whose characters"),
+            "{output}"
+        );
+        // A blank page alone is not called scanned.
+        let blank = render(&pdf, "doc.pdf", Some("2"), 10_000).unwrap();
+        assert!(!blank.contains("probably scanned"), "{blank}");
+    }
+
+    const OWNER_ONLY: [(&str, &[u8]); 5] = [
+        (
+            "RC4-40 (R2)",
+            include_bytes!("fixtures/pdf/encrypted-rc4_40.pdf"),
+        ),
+        (
+            "RC4-128 (R3)",
+            include_bytes!("fixtures/pdf/encrypted-rc4_128.pdf"),
+        ),
+        (
+            "AESV2 (R4)",
+            include_bytes!("fixtures/pdf/encrypted-aesv2.pdf"),
+        ),
+        (
+            "AES-256 (R5)",
+            include_bytes!("fixtures/pdf/encrypted-aes256r5.pdf"),
+        ),
+        (
+            "AES-256 (R6)",
+            include_bytes!("fixtures/pdf/encrypted-aes256.pdf"),
+        ),
+    ];
+
+    /// The fixtures were written by Ghostscript (RC4) and pypdf (AES) with an
+    /// owner password only; viewers open them with no password.
+    #[test]
+    fn owner_password_only_pdfs_decrypt_with_the_empty_user_password() {
+        for (label, pdf) in OWNER_ONLY {
+            assert!(find(pdf, b"/Encrypt", 0).is_some(), "{label} is encrypted");
+            assert!(
+                find(pdf, b"Hello Encrypted", 0).is_none(),
+                "{label} hides text"
+            );
+            let document = Document::parse(pdf).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let text = document.page_text(0).unwrap();
+            assert!(text.contains("Hello Encrypted World"), "{label}: {text}");
+            assert!(text.contains("Second line of text"), "{label}: {text}");
+            let rendered = render(pdf, "doc.pdf", None, 10_000).unwrap();
+            assert!(
+                rendered.contains("Hello Encrypted World"),
+                "{label}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn pdfs_with_a_real_user_password_report_password_required() {
+        let pdf = include_bytes!("fixtures/pdf/encrypted-needpw.pdf");
+        assert_eq!(Document::parse(pdf).err(), Some(PdfError::PasswordRequired));
+        let message = render(pdf, "doc.pdf", None, 10_000).unwrap_err();
+        assert!(message.contains("password required"), "{message}");
+    }
+
+    /// Replace `from` (once) with the same-length `to` in a fixture.
+    fn patched(pdf: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        assert_eq!(from.len(), to.len());
+        let at = find(pdf, from, 0).unwrap_or_else(|| panic!("{from:?} not found"));
+        let mut out = pdf.to_vec();
+        out[at..at + from.len()].copy_from_slice(to);
+        out
+    }
+
+    #[test]
+    fn tampered_or_unsupported_encryption_fails_closed_without_panicking() {
+        let rc4 = include_bytes!("fixtures/pdf/encrypted-rc4_128.pdf");
+        let aes = include_bytes!("fixtures/pdf/encrypted-aes256.pdf");
+        // A foreign security handler is named, never "decrypted".
+        let foreign = patched(rc4, b"/Standard", b"/Foo.Bar!");
+        match Document::parse(&foreign) {
+            Err(PdfError::UnsupportedEncryption(what)) => {
+                assert!(what.contains("security handler Foo.Bar!"), "{what}")
+            }
+            other => panic!("unexpected {:?}", other.err()),
+        }
+        // A different revision is unsupported rather than guessed at.
+        let revision = patched(rc4, b"/R 3", b"/R 9");
+        assert!(matches!(
+            Document::parse(&revision).err(),
+            Some(PdfError::UnsupportedEncryption(_))
+        ));
+        // A damaged user-validation entry is a password failure, not garbage text.
+        let mut broken_user = aes.to_vec();
+        let at = find(&broken_user, b"/U", 0).unwrap();
+        let hex = find(&broken_user, b"<", at).unwrap() + 1;
+        broken_user[hex] = if broken_user[hex] == b'0' { b'1' } else { b'0' };
+        assert_eq!(
+            Document::parse(&broken_user).err(),
+            Some(PdfError::PasswordRequired)
+        );
+        // Every truncation of an encrypted file parses or errors; none panics.
+        for len in (0..aes.len()).step_by(37) {
+            let _ = Document::parse(&aes[..len]);
+            let _ = Document::parse(&rc4[..len.min(rc4.len())]);
+        }
+        // Garbage in encrypted stream bodies yields a note, not a panic.
+        let mut garbled = aes.to_vec();
+        let stream = find(&garbled, b"stream", 0).unwrap() + 8;
+        for byte in garbled.iter_mut().skip(stream).take(24) {
+            *byte ^= 0xA5;
+        }
+        if let Ok(document) = Document::parse(&garbled) {
+            let _ = document.page_content(0);
+        }
+        // An Encrypt entry that points nowhere stays a clean refusal.
+        let mut dangling = build(&[Content::Plain(HELLO_PAGE.into())], false);
+        let trailer = find(&dangling, b"/Root", 0).unwrap();
+        dangling.splice(trailer..trailer, b"/Encrypt 99 0 R ".iter().copied());
+        assert_eq!(Document::parse(&dangling).err(), Some(PdfError::Encrypted));
+    }
+
+    #[test]
+    fn stream_over_the_decode_budget_is_reported_not_dropped() {
+        let big = vec![b' '; (MAX_STREAM_DECODED as usize) + 1024];
+        let pdf = build(
+            &[Content::Encoded(
+                "/Filter /FlateDecode".into(),
+                deflate(&big),
+            )],
+            false,
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let content = document.page_content(0).unwrap();
+        assert!(content.text.is_empty());
+        assert!(
+            content.notes[0].contains("exceeds the decode budget"),
+            "{:?}",
+            content.notes
+        );
+    }
 
     #[test]
     fn extracts_plain_and_deflated_pages_in_page_tree_order() {

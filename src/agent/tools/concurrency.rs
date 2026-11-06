@@ -18,6 +18,31 @@ use rig::wasm_compat::WasmBoxedFuture;
 use tokio::sync::RwLock;
 
 pub(crate) const DEFAULT_TOOL_CONCURRENCY: usize = 4;
+/// Largest `tool_concurrency` a config may select.
+pub(crate) const MAX_TOOL_CONCURRENCY: usize = 16;
+
+static CONFIGURED_TOOL_CONCURRENCY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_TOOL_CONCURRENCY);
+
+/// Install the `tool_concurrency` config value (clamped to
+/// `1..=MAX_TOOL_CONCURRENCY`; unset restores the default of 4).
+pub(crate) fn install_tool_concurrency(configured: Option<usize>) {
+    CONFIGURED_TOOL_CONCURRENCY.store(
+        resolve_tool_concurrency(configured),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn resolve_tool_concurrency(configured: Option<usize>) -> usize {
+    configured.map_or(DEFAULT_TOOL_CONCURRENCY, |value| {
+        value.clamp(1, MAX_TOOL_CONCURRENCY)
+    })
+}
+
+/// Tool calls of one model turn that may run at once.
+pub(crate) fn tool_concurrency() -> usize {
+    CONFIGURED_TOOL_CONCURRENCY.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolAccess {
@@ -367,6 +392,24 @@ pub(crate) fn bind_with_shared(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_concurrency_setting_is_bounded_and_defaults_to_four() {
+        assert_eq!(resolve_tool_concurrency(None), 4);
+        assert_eq!(resolve_tool_concurrency(Some(0)), 1);
+        assert_eq!(resolve_tool_concurrency(Some(10)), 10);
+        assert_eq!(resolve_tool_concurrency(Some(10_000)), MAX_TOOL_CONCURRENCY);
+        let cfg = crate::config::load::parse_config_content(
+            std::path::Path::new("config.toml"),
+            "tool_concurrency = 9\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tool_concurrency, Some(9));
+        let unset =
+            crate::config::load::parse_config_content(std::path::Path::new("config.toml"), "")
+                .unwrap();
+        assert_eq!(unset.tool_concurrency, None);
+    }
+
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

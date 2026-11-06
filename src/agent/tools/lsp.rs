@@ -25,6 +25,7 @@ pub struct LspTool {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LspArgs {
     /// File to inspect. Omit to list diagnostics for every file.
     pub path: Option<String>,
@@ -204,6 +205,7 @@ pub struct LspNavigateTool {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LspNavigateArgs {
     /// definition | type_definition | implementation | references | hover |
     /// symbols | workspace_symbols

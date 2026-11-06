@@ -43,11 +43,17 @@ impl ImageReadSupport {
 pub(crate) struct ImageRead {
     pub(crate) mime: &'static str,
     pub(crate) data: String,
+    /// Further images returned in the same result (PDF page images).
+    pub(crate) more: Vec<(&'static str, String)>,
 }
 #[cfg(feature = "multimodal")]
 impl ImageRead {
     pub(crate) fn output(self, summary: &str) -> String {
-        serde_json::json!({"response": summary, "parts":[{"type":"image","mimeType":self.mime,"data":self.data}]}).to_string()
+        let parts: Vec<serde_json::Value> = std::iter::once((self.mime, self.data))
+            .chain(self.more)
+            .map(|(mime, data)| serde_json::json!({"type":"image","mimeType":mime,"data":data}))
+            .collect();
+        serde_json::json!({"response": summary, "parts": parts}).to_string()
     }
 }
 

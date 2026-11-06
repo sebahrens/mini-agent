@@ -21,6 +21,8 @@ pub(crate) mod memoize;
 pub(crate) mod mutation_diff;
 pub(crate) mod normalize;
 pub(crate) mod notebook;
+pub(crate) mod pdf_crypt;
+pub(crate) mod pdf_filters;
 pub(crate) mod pdf_text;
 pub(crate) mod read;
 pub(crate) mod read_image;
@@ -697,6 +699,7 @@ pub fn is_vcs_metadata(name: &str) -> bool {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadArgs {
     pub path: String,
     #[serde(default)]
@@ -712,6 +715,7 @@ pub struct ReadArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteArgs {
     pub path: String,
     pub content: String,
@@ -720,6 +724,7 @@ pub struct WriteArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EditArgs {
     pub path: String,
     #[serde(default)]
@@ -741,6 +746,7 @@ pub(crate) struct EditBlock {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EditOp {
     pub line: Option<String>,
     pub lines: Option<String>,
@@ -748,6 +754,7 @@ pub(crate) struct EditOp {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BashArgs {
     pub command: String,
     pub timeout: Option<u64>,
@@ -777,6 +784,7 @@ pub enum JobAction {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobStatusArgs {
     pub id: Option<String>,
     #[serde(default)]
@@ -792,6 +800,7 @@ pub struct JobStatusArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrepArgs {
     pub pattern: String,
     pub path: Option<String>,
@@ -810,6 +819,9 @@ pub struct GrepArgs {
     /// Result lines (or matching files) to skip, for paging.
     #[serde(default)]
     pub offset: Option<u64>,
+    /// Also search files that `.gitignore`/`.ignore`/global excludes hide.
+    #[serde(default)]
+    pub no_ignore: bool,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -830,6 +842,7 @@ pub enum FindFilesSort {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FindFilesArgs {
     pub pattern: String,
     /// Matches to skip (0-based) for paging past the result cap.
@@ -844,9 +857,13 @@ pub struct FindFilesArgs {
     pub mode: FindFilesMode,
     #[serde(default)]
     pub sort: FindFilesSort,
+    /// Also list files that `.gitignore`/`.ignore`/global excludes hide.
+    #[serde(default)]
+    pub no_ignore: bool,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ListDirArgs {
     pub path: Option<String>,
     /// Entries to skip (0-based) for paging past the entry cap.
@@ -858,6 +875,9 @@ pub struct ListDirArgs {
     /// Levels to expand (1 = this directory only; at most 3).
     #[serde(default)]
     pub depth: Option<usize>,
+    /// Also list entries that `.gitignore`/`.ignore`/global excludes hide.
+    #[serde(default)]
+    pub no_ignore: bool,
 }
 
 /// Turns a diagnosed permission verdict into the tool-facing result: coaching

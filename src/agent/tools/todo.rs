@@ -27,6 +27,7 @@ pub struct TodoItem {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TodoWriteArgs {
     pub todos: Vec<TodoItem>,
 }
@@ -319,6 +320,7 @@ impl Tool for WriteTodoList {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TodoReadArgs {}
 
 pub struct ReadTodoList {

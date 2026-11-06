@@ -63,6 +63,24 @@ Notable changes to mini-agent are documented in this file. The format follows
   mini-agent-ktcqn).
 ### Tool layer
 
+- Tool argument structs reject unknown field names (`workdir`, `run_in_background`, `glob`,
+  `head_limit`, ...) with an error listing the valid names instead of silently dropping them
+  (mini-agent-hj7hy).
+- `read` on a PDF now decodes ASCII85, LZW, RunLength and PNG/TIFF-predicted content streams, names
+  any stream it still cannot decode (`[page 3: content stream uses JBIG2Decode, not supported]`),
+  and calls a PDF scanned only when its pages paint images and run no text operators
+  (mini-agent-7qbtw).
+- New `tool_concurrency` setting (default 4, clamped to 1..=16) sets how many tool calls of one
+  model turn run at once; read/write lanes still serialize conflicting calls (mini-agent-poi3o).
+- `grep`, `find_files` and `list_dir` accept `no_ignore` (default false) to include gitignored and
+  generated files, and otherwise count and name the ignored entries they skipped
+  (mini-agent-hacmm).
+- `read` on a scanned PDF (pages that paint images and have no text layer) returns the page images
+  (up to 4 per call, JPEG passthrough or PNG) to models that accept images, naming the page of each
+  image and how to continue (mini-agent-totd8).
+- `read` and `web_fetch` open PDFs encrypted with the standard security handler and an empty user
+  password (RC4-40/128, AESV2, AES-256); files needing a real password report `password required`
+  (mini-agent-6xx6x). Adds the `aes` and `md-5` crates (RustCrypto, already-shared digest stack).
 - `list_dir` pages through every entry of a flat directory (the 10,000-entry cap now applies only to
   depth 2-3 trees); `find_files` accepts `offset`/`limit` and names `continue with offset=N`.
 - `git` diff/show pages and `job_status` polls are self-bounded (git pages scale under

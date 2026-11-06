@@ -1662,6 +1662,7 @@ pub(crate) fn effective_session_reserve(
 // Rig tools
 // ---------------------------------------------------------------------------
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryWriteArgs {
     /// "long_term" | "scratchpad" | "daily" | "note"
     pub target: String,
@@ -1741,6 +1742,7 @@ Prefer long_term for things that should always be remembered."
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryEditArgs {
     /// "long_term" | "scratchpad" | "daily" | "note"
     pub target: String,
@@ -1832,6 +1834,7 @@ append or overwrite; use this to surgically fix or remove existing content."
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryReadArgs {
     /// "long_term" | "scratchpad" | "daily" | "note" | "list"
     pub source: String,
@@ -1943,6 +1946,7 @@ impl Mem {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemorySearchArgs {
     pub query: String,
 }

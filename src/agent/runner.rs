@@ -2974,9 +2974,7 @@ where
                 async move {
                     agent_ref
                         .stream_chat(p, h)
-                        .tool_concurrency(
-                            crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY,
-                        )
+                        .tool_concurrency(crate::agent::tools::concurrency::tool_concurrency())
                         .add_hook(crate::spend::run::AdmissionHook(
                             crate::spend::run::Run::current(),
                         ))
@@ -3644,7 +3642,7 @@ where
     agent
         .stream_chat(current_prompt.clone(), new_history)
         .max_turns(max_turns)
-        .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+        .tool_concurrency(crate::agent::tools::concurrency::tool_concurrency())
         .add_hook(steering_hook.unwrap_or_default())
         .add_hook(native_capture)
         .add_hook(crate::spend::run::AdmissionHook(
@@ -4143,9 +4141,7 @@ where
                         let request = agent
                             .stream_chat(prompt, history)
                             .max_turns(max_turns)
-                            .tool_concurrency(
-                                crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY,
-                            )
+                            .tool_concurrency(crate::agent::tools::concurrency::tool_concurrency())
                             .add_hook(steering_hook.clone())
                             .add_hook(StopBarrierHook(Arc::clone(&runner_compaction_shared)))
                             .add_hook(native_capture.clone())
@@ -5219,7 +5215,7 @@ where
                 agent
                     .stream_chat(p, h)
                     .max_turns(max_turns)
-                    .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+                    .tool_concurrency(crate::agent::tools::concurrency::tool_concurrency())
                     .add_hook(capture)
                     .add_hook(crate::spend::run::AdmissionHook(
                         crate::spend::run::Run::current(),
@@ -5916,7 +5912,7 @@ where
                     .stream_chat(p, history)
                     .max_turns(max_turns)
                     .add_hook(admission)
-                    .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+                    .tool_concurrency(crate::agent::tools::concurrency::tool_concurrency())
                     .add_hook(crate::spend::run::AdmissionHook(
                         crate::spend::run::Run::current(),
                     ))

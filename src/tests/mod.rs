@@ -332,6 +332,8 @@ mod headless_forced_stop_tests;
 #[cfg(all(test, feature = "hooks"))]
 mod hooks;
 #[cfg(test)]
+mod ignored_discovery_tests;
+#[cfg(test)]
 mod image_read_tests;
 #[cfg(test)]
 mod input_tests;
@@ -365,6 +367,8 @@ mod multimodal_tests;
 mod normalize_tests;
 #[cfg(test)]
 mod paste_burst_tests;
+#[cfg(all(test, feature = "multimodal"))]
+mod pdf_page_image_tests;
 #[cfg(test)]
 mod picker_tests;
 #[cfg(test)]
@@ -418,6 +422,8 @@ mod subprocess_inventory_tests;
 pub(crate) mod support;
 #[cfg(test)]
 mod todo_tests;
+#[cfg(test)]
+mod tool_unknown_args_tests;
 #[cfg(test)]
 mod tools_filter_tests;
 #[cfg(test)]
