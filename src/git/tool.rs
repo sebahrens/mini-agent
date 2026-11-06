@@ -17,6 +17,15 @@ const TEXT_LIMITS: crate::sandbox::CommandLimits = crate::sandbox::CommandLimits
     combined_bytes: 224 * 1024,
 };
 
+/// Bounds for `git status`: a larger time budget than other queries (huge
+/// monorepos), with output beyond the cap reported as truncated.
+const STATUS_LIMITS: crate::sandbox::CommandLimits = crate::sandbox::CommandLimits {
+    timeout: std::time::Duration::from_secs(30),
+    stdout_bytes: 256 * 1024,
+    stderr_bytes: 64 * 1024,
+    combined_bytes: 320 * 1024,
+};
+
 /// Bounds for the filter-attribute probe, which lists and classifies every
 /// index path. Exceeding them fails the operation closed.
 const FILTER_PROBE_LIMITS: crate::sandbox::CommandLimits = crate::sandbox::CommandLimits {
@@ -289,14 +298,28 @@ impl GitTool {
         #[cfg(test)]
         if self.test_uncontained {
             let result = if allow_nonzero_or_truncated {
-                self.runner
-                    .run_allow_exit(
+                // Mirrors the contained path: truncated output is observed,
+                // not an error.
+                match self
+                    .runner
+                    .run_observed(
                         self.workspace.root(),
                         operation,
                         hardened_args(args),
                         limits,
                     )
                     .await
+                {
+                    Ok(output)
+                        if matches!(output.status, CommandStatus::OutputLimitExceeded(_))
+                            || (output.status == CommandStatus::Completed
+                                && output.exit_status.is_some()) =>
+                    {
+                        Ok(output)
+                    }
+                    Ok(output) => command_result(operation, limits, output),
+                    Err(error) => Err(error),
+                }
             } else {
                 self.runner
                     .run(
@@ -464,32 +487,78 @@ impl GitTool {
 
     /// `git status` refreshes the index, so callers pass the argument prefix
     /// returned by [`Self::filter_guard`] for the current operation.
+    ///
+    /// Untracked directories are collapsed (`dir/`) so an un-ignored
+    /// `node_modules` costs one record, and output beyond the cap is reported
+    /// as `truncated: true` with the complete records that fit instead of
+    /// failing the operation (and every mutation that snapshots around it).
     async fn status_snapshot(&self, guard: &[String]) -> Result<serde_json::Value, ToolError> {
+        self.status_snapshot_for(guard, &[]).await
+    }
+
+    async fn status_snapshot_for(
+        &self,
+        guard: &[String],
+        paths: &[String],
+    ) -> Result<serde_json::Value, ToolError> {
+        // Narrowing to paths expands untracked directories inside them.
+        let untracked = if paths.is_empty() {
+            "--untracked-files=normal"
+        } else {
+            "--untracked-files=all"
+        };
+        let mut command = vec![
+            "status".into(),
+            "--porcelain=v2".into(),
+            "-z".into(),
+            "--branch".into(),
+            untracked.into(),
+            "--ignore-submodules=all".into(),
+        ];
+        if !paths.is_empty() {
+            command.push("--".into());
+            command.extend(paths.iter().cloned());
+        }
         let output = self
-            .run(
-                "status",
-                guarded(
-                    guard,
-                    vec![
-                        "status".into(),
-                        "--porcelain=v2".into(),
-                        "-z".into(),
-                        "--branch".into(),
-                        "--untracked-files=all".into(),
-                        "--ignore-submodules=all".into(),
-                    ],
-                ),
-                QUERY_LIMITS,
-                false,
-            )
+            .run("status", guarded(guard, command), STATUS_LIMITS, true)
             .await?;
-        let records = output
-            .stdout
+        let truncated = matches!(output.status, CommandStatus::OutputLimitExceeded(_));
+        let output = if truncated {
+            output
+        } else {
+            command_result("status", STATUS_LIMITS, output).map_err(ToolError::Msg)?
+        };
+        let mut stdout: &[u8] = &output.stdout;
+        if truncated {
+            // Keep only complete NUL-terminated records.
+            stdout = &stdout[..stdout
+                .iter()
+                .rposition(|byte| *byte == 0)
+                .map_or(0, |i| i + 1)];
+        }
+        let records = stdout
             .split(|byte| *byte == 0)
             .filter(|record| !record.is_empty())
             .map(|record| String::from_utf8_lossy(record).into_owned())
             .collect::<Vec<_>>();
-        Ok(serde_json::json!({ "records": records }))
+        let untracked_count = records.iter().filter(|r| r.starts_with("? ")).count();
+        let changed_count = records
+            .iter()
+            .filter(|r| matches!(r.as_bytes().first(), Some(b'1' | b'2' | b'u')))
+            .count();
+        let mut value = serde_json::json!({
+            "records": records,
+            "truncated": truncated,
+            "counts": { "changed": changed_count, "untracked": untracked_count },
+        });
+        if truncated {
+            value["truncation_note"] = serde_json::json!(
+                "status output exceeded the cap; only the first records are listed. \
+                 Pass `paths` to narrow status to a subdirectory (untracked files are \
+                 then listed individually)."
+            );
+        }
+        Ok(value)
     }
 
     async fn head_id(&self) -> Option<String> {
@@ -651,16 +720,28 @@ impl GitTool {
     }
 
     async fn ensure_no_external_filters(&self, paths: &[String]) -> Result<(), ToolError> {
-        let mut args = vec![
-            "check-attr".into(),
-            "-z".into(),
-            "--all".into(),
-            "--".into(),
-        ];
-        args.extend(paths.iter().cloned());
+        // Paths travel on stdin: a large directory expands to more operands
+        // than argv can carry.
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
         let output = self
-            .run("check-attributes", args, QUERY_LIMITS, false)
+            .run_with_input(
+                "check-attributes",
+                vec![
+                    "check-attr".into(),
+                    "-z".into(),
+                    "--all".into(),
+                    "--stdin".into(),
+                ],
+                input,
+                PAGED_TEXT_LIMITS,
+            )
             .await?;
+        let output = command_result("check-attributes", PAGED_TEXT_LIMITS, output)
+            .map_err(ToolError::Msg)?;
         let fields = output
             .stdout
             .split(|byte| *byte == 0)
@@ -697,8 +778,14 @@ impl GitTool {
         ];
         args.extend(paths.iter().cloned());
         let output = self
-            .run("expand-stage-paths", args, QUERY_LIMITS, false)
-            .await?;
+            .run("expand-stage-paths", args, PAGED_TEXT_LIMITS, false)
+            .await
+            .map_err(|error| {
+                ToolError::Msg(format!(
+                    "{error}; the selection is too large to stage at once. Stage a narrower \
+                     set of subdirectories in separate calls."
+                ))
+            })?;
         Ok(output
             .stdout
             .split(|byte| *byte == 0)
@@ -1178,14 +1265,15 @@ impl GitTool {
         match args.operation {
             GitOperation::Status => {
                 reject_irrelevant_fields(&args, false, false, false)?;
-                if !args.paths.is_empty() {
-                    return Err(ToolError::Msg(
-                        "paths are not supported by Git status".to_string(),
-                    ));
-                }
-                let coaching = self.permission("git/status", "workspace").await?;
+                let paths = self.validate_paths(&args.paths, None).await?;
+                let identity = if paths.is_empty() {
+                    "workspace".to_string()
+                } else {
+                    serde_json::to_string(&serde_json::json!({ "paths": paths }))?
+                };
+                let coaching = self.permission("git/status", &identity).await?;
                 let guard = self.filter_guard("status").await?;
-                let mut value = self.status_snapshot(&guard).await?;
+                let mut value = self.status_snapshot_for(&guard, &paths).await?;
                 value["operation"] = serde_json::json!("status");
                 value["coaching"] = serde_json::json!(coaching);
                 Ok(value)
@@ -1341,7 +1429,7 @@ impl Tool for GitTool {
     type Output = serde_json::Value;
 
     fn description(&self) -> String {
-        "Inspect and update the bound Git repository through fixed structured operations: status, diff/show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log, stage, unstage, commit, branches, branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available.".to_string()
+        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff/show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log, stage, unstage, commit, branches, branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -2018,6 +2106,58 @@ mod tests {
 
         assert!(text.contains("Binary files"), "{text}");
         assert!(!text.contains("GIT binary patch"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn status_collapses_untracked_directories_and_flags_truncation() {
+        let repo = TestRepo::new();
+        std::fs::create_dir(repo.path().join("generated")).unwrap();
+        for i in 0..6000 {
+            repo.write(
+                &format!("generated/file-with-a-long-generated-name-{i:06}.txt"),
+                "x",
+            );
+        }
+        let tool = repo.tool();
+        let status = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .expect("status of a huge untracked tree must succeed");
+        assert_eq!(status["truncated"], false, "{status}");
+        assert_eq!(status["counts"]["untracked"], 1);
+        assert!(
+            status["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "? generated/"),
+            "{status}"
+        );
+
+        // Narrowing to a path lists files individually; the cap flags truncation.
+        let narrowed = tool
+            .call(args(GitOperation::Status, &["generated"], None))
+            .await
+            .expect("narrowed status");
+        assert_eq!(narrowed["truncated"], true, "{narrowed}");
+        assert!(narrowed["truncation_note"].is_string());
+        let records = narrowed["records"].as_array().unwrap();
+        assert!(!records.is_empty());
+        assert!(
+            records
+                .iter()
+                .filter(|r| r.as_str().unwrap().starts_with("? "))
+                .all(|r| r.as_str().unwrap().ends_with(".txt")),
+            "only complete records survive truncation"
+        );
+
+        // Mutations snapshot around the tool and keep working.
+        let staged = tool
+            .call(args(GitOperation::Stage, &["generated"], None))
+            .await
+            .expect("stage a large directory");
+        assert_eq!(staged["exit_code"], 0, "{staged}");
+        assert_eq!(repo.git(["ls-files"]).lines().count(), 6000);
     }
 
     #[tokio::test]

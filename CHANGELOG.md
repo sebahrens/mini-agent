@@ -23,6 +23,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   mini-agent-ktcqn).
 ### Tool layer
 
+- `git status` collapses untracked directories, accepts `paths`, and reports `truncated`/`counts`
+  instead of failing past 256 KiB (so stage/commit/restore snapshots work in repos with huge
+  untracked trees); `stage` handles directories of many thousands of files (mini-agent-ql57u).
 - `list_dir` pages through every entry of a flat directory (the 10,000-entry cap now applies only to
   depth 2-3 trees); `find_files` accepts `offset`/`limit` and names `continue with offset=N`.
 - `git` diff/show pages and `job_status` polls are self-bounded (git pages scale under

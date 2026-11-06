@@ -741,6 +741,14 @@ their output: one run captures up to 16 MiB (30 s), each call returns at most
 `total_bytes`, and `truncated` reports output beyond the run ceiling. There are
 still no remotes, fetch/pull/push or network operations.
 
+`status` collapses untracked directories (`? dir/`), runs under a 30 s / 256 KiB budget and
+returns `{records, truncated, counts}`; output past the cap lists only complete records with
+`truncated: true` and a `truncation_note` instead of failing, and every mutation's before/after
+snapshot tolerates truncation. `status` accepts optional `paths`, which narrows the query and lists
+untracked files inside them individually. `stage` expands directory operands with a 16 MiB budget
+and checks attributes over stdin, so a directory of many thousands of files stages; a selection too
+large for that budget fails with a message to stage narrower subdirectories (mini-agent-ql57u).
+
 `src/ui/slash/git.rs` owns parsing, bounded request-path selection, proposal
 validation and SDK-free native actors for `/diff`, `/commit` and `/pr`. The App
 owns the preview, async event receiver and captured session/workspace identity.
