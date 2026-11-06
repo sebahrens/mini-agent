@@ -190,6 +190,8 @@ fn main() {
             let id = request_id(&body);
             let capabilities = if mode == "save-diagnostics" {
                 "{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}}}"
+            } else if mode == "navigate" {
+                "{\"definitionProvider\":true,\"referencesProvider\":true,\"hoverProvider\":true,\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true}"
             } else {
                 "{}"
             };
@@ -272,6 +274,51 @@ fn main() {
                     publish(&uri, version);
                 }
             }
+        } else if mode == "navigate"
+            && (body.contains("\"method\":\"textDocument/")
+                || body.contains("\"method\":\"workspace/symbol\""))
+        {
+            let id = request_id(&body);
+            let uri = body
+                .split_once("\"uri\":")
+                .map(|(_, rest)| rest.split('"').nth(1).unwrap().to_string())
+                .unwrap_or_default();
+            let number = |key: &str| -> String {
+                body.split_once(&format!("\"{key}\":"))
+                    .map(|(_, rest)| rest.chars().take_while(|c| c.is_ascii_digit()).collect())
+                    .unwrap_or_default()
+            };
+            let range = |line: u32, character: u32| format!(
+                "{{\"start\":{{\"line\":{line},\"character\":{character}}},\"end\":{{\"line\":{line},\"character\":{}}}}}",
+                character + 1
+            );
+            let result = if body.contains("textDocument/definition") {
+                format!("{{\"uri\":\"{uri}\",\"range\":{}}}", range(2, 4))
+            } else if body.contains("textDocument/references") {
+                format!(
+                    "[{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"file:///nonexistent-outside/lib.rs\",\"range\":{}}}]",
+                    range(0, 3), range(5, 0), range(1, 1)
+                )
+            } else if body.contains("textDocument/hover") {
+                format!(
+                    "{{\"contents\":{{\"kind\":\"markdown\",\"value\":\"fixture hover at {}:{}\"}}}}",
+                    number("line"), number("character")
+                )
+            } else if body.contains("textDocument/documentSymbol") {
+                format!(
+                    "[{{\"name\":\"Outer\",\"kind\":23,\"range\":{},\"selectionRange\":{},\"children\":[{{\"name\":\"inner\",\"kind\":6,\"range\":{},\"selectionRange\":{}}}]}}]",
+                    range(0, 0), range(0, 7), range(1, 0), range(1, 4)
+                )
+            } else if body.contains("workspace/symbol") {
+                let workspace_uri = env::var("LSP_FIXTURE_SYMBOL_URI").unwrap_or_default();
+                format!(
+                    "[{{\"name\":\"found_symbol\",\"kind\":12,\"location\":{{\"uri\":\"{workspace_uri}\",\"range\":{}}}}}]",
+                    range(7, 2)
+                )
+            } else {
+                "null".to_string()
+            };
+            write_frame(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}"));
         } else if body.contains("\"method\":\"mini-agent/test\"") {
             if let Some(path) = env::var_os("LSP_FIXTURE_REQUEST_FILE") {
                 fs::write(path, "seen").unwrap();
@@ -1290,6 +1337,120 @@ async fn lsp_process_configured_wait_admits_slow_publish_and_timeout_is_reported
         !timed_out.contains("fixture delayed diagnostic"),
         "{timed_out}"
     );
+}
+
+#[tokio::test]
+async fn lsp_process_navigate_tool_maps_locations_and_respects_read_denies() {
+    use crate::agent::tools::lsp::{LspNavigateArgs, LspNavigateTool};
+    let fixture = FixtureBuild::compile("navigate");
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("src/nav.rs"),
+        "struct Outer;\nfn inner() {}\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/secret.rs"), "fn hidden() {}\n").unwrap();
+    let symbol_uri = file_uri(&workspace.join("src/nav.rs")).unwrap();
+    let lease = fixture.path("navigate.lease");
+    let mut server = fixture.config("navigate", &lease);
+    server.extensions = vec![".rs".into()];
+    server
+        .env
+        .insert("LSP_FIXTURE_SYMBOL_URI".into(), symbol_uri);
+    let manager = LspManager::new(
+        &LspConfig {
+            servers: HashMap::from([("fixture".into(), server)]),
+            ..Default::default()
+        },
+        Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+    );
+    let tool = LspNavigateTool::new(manager.clone(), None, None);
+    let args = |op: &str, path: &str, position: Option<(u32, u32)>| LspNavigateArgs {
+        op: op.into(),
+        path: path.into(),
+        line: position.map(|(line, _)| line),
+        column: position.map(|(_, column)| column),
+        query: Some("found".into()),
+    };
+    let definition = tool
+        .call(args("definition", "src/nav.rs", Some((2, 4))))
+        .await;
+    let references = tool
+        .call(args("references", "src/nav.rs", Some((1, 1))))
+        .await;
+    let hover = tool.call(args("hover", "src/nav.rs", Some((2, 6)))).await;
+    let symbols = tool.call(args("symbols", "src/nav.rs", None)).await;
+    let workspace_symbols = tool
+        .call(args("workspace_symbols", "src/nav.rs", None))
+        .await;
+    let unsupported = tool
+        .call(args("implementation", "src/nav.rs", Some((1, 1))))
+        .await;
+    let missing_position = tool.call(args("references", "src/nav.rs", None)).await;
+    let outside = tool.call(args("symbols", "../outside.rs", None)).await;
+
+    // A read deny rule blocks the query and hides denied result files.
+    let permission = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                read: Some(crate::permission::ToolPerm::Granular(
+                    [("**/secret.rs".to_string(), crate::permission::Action::Deny)].into(),
+                )),
+                ..Default::default()
+            }),
+            crate::permission::SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["guarded".into(), "standard".into()]),
+        )
+        .unwrap(),
+    ));
+    let guarded = LspNavigateTool::new(manager.clone(), Some(permission), None);
+    let denied = guarded.call(args("symbols", "src/secret.rs", None)).await;
+    let allowed = guarded
+        .call(args("definition", "src/nav.rs", Some((2, 4))))
+        .await;
+    manager.shutdown().await;
+    drop(tool);
+    drop(guarded);
+    drop(manager);
+    fixture.cleanup().await;
+
+    assert_eq!(definition.unwrap(), "src/nav.rs:3:5");
+    let references = references.unwrap();
+    assert!(
+        references.starts_with("src/nav.rs:1:4\nsrc/nav.rs:6:1"),
+        "{references}"
+    );
+    assert!(
+        references.contains("[1 results outside the workspace omitted]"),
+        "{references}"
+    );
+    assert!(!references.contains("nonexistent-outside"), "{references}");
+    // The 1-based position is sent zero-based.
+    assert_eq!(hover.unwrap(), "fixture hover at 1:5");
+    assert_eq!(
+        symbols.unwrap(),
+        "struct Outer — src/nav.rs:1:8\n  method inner — src/nav.rs:2:5"
+    );
+    assert_eq!(
+        workspace_symbols.unwrap(),
+        "function found_symbol — src/nav.rs:8:3"
+    );
+    let unsupported = unsupported.unwrap_err().to_string();
+    assert!(
+        unsupported.contains("implementationProvider"),
+        "{unsupported}"
+    );
+    assert!(
+        missing_position
+            .unwrap_err()
+            .to_string()
+            .contains("needs 1-based `line` and `column`")
+    );
+    assert!(outside.is_err());
+    assert!(denied.is_err(), "read deny must block the query");
+    assert_eq!(allowed.unwrap(), "src/nav.rs:3:5");
 }
 
 #[cfg(unix)]

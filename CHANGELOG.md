@@ -139,6 +139,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   gives a sandboxed agent guarded `push_branch` and `wait_for_checks`, plus opt-in
   `create_release`). `make install` now also runs `make install-ghagent`, which installs it under
   `$(PREFIX)` (default `~/.local`); it never touches `~/.config/ghagent` or the mini-agent config.
+- `lsp_navigate` tool: read-only semantic navigation through the configured language servers
+  (`definition`, `type_definition`, `implementation`, `references`, `hover`, `symbols`,
+  `workspace_symbols`). It follows `read` permission rules, only queries workspace files, maps
+  result URIs back to workspace paths (outside locations are counted, not named) and caps results
+  at 100 entries and hover text at 8 KiB (mini-agent-8v84r).
 
 **Fork release 1.14.1 (2026-10-26)**
 

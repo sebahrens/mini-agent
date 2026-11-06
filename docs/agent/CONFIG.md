@@ -2150,7 +2150,7 @@ cannot be rooted at `/proc` or a process directory. This keeps env-held tokens
 out of the model's reach through the in-process read tools.
 An `external_directory` deny is a security baseline: it takes precedence over
 matching tool-specific allows and prior session AllowAlways scopes, including
-inherited `read` access used by `lsp_diagnostics`. When several
+inherited `read` access used by `lsp_diagnostics` and `lsp_navigate`. When several
 `external_directory` rules match one path they follow the same
 order-independent precedence as tool rules (see Rule precedence): any `deny`
 wins, otherwise the most specific pattern, with `ask` beating `allow` on a tie.
@@ -3562,6 +3562,25 @@ For a file extension claimed by multiple servers, user-configured servers
 take precedence in alphabetical server-name order, followed by built-ins in
 their declaration order. A same-named user entry replaces its built-in;
 `disabled = true` or an empty command removes that entry from selection.
+
+An `lsp_navigate` tool offers read-only semantic navigation through the same
+servers: `op` = `definition`, `type_definition`, `implementation`,
+`references` (these take the 1-based `line`/`column` of the symbol; columns
+are UTF-16 code units as in LSP, equal to characters for BMP text), `hover`,
+`symbols` (outline of `path`) and `workspace_symbols` (`query`; `path`
+selects the server). It returns workspace-relative `path:line:column`
+locations (1-based). Only files inside the session workspace can be queried;
+the file is checked against the `read` policy (rules written for `read`
+apply, as for `lsp_diagnostics`) and synchronized from disk before the
+request. Result locations are mapped back through the same URI translation
+as diagnostics: locations outside the workspace or through symlink aliases
+are counted but never named, and files hidden by a `read` deny rule are
+counted as hidden. Results are capped at 100 locations/symbols (excess is
+reported with a count), hover text at 8 KiB (marked when truncated), and
+each request at 10 seconds. An op the server does not advertise in its
+`initialize` capabilities (for example no `implementationProvider`) fails
+with a message naming the missing capability. Restrict the tool with
+`--tools` like any other; it is registered whenever an LSP manager is.
 
 `lsp_diagnostics` uses the existing `read` permission policy. A file query
 checks the canonical file path before synchronizing it or starting a language

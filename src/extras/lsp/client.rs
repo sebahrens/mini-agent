@@ -427,6 +427,8 @@ pub struct LspClient {
     /// `initialize` result: [`SAVE_NONE`], [`SAVE_NOTIFY`] or
     /// [`SAVE_WITH_TEXT`]. Set once after the handshake.
     save_mode: AtomicU8,
+    /// `capabilities` from the server's `initialize` result.
+    capabilities: std::sync::OnceLock<Value>,
     #[cfg(test)]
     sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
     #[cfg(test)]
@@ -749,6 +751,7 @@ impl LspClient {
             last_used_ms: std::sync::atomic::AtomicU64::new(0),
             idle_task: Mutex::new(None),
             save_mode: AtomicU8::new(SAVE_NONE),
+            capabilities: std::sync::OnceLock::new(),
             #[cfg(test)]
             sync_probes: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
@@ -791,6 +794,12 @@ impl LspClient {
         client.save_mode.store(
             save_mode_from_capabilities(result.get("capabilities")),
             Ordering::Release,
+        );
+        let _ = client.capabilities.set(
+            result
+                .get("capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         );
         if !client.notify("initialized", json!({})).await {
             client.shutdown().await;
@@ -862,6 +871,61 @@ impl LspClient {
                 None
             }
         }
+    }
+
+    /// Whether the server's `initialize` result advertises `provider`
+    /// (e.g. `definitionProvider`). Absent, `null` and `false` mean no.
+    pub(crate) fn supports(&self, provider: &str) -> bool {
+        self.capabilities
+            .get()
+            .and_then(|capabilities| capabilities.get(provider))
+            .is_some_and(|value| !matches!(value, Value::Null | Value::Bool(false)))
+    }
+
+    /// Sends a navigation request and returns its `result` (`Value::Null`
+    /// for an empty answer). Errors on timeout, transport failure or an
+    /// error response.
+    pub(crate) async fn query(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        if !self.is_usable() {
+            return Err("language server is not running".to_string());
+        }
+        let response = self
+            .request(method, params, timeout)
+            .await
+            .ok_or_else(|| format!("'{method}' timed out after {} ms", timeout.as_millis()))?;
+        if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            return Err(format!(
+                "'{method}' failed: {}",
+                truncate_utf8_bytes(message, MAX_DIAGNOSTIC_MESSAGE_BYTES)
+            ));
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// The URI this server uses for a canonical workspace file.
+    pub(crate) fn wire_uri(&self, parent_path: &Path) -> Option<String> {
+        self.workspace.validate().ok()?;
+        let relative = parent_path.strip_prefix(self.workspace.root()).ok()?;
+        file_uri(&self.server_root.join(relative))
+    }
+
+    /// Maps a URI reported by the server to a canonical workspace path.
+    /// Outside paths, traversal and symlink aliases yield `None`.
+    pub(crate) fn parent_path(&self, wire_uri: &str) -> Option<PathBuf> {
+        file_path(&parent_diagnostic_uri(
+            &self.workspace,
+            &self.server_root,
+            wire_uri,
+        )?)
     }
 
     #[cfg(test)]

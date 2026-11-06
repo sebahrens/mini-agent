@@ -7,6 +7,7 @@
 //! crashed server only means "no diagnostics", never a failed edit.
 
 pub(crate) mod client;
+pub(crate) mod navigate;
 pub(crate) mod registry;
 pub mod rpc;
 

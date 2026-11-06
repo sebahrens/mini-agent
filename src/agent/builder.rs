@@ -81,6 +81,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "memory_search"
             | "advisor"
             | "lsp_diagnostics"
+            | "lsp_navigate"
             | "skills_search"
             | "ask_user_question"
             | "mcp_search"
@@ -597,6 +598,12 @@ fn compose_registered_preamble(
         }
     }
     #[cfg(feature = "lsp")]
+    if has("lsp_navigate") {
+        composition
+            .text
+            .push_str(crate::agent::prompt::LSP_NAVIGATE_PROMPT);
+    }
+    #[cfg(feature = "lsp")]
     if has("lsp_diagnostics") {
         composition.text.push_str(crate::agent::prompt::LSP_PROMPT);
         if has("edit") || has("write") {
@@ -659,6 +666,10 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
     #[cfg(feature = "lsp")]
     if cli.tool_is_eligible(cfg, "lsp_diagnostics") && cfg.resolve_lsp().is_some() {
         names.push("lsp_diagnostics");
+    }
+    #[cfg(feature = "lsp")]
+    if cli.tool_is_eligible(cfg, "lsp_navigate") && cfg.resolve_lsp().is_some() {
+        names.push("lsp_navigate");
     }
     names.retain(|name| {
         if *name == "job_status" {
@@ -1011,7 +1022,9 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     #[cfg(feature = "js")]
     let js_tool_enabled = cli.tool_is_eligible(cfg, "js");
     #[cfg(feature = "lsp")]
-    let lsp_manager = if !cli.tool_is_eligible(cfg, "lsp_diagnostics") {
+    let lsp_manager = if !cli.tool_is_eligible(cfg, "lsp_diagnostics")
+        && !cli.tool_is_eligible(cfg, "lsp_navigate")
+    {
         None
     } else {
         match cfg.resolve_lsp() {
@@ -1389,11 +1402,20 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
 
         #[cfg(feature = "lsp")]
         if let Some(lsp) = &lsp_manager {
-            all_tools.push(Box::new(tools::lsp::LspTool::new(
-                lsp.clone(),
-                permission.clone(),
-                ask_tx.clone(),
-            )));
+            if cli.tool_is_eligible(cfg, "lsp_diagnostics") {
+                all_tools.push(Box::new(tools::lsp::LspTool::new(
+                    lsp.clone(),
+                    permission.clone(),
+                    ask_tx.clone(),
+                )));
+            }
+            if cli.tool_is_eligible(cfg, "lsp_navigate") {
+                all_tools.push(Box::new(tools::lsp::LspNavigateTool::new(
+                    lsp.clone(),
+                    permission.clone(),
+                    ask_tx.clone(),
+                )));
+            }
         }
 
         #[cfg(feature = "agent-skills")]
@@ -2553,6 +2575,7 @@ mod mcp_tests {
             "memory_search",
             "advisor",
             "lsp_diagnostics",
+            "lsp_navigate",
             "skills_search",
             <crate::agent::tools::schedule_wakeup::ScheduleWakeup as rig::tool::Tool>::NAME,
         ] {

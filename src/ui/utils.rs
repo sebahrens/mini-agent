@@ -335,7 +335,7 @@ fn format_task_summary(
 pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
     match tool {
         "bash" | "shell" => input.to_string(),
-        "lsp_diagnostics" => {
+        "lsp_diagnostics" | "lsp_navigate" => {
             let expanded = crate::fs::expand_tilde(input);
             let path = std::path::Path::new(&expanded);
             // Aggregate LSP prompts carry the canonical project directory;
