@@ -1047,6 +1047,15 @@ pub struct Cli {
     )]
     pub mcp_server_allow_cwd_override: bool,
 
+    /// With `--mcp-server`: forward child permission asks as MCP elicitation.
+    #[cfg(feature = "mcp")]
+    #[arg(
+        long = "mcp-server-elicit-approvals",
+        requires = "mcp_server",
+        help = "With --mcp-server: when the MCP client supports elicitation, forward a run's permission asks to it for approval (default: asks fail closed)"
+    )]
+    pub mcp_server_elicit_approvals: bool,
+
     /// With `--mcp-server`: bound on one `run`, in seconds.
     #[cfg(feature = "mcp")]
     #[arg(
