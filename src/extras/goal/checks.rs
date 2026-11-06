@@ -98,7 +98,7 @@ where
                 false,
             );
         }
-        let operation = crate::extras::validation::start_with_limits(sandbox, command, limits);
+        let operation = crate::extras::validation::start_spooled(sandbox, command, limits);
         let cancellation = operation.cancellation();
         let wait = operation.wait();
         tokio::pin!(wait);

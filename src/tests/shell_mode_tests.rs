@@ -460,37 +460,51 @@ fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn explicit_shell_bounds_stdout_stderr_and_mixed_floods() {
+async fn explicit_shell_spools_large_output_instead_of_killing_the_command() {
     let sandbox = Sandbox::new(false, "bwrap");
-    let cases = [
-        ("!yes o", COMPLETION_LIMITS, CommandOutputLimit::Stdout),
-        ("!yes e >&2", COMPLETION_LIMITS, CommandOutputLimit::Stderr),
-        (
-            "!yes o & yes e >&2 & wait",
-            CommandLimits {
-                timeout: COMPLETION_LIMITS.timeout,
-                stdout_bytes: 8192,
-                stderr_bytes: 8192,
-                combined_bytes: SHORT_LIMITS.combined_bytes,
-            },
-            CommandOutputLimit::Combined,
-        ),
-    ];
+    let dir = std::env::temp_dir().join(format!("mini-agent-bang-logs-{}", uuid::Uuid::new_v4()));
+    sandbox.set_command_log_dir(Some(dir.clone()));
+    // 3 MiB exceeds the old 1 MiB stdout / 1.5 MiB combined kill caps.
+    let run = sandbox
+        .run_explicit_shell(
+            "!yes 0123456789abcdef | head -c 3145728; echo END-MARKER; exit 4",
+            COMPLETION_LIMITS,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.output.status, CommandStatus::Completed);
+    assert_eq!(run.output.exit_status.unwrap().code(), Some(4));
+    let rendered = run.rendered_output();
+    assert!(rendered.contains("END-MARKER"), "tail survives");
+    assert!(rendered.contains("[output truncated:"), "visible truncation");
+    assert!(rendered.contains("full output log:"), "names the log");
+    assert!(rendered.contains("exited with status 4"));
+    let logs: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].as_ref().unwrap().metadata().unwrap().len() >= 3 * 1024 * 1024);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(sandbox.active_group_count(), 0);
+}
 
-    for (command, limits, expected_limit) in cases {
-        let run = sandbox
-            .run_explicit_shell(command, limits, None)
-            .await
-            .unwrap();
-        assert!(matches!(
-            run.output.status,
-            CommandStatus::OutputLimitExceeded(limit) if limit == expected_limit
-        ));
-        assert!(run.output.stdout.len() <= limits.stdout_bytes);
-        assert!(run.output.stderr.len() <= limits.stderr_bytes);
-        assert!(run.output.stdout.len() + run.output.stderr.len() <= limits.combined_bytes);
-        assert_eq!(sandbox.active_group_count(), 0);
-    }
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_shell_infinite_output_stops_at_the_hard_ceiling_with_a_tail() {
+    let sandbox = Sandbox::new(false, "bwrap");
+    let run = sandbox
+        .run_explicit_shell("!yes o", COMPLETION_LIMITS, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        run.output.status,
+        CommandStatus::OutputLimitExceeded(CommandOutputLimit::Combined)
+    ));
+    // Memory stays at head + tail, not the 64 MiB that was produced.
+    assert!(run.output.stdout.len() < 2 * 1024 * 1024);
+    let rendered = run.rendered_output();
+    assert!(rendered.contains("64 MiB hard ceiling"), "{}", &rendered[rendered.len().saturating_sub(300)..]);
+    assert!(rendered.contains("[output truncated:"));
+    assert_eq!(sandbox.active_group_count(), 0);
 }
 
 #[cfg(unix)]

@@ -37,6 +37,12 @@ pub(crate) struct ValidationResult {
     pub stderr: Vec<u8>,
     limits: CommandLimits,
     diagnostic_truncated: bool,
+    /// Spooled run: bytes left out of the middle of the output, and the
+    /// private log holding the complete output when one could be written.
+    omitted_bytes: u64,
+    log: Option<std::path::PathBuf>,
+    /// Spooled run: the hard output ceiling reported by `output_truncated`.
+    hard_cap: Option<u64>,
 }
 
 /// Operation-scoped cancellation for exactly one loop validator.
@@ -63,15 +69,34 @@ pub(crate) struct ValidationOperation {
     command: String,
     limits: CommandLimits,
     cancellation: ValidationCancellation,
+    /// Run into a spooled capture instead of killing at the byte caps.
+    spooled: bool,
 }
 
 impl ValidationOperation {
+    /// Run this validation with spooled head/tail capture: output volume
+    /// never fails the command; only the hard ceiling stops it. The caps in
+    /// `limits` then only bound the rendered diagnostic.
+    pub(crate) fn spooled(mut self) -> Self {
+        self.spooled = true;
+        self
+    }
+
     #[cfg(any(feature = "goal", all(test, unix)))]
     pub(crate) fn cancellation(&self) -> ValidationCancellation {
         self.cancellation.clone()
     }
 
     pub(crate) async fn wait(self) -> ValidationResult {
+        if self.spooled {
+            return run_spooled(
+                &self.sandbox,
+                &self.command,
+                self.limits,
+                &self.cancellation,
+            )
+            .await;
+        }
         run_with_limits_and_cancellation(
             &self.sandbox,
             &self.command,
@@ -108,7 +133,25 @@ impl ValidationResult {
             stderr,
             limits,
             diagnostic_truncated,
+            omitted_bytes: 0,
+            log: None,
+            hard_cap: None,
         }
+    }
+
+    fn from_spooled(
+        output: CommandOutput,
+        transcript: &crate::sandbox::OutputTranscript,
+        limits: CommandLimits,
+    ) -> Self {
+        let mut result = Self::from_command_output(output, limits);
+        result.omitted_bytes = transcript.omitted_bytes;
+        result.log = transcript.log.as_ref().map(|log| log.path.clone());
+        result.hard_cap = Some(crate::sandbox::SHELL_HARD_OUTPUT_BYTES);
+        if result.omitted_bytes > 0 {
+            result.diagnostic_truncated = true;
+        }
+        result
     }
 
     fn failed(error: std::io::Error, limits: CommandLimits) -> Self {
@@ -123,6 +166,9 @@ impl ValidationResult {
             stderr,
             limits,
             diagnostic_truncated,
+            omitted_bytes: 0,
+            log: None,
+            hard_cap: None,
         }
     }
 
@@ -142,6 +188,19 @@ impl ValidationResult {
         let mut rendered = self.metadata(diagnostic_truncated);
         append_stream(&mut rendered, "stdout", &stdout, !self.stdout.is_empty());
         append_stream(&mut rendered, "stderr", &stderr, !self.stderr.is_empty());
+        if self.omitted_bytes > 0 {
+            rendered.push_str(&format!(
+                "\n[output truncated: {} bytes omitted from the middle; ",
+                self.omitted_bytes
+            ));
+            match &self.log {
+                Some(path) => rendered.push_str(&format!(
+                    "full output log: {}; read it with the read tool (offset/limit) to continue]",
+                    sanitize_bytes(path.to_string_lossy().as_bytes(), 1024).0
+                )),
+                None => rendered.push_str("no output log is configured]"),
+            }
+        }
         rendered
     }
 
@@ -187,10 +246,21 @@ impl ValidationResult {
                 format!("[validation status=cancelled {captured}]")
             }
             ValidationStatus::OutputLimitExceeded(limit) => {
-                let (stream, byte_cap) = match limit {
-                    CommandOutputLimit::Stdout => ("stdout", self.limits.stdout_bytes),
-                    CommandOutputLimit::Stderr => ("stderr", self.limits.stderr_bytes),
-                    CommandOutputLimit::Combined => ("combined", self.limits.combined_bytes),
+                let (stream, byte_cap) = match (limit, self.hard_cap) {
+                    (CommandOutputLimit::Stdout, None) => ("stdout", self.limits.stdout_bytes),
+                    (CommandOutputLimit::Stderr, None) => ("stderr", self.limits.stderr_bytes),
+                    (CommandOutputLimit::Combined, None) => {
+                        ("combined", self.limits.combined_bytes)
+                    }
+                    (CommandOutputLimit::Stdout, Some(cap)) => {
+                        ("stdout", usize::try_from(cap).unwrap_or(usize::MAX))
+                    }
+                    (CommandOutputLimit::Stderr, Some(cap)) => {
+                        ("stderr", usize::try_from(cap).unwrap_or(usize::MAX))
+                    }
+                    (CommandOutputLimit::Combined, Some(cap)) => {
+                        ("combined", usize::try_from(cap).unwrap_or(usize::MAX))
+                    }
                 };
                 format!(
                     "[validation status=output_truncated limit={stream} byte_cap={byte_cap} {captured}]"
@@ -302,6 +372,33 @@ pub(crate) fn start_with_limits(
         cancellation: ValidationCancellation {
             command: CommandCancellation::new(),
         },
+        spooled: false,
+    }
+}
+
+/// [`start_with_limits`] that runs into a spooled capture, for production
+/// verification commands, goal checks and loop validators.
+pub(crate) fn start_spooled(
+    sandbox: &Sandbox,
+    command: &str,
+    limits: CommandLimits,
+) -> ValidationOperation {
+    start_with_limits(sandbox, command, limits).spooled()
+}
+
+async fn run_spooled(
+    sandbox: &Sandbox,
+    command: &str,
+    limits: CommandLimits,
+    cancellation: &ValidationCancellation,
+) -> ValidationResult {
+    let capture = sandbox.captured_command_output();
+    match sandbox
+        .output_command_spooled_cancelled(command, limits, &cancellation.command, &capture)
+        .await
+    {
+        Ok(output) => ValidationResult::from_spooled(output, &capture.transcript(), limits),
+        Err(error) => ValidationResult::failed(error, limits),
     }
 }
 
@@ -550,6 +647,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spooled_validation_runs_past_the_byte_caps_and_names_the_log() {
+        let dir = temp_path("spool-logs");
+        let sandbox = Sandbox::new(false, "bwrap");
+        sandbox.set_command_log_dir(Some(dir.clone()));
+        // 3 MiB on stdout (beyond the 1 MiB / 1.5 MiB caps of production
+        // limits), then a marker and the real exit status.
+        let script = "yes 0123456789abcdef | head -c 3145728; echo; echo END-MARKER; exit 3";
+        let production = CommandLimits {
+            timeout: SETTLE,
+            stdout_bytes: 1024 * 1024,
+            stderr_bytes: 1024 * 1024,
+            combined_bytes: 1536 * 1024,
+        };
+        // The bounded path kills the command (the bug).
+        let bounded = run_with_limits(&sandbox, script, production).await;
+        assert!(matches!(
+            bounded.status,
+            ValidationStatus::OutputLimitExceeded(_)
+        ));
+        // The spooled path lets it finish; the exit status decides.
+        let result = start_spooled(&sandbox, script, production).wait().await;
+        assert_eq!(
+            result.status,
+            ValidationStatus::NonZeroExit { exit_code: Some(3) }
+        );
+        let rendered = result.render();
+        assert!(rendered.contains("diagnostic_truncated=true"), "{rendered:.300}");
+        assert!(rendered.contains("END-MARKER"), "tail must survive");
+        let log = result.log.clone().expect("log path");
+        assert!(rendered.contains(&log.display().to_string()));
+        assert!(std::fs::metadata(&log).unwrap().len() >= 3 * 1024 * 1024);
+        // The same command exiting 0 now passes instead of failing on volume.
+        let passing = start_spooled(
+            &sandbox,
+            "yes 0123456789abcdef | head -c 3145728; exit 0",
+            production,
+        )
+        .wait()
+        .await;
+        assert!(passing.succeeded(), "{:?}", passing.status);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sandbox.active_group_count(), 0);
+    }
+
+    #[tokio::test]
     async fn loop_validation_process_limits_timeout_kills_ignored_term_process_tree_and_recovers() {
         let sandbox = Sandbox::new(false, "bwrap");
         // The TERM-ignoring child must exist before the deadline for this to
@@ -766,6 +908,9 @@ mod tests {
             stderr: b"sandbox_apply: Operation not permitted".to_vec(),
             limits: limits(Duration::from_secs(1)),
             diagnostic_truncated: false,
+            omitted_bytes: 0,
+            log: None,
+            hard_cap: None,
         };
         assert!(!explicit_seatbelt_capability_denial(&cleanup_failure));
     }

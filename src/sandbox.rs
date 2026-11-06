@@ -513,6 +513,10 @@ pub struct Sandbox {
     /// Executable that runs the in-namespace forwarder for the bwrap
     /// allowlist; `None` means this process's own executable.
     net_forwarder_exe: Option<PathBuf>,
+    /// Private per-session directory for full-output logs of `!` commands,
+    /// verification commands, goal checks and loop validators. Shared by all
+    /// clones; `None` keeps only the in-memory head and tail.
+    command_log_dir: Arc<Mutex<Option<PathBuf>>>,
     /// Where the proxy asks about unlisted hosts; set once the UI exists.
     network_prompt: Arc<Mutex<Option<crate::permission::ask::AskSender>>>,
     /// Canonicalized cache directory computed once per instance.
@@ -1294,6 +1298,9 @@ pub(crate) struct ExplicitShellRun {
     pub output: CommandOutput,
     /// Deadline this run was given, for the timeout message.
     pub timeout: std::time::Duration,
+    /// The spooled capture behind `output`, for the omitted-byte accounting
+    /// and full-output log path.
+    pub capture: Option<ShellOutputCapture>,
 }
 
 impl ExplicitShellRun {
@@ -1339,12 +1346,13 @@ impl ExplicitShellRun {
                 Some(format!("explicit shell cancelled; boundary={boundary}"))
             }
             CommandStatus::OutputLimitExceeded(limit) => Some(format!(
-                "explicit shell exceeded {} output limit; boundary={boundary}",
+                "explicit shell stopped: {} output reached the {} MiB hard ceiling (the retained head/tail and any log are shown above); boundary={boundary}",
                 match limit {
                     CommandOutputLimit::Stdout => "stdout",
                     CommandOutputLimit::Stderr => "stderr",
                     CommandOutputLimit::Combined => "combined",
-                }
+                },
+                SHELL_HARD_OUTPUT_BYTES / (1024 * 1024)
             )),
             CommandStatus::Failed => Some(format!("explicit shell failed; boundary={boundary}")),
         };
@@ -1357,12 +1365,49 @@ impl ExplicitShellRun {
                 None => warning,
             });
         }
+        let mut rendered = rendered;
+        if let Some(note) = self
+            .capture
+            .as_ref()
+            .and_then(|capture| spooled_output_note(&capture.transcript()))
+        {
+            if !rendered.is_empty() {
+                rendered.push('\n');
+            }
+            rendered.push_str(&note);
+        }
         match (rendered.is_empty(), status) {
             (true, Some(status)) => format!("[{status}]"),
             (false, Some(status)) => format!("{rendered}\n[{status}]"),
             (_, None) => rendered,
         }
     }
+}
+
+/// Visible truncation notice for a spooled capture: how many bytes were left
+/// out of the middle and where the complete output can be read. `None` when
+/// nothing was omitted.
+pub(crate) fn spooled_output_note(transcript: &OutputTranscript) -> Option<String> {
+    if transcript.omitted_bytes == 0 {
+        return None;
+    }
+    Some(match (&transcript.log, &transcript.log_error) {
+        (Some(log), _) => format!(
+            "[output truncated: {} of {} bytes omitted from the middle; {} output log: {}; read it with the read tool (offset/limit) to continue]",
+            transcript.omitted_bytes,
+            transcript.total_bytes,
+            if log.complete { "full" } else { "partial" },
+            log.path.display()
+        ),
+        (None, Some(error)) => format!(
+            "[output truncated: {} of {} bytes omitted from the middle; no log could be written ({error})]",
+            transcript.omitted_bytes, transcript.total_bytes
+        ),
+        (None, None) => format!(
+            "[output truncated: {} of {} bytes omitted from the middle; no output log is configured]",
+            transcript.omitted_bytes, transcript.total_bytes
+        ),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2784,6 +2829,7 @@ impl Sandbox {
             cached_essential_env: Arc::new(OnceLock::new()),
             network_proxy: Arc::new(OnceLock::new()),
             net_forwarder_exe: None,
+            command_log_dir: Arc::new(Mutex::new(None)),
             network_prompt: Arc::default(),
             cached_cache_dir: Arc::new(Mutex::new(None)),
             cached_seatbelt_profiles: Arc::new(Mutex::new(SeatbeltProfileMap::default())),
@@ -3318,6 +3364,27 @@ impl Sandbox {
 
     /// Configured validators retain the same workspace, executable identity,
     /// containment policy, and scoped process ownership as ordinary commands.
+    /// Where full-output logs of spooled commands are written (the session's
+    /// tool-output directory, which the `read` tool may open).
+    pub(crate) fn set_command_log_dir(&self, dir: Option<PathBuf>) {
+        *self
+            .command_log_dir
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = dir;
+    }
+
+    /// A fresh spooled capture for one user/config-chosen command.
+    pub(crate) fn captured_command_output(&self) -> ShellOutputCapture {
+        let dir = self
+            .command_log_dir
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        ShellOutputCapture::new(SpoolPolicy::captured_command(
+            dir.map(|dir| ShellOutputCapture::log_path_in(&dir, "command-output")),
+        ))
+    }
+
     pub(crate) fn for_validation(&self) -> Self {
         let mut sandbox = self.clone();
         sandbox.validation_only_shell = false;
@@ -4857,6 +4924,9 @@ impl Sandbox {
             boundary,
         };
         let cancellation = cancellation.map(CommandCancellation::subscribe);
+        // Spooled: a verbose command runs to completion; the middle of a huge
+        // output goes to a private log named in the rendered result.
+        let capture = self.captured_command_output();
         // The output worker wraps the command on the blocking pool, so this
         // (UI) task never runs the sandbox preparation. It applies the explicit
         // cwd snapshot even for the intentional uncontained branch, which would
@@ -4876,12 +4946,14 @@ impl Sandbox {
                 )),
                 None,
                 progress,
+                Some(capture.clone()),
             )
             .await?;
         Ok(ExplicitShellRun {
             audit,
             output,
             timeout: limits.timeout,
+            capture: Some(capture),
         })
     }
 
@@ -5446,6 +5518,40 @@ impl Sandbox {
         })
     }
 
+    /// [`Self::output_command_with_limits_cancelled`] into a caller-owned
+    /// spooled capture: output volume never stops the command below the
+    /// capture's hard ceiling.
+    pub(crate) async fn output_command_spooled_cancelled(
+        &self,
+        command: &str,
+        limits: CommandLimits,
+        cancellation: &CommandCancellation,
+        capture: &ShellOutputCapture,
+    ) -> std::io::Result<CommandOutput> {
+        if cancellation.is_cancelled() {
+            return Ok(CommandOutput {
+                exit_status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: CommandStatus::Cancelled,
+                descendants_escaped: false,
+            });
+        }
+        self.output_pending_command_scoped(
+            PendingCommand::Shell {
+                command: command.to_string(),
+                cwd: None,
+            },
+            limits,
+            Some(cancellation.subscribe()),
+            None,
+            None,
+            None,
+            Some(capture.clone()),
+        )
+        .await
+    }
+
     pub(crate) async fn output_command_with_limits_cancelled(
         &self,
         command: &str,
@@ -5522,6 +5628,7 @@ impl Sandbox {
             },
             limits,
             cancellation,
+            None,
             None,
             None,
             None,
@@ -5610,6 +5717,7 @@ impl Sandbox {
             audit,
             input,
             None,
+            None,
         )
         .await
     }
@@ -5622,9 +5730,11 @@ impl Sandbox {
         audit: Option<OwnedExplicitShellAudit>,
         input: Option<Vec<u8>>,
         progress: Option<CommandProgress>,
+        capture: Option<ShellOutputCapture>,
     ) -> std::io::Result<CommandOutput> {
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
+        let capture = capture.map(|capture| capture.0);
         std::mem::drop(crate::agent::runner::spawn_async_scoped(
             crate::startup::heap_future(|| async move {
                 sandbox
@@ -5635,7 +5745,7 @@ impl Sandbox {
                             cancellation,
                             audit,
                             input,
-                            capture: None,
+                            capture,
                             progress,
                             stdio: CommandStdio::Pipes,
                         },

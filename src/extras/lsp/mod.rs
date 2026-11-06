@@ -514,13 +514,6 @@ impl LspManager {
         Some(Self::with_servers_withheld(servers, withheld, workspace))
     }
 
-    fn with_servers(
-        servers: Vec<(String, crate::config::types::LspServerConfig)>,
-        workspace: Arc<crate::paths::WorkspaceBinding>,
-    ) -> Self {
-        Self::with_servers_withheld(servers, Vec::new(), workspace)
-    }
-
     /// Explanation when `path` would be served by a withheld built-in.
     pub(crate) fn withheld_explanation(&self, path: &Path) -> Option<String> {
         let ext = format!(".{}", path.extension()?.to_str()?.to_ascii_lowercase());

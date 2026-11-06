@@ -1164,6 +1164,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             ask_tx.clone(),
             cfg.headless_questions.unwrap_or_default(),
         )));
+        // Full-output logs of `!`, verification and goal-check commands.
+        sandbox.set_command_log_dir(crate::session::storage::command_log_dir(
+            tool_output_session_id,
+        ));
         if shell_tool_enabled {
             // Unlisted hosts of `sandbox-network = "allowlist"` prompt here.
             sandbox.set_network_prompt(ask_tx.clone());

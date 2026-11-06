@@ -705,7 +705,7 @@ impl CompletionVerification {
     }
 
     async fn run(&self) -> crate::extras::validation::ValidationResult {
-        crate::extras::validation::start_with_limits(
+        crate::extras::validation::start_spooled(
             &self.sandbox,
             self.command
                 .as_deref()
