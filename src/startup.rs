@@ -1241,6 +1241,11 @@ impl Startup {
 
         let max_budget_usd = cli.resolve_max_budget_usd(&cfg)?;
         cfg.max_budget_usd = max_budget_usd;
+        if let Some(warning) =
+            crate::spend::service_tier_ceiling_warning(&cfg, &cli.resolve_model(&cfg))
+        {
+            eprintln!("warning: {warning}");
+        }
         validate_startup_permission_policy(&cli, &cfg)?;
 
         // Load context first so prompts/themes are available early. Root

@@ -1433,6 +1433,11 @@ fn init_acp_subagents(cli: &Cli, cfg: &Config) {
 
 pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
     cfg.max_budget_usd = cli.resolve_max_budget_usd(&cfg)?;
+    if let Some(warning) =
+        crate::spend::service_tier_ceiling_warning(&cfg, &cli.resolve_model(&cfg))
+    {
+        tracing::warn!("{warning}");
+    }
     // Keep direct callers fail-closed too. The normal binary path has already
     // validated in `Startup::init`, before provider/client construction.
     let (authority, _) = crate::permission::resolve_configured_execution_authority(&cli, &cfg)?;

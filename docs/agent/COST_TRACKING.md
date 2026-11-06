@@ -93,7 +93,9 @@ Not modelled, so `/cost` and the USD ceiling can undercount them:
 - long-context premiums the catalog does not list (the Anthropic 1M-context beta
   premium above 200k input tokens is not in the models.dev snapshot; configure an
   explicit quick-model price if you rely on it);
-- service tiers: OpenAI `priority`/`flex`, Anthropic priority tier, batch discounts;
+- service tiers: OpenAI `priority`/`flex`, Anthropic priority tier, batch discounts. A
+  non-default `service_tier` in `extra_body` makes `/cost` append a note that figures use base
+  rates, and with a USD ceiling (`--max-budget-usd` / `max_budget_usd`) startup also warns;
 - a separate reasoning-token rate (reasoning tokens are priced as output tokens);
 - provider fees, regional surcharges (Bedrock/Vertex) and gateway markups.
 

@@ -124,6 +124,40 @@ pub(crate) async fn cost_lines(session: &Session, ledger: Ledger) -> anyhow::Res
     Ok(lines)
 }
 
+/// The non-default `service_tier` forwarded through `extra_body` (OpenAI
+/// `priority`/`flex`, Anthropic `priority`), or `None` for unset, `auto` and
+/// `default`. Pricing has no tier concept, so cost and USD ceilings use base
+/// rates for such requests.
+pub(crate) fn configured_service_tier(cfg: &crate::config::Config, model: &str) -> Option<String> {
+    let qm = crate::config::quick_models_map(cfg);
+    let body = cfg.resolve_extra_body(model, qm)?;
+    let tier = body.get("service_tier")?.as_str()?.trim();
+    (!tier.is_empty() && !matches!(tier.to_ascii_lowercase().as_str(), "auto" | "default"))
+        .then(|| tier.to_owned())
+}
+
+/// Note shown when a service tier is set: base-rate pricing can miss the
+/// tier's premium (or discount).
+pub(crate) fn service_tier_note(tier: &str) -> String {
+    format!(
+        "Service tier `{tier}` is not priced: cost and USD ceilings use base rates, so spend can exceed (priority) or undercut (flex) the reported figure"
+    )
+}
+
+/// Startup warning when a service tier is configured while a USD ceiling is
+/// active (`cfg.max_budget_usd` already holds the resolved `--max-budget-usd`).
+pub(crate) fn service_tier_ceiling_warning(
+    cfg: &crate::config::Config,
+    model: &str,
+) -> Option<String> {
+    cfg.max_budget_usd?;
+    let tier = configured_service_tier(cfg, model)?;
+    Some(format!(
+        "service_tier `{tier}` is set with a USD budget ceiling; {}",
+        service_tier_note(&tier)
+    ))
+}
+
 /// `/cost` line naming the active model's long-context premium.
 pub(crate) fn long_context_label(tier: &crate::pricing::LongContextPrices) -> String {
     format!(
@@ -135,6 +169,32 @@ pub(crate) fn long_context_label(tier: &crate::pricing::LongContextPrices) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_tier_with_usd_ceiling_warns_and_cost_note_names_the_tier() {
+        let mut cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"extra_body": {"service_tier": "priority"}}))
+                .unwrap();
+        // No ceiling: no warning, but the tier is still detected for /cost.
+        assert_eq!(service_tier_ceiling_warning(&cfg, "m"), None);
+        assert_eq!(
+            configured_service_tier(&cfg, "m").as_deref(),
+            Some("priority")
+        );
+        cfg.max_budget_usd = Some(1.0);
+        let warning = service_tier_ceiling_warning(&cfg, "m").unwrap();
+        assert!(
+            warning.contains("priority") && warning.contains("base rates"),
+            "{warning}"
+        );
+        assert!(service_tier_note("priority").contains("not priced"));
+        for tier in ["auto", "default", ""] {
+            cfg.extra_body = Some(serde_json::json!({"service_tier": tier}));
+            assert_eq!(service_tier_ceiling_warning(&cfg, "m"), None, "{tier}");
+        }
+        cfg.extra_body = None;
+        assert_eq!(service_tier_ceiling_warning(&cfg, "m"), None);
+    }
     use crate::event::UsageDelta;
     use crate::spend::{Account, PriceSnapshot, Receipt, RequestKind};
 
