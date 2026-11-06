@@ -144,10 +144,12 @@ impl ChildEvidence {
         self.records.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn unrecorded(&self) -> usize {
         self.unrecorded
     }
 
+    #[cfg(test)]
     pub(crate) fn metas(&self) -> impl Iterator<Item = &EvidenceMeta> {
         self.records.iter().map(|(meta, _)| meta)
     }
