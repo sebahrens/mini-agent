@@ -3771,6 +3771,36 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    fn project_sandbox_network_opt_in_requires_current_project_approval() {
+        let root = crate::tests::OwnedTestDirectory::new("sandbox-network-project-trust");
+        let path = root.path().join("project/.mini-agent/config.toml");
+        let trust = root.path().join("state/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "sandbox-network = 'allow'\nchat_left_margin = 3\n").unwrap();
+        let mut cfg = Config::default();
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| {
+                panic!("no headless prompt")
+            })
+            .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert_eq!(
+            cfg.sandbox_network, None,
+            "untrusted project cannot open the network"
+        );
+        assert_eq!(cfg.chat_left_margin, Some(3));
+        let mut declined = Config::default();
+        apply_local_override_with_confirmation(&mut declined, &path, &trust, true, &|_| false)
+            .unwrap();
+        assert_eq!(declined.sandbox_network, None);
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
+        assert_eq!(
+            cfg.sandbox_network,
+            Some(crate::sandbox::SandboxNetwork::Allow)
+        );
+    }
+
+    #[test]
     fn home24w5s_project_layers_only_add_masks_and_need_trust_for_mounts() {
         let root = crate::tests::OwnedTestDirectory::new("home24w5s-project-trust");
         let path = root.path().join("project/.zerostack/config.toml");

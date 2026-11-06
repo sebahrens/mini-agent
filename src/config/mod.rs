@@ -443,6 +443,15 @@ pub struct Config {
         alias = "sandbox_home_masks"
     )]
     pub sandbox_home_masks: Vec<String>,
+    /// `sandbox-network`: `deny` (default) or `allow` network access for
+    /// contained shell commands. A project layer needs project trust.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "sandbox-network",
+        alias = "sandbox_network"
+    )]
+    pub sandbox_network: Option<crate::sandbox::SandboxNetwork>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

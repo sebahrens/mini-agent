@@ -231,6 +231,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("sandbox-home-masks", &["sandbox_home_masks"])
         .described("HOME-relative dot paths hidden in every sandbox profile, added to the built-in masks")
         .shaped(ConfigShape::Strings),
+    aliased("sandbox-network", &["sandbox_network"])
+        .described("Network access for contained shell commands: deny (default) or allow. Project layers need trust.")
+        .shaped(ConfigShape::Enum(crate::sandbox::SandboxNetwork::NAMES)),
     aliased(
         "windows-appcontainer-read-roots",
         &["windows_appcontainer_read_roots"],

@@ -20,6 +20,8 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod general_profile;
+#[cfg(test)]
+mod network_tests;
 mod output_capture;
 pub(crate) use output_capture::{
     OutputChannel, OutputTranscript, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy, TranscriptPart,
@@ -301,6 +303,40 @@ impl SandboxProfile {
     }
 }
 
+/// Network reach of contained shell commands (`sandbox-network`). `Deny`
+/// is the default; `Allow` is an explicit, project-trust-gated opt-in that
+/// only changes network policy, never filesystem reach.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxNetwork {
+    #[default]
+    Deny,
+    Allow,
+}
+
+impl SandboxNetwork {
+    pub const NAMES: &'static [&'static str] = &["deny", "allow"];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Allow => "allow",
+        }
+    }
+
+    pub fn allows(self) -> bool {
+        self == Self::Allow
+    }
+}
+
+impl std::fmt::Display for SandboxNetwork {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
 impl std::fmt::Display for SandboxProfile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
@@ -383,6 +419,8 @@ impl ExecutionCommand {
 pub struct SandboxConfig {
     backend: String,
     profile: SandboxProfile,
+    /// `sandbox-network`: whether contained shell commands may use the network.
+    network: SandboxNetwork,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     /// Raw HOME-relative `sandbox-home-mounts` entries, validated at capture.
@@ -2262,6 +2300,25 @@ impl Sandbox {
         self
     }
 
+    /// `sandbox-network`: let contained shell commands reach the network.
+    /// Hooks, workspace services and brokered JS `spawn` keep their own
+    /// (denied) network policy.
+    pub fn with_network(mut self, network: SandboxNetwork) -> Self {
+        self.network = network;
+        self.cached_seatbelt_profiles = Arc::new(Mutex::new(SeatbeltProfileMap::default()));
+        self
+    }
+
+    pub fn network(&self) -> SandboxNetwork {
+        self.network
+    }
+
+    /// Whether contained shell commands can actually reach the network: the
+    /// opt-in is set, containment is active, and the backend honours it.
+    pub fn shell_network_effective(&self) -> bool {
+        self.network.allows() && matches!(self.backend.as_str(), "bwrap" | "seatbelt")
+    }
+
     /// HOME-relative `sandbox-home-mounts` (read-only, or writable with a
     /// `:rw` suffix) and `sandbox-home-masks` (added to the built-in private
     /// masks). Entries are validated, fail closed, when roots are captured.
@@ -2420,6 +2477,7 @@ impl Sandbox {
             config: Arc::new(SandboxConfig {
                 backend: backend.to_string(),
                 profile: SandboxProfile::Workspace,
+                network: SandboxNetwork::Deny,
                 read_roots: Vec::new(),
                 write_roots: Vec::new(),
                 home_mounts: Vec::new(),
@@ -2748,6 +2806,10 @@ impl Sandbox {
                 requested_network_policy: "backend-defined; mini-agent makes no network-isolation claim",
             },
         };
+        if policy == SandboxPolicy::RequiredAndAvailable && self.shell_network_effective() {
+            matrix.network = "shell commands may use the host network (sandbox-network = allow); hooks, workspace services and JS spawn remain denied";
+            matrix.requested_network_policy = "allow for shell commands (sandbox-network opt-in)";
+        }
         if policy == SandboxPolicy::RequiredAndAvailable
             && matches!(self.backend.as_str(), "bwrap" | "seatbelt")
         {
@@ -4079,7 +4141,8 @@ impl Sandbox {
         cache_dir: &Path,
         launch: Option<&LaunchValidation>,
     ) -> Result<Command, String> {
-        let profile = self.get_seatbelt_profile_for_launch(cwd, cache_dir, true, launch)?;
+        let profile =
+            self.get_seatbelt_profile_for_launch(cwd, cache_dir, !self.network.allows(), launch)?;
 
         let mut cmd = Command::new(seatbelt);
         cmd.arg("-p").arg(profile.as_ref());
@@ -4114,10 +4177,19 @@ impl Sandbox {
         let mut cmd =
             self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata, read_roots)?;
         let sandbox_cwd = self.sandbox_cwd(cwd);
+        let deny_network = !self.network.allows();
+        if !deny_network && self.profile == SandboxProfile::Workspace {
+            // The workspace profile exposes only a synthetic /etc; resolver
+            // and CA configuration must be visible for the opt-in to work.
+            for path in BWRAP_NETWORK_ETC_FILES {
+                cmd.args(["--ro-bind-try", path, path]);
+            }
+        }
         append_bwrap_isolation(
             &mut cmd,
             &sandbox_cwd,
             self.profile != SandboxProfile::HostFull,
+            deny_network,
         );
         cmd.args(["--new-session", "--die-with-parent", "--"]);
         if self.workspace_binding.is_some() {
@@ -4164,10 +4236,12 @@ impl Sandbox {
         // descendant can inherit the snapshot descriptor.
         cmd.args(["--perms", "0500", "--ro-bind-data", "3", executable]);
         let sandbox_cwd = self.sandbox_cwd(cwd);
+        // Brokered JS spawn never inherits the shell network opt-in.
         append_bwrap_isolation(
             &mut cmd,
             &sandbox_cwd,
             self.profile != SandboxProfile::HostFull,
+            true,
         );
         cmd.args(["--new-session", "--die-with-parent", "--", executable]);
         cmd.args(arguments);
@@ -6408,15 +6482,33 @@ fn essential_env() -> Vec<(&'static str, String)> {
     vars
 }
 
-fn append_bwrap_isolation(command: &mut Command, cwd: &Path, readonly_root: bool) {
-    command.args([
-        "--unshare-user",
-        "--unshare-ipc",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-uts",
-        "--unshare-cgroup",
-    ]);
+/// Resolver, host and CA files bound read-only into the workspace profile
+/// when `sandbox-network = "allow"`.
+const BWRAP_NETWORK_ETC_FILES: &[&str] = &[
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/host.conf",
+    "/etc/gai.conf",
+    "/etc/services",
+    "/etc/protocols",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/pki",
+    "/etc/gitconfig",
+];
+
+fn append_bwrap_isolation(
+    command: &mut Command,
+    cwd: &Path,
+    readonly_root: bool,
+    deny_network: bool,
+) {
+    command.args(["--unshare-user", "--unshare-ipc", "--unshare-pid"]);
+    if deny_network {
+        command.arg("--unshare-net");
+    }
+    command.args(["--unshare-uts", "--unshare-cgroup"]);
     if readonly_root {
         command.args(["--remount-ro", "/"]);
     }
@@ -6482,9 +6574,11 @@ fn seatbelt_profile_ladder(
         )
     };
     let network = if deny_network {
-        "(deny network*)"
+        "(deny network*)".to_string()
+    } else if profile == SandboxProfile::Workspace {
+        format!("{SEATBELT_NETWORK_READS}\n{SEATBELT_ALLOW_NETWORK}")
     } else {
-        "(allow network*)"
+        SEATBELT_ALLOW_NETWORK.to_string()
     };
     let git_rule = if protected_git.is_empty() {
         String::new()
@@ -6572,6 +6666,12 @@ fn seatbelt_root_inputs(
     Ok(inputs)
 }
 
+/// Network opt-in rules: sockets plus the system services name resolution
+/// and certificate evaluation reach over Mach IPC.
+const SEATBELT_ALLOW_NETWORK: &str = "(allow network*)\n(allow system-socket)\n(allow mach-lookup (global-name \"com.apple.dnssd.service\") (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.SystemConfiguration.DNSConfiguration\"))";
+/// Resolver and CA files the workspace profile does not otherwise read.
+const SEATBELT_NETWORK_READS: &str = "(allow file-read* (literal \"/etc\") (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\") (literal \"/private/etc/services\") (literal \"/private/etc/protocols\") (subpath \"/private/etc/ssl\") (literal \"/private/etc/gitconfig\") (subpath \"/private/var/run/resolv.conf\") (subpath \"/Library/Keychains\"))";
+
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn seatbelt_shell_profile(
     workspace_str: &str,
@@ -6583,7 +6683,7 @@ pub(crate) fn seatbelt_shell_profile(
     let network_rule = if deny_network {
         "(deny network*)"
     } else {
-        "(allow network*)"
+        SEATBELT_ALLOW_NETWORK
     };
     let git_rule = if git_write_denies.is_empty() {
         String::new()
@@ -10199,7 +10299,7 @@ echo COMMITTED"#;
             "",
             false,
         );
-        assert!(open_network.ends_with("(allow network*)"));
+        assert!(open_network.ends_with(SEATBELT_ALLOW_NETWORK));
         assert!(!open_network.contains("(deny file-write*)"));
         assert!(
             !Sandbox::new(true, "appcontainer")

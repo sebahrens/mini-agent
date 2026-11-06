@@ -6,6 +6,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `sandbox-network = "allow"` opts contained shell commands into the network (bwrap omits
+  `--unshare-net`; Seatbelt allows network and name resolution) without widening filesystem reach.
+  The default stays `deny`, a project layer needs project trust, and `/sandbox` plus the
+  `sandbox:net` status segment show it. Hooks, services and JS `spawn` stay denied
+  (mini-agent-p0ski).
+
 ### Changed
 
 - Foreground `shell` commands that print more than 1 MiB are no longer killed: the capture keeps

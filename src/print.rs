@@ -2099,6 +2099,13 @@ pub(crate) fn print_sessions(
     Ok(())
 }
 
+fn sandbox_network_entry(cfg: &config::Config) -> (&'static str, String) {
+    (
+        "sandbox-network",
+        cfg.sandbox_network.unwrap_or_default().to_string(),
+    )
+}
+
 fn sandbox_profile_entry(cli: &cli::Cli, cfg: &config::Config) -> (&'static str, String) {
     (
         "sandbox-profile",
@@ -2177,6 +2184,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         cfg.sandbox_home_mounts.clone(),
         cfg.sandbox_home_masks.clone(),
     )
+    .with_network(cfg.sandbox_network.unwrap_or_default())
     .with_shell(&shell)
     .with_windows_appcontainer_roots(
         cli.resolve_windows_appcontainer_read_roots(cfg),
@@ -2328,6 +2336,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
             ("edit-system", edit_system.to_string()),
             ("sandbox", sandbox.to_string()),
             sandbox_profile_entry(cli, cfg),
+            sandbox_network_entry(cfg),
             ("no-tools", no_tools.to_string()),
             ("tools", tools_allowlist),
             ("no-context-files", no_context_files.to_string()),

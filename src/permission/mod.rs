@@ -264,6 +264,7 @@ pub(crate) struct ConfiguredSandboxKey {
     appcontainer_read_roots: Vec<std::path::PathBuf>,
     appcontainer_write_roots: Vec<std::path::PathBuf>,
     toolchain_roots: Vec<std::path::PathBuf>,
+    network: crate::sandbox::SandboxNetwork,
 }
 
 #[cfg(test)]
@@ -289,6 +290,7 @@ impl ConfiguredSandboxKey {
             appcontainer_read_roots: cli.resolve_windows_appcontainer_read_roots(cfg),
             appcontainer_write_roots: cli.resolve_windows_appcontainer_write_roots(cfg),
             toolchain_roots: cli.resolve_sandbox_toolchain_roots(cfg),
+            network: cfg.sandbox_network.unwrap_or_default(),
         }
     }
 
@@ -311,6 +313,7 @@ impl ConfiguredSandboxKey {
                 self.appcontainer_write_roots.clone(),
             )
             .with_bwrap_read_roots(self.toolchain_roots.clone())
+            .with_network(self.network)
     }
 }
 
