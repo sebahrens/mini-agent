@@ -317,6 +317,7 @@ impl Drop for BoundDiagnosticPath {
 pub(crate) struct DiagnosticSnapshot {
     uri: String,
     lines: Vec<String>,
+    #[cfg(test)]
     truncated: bool,
     /// Diagnostics the cache dropped at storage time (per-file cap).
     omitted: usize,
@@ -726,6 +727,7 @@ impl LspManager {
     /// Wait from the counter captured by synchronization, including a publish
     /// that arrived before this future was polled. Without a completed sync,
     /// retain the existing bounded cache-refresh behavior.
+    #[cfg(test)]
     pub async fn diagnostics_block_since(
         &self,
         path: &Path,
@@ -1016,6 +1018,7 @@ impl LspManager {
     /// Copy diagnostics only when the cache still names the exact object held
     /// by `binding`. The returned snapshot is independent of the file handle,
     /// so the caller can release it before authorizing the next candidate.
+    #[cfg(test)]
     pub async fn snapshot_bound_diagnostics(
         &self,
         binding: &BoundDiagnosticPath,
@@ -1071,6 +1074,7 @@ impl LspManager {
             .filter(|diag| severity.is_none_or(|wanted| diag.severity == Some(wanted)))
             .collect();
         interesting.sort_by_key(|d| (d.severity, d.range.start.line, d.range.start.character));
+        #[cfg(test)]
         let truncated = interesting.len() > remaining_lines;
         let lines: Vec<String> = interesting
             .into_iter()
@@ -1080,6 +1084,7 @@ impl LspManager {
         Some(DiagnosticSnapshot {
             uri: binding.uri.clone(),
             lines,
+            #[cfg(test)]
             truncated,
             omitted: cached.omitted,
         })

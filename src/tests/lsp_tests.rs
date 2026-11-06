@@ -2601,7 +2601,7 @@ async fn explicit_project_diagnostics_page_with_exact_hidden_counts() {
         None,
     );
     let first = tool.call(LspArgs::default()).await.unwrap();
-    assert_eq!(first.matches(": f").count() >= 200, true, "{first}");
+    assert!(first.matches(": f").count() >= 200, "{first}");
     assert_eq!(
         first
             .lines()

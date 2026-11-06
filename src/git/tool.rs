@@ -2681,13 +2681,13 @@ mod tests {
     #[test]
     fn status_parser_attaches_rename_origin_and_cuts_at_entry_boundaries() {
         use super::parse_status_records;
-        let out = b"1 .M N... 100644 100644 100644 a b x.txt\02 R. N... 100644 100644 100644 a b R100 new.txt\0u.rs\0? untracked\0";
+        let out = b"1 .M N... 100644 100644 100644 a b x.txt\x002 R. N... 100644 100644 100644 a b R100 new.txt\0u.rs\0? untracked\0";
         let (records, changed, untracked) = parse_status_records(out, false);
         assert_eq!(records.len(), 3, "{records:?}");
         assert!(records[1].ends_with("new.txt\torig: u.rs"), "{records:?}");
         assert_eq!((changed, untracked), (2, 1));
         // Cut between a rename record and its origin: the entry is dropped.
-        let cut = b"1 .M N... 100644 100644 100644 a b x.txt\02 R. N... 100644 100644 100644 a b R100 new.txt\0";
+        let cut = b"1 .M N... 100644 100644 100644 a b x.txt\x002 R. N... 100644 100644 100644 a b R100 new.txt\0";
         let (records, changed, _) = parse_status_records(cut, true);
         assert_eq!(records.len(), 1, "{records:?}");
         assert_eq!(changed, 1);
