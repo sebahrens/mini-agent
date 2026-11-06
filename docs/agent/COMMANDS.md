@@ -167,7 +167,7 @@ startup config. See Prompts & Themes below.
 
 ## Hooks
 
-Requires the `hooks` feature (default-off; see [CONFIG.md](CONFIG.md#hooks)).
+Requires the `hooks` feature (default-on; absent in lite/no-default builds; see [CONFIG.md](CONFIG.md#hooks)).
 
 | Command | Description |
 | ------- | ----------- |
