@@ -1564,8 +1564,14 @@ impl Startup {
         // (mini-agent-vx0yg).
         #[cfg(feature = "memory")]
         {
-            context.memory = crate::extras::memory::Mem::open()
-                .context_block_excluding_cached(session.active_compaction_ref());
+            let (memory, notices) = crate::extras::memory::Mem::open()
+                .context_block_and_notices_excluding_cached(session.active_compaction_ref());
+            context.memory = memory;
+            // A budget cut or a lossily decoded file is shown to the user, not
+            // only marked inside the system block.
+            for notice in notices {
+                eprintln!("notice: {notice}");
+            }
         }
 
         // The invocation's captured workspace is authoritative until an
