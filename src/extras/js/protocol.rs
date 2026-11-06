@@ -636,6 +636,19 @@ pub(crate) struct GrepMatch {
     pub(crate) text: String,
 }
 
+/// Files a JS `grep` could not search faithfully. `large`, `binary` and
+/// `unreadable` files were not searched; `non_utf8` files were searched after
+/// lossy decoding (invalid bytes replaced), so a match on those bytes may be
+/// missed or altered.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GrepSkipped {
+    pub(crate) large: u32,
+    pub(crate) binary: u32,
+    pub(crate) non_utf8: u32,
+    pub(crate) unreadable: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HttpMethod {
@@ -734,6 +747,8 @@ pub(crate) enum EffectResult {
     Grep {
         matches: Vec<GrepMatch>,
         truncated: bool,
+        #[serde(default)]
+        skipped: GrepSkipped,
     },
     WriteFile,
     ResultAccepted {

@@ -25,12 +25,12 @@ use super::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, DenialReason, Diagnostic,
     DiagnosticClass, DiagnosticStage, DirectoryEntry, DirectoryEntryKind, EffectErrorCode,
     EffectOperation, EffectRequest, EffectResponse, EffectResult, GrepMatch, GrepOptions,
-    JsDiagnosticHint, JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES, MAX_CONSOLE_RECORD_BYTES,
-    MAX_CONSOLE_RECORDS, MAX_RESULT_BYTES, ModelEffectProfile, ParentFrame, ParentWireFrame,
-    ProtocolError, ProtocolFault, ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole,
-    StepOutcome, StepResult, VERIFICATION_LOADER_VERSION, VerificationCaseResult,
-    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerWireFrame,
-    read_frame, source_position_is_valid, write_frame,
+    GrepSkipped, JsDiagnosticHint, JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES,
+    MAX_CONSOLE_RECORD_BYTES, MAX_CONSOLE_RECORDS, MAX_RESULT_BYTES, ModelEffectProfile,
+    ParentFrame, ParentWireFrame, ProtocolError, ProtocolFault, ProtocolFaultCode, ProtocolStage,
+    RunStep, ScriptRole, StepOutcome, StepResult, VERIFICATION_LOADER_VERSION,
+    VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
+    WorkerProtocol, WorkerWireFrame, read_frame, source_position_is_valid, write_frame,
 };
 #[cfg(feature = "sandbox")]
 use super::protocol::{HttpHeader, HttpMethod};
@@ -346,6 +346,7 @@ fn parse_read_lines_range(from: f64, count: Option<f64>) -> Result<(i64, u32), E
 struct WorkerGrepResult {
     matches: Vec<GrepMatch>,
     truncated: bool,
+    skipped: GrepSkipped,
 }
 
 impl<'js> IntoJs<'js> for WorkerGrepResult {
@@ -359,6 +360,12 @@ impl<'js> IntoJs<'js> for WorkerGrepResult {
                 .collect::<Vec<_>>(),
         )?;
         object.set("truncated", self.truncated)?;
+        let skipped = Object::new(ctx.clone())?;
+        skipped.set("large", self.skipped.large)?;
+        skipped.set("binary", self.skipped.binary)?;
+        skipped.set("non_utf8", self.skipped.non_utf8)?;
+        skipped.set("unreadable", self.skipped.unreadable)?;
+        object.set("skipped", skipped)?;
         Ok(object.into())
     }
 }
@@ -466,9 +473,15 @@ fn install_model_effect_globals(
                     pattern,
                     options,
                 }) {
-                    EffectResult::Grep { matches, truncated } => {
-                        Ok(WorkerGrepResult { matches, truncated })
-                    }
+                    EffectResult::Grep {
+                        matches,
+                        truncated,
+                        skipped,
+                    } => Ok(WorkerGrepResult {
+                        matches,
+                        truncated,
+                        skipped,
+                    }),
                     EffectResult::Error(error) => Err(effect_error_from(&ctx, "grep", &error)),
                     _ => Err(rquickjs::Error::Unknown),
                 }
@@ -1108,6 +1121,7 @@ mod effect_error_tests {
                         text: "let needle = true;".into(),
                     }],
                     truncated: false,
+                    skipped: GrepSkipped::default(),
                 },
                 _ => EffectResult::Error(super::super::protocol::EffectError::new(
                     EffectErrorCode::BackendFailure,

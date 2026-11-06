@@ -43,6 +43,7 @@ use crate::extras::js::broker::{
 };
 use crate::extras::js::protocol::{
     DirectoryEntry, DirectoryEntryKind, EffectOperation, EffectResult, GrepMatch, GrepOptions,
+    GrepSkipped,
 };
 use crate::extras::js::session::{
     SCRATCH_VALUE_MAX_BYTES, STRUCTURED_RESULT_MAX_BYTES, ScratchStore, SessionStateError,
@@ -3324,15 +3325,13 @@ fn execute_discovery(
             let mut bytes = 0_usize;
             let mut visited = 0_usize;
             let mut truncated = false;
+            let mut skipped = GrepSkipped::default();
             'files: for entry in &mut walker {
                 control.checkpoint().map_err(discovery_control_error)?;
                 visited += 1;
                 if visited > DISCOVERY_MAX_VISITED_FILES {
                     truncated = true;
                     break;
-                }
-                if entry.metadata.len() > GREP_FILE_MAX_BYTES {
-                    continue;
                 }
                 if let Some((include, path_aware)) = &include {
                     let candidate = if *path_aware {
@@ -3349,22 +3348,39 @@ fn execute_discovery(
                         continue;
                     }
                 }
+                if entry.metadata.len() > GREP_FILE_MAX_BYTES {
+                    skipped.large = skipped.large.saturating_add(1);
+                    continue;
+                }
                 let capacity = usize::try_from(entry.metadata.len())
                     .unwrap_or(GREP_FILE_MAX_BYTES as usize)
                     .min(GREP_FILE_MAX_BYTES as usize);
                 let mut data = Vec::with_capacity(capacity.saturating_add(1));
-                entry
+                if entry
                     .file
                     .take(GREP_FILE_MAX_BYTES.saturating_add(1))
                     .read_to_end(&mut data)
-                    .map_err(file_path_error)?;
-                control.checkpoint().map_err(discovery_control_error)?;
-                if data.len() as u64 > GREP_FILE_MAX_BYTES || GrepTool::is_binary(&data) {
+                    .is_err()
+                {
+                    skipped.unreadable = skipped.unreadable.saturating_add(1);
                     continue;
                 }
-                let Ok(content) = std::str::from_utf8(&data) else {
+                control.checkpoint().map_err(discovery_control_error)?;
+                if data.len() as u64 > GREP_FILE_MAX_BYTES {
+                    skipped.large = skipped.large.saturating_add(1);
                     continue;
-                };
+                }
+                if GrepTool::is_binary(&data) {
+                    skipped.binary = skipped.binary.saturating_add(1);
+                    continue;
+                }
+                // Decode lossily like the native grep tool: a Latin-1 or
+                // Windows-1252 file is searched, with its invalid bytes
+                // replaced, instead of silently contributing no matches.
+                let content = String::from_utf8_lossy(&data);
+                if matches!(content, std::borrow::Cow::Owned(_)) {
+                    skipped.non_utf8 = skipped.non_utf8.saturating_add(1);
+                }
                 let path = discovery_output_path(&prepared.output_base, &entry.path)?;
                 for (line_index, line) in content.lines().enumerate() {
                     let Some(found) = matcher.find(line) else {
@@ -3395,7 +3411,11 @@ fn execute_discovery(
                     .cmp(&right.path)
                     .then_with(|| left.line.cmp(&right.line))
             });
-            Ok(EffectResult::Grep { matches, truncated })
+            Ok(EffectResult::Grep {
+                matches,
+                truncated,
+                skipped,
+            })
         }
     }
 }
@@ -5776,7 +5796,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let EffectResult::Grep { matches, truncated } = searched else {
+        let EffectResult::Grep {
+            matches, truncated, ..
+        } = searched
+        else {
             panic!("unexpected grep result: {searched:?}");
         };
         assert!(!truncated);
@@ -6322,7 +6345,10 @@ mod tests {
             "config/app.txt".to_string(),
             absolute.to_string_lossy().into_owned(),
         ] {
-            let Ok(EffectResult::Grep { matches, truncated }) = grep(path.clone()).await else {
+            let Ok(EffectResult::Grep {
+                matches, truncated, ..
+            }) = grep(path.clone()).await
+            else {
                 panic!("{path}: single-file grep must succeed");
             };
             assert!(!truncated);
@@ -6345,6 +6371,61 @@ mod tests {
         assert_eq!(
             matches.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
             vec!["config/app.txt", "config/sibling.txt"]
+        );
+    }
+
+    // mini-agent-azgi7: files a JS grep cannot search faithfully are counted, never silent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn brokered_grep_counts_skipped_files_and_decodes_non_utf8_lossily() {
+        let directory = TempDir::new("js-grep-skipped");
+        let base = directory.path().canonicalize().unwrap();
+        let workspace_root = base.join("workspace");
+        std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+        // Latin-1: the match is before the invalid byte, so lossy decoding finds it.
+        std::fs::write(workspace_root.join("src/latin1.txt"), b"needle caf\xe9\n").unwrap();
+        std::fs::write(workspace_root.join("src/utf8.txt"), "needle ok\n").unwrap();
+        std::fs::write(workspace_root.join("src/blob.bin"), b"needle\0\0").unwrap();
+        let big = std::fs::File::create(workspace_root.join("src/big.txt")).unwrap();
+        big.set_len(GREP_FILE_MAX_BYTES + 1).unwrap();
+        let (mut broker, grant, _owner) = bound_file_broker(&base, &workspace_root, None, "gskip");
+        let result = broker
+            .dispatch(
+                c1o7m_request(
+                    &grant,
+                    0,
+                    EffectOperation::Grep {
+                        path: "src".into(),
+                        pattern: "needle".into(),
+                        options: GrepOptions::default(),
+                    },
+                ),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        let EffectResult::Grep {
+            matches,
+            truncated,
+            skipped,
+        } = result
+        else {
+            panic!("unexpected result");
+        };
+        assert!(!truncated);
+        assert_eq!(
+            matches.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/latin1.txt", "src/utf8.txt"]
+        );
+        assert!(matches[0].text.contains("needle caf"));
+        assert_eq!(
+            skipped,
+            GrepSkipped {
+                large: 1,
+                binary: 1,
+                non_utf8: 1,
+                unreadable: 0
+            }
         );
     }
 

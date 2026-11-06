@@ -1051,8 +1051,18 @@ fn worker_protocol_v7_discovery_operations_and_results_are_closed() {
             text: "needle".into(),
         }],
         truncated: false,
+        skipped: GrepSkipped {
+            large: 1,
+            binary: 2,
+            non_utf8: 3,
+            unreadable: 4,
+        },
     };
     let encoded = serde_json::to_string(&result).unwrap();
+    assert!(
+        encoded.ends_with(r#""skipped":{"large":1,"binary":2,"non_utf8":3,"unreadable":4}}}"#),
+        "{encoded}"
+    );
     assert_eq!(
         serde_json::from_str::<EffectResult>(&encoded).unwrap(),
         result

@@ -1466,7 +1466,7 @@ bead is closed with its required regression tests, so all items are part of the 
    available on every platform and do not depend on `spawn` authority.
    `list_dir` returns at most 1,000 direct entries; `glob` and `grep` visit at most 100,000 files
    and return at most 1,000 paths or matches. Each result is also capped at 256 KiB, patterns are
-   capped at 8 KiB, grep skips binary and over-10-MiB files, and each matched line is truncated to
+   capped at 8 KiB, grep decodes invalid UTF-8 lossily and does not search binary and over-10-MiB files but counts them (and unreadable and lossily decoded files) in `skipped: {large, binary, non_utf8, unreadable}` instead of reporting a clean miss (mini-agent-azgi7), and each matched line is truncated to
    500 characters around the match. A `truncated` boolean reports any result, byte, or traversal
    cap. Traversal is descriptor-bound, ignores symlinks and unsafe file kinds, honors ignore files,
    and checks the shared invocation cancellation/deadline between entries and file reads.
