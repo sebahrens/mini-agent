@@ -772,6 +772,19 @@ pub struct Config {
     /// Default false: they only observe.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks_permission_decisions: Option<bool>,
+    /// Agent Skills injected per turn by relevance (default 3, at most 16).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_max_selected: Option<usize>,
+    /// Minimum relevance score for automatic skill selection (default 0.20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_score_floor: Option<f64>,
+    /// Bytes of the always-visible skill name/description catalog (default
+    /// 0 = off, at most 65536).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_catalog_bytes: Option<usize>,
+    /// Skill packages discovered across all roots (default 64, at most 1024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_max_packages: Option<usize>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///

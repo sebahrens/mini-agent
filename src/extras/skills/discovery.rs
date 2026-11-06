@@ -14,7 +14,10 @@ use super::catalog::AgentSkillCatalog;
 use super::import::{SourceTree, publish_tree};
 use super::index::AgentSkillRecord;
 
-const MAX_PACKAGES: usize = 64;
+/// `skills_max_packages` (default 64, at most 1,024).
+fn max_packages() -> usize {
+    super::index::AgentSkillSearchPolicy::configured().max_packages
+}
 const MAX_ENTRIES: usize = 1024;
 const MAX_DEPTH: usize = 8;
 const MAX_RESOURCE_BYTES: usize = 1024 * 1024;
@@ -395,7 +398,7 @@ pub(crate) fn discover(
     match imported.refresh_lexical() {
         Ok(index) => {
             for record in index.records() {
-                if result.packages.len() == MAX_PACKAGES {
+                if result.packages.len() == max_packages() {
                     result
                         .diagnostics
                         .push("skill package limit exceeded".into());
@@ -483,7 +486,7 @@ pub(crate) fn discover(
         }
         for name in names {
             packages = packages.saturating_add(1);
-            if packages > MAX_PACKAGES {
+            if packages > max_packages() {
                 result
                     .diagnostics
                     .push("skill package limit exceeded".into());

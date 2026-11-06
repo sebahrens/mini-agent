@@ -107,6 +107,10 @@ pub(crate) struct InstructionSelection {
     pub(crate) sections: Vec<AgentSection>,
     pub(crate) pin: Option<String>,
     pub(crate) diagnostics: Vec<String>,
+    /// Always-visible `(name, description)` catalog of every authorized
+    /// skill, bounded by `skills_catalog_bytes`; empty when disabled.
+    pub(crate) catalog: Vec<(String, String)>,
+    pub(crate) catalog_omitted: usize,
 }
 
 /// Select and progressively load one immutable generation. The explicit pin
@@ -118,11 +122,26 @@ pub(crate) fn select_with_vector(
     pin: Option<&str>,
     vector: Option<&[f32]>,
 ) -> Result<InstructionSelection, String> {
-    use super::index::{AgentSkillSearchPolicy, ScoredAgentSkill};
-    let policy = AgentSkillSearchPolicy::default();
+    select_with_vector_and_policy(
+        index,
+        query,
+        pin,
+        vector,
+        &super::index::AgentSkillSearchPolicy::configured(),
+    )
+}
+
+pub(crate) fn select_with_vector_and_policy(
+    index: &super::index::AgentSkillIndex,
+    query: &str,
+    pin: Option<&str>,
+    vector: Option<&[f32]>,
+    policy: &super::index::AgentSkillSearchPolicy,
+) -> Result<InstructionSelection, String> {
+    use super::index::ScoredAgentSkill;
     let mut ranked = match vector {
-        Some(vector) => index.search(vector, &policy),
-        None => index.search_lexical(query, &policy),
+        Some(vector) => index.search(vector, policy),
+        None => index.search_lexical(query, policy),
     }
     .map_err(|error| error.to_string())?;
     if let Some(pin) = pin {
@@ -146,6 +165,11 @@ pub(crate) fn select_with_vector(
         pin: pin.map(str::to_string),
         ..Default::default()
     };
+    if policy.catalog_byte_budget > 0 {
+        let (catalog, omitted) = catalog_entries(index, policy.catalog_byte_budget);
+        selection.catalog = catalog;
+        selection.catalog_omitted = omitted;
+    }
     let mut instructions_left = policy.instruction_byte_budget;
     let mut resources_left = 32 * 1024usize;
     for skill in ranked.into_iter().take(policy.max_skills) {
@@ -206,6 +230,73 @@ pub(crate) fn select_with_vector(
     Ok(selection)
 }
 
+/// Every authorized skill's name and one-line description, sorted by name,
+/// until `budget` bytes; returns the entries and how many did not fit.
+fn catalog_entries(
+    index: &super::index::AgentSkillIndex,
+    budget: usize,
+) -> (Vec<(String, String)>, usize) {
+    let mut records: Vec<_> = index.records().iter().collect();
+    records.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut used = 0usize;
+    let mut entries = Vec::new();
+    let mut omitted = 0usize;
+    for record in records {
+        let description: String = record
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect();
+        let cost = record.name.len() + description.len() + 8;
+        if used.saturating_add(cost) > budget {
+            omitted += 1;
+            continue;
+        }
+        used += cost;
+        entries.push((record.name.clone(), description));
+    }
+    (entries, omitted)
+}
+
+/// Adds the catalog to an already composed trusted block (learned-skill
+/// builds), or returns a standalone block when nothing else was selected.
+#[cfg(feature = "skills")]
+pub(crate) fn with_catalog(block: String, selection: &InstructionSelection) -> String {
+    let catalog = render_catalog(selection);
+    if catalog.is_empty() {
+        return block;
+    }
+    const CLOSING: &str = "</trusted_skill_context>";
+    match block.rfind(CLOSING) {
+        Some(at) => format!("{}{catalog}{}", &block[..at], &block[at..]),
+        None => format!("<trusted_skill_context>\n{catalog}{CLOSING}"),
+    }
+}
+
+fn render_catalog(selection: &InstructionSelection) -> String {
+    if selection.catalog.is_empty() && selection.catalog_omitted == 0 {
+        return String::new();
+    }
+    let mut output = String::from(
+        "Available skills (name — description). Call skills_search with a skill name to load one; listing grants nothing:\n",
+    );
+    for (name, description) in &selection.catalog {
+        let line = format!("- {name} — {description}\n");
+        output
+            .push_str(&line.replace("</trusted_skill_context>", "&lt;/trusted_skill_context&gt;"));
+    }
+    if selection.catalog_omitted > 0 {
+        output.push_str(&format!(
+            "…[{} more skills omitted by skills_catalog_bytes; use skills_search]\n",
+            selection.catalog_omitted
+        ));
+    }
+    output
+}
+
 /// The plain instruction compositor. Whole sections fit after escaping; a
 /// requested pin that cannot fit is an error, not a false selected-success.
 pub(crate) fn render_plain(selection: &InstructionSelection) -> Result<String, String> {
@@ -220,7 +311,8 @@ fn render_plain_view(
     selection: &InstructionSelection,
     discovery_metadata: bool,
 ) -> Result<String, String> {
-    if selection.sections.is_empty() {
+    let catalog = render_catalog(selection);
+    if selection.sections.is_empty() && catalog.is_empty() {
         return Ok(String::new());
     }
     let mut output = if discovery_metadata {
@@ -233,6 +325,7 @@ fn render_plain_view(
             .into()
     };
     const CLOSING: &str = "</trusted_skill_context>";
+    output.push_str(&catalog);
     for section in &selection.sections {
         let rendered = if discovery_metadata {
             render_agent_section(section)

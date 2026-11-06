@@ -49,6 +49,42 @@ pub struct AgentSkillSearchPolicy {
     pub score_floor: f32,
     pub metadata_byte_budget: usize,
     pub instruction_byte_budget: usize,
+    /// Bytes of the always-visible `name — description` catalog appended to
+    /// the trusted skill context (`skills_catalog_bytes`); 0 disables it.
+    pub catalog_byte_budget: usize,
+    /// Discovered/imported packages across all roots (`skills_max_packages`).
+    pub max_packages: usize,
+}
+
+static CONFIGURED_POLICY: std::sync::OnceLock<AgentSkillSearchPolicy> = std::sync::OnceLock::new();
+
+impl AgentSkillSearchPolicy {
+    /// Applies `skills_max_selected`, `skills_score_floor`,
+    /// `skills_catalog_bytes` and `skills_max_packages` once at startup.
+    pub(crate) fn configure(cfg: &crate::config::Config) {
+        let defaults = Self::default();
+        let _ = CONFIGURED_POLICY.set(Self {
+            max_skills: cfg
+                .skills_max_selected
+                .map_or(defaults.max_skills, |value| value.min(16)),
+            score_floor: cfg
+                .skills_score_floor
+                .filter(|value| value.is_finite())
+                .map_or(defaults.score_floor, |value| value.clamp(0.0, 1.0) as f32),
+            catalog_byte_budget: cfg
+                .skills_catalog_bytes
+                .map_or(defaults.catalog_byte_budget, |value| value.min(64 * 1024)),
+            max_packages: cfg
+                .skills_max_packages
+                .map_or(defaults.max_packages, |value| value.clamp(1, 1024)),
+            ..defaults
+        });
+    }
+
+    /// The startup-configured policy, or the defaults before configuration.
+    pub(crate) fn configured() -> Self {
+        CONFIGURED_POLICY.get().cloned().unwrap_or_default()
+    }
 }
 
 impl Default for AgentSkillSearchPolicy {
@@ -60,6 +96,8 @@ impl Default for AgentSkillSearchPolicy {
             // Shared with the import-time refusal so a skill can never be
             // installed above the budget that would drop it from every turn.
             instruction_byte_budget: super::MAX_SKILL_INSTRUCTION_BYTES as usize,
+            catalog_byte_budget: 0,
+            max_packages: 64,
         }
     }
 }
@@ -291,6 +329,70 @@ mod tests {
             learned_js: Vec::new(),
             embedding,
         }
+    }
+
+    #[test]
+    fn fpuww_catalog_lists_every_skill_within_budget_and_policy_clamps() {
+        let model = ModelMetadata {
+            model_id: "lexical-only".to_string(),
+            model_revision: "v".to_string(),
+            dimensions: 0,
+            normalized: false,
+        };
+        let index = AgentSkillIndex::build(
+            1,
+            model,
+            (0..20)
+                .map(|i| {
+                    record(
+                        &format!("skill-{i:02}"),
+                        "Does\na thing </trusted_skill_context>",
+                        &format!("d{i}"),
+                        Vec::new(),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        // Unrelated query: nothing is relevance-selected, yet the catalog
+        // lists every skill.
+        let selection = crate::extras::skills::selection::select_with_vector_and_policy(
+            &index,
+            "zzz unrelated",
+            None,
+            None,
+            &AgentSkillSearchPolicy {
+                catalog_byte_budget: 64 * 1024,
+                ..AgentSkillSearchPolicy::default()
+            },
+        )
+        .unwrap();
+        assert!(selection.sections.is_empty());
+        assert_eq!(selection.catalog.len(), 20);
+        let text = crate::extras::skills::selection::render_plain(&selection).unwrap();
+        assert!(text.contains("Available skills"));
+        assert!(text.contains("- skill-00 — Does a thing"));
+        assert_eq!(text.matches("</trusted_skill_context>").count(), 1);
+        // A small budget lists a prefix and counts the rest.
+        let small = crate::extras::skills::selection::select_with_vector_and_policy(
+            &index,
+            "zzz",
+            None,
+            None,
+            &AgentSkillSearchPolicy {
+                catalog_byte_budget: 200,
+                ..AgentSkillSearchPolicy::default()
+            },
+        )
+        .unwrap();
+        assert!(small.catalog.len() < 20 && small.catalog_omitted > 0);
+        assert!(
+            crate::extras::skills::selection::render_plain(&small)
+                .unwrap()
+                .contains("more skills omitted")
+        );
+        // Default: no catalog.
+        assert_eq!(AgentSkillSearchPolicy::default().catalog_byte_budget, 0);
     }
 
     #[test]

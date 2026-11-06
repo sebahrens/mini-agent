@@ -359,7 +359,7 @@ impl SkillRuntime {
             degraded,
             turn_context: Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(revision))),
             learned_policy,
-            agent_policy: AgentSkillSearchPolicy::default(),
+            agent_policy: AgentSkillSearchPolicy::configured(),
             pure_learned_only: false,
             #[cfg(test)]
             background_rebuild_disabled: std::sync::atomic::AtomicBool::new(false),
@@ -501,6 +501,7 @@ impl SkillRuntime {
             &mut Vec::new(),
             selection.pin.as_deref(),
         )
+        .map(|block| crate::extras::skills::selection::with_catalog(block, selection))
     }
 
     pub(crate) fn compose_native_instructions(
@@ -515,6 +516,7 @@ impl SkillRuntime {
             selection.pin.as_deref(),
             true,
         )
+        .map(|block| crate::extras::skills::selection::with_catalog(block, selection))
     }
 
     pub(crate) fn embedder(&self) -> Arc<Embedder> {

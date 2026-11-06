@@ -599,6 +599,8 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         sandbox::begin_backend_probe(&cli.resolve_sandbox_backend(&cfg));
     }
     let version_changed = docs::ensure_global()?;
+    #[cfg(feature = "agent-skills")]
+    extras::skills::index::AgentSkillSearchPolicy::configure(&cfg);
     // ── Hooks: load settings.json config, apply trust, install dispatcher ──
     // Done this early (before provider/API-key resolution) so `--hooks-test`
     // is a pure config/dispatch dry run that needs no API key and makes no
