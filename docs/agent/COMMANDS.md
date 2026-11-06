@@ -941,6 +941,15 @@ Includes and supplied arguments cannot introduce another include or directive.
 Arguments are limited to 64 KiB and the expanded message to 256 KiB, followed by
 the normal context-budget check. Templates submit prompts through normal tools
 and permissions; they never execute their body as shell or slash commands.
+
+Over ACP, `session/new` and `session/load` advertise the same trusted command set for the session
+workspace (description, and `argument-hint` as the input hint), and a `session/prompt` that is one
+text block `/name args` is expanded with the same trust rules and limits (64 KiB arguments, 8
+includes, 256 KiB expansion) into one ordinary user message. Include reads need existing read
+permission and fail closed when approval would be required. `mode` and `model` frontmatter and an
+authored `%%mode` are not applied over ACP (the editor owns those selections). An unknown name is
+sent to the model as literal text, as before. Headless `-p` does not expand custom commands: a
+leading `/name` stays literal prompt text.
 ### Context composition
 
 `/context` shows estimates by section and the five largest live retained tool

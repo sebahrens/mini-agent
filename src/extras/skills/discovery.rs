@@ -20,7 +20,6 @@ fn max_packages() -> usize {
 }
 const MAX_ENTRIES: usize = 1024;
 const MAX_DEPTH: usize = 8;
-const DEFAULT_MAX_RESOURCE_BYTES: usize = 1024 * 1024;
 /// Per-package content budget (not shared across packages or roots).
 const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 

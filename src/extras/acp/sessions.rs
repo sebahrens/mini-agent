@@ -266,7 +266,7 @@ pub(super) async fn handle_load(
         }
     }
     let config_options = super::persona_config_options(state, &req.session_id).await;
-    super::commands::announce(&req.session_id, &cx)?;
+    super::commands::announce(state, &req.session_id, &cx).await?;
     responder.respond(
         LoadSessionResponse::new()
             .modes(modes)
