@@ -694,7 +694,12 @@ impl Pool {
             write_lane: Arc::new(tokio::sync::Semaphore::new(1)),
             recent: Mutex::default(),
             evidence: Default::default(),
-            resumable: Default::default(),
+            resumable: Arc::new(
+                crate::extras::subagents::resume::session_store_path(session.id.as_str())
+                    .map_or_else(Default::default, |path| {
+                        crate::extras::subagents::resume::ResumeStore::persistent(path)
+                    }),
+            ),
         });
         session.background_pool = Some(pool.clone());
         Ok(pool)

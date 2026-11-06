@@ -71,11 +71,12 @@ const CHILD_ID_MARKER: &str = "[child id: ";
 const MAX_STALE_CHILD_IDS: usize = 8;
 
 impl super::Session {
-    /// Resumable subagent conversations are kept in memory only, so every
-    /// `[child id: ...]` line stored in a resumed session names a child that
-    /// no longer exists and `task` with `resume` would fail with "unknown or
-    /// expired". Append one system notice (once per resume, only for ids newer
-    /// than the last notice) saying so, so the model is not offered dead ids.
+    /// Resumable subagent conversations are persisted with the session when
+    /// they fit the resume store limits; a `[child id: ...]` line naming a
+    /// child that was not restored would make `task` with `resume` fail with
+    /// "unknown or expired". Append one system notice (once per resume, only
+    /// for ids newer than the last notice and absent from the persisted store)
+    /// so the model is not offered dead ids.
     /// Returns whether a notice was added (mini-agent-csk01).
     pub fn note_stale_child_ids(&mut self, resumed: bool) -> bool {
         if !resumed {
@@ -89,6 +90,10 @@ impl super::Session {
                     && message.content.starts_with(STALE_CHILD_NOTICE)
             })
             .map_or(0, |index| index + 1);
+        // Children persisted with the session are restored on first use, so
+        // only ids missing from that store are reported as lost.
+        #[cfg(feature = "subagents")]
+        let restorable = crate::extras::subagents::resume::restorable_ids(self.id.as_str());
         let mut ids: Vec<String> = Vec::new();
         let mut total = 0usize;
         for message in &self.messages[start..] {
@@ -105,6 +110,10 @@ impl super::Session {
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
                     .take(64)
                     .collect();
+                #[cfg(feature = "subagents")]
+                if restorable.contains(&id) {
+                    continue;
+                }
                 if id.is_empty() || ids.contains(&id) {
                     continue;
                 }
@@ -123,7 +132,7 @@ impl super::Session {
             String::new()
         };
         let text = format!(
-            "{STALE_CHILD_NOTICE} are no longer resumable: {}{more}. Subagent conversations are kept in memory only and did not survive the restart, so a task call with `resume` for any of them fails. Start a new task instead and pass what the child found as context.",
+            "{STALE_CHILD_NOTICE} are no longer resumable: {}{more}. These subagent conversations were not kept with the session (they exceeded the resume store limits, were dropped, or the session artifacts were removed), so a task call with `resume` for any of them fails. Start a new task instead and pass what the child found as context.",
             ids.join(", ")
         );
         self.add_message(super::MessageRole::System, &text);

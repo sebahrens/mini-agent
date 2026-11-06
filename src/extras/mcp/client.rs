@@ -234,7 +234,7 @@ pub struct McpClientHandle {
     pub(crate) elicitation: super::elicitation::Handler,
     pub(crate) source_proof: Option<std::sync::Arc<super::project::ServerSourceProof>>,
     pub(crate) liveness: std::sync::Arc<()>,
-    pub(crate) auxiliary: Arc<tokio::sync::OnceCell<super::catalogue::Catalogue>>,
+    pub(crate) auxiliary: Arc<super::catalogue::AuxiliaryCache>,
     /// Successful `tools/list` of this connection generation. A reconnect is a
     /// new handle (and cache); failures are not cached. A server's
     /// `notifications/tools/list_changed` marks it stale, so the next
@@ -644,6 +644,7 @@ impl McpClientHandle {
                 // may learn that root through `roots/list`.
                 let elicitation = super::elicitation::Handler::with_root(workspace);
                 let tools_changed = elicitation.tools_changed.clone();
+                let auxiliary_changed = elicitation.auxiliary_changed.clone();
                 let (transport, cleanup_complete, stderr) =
                     spawn_stdio_server(cmd, MCP_STDIO_MAX_LINE_BYTES, elicitation.forms.clone())
                         .map_err(|error| {
@@ -707,7 +708,9 @@ impl McpClientHandle {
                     elicitation,
                     source_proof: None,
                     liveness: std::sync::Arc::new(()),
-                    auxiliary: Arc::new(tokio::sync::OnceCell::new()),
+                    auxiliary: Arc::new(super::catalogue::AuxiliaryCache::with_flag(
+                        auxiliary_changed,
+                    )),
                     tools: Arc::new(ToolListCache::with_flag(tools_changed)),
                     options: Default::default(),
                     defer: Default::default(),
@@ -820,6 +823,7 @@ impl McpClientHandle {
         let oauth_settings = oauth.and_then(|o| o.settings());
         let elicitation = super::elicitation::Handler::default();
         let tools_changed = elicitation.tools_changed.clone();
+        let auxiliary_changed = elicitation.auxiliary_changed.clone();
         // Every response body and SSE event is capped (see `bounded_http`).
         let http_client = BoundedHttpClient::new(
             http_client_for(initialize_timeout, endpoint)?,
@@ -875,7 +879,9 @@ impl McpClientHandle {
             elicitation,
             source_proof: None,
             liveness: std::sync::Arc::new(()),
-            auxiliary: Arc::new(tokio::sync::OnceCell::new()),
+            auxiliary: Arc::new(super::catalogue::AuxiliaryCache::with_flag(
+                auxiliary_changed,
+            )),
             tools: Arc::new(ToolListCache::with_flag(tools_changed)),
             options: Default::default(),
             defer: Default::default(),
@@ -896,31 +902,48 @@ impl McpClientHandle {
     #[cfg(test)]
     pub(crate) async fn discover_auxiliary(&self) {
         self.auxiliary
-            .get_or_init(|| super::catalogue::discover(self, Duration::from_secs(3)))
+            .ensure(
+                &super::catalogue::RpcClient::capture(self),
+                Duration::from_secs(3),
+            )
             .await;
     }
 
-    /// Fill the auxiliary catalogue in a detached task so prompt/resource
+    /// Fill (or, after a prompts/resources `list_changed` notification,
+    /// refresh) the auxiliary catalogue in a detached task so prompt/resource
     /// discovery never sits on the connect critical path. Status and the
     /// pickers already treat a pending cell as empty. The task owns only an
     /// [`RpcClient`](super::catalogue::RpcClient) capture with a weak liveness
     /// witness, so retirement ends it at the next request boundary.
     pub(crate) fn spawn_auxiliary_discovery(&self) {
-        if self.auxiliary.initialized() {
+        if self.auxiliary.initialized() && !self.auxiliary.is_stale() {
             return;
         }
-        let cell = Arc::clone(&self.auxiliary);
+        let cache = Arc::clone(&self.auxiliary);
         let client = super::catalogue::RpcClient::capture(self);
-        let capabilities = self
-            .peer()
-            .peer_info()
-            .map(|info| info.capabilities.clone());
         tokio::spawn(async move {
-            cell.get_or_init(|| {
-                super::catalogue::discover_captured(&client, capabilities, Duration::from_secs(3))
-            })
-            .await;
+            cache.ensure(&client, Duration::from_secs(3)).await;
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn auxiliary_mark_stale_for_test(&self) {
+        self.elicitation
+            .auxiliary_changed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Refresh the catalogue now when the server announced a change, so a
+    /// prompt or resource lookup never acts on a removed entry.
+    pub(crate) async fn refresh_auxiliary_if_stale(&self) {
+        if self.auxiliary.is_stale() {
+            self.auxiliary
+                .ensure(
+                    &super::catalogue::RpcClient::capture(self),
+                    Duration::from_secs(3),
+                )
+                .await;
+        }
     }
 
     /// The cached listing of this connection generation, listing (and

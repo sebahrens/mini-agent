@@ -366,6 +366,9 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
             imported.install_path.display(),
             imported.reimported
         );
+        for diagnostic in &imported.manifest.diagnostics {
+            println!("Agent Skill note: {diagnostic}");
+        }
         return Ok(());
     }
 

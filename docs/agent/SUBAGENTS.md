@@ -206,14 +206,21 @@ deadlines and report contract, and its requests are charged to the call's
 `task_max_cost_units` and the session spend account. A resumed child gets a
 new child id. Exactly one prompt is accepted.
 
-The conversations are bounded and in memory only: the session keeps the 16
-most recent (8 MiB of serialized conversation each; larger ones get no id),
-owned by the session's task pool (or the task tool without one). They do not
-survive a restart: when a saved session is resumed (`--continue`, `--resume`), one system
-notice names the `[child id: ...]` ids stored in it as no longer resumable (ids from before the
-last such notice are not repeated), so the model starts a new task instead of using a dead id. An
-unknown or expired id is rejected with an explicit error. Worktree-isolated children are not resumable (their worktree ends with
-them); failed children get no id.
+The conversations are bounded: the session keeps the 16 most recent (8 MiB of
+serialized conversation each; larger ones get no id), owned by the session's task pool (or the
+task tool without one). A session-owned store is also written, after every change, to a private
+(owner-only) file inside the session's private tool-output directory, so it is deleted, pruned
+and swept together with the session. The file holds the newest children whose serialized size
+sums to at most `task_resume_max_bytes` (the newest is always kept) and at most
+`task_resume_max_children` children; when a saved session is resumed (`--continue`, `--resume`)
+the ids in that file work again with `task {"resume": id}`. A malformed, oversized or unsafe
+file (symlink, wrong owner or mode, invalid ids) is ignored. Only ids that could not be restored
+(dropped by the limits, removed artifacts, or a forked/imported session) are named in one system
+notice as no longer resumable (ids from before the last such notice are not repeated), so the
+model starts a new task instead of using a dead id. An unknown or expired id is rejected with an
+explicit error. The task tool without a session pool keeps its conversations in memory only.
+Worktree-isolated children are not resumable (their worktree ends with them); failed children get
+no id.
 
 ## Specialist Agent Types
 
@@ -592,7 +599,14 @@ mode: review
   `mcp_servers`), within the same 8-server limit, still child-only, trust-gated like any project
   persona and permission-checked per call. A server that is not configured in mini-agent fails the
   child, and an inline server definition is never started (it is reported as not applied).
-  `skills`, `permissionMode`, `background`, `memory` and `hooks` are recognised but have no effect;
+  `skills` lists skill names: each is resolved against the current authorized skills catalogue
+  when the child starts and its `SKILL.md` instructions are placed in the child's system prompt
+  (resources are not inlined), within the instruction byte budget of `[skills]` selection (48 KiB
+  by default) across all listed skills and at most 16 names. A name that is unknown, not
+  authorized, invalid, or does not fit the budget is skipped with a
+  `[skill preload: ...]` notice in the child's prompt (and a log warning); the child can still call
+  `skills_search` when granted. Preloaded text never grants permissions.
+  `permissionMode`, `background`, `memory` and `hooks` are recognised but have no effect;
   each produces a `[specialist metadata: <key> not applied: ...]` notice naming the behaviour that
   is missing.
 - `model` is first resolved as a configured quick-model alias, including its

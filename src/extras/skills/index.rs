@@ -33,6 +33,10 @@ pub struct AgentSkillRecord {
     pub disable_model_invocation: bool,
     /// `user-invocable: false`: hidden from the `/` picker and not pinnable.
     pub user_invocable: bool,
+    /// `argument-hint` text for the `/skills` listing.
+    pub argument_hint: Option<String>,
+    /// Unsupported Claude Code key diagnostics, surfaced by `/skills`.
+    pub diagnostics: Vec<String>,
     pub(crate) embedding: Vec<f32>,
 }
 
@@ -345,6 +349,8 @@ mod tests {
             learned_js: Vec::new(),
             disable_model_invocation: false,
             user_invocable: true,
+            argument_hint: None,
+            diagnostics: Vec::new(),
             embedding,
         }
     }

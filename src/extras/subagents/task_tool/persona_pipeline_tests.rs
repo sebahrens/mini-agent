@@ -345,6 +345,7 @@ const CLI_KEY: &str = "sk-ant-cli-key-must-never-reach-glm";
 /// need neither persona files nor process environment.
 fn alias_persona(alias: &str) -> ResolvedSpecialization {
     ResolvedSpecialization {
+        skills: Vec::new(),
         write_mode: false,
         isolation_worktree: false,
         prompt: "persona".into(),

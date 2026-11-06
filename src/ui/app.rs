@@ -7008,10 +7008,26 @@ impl<'a> App<'a> {
                     C_TOOL,
                 )?;
                 for (name, description) in &entries {
+                    let package = snapshot.packages.get(name.trim_start_matches('/'));
+                    let hint = package
+                        .and_then(|package| package.record.argument_hint.as_deref())
+                        .map(|hint| format!(" {hint}"))
+                        .unwrap_or_default();
                     renderer.write_line(
-                        &format!("  {}  {}", sanitize_output(name), description),
+                        &format!(
+                            "  {}{}  {}",
+                            sanitize_output(name),
+                            sanitize_output(&hint),
+                            description
+                        ),
                         C_TOOL,
                     )?;
+                    for diagnostic in package.iter().flat_map(|p| p.record.diagnostics.iter()) {
+                        renderer.write_line(
+                            &format!("    note: {}", sanitize_output(diagnostic)),
+                            C_ERROR,
+                        )?;
+                    }
                 }
                 if entries.is_empty() {
                     renderer.write_line("  no currently authorized skills", C_TOOL)?;
