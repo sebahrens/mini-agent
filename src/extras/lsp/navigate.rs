@@ -2,8 +2,12 @@
 //! definition, references, implementation, type definition, hover, document
 //! symbols and workspace symbols. Requests reuse the capability-bound
 //! document sync of the diagnostics path; every result location is mapped
-//! back to a canonical workspace path, and locations outside the workspace
-//! (or reported through symlink aliases) are counted but never named.
+//! back to a canonical workspace path. A location outside the workspace
+//! (dependency or standard-library source) is returned as an `external` item
+//! with its canonical absolute path when it is an existing regular file; the
+//! tool layer re-checks it against the `read` rules before naming it. Anything
+//! else (non-file URIs, missing files, control characters, symlink aliases of
+//! workspace files) is counted but never named.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -99,6 +103,10 @@ pub(crate) struct NavItem {
     pub label: Option<String>,
     /// Nesting depth for document symbols.
     pub depth: usize,
+    /// The location is a canonical absolute path outside the workspace
+    /// (dependency, standard library). The tool layer re-checks it against
+    /// the `read` permission before naming it.
+    pub external: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +203,31 @@ fn clean_name(value: &str) -> String {
     truncate(single_line.trim(), MAX_NAME_BYTES).0
 }
 
+/// Longest absolute path named for a location outside the workspace.
+const MAX_EXTERNAL_PATH_BYTES: usize = 4096;
+
+/// The canonical absolute path of a `file:` URI the server reported outside
+/// the workspace (dependency source, standard library). Only an existing
+/// regular file is named; the canonical target is used, so a symlink alias
+/// never changes which path the permission check judges. Paths that are not
+/// UTF-8, carry control characters (a hostile server could use them to forge
+/// output lines) or exceed [`MAX_EXTERNAL_PATH_BYTES`] stay omitted.
+fn external_location(uri: &str) -> Option<PathBuf> {
+    let path = super::client::file_path(uri)?;
+    if !path.is_absolute() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let text = canonical.to_str()?;
+    if text.len() > MAX_EXTERNAL_PATH_BYTES || text.chars().any(char::is_control) {
+        return None;
+    }
+    std::fs::metadata(&canonical)
+        .ok()?
+        .is_file()
+        .then_some(canonical)
+}
+
 /// Location, Location[] or LocationLink[] (definition-style responses).
 pub(crate) fn locations_answer(result: &Value, map: &dyn Fn(&str) -> Option<PathBuf>) -> NavAnswer {
     let entries: Vec<&Value> = match result {
@@ -215,9 +248,15 @@ pub(crate) fn locations_answer(result: &Value, map: &dyn Fn(&str) -> Option<Path
             ),
             None => (entry.get("uri").and_then(Value::as_str), entry.get("range")),
         };
-        let Some(path) = uri.and_then(map) else {
-            outside += 1;
-            continue;
+        let (path, external) = match uri.and_then(map) {
+            Some(path) => (path, false),
+            None => match uri.and_then(external_location) {
+                Some(path) => (path, true),
+                None => {
+                    outside += 1;
+                    continue;
+                }
+            },
         };
         let (line, character) = position_of(range);
         let item = NavItem {
@@ -226,6 +265,7 @@ pub(crate) fn locations_answer(result: &Value, map: &dyn Fn(&str) -> Option<Path
             character,
             label: None,
             depth: 0,
+            external,
         };
         if items.contains(&item) {
             continue;
@@ -267,14 +307,22 @@ pub(crate) fn symbols_answer(
             .filter(|container| !container.is_empty())
             .map(|container| format!(" (in {})", clean_name(container)))
             .unwrap_or_default();
-        let (path, range) = match entry.get("location") {
-            Some(location) => (
-                location.get("uri").and_then(Value::as_str).and_then(map),
-                location.get("range"),
-            ),
+        let (path, range, external) = match entry.get("location") {
+            Some(location) => {
+                let uri = location.get("uri").and_then(Value::as_str);
+                match uri.and_then(map) {
+                    Some(path) => (Some(path), location.get("range"), false),
+                    None => {
+                        let path = uri.and_then(external_location);
+                        let external = path.is_some();
+                        (path, location.get("range"), external)
+                    }
+                }
+            }
             None => (
                 document.map(Path::to_path_buf),
                 entry.get("selectionRange").or_else(|| entry.get("range")),
+                false,
             ),
         };
         if depth < MAX_SYMBOL_DEPTH
@@ -297,6 +345,7 @@ pub(crate) fn symbols_answer(
             character,
             label: Some(format!("{kind} {}{detail}", clean_name(name))),
             depth,
+            external,
         });
     }
     NavAnswer::Items {
@@ -392,7 +441,8 @@ mod tests {
                     line: 4,
                     character: 2,
                     label: None,
-                    depth: 0
+                    depth: 0,
+                    external: false,
                 }],
                 outside: 0,
                 truncated: 0
@@ -489,5 +539,70 @@ mod tests {
         assert!(NavOp::parse("rename").is_none());
         assert!(NavOp::References.needs_position());
         assert!(!NavOp::WorkspaceSymbols.needs_position());
+    }
+}
+
+#[cfg(test)]
+mod external_tests {
+    use super::*;
+
+    fn none(_: &str) -> Option<PathBuf> {
+        None
+    }
+
+    #[test]
+    fn existing_outside_file_is_named_canonically_and_flagged() {
+        let dir = std::env::temp_dir().join(format!("nav-external-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "x").unwrap();
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        let uri = super::super::client::file_uri(&canonical).unwrap();
+        let range = json!({"start": {"line": 1, "character": 2}});
+        let answer = locations_answer(&json!([{"uri": uri, "range": range}]), &none);
+        let NavAnswer::Items { items, outside, .. } = answer else {
+            panic!("items");
+        };
+        assert_eq!(outside, 0);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].external);
+        assert_eq!(items[0].path, canonical);
+        // Directories, missing files, non-file schemes and relative URIs
+        // stay omitted (counted, never named).
+        let bad = locations_answer(
+            &json!([
+                {"uri": super::super::client::file_uri(&std::fs::canonicalize(&dir).unwrap()).unwrap(), "range": range},
+                {"uri": "file:///definitely/missing/lib.rs", "range": range},
+                {"uri": "jar:file:///x.jar!/A.class", "range": range},
+                {"uri": "https://example.invalid/lib.rs", "range": range},
+            ]),
+            &none,
+        );
+        let NavAnswer::Items { items, outside, .. } = bad else {
+            panic!("items");
+        };
+        assert!(items.is_empty());
+        assert_eq!(outside, 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_characters_in_an_outside_path_are_never_named() {
+        let dir = std::env::temp_dir().join(format!("nav-ctrl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("evil\nINJECTED line.rs");
+        std::fs::write(&file, "x").unwrap();
+        let uri = super::super::client::file_uri(&std::fs::canonicalize(&file).unwrap()).unwrap();
+        let answer = locations_answer(
+            &json!({"uri": uri, "range": {"start": {"line": 0, "character": 0}}}),
+            &none,
+        );
+        let NavAnswer::Items { items, outside, .. } = answer else {
+            panic!("items");
+        };
+        assert!(items.is_empty());
+        assert_eq!(outside, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

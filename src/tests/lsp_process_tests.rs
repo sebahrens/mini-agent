@@ -310,8 +310,10 @@ fn main() {
             let result = if body.contains("textDocument/definition") {
                 format!("{{\"uri\":\"{uri}\",\"range\":{}}}", range(2, 4))
             } else if body.contains("textDocument/references") {
+                let outside = env::var("LSP_FIXTURE_OUTSIDE_URI")
+                    .unwrap_or_else(|_| "file:///nonexistent-outside/lib.rs".to_string());
                 format!(
-                    "[{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"file:///nonexistent-outside/lib.rs\",\"range\":{}}}]",
+                    "[{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"{outside}\",\"range\":{}}}]",
                     range(0, 3), range(5, 0), range(1, 1)
                 )
             } else if body.contains("textDocument/hover") {
@@ -1502,6 +1504,79 @@ async fn lsp_process_navigate_tool_maps_locations_and_respects_read_denies() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn lsp_process_navigate_names_outside_workspace_locations_subject_to_read_rules() {
+    use crate::agent::tools::lsp::{LspNavigateArgs, LspNavigateTool};
+    let fixture = FixtureBuild::compile("navigate-outside");
+    let workspace = fixture.workspace("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("src/nav.rs"),
+        "struct Outer;\nfn inner() {}\n",
+    )
+    .unwrap();
+    let dependency = fixture.path("deps/lib.rs");
+    fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+    fs::write(&dependency, "pub fn dep() {}\n").unwrap();
+    let dependency = dependency.canonicalize().unwrap();
+    let mut server = fixture.config("navigate", &fixture.path("navigate-outside.lease"));
+    server.extensions = vec![".rs".into()];
+    server.env.insert(
+        "LSP_FIXTURE_OUTSIDE_URI".into(),
+        file_uri(&dependency).unwrap(),
+    );
+    let manager = LspManager::new(
+        &LspConfig {
+            servers: HashMap::from([("fixture".into(), server)]),
+            ..Default::default()
+        },
+        Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+    );
+    let args = || LspNavigateArgs {
+        op: "references".into(),
+        path: "src/nav.rs".into(),
+        line: Some(1),
+        column: Some(1),
+        query: None,
+    };
+    let open = LspNavigateTool::new(manager.clone(), None, None)
+        .call(args())
+        .await
+        .unwrap();
+    let permission = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                read: Some(crate::permission::ToolPerm::Granular(
+                    [("**/deps/**".to_string(), crate::permission::Action::Deny)].into(),
+                )),
+                ..Default::default()
+            }),
+            crate::permission::SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["guarded".into(), "standard".into()]),
+        )
+        .unwrap(),
+    ));
+    let guarded = LspNavigateTool::new(manager.clone(), Some(permission), None)
+        .call(args())
+        .await
+        .unwrap();
+    manager.shutdown().await;
+    drop(manager);
+    fixture.cleanup().await;
+    let expected = format!("{}:2:2 (outside workspace)", dependency.display());
+    assert!(open.contains(&expected), "{open}");
+    assert!(!open.contains("outside the workspace omitted"), "{open}");
+    assert!(
+        !guarded.contains(&dependency.display().to_string()),
+        "{guarded}"
+    );
+    assert!(
+        guarded.contains("[1 results hidden by permission rules]"),
+        "{guarded}"
+    );
+}
+
 #[tokio::test]
 async fn lsp_process_permission_wait_rejects_leaf_and_parent_symlink_retargets() {
     use crate::agent::tools::lsp::{LspArgs, LspTool};

@@ -3785,9 +3785,13 @@ locations (1-based). Only files inside the session workspace can be queried;
 the file is checked against the `read` policy (rules written for `read`
 apply, as for `lsp_diagnostics`) and synchronized from disk before the
 request. Result locations are mapped back through the same URI translation
-as diagnostics: locations outside the workspace or through symlink aliases
-are counted but never named, and files hidden by a `read` deny rule are
-counted as hidden. Results are capped at 100 locations/symbols (excess is
+as diagnostics. A location outside the workspace (dependency or standard
+library source) is listed by its canonical absolute path and marked
+`(outside workspace)` when it is an existing regular file the `read` rules do
+not deny, so it can be opened with `read` under the normal permission flow;
+denied ones are counted as hidden, and non-file URIs, missing files and paths
+with control characters are counted but never named. Symlink aliases of
+workspace files are counted but never named. Results are capped at 100 locations/symbols (excess is
 reported with a count), hover text at 8 KiB (marked when truncated), and
 each request at 10 seconds. An op the server does not advertise in its
 `initialize` capabilities (for example no `implementationProvider`) fails
