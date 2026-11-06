@@ -12,8 +12,11 @@ with the retained user messages. A consumed steering message is anchored to its
 actual canonical user row before the runner may request another completion or
 perform later tools. A stale or unacknowledged handoff stops that continuation.
 
-Native `write` and `edit` capture complete permitted preimages before their
-checked publication. Checkpoints are independent of displayed diff limits and
+Native `write`, `edit` and `notebook_edit` capture complete permitted preimages
+before their checked publication (`notebook_edit` records the exact raw `.ipynb`
+bytes, so restoring returns the original formatting byte for byte; notebooks
+outside the bound workspace are counted as unavailable checkpoints, like
+external `edit` targets). Checkpoints are independent of displayed diff limits and
 post-tool output rewriting. The committed postimage is recorded before optional
 formatter work yields; a known formatter result updates that postimage. The
 ordinary request owns the capture, including native writes made by its child

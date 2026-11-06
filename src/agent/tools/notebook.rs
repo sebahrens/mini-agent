@@ -585,6 +585,26 @@ impl NotebookTool {
             crate::spend::run::admit_current_effect()
                 .await
                 .map_err(|err| ToolError::Msg(err.to_string()))?;
+            // Capture the exact preimage for /rewind like native write/edit.
+            let before: Arc<[u8]> = Arc::from(before);
+            let mut checkpoint = match &bound {
+                Some(relative) => {
+                    crate::session::file_checkpoints::prepare(
+                        &self.workspace,
+                        relative,
+                        Some(crate::session::file_checkpoints::Preimage::new(
+                            Arc::clone(&before),
+                            &base,
+                        )),
+                        disclose,
+                    )
+                    .await
+                }
+                None => {
+                    crate::session::file_checkpoints::skipped();
+                    None
+                }
+            };
             #[cfg(test)]
             let cancellation = self.publication_cancellation.clone().unwrap_or_default();
             #[cfg(not(test))]
@@ -618,6 +638,10 @@ impl NotebookTool {
                     cancellation,
                 )
                 .await?;
+            }
+            crate::session::file_checkpoints::published();
+            if let Some(checkpoint) = &mut checkpoint {
+                checkpoint.committed(&crate::fs::ContentDigest::of(&after), after.len());
             }
             if disclose {
                 diff = MutationDiff::replacement(

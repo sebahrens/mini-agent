@@ -71,6 +71,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   bit-parallel Levenshtein distance, and overlapping windows count as one region. The old
   8M-cell budget made it inert for multi-line SEARCH blocks beyond ~45-line files; the new
   64M-word budget is documented in `docs/agent/TOOL_RUNTIME.md` (mini-agent-73js3).
+- `notebook_edit` changes are now captured by file checkpoints, so `/rewind` "restore files" lists
+  and restores the exact pre-edit `.ipynb` bytes instead of silently skipping them
+  (mini-agent-qs5dg).
 
 ### Added
 

@@ -984,6 +984,47 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn rewind_restores_exact_notebook_preimage_after_notebook_edit() {
+        let root = crate::tests::OwnedTestDirectory::new("rewind-notebook");
+        // Jupyter-style bytes (indent 1, trailing newline) must come back exactly.
+        let original = "{\n \"cells\": [\n  {\n   \"cell_type\": \"code\",\n   \"execution_count\": 3,\n   \"metadata\": {},\n   \"outputs\": [],\n   \"source\": [\n    \"print(1)\"\n   ]\n  }\n ],\n \"metadata\": {},\n \"nbformat\": 4,\n \"nbformat_minor\": 4\n}\n";
+        std::fs::write(root.path().join("book.ipynb"), original).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let store = FileCheckpoints::default();
+        scope(Some(store.recorder("session", 0, true)), async {
+            crate::agent::tools::notebook::NotebookTool::new(
+                None,
+                None,
+                workspace.clone(),
+                ReadTracker::new(true),
+                None,
+                crate::agent::tools::mutation_diff::DiffOptions::default(),
+            )
+            .call(
+                serde_json::from_value(serde_json::json!({
+                    "path": "book.ipynb", "mode": "replace", "cell_index": 0, "source": "print(2)"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        assert_ne!(
+            std::fs::read_to_string(root.path().join("book.ipynb")).unwrap(),
+            original
+        );
+        let summary = store.summary_from("session", 0);
+        assert!(summary.contains("1 files"), "{summary}");
+        assert!(summary.contains("book.ipynb"), "{summary}");
+        assert!(!summary.contains("unavailable"), "{summary}");
+        assert_eq!(store.restore("session", 0, &workspace).unwrap(), 1);
+        assert_eq!(
+            std::fs::read(root.path().join("book.ipynb")).unwrap(),
+            original.as_bytes()
+        );
+    }
+    #[tokio::test]
     async fn rewind35_checks_all_postimages_before_any_restore_and_preserves_editor_changes() {
         let root = crate::tests::OwnedTestDirectory::new("rewind35-conflict");
         for path in ["a", "z"] {
