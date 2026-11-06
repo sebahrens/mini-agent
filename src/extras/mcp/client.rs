@@ -591,7 +591,9 @@ impl McpClientHandle {
                     )
                 })?;
                 validate()?;
-                let elicitation = super::elicitation::Handler::default();
+                // A stdio server already runs in the captured workspace; it
+                // may learn that root through `roots/list`.
+                let elicitation = super::elicitation::Handler::with_root(workspace);
                 let tools_changed = elicitation.tools_changed.clone();
                 let (transport, cleanup_complete, stderr) =
                     spawn_stdio_server(cmd, MCP_STDIO_MAX_LINE_BYTES, elicitation.forms.clone())

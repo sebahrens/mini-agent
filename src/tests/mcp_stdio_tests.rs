@@ -290,6 +290,14 @@ fn main() {
                 );
             }
             let id = request_id(&compact);
+            if mode == "aux-roots" {
+                pending_aux = Some(id);
+                write_response(
+                    &mut stdout,
+                    "{\"jsonrpc\":\"2.0\",\"id\":\"aux-form-roots\",\"method\":\"roots/list\"}",
+                );
+                continue;
+            }
             if mode == "aux-elicit-concurrent" {
                 concurrent_ids.push(id);
                 if concurrent_ids.len() == 2 {
@@ -1833,6 +1841,55 @@ async fn mcp_tools_list_changed_relists_at_the_next_collection_or_keeps_the_old_
         shutdown(manager).await;
         assert_process_reaped(pid).await;
     }
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_stdio_server_lists_the_workspace_root_and_sampling_stays_unadvertised() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("aux-roots");
+    let workspace = fixture.root.join("roots workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let handle = McpClientHandle::connect_in(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "aux-roots",
+            &lease,
+        ),
+        &workspace,
+    )
+    .await
+    .unwrap();
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let tools = manager
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Allow)),
+            None,
+            McpToolTimeouts::default(),
+        )
+        .await;
+    let output = tools[0].call("{}".to_string()).await.unwrap();
+    let expected = reqwest::Url::from_directory_path(&workspace).unwrap();
+    // The tool output is the server's escaped copy of our roots/list reply.
+    assert!(
+        output
+            .replace("\\\"", "\"")
+            .contains(&format!("\"uri\":\"{expected}\"")),
+        "{output}"
+    );
+    let trace = std::fs::read_to_string(lease.with_extension("rpc")).unwrap();
+    let initialize = trace
+        .lines()
+        .find(|line| line.contains("\"initialize\""))
+        .unwrap();
+    assert!(initialize.contains("\"roots\""), "{initialize}");
+    assert!(!initialize.contains("\"sampling\""), "{initialize}");
+    assert!(initialize.contains("\"url\""), "{initialize}");
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
     fixture.cleanup();
 }
 

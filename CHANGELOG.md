@@ -70,6 +70,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- MCP: stdio servers get the `roots` capability (`roots/list` returns the workspace root;
+  remote servers get none); URL-mode elicitation shows the link for the user to open and
+  answer Done/Decline; sampling stays explicitly refused and documented (mini-agent-a67h7).
 - MCP `notifications/tools/list_changed` is honoured: the connection relists at the next tool
   collection and the TUI rebuilds the agent before the next turn; a failed relist keeps the
   previous tools with a notice (mini-agent-7mqfb).

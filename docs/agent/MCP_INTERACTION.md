@@ -79,7 +79,20 @@ connection. Its frontend, Question turn, Run and cancellation scope are captured
 from that RPC, not inferred from a tool name, callback text or a last-running
 request. Ambiguous concurrent RPCs, reused request IDs and retired sources are
 refused. The callback is an owned part of the original work scope and stops with
-that work. URL elicitation and server sampling are unsupported. Headless declines forms; ACP cancels unsupported forms; they never supply a permission answer instead.
+that work. Headless declines forms; ACP cancels unsupported forms; they never supply a permission answer instead.
+
+URL-mode elicitation is advertised and follows the same exact-RPC lease, owner,
+cancellation and cost checks as forms. The user sees the server message and the
+link and chooses `Done` (accept, no content) or `Decline`; mini-agent never opens
+or fetches the URL itself. Only absolute HTTPS links (or loopback HTTP) of at most
+1,536 bytes without embedded credentials are shown; anything else is declined.
+
+Stdio servers receive the `roots` capability and `roots/list` returns the
+captured workspace root as a `file://` URI; URL (remote) servers get no roots
+capability, so local paths are not disclosed to them. Server sampling
+(`sampling/createMessage`) is deliberately not advertised and is answered with
+method-not-found: a server-initiated model request would bypass the operator's
+turn, budget and permission flow.
 
 The interactive form overlay uses the ordinary typed question editor, while
 agent, side-question and other UI channels continue to drain. Esc or Ctrl-C
