@@ -92,6 +92,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   when the child ends), plus the parent's `shell_auto_background` and a command-log directory so
   oversized output stays recoverable (mini-agent-eqlme, mini-agent-ysugx).
 
+- The task tool's `agent_type` listing keeps up to 1,000 characters of each agent description
+  (was 160) under a 12,000-character combined budget, with an explicit shortened/omitted count
+  instead of a silent per-agent cut (mini-agent-767y1).
+
 ### Shell and pty jobs (round 7, group P)
 
 - `job_status` input no longer accepts TAB or shell history expansion (`!` followed by text, a

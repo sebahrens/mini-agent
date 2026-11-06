@@ -532,8 +532,12 @@ mode: review
 ---
 ```
 
-- `description` is the bounded (160-character) summary shown in the task
-  tool's `agent_type` schema. Without it, the first prompt paragraph is used.
+- `description` is the delegation guidance shown in the task tool's `agent_type` schema. Up to
+  1,000 characters of it are listed per agent (4,096 are kept); when all listed descriptions
+  together exceed 12,000 characters the per-agent share shrinks (down to 160) and, last, trailing
+  agents lose their description. The listing then ends with a note counting how many descriptions
+  were shortened or omitted (also logged as a warning); the full text stays in the agent file.
+  Without a description, the first sentence of the prompt (at most 160 characters) is used.
 - `tools` narrows the installed child tools. It accepts a YAML list or a
   comma-separated string. Canonical names are `read`, `grep`, `find_files`,
   `list_dir`, `js` when JS support is compiled, and `skills_search` when skills support is compiled, plus
@@ -618,7 +622,7 @@ tool-result and `[subagent output ...]` report boundaries.
 
 The block is validated and removed before the prompt is installed. Malformed
 metadata, empty prompt bodies, invalid UTF-8, and oversized
-files are rejected. Claude Code compatibility: a frontmatter `name` that differs from the file name is not fatal (the file name stays the agent type and a `[specialist metadata: ...]` notice is recorded), and a `description` over 160 characters is shortened with an ellipsis and a notice. The loader emits a warning naming the file and reason. If the
+files are rejected. Claude Code compatibility: a frontmatter `name` that differs from the file name is not fatal (the file name stays the agent type and a `[specialist metadata: ...]` notice is recorded), and a `description` over 4,096 characters is cut with a notice (the listing budget above applies separately). The loader emits a warning naming the file and reason. If the
 rejected user or trusted-project file has the same valid stem as an available
 lower-priority persona, the task result is prefixed with a
 `[specialist source: ... definition ignored: ...]` notice and identifies the

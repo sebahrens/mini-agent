@@ -5,7 +5,17 @@ use include_dir::{Dir, include_dir};
 
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/data/agents");
 const MAX_AGENT_PROMPT_BYTES: usize = 256 * 1024;
-const MAX_AGENT_DESCRIPTION_CHARS: usize = 160;
+/// Longest frontmatter `description` kept (Claude Code descriptions carry
+/// when-to-use text and examples, so this is far above a display length).
+const MAX_AGENT_DESCRIPTION_CHARS: usize = 4096;
+/// Longest description derived from the prompt when there is no frontmatter one.
+const MAX_DERIVED_DESCRIPTION_CHARS: usize = 160;
+/// Per-agent share of the model-facing `agent_type` listing.
+const MAX_LISTED_DESCRIPTION_CHARS: usize = 1000;
+/// Combined size of all listed descriptions before they are shortened.
+const MAX_LISTED_DESCRIPTIONS_TOTAL_CHARS: usize = 12_000;
+/// Shortest per-agent share the combined budget may squeeze a description to.
+const MIN_LISTED_DESCRIPTION_CHARS: usize = 160;
 const MAX_AGENT_MODEL_CHARS: usize = 256;
 const MAX_PROJECT_NOTES_BYTES: usize = 64 * 1024;
 const MAX_PROJECT_AGENT_ENTRIES: usize = 1_024;
@@ -305,7 +315,7 @@ fn normalize_agent_definition(
                     .take(MAX_AGENT_DESCRIPTION_CHARS)
                     .collect::<String>();
                 compat_notices.push(format!(
-                    "[specialist metadata: description shortened to {MAX_AGENT_DESCRIPTION_CHARS} characters for display]"
+                    "[specialist metadata: description longer than {MAX_AGENT_DESCRIPTION_CHARS} characters was cut]"
                 ));
                 return Ok(format!("{}…", shortened.trim_end()));
             }
@@ -914,7 +924,7 @@ impl AgentDefinition {
         let mut chars = sentence.chars();
         let description = chars
             .by_ref()
-            .take(MAX_AGENT_DESCRIPTION_CHARS)
+            .take(MAX_DERIVED_DESCRIPTION_CHARS)
             .collect::<String>();
         if chars.next().is_some() {
             format!("{}…", description.trim_end())
@@ -1753,12 +1763,14 @@ fn described_names(agents: &HashMap<String, AgentDefinition>) -> Vec<(String, St
 }
 
 #[cfg(feature = "subagents")]
-/// `(name, annotation, description)` per specialist. The annotation is empty
-/// for a plain persona, else `[mode: write, model: <frontmatter value>]`
-/// (mini-agent-7q04e): the frontmatter strings only, never a resolved secret.
+/// `(name, annotation, description)` per specialist plus an optional note when
+/// descriptions had to be shortened to fit the listing budget. The annotation
+/// is empty for a plain persona, else `[mode: write, model: <frontmatter
+/// value>]` (mini-agent-7q04e): the frontmatter strings only, never a resolved
+/// secret.
 pub(crate) fn available_schema_entries_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,
-) -> Vec<(String, String, String)> {
+) -> (Vec<(String, String, String)>, Option<String>) {
     let agents = match workspace {
         Some(workspace) => shared_for_workspace_binding(workspace),
         None => std::sync::Arc::new(load()),
@@ -1766,11 +1778,11 @@ pub(crate) fn available_schema_entries_for_workspace(
     let mut entries = agents
         .iter()
         .map(|(name, definition)| {
-            let name = name.clone();
-            let mut description = definition.one_line_description();
             let required = definition.required_tool_names();
-            if !required.is_empty() {
-                description.push_str(&format!(
+            let suffix = if required.is_empty() {
+                String::new()
+            } else {
+                format!(
                     " [requires installed child tools: {}]",
                     required
                         .iter()
@@ -1778,13 +1790,84 @@ pub(crate) fn available_schema_entries_for_workspace(
                         .cloned()
                         .collect::<Vec<_>>()
                         .join(", ")
-                ));
-            }
-            (name, definition.schema_annotation(), description)
+                )
+            };
+            (
+                name.clone(),
+                definition.schema_annotation(),
+                definition.one_line_description(),
+                suffix,
+            )
         })
         .collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    entries
+    let (limits, note) = fit_listing_descriptions(
+        &entries
+            .iter()
+            .map(|entry| entry.2.chars().count())
+            .collect::<Vec<_>>(),
+    );
+    if let Some(note) = &note {
+        tracing::warn!("{note}");
+    }
+    let entries = entries
+        .into_iter()
+        .zip(limits)
+        .map(|((name, annotation, description, suffix), limit)| {
+            let description = match limit {
+                Some(limit) if description.chars().count() > limit => {
+                    let kept = description.chars().take(limit).collect::<String>();
+                    format!("{}…", kept.trim_end())
+                }
+                Some(_) => description,
+                None => "(description omitted to fit the listing budget)".to_string(),
+            };
+            (name, annotation, format!("{description}{suffix}"))
+        })
+        .collect();
+    (entries, note)
+}
+
+/// Per-entry character limit for the model-facing listing (`None` = the
+/// description is omitted) and, when anything was shortened or omitted, the
+/// note that says how many. Each description keeps up to
+/// [`MAX_LISTED_DESCRIPTION_CHARS`]; when the combined size exceeds
+/// [`MAX_LISTED_DESCRIPTIONS_TOTAL_CHARS`] the shared limit shrinks (never
+/// below [`MIN_LISTED_DESCRIPTION_CHARS`]) and, as a last resort, the tail of
+/// the alphabetical list is omitted.
+fn fit_listing_descriptions(lengths: &[usize]) -> (Vec<Option<usize>>, Option<String>) {
+    let total_at =
+        |limit: usize| -> usize { lengths.iter().map(|length| (*length).min(limit)).sum() };
+    let mut limit = MAX_LISTED_DESCRIPTION_CHARS;
+    while limit > MIN_LISTED_DESCRIPTION_CHARS
+        && total_at(limit) > MAX_LISTED_DESCRIPTIONS_TOTAL_CHARS
+    {
+        limit = (limit - 20).max(MIN_LISTED_DESCRIPTION_CHARS);
+    }
+    let mut remaining = MAX_LISTED_DESCRIPTIONS_TOTAL_CHARS;
+    let mut limits = Vec::with_capacity(lengths.len());
+    for length in lengths {
+        let used = (*length).min(limit);
+        if used > remaining {
+            limits.push(None);
+        } else {
+            remaining -= used;
+            limits.push(Some(limit));
+        }
+    }
+    let shortened = lengths
+        .iter()
+        .zip(&limits)
+        .filter(|(length, limit)| limit.is_some_and(|limit| **length > limit))
+        .count();
+    let omitted = limits.iter().filter(|limit| limit.is_none()).count();
+    let note = (shortened > 0 || omitted > 0).then(|| {
+        format!(
+            "{shortened} of {} specialist descriptions shortened to {limit} characters and {omitted} omitted to fit the listing budget ({MAX_LISTED_DESCRIPTIONS_TOTAL_CHARS} characters combined); the full text stays in each agent file, which `read` can open",
+            lengths.len()
+        )
+    });
+    (limits, note)
 }
 
 #[cfg(any(test, feature = "subagents"))]
@@ -2149,9 +2232,10 @@ pub(crate) mod tests {
         let with_claude = load_for_paths_and_workspace(&paths, &workspace);
         assert!(with_claude.contains_key("claude-only"));
         let long = &with_claude["long"];
-        assert!(long.one_line_description().chars().count() <= MAX_AGENT_DESCRIPTION_CHARS + 1);
+        // A long Claude Code description is kept whole, not cut at 160.
+        assert_eq!(long.one_line_description().chars().count(), 400);
         let notice = long.result_notice("long").unwrap();
-        assert!(notice.contains("description shortened"), "{notice}");
+        assert!(!notice.contains("description shortened"), "{notice}");
         assert!(notice.contains("differs from the file name"), "{notice}");
 
         CLAUDE_PROJECT_AGENTS_OVERRIDE.with(|cell| cell.set(Some(false)));
@@ -2938,7 +3022,46 @@ pub(crate) mod tests {
         };
         let description = long.one_line_description();
         assert!(description.ends_with('…'));
-        assert!(description.chars().count() <= MAX_AGENT_DESCRIPTION_CHARS + 1);
+        assert!(description.chars().count() <= MAX_DERIVED_DESCRIPTION_CHARS + 1);
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn listing_keeps_a_large_description_per_agent_and_counts_what_it_shortens() {
+        // Few agents: nothing is shortened below 1000 characters, no note.
+        let (limits, note) = fit_listing_descriptions(&[400, 900, 1000]);
+        assert_eq!(limits, vec![Some(1000); 3]);
+        assert!(note.is_none());
+        // One over-long description is cut at the per-agent limit and counted.
+        let (limits, note) = fit_listing_descriptions(&[4000, 50]);
+        assert_eq!(limits, vec![Some(1000); 2]);
+        assert!(
+            note.unwrap()
+                .starts_with("1 of 2 specialist descriptions shortened")
+        );
+        // Many agents share the combined budget: the limit shrinks, never
+        // below the minimum, and what cannot fit is counted as omitted.
+        let (limits, note) = fit_listing_descriptions(&[1000; 30]);
+        let shared = limits[0].unwrap();
+        assert!(
+            (MIN_LISTED_DESCRIPTION_CHARS..1000).contains(&shared),
+            "{shared}"
+        );
+        assert!(note.unwrap().contains("shortened"));
+        let (limits, note) = fit_listing_descriptions(&[1000; 200]);
+        assert_eq!(limits[0], Some(MIN_LISTED_DESCRIPTION_CHARS));
+        assert!(limits.iter().any(Option::is_none));
+        let note = note.unwrap();
+        assert!(
+            note.contains("omitted") && !note.contains(" 0 omitted"),
+            "{note}"
+        );
+        let used = limits
+            .iter()
+            .flatten()
+            .map(|limit| limit.min(&1000))
+            .sum::<usize>();
+        assert!(used <= MAX_LISTED_DESCRIPTIONS_TOTAL_CHARS);
     }
 
     #[test]

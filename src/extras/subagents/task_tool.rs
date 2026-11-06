@@ -1192,9 +1192,10 @@ editing in a known location, grepping for a literal you will act on immediately.
             DEFAULT_MAX_PROMPTS,
             (DEFAULT_MAX_TURNS_CEILING, DEFAULT_TIMEOUT_CEILING_SECS),
         ));
-        let specialist_entries = crate::context::agents::available_schema_entries_for_workspace(
-            self.workspace.as_deref(),
-        );
+        let (specialist_entries, listing_note) =
+            crate::context::agents::available_schema_entries_for_workspace(
+                self.workspace.as_deref(),
+            );
         let specialist_names = specialist_entries
             .iter()
             .map(|(name, _, _)| name.clone())
@@ -1204,6 +1205,10 @@ editing in a known location, grepping for a literal you will act on immediately.
             .map(|(name, annotation, description)| format!("{name}{annotation}: {description}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let specialist_descriptions = match listing_note {
+            Some(note) => format!("{specialist_descriptions}\n[{note}]"),
+            None => specialist_descriptions,
+        };
         serde_json::json!({
             "type": "object",
             "description": "Provide exactly one of prompts or briefs. mini-agent validates this constraint when the tool call is decoded.",
