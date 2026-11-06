@@ -3320,6 +3320,70 @@ impl Sandbox {
         self
     }
 
+    /// The script that runs `command` from `workdir` (mini-agent-nyp3y):
+    /// workspace-relative, or absolute inside the workspace. The directory is
+    /// resolved (symlinks and `..` included) and must be an existing directory
+    /// inside the canonical workspace root, so a link or `..` cannot leave it.
+    /// Each call is a fresh shell, so the prefix is the only thing that moves
+    /// the command; the sandbox's own grants are unchanged.
+    pub(crate) fn command_in_workdir(
+        &self,
+        workdir: &str,
+        command: &str,
+    ) -> Result<String, String> {
+        let workdir = workdir.trim();
+        if workdir.is_empty() || workdir.contains('\0') {
+            return Err("workdir must be a non-empty path".into());
+        }
+        let root = match &self.workspace_binding {
+            Some(workspace) => workspace.root().to_path_buf(),
+            None => self
+                .working_dir()
+                .and_then(|dir| dir.canonicalize())
+                .map_err(|error| format!("workdir: cannot resolve the workspace: {error}"))?,
+        };
+        let requested = Path::new(workdir);
+        let joined = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            root.join(requested)
+        };
+        let resolved = joined
+            .canonicalize()
+            .map_err(|error| format!("workdir {workdir:?} cannot be used: {error}"))?;
+        if !resolved.starts_with(&root) {
+            return Err(format!(
+                "workdir {workdir:?} resolves outside the workspace; use a directory inside {}",
+                root.display()
+            ));
+        }
+        if !resolved.is_dir() {
+            return Err(format!("workdir {workdir:?} is not a directory"));
+        }
+        let shown = resolved.to_string_lossy();
+        let dialect = self
+            .shell_capability()
+            .map_or(ShellDialect::Posix, ShellCapability::dialect);
+        Ok(match dialect {
+            ShellDialect::Posix => {
+                let path = if cfg!(windows) {
+                    shown.replace('\\', "/")
+                } else {
+                    shown.into_owned()
+                };
+                format!(
+                    "cd -- '{}' || exit 1; {command}",
+                    path.replace('\'', "'\\''")
+                )
+            }
+            ShellDialect::PowerShell => format!(
+                "Set-Location -LiteralPath '{}'; if (-not $?) {{ exit 1 }}; {command}",
+                shown.replace('\'', "''")
+            ),
+            ShellDialect::Cmd => format!("cd /d \"{shown}\" && {command}"),
+        })
+    }
+
     fn working_dir(&self) -> std::io::Result<PathBuf> {
         self.working_dir
             .clone()

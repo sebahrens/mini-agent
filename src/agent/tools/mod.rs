@@ -766,6 +766,10 @@ pub struct BashArgs {
     /// Capture stdout and stderr separately instead of one merged stream.
     #[serde(default)]
     pub separate_streams: bool,
+    /// Directory to run in: workspace-relative or absolute inside the
+    /// workspace. Each call is a fresh shell, so `cd` does not persist.
+    #[serde(default)]
+    pub workdir: Option<String>,
     /// Promote the foreground command to a background job at its deadline.
     #[serde(default)]
     pub auto_background: Option<bool>,

@@ -358,6 +358,10 @@ impl Tool for ShellTool {
                     "maximum": 86_400_000,
                     "description": format!("Lower command deadline in milliseconds (optional; maximum {} foreground or 86400000 background)", self.foreground_timeout.as_secs() * 1000)
                 },
+                "workdir": {
+                    "type": "string",
+                    "description": "Directory to run the command in: workspace-relative or absolute inside the workspace (default: the workspace root). It must exist; symlinks and .. that leave the workspace are refused. Every call starts a fresh shell, so cd does NOT persist between calls: pass workdir each time. The permission check sees the command with the directory change, so rules and approvals are for that directory."
+                },
                 "background": {
                     "type": "boolean",
                     "description": "Start a session-scoped background job and return its id (default false)"
@@ -509,6 +513,26 @@ impl ShellTool {
             args.timeout,
             args.background,
         );
+        let mut args = args;
+        if let Some(workdir) = args.workdir.take() {
+            let plain = args.command.clone();
+            args.command = self
+                .sandbox
+                .command_in_workdir(&workdir, &plain)
+                .map_err(ToolError::Msg)?;
+            // The permission key is the script with the directory change, so
+            // approvals are per directory, but a deny rule on the command
+            // itself still applies.
+            if let Some(permission) = &self.permission {
+                let (result, _) = permission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .check_diagnosed(|guard| guard.check("shell", &plain));
+                if let crate::permission::checker::CheckResult::Denied(reason) = result {
+                    return Err(ToolError::Msg(format!("Permission denied: {reason}")));
+                }
+            }
+        }
         let maximum = if args.background {
             DEFAULT_BACKGROUND_COMMAND_TIMEOUT
         } else {
@@ -3100,6 +3124,171 @@ mod tests {
         start_job(&shell, "echo loud").await;
         wait_for_notice(&shell).await;
         assert_eq!(shell.sandbox.job_notice_queue().len(), 1);
+    }
+
+    fn workdir_fixture(label: &str) -> std::path::PathBuf {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(format!("workdir-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub/deep")).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workdir_runs_foreground_and_background_commands_in_the_directory() {
+        let fixture = workdir_fixture("run");
+        let rel = format!("{}/sub", fixture.file_name().unwrap().to_string_lossy());
+        let shell = test_tool();
+        let out = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                workdir: Some(rel.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let real = fixture.join("sub").canonicalize().unwrap();
+        assert!(out.contains(real.to_str().unwrap()), "{out}");
+        // Absolute inside the workspace works too.
+        let out = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                workdir: Some(fixture.join("sub/deep").to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(out.contains("deep"), "{out}");
+        // cd does not persist; the next call starts at the workspace root.
+        shell
+            .call(BashArgs {
+                command: "cd sub && pwd".into(),
+                workdir: Some(fixture.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let root = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!root.contains("workdir-run"), "{root}");
+        // A background job runs there as well.
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_job(&shell, "true").await;
+        let _ = wait_for_terminal_job(&status, &id).await;
+        let started = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                background: true,
+                workdir: Some(rel),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let terminal = wait_for_terminal_job(&status, &background_id(&started)).await;
+        assert!(terminal.contains(real.to_str().unwrap()), "{terminal}");
+        std::fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workdir_refuses_escapes_links_files_and_missing_directories() {
+        let fixture = workdir_fixture("escape");
+        let outside = std::env::temp_dir().join(format!("workdir-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, fixture.join("link")).unwrap();
+        std::fs::write(fixture.join("file.txt"), "x").unwrap();
+        let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
+        let shell = test_tool();
+        for (workdir, needle) in [
+            (format!("{name}/../.."), "outside the workspace"),
+            ("..".to_string(), "outside the workspace"),
+            (
+                outside.to_string_lossy().into_owned(),
+                "outside the workspace",
+            ),
+            ("/".to_string(), "outside the workspace"),
+            (format!("{name}/link"), "outside the workspace"),
+            (format!("{name}/file.txt"), "not a directory"),
+            (format!("{name}/missing"), "cannot be used"),
+            (String::new(), "non-empty"),
+        ] {
+            let error = shell
+                .call(BashArgs {
+                    command: format!("touch {}/escaped", outside.display()),
+                    workdir: Some(workdir.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(needle), "{workdir}: {error}");
+        }
+        assert!(!outside.join("escaped").exists());
+        std::fs::remove_dir_all(&fixture).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// The permission key carries the directory, and a deny rule on the bare
+    /// command still applies when a workdir is passed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workdir_permission_identity_includes_the_directory_and_deny_rules_hold() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        let fixture = workdir_fixture("perm");
+        let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
+        let marker = fixture.join("sub/denied");
+        let mut shell = test_tool();
+        shell.permission = Some(shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("*".to_string(), Action::Allow),
+                        ("touch *".to_string(), Action::Deny),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Yolo,
+        ));
+        let error = shell
+            .call(BashArgs {
+                command: "touch denied".into(),
+                workdir: Some(format!("{name}/sub")),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("denied"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+        let ok = shell
+            .call(BashArgs {
+                command: "echo fine".into(),
+                workdir: Some(format!("{name}/sub")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(ok.contains("fine"), "{ok}");
+        std::fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    #[test]
+    fn workdir_is_in_the_schema_and_documents_that_cd_does_not_persist() {
+        let schema = test_tool().parameters();
+        let text = schema["properties"]["workdir"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("does NOT persist"), "{text}");
     }
 
     #[test]

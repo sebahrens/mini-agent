@@ -66,6 +66,15 @@ call is interrupted before either happens, the job is stopped. At most
 table is full an explicit `background = true` call fails naming the key, while
 an `auto_background` call simply runs as an ordinary foreground command.
 
+`shell` takes an optional `workdir` (workspace-relative, or absolute inside the
+workspace). It is resolved with symlinks and `..` followed and must be an
+existing directory inside the canonical workspace root; anything else is
+refused, so a link or `..` cannot leave the workspace. It applies to foreground,
+background and pty commands. Every call is still a fresh shell: `cd` does not
+persist between calls. The permission key is the script with the directory
+change (`cd -- '<dir>' || exit 1; <command>`), so allow rules and approvals are
+per directory, while a deny rule on the bare command still applies.
+
 `job_status action=input` refuses C0 control bytes other than LF and CR (Tab,
 Ctrl-U, backspace, ESC, DEL, ...) and shell history expansion (`!` followed by
 text, a line starting with `^`), because an interactive bash or zsh rewrites
