@@ -963,10 +963,10 @@ startup notice for a newer stable release. [`src/update.rs`](../../src/update.rs
 owns the check. It uses the package repository's GitHub latest-release endpoint
 without credentials, provider settings, redirects, or ambient proxies. Drafts,
 prereleases, malformed tags, oversized bodies, and network failures produce no
-new notice. The check never downloads or runs an installer. A notice prints
-the explicit-release command for the existing installer, which checks release
-`SHA256SUMS` and also requires build attestation when authenticated `gh` is
-available. The release metadata itself is not an attestation.
+new notice. The check never downloads or runs an installer. A notice follows the install channel: a self-managed
+install is told to run `mini-agent update`; Homebrew, cargo, Nix, system
+package, VS Code extension and Windows installs get their own instruction (never
+the `install.sh` pipeline, which would create a second binary). The release metadata itself is not an attestation.
 
 The private `<state>/update/latest.json` cache retains the last valid version
 and attempt timestamp. A nonblocking cross-process lock admits one check at a
@@ -993,9 +993,17 @@ beside the installed binary and renames it into place atomically (a running
 session keeps the old inode). It refuses, printing the right command, when the
 binary was installed by Homebrew, npm, cargo, Nix or a system package, by the VS Code
 extension, or is a local build; on Windows it points to the MSI, because a running
-`.exe` cannot be replaced in place. Build provenance is not checked by this command
-(use `gh attestation verify` or rerun `install.sh`, which also refreshes the bundled
-notice documents). The bare word `update` followed by anything else stays an ordinary prompt.
+`.exe` cannot be replaced in place. Before the rename it runs
+`gh attestation verify <archive> --repo <slug>` when `gh` is installed and signed
+in, and a rejection aborts with nothing installed. Without a usable `gh` it prints
+the manual command first and requires `--allow-unattested` or an interactive "yes"
+for a checksum-only install; `MINI_AGENT_SKIP_ATTESTATION=1` skips verification as
+in `install.sh` and `MINI_AGENT_INSTALL_NO_GH=1` never calls `gh`. A `--release`
+older than the running version needs `--allow-downgrade` or an interactive "yes".
+The explicit command (version lookup and download alike) honours `HTTPS_PROXY` and
+reports the HTTP status or transport error on failure; the passive startup check
+stays direct (no proxy, no redirects). `install.sh` also refreshes the bundled
+notice documents. The bare word `update` followed by anything else stays an ordinary prompt.
 
 ## Prompt-cache prefix and memory snapshots
 

@@ -8,8 +8,13 @@
 //! staged beside the installed binary and renamed over it atomically, and a
 //! binary installed by a package manager, a build tree or the VS Code extension
 //! is left alone with the command that updates it. Build provenance is not
-//! checked here: run `gh attestation verify` on the archive, or reinstall with
-//! `install.sh`, which also refreshes the bundled notice documents.
+//! checked by checksum alone: when an authenticated GitHub CLI is available the
+//! archive must also pass `gh attestation verify --repo <slug>` before anything is
+//! installed (a failure aborts); without it the manual command is printed and the
+//! install needs `--allow-unattested` or an interactive confirmation.
+//! `MINI_AGENT_SKIP_ATTESTATION=1` skips the check as in `install.sh`, and an
+//! older `--release` than the running version needs `--allow-downgrade` or a
+//! confirmation. `install.sh` also refreshes the bundled notice documents.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -29,9 +34,14 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) struct UpdateArgs {
     pub check: bool,
     pub release: Option<String>,
+    /// Install without build-provenance verification when `gh` cannot do it.
+    pub allow_unattested: bool,
+    /// Allow `--release` to pick a version older than the running one.
+    pub allow_downgrade: bool,
 }
 
-/// Recognises `mini-agent update` with only `--check` and `--release X.Y.Z`
+/// Recognises `mini-agent update` with only `--check`, `--release X.Y.Z`,
+/// `--allow-unattested` and `--allow-downgrade`
 /// after it. Anything else (including `mini-agent update the docs`) is left to
 /// the normal command line, where it stays an ordinary prompt.
 pub(crate) fn parse_update_args(args: &[OsString]) -> Option<UpdateArgs> {
@@ -42,10 +52,14 @@ pub(crate) fn parse_update_args(args: &[OsString]) -> Option<UpdateArgs> {
     let mut parsed = UpdateArgs {
         check: false,
         release: None,
+        allow_unattested: false,
+        allow_downgrade: false,
     };
     while let Some(arg) = args.next() {
         match arg.to_str()? {
             "--check" if !parsed.check => parsed.check = true,
+            "--allow-unattested" if !parsed.allow_unattested => parsed.allow_unattested = true,
+            "--allow-downgrade" if !parsed.allow_downgrade => parsed.allow_downgrade = true,
             "--release" if parsed.release.is_none() => {
                 parsed.release = Some(args.next()?.to_str()?.to_owned());
             }
@@ -88,7 +102,12 @@ pub(crate) fn classify_install(exe: &str, home: Option<&str>, version: &str) -> 
         );
     }
     if path.contains("/Cellar/") || path.contains("/homebrew/") || path.contains("/linuxbrew/") {
-        return managed("Installed with Homebrew: run `brew upgrade mini-agent`.");
+        return managed(
+            "Installed with Homebrew. The in-repo formula is named `zerostack` and no \
+             `mini-agent` tap is published, so `brew upgrade mini-agent` does not exist: \
+             upgrade the formula you installed from (`brew list --formula` shows it), or \
+             install the release archive from the GitHub releases page.",
+        );
     }
     if path.contains("/node_modules/") {
         return managed(
@@ -298,7 +317,7 @@ fn install_atomically(_target: &Path, _bytes: &[u8]) -> std::io::Result<()> {
     Err(std::io::Error::other("in-place update is Unix only"))
 }
 
-fn https_only_redirects() -> reqwest::redirect::Policy {
+pub(crate) fn https_only_redirects() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= 5 || attempt.url().scheme() != "https" {
             attempt.error("release downloads must stay on https and follow at most 5 redirects")
@@ -349,9 +368,15 @@ async fn download(url: &str, limit: u64) -> Result<Vec<u8>, String> {
 async fn latest_version() -> Result<String, String> {
     let endpoint = crate::update::github_latest_url(env!("CARGO_PKG_REPOSITORY"))
         .ok_or("the repository URL is not a GitHub URL")?;
-    crate::update::fetch_latest_within(&endpoint, API_TIMEOUT)
+    crate::update::fetch_latest_explicit(&endpoint, API_TIMEOUT)
         .await
-        .ok_or_else(|| "could not read the latest release from GitHub".to_string())
+        .map_err(|error| {
+            format!(
+                "could not read the latest release from GitHub: {error}. Behind a proxy, set \
+                 HTTPS_PROXY (the explicit update honours it; the passive update check stays \
+                 direct), or name a version with `mini-agent update --release X.Y.Z`."
+            )
+        })
 }
 
 fn running_version() -> &'static str {
@@ -393,6 +418,19 @@ async fn run_inner(args: UpdateArgs) -> Result<(), String> {
         println!("mini-agent {current} is already installed.");
         return Ok(());
     }
+    let downgrade = args.release.is_some()
+        && crate::update::stable_version(&requested) < crate::update::stable_version(current);
+    if downgrade
+        && !args.allow_downgrade
+        && !confirm(&format!(
+            "mini-agent {requested} is older than the installed {current}. Downgrade?"
+        ))
+    {
+        return Err(format!(
+            "{requested} is older than the installed {current}; rerun with --allow-downgrade \
+             to install it anyway."
+        ));
+    }
     if !newer && args.release.is_none() {
         println!(
             "mini-agent {current} is newer than the latest release ({requested}); nothing to do."
@@ -420,18 +458,226 @@ async fn run_inner(args: UpdateArgs) -> Result<(), String> {
     let manifest = String::from_utf8(manifest).map_err(|_| "SHA256SUMS is not UTF-8")?;
     let binary = verified_binary(&manifest, &archive_name, &archive)?;
     println!("Checksum verified against SHA256SUMS.");
+    let attestation = verify_provenance(&archive_name, &archive, args.allow_unattested).await?;
     install_verified(&exe, &binary, &requested).await?;
     println!(
         "Updated mini-agent {current} -> {requested} at {}",
         exe.display()
     );
-    eprintln!(
-        "Note: build provenance was not checked. Verify it with \
-         `gh attestation verify {archive_name} --repo {}`; install.sh also refreshes the \
-         bundled notice documents.",
-        crate::product::REPOSITORY_SLUG
-    );
+    if attestation != Attestation::Verified {
+        eprintln!(
+            "Note: this install was not provenance-verified; install.sh also refreshes the \
+             bundled notice documents."
+        );
+    }
     Ok(())
+}
+
+/// What `gh attestation verify` could say about the downloaded archive.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Attestation {
+    Verified,
+    /// gh ran and rejected the archive: never installed.
+    Failed(String),
+    /// Could not run the check at all (and why).
+    Unavailable(String),
+    /// `MINI_AGENT_SKIP_ATTESTATION=1`.
+    Skipped,
+}
+
+fn run_gh(
+    program: &std::ffi::OsStr,
+    args: &[&std::ffi::OsStr],
+) -> Result<std::process::Output, std::io::Error> {
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+}
+
+/// Mirrors `install.sh`'s `verify_attestation`: skip on request, report an
+/// unusable `gh` as unavailable, and treat only a rejection by a working `gh`
+/// as a failure. `program` is the GitHub CLI executable (injectable for tests).
+pub(crate) fn check_attestation(
+    program: &std::ffi::OsStr,
+    archive: &Path,
+    repo: &str,
+    skip: bool,
+    no_gh: bool,
+) -> Attestation {
+    use std::ffi::OsStr;
+    if skip {
+        return Attestation::Skipped;
+    }
+    if no_gh {
+        return Attestation::Unavailable(
+            "MINI_AGENT_INSTALL_NO_GH=1 disables the GitHub CLI".into(),
+        );
+    }
+    match run_gh(program, &[OsStr::new("auth"), OsStr::new("status")]) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Attestation::Unavailable("the GitHub CLI ('gh') is not installed".into());
+        }
+        Err(error) => return Attestation::Unavailable(format!("could not run gh: {error}")),
+        Ok(output) if !output.status.success() => {
+            return Attestation::Unavailable(
+                "the GitHub CLI is not signed in (run 'gh auth login')".into(),
+            );
+        }
+        Ok(_) => {}
+    }
+    let help = run_gh(
+        program,
+        &[
+            OsStr::new("attestation"),
+            OsStr::new("verify"),
+            OsStr::new("--help"),
+        ],
+    );
+    if !help.is_ok_and(|output| output.status.success()) {
+        return Attestation::Unavailable(
+            "this GitHub CLI does not support 'gh attestation verify'; upgrade gh".into(),
+        );
+    }
+    match run_gh(
+        program,
+        &[
+            OsStr::new("attestation"),
+            OsStr::new("verify"),
+            archive.as_os_str(),
+            OsStr::new("--repo"),
+            OsStr::new(repo),
+        ],
+    ) {
+        Ok(output) if output.status.success() => Attestation::Verified,
+        Ok(output) => {
+            let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stdout));
+            Attestation::Failed(text.trim().chars().take(2000).collect())
+        }
+        Err(error) => Attestation::Failed(format!("could not run gh: {error}")),
+    }
+}
+
+/// What to do about the attestation result.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AttestationAction {
+    Proceed,
+    /// Needs `--allow-unattested` or an interactive "yes"; carries the reason.
+    Confirm(String),
+    Abort(String),
+}
+
+pub(crate) fn attestation_action(
+    outcome: &Attestation,
+    allow_unattested: bool,
+) -> AttestationAction {
+    match outcome {
+        Attestation::Verified | Attestation::Skipped => AttestationAction::Proceed,
+        Attestation::Failed(detail) => AttestationAction::Abort(format!(
+            "build provenance verification failed; nothing was installed.\n{detail}\n\
+             To install without provenance verification anyway, rerun with \
+             MINI_AGENT_SKIP_ATTESTATION=1."
+        )),
+        Attestation::Unavailable(_) if allow_unattested => AttestationAction::Proceed,
+        Attestation::Unavailable(reason) => AttestationAction::Confirm(reason.clone()),
+    }
+}
+
+fn manual_attestation_hint(archive_name: &str) -> String {
+    format!(
+        "  Verify it yourself with the GitHub CLI (https://cli.github.com):\n    \
+         gh attestation verify {archive_name} --repo {}",
+        crate::product::REPOSITORY_SLUG
+    )
+}
+
+/// Asks on stderr/stdin; only an interactive terminal can answer "yes".
+fn confirm(question: &str) -> bool {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    eprint!("{question} [y/N] ");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).is_ok()
+        && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Writes the archive into a fresh private directory so `gh` can read it.
+fn stage_archive(name: &str, archive: &[u8]) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("mini-agent-update-{}", uuid::Uuid::new_v4()));
+    crate::fs::ensure_private_directory(&dir)
+        .map_err(|error| format!("cannot create a staging directory: {error}"))?;
+    let path = dir.join(name);
+    std::fs::write(&path, archive).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&dir);
+        format!("cannot stage the archive for verification: {error}")
+    })?;
+    Ok(path)
+}
+
+async fn verify_provenance(
+    archive_name: &str,
+    archive: &[u8],
+    allow_unattested: bool,
+) -> Result<Attestation, String> {
+    let staged = stage_archive(archive_name, archive)?;
+    let skip = std::env::var("MINI_AGENT_SKIP_ATTESTATION").is_ok_and(|v| v == "1");
+    let no_gh = std::env::var("MINI_AGENT_INSTALL_NO_GH").is_ok_and(|v| v == "1");
+    let path = staged.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        check_attestation(
+            std::ffi::OsStr::new("gh"),
+            &path,
+            crate::product::REPOSITORY_SLUG,
+            skip,
+            no_gh,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string());
+    if let Some(dir) = staged.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let outcome = outcome?;
+    match &outcome {
+        Attestation::Verified => println!(
+            "Verified build provenance for {archive_name} (gh attestation verify --repo {}).",
+            crate::product::REPOSITORY_SLUG
+        ),
+        Attestation::Skipped => {
+            eprintln!(
+                "Warning: skipping build provenance verification (MINI_AGENT_SKIP_ATTESTATION=1)."
+            );
+            eprintln!("{}", manual_attestation_hint(archive_name));
+        }
+        Attestation::Unavailable(reason) => {
+            eprintln!("Warning: build provenance was not verified: {reason}.");
+            eprintln!(
+                "  The archive matched SHA256SUMS, which is served from the same release;\n  \
+                 that detects a damaged download, not a replaced release."
+            );
+            eprintln!("{}", manual_attestation_hint(archive_name));
+        }
+        Attestation::Failed(_) => {}
+    }
+    match attestation_action(&outcome, allow_unattested) {
+        AttestationAction::Proceed => Ok(outcome),
+        AttestationAction::Abort(message) => Err(message),
+        AttestationAction::Confirm(_) => {
+            if confirm("Install without build provenance verification?") {
+                Ok(outcome)
+            } else {
+                Err(
+                    "not installed: provenance could not be verified. Install and sign in to \
+                     the GitHub CLI, or rerun with --allow-unattested to accept a \
+                     checksum-only install."
+                        .into(),
+                )
+            }
+        }
+    }
 }
 
 /// Runs the staged binary's `--version` before replacing anything, so a wrong
@@ -515,7 +761,9 @@ mod tests {
             parse_update_args(&args(&["mini-agent", "update"])),
             Some(UpdateArgs {
                 check: false,
-                release: None
+                release: None,
+                allow_unattested: false,
+                allow_downgrade: false
             })
         );
         assert_eq!(
@@ -524,11 +772,15 @@ mod tests {
                 "update",
                 "--check",
                 "--release",
-                "1.2.3"
+                "1.2.3",
+                "--allow-unattested",
+                "--allow-downgrade"
             ])),
             Some(UpdateArgs {
                 check: true,
-                release: Some("1.2.3".into())
+                release: Some("1.2.3".into()),
+                allow_unattested: true,
+                allow_downgrade: true
             })
         );
         // Ordinary prompts and malformed forms stay with the normal command line.
@@ -536,6 +788,12 @@ mod tests {
             vec!["mini-agent", "update", "the", "docs"],
             vec!["mini-agent", "update", "--release"],
             vec!["mini-agent", "update", "--check", "--check"],
+            vec![
+                "mini-agent",
+                "update",
+                "--allow-downgrade",
+                "--allow-downgrade",
+            ],
             vec!["mini-agent", "-p", "update"],
             vec!["mini-agent"],
             vec!["mini-agent", "updates"],
@@ -551,10 +809,16 @@ mod tests {
             InstallChannel::Managed(message) => message,
             InstallChannel::SelfManaged => panic!("{path} must be refused"),
         };
-        assert!(
-            managed("/opt/homebrew/Cellar/mini-agent/1.0/bin/mini-agent").contains("brew upgrade")
-        );
-        assert!(managed("/home/linuxbrew/.linuxbrew/bin/mini-agent").contains("brew upgrade"));
+        for brew in [
+            "/opt/homebrew/Cellar/mini-agent/1.0/bin/mini-agent",
+            "/home/linuxbrew/.linuxbrew/bin/mini-agent",
+        ] {
+            let message = managed(brew);
+            // Never advertises a formula that does not exist.
+            assert!(message.contains("`zerostack`"), "{message}");
+            assert!(message.contains("releases page"), "{message}");
+            assert!(message.contains("does not exist"), "{message}");
+        }
         assert!(managed("/home/u/.cargo/bin/mini-agent").contains("cargo install --locked"));
         assert!(managed("/nix/store/abc-mini-agent/bin/mini-agent").contains("Nix"));
         assert!(managed("/usr/bin/mini-agent").contains("package manager"));
@@ -709,5 +973,96 @@ mod tests {
         assert_eq!(leftovers, 1);
         assert!(install_atomically(&dir.join("missing").join("mini-agent"), b"x").is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    fn stub_gh(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("gh");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attestation_uses_gh_and_only_a_rejection_by_a_working_gh_aborts() {
+        let dir = std::env::temp_dir().join(format!("stub-gh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("a.tar.gz");
+        let log = dir.join("calls.log");
+        let run = |gh: &Path, skip: bool, no_gh: bool| {
+            check_attestation(gh.as_os_str(), &archive, "owner/repo", skip, no_gh)
+        };
+        // A working gh that accepts the archive: the verify call names archive and repo.
+        let ok = stub_gh(&dir, &format!("echo \"$@\" >> {}\nexit 0", log.display()));
+        assert_eq!(run(&ok, false, false), Attestation::Verified);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains(&format!(
+                "attestation verify {} --repo owner/repo",
+                archive.display()
+            )),
+            "{calls}"
+        );
+        // Rejected archive: failure carrying gh's message, and the action aborts.
+        let reject = stub_gh(
+            &dir,
+            "if [ \"$1\" = attestation ] && [ \"$3\" != --help ]; then echo 'no matching attestation' >&2; exit 1; fi\nexit 0",
+        );
+        let outcome = run(&reject, false, false);
+        assert!(
+            matches!(&outcome, Attestation::Failed(m) if m.contains("no matching attestation"))
+        );
+        // Even the escape flag for unattested installs cannot override a rejection.
+        assert!(matches!(
+            attestation_action(&outcome, true),
+            AttestationAction::Abort(_)
+        ));
+        // Unauthenticated gh and a gh without the subcommand are "unavailable".
+        let unauth = stub_gh(&dir, "if [ \"$1\" = auth ]; then exit 1; fi\nexit 0");
+        assert!(
+            matches!(run(&unauth, false, false), Attestation::Unavailable(m) if m.contains("signed in"))
+        );
+        let old = stub_gh(&dir, "if [ \"$1\" = attestation ]; then exit 2; fi\nexit 0");
+        assert!(
+            matches!(run(&old, false, false), Attestation::Unavailable(m) if m.contains("upgrade gh"))
+        );
+        // Missing gh, MINI_AGENT_INSTALL_NO_GH and the skip switch.
+        let missing = dir.join("nope");
+        assert!(
+            matches!(run(&missing, false, false), Attestation::Unavailable(m) if m.contains("not installed"))
+        );
+        assert!(matches!(run(&ok, false, true), Attestation::Unavailable(_)));
+        assert_eq!(run(&reject, true, false), Attestation::Skipped);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unattested_installs_need_the_flag_or_a_confirmation() {
+        let unavailable = Attestation::Unavailable("gh missing".into());
+        assert_eq!(
+            attestation_action(&unavailable, false),
+            AttestationAction::Confirm("gh missing".into())
+        );
+        assert_eq!(
+            attestation_action(&unavailable, true),
+            AttestationAction::Proceed
+        );
+        assert_eq!(
+            attestation_action(&Attestation::Verified, false),
+            AttestationAction::Proceed
+        );
+        assert_eq!(
+            attestation_action(&Attestation::Skipped, false),
+            AttestationAction::Proceed
+        );
+        assert!(matches!(
+            attestation_action(&Attestation::Failed("bad".into()), false),
+            AttestationAction::Abort(m) if m.contains("MINI_AGENT_SKIP_ATTESTATION=1")
+        ));
+        assert!(
+            manual_attestation_hint("a.tar.gz").contains("gh attestation verify a.tar.gz --repo ")
+        );
     }
 }
