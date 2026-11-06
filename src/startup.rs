@@ -1262,9 +1262,8 @@ impl Startup {
             anyhow::bail!("--input-format stream-json requires --output stream-json");
         }
         #[allow(unused_mut)]
-        let mut expand_custom = cli.print
-            && cli.input_format() == crate::cli::InputFormat::Text
-            && !cli.is_loop_mode();
+        let mut expand_custom =
+            cli.print && cli.input_format() == crate::cli::InputFormat::Text && !cli.is_loop_mode();
         #[cfg(feature = "acp")]
         {
             expand_custom = expand_custom && !cli.acp_enabled;
@@ -1283,12 +1282,8 @@ impl Startup {
                 Ok(crate::context::commands::HeadlessCommand::Literal) => {}
                 Err(error) => {
                     let message = format!("custom command: {error}");
-                    crate::print::emit_headless_preflight_failure(
-                        &cli,
-                        workspace.root(),
-                        &message,
-                    )
-                    .await?;
+                    crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message)
+                        .await?;
                     anyhow::bail!(message);
                 }
             }

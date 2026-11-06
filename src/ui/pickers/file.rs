@@ -20,6 +20,29 @@ const MAX_WALK_ENTRIES: usize = 50_000;
 /// Deepest directory level the walk descends into.
 const MAX_WALK_DEPTH: usize = 16;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_FILE_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The file cap; tests shrink it per thread to exercise truncation.
+fn max_walk_files() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_FILE_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    MAX_WALK_FILES
+}
+
+/// Dot-directories directly under the walk root that stay selectable. Every
+/// other dot-entry (`.git`, `.env`, `.cache`, ...) is pruned from the walk;
+/// type its path (`.name/`) to list inside a pruned directory other than `.git`.
+const ALLOWED_ROOT_DOT_DIRS: [&str; 3] = [".github", ".devcontainer", ".vscode"];
+
+/// Shown while the cached walk stopped at a cap.
+const TRUNCATED_NOTICE: &str =
+    "results truncated, keep typing a longer path (e.g. dir/sub/) to search that folder";
+
 #[cfg(all(test, feature = "mcp"))]
 mod mcp_resource_tests {
     use super::*;
@@ -70,6 +93,8 @@ struct WalkSnapshot {
     root: PathBuf,
     finished: std::time::Instant,
     entries: Vec<CacheEntry>,
+    /// The walk stopped at a file/entry cap, so `entries` is partial.
+    truncated: bool,
 }
 
 /// Roots with a walk running, so a repeated press revalidates only once.
@@ -204,7 +229,22 @@ fn cached_walk(root: &Path) -> Option<(Vec<CacheEntry>, std::time::Instant)> {
         .then(|| (snapshot.entries.clone(), snapshot.finished))
 }
 
+/// Whether the remembered walk of `root` stopped at a cap.
+fn cached_truncated(root: &Path) -> bool {
+    WALK_SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|snapshot| snapshot.root == root)
+        .is_some_and(|snapshot| snapshot.truncated)
+}
+
+#[cfg(test)]
 fn remember_walk(root: PathBuf, entries: Vec<CacheEntry>) {
+    remember_walk_marked(root, entries, false);
+}
+
+fn remember_walk_marked(root: PathBuf, entries: Vec<CacheEntry>, truncated: bool) {
     let mut cache = WALK_SNAPSHOT_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -218,6 +258,7 @@ fn remember_walk(root: PathBuf, entries: Vec<CacheEntry>) {
         root,
         finished: std::time::Instant::now(),
         entries,
+        truncated,
     });
 }
 
@@ -359,6 +400,20 @@ pub struct FilePicker {
     /// Another picker's walk of this root is running: the root and the
     /// snapshot time shown now. A newer snapshot replaces the list.
     waiting: Option<(PathBuf, std::time::Instant)>,
+    /// The shown walk stopped at a cap (partial list).
+    truncated: bool,
+    /// Set by the walk thread when it stopped at a cap.
+    walk_truncated: Arc<AtomicBool>,
+    /// Entries of a typed-prefix subtree walk, scanned after `file_cache`.
+    subtree_cache: Vec<CacheEntry>,
+    subtree: Option<SubtreeWalk>,
+}
+
+/// A running or finished walk of one typed directory prefix.
+struct SubtreeWalk {
+    dir: String,
+    rx: Option<mpsc::Receiver<Vec<CacheEntry>>>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl FilePicker {
@@ -385,6 +440,10 @@ impl FilePicker {
             walk_complete: Arc::new(AtomicBool::new(false)),
             refresh: None,
             waiting: None,
+            truncated: false,
+            walk_truncated: Arc::new(AtomicBool::new(false)),
+            subtree_cache: Vec::new(),
+            subtree: None,
         }
     }
 
@@ -487,6 +546,8 @@ impl FilePicker {
         self.loading = false;
         self.refresh = None;
         self.waiting = None;
+        self.truncated = false;
+        self.drop_subtree();
         self.walk_workspace = workspace.clone();
         if require_binding
             && workspace
@@ -502,6 +563,7 @@ impl FilePicker {
             let root = walk_root(workspace.as_deref());
             if let Some((entries, finished)) = cached_walk(&root) {
                 self.file_cache = entries;
+                self.truncated = cached_truncated(&root);
                 self.filter();
                 if walk_in_flight(&root) {
                     self.waiting = Some((root, finished));
@@ -519,8 +581,10 @@ impl FilePicker {
             self.loading = true;
             self.walk_cancel = Arc::new(AtomicBool::new(false));
             self.walk_complete = Arc::new(AtomicBool::new(false));
+            self.walk_truncated = Arc::new(AtomicBool::new(false));
             let cancel = self.walk_cancel.clone();
             let complete = self.walk_complete.clone();
+            let was_truncated = self.walk_truncated.clone();
             let (tx, rx) = mpsc::channel();
             self.walk_rx = Some(rx);
             let running = InFlight::begin(&root);
@@ -531,10 +595,11 @@ impl FilePicker {
                 #[cfg(test)]
                 wait_for_test_gate(&gated_root);
                 let mut all = Vec::new();
+                let mut capped = false;
                 let finished = if let Some(workspace) = workspace {
                     let mut batches = 0usize;
                     workspace.validate().is_ok()
-                        && walk_entries_streaming(workspace.root(), &cancel, |batch| {
+                        && walk_entries_capped(workspace.root(), workspace.root(), &cancel, &mut capped, |batch| {
                             all.extend(batch.iter().cloned());
                             batches += 1;
                             (!batches.is_multiple_of(VALIDATE_EVERY_BATCHES) || workspace.validate().is_ok())
@@ -543,13 +608,14 @@ impl FilePicker {
                         // A replaced root is never remembered or completed.
                         && workspace.validate().is_ok()
                 } else {
-                    walk_entries_streaming(Path::new("."), &cancel, |batch| {
+                    walk_entries_capped(Path::new("."), Path::new("."), &cancel, &mut capped, |batch| {
                         all.extend(batch.iter().cloned());
                         tx.send(batch).is_ok()
                     })
                 };
                 if finished {
-                    remember_walk(root, all);
+                    was_truncated.store(capped, Ordering::Release);
+                    remember_walk_marked(root, all, capped);
                     complete.store(true, Ordering::Release);
                 }
             });
@@ -562,23 +628,41 @@ impl FilePicker {
         if let Some(workspace) = &self.walk_workspace {
             let mut files = Vec::new();
             let mut batches = 0usize;
-            walk_entries_streaming(workspace.root(), &AtomicBool::new(false), |batch| {
-                if batches.is_multiple_of(VALIDATE_EVERY_BATCHES) && workspace.validate().is_err() {
-                    return false;
-                }
-                batches += 1;
-                files.extend(batch);
-                true
-            });
+            let mut capped = false;
+            walk_entries_capped(
+                workspace.root(),
+                workspace.root(),
+                &AtomicBool::new(false),
+                &mut capped,
+                |batch| {
+                    if batches.is_multiple_of(VALIDATE_EVERY_BATCHES)
+                        && workspace.validate().is_err()
+                    {
+                        return false;
+                    }
+                    batches += 1;
+                    files.extend(batch);
+                    true
+                },
+            );
             if workspace.validate().is_ok() {
                 self.file_cache.truncate(self.virtual_len);
                 self.file_cache.extend(files);
+                self.truncated = capped;
             }
         } else {
-            walk_entries_streaming(Path::new("."), &AtomicBool::new(false), |batch| {
-                self.file_cache.extend(batch);
-                true
-            });
+            let mut capped = false;
+            walk_entries_capped(
+                Path::new("."),
+                Path::new("."),
+                &AtomicBool::new(false),
+                &mut capped,
+                |batch| {
+                    self.file_cache.extend(batch);
+                    true
+                },
+            );
+            self.truncated = capped;
         }
         self.filter();
     }
@@ -592,6 +676,7 @@ impl FilePicker {
         self.loading = false;
         self.refresh = None;
         self.waiting = None;
+        self.drop_subtree();
         evict_stale_walks();
     }
 
@@ -603,6 +688,11 @@ impl FilePicker {
     /// Drain walk batches that arrived since the last call. Returns true
     /// when new files arrived or the walk just finished.
     pub fn try_finish_loading(&mut self) -> bool {
+        let subtree = self.drain_subtree();
+        self.try_finish_walk() || subtree
+    }
+
+    fn try_finish_walk(&mut self) -> bool {
         if self
             .walk_workspace
             .as_ref()
@@ -628,6 +718,8 @@ impl FilePicker {
                 self.loading = false;
                 self.file_cache.truncate(self.virtual_len);
                 self.file_cache.extend(entries);
+                self.truncated = cached_truncated(&root);
+                self.drop_subtree();
                 self.filter();
                 return true;
             }
@@ -666,14 +758,21 @@ impl FilePicker {
         if done {
             self.loading = false;
             self.walk_rx = None;
+            if self.walk_complete.load(Ordering::Acquire) {
+                self.truncated = self.walk_truncated.load(Ordering::Acquire);
+            }
             if let Some(fresh) = self.refresh.take()
                 && self.walk_complete.load(Ordering::Acquire)
             {
                 // The remembered list gives way to the finished walk.
                 self.file_cache.truncate(self.virtual_len);
                 self.file_cache.extend(fresh);
+                self.drop_subtree();
                 self.filter();
                 return true;
+            }
+            if self.truncated {
+                self.start_subtree_walk();
             }
         }
         if changed {
@@ -739,6 +838,7 @@ impl FilePicker {
         #[cfg(test)]
         count_filter(0, true);
         self.filter_from(0);
+        self.start_subtree_walk();
     }
 
     /// Append matches for the query from `file_cache[start..]` until
@@ -748,25 +848,164 @@ impl FilePicker {
         if self.matches.len() >= MAX_MATCHES {
             return;
         }
-        let query = self.query_lower.as_str();
-        for entry in self.file_cache.iter().skip(start) {
+        let cache = std::mem::take(&mut self.file_cache);
+        self.scan(cache.iter().skip(start));
+        self.file_cache = cache;
+        if start == 0 && self.matches.len() < MAX_MATCHES {
+            let subtree = std::mem::take(&mut self.subtree_cache);
+            self.scan(subtree.iter());
+            self.subtree_cache = subtree;
+        }
+    }
+
+    /// Keep entries matching the current query until [`MAX_MATCHES`].
+    fn scan<'a>(&mut self, entries: impl Iterator<Item = &'a CacheEntry>) {
+        let query = self.query_lower.clone();
+        for entry in entries {
+            if self.matches.len() >= MAX_MATCHES {
+                break;
+            }
             #[cfg(test)]
             count_filter(1, false);
             if entry
                 .lower
                 .as_deref()
                 .unwrap_or(&entry.text)
-                .contains(query)
+                .contains(query.as_str())
             {
                 self.matches.push(PathBuf::from(&*entry.text));
                 self.match_dirs.push(entry.is_dir);
                 self.match_kinds.push(entry.kind);
                 self.match_descriptions.push(entry.description.clone());
-                if self.matches.len() >= MAX_MATCHES {
+            }
+        }
+    }
+
+    /// Stops and forgets a typed-prefix subtree walk.
+    fn drop_subtree(&mut self) {
+        if let Some(subtree) = self.subtree.take() {
+            subtree.cancel.store(true, Ordering::Relaxed);
+        }
+        self.subtree_cache.clear();
+    }
+
+    /// The directory a typed query names (`src/ui/f` -> `src/ui`), when it is
+    /// a plain relative path with no `.`, `..` or `.git` component.
+    fn typed_directory(&self) -> Option<String> {
+        let (dir, _) = self.query.rsplit_once('/')?;
+        let dir = dir.strip_prefix("./").unwrap_or(dir);
+        if dir.is_empty()
+            || dir
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".." || part == ".git")
+            || dir.contains('\\')
+        {
+            return None;
+        }
+        Some(dir.to_owned())
+    }
+
+    /// While the cached walk is partial, a typed `dir/` prefix walks that
+    /// subtree directly so entries past the cap become reachable.
+    fn start_subtree_walk(&mut self) {
+        if !self.truncated || self.loading && self.refresh.is_none() && self.walk_rx.is_some() {
+            return;
+        }
+        let Some(dir) = self.typed_directory() else {
+            return;
+        };
+        if self.subtree.as_ref().is_some_and(|walk| walk.dir == dir) {
+            return;
+        }
+        self.drop_subtree();
+        let root = match &self.walk_workspace {
+            Some(workspace) if workspace.validate().is_ok() => workspace.root().to_path_buf(),
+            Some(_) => return,
+            None => PathBuf::from("."),
+        };
+        let start = root.join(&dir);
+        let inside = match (std::fs::canonicalize(&start), std::fs::canonicalize(&root)) {
+            (Ok(start), Ok(root)) => start.starts_with(root) && start.is_dir(),
+            _ => false,
+        };
+        if !inside {
+            return;
+        }
+        let known: std::collections::HashSet<Arc<str>> = self
+            .file_cache
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let walk_root = root.clone();
+        let walk_cancel = cancel.clone();
+        let collect = move |tx: Option<&mpsc::Sender<Vec<CacheEntry>>>,
+                            out: &mut Vec<CacheEntry>| {
+            let mut capped = false;
+            walk_entries_capped(&walk_root, &start, &walk_cancel, &mut capped, |batch| {
+                let fresh: Vec<CacheEntry> = batch
+                    .into_iter()
+                    .filter(|entry| !known.contains(&entry.text))
+                    .collect();
+                match tx {
+                    Some(tx) => fresh.is_empty() || tx.send(fresh).is_ok(),
+                    None => {
+                        out.extend(fresh);
+                        true
+                    }
+                }
+            });
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let (tx, rx) = mpsc::channel();
+            handle.spawn_blocking(move || collect(Some(&tx), &mut Vec::new()));
+            self.subtree = Some(SubtreeWalk {
+                dir,
+                rx: Some(rx),
+                cancel,
+            });
+        } else {
+            let mut out = Vec::new();
+            collect(None, &mut out);
+            self.subtree_cache = out;
+            self.subtree = Some(SubtreeWalk {
+                dir,
+                rx: None,
+                cancel,
+            });
+            let cache = std::mem::take(&mut self.subtree_cache);
+            self.scan(cache.iter());
+            self.subtree_cache = cache;
+        }
+    }
+
+    /// Takes subtree batches that arrived; true when matches may have changed.
+    fn drain_subtree(&mut self) -> bool {
+        let Some(rx) = self.subtree.as_ref().and_then(|walk| walk.rx.as_ref()) else {
+            return false;
+        };
+        let mut batches = Vec::new();
+        let mut finished = false;
+        loop {
+            match rx.try_recv() {
+                Ok(batch) => batches.push(batch),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    finished = true;
                     break;
                 }
             }
         }
+        if finished && let Some(walk) = &mut self.subtree {
+            walk.rx = None;
+        }
+        let mut changed = false;
+        for batch in batches {
+            self.scan(batch.iter());
+            self.subtree_cache.extend(batch);
+            changed = true;
+        }
+        changed
     }
 
     pub fn select_next(&mut self) {
@@ -837,7 +1076,21 @@ impl FilePicker {
                 floor_row,
             );
         }
-        super::draw_picker_described_rows(
+        let notice = self.truncated && !self.loading;
+        if notice && self.matches.is_empty() {
+            return super::draw_picker_message(
+                out,
+                &format!("no matches; {TRUNCATED_NOTICE}"),
+                self.monochrome,
+                floor_row,
+            );
+        }
+        let rows_floor = if notice {
+            floor_row.saturating_sub(1)
+        } else {
+            floor_row
+        };
+        let drawn = super::draw_picker_described_rows(
             out,
             cols,
             self.matches.len(),
@@ -852,17 +1105,30 @@ impl FilePicker {
             self.monochrome,
             self.accent,
             None,
-            floor_row,
+            rows_floor,
             0,
-        )
+        );
+        if notice {
+            drawn?;
+            return super::draw_picker_message(out, TRUNCATED_NOTICE, self.monochrome, floor_row);
+        }
+        drawn
     }
 }
 
-/// Whether a walk entry is a dot-entry (`.git`, `.env`, `.cache`, ...). The
-/// walk root itself (depth 0) is never pruned, even when its own name starts
-/// with a dot.
-fn is_dot_entry(entry: &ignore::DirEntry) -> bool {
-    entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
+/// Whether a walk entry is a pruned dot-entry (`.git`, `.env`, `.cache`, ...).
+/// The walk start itself (depth 0) is never pruned, even when its own name
+/// starts with a dot; [`ALLOWED_ROOT_DOT_DIRS`] directly under `root` are kept.
+fn is_dot_entry(entry: &ignore::DirEntry, root: &Path) -> bool {
+    if entry.depth() == 0 {
+        return false;
+    }
+    let name = entry.file_name().to_string_lossy();
+    if !name.starts_with('.') {
+        return false;
+    }
+    let allowed = entry.path().parent() == Some(root) && ALLOWED_ROOT_DOT_DIRS.contains(&&*name);
+    !allowed
 }
 
 /// Walk `root`, invoking `emit` with batches of paths as they are found so
@@ -879,7 +1145,8 @@ pub(crate) fn walk_files_streaming(
     cancel: &AtomicBool,
     mut emit: impl FnMut(Vec<PathBuf>) -> bool,
 ) {
-    let _ = walk_entries_streaming(Path::new(root), cancel, |batch| {
+    let root = Path::new(root);
+    let _ = walk_entries_capped(root, root, cancel, &mut false, |batch| {
         emit(
             batch
                 .into_iter()
@@ -892,12 +1159,27 @@ pub(crate) fn walk_files_streaming(
 /// The walk behind [`walk_files_streaming`], emitting picker cache entries
 /// whose lowercase text and directory flag are computed here, off the UI
 /// task.
+#[cfg(test)]
 fn walk_entries_streaming(
     root: &Path,
     cancel: &AtomicBool,
+    emit: impl FnMut(Vec<CacheEntry>) -> bool,
+) -> bool {
+    walk_entries_capped(root, root, cancel, &mut false, emit)
+}
+
+/// Walks `start` (at or under `root`), reporting paths relative to `root`.
+/// `capped` is set when the walk stopped at the file or entry cap with more
+/// entries left, so the list is partial.
+fn walk_entries_capped(
+    root: &Path,
+    start: &Path,
+    cancel: &AtomicBool,
+    capped: &mut bool,
     mut emit: impl FnMut(Vec<CacheEntry>) -> bool,
 ) -> bool {
-    let walker = ignore::WalkBuilder::new(root)
+    let filter_root = root.to_path_buf();
+    let walker = ignore::WalkBuilder::new(start)
         // Dot-entries are pruned by `filter_entry` below so the walker never
         // descends into `.git`; the built-in hidden filter is equivalent but
         // implicit.
@@ -905,7 +1187,7 @@ fn walk_entries_streaming(
         .git_ignore(true)
         .max_depth(Some(MAX_WALK_DEPTH))
         .sort_by_file_name(|a, b| a.cmp(b))
-        .filter_entry(|entry| !is_dot_entry(entry))
+        .filter_entry(move |entry| !is_dot_entry(entry, &filter_root))
         .build();
 
     let mut batch = Vec::with_capacity(WALK_BATCH_SIZE);
@@ -917,6 +1199,10 @@ fn walk_entries_streaming(
         }
         if entry.depth() == 0 {
             continue;
+        }
+        if files >= max_walk_files() || entries >= MAX_WALK_ENTRIES {
+            *capped = true;
+            break;
         }
         let path = entry.path();
         let is_file = match entry.file_type() {
@@ -945,9 +1231,6 @@ fn walk_entries_streaming(
         if batch.len() >= WALK_BATCH_SIZE && !emit(std::mem::take(&mut batch)) {
             return false;
         }
-        if files >= MAX_WALK_FILES || entries >= MAX_WALK_ENTRIES {
-            break;
-        }
     }
     batch.is_empty() || emit(batch)
 }
@@ -962,6 +1245,117 @@ pub(crate) fn walk_files(root: &str) -> Vec<PathBuf> {
         true
     });
     files
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    fn draw_text(picker: &FilePicker) -> String {
+        let mut out = Vec::new();
+        picker.draw(&mut out, 120, 20).unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn common_dot_directories_are_listed_and_the_rest_stay_pruned() {
+        let root = crate::tests::OwnedTestDirectory::new("file-picker-dot-dirs");
+        for dir in [
+            ".github/workflows",
+            ".devcontainer",
+            ".vscode",
+            ".git",
+            ".secret",
+        ] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        std::fs::write(root.path().join(".github/workflows/ci.yml"), "").unwrap();
+        std::fs::write(root.path().join(".vscode/settings.json"), "").unwrap();
+        std::fs::write(root.path().join(".git/config"), "").unwrap();
+        std::fs::write(root.path().join(".secret/key"), "").unwrap();
+        std::fs::write(root.path().join(".env"), "").unwrap();
+        std::fs::write(root.path().join("a.txt"), "").unwrap();
+        let listed: Vec<String> = walk_files(&root.path().to_string_lossy())
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        for wanted in [
+            ".github/workflows/ci.yml",
+            ".vscode/settings.json",
+            ".devcontainer",
+            "a.txt",
+        ] {
+            assert!(listed.iter().any(|p| p == wanted), "{wanted} in {listed:?}");
+        }
+        for pruned in [".git", ".git/config", ".secret", ".secret/key", ".env"] {
+            assert!(
+                !listed.iter().any(|p| p == pruned),
+                "{pruned} in {listed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_capped_walk_shows_a_notice_and_a_typed_prefix_reaches_past_the_cut() {
+        TEST_FILE_CAP.with(|cap| cap.set(Some(3)));
+        let root = crate::tests::OwnedTestDirectory::new("file-picker-truncated");
+        std::fs::create_dir_all(root.path().join("a")).unwrap();
+        std::fs::create_dir_all(root.path().join("z/deep")).unwrap();
+        for index in 0..5 {
+            std::fs::write(root.path().join(format!("a/f{index}.txt")), "").unwrap();
+        }
+        std::fs::write(root.path().join("z/deep/target.txt"), "").unwrap();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut picker = FilePicker::new();
+        picker.activate_for_add(Some(binding));
+        assert!(picker.truncated, "the cap was hit with files left");
+        assert!(!picker.matches.iter().any(|m| m.ends_with("target.txt")));
+        assert!(draw_text(&picker).contains("results truncated"));
+        // Typing the directory prefix walks that subtree directly.
+        for c in "z/deep/t".chars() {
+            picker.char_input(c);
+        }
+        assert_eq!(picker.matches, vec![PathBuf::from("z/deep/target.txt")]);
+        // Escapes and `.git` never start a subtree walk.
+        for hostile in ["../", "a/../../", "/etc/", ".git/", "./../"] {
+            let mut other = FilePicker::new();
+            other.truncated = true;
+            other.query = hostile.into();
+            assert_eq!(other.typed_directory(), None, "{hostile}");
+        }
+        TEST_FILE_CAP.with(|cap| cap.set(None));
+    }
+
+    #[test]
+    fn a_complete_walk_shows_no_notice() {
+        let root = crate::tests::OwnedTestDirectory::new("file-picker-complete");
+        std::fs::write(root.path().join("a.txt"), "").unwrap();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut picker = FilePicker::new();
+        picker.activate_for_add(Some(binding));
+        assert!(!picker.truncated);
+        assert!(!draw_text(&picker).contains("truncated"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_prefix_pointing_outside_the_workspace_is_not_walked() {
+        TEST_FILE_CAP.with(|cap| cap.set(Some(1)));
+        let outside = crate::tests::OwnedTestDirectory::new("file-picker-outside");
+        std::fs::write(outside.path().join("secret.txt"), "").unwrap();
+        let root = crate::tests::OwnedTestDirectory::new("file-picker-link");
+        std::fs::write(root.path().join("a.txt"), "").unwrap();
+        std::fs::write(root.path().join("b.txt"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut picker = FilePicker::new();
+        picker.activate_for_add(Some(binding));
+        assert!(picker.truncated);
+        picker.push_query_str("link/secret");
+        assert!(picker.matches.is_empty());
+        assert!(picker.subtree.is_none());
+        TEST_FILE_CAP.with(|cap| cap.set(None));
+    }
 }
 
 #[cfg(test)]

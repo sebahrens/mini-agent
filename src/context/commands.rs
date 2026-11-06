@@ -766,7 +766,11 @@ mod tests {
         let workspace_dir = root.path().join("workspace");
         let project = workspace_dir.join(".mini-agent/commands");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("fix-issue.md"), "Fix issue $1 (all: $ARGUMENTS)").unwrap();
+        std::fs::write(
+            project.join("fix-issue.md"),
+            "Fix issue $1 (all: $ARGUMENTS)",
+        )
+        .unwrap();
         let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
         let (cli, cfg) = (crate::cli::Cli::default(), crate::config::Config::default());
         let run = |commands: &BTreeMap<String, CommandTemplate>, prompt: &str| {
@@ -779,12 +783,27 @@ mod tests {
         );
         // Untrusted project config: the project command is inactive, text literal.
         let untrusted = load_layers(&paths, &workspace, false);
-        assert_eq!(run(&untrusted, "/fix-issue 123").unwrap(), HeadlessCommand::Literal);
+        assert_eq!(
+            run(&untrusted, "/fix-issue 123").unwrap(),
+            HeadlessCommand::Literal
+        );
         // Built-ins are flagged; paths and plain text stay literal.
-        assert_eq!(run(&trusted, "/help").unwrap(), HeadlessCommand::BuiltIn("help".into()));
-        assert_eq!(run(&trusted, "/etc/passwd explain").unwrap(), HeadlessCommand::Literal);
-        assert_eq!(run(&trusted, "summarize").unwrap(), HeadlessCommand::Literal);
-        assert_eq!(run(&trusted, "/unknown x").unwrap(), HeadlessCommand::Literal);
+        assert_eq!(
+            run(&trusted, "/help").unwrap(),
+            HeadlessCommand::BuiltIn("help".into())
+        );
+        assert_eq!(
+            run(&trusted, "/etc/passwd explain").unwrap(),
+            HeadlessCommand::Literal
+        );
+        assert_eq!(
+            run(&trusted, "summarize").unwrap(),
+            HeadlessCommand::Literal
+        );
+        assert_eq!(
+            run(&trusted, "/unknown x").unwrap(),
+            HeadlessCommand::Literal
+        );
         // Oversized arguments are refused like the TUI/ACP path.
         let huge = format!("/fix-issue {}", "a".repeat(MAX_TEMPLATE_BYTES + 1));
         assert!(run(&trusted, &huge).unwrap_err().contains("64 KiB"));
