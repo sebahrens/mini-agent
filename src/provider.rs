@@ -445,6 +445,67 @@ pub(crate) fn merge_extra_body(
     }
 }
 
+/// `params` with `num_ctx` set to `context_window` unless it already names
+/// one (rig's Ollama request moves `num_ctx` under `options`).
+pub(crate) fn with_ollama_num_ctx(
+    params: Option<serde_json::Value>,
+    context_window: u64,
+) -> Option<serde_json::Value> {
+    if context_window == 0 {
+        return params;
+    }
+    match params {
+        Some(serde_json::Value::Object(mut map)) => {
+            let explicit = map.contains_key("num_ctx")
+                || map
+                    .get("options")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|options| options.contains_key("num_ctx"));
+            if !explicit {
+                map.insert("num_ctx".into(), context_window.into());
+            }
+            Some(serde_json::Value::Object(map))
+        }
+        None => Some(serde_json::json!({ "num_ctx": context_window })),
+        other => other,
+    }
+}
+
+/// The model's trained context length from an Ollama `/api/show` response
+/// (`model_info["<architecture>.context_length"]`).
+pub(crate) fn ollama_show_context_length(show: &serde_json::Value) -> Option<u64> {
+    show.get("model_info")?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.ends_with(".context_length"))
+        .and_then(|(_, value)| value.as_u64())
+        .filter(|length| *length > 0)
+}
+
+/// Ask an Ollama server for a model's context length (best effort, bounded
+/// by `timeout`). `None` for any other client or on any failure.
+pub(crate) async fn probe_ollama_context_length(
+    client: &AnyClient,
+    model: &str,
+    timeout: std::time::Duration,
+) -> Option<u64> {
+    let AnyClient::Ollama(client) = client else {
+        return None;
+    };
+    let url = format!("{}/api/show", client.base_url().trim_end_matches('/'));
+    let request = reqwest::Client::new()
+        .post(url)
+        .headers(client.headers().clone())
+        .json(&serde_json::json!({ "model": model }))
+        .timeout(timeout);
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = response.json().await.ok()?;
+    ollama_show_context_length(&body)
+}
+
 /// Provider parameters for tool-free formatting/title requests. Only typed
 /// generation/privacy fields survive raw overrides; capabilities, messages,
 /// retained server state, and token/format replacements never pass through.
@@ -3328,7 +3389,9 @@ impl AnyAgent {
     /// Capture main-session data before restoring a binding or starting work.
     /// Independently built auxiliary agents retain their own context policy.
     pub(crate) fn with_main_session(self, cfg: &Config, session: &crate::session::Session) -> Self {
-        let agent = self.with_reasoning_controls(cfg, session.reasoning_controls);
+        let agent = self
+            .with_reasoning_controls(cfg, session.reasoning_controls)
+            .with_ollama_context_window(session.context_window);
         #[cfg(feature = "memory")]
         {
             agent.with_memory_placement(session.memory_placement)
@@ -3337,6 +3400,18 @@ impl AnyAgent {
         {
             agent
         }
+    }
+
+    /// Ollama applies its own small default `num_ctx` and silently drops the
+    /// oldest prompt tokens beyond it (mini-agent-djwve). Send the window the
+    /// session's compaction and reserve math use as `options.num_ctx`. An
+    /// explicit `num_ctx` in the user's `extra_body` wins.
+    pub(crate) fn with_ollama_context_window(mut self, context_window: u64) -> Self {
+        if let AnyAgentInner::Ollama(agent) = &mut self.inner {
+            agent.additional_params =
+                with_ollama_num_ctx(agent.additional_params.take(), context_window);
+        }
+        self
     }
 
     #[cfg(feature = "memory")]

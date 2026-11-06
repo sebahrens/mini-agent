@@ -1467,6 +1467,29 @@ impl Startup {
             cfg.api_keys.as_ref(),
         )?;
 
+        // Ollama truncates silently beyond the model's context length, so a
+        // window larger than it is capped (mini-agent-djwve). Best effort: an
+        // unreachable server keeps the configured window.
+        if let Some(length) = provider::probe_ollama_context_length(
+            &client,
+            session.model.as_str(),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+            && length < session.context_window
+        {
+            if cfg
+                .known_context_window(session.provider.as_str(), session.model.as_str(), qm_map)
+                .is_some()
+            {
+                eprintln!(
+                    "warning: context_window {} exceeds the Ollama model's context length {length}; using {length}",
+                    session.context_window
+                );
+            }
+            session.update_context_window(length);
+        }
+
         let resume_override_pending = resume_decision
             .as_ref()
             .is_some_and(|decision| decision.override_identities().is_some());

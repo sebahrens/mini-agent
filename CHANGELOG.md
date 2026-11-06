@@ -23,6 +23,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   conversation (oldest tool results trimmed, tool-free summary, continue) instead of failing, at
   most twice per child and charged to the task's weighted units; with `compact_enabled = false`
   the refusal, which names `subagent_context_window`, is unchanged (mini-agent-d0rfu).
+- Ollama requests now send the session's context window as `options.num_ctx` (an explicit
+  `extra_body` `num_ctx` wins), and startup caps the window to the model's context length from
+  `/api/show`, so the server no longer silently truncates at its small default (mini-agent-djwve).
 
 ### Security
 

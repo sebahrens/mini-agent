@@ -119,6 +119,21 @@ script omits entries whose upstream pricing is absent so the status line never
 silently treats a paid model as free. OpenRouter continues to refresh its
 marketplace pricing at runtime.
 
+### Ollama context window
+
+Ollama applies its own small default context (`num_ctx`) and silently drops the
+oldest prompt tokens beyond it, including the system prompt and tool schemas.
+mini-agent therefore sends the session's effective `context_window` as
+`options.num_ctx` on every main-agent request (TUI, headless and ACP turns). At
+startup it also asks the server's `/api/show` for the model's trained context
+length (2-second best-effort probe) and caps the session window to it, warning
+when a configured `context_window` is larger. Compaction, the status bar and the
+reserve math then use the window the server actually honours. An explicit
+`num_ctx` in `extra_body` (top level or under `options`) wins over the derived
+value. Set `context_window` (or a quick model's `context_window`) to choose a
+smaller window, for example to fit VRAM; `task` children keep the server default
+unless their persona's `extra_body` sets `num_ctx`.
+
 Startup and `/provider <name>` use the same default resolver: the configured
 `model` when it belongs to that provider, a custom provider's own `model`, the
 `deepseek-v4-pro` quick model when it targets that provider, another matching
