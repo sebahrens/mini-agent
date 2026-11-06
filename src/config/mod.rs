@@ -721,6 +721,12 @@ pub struct Config {
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_enabled: Option<bool>,
+    /// Host-minted subagent evidence handles (default true): record each
+    /// child tool result, accept `[evidence: En]` citations, append the
+    /// metadata-only Evidence section and offer `task_evidence`.
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_evidence: Option<bool>,
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagents: Option<types::SubagentPolicy>,

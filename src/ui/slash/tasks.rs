@@ -162,6 +162,7 @@ mod tests {
                 tool_calls: 30,
                 log: vec![read, grep],
                 unverified: Some("raw\nchild text".into()),
+                evidence: None,
             }],
         }
     }

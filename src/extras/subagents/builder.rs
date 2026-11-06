@@ -113,6 +113,9 @@ struct ReadOnlyJsAuthorization {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PersonaExecution {
     pub(crate) write_mode: bool,
+    /// Host evidence handles are on for this delegation: the child is told
+    /// how to cite `[evidence: En]` (see `prompt::EVIDENCE_CITATION_RULES`).
+    pub(crate) evidence: bool,
     /// `None` installs the complete read-only child tool set. `Some` is always
     /// a narrowing parsed from trusted persona metadata.
     pub(crate) tools: Option<Vec<AgentTool>>,
@@ -776,6 +779,11 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
         preamble.truncate(policy_start);
         preamble.push_str(&prompt::write_rules());
         preamble.push_str("\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in the required sections.");
+    }
+
+    if persona.evidence {
+        preamble.push_str("\n\n");
+        preamble.push_str(prompt::EVIDENCE_CITATION_RULES);
     }
 
     #[cfg(feature = "agent-skills")]
@@ -2106,6 +2114,10 @@ mod tests {
         let authorization = writable_parent(root.path(), None);
         let tools = filesystem_tools(&authorization);
         assert!(tools.iter().all(|tool| tool.name() != "task"));
+        assert!(
+            tools.iter().all(|tool| tool.name() != "task_evidence"),
+            "task_evidence is parent-only"
+        );
         let write = tools.iter().find(|tool| tool.name() == "write").unwrap();
         assert!(
             write
@@ -2481,6 +2493,7 @@ mod provider_param_tests {
         PersonaExecution {
             write_mode: false,
             tools: None,
+            evidence: false,
             provider_extra_body: config.extra_body.clone(),
             additional_params: Some(serde_json::json!({"user": "persona-tenant"})),
             #[cfg(feature = "mcp")]

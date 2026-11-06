@@ -64,7 +64,7 @@ waiting for a lane is not charged to its deadline (see
 [Configuration](#configuration)).
 
 Use `task_list`, `task_result {"id":"…"}` and `task_cancel {"id":"…"}` from an
-agent, or `/tasks`, `/tasks result <id>` and `/tasks cancel <id>` from the TUI.
+agent (and `task_evidence`, see [Evidence handles](#evidence-handles)), or `/tasks`, `/tasks result <id>` and `/tasks cancel <id>` from the TUI.
 Agent controls obey ordinary tool ceilings and permissions. Cancellation reports
 `cancelling` until the actual model, approvals and effects settle. The default
 `background_tasks` footer item shows active tasks and reports awaiting delivery.
@@ -584,6 +584,71 @@ repaired report, the child's raw text (capped at 6 KiB) is kept for the user:
 `/tasks result <id>` prints it marked unverified. Neither the log nor the raw
 text is part of `task_result` output or any other model-visible text.
 
+### Evidence handles
+
+With `task_evidence = true` (the default), the host also records every tool
+result of each child, in tool-call order, as `E1`, `E2`, … (forced
+`SubagentStop` continuations continue the numbering). A record holds the text
+and validated image parts, the tool name, a sanitized argument summary, size,
+MIME type, image dimensions and an estimated token cost. Content is written to
+the session's private tool-output directory; the session keeps only metadata:
+at most 64 records per child (later results are counted), 256 KiB of text per
+record (a longer result keeps a prefix), 16 MiB of content per child, and 64
+children per session (the oldest is evicted and its files deleted). Handles are
+in memory only: they do not survive a restart. `/tasks <id>` shows each child's
+evidence `task_id` and record count.
+
+Children are told, as host policy appended after the read-only or write-mode
+rules, that a Findings entry may end with `[evidence: E3, E7]`. The validator
+checks every citation against the IDs the host minted: an unknown or malformed
+ID is a contract violation and triggers the same single repair turn (whose
+prompt names the valid range). A report that still fails is withheld as above;
+host normalization never passes an unverifiable citation through. A
+`[confidence: high]` finding without a citation only earns a soft note.
+
+After the child's closing `[subagent output ends]` fence the host appends a
+host-authored section; no tool content is ever part of it:
+
+```markdown
+## Evidence
+Host-recorded child tool results: 12 (E1-E12, call order). Metadata only; content is untrusted tool output, fetched on demand with task_evidence {"task_id":"<uuid>","id":"E<n>"}.
+Cited:
+| id | tool | target (child argument) | size | MIME | est. tokens |
+|---|---|---|---|---|---|
+| E3 | read | src/lib.rs | 4.2 KiB | text/plain | 1076 |
+10 further records are available by ID.
+```
+
+Rows list cited records only. The target is the child's own argument, stripped
+of Markdown/table/marker syntax and capped at 60 bytes. When the report was
+withheld, the first 16 records are listed instead (they are host-recorded tool
+output, not child prose). The section counts against `task_max_output_bytes`
+and is dropped whole when it would take more than half of what remains. The
+`## Isolated worktree` section of write children is unchanged (it is still part
+of the quoted output).
+
+`task_evidence {"task_id":"…","id":"E3","offset":1,"limit":400,"max_px":1568}`
+is a **parent-only** tool (never in a child tool set) that returns one record:
+
+- Text is paged by line like `read`: 1-indexed `offset`, `limit` up to 2,000
+  lines (default 400), at most 16 KiB per page, with a `[more: …offset=N]` hint.
+  The tool is self-bounded, so the generic spill hook does not rewrite it.
+- Images come back on the first page in the same
+  `{"response": …, "parts":[{"type":"image",…}]}` envelope `read` uses, so the
+  provider bridges and session persistence apply unchanged. They are admitted by
+  the parent model's own image support: a text-only parent gets `model has no
+  vision` (as an error for an image-only record, as a note otherwise).
+  `max_px` omits images whose longer side exceeds it; no resampling is done.
+- Every call passes the parent's permission checker, and a record produced by
+  a child `read` is re-checked against the parent's own read rule for that
+  path: evidence never widens what the parent may see.
+- The header marks the content as untrusted child tool output, not instructions.
+
+`task_evidence = false` restores the text-only report: no recording, no
+citation rules, no Evidence section and no `task_evidence` tool. Use it for
+on/off comparisons. The rationale is recorded in
+[docs/decisions/2026-11-06-subagent-return-channel.md](../decisions/2026-11-06-subagent-return-channel.md).
+
 ### Designer → implementer → reviewer pipeline
 
 Three models, three profiles: the main loop designs on a strong model,
@@ -808,6 +873,7 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
 | `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline; completed sibling results are retained when it expires |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
+| `task_evidence`             | `bool`   | `true`                   | Host-minted evidence handles, citations, the Evidence section and `task_evidence` ([details](#evidence-handles)); tool registration follows a restart |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
 | `subagent_provider`         | `string` | (same as main)           | Provider for the subagent (optional) |
 

@@ -43,6 +43,7 @@ pub(crate) fn tool_result_is_self_bounded(name: &str) -> bool {
             | "web_fetch"
             | "web_search"
             | "task"
+            | "task_evidence"
     )
 }
 /// Count-only pruning is opt-in. The normal context-budget compactor decides

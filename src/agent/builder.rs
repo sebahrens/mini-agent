@@ -74,6 +74,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "task_result"
             | "task_list"
             | "task_cancel"
+            | "task_evidence"
             | "memory_write"
             | "memory_edit"
             | "memory_read"
@@ -1257,6 +1258,18 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     workspace.clone(),
                 ),
             ));
+            // Parent-only: child tool sets never contain it.
+            if crate::extras::subagents::evidence::enabled(cfg) {
+                all_tools.push(Box::new(
+                    crate::extras::subagents::background::EvidenceTool::new(
+                        permission.clone(),
+                        ask_tx.clone(),
+                        workspace.clone(),
+                        #[cfg(feature = "multimodal")]
+                        read_tracker.image_support,
+                    ),
+                ));
+            }
         }
         #[cfg(feature = "subagents")]
         if cfg.task_enabled.unwrap_or(true) && !crate::extras::subagents::is_initialized() {
@@ -2531,6 +2544,7 @@ mod mcp_tests {
             "task_result",
             "task_list",
             "task_cancel",
+            "task_evidence",
             "memory_write",
             "memory_edit",
             "memory_read",
