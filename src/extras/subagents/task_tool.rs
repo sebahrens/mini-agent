@@ -6196,6 +6196,8 @@ mod tests {
                 max_text_file_size: None,
                 max_shell_output_lines: None,
                 shell_timeout_secs: 10,
+                shell_auto_background: false,
+                shell_output_log_dir: None,
                 diff_options: Default::default(),
                 formatter: None,
                 #[cfg(feature = "lsp")]

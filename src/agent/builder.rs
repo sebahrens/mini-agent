@@ -1316,6 +1316,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     max_text_file_size: max_edit_file_size,
                     max_shell_output_lines: max_bash_output_lines,
                     shell_timeout_secs: cfg.resolve_shell_timeout_secs(),
+                    shell_auto_background: cfg.shell_auto_background.unwrap_or(false),
+                    shell_output_log_dir: crate::session::storage::command_log_dir(
+                        tool_output_session_id,
+                    ),
                     diff_options: cfg.mutation_diff_options(),
                     formatter: formatter.clone(),
                     #[cfg(feature = "lsp")]

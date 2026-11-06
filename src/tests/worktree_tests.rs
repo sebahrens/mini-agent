@@ -5203,6 +5203,8 @@ wait
                     max_text_file_size: Some(1024 * 1024),
                     max_shell_output_lines: Some(100),
                     shell_timeout_secs: 10,
+                    shell_auto_background: false,
+                    shell_output_log_dir: None,
                     diff_options: Default::default(),
                     formatter: None,
                     #[cfg(feature = "lsp")]

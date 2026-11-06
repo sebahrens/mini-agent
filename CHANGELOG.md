@@ -88,6 +88,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   the budget fairly across roots so a large project root cannot hide user roots, and reports the
   limit, config key, skipped count and roots once at startup (mini-agent-hi8rm).
 
+- Subagents with a shell now also get `job_status`, restricted to their own jobs (which are stopped
+  when the child ends), plus the parent's `shell_auto_background` and a command-log directory so
+  oversized output stays recoverable (mini-agent-eqlme, mini-agent-ysugx).
+
 ### Shell and pty jobs (round 7, group P)
 
 - `job_status` input no longer accepts TAB or shell history expansion (`!` followed by text, a

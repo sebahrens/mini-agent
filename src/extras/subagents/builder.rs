@@ -124,6 +124,8 @@ pub(crate) struct ReadOnlyShell {
     pub(crate) sandbox: crate::sandbox::Sandbox,
     pub(crate) max_output_lines: Option<u64>,
     pub(crate) timeout_secs: u64,
+    pub(crate) auto_background: bool,
+    pub(crate) output_log_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -147,6 +149,11 @@ pub(crate) struct WriteChildTools {
     pub(crate) max_text_file_size: Option<u64>,
     pub(crate) max_shell_output_lines: Option<u64>,
     pub(crate) shell_timeout_secs: u64,
+    /// The parent's `shell_auto_background` setting.
+    pub(crate) shell_auto_background: bool,
+    /// The parent session's private command-log directory; the child read
+    /// tool may read it, so output past the in-memory limit stays recoverable.
+    pub(crate) shell_output_log_dir: Option<std::path::PathBuf>,
     pub(crate) diff_options: tools::mutation_diff::DiffOptions,
     pub(crate) formatter: Option<std::sync::Arc<tools::format_after_edit::FormatAfterEdit>>,
     #[cfg(feature = "lsp")]
@@ -553,6 +560,7 @@ impl SubagentAuthorization {
                 tools.push(Box::new(tool));
             }
             if enabled(AgentTool::Shell) {
+                let scope = tools::JobScope::new(parent.sandbox.clone());
                 tools.push(Box::new(
                     tools::ShellTool::new(
                         self.permission.clone(),
@@ -560,12 +568,24 @@ impl SubagentAuthorization {
                         parent.sandbox.clone(),
                         parent.max_shell_output_lines,
                     )
-                    .with_foreground_timeout_secs(parent.shell_timeout_secs),
+                    .with_foreground_timeout_secs(parent.shell_timeout_secs)
+                    .with_auto_background(parent.shell_auto_background)
+                    .with_output_log_dir(parent.shell_output_log_dir.clone())
+                    .with_job_scope(scope.clone()),
+                ));
+                tools.push(Box::new(
+                    tools::JobStatusTool::new(
+                        parent.sandbox.clone(),
+                        parent.max_shell_output_lines,
+                    )
+                    .with_permission(self.permission.clone(), self.ask_tx.clone())
+                    .with_job_scope(scope),
                 ));
             }
         } else if enabled(AgentTool::Shell)
             && let ReadOnlyShellState::Bound(shell) = &self.read_only_shell
         {
+            let scope = tools::JobScope::new(shell.sandbox.clone());
             tools.push(Box::new(
                 tools::ShellTool::new(
                     self.permission.clone(),
@@ -573,7 +593,15 @@ impl SubagentAuthorization {
                     shell.sandbox.clone(),
                     shell.max_output_lines,
                 )
-                .with_foreground_timeout_secs(shell.timeout_secs),
+                .with_foreground_timeout_secs(shell.timeout_secs)
+                .with_auto_background(shell.auto_background)
+                .with_output_log_dir(shell.output_log_dir.clone())
+                .with_job_scope(scope.clone()),
+            ));
+            tools.push(Box::new(
+                tools::JobStatusTool::new(shell.sandbox.clone(), shell.max_output_lines)
+                    .with_permission(self.permission.clone(), self.ask_tx.clone())
+                    .with_job_scope(scope),
             ));
         }
         tools
@@ -741,7 +769,11 @@ pub(crate) fn persona_tool_names(
         skill_services_available,
     )
     .into_iter()
-    .map(AgentTool::name)
+    .flat_map(|kind| {
+        // A child with a shell also gets `job_status`, scoped to its own jobs.
+        let companion = (kind == AgentTool::Shell).then_some("job_status");
+        std::iter::once(kind.name()).chain(companion)
+    })
     .collect()
 }
 
@@ -2225,11 +2257,55 @@ mod tests {
             max_text_file_size: Some(1024 * 1024),
             max_shell_output_lines: Some(100),
             shell_timeout_secs: 5,
+            shell_auto_background: false,
+            shell_output_log_dir: None,
             diff_options: Default::default(),
             formatter: None,
             #[cfg(feature = "lsp")]
             lsp: None,
         }))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_child_shell_logs_oversized_output_and_gets_scoped_job_status() {
+        let root = TempDir::new("child-shell-log");
+        let logs = root.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let mut authorization = parent_authorization(root.path(), None);
+        authorization.permission = None;
+        let authorization = authorization.with_write_tools(Some(super::WriteChildTools {
+            sandbox: crate::sandbox::Sandbox::new(false, "auto").with_workspace_binding(Arc::new(
+                crate::paths::WorkspaceBinding::capture(root.path()).unwrap(),
+            )),
+            write_enabled: false,
+            edit_enabled: false,
+            shell_enabled: true,
+            max_text_file_size: Some(1024 * 1024),
+            max_shell_output_lines: Some(50),
+            shell_timeout_secs: 20,
+            shell_auto_background: true,
+            shell_output_log_dir: Some(logs.clone()),
+            diff_options: Default::default(),
+            formatter: None,
+            #[cfg(feature = "lsp")]
+            lsp: None,
+        }));
+        let tools = filesystem_tools(&authorization);
+        assert!(tools.iter().any(|tool| tool.name() == "job_status"));
+        let shell = tools.iter().find(|tool| tool.name() == "shell").unwrap();
+        let output = shell
+            .call(
+                serde_json::json!({"command":"head -c 3000000 /dev/zero | tr '\\0' a | fold -w 80"})
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !output.contains("not recoverable"),
+            "child shell must keep an output log: {output}"
+        );
+        assert!(output.contains(logs.to_str().unwrap()), "{output}");
     }
 
     #[tokio::test]

@@ -1075,6 +1075,15 @@ Only active pure learned-JS exports can be installed in this realm.
 | `memory_read`   | Read memory files (long-term, notes…)  |
 | `memory_search` | Keyword search across all memory       |
 
+### Child shell jobs and output logs
+
+A child that has `shell` (write-capable or read-only shell) also gets `job_status`, scoped to the
+background jobs that child started: it cannot list, poll, wait for, stop or type into the parent's
+or a sibling's jobs, and it does not receive the parent's job-completion notices. Jobs still
+running when the child ends are stopped. Child shells honour the parent's `shell_auto_background`
+and spool output beyond the in-memory limit to the parent session's private command-log directory,
+so the omitted middle is recoverable with `read`/`grep` from the path named in the result.
+
 ### Opt-in read-only shell and web tools
 
 Two `[subagents]` opt-ins (both default `false`) let a read-mode persona run

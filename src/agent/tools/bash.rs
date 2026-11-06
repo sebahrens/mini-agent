@@ -234,6 +234,56 @@ pub(crate) struct ForegroundResult {
 #[cfg(not(any(feature = "git-worktree", test)))]
 type ForegroundResult = std::convert::Infallible;
 
+/// The background jobs one subagent started. A subagent shares its parent's
+/// sandbox, so `job_status` is restricted to the ids recorded here (it can
+/// neither see nor control the parent's or a sibling's jobs), and jobs still
+/// running when the last tool holding the scope is dropped are stopped.
+#[derive(Clone)]
+pub struct JobScope(std::sync::Arc<JobScopeInner>);
+
+struct JobScopeInner {
+    sandbox: Sandbox,
+    ids: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl JobScope {
+    pub fn new(sandbox: Sandbox) -> Self {
+        Self(std::sync::Arc::new(JobScopeInner {
+            sandbox,
+            ids: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        }))
+    }
+
+    fn record(&self, id: &str) {
+        self.0
+            .ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id.to_string());
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.0
+            .ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(id)
+    }
+}
+
+impl Drop for JobScopeInner {
+    fn drop(&mut self) {
+        let ids = std::mem::take(
+            self.ids
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for id in ids {
+            let _ = self.sandbox.request_stop_background_job(&id);
+        }
+    }
+}
+
 pub struct ShellTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -254,6 +304,8 @@ pub struct ShellTool {
     /// `shell-allow-escalation`: offer the per-call `escalate` parameter.
     /// Default closed.
     allow_escalation: bool,
+    /// Set for subagents: records the ids of the jobs this tool starts.
+    job_scope: Option<JobScope>,
 }
 
 /// Longest `justification` shown in the escalation approval.
@@ -277,7 +329,14 @@ impl ShellTool {
             output_log_dir: None,
             auto_background: false,
             allow_escalation: false,
+            job_scope: None,
         }
+    }
+
+    /// Record every background job this tool starts in `scope` (subagents).
+    pub fn with_job_scope(mut self, scope: JobScope) -> Self {
+        self.job_scope = Some(scope);
+        self
     }
 
     /// Offer the `escalate` parameter (`shell-allow-escalation`, never when
@@ -486,6 +545,7 @@ impl ShellTool {
             output_log_dir: self.output_log_dir.clone(),
             auto_background: self.auto_background,
             allow_escalation: false,
+            job_scope: self.job_scope.clone(),
         };
         args.escalate = false;
         let (text, metadata) = Box::pin(tool.execute(args)).await?;
@@ -581,6 +641,9 @@ impl ShellTool {
                     None,
                 )
                 .await?;
+            if let Some(scope) = &self.job_scope {
+                scope.record(&id);
+            }
             let log = self
                 .output_log_dir
                 .as_ref()
@@ -772,6 +835,9 @@ impl ShellTool {
             Err(error) if error.kind() == std::io::ErrorKind::QuotaExceeded => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        if let Some(scope) = &self.job_scope {
+            scope.record(&id);
+        }
         let mut pending = PendingAutoJob {
             sandbox: &self.sandbox,
             id: id.clone(),
@@ -960,6 +1026,8 @@ pub struct JobStatusTool {
     /// Jobs whose unterminated line was edited with cursor, history or escape
     /// keys, so the typed text is no longer the line the program will run.
     edited_lines: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Subagents: only the jobs recorded here are visible and controllable.
+    job_scope: Option<JobScope>,
 }
 
 /// Permission text for a line the terminal's own editing (cursor, history,
@@ -1012,7 +1080,14 @@ impl JobStatusTool {
             ask_tx: None,
             pending_input: std::sync::Mutex::new(std::collections::HashMap::new()),
             edited_lines: std::sync::Mutex::new(std::collections::HashSet::new()),
+            job_scope: None,
         }
+    }
+
+    /// Restrict the tool to the jobs started under `scope` (subagents).
+    pub fn with_job_scope(mut self, scope: JobScope) -> Self {
+        self.job_scope = Some(scope);
+        self
     }
 
     /// Judge typed terminal input (`action=input`) like a shell command.
@@ -1216,6 +1291,10 @@ impl Tool for JobStatusTool {
 
     async fn call(&self, args: JobStatusArgs) -> Result<String, ToolError> {
         let output = self.call_inner(args).await?;
+        if self.job_scope.is_some() {
+            // The notice queue belongs to the parent session.
+            return Ok(output);
+        }
         Ok(append_job_notices(&self.sandbox, output))
     }
 }
@@ -1252,7 +1331,16 @@ impl JobStatusTool {
                         .into(),
                 ));
             }
-            let summaries = self.sandbox.background_job_summaries();
+            let summaries = self
+                .sandbox
+                .background_job_summaries()
+                .into_iter()
+                .filter(|job| {
+                    self.job_scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.contains(&job.id))
+                })
+                .collect::<Vec<_>>();
             if summaries.is_empty() {
                 return Ok("No background jobs in this session.".into());
             }
@@ -1279,6 +1367,15 @@ impl JobStatusTool {
         let id = args.id.as_deref().ok_or_else(|| ToolError::Msg(
             "job_status requires an id for poll, wait or stop. Example: {\"id\":\"job-...\",\"action\":\"wait\"}".into(),
         ))?;
+        if self
+            .job_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.contains(id))
+        {
+            return Err(ToolError::Msg(format!(
+                "unknown background job '{id}': this subagent can only use jobs it started itself. Example: {{\"action\":\"list\"}}"
+            )));
+        }
         match args.action {
             JobAction::Poll => self.sandbox.background_job_snapshot(id).map(drop),
             JobAction::Stop => {
@@ -2247,6 +2344,99 @@ mod tests {
             .find_map(|line| line.strip_prefix("Background job started: "))
             .expect("background shell result must return a job id")
             .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_job_status_only_sees_and_controls_the_jobs_its_shell_started() {
+        let parent = test_tool();
+        let parent_started = parent
+            .call(BashArgs {
+                command: "sleep 30".to_string(),
+                timeout: Some(60_000),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let parent_id = background_id(&parent_started);
+        // The child shares the parent's sandbox (and so its job table).
+        let scope = JobScope::new(parent.sandbox.clone());
+        let child =
+            BashTool::new(None, None, parent.sandbox.clone(), None).with_job_scope(scope.clone());
+        let status = JobStatusTool::new(parent.sandbox.clone(), None).with_job_scope(scope);
+        let child_started = child
+            .call(BashArgs {
+                command: "sleep 30".to_string(),
+                timeout: Some(60_000),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let child_id = background_id(&child_started);
+
+        let listed = status
+            .call(JobStatusArgs {
+                action: JobAction::List,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(listed.contains(&child_id), "{listed}");
+        assert!(!listed.contains(&parent_id), "{listed}");
+        for action in [JobAction::Poll, JobAction::Stop, JobAction::Wait] {
+            let error = status
+                .call(JobStatusArgs {
+                    id: Some(parent_id.clone()),
+                    action,
+                    timeout_ms: None,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("only use jobs it started"), "{error}");
+        }
+        assert_eq!(parent.sandbox.running_background_job_count(), 2);
+        status
+            .call(JobStatusArgs {
+                id: Some(child_id.clone()),
+                action: JobAction::Stop,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        parent
+            .sandbox
+            .stop_background_job(&parent_id)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_job_scope_stops_the_jobs_a_subagent_left_running() {
+        let sandbox = Sandbox::new(false, "bwrap");
+        let scope = JobScope::new(sandbox.clone());
+        let child = BashTool::new(None, None, sandbox.clone(), None).with_job_scope(scope.clone());
+        child
+            .call(BashArgs {
+                command: "sleep 30".to_string(),
+                timeout: Some(60_000),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(sandbox.running_background_job_count(), 1);
+        drop(child);
+        drop(scope);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sandbox.running_background_job_count() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(sandbox.running_background_job_count(), 0);
     }
 
     async fn wait_for_terminal_job(tool: &JobStatusTool, id: &str) -> String {
