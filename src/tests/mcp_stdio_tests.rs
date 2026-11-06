@@ -3001,6 +3001,48 @@ async fn mcp_resource_pages_reuse_one_server_read_and_report_the_content_hash() 
 }
 
 #[tokio::test]
+async fn mcp_server_initialize_instructions_reach_the_prompt_bounded_and_fenced() {
+    let fixture = FixtureBuild::compile();
+    let mut sections = Vec::new();
+    for mode in ["aux-instructions", "aux-instructions-big", "aux"] {
+        let cfg = fixture.config(
+            fixture.executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            mode,
+            &fixture.lease(mode),
+        );
+        let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+            .await
+            .unwrap();
+        let manager = McpClientManager::from_handles(vec![handle]);
+        sections.push(manager.instructions_section());
+        manager.shutdown().await;
+    }
+    fixture.cleanup();
+    let small = &sections[0];
+    assert!(
+        small.contains("<mcp_server_instructions server=\"owned\">"),
+        "{small}"
+    );
+    assert!(small.contains("Prefer notes over guessing."), "{small}");
+    assert!(small.contains("untrusted"), "{small}");
+    // The server's own closing tag is neutralised; only ours closes the block.
+    assert_eq!(
+        small.matches("</mcp_server_instructions>").count(),
+        1,
+        "{small}"
+    );
+    let big = &sections[1];
+    assert!(
+        big.contains("[instructions truncated at 2048 bytes]"),
+        "{}",
+        big.len()
+    );
+    assert!(big.len() < 2048 + 600, "{}", big.len());
+    assert!(sections[2].is_empty(), "no instructions, no section");
+}
+
+#[tokio::test]
 async fn mcp_manager_connect_fills_the_auxiliary_catalogue_off_the_connect_path() {
     let fixture = FixtureBuild::compile();
     let lease = fixture.lease("auxiliary-detached");

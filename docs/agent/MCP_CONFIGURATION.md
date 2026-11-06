@@ -238,6 +238,18 @@ size and MIME type, and a resource with nothing readable is refused with that
 reason. Operator `@mcp:` attachments stay strict: text over 256 KiB is refused
 with its size and the limit, since it must fit the prompt snapshot.
 
+## Server instructions
+
+The `instructions` text a server returns from `initialize` is added to the
+system prompt (section "MCP server instructions", also with deferred tool
+loading) as untrusted data: each server is cut at 2 KiB (visible
+`[instructions truncated at 2048 bytes]` notice), all servers together at 8 KiB
+(a notice counts the omitted ones), control characters are removed, the server
+name is reduced to `[A-Za-z0-9._-]`, and a server's own closing tag is
+neutralised so it cannot escape its block. The block states that it carries no
+system, user or approval authority and cannot change permissions. It is omitted
+when `--tools` restricts the tool set.
+
 ## MCP server mode (`--mcp-server`)
 
 `mini-agent --mcp-server [flags]` serves mini-agent itself to another agent or

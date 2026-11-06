@@ -1688,6 +1688,20 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             "Deferred MCP tool index",
         );
     }
+    #[cfg(feature = "mcp")]
+    if cli.tools.is_empty()
+        && let Some(manager) = mcp_manager
+    {
+        let section = manager.instructions_section();
+        if !section.is_empty() {
+            composition.text.push_str(&section);
+            record_part(
+                &mut composition.parts,
+                &composition.text,
+                "MCP server instructions",
+            );
+        }
+    }
     if let Some(instructions) = &instructions {
         let overlay = instructions.initial_overlay();
         if !overlay.is_empty()

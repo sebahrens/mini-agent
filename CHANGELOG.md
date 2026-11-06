@@ -8,6 +8,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- The `instructions` from each MCP server's `initialize` result are added to the system prompt as
+  bounded (2 KiB per server, 8 KiB total), fenced untrusted text with a truncation notice
+  (mini-agent-l6u7o).
 - `read_mcp_resource` continuation pages reuse the first read for two minutes (one server request,
   one permission decision) and show a `content_hash`; a changed resource is reported
   (mini-agent-0kbkd). `list_mcp_resources` continuation hints name `server=` so paging an unscoped
