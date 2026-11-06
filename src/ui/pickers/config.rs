@@ -289,6 +289,7 @@ mod tests {
                     | "task_cost_weights"
                     | "task_cost_overrides"
                     | "task_timeout_secs"
+                    | "task_evidence"
             );
             assert_eq!(
                 key.restart_required,

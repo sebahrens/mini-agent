@@ -12800,7 +12800,9 @@ mod replay_and_gate_attribution_tests {
     #[cfg(feature = "subagents")]
     #[test]
     fn history_count_cache_entries_hold_no_message() {
-        assert!(std::mem::size_of::<super::CacheEntry>() <= 24);
+        // Four u64 counters (hash, wide, narrow, image patch tokens); the
+        // entry must never grow to hold the message itself.
+        assert!(std::mem::size_of::<super::CacheEntry>() <= 32);
     }
 
     /// v98t: the skipped-gate turn must be recorded, not dropped. Reusing
