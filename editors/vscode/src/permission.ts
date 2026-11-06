@@ -1,5 +1,5 @@
 import type * as acp from '@agentclientprotocol/sdk';
-import { diffSummaryLines } from './toolcontent';
+import { diffSummaryLines, diffText } from './toolcontent';
 
 /** Upper bound for the input text rendered in the permission modal `detail`. */
 export const PERMISSION_DETAIL_LIMIT = 800;
@@ -52,7 +52,7 @@ function stringifyRawInput(rawInput: unknown): string | undefined {
 }
 
 /** Human-readable lines describing what the tool call is about to do. */
-export function toolCallInputLines(toolCall: acp.ToolCallUpdate): string[] {
+export function toolCallInputLines(toolCall: acp.ToolCallUpdate, full = false): string[] {
   const lines: string[] = [];
   for (const entry of toolCall.content ?? []) {
     switch (entry.type) {
@@ -64,7 +64,8 @@ export function toolCallInputLines(toolCall: acp.ToolCallUpdate): string[] {
         break;
       }
       case 'diff':
-        lines.push(`edit ${entry.path}`, ...diffSummaryLines(entry).slice(1));
+        // The modal detail gets the 12-row summary; the full view gets every row the server sent.
+        lines.push(`edit ${entry.path}`, ...(full ? diffText(entry).split('\n') : diffSummaryLines(entry)).slice(1));
         break;
       case 'terminal':
         lines.push(`terminal ${entry.terminalId}`);
@@ -83,7 +84,12 @@ export function toolCallInputLines(toolCall: acp.ToolCallUpdate): string[] {
 
 /** The complete input text of the tool call (what an allow authorises). */
 export function permissionInputText(request: acp.RequestPermissionRequest): string {
-  return toolCallInputLines(request.toolCall).join('\n');
+  return toolCallInputLines(request.toolCall, true).join('\n');
+}
+
+/** True when the agent itself marked a diff preview as truncated (the full view cannot show more). */
+function agentTruncatedDiff(toolCall: acp.ToolCallUpdate): boolean {
+  return (toolCall.content ?? []).some(entry => entry.type === 'diff' && Boolean(entry._meta?.['mini-agent-truncated']));
 }
 
 /** The allow-always session rule, if the server advertised one. */
@@ -98,8 +104,11 @@ export function permissionOmittedChars(
   limit: number = PERMISSION_DETAIL_LIMIT,
 ): number {
   const input = permissionInputText(request).trim();
+  // The modal shows the clipped summary (diffs are cut to a few rows), so measure against that.
+  const shown = Math.min(toolCallInputLines(request.toolCall).join('\n').trim().length, limit);
   const pattern = allowAlwaysPattern(request)?.trim() ?? '';
-  return Math.max(0, input.length - limit) + Math.max(0, pattern.length - limit);
+  const inputOmitted = Math.max(0, input.length - shown);
+  return Math.max(inputOmitted, agentTruncatedDiff(request.toolCall) ? 1 : 0) + Math.max(0, pattern.length - limit);
 }
 
 /** Text for the read-only full view: the whole input and the whole allow-always rule. */

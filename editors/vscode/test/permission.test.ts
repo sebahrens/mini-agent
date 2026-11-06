@@ -119,6 +119,34 @@ describe('buildPermissionDetail', () => {
     expect(permissionOmittedChars(serverRequest('ls'))).toBe(0);
   });
 
+  it('warns and lists every row when a 100-line diff is clipped to 12 rows in the modal', () => {
+    const newText = Array.from({ length: 100 }, (_, i) => `line ${i}`).join('\n');
+    const request = serverRequest('', {
+      content: [{ type: 'diff', path: '/repo/big.txt', oldText: null, newText }],
+    });
+    const detail = buildPermissionDetail(request);
+    expect(detail).toContain('more lines');
+    expect(detail).not.toContain('line 50');
+    expect(permissionOmittedChars(request)).toBeGreaterThan(0);
+    expect(detail).toContain('WARNING');
+    expect(detail).toContain('Show full command');
+    const full = permissionFullText(request);
+    expect(full).toContain('+line 0');
+    expect(full).toContain('+line 99');
+  });
+
+  it('flags an agent-truncated diff even when it is short, and a small diff stays unflagged', () => {
+    const truncated = serverRequest('', {
+      content: [{ type: 'diff', path: '/repo/a.txt', oldText: 'a', newText: 'b', _meta: { 'mini-agent-truncated': true } }],
+    });
+    expect(permissionOmittedChars(truncated)).toBeGreaterThan(0);
+    expect(permissionFullText(truncated)).toContain('truncated by the agent');
+    const small = serverRequest('', {
+      content: [{ type: 'diff', path: '/repo/a.txt', oldText: 'a', newText: 'b' }],
+    });
+    expect(permissionOmittedChars(small)).toBe(0);
+  });
+
   it('names the session rule when the server provides one', () => {
     const request = serverRequest('npm test');
     request.options = options.map(option => option.kind === 'allow_always'
