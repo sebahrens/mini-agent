@@ -171,7 +171,21 @@ the current ceilings.
 - **Multiple prompts or briefs**: up to `task_max_concurrency` subagents run at once.
   Each result appears under a `## Task N:` heading in original prompt order.
 - The complete request is rejected before permission checking or execution if
-  it is empty, contains a blank prompt, or exceeds `task_max_prompts`.
+  it is empty, contains a blank prompt, exceeds `task_max_prompts`, or has a
+  prompt longer than 64 KiB (`MAX_BRIEF_BYTES`, the same bound as a rendered
+  brief); the error says to put bulk content in a file and name it, or to
+  split the work.
+
+Display-only bounds (none of them changes what a child receives; source
+constants in `task_tool.rs` and `background.rs`):
+
+| What | Bound | Marker |
+|---|---|---|
+| `## Task N:` heading label | 60 characters of the whitespace-collapsed prompt (`task_heading`) | `…` when shortened |
+| Foreground `/tasks` label | 200 characters, then 60 bytes | `...` |
+| Tool log per child | 24 rows (`MAX_TOOL_LOG_ENTRIES`), names 48 / arguments 100 / errors 80 bytes | `...` per field, `... N more tool calls not logged` |
+| Children with details per task | 8 (`MAX_DETAIL_CHILDREN`) | later children have no `/tasks` detail |
+| Foreground calls kept for `/tasks` | 8 most recent (`MAX_RECENT_FOREGROUND`) | oldest dropped |
 
 ### Resuming a child (`resume`)
 
@@ -1456,8 +1470,8 @@ defaults to 32 KiB and is bounded by the aggregate limit, while
 entire rendered tool result, including headings and status markers.
 Scheduling charges completed responses with their quotation prefixes and host
 markers, plus any specialist notice, before starting queued work. Task labels
-collapse prompt whitespace into a single line and keep at most 60 characters;
-the full execution prompt is preserved.
+collapse prompt whitespace into a single line and keep at most 60 characters,
+ending with `…` when shortened; the full execution prompt is preserved.
 
 Children report their nested tool calls on the parent run's event channel.
 Runs started while delegation is installed use a 512-slot channel instead of

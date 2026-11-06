@@ -43,6 +43,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   are refused and the message grants no permission.
 - When a child's 4 MiB history image ceiling omits images, its report now carries an explicit host
   note; the fixed subagent image limits and their source constants are documented.
+- `task` rejects a prompt over 64 KiB up front with an actionable error (matching the brief
+  limit), shortened `## Task N:` labels end with `…`, and the display-only `/tasks` bounds are
+  documented.
 
 **Fork release 1.14.2 (2026-10-28)**
 

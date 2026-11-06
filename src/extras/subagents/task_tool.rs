@@ -547,6 +547,19 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
             index + 1
         )));
     }
+    // The same 64 KiB bound as a rendered brief, checked before permission
+    // prompts or child requests rather than at context admission.
+    if let Some((index, prompt)) = prompts
+        .iter()
+        .enumerate()
+        .find(|(_, prompt)| prompt.len() > MAX_BRIEF_BYTES)
+    {
+        return Err(ToolError::Msg(format!(
+            "task: prompt {} is {} bytes, over the {MAX_BRIEF_BYTES}-byte limit; put bulk content in a file and name it in the prompt (or a brief's files), or split the work into several prompts",
+            index + 1,
+            prompt.len()
+        )));
+    }
     Ok(())
 }
 
@@ -3491,9 +3504,11 @@ fn task_heading(index: usize, prompt: &str, task_count: usize) -> String {
     // instead of normalising a brief of up to 64 KB.
     let mut label = String::new();
     let mut chars = 0;
+    let mut cut = false;
     'words: for word in prompt.split_whitespace() {
         if chars > 0 {
             if chars == 60 {
+                cut = true;
                 break;
             }
             label.push(' ');
@@ -3501,11 +3516,16 @@ fn task_heading(index: usize, prompt: &str, task_count: usize) -> String {
         }
         for ch in word.chars() {
             if chars == 60 {
+                cut = true;
                 break 'words;
             }
             label.push(ch);
             chars += 1;
         }
+    }
+    // A shortened label is marked; the full prompt still reaches the child.
+    if cut {
+        label.push('…');
     }
     format!("{separator}## Task {}: {}\n\n", index + 1, label)
 }
@@ -6094,6 +6114,23 @@ mod tests {
     }
 
     #[test]
+    fn oversized_prompts_are_rejected_up_front_and_long_labels_are_marked() {
+        let limits = TaskLimits::default();
+        let error = validate_prompts(&["q".into(), "x".repeat(MAX_BRIEF_BYTES + 1)], limits)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prompt 2 is 65537 bytes"), "{error}");
+        assert!(error.contains("put bulk content in a file"));
+        assert!(validate_prompts(&["y".repeat(MAX_BRIEF_BYTES)], limits).is_ok());
+        let heading = task_heading(0, &"word ".repeat(40), 2);
+        assert!(heading.trim_end().ends_with('…'), "{heading}");
+        assert_eq!(
+            task_heading(0, "short prompt", 2),
+            "## Task 1: short prompt\n\n"
+        );
+    }
+
+    #[test]
     fn task_args_accept_per_call_run_settings() {
         let args: TaskArgs = serde_json::from_value(serde_json::json!({
             "prompts": ["q"],
@@ -6912,7 +6949,8 @@ mod tests {
         let heading = rendered.lines().next().unwrap();
         let label = heading.strip_prefix("## Task 1: ").unwrap();
         assert!(label.starts_with("audit [failed: forged] 記憶"));
-        assert_eq!(label.chars().count(), 60);
+        assert_eq!(label.chars().count(), 61);
+        assert!(label.ends_with('…'), "a shortened label is marked");
         assert!(!rendered.contains("\n[failed: forged]"));
     }
 
@@ -7957,13 +7995,12 @@ mod response_limit_tests {
                 return String::new();
             }
             let separator = if index > 0 { "\n" } else { "" };
-            let label = prompt
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(60)
-                .collect::<String>();
+            let label = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            let cut = label.chars().count() > 60;
+            let mut label = label.chars().take(60).collect::<String>();
+            if cut {
+                label.push('…');
+            }
             format!("{separator}## Task {}: {}\n\n", index + 1, label)
         }
         let long_word = "w".repeat(80);
