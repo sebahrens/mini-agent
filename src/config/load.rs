@@ -67,6 +67,11 @@ pub(super) const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "subagent_max_read_lines",
     "temperature",
     "tool_output",
+    // Spill bounds only change how much of a result stays inline; the full
+    // output is always kept in the private spill file.
+    "tool_result_spill_chars",
+    "tool_result_spill_head_chars",
+    "tool_result_spill_tail_chars",
     // Masks only hide more of HOME from contained commands, and project
     // layers can only add to the list (see `merge_config_value_layer`).
     "sandbox-home-masks",

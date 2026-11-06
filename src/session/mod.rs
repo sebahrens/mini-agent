@@ -26,6 +26,86 @@ pub const TOOL_RESULT_SAVE_THRESHOLD: usize = 12_000;
 pub const TOOL_RESULT_HEAD_CHARS: usize = 2_000;
 pub const TOOL_RESULT_TAIL_CHARS: usize = 8_000;
 
+/// Generic spill bound for textual tool results that do not bound
+/// themselves (mini-agent-bjiqr): results over `threshold` characters keep
+/// `head` + `tail` characters inline and spill the rest. The defaults
+/// ([`Default`]) are the historical 12,000 / 2,000 / 8,000.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolResultSpillLimits {
+    pub threshold: usize,
+    pub head: usize,
+    pub tail: usize,
+}
+
+impl Default for ToolResultSpillLimits {
+    fn default() -> Self {
+        Self {
+            threshold: TOOL_RESULT_SAVE_THRESHOLD,
+            head: TOOL_RESULT_HEAD_CHARS,
+            tail: TOOL_RESULT_TAIL_CHARS,
+        }
+    }
+}
+
+impl ToolResultSpillLimits {
+    /// Smallest accepted threshold; smaller values are raised to it.
+    pub const MIN_THRESHOLD: usize = 1_000;
+    /// Largest accepted threshold (characters).
+    pub const MAX_THRESHOLD: usize = 1_000_000;
+    /// Upper bound of the window-scaled default threshold.
+    pub const MAX_SCALED_THRESHOLD: usize = 50_000;
+
+    /// Default limits for a context window: a tenth of the window in
+    /// characters (about a fortieth of it in tokens), never below the
+    /// historical 12,000 nor above 50,000; head and tail keep the historical
+    /// 1:4 split of five sixths of the threshold.
+    pub fn for_window(context_window: u64) -> Self {
+        let scaled = usize::try_from(context_window / 10).unwrap_or(usize::MAX);
+        let threshold = scaled.clamp(TOOL_RESULT_SAVE_THRESHOLD, Self::MAX_SCALED_THRESHOLD);
+        Self::proportional(threshold)
+    }
+
+    fn proportional(threshold: usize) -> Self {
+        Self {
+            threshold,
+            head: threshold / 6,
+            tail: threshold * 2 / 3,
+        }
+    }
+
+    /// Apply explicit overrides. The threshold is clamped to
+    /// `[MIN_THRESHOLD, MAX_THRESHOLD]`; an explicit head or tail keeps its
+    /// value, and when head + tail would not stay below the threshold both
+    /// are scaled back to the proportional split, so truncation always
+    /// shortens the result.
+    pub fn with_overrides(
+        self,
+        threshold: Option<u64>,
+        head: Option<u64>,
+        tail: Option<u64>,
+    ) -> Self {
+        let as_usize = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+        let mut limits = match threshold {
+            Some(threshold) => Self::proportional(
+                as_usize(threshold).clamp(Self::MIN_THRESHOLD, Self::MAX_THRESHOLD),
+            ),
+            None => self,
+        };
+        if let Some(head) = head {
+            limits.head = as_usize(head);
+        }
+        if let Some(tail) = tail {
+            limits.tail = as_usize(tail);
+        }
+        if limits.head.saturating_add(limits.tail) >= limits.threshold {
+            let fallback = Self::proportional(limits.threshold);
+            limits.head = fallback.head;
+            limits.tail = fallback.tail;
+        }
+        limits
+    }
+}
+
 /// These built-ins enforce their own documented line, byte, or result caps.
 /// Applying the generic spill cap again would lose their continuation contract.
 /// `task` renders its reports within `task_max_report_bytes` per child and
@@ -2884,24 +2964,74 @@ fn format_truncated_tool_output_with_notice(
     output_chars: usize,
     notice: &str,
 ) -> String {
+    format_truncated_tool_output_with_limits(
+        ToolResultSpillLimits::default(),
+        output,
+        output_chars,
+        notice,
+    )
+}
+
+/// As [`format_truncated_tool_output`], keeping `limits.head` and
+/// `limits.tail` characters.
+pub(crate) fn format_spilled_tool_output_with(
+    limits: ToolResultSpillLimits,
+    output: &str,
+    output_chars: usize,
+    path: &Path,
+) -> String {
+    format_truncated_tool_output_with_limits(
+        limits,
+        output,
+        output_chars,
+        &format!(
+            "[full output saved to: {}; use the read tool on this path to inspect the complete output; use offset/limit for lines or character_offset/character_limit inside long lines]",
+            path.display()
+        ),
+    )
+}
+
+/// As [`format_unpersisted_truncated_tool_output`] with explicit limits.
+pub(crate) fn format_unpersisted_tool_output_with(
+    limits: ToolResultSpillLimits,
+    output: &str,
+    output_chars: usize,
+    error: &str,
+) -> String {
+    format_truncated_tool_output_with_limits(
+        limits,
+        output,
+        output_chars,
+        &format!("[full output could not be saved: {error}]"),
+    )
+}
+
+fn format_truncated_tool_output_with_limits(
+    limits: ToolResultSpillLimits,
+    output: &str,
+    output_chars: usize,
+    notice: &str,
+) -> String {
     // Byte offsets found from each end, so only the kept head and tail are
     // walked and the omitted middle is never scanned or copied.
     let head_end = output
         .char_indices()
-        .nth(TOOL_RESULT_HEAD_CHARS)
+        .nth(limits.head)
         .map_or(output.len(), |(index, _)| index);
-    let tail_begin = if output_chars <= TOOL_RESULT_TAIL_CHARS {
+    let tail_begin = if limits.tail == 0 {
+        output.len()
+    } else if output_chars <= limits.tail {
         0
     } else {
         output
             .char_indices()
             .rev()
-            .nth(TOOL_RESULT_TAIL_CHARS - 1)
+            .nth(limits.tail - 1)
             .map_or(0, |(index, _)| index)
     };
     let head = &output[..head_end];
-    let tail = &output[tail_begin..];
-    let omitted = output_chars.saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
+    let tail = &output[tail_begin.max(head_end)..];
+    let omitted = output_chars.saturating_sub(limits.head + limits.tail);
 
     format!(
         "{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n{notice}\n\n{tail}"

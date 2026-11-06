@@ -76,6 +76,7 @@ impl Drop for UncommittedToolResultSpill {
 pub(crate) struct ToolResultSpillHook {
     session_id: CompactString,
     spills: Option<crate::session::ToolResultSpillStore>,
+    limits: crate::session::ToolResultSpillLimits,
 }
 
 impl ToolResultSpillHook {
@@ -86,7 +87,14 @@ impl ToolResultSpillHook {
         Self {
             session_id: session_id.into(),
             spills,
+            limits: Default::default(),
         }
+    }
+
+    /// Spill at configured limits instead of the historical defaults.
+    pub(crate) fn with_limits(mut self, limits: crate::session::ToolResultSpillLimits) -> Self {
+        self.limits = limits;
+        self
     }
 }
 
@@ -105,8 +113,9 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
 
         // Cheap checks first: self-bounded tools and byte lengths under the
         // threshold (bytes >= chars) never need the UTF-8 char walk.
+        let limits = self.limits;
         if crate::session::tool_result_is_self_bounded(tool_name)
-            || result.len() <= crate::session::TOOL_RESULT_SAVE_THRESHOLD
+            || result.len() <= limits.threshold
         {
             return Flow::cont();
         }
@@ -130,7 +139,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
             return Flow::cont();
         }
         let output_chars = result.chars().count();
-        if output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
+        if output_chars <= limits.threshold {
             return Flow::cont();
         }
 
@@ -150,7 +159,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
 
         match saved {
             Ok(Ok(spill)) => {
-                let bounded = crate::session::format_truncated_tool_output(
+                let bounded = crate::session::format_spilled_tool_output_with(
+                    limits,
                     &output,
                     output_chars,
                     spill.path(),
@@ -174,7 +184,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
                     %error,
                     "failed to persist oversized live tool result"
                 );
-                Flow::rewrite_result(crate::session::format_unpersisted_truncated_tool_output(
+                Flow::rewrite_result(crate::session::format_unpersisted_tool_output_with(
+                    limits,
                     &output,
                     output_chars,
                     &error.to_string(),
@@ -187,7 +198,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
                     %error,
                     "tool-result spill worker failed"
                 );
-                Flow::rewrite_result(crate::session::format_unpersisted_truncated_tool_output(
+                Flow::rewrite_result(crate::session::format_unpersisted_tool_output_with(
+                    limits,
                     &output,
                     output_chars,
                     "the spill worker failed",
@@ -7299,6 +7311,102 @@ mod tests {
             })
             .expect("the next request must contain the tool result");
         assert_eq!(live_output, "é".repeat(6_000));
+    }
+
+    async fn live_tool_output_with_limits(
+        limits: Option<crate::session::ToolResultSpillLimits>,
+    ) -> String {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "mini-agent-live-spill-limits-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("MINI_AGENT_DATA_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_CONFIG_DIR", Some(root.clone().into_os_string())),
+            ("MINI_AGENT_STATE_DIR", Some(root.clone().into_os_string())),
+        ]);
+        let session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("limits-id", OversizedTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let mut hook =
+            ToolResultSpillHook::new(session.id.clone(), Some(session.tool_result_spills.clone()));
+        if let Some(limits) = limits {
+            hook = hook.with_limits(limits);
+        }
+        let agent = AgentBuilder::new(model.clone())
+            .tool(OversizedTool)
+            .add_hook(hook)
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        while stream.next().await.is_some() {}
+        let requests = model.requests();
+        let output = requests[1]
+            .chat_history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|content| match content {
+                    UserContent::ToolResult(result) => {
+                        result.content.iter().find_map(|content| match content {
+                            ToolResultContent::Text(text) => Some(text.text.clone()),
+                            ToolResultContent::Image(_) => None,
+                        })
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the next request contains the tool result");
+        let _ = std::fs::remove_dir_all(&root);
+        output
+    }
+
+    // mini-agent-bjiqr: configured spill limits change what stays inline.
+    #[tokio::test]
+    async fn configured_spill_limits_raise_and_lower_the_generic_bound() {
+        let full_chars = crate::session::TOOL_RESULT_HEAD_CHARS
+            + crate::session::TOOL_RESULT_SAVE_THRESHOLD
+            + crate::session::TOOL_RESULT_TAIL_CHARS;
+        let raised = crate::config::Config {
+            tool_result_spill_chars: Some(30_000),
+            ..Default::default()
+        }
+        .resolve_tool_result_spill_limits(128_000);
+        let inline = live_tool_output_with_limits(Some(raised)).await;
+        assert_eq!(
+            inline.chars().count(),
+            full_chars,
+            "raised bound keeps it inline"
+        );
+        assert!(!inline.contains("[tool output truncated:"));
+
+        let lowered = crate::config::Config {
+            tool_result_spill_chars: Some(4_000),
+            tool_result_spill_head_chars: Some(500),
+            tool_result_spill_tail_chars: Some(1_000),
+            ..Default::default()
+        }
+        .resolve_tool_result_spill_limits(128_000);
+        let bounded = live_tool_output_with_limits(Some(lowered)).await;
+        assert!(bounded.contains("[tool output truncated:"));
+        assert!(bounded.starts_with(&format!("{}\n", "H".repeat(500))));
+        assert!(bounded.ends_with(&format!("\n{}", "T".repeat(1_000))));
+        assert!(bounded.chars().count() < 4_000);
+
+        let default = live_tool_output_with_limits(None).await;
+        assert!(default.starts_with(&"H".repeat(crate::session::TOOL_RESULT_HEAD_CHARS)));
+        assert!(default.contains("[tool output truncated:"));
     }
 
     #[tokio::test]

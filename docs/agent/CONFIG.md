@@ -742,6 +742,9 @@ Accepted top-level keys:
 | `subagent_max_list_dir_entries` | integer | Optional per-subagent directory-entry cap; requires `subagents`. |
 | `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section while its prior result remains in the current conversation. The section's served-content CRC joins file length and modification time in the version key, so same-length or mtime-preserving edits remain readable. Editing or writing the target, compaction, failed-turn rollback, clear, undo/rewind, and redo reset the relevant session tracker. Ordinary agent rebuilds retain it; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
 | `show_cost_always`        | boolean | Show the session cost in the status bar even when it is `$0.0000` (for example when the model has no per-token pricing configured). Default: `false`, which hides the cost until it is above zero. |
+| `tool_result_spill_chars` | integer | Generic spill threshold, in characters, for tool results without their own documented bound (MCP, git, docs, memory, ...). Default: `context_window / 10` clamped to `12000`–`50000`. Explicit values are clamped to `1000`–`1000000`. |
+| `tool_result_spill_head_chars` | integer | Characters of a spilled result kept from its start. Default: a sixth of the threshold. If head + tail would not stay below the threshold, both fall back to the default split. |
+| `tool_result_spill_tail_chars` | integer | Characters of a spilled result kept from its end. Default: two thirds of the threshold. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, headless context relief, and mid-turn compaction). Default: `true`. An explicit `false` is honored: nothing is ever compacted automatically.            |
 | `claude_project_agents`   | boolean | Read project `.claude/agents/*.md` as specialist definitions (Claude Code compatibility). `false` makes mini-agent ignore that layer entirely (no loading, no validation warnings), leaving `.mini-agent/agents`, the user-global and the built-in definitions. Default: `true`. Restart required. |
 | `mid_turn_compact_threshold` | number | Mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Default when unset: `0.9`; `0` disables mid-turn compaction. Honored only when `compact_enabled` is `true`. See Mid-turn compaction below.            |
@@ -1336,9 +1339,13 @@ limits in both live and replayed history. Their
 continuation hints remain intact, and a completed read window remains available
 when repeated-read protection asks the model to reuse it. Other textual tool
 results, including MCP results, are independently bounded before Rig commits
-them to the live conversation: results over 12,000 characters are written to
-the private tool-output directory and replaced with a 2,000-character head,
-an omission/path notice, and an 8,000-character tail. The `read` tool can open
+them to the live conversation: results over `tool_result_spill_chars`
+characters are written to the private tool-output directory and replaced with a
+head, an omission/path notice, and a tail. The defaults scale with the model's
+context window: `context_window / 10` characters (about a fortieth of the window
+in tokens), clamped to 12,000–50,000, keeping a sixth of it as head and two thirds
+as tail (12,000 / 2,000 / 8,000 for windows up to 120k; 50,000 / 8,333 / 33,333
+for a 1M window). `task` children use their own child window. The `read` tool can open
 immediate spill files for the active session without an approval prompt. Use line
 `offset`/`limit`, or `character_offset`/`character_limit` for a range inside a huge
 single line. Character offsets count Unicode scalar values from 1, not UTF-8 bytes;
@@ -2596,9 +2603,12 @@ blocks are joined with newlines; images and binary resources are shown as
 placeholders rather than inlined base64, and host permission notes appear
 outside the `[mcp output begins]` fence that marks server text. Text and
 embedded resource text from one result share the same model-facing bound as
-ordinary tool output: results over 12,000 characters are stored in the private
-tool-output directory and replaced with a 2,000-character head, an omission
-notice with the spill-file path, and an 8,000-character tail. If private
+ordinary tool output: results over `tool_result_spill_chars` characters (default:
+`context_window / 10`, clamped to 12,000–50,000, using `context_window` or 128k for
+MCP connections) are stored in the private tool-output directory and replaced with
+a head (`tool_result_spill_head_chars`, default a sixth of the threshold), an
+omission notice with the spill-file path, and a tail
+(`tool_result_spill_tail_chars`, default two thirds of the threshold). If private
 storage is unavailable, the bounded head/tail view remains available and tells
 the model to retry with a narrower request.
 

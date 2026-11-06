@@ -26,6 +26,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Ollama requests now send the session's context window as `options.num_ctx` (an explicit
   `extra_body` `num_ctx` wins), and startup caps the window to the model's context length from
   `/api/show`, so the server no longer silently truncates at its small default (mini-agent-djwve).
+- The generic tool-result spill bound (MCP and other tools without their own limit) is now
+  configurable with `tool_result_spill_chars`, `tool_result_spill_head_chars` and
+  `tool_result_spill_tail_chars`, and by default scales with the context window
+  (`window / 10` characters, 12,000–50,000) instead of a fixed 12,000 (mini-agent-bjiqr).
 
 ### Security
 

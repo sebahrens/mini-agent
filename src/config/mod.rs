@@ -749,6 +749,17 @@ pub struct Config {
     #[cfg(feature = "advisor")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advisor: Option<types::AdvisorConfig>,
+    /// Generic tool-result spill threshold in characters for tools without
+    /// their own output bound (MCP, git, docs, ...). Unset scales with the
+    /// context window (mini-agent-bjiqr).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_spill_chars: Option<u64>,
+    /// Characters kept from the start of a spilled tool result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_spill_head_chars: Option<u64>,
+    /// Characters kept from the end of a spilled tool result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_spill_tail_chars: Option<u64>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///
@@ -1145,6 +1156,21 @@ impl Config {
             Some(t) if t > 0.0 && t <= 1.0 => Some(t),
             _ => None,
         }
+    }
+
+    /// Generic tool-result spill limits for a context window: explicit
+    /// `tool_result_spill_*` keys over [`ToolResultSpillLimits::for_window`].
+    ///
+    /// [`ToolResultSpillLimits::for_window`]: crate::session::ToolResultSpillLimits::for_window
+    pub fn resolve_tool_result_spill_limits(
+        &self,
+        context_window: u64,
+    ) -> crate::session::ToolResultSpillLimits {
+        crate::session::ToolResultSpillLimits::for_window(context_window).with_overrides(
+            self.tool_result_spill_chars,
+            self.tool_result_spill_head_chars,
+            self.tool_result_spill_tail_chars,
+        )
     }
 
     pub fn resolve_max_read_lines(&self) -> u64 {

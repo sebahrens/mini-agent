@@ -126,6 +126,7 @@ pub struct McpClientManager {
     /// manager. MCP calls do not own a durable mini-agent Session, so their
     /// oversized result artifacts use a process-manager scope instead.
     spill_scope: CompactString,
+    spill_limits: crate::session::ToolResultSpillLimits,
     health: health::Health,
     origins: std::collections::BTreeMap<String, Vec<project::ServerOrigin>>,
     origins_omitted: bool,
@@ -150,6 +151,7 @@ impl McpClientManager {
             notices: Vec::new(),
             tool_notices: Mutex::new(ToolNoticeState::default()),
             spill_scope: CompactString::new(uuid::Uuid::new_v4().to_string()),
+            spill_limits: Default::default(),
             health,
             origins: Default::default(),
             origins_omitted: false,
@@ -188,6 +190,10 @@ impl McpClientManager {
     }
     pub(crate) fn capture_config(&mut self, cfg: &crate::config::Config) {
         self.configured_count = Some(cfg.mcp_servers.as_ref().map_or(0, HashMap::len));
+        // MCP connections outlive model switches, so their bound scales with
+        // the configured window (or the 128k default) rather than a model's.
+        self.spill_limits =
+            cfg.resolve_tool_result_spill_limits(cfg.context_window.unwrap_or(128_000));
         self.capture_origins(&cfg.mcp_origins);
     }
     /// Diagnostic-only source catalogue. It is never consulted for grants,
@@ -565,6 +571,7 @@ impl McpClientManager {
                             ask_tx: ask_tx.clone(),
                             call_timeout: timeouts.call,
                             spill_scope: self.spill_scope.clone(),
+                            spill_limits: self.spill_limits,
                         });
                     }
                     if reached_tool_cap {

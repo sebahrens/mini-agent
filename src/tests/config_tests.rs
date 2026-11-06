@@ -1623,3 +1623,59 @@ fn quick_model_context_window_applies_to_main_session_and_subagents() {
         None
     );
 }
+
+// mini-agent-bjiqr: the generic spill bound scales with the window and
+// explicit keys override it, always leaving head + tail below the threshold.
+#[test]
+fn tool_result_spill_limits_scale_with_window_and_accept_overrides() {
+    use crate::session::ToolResultSpillLimits;
+    let defaults = Config::default();
+    assert_eq!(
+        defaults.resolve_tool_result_spill_limits(32_000),
+        ToolResultSpillLimits {
+            threshold: 12_000,
+            head: 2_000,
+            tail: 8_000
+        }
+    );
+    assert_eq!(
+        defaults.resolve_tool_result_spill_limits(200_000).threshold,
+        20_000
+    );
+    assert_eq!(
+        defaults.resolve_tool_result_spill_limits(1_000_000),
+        ToolResultSpillLimits {
+            threshold: 50_000,
+            head: 8_333,
+            tail: 33_333
+        }
+    );
+    let explicit = Config {
+        tool_result_spill_chars: Some(30_000),
+        tool_result_spill_head_chars: Some(20_000),
+        ..Config::default()
+    };
+    let limits = explicit.resolve_tool_result_spill_limits(1_000_000);
+    assert_eq!(limits.threshold, 30_000);
+    assert!(limits.head + limits.tail < limits.threshold, "{limits:?}");
+    let tiny = Config {
+        tool_result_spill_chars: Some(10),
+        ..Config::default()
+    };
+    assert_eq!(
+        tiny.resolve_tool_result_spill_limits(128_000).threshold,
+        ToolResultSpillLimits::MIN_THRESHOLD
+    );
+    let yaml: Config = serde_yaml_ng::from_str(
+        "tool_result_spill_chars: 40000\ntool_result_spill_head_chars: 10000\ntool_result_spill_tail_chars: 20000\n",
+    )
+    .unwrap();
+    assert_eq!(
+        yaml.resolve_tool_result_spill_limits(128_000),
+        ToolResultSpillLimits {
+            threshold: 40_000,
+            head: 10_000,
+            tail: 20_000
+        }
+    );
+}

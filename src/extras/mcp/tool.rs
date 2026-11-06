@@ -51,6 +51,8 @@ pub struct McpTool {
     pub call_timeout: Duration,
     /// Opaque private-storage owner for oversized MCP results.
     pub(super) spill_scope: CompactString,
+    /// Inline bound for oversized results (`tool_result_spill_*`).
+    pub(super) spill_limits: crate::session::ToolResultSpillLimits,
 }
 
 impl McpTool {
@@ -104,8 +106,13 @@ fn parse_arguments(args: &str) -> Result<Option<JsonObject>, McpToolError> {
     })
 }
 
-fn bounded_mcp_output(output: &str, spill_scope: &str, tool_name: &str) -> String {
-    bounded_mcp_output_after(String::new(), output, spill_scope, tool_name)
+fn bounded_mcp_output(
+    output: &str,
+    limits: crate::session::ToolResultSpillLimits,
+    spill_scope: &str,
+    tool_name: &str,
+) -> String {
+    bounded_mcp_output_after(String::new(), output, limits, spill_scope, tool_name)
 }
 
 /// `bounded_mcp_output` rendered after `head` (trusted host text that stays
@@ -113,10 +120,11 @@ fn bounded_mcp_output(output: &str, spill_scope: &str, tool_name: &str) -> Strin
 fn bounded_mcp_output_after(
     head: String,
     output: &str,
+    limits: crate::session::ToolResultSpillLimits,
     spill_scope: &str,
     tool_name: &str,
 ) -> String {
-    bounded_mcp_output_with_after(head, output, |full_output| {
+    bounded_mcp_output_with_after(head, output, limits, |full_output| {
         crate::session::storage::save_tool_output(spill_scope, tool_name, full_output)
     })
 }
@@ -126,26 +134,27 @@ fn bounded_mcp_output_with(
     output: &str,
     save: impl FnOnce(&str) -> anyhow::Result<PathBuf>,
 ) -> String {
-    bounded_mcp_output_with_after(String::new(), output, save)
+    bounded_mcp_output_with_after(String::new(), output, Default::default(), save)
 }
 
 fn bounded_mcp_output_with_after(
     head: String,
     output: &str,
+    limits: crate::session::ToolResultSpillLimits,
     save: impl FnOnce(&str) -> anyhow::Result<PathBuf>,
 ) -> String {
     // Bytes bound characters from above, so only a long result is counted.
-    if output.len() <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
+    if output.len() <= limits.threshold {
         return delimit_mcp_body_after(head, output, None);
     }
     let output_chars = output.chars().count();
-    if output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
+    if output_chars <= limits.threshold {
         return delimit_mcp_body_after(head, output, None);
     }
 
     match save(output) {
         Ok(path) => {
-            let (body, omitted) = truncated_mcp_body(output, output_chars);
+            let (body, omitted) = truncated_mcp_body(output, output_chars, limits);
             delimit_mcp_body_after(
                 head,
                 &body,
@@ -157,21 +166,22 @@ fn bounded_mcp_output_with_after(
         }
         Err(error) => {
             tracing::debug!(%error, "failed to spill oversized MCP tool result");
-            format_unsaved_mcp_output(head, output, output_chars, &error.to_string())
+            format_unsaved_mcp_output(head, output, output_chars, limits, &error.to_string())
         }
     }
 }
 
-fn truncated_mcp_body(output: &str, output_chars: usize) -> (String, usize) {
-    let head: String = output
-        .chars()
-        .take(crate::session::TOOL_RESULT_HEAD_CHARS)
-        .collect();
-    let tail_start = output_chars.saturating_sub(crate::session::TOOL_RESULT_TAIL_CHARS);
+fn truncated_mcp_body(
+    output: &str,
+    output_chars: usize,
+    limits: crate::session::ToolResultSpillLimits,
+) -> (String, usize) {
+    let head: String = output.chars().take(limits.head).collect();
+    let tail_start = output_chars
+        .saturating_sub(limits.tail)
+        .max(limits.head.min(output_chars));
     let tail: String = output.chars().skip(tail_start).collect();
-    let omitted = output_chars.saturating_sub(
-        crate::session::TOOL_RESULT_HEAD_CHARS + crate::session::TOOL_RESULT_TAIL_CHARS,
-    );
+    let omitted = output_chars.saturating_sub(limits.head + limits.tail);
     (format!("{head}\n…\n{tail}"), omitted)
 }
 
@@ -202,9 +212,10 @@ fn format_unsaved_mcp_output(
     head: String,
     output: &str,
     output_chars: usize,
+    limits: crate::session::ToolResultSpillLimits,
     error: &str,
 ) -> String {
-    let (body, omitted) = truncated_mcp_body(output, output_chars);
+    let (body, omitted) = truncated_mcp_body(output, output_chars, limits);
     let diagnostic = error
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -242,6 +253,7 @@ impl ToolDyn for McpTool {
         let ask_tx = self.ask_tx.clone();
         let call_timeout = self.call_timeout;
         let spill_scope = self.spill_scope.clone();
+        let spill_limits = self.spill_limits;
         let source_proof = self.source_proof.clone();
         let client_is_live = self.client_is_live.clone();
         let elicitation = self.elicitation.clone();
@@ -348,6 +360,7 @@ impl ToolDyn for McpTool {
                 } else {
                     bounded_mcp_output(
                         &error_msg,
+                        spill_limits,
                         &spill_scope,
                         &format!("mcp:{server_name}:{tool_name}:error"),
                     )
@@ -371,6 +384,7 @@ impl ToolDyn for McpTool {
                     bounded_mcp_output_after(
                         head,
                         response,
+                        spill_limits,
                         &spill_scope,
                         &format!("mcp:{server_name}:{tool_name}"),
                     )
@@ -965,13 +979,18 @@ mod tests {
                 vec![text_block(&text), image_block(&data)],
                 None,
                 |response| {
-                    bounded_mcp_output_with_after("host coaching\n\n".into(), response, |saved| {
-                        assert_eq!(saved, text);
-                        if fail_save {
-                            anyhow::bail!("disk full");
-                        }
-                        Ok(PathBuf::from("/private/mcp-output.txt"))
-                    })
+                    bounded_mcp_output_with_after(
+                        "host coaching\n\n".into(),
+                        response,
+                        Default::default(),
+                        |saved| {
+                            assert_eq!(saved, text);
+                            if fail_save {
+                                anyhow::bail!("disk full");
+                            }
+                            Ok(PathBuf::from("/private/mcp-output.txt"))
+                        },
+                    )
                 },
             );
             let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
