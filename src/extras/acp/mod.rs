@@ -7,6 +7,7 @@ mod persona;
 mod policy;
 mod sessions;
 mod tls;
+mod toolcall;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -3483,9 +3484,14 @@ async fn drive_permission_bridge(
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         );
-        let content = vec![ToolCallContent::from(ContentBlock::Text(TextContent::new(
+        let recalled = ask.tool_call_id.as_deref().and_then(toolcall::recall_args);
+        let mut content = recalled
+            .as_ref()
+            .map(|args| toolcall::pending_diffs(&ask.tool, args))
+            .unwrap_or_default();
+        content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
             ask.input.clone(),
-        )))];
+        ))));
         if synthetic_tool_call_id {
             let announced = ToolCall::new(tool_call_id.clone(), title.clone())
                 .content(content.clone())
@@ -3501,7 +3507,10 @@ async fn drive_permission_bridge(
         }
         let tool_call = ToolCallUpdate::new(
             tool_call_id.clone(),
-            ToolCallUpdateFields::new().title(title).content(content),
+            ToolCallUpdateFields::new()
+                .title(title)
+                .kind(toolcall::kind_for(&ask.tool))
+                .content(content),
         );
         let mut options = vec![
             PermissionOption::new(
@@ -5264,6 +5273,7 @@ async fn relay_prompt_events(
     #[cfg(feature = "goal")]
     let mut usage = rig::completion::Usage::default();
     let mut pending_text = PendingText::default();
+    let mut mutation_diffs: HashMap<String, ToolCallContent> = HashMap::new();
     loop {
         let event = tokio::select! {
             biased;
@@ -5303,14 +5313,29 @@ async fn relay_prompt_events(
                 pending_text.push(TextKind::Thought, &text, &session_id, &cx);
             }
             AgentEvent::ToolCall { id, name, args } => {
+                toolcall::remember_args(&id, &name, &args);
                 let id = ToolCallId::new(id.to_string());
-                let tool_call = ToolCall::new(id.clone(), name.to_string()).raw_input(Some(args));
+                let tool_call = ToolCall::new(id.clone(), toolcall::title_for(&name, &args))
+                    .kind(toolcall::kind_for(&name))
+                    .locations(toolcall::locations_for(&name, &args))
+                    .raw_input(Some(args));
                 let notif = SessionNotification::new(
                     session_id.clone(),
                     SessionUpdate::ToolCall(tool_call),
                 );
                 if let Err(e) = cx.send_notification(notif) {
                     tracing::warn!("ACP failed to send tool call notification: {}", e);
+                }
+                // The runner starts the tool right after announcing it.
+                let started = SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        id,
+                        ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+                    )),
+                );
+                if let Err(e) = cx.send_notification(started) {
+                    tracing::warn!("ACP failed to send tool start notification: {}", e);
                 }
             }
             #[cfg(feature = "subagents")]
@@ -5329,22 +5354,14 @@ async fn relay_prompt_events(
                 // Display-only live output preview for the TUI. The tool
                 // result update below remains the canonical ACP content.
             }
-            AgentEvent::FileMutation { id, name, diff } => {
-                // A distinct historical preview survives the subsequent tool
-                // result update; it never asserts current filesystem contents.
-                if diff.bounded() {
-                    let text = crate::ui::events::sanitize_for_review(&format!(
-                        "Recorded {name} mutation preview (call {id}):\n{}",
-                        diff.review_text()
-                    ));
-                    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
-                    let notification = SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::AgentThoughtChunk(chunk),
-                    );
-                    if let Err(error) = cx.send_notification(notification) {
-                        tracing::warn!(%error,"ACP failed to send mutation preview");
+            AgentEvent::FileMutation { id, diff, .. } => {
+                // Carried as ACP diff content on the tool result update; it
+                // is a historical preview, never current filesystem contents.
+                if let Some(content) = toolcall::mutation_diff_content(&diff) {
+                    if mutation_diffs.len() >= 64 {
+                        mutation_diffs.clear();
                     }
+                    mutation_diffs.insert(id.to_string(), content);
                 }
             }
             AgentEvent::ToolResult {
@@ -5354,11 +5371,15 @@ async fn relay_prompt_events(
                 ..
             } => {
                 let id = id.to_string();
+                toolcall::forget_args(&id);
+                let mut content = Vec::new();
+                content.extend(mutation_diffs.remove(&id));
+                content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
+                    output.to_string(),
+                ))));
                 let mut fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
-                    .content(vec![ToolCallContent::from(ContentBlock::Text(
-                        TextContent::new(output.to_string()),
-                    ))]);
+                    .content(content);
                 if is_error {
                     fields.status = Some(ToolCallStatus::Failed);
                 }
@@ -8600,6 +8621,30 @@ mod protocol_tests {
                                 name: "nested-display-only".into(),
                                 args: serde_json::json!({"not": "canonical"}),
                             },
+                            AgentEvent::ToolCall {
+                                id: "lifecycle-w".into(),
+                                name: "write".into(),
+                                args: serde_json::json!({"path": "w.txt", "content": "new\n"}),
+                            },
+                            AgentEvent::FileMutation {
+                                id: "lifecycle-w".into(),
+                                name: "write".into(),
+                                diff:
+                                    crate::agent::tools::mutation_diff::MutationDiff::replacement(
+                                        "w.txt",
+                                        Some("old\n"),
+                                        "new\n",
+                                        Default::default(),
+                                    )
+                                    .unwrap(),
+                            },
+                            AgentEvent::ToolResult {
+                                id: "lifecycle-w".into(),
+                                name: "write".into(),
+                                output: "wrote".into(),
+                                images: Vec::new(),
+                                is_error: false,
+                            },
                             AgentEvent::ToolResult {
                                 id: "lifecycle-b".into(),
                                 name: "read".into(),
@@ -8761,12 +8806,76 @@ mod protocol_tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(call_ids, vec!["lifecycle-a", "lifecycle-b"]);
-        assert_eq!(result_ids, vec!["lifecycle-b", "lifecycle-a"]);
+        assert_eq!(call_ids, vec!["lifecycle-a", "lifecycle-b", "lifecycle-w"]);
+        let finished = |ids: Vec<String>| {
+            ids.into_iter()
+                .zip(notifications.iter().filter_map(|n| match &n.update {
+                    SessionUpdate::ToolCallUpdate(u) => Some(u.fields.status),
+                    _ => None,
+                }))
+                .filter(|(_, status)| *status != Some(ToolCallStatus::InProgress))
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        let in_progress = notifications
+            .iter()
+            .filter(|n| {
+                matches!(&n.update, SessionUpdate::ToolCallUpdate(u)
+                if u.fields.status == Some(ToolCallStatus::InProgress))
+            })
+            .count();
+        assert_eq!(in_progress, 3, "every announced call goes in_progress");
+        let result_ids = finished(result_ids);
+        assert_eq!(
+            result_ids,
+            vec!["lifecycle-w", "lifecycle-b", "lifecycle-a"]
+        );
+        let first = notifications
+            .iter()
+            .find_map(|n| match &n.update {
+                SessionUpdate::ToolCall(call) if call.tool_call_id.to_string() == "lifecycle-a" => {
+                    Some(call.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(first.title, "read a");
+        assert_eq!(first.kind, ToolKind::Read);
+        assert_eq!(first.locations[0].path.to_str(), Some("a"));
+        let write_result = notifications
+            .iter()
+            .find_map(|n| match &n.update {
+                SessionUpdate::ToolCallUpdate(u)
+                    if u.tool_call_id.to_string() == "lifecycle-w"
+                        && u.fields.status == Some(ToolCallStatus::Completed) =>
+                {
+                    Some(u.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let content = write_result.fields.content.unwrap();
+        let ToolCallContent::Diff(diff) = &content[0] else {
+            panic!("diff content must come first: {content:?}");
+        };
+        assert_eq!(diff.new_text, "new");
+        assert_eq!(diff.old_text.as_deref(), Some("old"));
+        assert!(matches!(content[1], ToolCallContent::Content(_)));
+        let preview_thoughts = notifications.iter().any(|n| {
+            matches!(&n.update,
+            SessionUpdate::AgentThoughtChunk(c) if format!("{c:?}").contains("mutation preview"))
+        });
+        assert!(
+            !preview_thoughts,
+            "mutation preview is diff content, not a thought"
+        );
         let statuses = notifications
             .iter()
             .filter_map(|notification| match &notification.update {
-                SessionUpdate::ToolCallUpdate(update) => {
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.fields.status != Some(ToolCallStatus::InProgress)
+                        && update.tool_call_id.to_string() != "lifecycle-w" =>
+                {
                     Some((update.tool_call_id.to_string(), update.fields.status))
                 }
                 _ => None,

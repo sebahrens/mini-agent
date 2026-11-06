@@ -118,7 +118,7 @@ const LITERAL_SAFE_BLOCK_MARKERS: BlockMarkers = BlockMarkers {
     replace: ">>>>>>>>>>> REPLACE",
 };
 
-fn parse_blocks(raw: &str) -> Result<Vec<EditBlock>, ToolError> {
+pub(crate) fn parse_blocks(raw: &str) -> Result<Vec<EditBlock>, ToolError> {
     let mut blocks = Vec::new();
     let mut markers: Option<BlockMarkers> = None;
     let mut search_lines: Vec<String> = Vec::new();

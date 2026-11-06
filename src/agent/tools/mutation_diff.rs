@@ -491,7 +491,7 @@ impl MutationDiff {
         )
     }
 
-    #[cfg(any(feature = "acp", all(test, feature = "hooks", unix)))]
+    #[cfg(all(test, feature = "hooks", unix))]
     pub(crate) fn review_text(&self) -> String {
         let mut text = String::new();
         for row in &self.rows {

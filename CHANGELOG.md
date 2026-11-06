@@ -6,6 +6,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### ACP, IDE and headless
+
+- ACP tool calls now carry a descriptive title (tool plus path, command or pattern), a tool kind,
+  file locations for path tools, an `in_progress` update when the tool starts, and diff content:
+  edit/write approval dialogs show the proposed change, and results carry the recorded mutation
+  as an ACP diff (bounded hunks, marked `_meta."mini-agent-partial"`/`"mini-agent-truncated"`)
+  instead of an `agent_thought_chunk`.
+
 ### Subagents
 
 - A failed `task` child no longer cancels its siblings: the other children run to completion and
