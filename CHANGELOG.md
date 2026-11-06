@@ -16,6 +16,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Context compaction
 
+- A headless turn on a provider-native Anthropic replay session whose prompt pressure crosses
+  `mid_turn_compact_threshold` now stops at the tool-batch boundary with an explicit "context is N%
+  full" error and its completed tool results saved, instead of running into a provider context error.
+
 - Anthropic five-minute prompt caching now spends its spare cache breakpoints on earlier
   message blocks, spaced 18 blocks behind the tail, so a turn that adds 20+ content blocks (for
   example ten parallel tool calls) still finds the previous request's cache write inside the

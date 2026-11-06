@@ -1043,6 +1043,32 @@ impl std::fmt::Display for MidTurnCompactionBoundary {
 
 impl std::error::Error for MidTurnCompactionBoundary {}
 
+/// A provider-native replay turn stopped at a tool-batch boundary because real
+/// prompt pressure crossed the mid-turn threshold. Native history cannot be
+/// compacted in place, so the turn ends here with every tool result saved and
+/// the session resumable; it is not a provider error.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NativeContextFull {
+    pub(crate) pressure: f64,
+    pub(crate) session_id: String,
+}
+
+impl std::fmt::Display for NativeContextFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "context is {:.0}% full: stopped at a tool boundary before a provider context error. \
+             Native Anthropic replay history cannot be compacted in place; completed tool results \
+             are saved in session {} and its unfinished reply is preserved. Start a fresh context \
+             to continue.",
+            self.pressure * 100.0,
+            self.session_id,
+        )
+    }
+}
+
+impl std::error::Error for NativeContextFull {}
+
 /// Decision channel capacity. A runner that did not park leaves its decision
 /// queued; at most one `UsageDelta` per completion can be in flight on the
 /// bounded event channel, so this can never fill and block the UI.

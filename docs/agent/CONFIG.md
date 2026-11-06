@@ -1539,8 +1539,12 @@ same: the runner returns at that boundary, the turn's records are written to the
 session (in memory only under `--no-session`), the session is compacted and the
 task continues with a short continuation prompt, at most three times per turn. A
 boundary at which nothing older than the kept recent history exists continues
-without the mid-turn trigger. ACP turns and native Anthropic replay sessions do
-not compact mid-turn yet. It never aborts an in-flight tool merely to
+without the mid-turn trigger. ACP turns do not compact mid-turn yet. A native Anthropic replay session
+cannot be summarized in place (its signed thinking blocks and tool pairing replay
+verbatim), so headless `-p`/`--loop` turns on one stop at the tool-batch boundary
+with an explicit "context is N% full ... start a fresh context" error and the
+completed tool results saved, instead of failing with a provider context error; the
+interactive UI does the same. It never aborts an in-flight tool merely to
 create a compaction boundary.
 
 Tool calls and results are persisted as structured session messages before the

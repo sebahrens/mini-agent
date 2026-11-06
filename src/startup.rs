@@ -3500,17 +3500,45 @@ async fn run_bound_headless_round(
     }
     let history = binding.history();
     owner.binding = Some(binding);
+    // Provider-native replay history cannot be summarized in place (its signed
+    // thinking blocks and tool_use/tool_result pairing must replay verbatim),
+    // so pressure at a tool-batch boundary ends the turn cleanly instead of
+    // running into a provider context error (mini-agent-q3ki6).
+    let mid_turn = (cfg.resolve_compact_enabled() && session.context_window > 0)
+        .then(|| cfg.resolve_mid_turn_compact_threshold())
+        .flatten()
+        .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
+            window: session.context_window,
+            threshold,
+            anthropic_native: cfg.is_anthropic_native(&session.provider),
+        });
     let mut turn = heap_future(|| {
-        agent.run_print_with_output(
-            message,
-            output,
-            &cfg.retry,
-            history,
-            #[cfg(feature = "hooks")]
-            loop_info,
+        crate::agent::runner::with_headless_mid_turn(
+            mid_turn,
+            agent.run_print_with_output(
+                message,
+                output,
+                &cfg.retry,
+                history,
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
         )
     })
     .await;
+    if let Some(boundary) = turn.failure.as_ref().and_then(|error| {
+        error
+            .downcast_ref::<crate::agent::runner::MidTurnCompactionBoundary>()
+            .copied()
+    }) {
+        turn.failure = Some(
+            crate::agent::runner::NativeContextFull {
+                pressure: boundary.pressure,
+                session_id: session.id.to_string(),
+            }
+            .into(),
+        );
+    }
     // The producer returned only after its exact model and scoped effects joined.
     owner.outcome = if turn.failure.is_none() {
         RetiredNativeOutcome::Completed
@@ -3518,7 +3546,12 @@ async fn run_bound_headless_round(
         error
             .downcast_ref::<crate::question::QuestionRequired>()
             .is_some()
+            || error
+                .downcast_ref::<crate::agent::runner::NativeContextFull>()
+                .is_some()
     }) {
+        // A question or a context-full stop both end exactly at a complete
+        // tool reply, which the native history keeps verbatim.
         RetiredNativeOutcome::LiveToolReply
     } else {
         RetiredNativeOutcome::Incomplete
