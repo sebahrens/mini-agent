@@ -260,6 +260,7 @@ fn extract_value(text: &str, key: &str) -> Option<String> {
 struct Loopback {
     address: std::net::SocketAddr,
     requests: Arc<Mutex<usize>>,
+    bodies: Arc<Mutex<Vec<String>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -275,6 +276,8 @@ async fn serve(turns: Vec<ScriptTurn>) -> Loopback {
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(0usize));
     let counter = requests.clone();
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let captured = bodies.clone();
     let task = tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -309,6 +312,7 @@ async fn serve(turns: Vec<ScriptTurn>) -> Loopback {
             let body: serde_json::Value =
                 serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
             *counter.lock().unwrap() += 1;
+            captured.lock().unwrap().push(body.to_string());
             let turn_index = body["messages"]
                 .as_array()
                 .map(|messages| {
@@ -375,6 +379,7 @@ async fn serve(turns: Vec<ScriptTurn>) -> Loopback {
     Loopback {
         address,
         requests,
+        bodies,
         task,
     }
 }
@@ -386,6 +391,7 @@ pub(super) struct ParentRun {
     pub(super) context_bytes: usize,
     pub(super) image_tokens: u64,
     pub(super) evidence_calls: usize,
+    pub(super) inline_images: usize,
     pub(super) verified_from_evidence: bool,
 }
 
@@ -547,11 +553,42 @@ async fn parent_policy(
     tool: &EvidenceTool,
     run: &crate::spend::run::Run,
 ) -> ParentRun {
+    // An inline-image envelope: the text report plus host-attached images.
+    let mut inline = Vec::new();
+    let mut inline_tokens = 0;
+    let text = match serde_json::from_str::<serde_json::Value>(output) {
+        Ok(envelope) if envelope.get("parts").is_some() => {
+            for part in envelope["parts"].as_array().into_iter().flatten() {
+                use base64::Engine;
+                let data = part["data"].as_str().unwrap_or_default();
+                inline_tokens += crate::extras::subagents::image_cost::base64_image_tokens(data);
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
+                    && let Ok(Some(info)) = crate::agent::tools::read_image::inspect(&bytes)
+                {
+                    inline.push((info.width, info.height));
+                }
+            }
+            envelope["response"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+        _ => output.to_string(),
+    };
+    let output = text.as_str();
     let mut parent = ParentRun {
         answer: claimed_answer(output),
         context_bytes: output.len(),
+        image_tokens: inline_tokens,
+        inline_images: inline.len(),
         ..ParentRun::default()
     };
+    // An attached image answers an image question without a round trip.
+    if let (Question::Image { .. }, Some((width, height))) = (question, inline.first()) {
+        parent.answer = Some(format!("{width}x{height}"));
+        parent.verified_from_evidence = true;
+        return parent;
+    }
     // No evidence on offer, or none cited: the parent takes the report.
     let Some((task_id, total, rows)) = evidence_section(output) else {
         return parent;
@@ -590,6 +627,29 @@ async fn parent_policy(
     parent
 }
 
+/// The arm under test.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Arm {
+    pub(super) evidence: bool,
+    /// `[subagents] task_inline_images`.
+    pub(super) inline_images: u8,
+    /// `task_max_cost_units`, when the default is not wanted.
+    pub(super) max_cost_units: Option<u64>,
+    /// Identical prompts in one call (fan-out).
+    pub(super) prompts: usize,
+}
+
+impl Arm {
+    pub(super) const fn evidence(evidence: bool) -> Self {
+        Self {
+            evidence,
+            inline_images: 0,
+            max_cost_units: None,
+            prompts: 1,
+        }
+    }
+}
+
 /// One case under one arm, through the real task executor.
 pub(super) struct ArmResult {
     pub(super) oracle: String,
@@ -597,9 +657,11 @@ pub(super) struct ArmResult {
     pub(super) output: String,
     pub(super) child_requests: usize,
     pub(super) child_tool_calls: usize,
+    /// Every child request body, as sent.
+    pub(super) bodies: Vec<String>,
 }
 
-async fn run_arm(case: &EvidenceCase, values: &BTreeMap<String, u64>, evidence: bool) -> ArmResult {
+async fn run_arm(case: &EvidenceCase, values: &BTreeMap<String, u64>, arm: Arm) -> ArmResult {
     let root = crate::tests::OwnedTestDirectory::new("evidence-axis");
     let workspace_root = root.path().join("workspace");
     for (relative, template) in &case.files {
@@ -643,15 +705,21 @@ async fn run_arm(case: &EvidenceCase, values: &BTreeMap<String, u64>, evidence: 
         ),
     ]);
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap());
-    let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+    let mut config = serde_json::json!({
         "no_context_files": true, "session_title_model": "off",
         "max_tokens": 1024, "subagent_max_tokens": 1024,
-        "task_evidence": evidence,
+        "task_evidence": arm.evidence,
         "retry": {"max_attempts": 1},
         "custom_providers": {"eval-wire": {"provider_type": "openai",
             "base_url": format!("http://{}/v1", server.address), "api_style": "completions"}}
-    }))
-    .unwrap();
+    });
+    if arm.inline_images > 0 {
+        config["subagents"] = serde_json::json!({"task_inline_images": arm.inline_images});
+    }
+    if let Some(units) = arm.max_cost_units {
+        config["task_max_cost_units"] = serde_json::json!(units);
+    }
+    let config: crate::config::Config = serde_json::from_value(config).unwrap();
     let client = crate::provider::create_client(
         "eval-wire",
         Some("inert-loopback-key"),
@@ -694,9 +762,11 @@ async fn run_arm(case: &EvidenceCase, values: &BTreeMap<String, u64>, evidence: 
             false,
         ),
     };
-    let task = TaskTool::new(None, None, true).with_workspace_binding(workspace.clone());
-    let args =
-        serde_json::from_value(serde_json::json!({"prompts": [case.question.prompt()]})).unwrap();
+    let task = TaskTool::new(None, None, true)
+        .with_workspace_binding(workspace.clone())
+        .with_parent_image_support(parent_support);
+    let prompts: Vec<_> = (0..arm.prompts).map(|_| case.question.prompt()).collect();
+    let args = serde_json::from_value(serde_json::json!({"prompts": prompts})).unwrap();
     let scope = crate::agent::runner::AgentWorkScope::new();
     let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
     let output = tokio::time::timeout(
@@ -718,6 +788,7 @@ async fn run_arm(case: &EvidenceCase, values: &BTreeMap<String, u64>, evidence: 
     let tool = EvidenceTool::new(None, None, workspace.clone(), parent_support);
     let parent = parent_policy(&output, &case.question, &tool, &run).await;
     let child_requests = *server.requests.lock().unwrap();
+    let bodies = server.bodies.lock().unwrap().clone();
     drop(pool);
     ArmResult {
         oracle,
@@ -725,6 +796,7 @@ async fn run_arm(case: &EvidenceCase, values: &BTreeMap<String, u64>, evidence: 
         output,
         child_requests,
         child_tool_calls,
+        bodies,
     }
 }
 
@@ -741,9 +813,19 @@ pub(super) fn seed() -> u64 {
         .unwrap_or(DEFAULT_SEED)
 }
 
-pub(super) async fn run_case(case: &EvidenceCase, seed: u64, evidence: bool) -> ArmResult {
+pub(super) async fn run_case(case: &EvidenceCase, seed: u64, arm: Arm) -> ArmResult {
     let values = draw_values(case, seed);
-    run_arm(case, &values, evidence).await
+    Box::pin(run_arm(case, &values, arm)).await
+}
+
+impl EvidenceCase {
+    pub(super) fn has_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+
+    pub(super) fn parent(&self) -> ParentKind {
+        self.parent
+    }
 }
 
 #[test]
@@ -789,4 +871,207 @@ fn evidence_axis_generator_is_seeded_distinct_and_oracle_independent() {
         .unwrap()
         .unwrap();
     assert_eq!((info.width, info.height), (640, 480));
+}
+
+// ── Inline image lane (mini-agent-6m0om), end to end through the executor ──
+
+fn lane_case(parent: &str, attach: &str) -> EvidenceCase {
+    serde_json::from_value(serde_json::json!({
+        "name": "inline_lane",
+        "values": {"aw": [640, 640], "ah": [480, 480], "bw": [300, 300], "bh": [200, 200],
+                   "cw": [520, 520], "ch": [510, 510], "gw": [2000, 2000], "gh": [900, 900]},
+        "files": {"notes.txt": "plain text evidence\n"},
+        "images": {"a.png": ["aw", "ah"], "b.png": ["bw", "bh"], "c.png": ["cw", "ch"],
+                   "big.png": ["gw", "gh"]},
+        "question": {"kind": "image", "subject": "a.png"},
+        "parent": parent,
+        "turns": [
+            {"tools": [
+                {"name": "read", "args": {"path": "a.png"}},
+                {"name": "read", "args": {"path": "b.png"}},
+                {"name": "read", "args": {"path": "c.png"}},
+                {"name": "read", "args": {"path": "big.png"}},
+                {"name": "read", "args": {"path": "notes.txt"}}
+            ]},
+            {"text": format!("## Findings\n- [confidence: high] ANSWER: {{{{aw}}}}x{{{{ah}}}} for a.png. [evidence: E1] {attach}\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: a.png, b.png, c.png, big.png, notes.txt.\n- Skipped: None.")}
+        ]
+    }))
+    .unwrap()
+}
+
+async fn run_lane(case: &EvidenceCase, arm: Arm) -> ArmResult {
+    let values = draw_values(case, 1);
+    Box::pin(run_arm(case, &values, arm)).await
+}
+
+fn envelope_images(output: &str) -> (String, Vec<(u32, u32)>) {
+    use base64::Engine;
+    let value: serde_json::Value = serde_json::from_str(output).expect("image envelope");
+    let images = value["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|part| {
+            assert_eq!(part["type"], "image");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(part["data"].as_str().unwrap())
+                .unwrap();
+            let info = crate::agent::tools::read_image::inspect(&bytes)
+                .unwrap()
+                .unwrap();
+            (info.width, info.height)
+        })
+        .collect();
+    (value["response"].as_str().unwrap().to_string(), images)
+}
+
+#[tokio::test]
+async fn inline_lane_returns_the_host_envelope_with_caps_and_omissions() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let case = lane_case("vision", "[attach: E5, E4, E1, E2, E3]");
+    let arm = Arm {
+        inline_images: 2,
+        ..Arm::evidence(true)
+    };
+    let result = run_lane(&case, arm).await;
+    let (response, images) = envelope_images(&result.output);
+    // Images follow the whole text report, in attachment order, capped at 2.
+    assert_eq!(images, vec![(640, 480), (300, 200)], "{response}");
+    assert!(
+        response.starts_with("[subagent output begins]\n"),
+        "{response}"
+    );
+    assert!(response.contains("> ## Findings\n"));
+    for expected in [
+        "E5: not an image result; text is never inlined",
+        "E4: not inlined, 2000x900 exceeds the 1568 px inline limit",
+        "E1: attached inline (640x480, image/png, ~414 tokens)",
+        "E2: attached inline (300x200, image/png, ~88 tokens)",
+        "E3: not inlined, this child's limit of 2 inline images was reached",
+    ] {
+        assert!(
+            response.contains(expected),
+            "missing {expected:?}: {response}"
+        );
+    }
+    // Every attached record is listed as an evidence row.
+    for id in ["E1", "E2", "E3", "E4", "E5"] {
+        assert!(response.contains(&format!("| {id} | read |")), "{response}");
+    }
+    // rig lifts exactly these images into image content.
+    let lifted = rig::message::ToolResultContent::from_tool_output(result.output.clone());
+    let kinds: Vec<_> = lifted
+        .iter()
+        .map(|part| matches!(part, rig::message::ToolResultContent::Image(_)))
+        .collect();
+    assert_eq!(kinds, vec![false, true, true]);
+    // The child was told about the lane and its cap.
+    assert!(result.bodies[0].contains("Inline image attachments (host policy)"));
+    assert!(result.bodies[0].contains("At most 2 images are attached"));
+}
+
+#[tokio::test]
+async fn inline_lane_degrades_to_evidence_rows_for_a_text_only_parent_and_is_off_by_default() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let case = lane_case("text", "[attach: E1]");
+    let degraded = run_lane(
+        &case,
+        Arm {
+            inline_images: 3,
+            ..Arm::evidence(true)
+        },
+    )
+    .await;
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&degraded.output).is_err(),
+        "{}",
+        degraded.output
+    );
+    assert!(degraded.output.contains("| E1 | read | a.png |"));
+    assert!(
+        degraded
+            .output
+            .contains("E1: not inlined (Model has no vision"),
+        "{}",
+        degraded.output
+    );
+
+    // Default 0: the child is not told, the tag is ordinary text, no section.
+    let vision = lane_case("vision", "[attach: E1]");
+    let off = run_lane(&vision, Arm::evidence(true)).await;
+    assert!(!off.output.starts_with('{'));
+    assert!(!off.output.contains("Inline images"));
+    assert!(!off.bodies[0].contains("Inline image attachments"));
+    // Without evidence handles the lane is off whatever the setting.
+    let no_evidence = run_lane(
+        &vision,
+        Arm {
+            inline_images: 3,
+            ..Arm::evidence(false)
+        },
+    )
+    .await;
+    assert!(!no_evidence.output.starts_with('{'));
+    assert!(!no_evidence.bodies[0].contains("Inline image attachments"));
+}
+
+#[tokio::test]
+async fn inline_images_are_charged_to_the_task_cost_budget_and_capped_per_call() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+    let case = lane_case("vision", "[attach: E1]");
+    // Two child turns cost 2 x (100 + 5 x 20) = 400 units; a.png is
+    // ceil(640/28) x ceil(480/28) = 414 tokens, so 600 units cannot cover it.
+    let tight = run_lane(
+        &case,
+        Arm {
+            inline_images: 1,
+            max_cost_units: Some(600),
+            ..Arm::evidence(true)
+        },
+    )
+    .await;
+    assert!(!tight.output.starts_with('{'), "{}", tight.output);
+    assert!(
+        tight
+            .output
+            .contains("E1: not inlined, the task cost budget cannot cover its ~414 tokens"),
+        "{}",
+        tight.output
+    );
+    let roomy = run_lane(
+        &case,
+        Arm {
+            inline_images: 1,
+            max_cost_units: Some(900),
+            ..Arm::evidence(true)
+        },
+    )
+    .await;
+    let (response, images) = envelope_images(&roomy.output);
+    assert_eq!(images, vec![(640, 480)]);
+    assert!(!response.contains("[partial:"), "{response}");
+
+    // Two children with three attachments each: five images per call.
+    let fanout = lane_case("vision", "[attach: E1, E2, E3]");
+    let result = run_lane(
+        &fanout,
+        Arm {
+            inline_images: 3,
+            prompts: 2,
+            ..Arm::evidence(true)
+        },
+    )
+    .await;
+    let (response, images) = envelope_images(&result.output);
+    assert_eq!(images.len(), 5, "{response}");
+    assert_eq!(
+        response
+            .matches("not inlined, the per-call limit of 5 inline images was reached")
+            .count(),
+        1,
+        "{response}"
+    );
 }

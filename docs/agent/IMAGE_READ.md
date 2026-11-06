@@ -121,6 +121,13 @@ same aggregate as the native capture ceiling: a later image result past that
 ceiling keeps its text summary and replaces its image with an omission notice.
 The implementation is `src/extras/subagents/image_cost.rs`.
 
+The opt-in inline image lane for `task` results (`[subagents]
+task_inline_images`, default 0) reuses this envelope for the parent: at most 5
+images and 1.5 MiB of base64 per call, so a task result stays inside the 2 MiB
+frame and 4 MiB aggregate ceilings above, no image over 1,568 px on its longer
+side (nothing is resampled), and each image charged to `task_max_cost_units`
+by the same patch formula. See `docs/agent/SUBAGENTS.md#inline-image-lane`.
+
 Provider references: [Anthropic tool results](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls),
 [OpenAI function outputs](https://developers.openai.com/api/reference/resources/responses/methods/create),
 [OpenAI image inputs](https://developers.openai.com/api/docs/guides/images-vision),

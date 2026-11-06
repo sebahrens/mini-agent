@@ -1636,9 +1636,9 @@ async fn harness_regression_eval() {
 
 /// Evidence-handle axis (mini-agent-g442v): every case of
 /// `tests/harness_eval/evidence/fixture.json` runs through the real task
-/// executor with `task_evidence` on and off, and a fixed parent policy turns
-/// each report into a task-level verdict. One `EVIDENCE_EVAL` record per case
-/// and arm. The name keeps it inside the `harness_regression_eval` filter
+/// executor with `task_evidence` on and off (image cases also with the inline
+/// image lane, mini-agent-6m0om), and a fixed parent policy turns each report
+/// into a task-level verdict. One `EVIDENCE_EVAL` record per case and arm. The name keeps it inside the `harness_regression_eval` filter
 /// that ci.yml and the weekly workflow already run.
 #[cfg(feature = "multimodal")]
 #[tokio::test]
@@ -1650,16 +1650,46 @@ async fn harness_regression_eval_evidence_axis() {
     let mut totals = BTreeMap::<&str, (usize, usize, u64)>::new();
     for case in evidence_axis::cases() {
         let mut requests = BTreeMap::new();
-        for (arm, enabled) in [("off", false), ("on", true)] {
-            let result = evidence_axis::run_case(&case, seed, enabled).await;
+        // Image cases also run the opt-in inline image lane (mini-agent-6m0om).
+        let mut arms = vec![
+            ("off", evidence_axis::Arm::evidence(false)),
+            ("on", evidence_axis::Arm::evidence(true)),
+        ];
+        if case.has_images() {
+            arms.push((
+                "inline",
+                evidence_axis::Arm {
+                    inline_images: 1,
+                    ..evidence_axis::Arm::evidence(true)
+                },
+            ));
+        }
+        for (arm, options) in arms {
+            let enabled = options.evidence;
+            let result = evidence_axis::run_case(&case, seed, options).await;
+            let enveloped = result.output.starts_with("{\"");
+            let report = if enveloped {
+                serde_json::from_str::<serde_json::Value>(&result.output).unwrap()["response"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            } else {
+                result.output.clone()
+            };
+            assert_eq!(
+                enveloped,
+                arm == "inline" && case.parent() == evidence_axis::ParentKind::Vision,
+                "{} {arm}: only the inline lane with a vision parent returns an envelope: {}",
+                case.name,
+                result.output
+            );
             let correct = result.parent.answer.as_deref() == Some(result.oracle.as_str());
             if enabled {
                 if result.child_tool_calls > 0 {
                     assert!(
-                        result.output.contains("\n## Evidence\n"),
-                        "{}: evidence on must add the host section: {}",
+                        report.contains("\n## Evidence\n"),
+                        "{}: evidence on must add the host section: {report}",
                         case.name,
-                        result.output
                     );
                 }
             } else {
@@ -1695,6 +1725,7 @@ async fn harness_regression_eval_evidence_axis() {
                     "parent_image_tokens": result.parent.image_tokens,
                     "parent_est_tokens": result.parent.est_tokens(),
                     "evidence_calls": result.parent.evidence_calls,
+                    "inline_images": result.parent.inline_images,
                     "child_requests": result.child_requests,
                     "child_tool_calls": result.child_tool_calls,
                     "seed": seed,
@@ -1710,6 +1741,7 @@ async fn harness_regression_eval_evidence_axis() {
     }
     let (cases, on_correct, on_tokens) = totals["on"];
     let (_, off_correct, off_tokens) = totals["off"];
+    let (inline_cases, inline_correct, inline_tokens) = totals["inline"];
     println!(
         "EVIDENCE_EVAL_SUMMARY {}",
         serde_json::json!({
@@ -1718,6 +1750,9 @@ async fn harness_regression_eval_evidence_axis() {
             "off_correct": off_correct,
             "on_est_tokens": on_tokens,
             "off_est_tokens": off_tokens,
+            "inline_cases": inline_cases,
+            "inline_correct": inline_correct,
+            "inline_est_tokens": inline_tokens,
             "seed": seed,
         })
     );

@@ -56,14 +56,16 @@ jobs:
             --expect 9
           # The evidence-handle axis (harness_regression_eval_evidence_axis,
           # selected by the same filter) runs 11 cases with task_evidence on
-          # and off: 22 records plus one summary.
+          # and off, and its 2 image cases also with the inline image lane:
+          # 24 records plus one summary.
           python3 scripts/harness_eval_metrics.py \
             --marker EVIDENCE_EVAL \
             --log "$RUNNER_TEMP/harness-eval.log" \
             --out "$RUNNER_TEMP/evidence-eval.jsonl" \
-            --expect 22 \
+            --expect 24 \
             --require arm=on \
-            --require arm=off
+            --require arm=off \
+            --require arm=inline
           python3 scripts/harness_eval_metrics.py \
             --marker EVIDENCE_EVAL_SUMMARY \
             --log "$RUNNER_TEMP/harness-eval.log" \

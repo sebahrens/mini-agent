@@ -3995,6 +3995,14 @@ round-trip check of the global writer.
 tools, permissions, workspace and sandbox; write children are serialized within
 each call. See [Subagents](SUBAGENTS.md#opt-in-implementation-personas).
 
+`[subagents] task_inline_images = N` (default 0, at most 3) lets a child attach
+up to `N` of its recorded image results (`[attach: E5]`) inline to the `task`
+result when the parent model accepts images; at most 5 images and 1.5 MiB of
+base64 per call, each image no larger than 1,568 px on its longer side and
+charged to `task_max_cost_units`. It needs `task_evidence = true`. A persona's
+`inline_images` frontmatter can only narrow it. See
+[Inline image lane](SUBAGENTS.md#inline-image-lane).
+
 ### Hook event parity
 
 `PreCompact` observes an actual compaction before summarization. Its envelope has

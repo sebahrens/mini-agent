@@ -1236,6 +1236,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             let task_tool = task_tool.with_skill_services(skill_services.clone());
             #[cfg(feature = "archmd")]
             let task_tool = task_tool.with_architecture(context.architecture.clone());
+            #[cfg(feature = "multimodal")]
+            let task_tool = task_tool.with_parent_image_support(read_tracker.image_support);
             all_tools.push(Box::new(task_tool));
             all_tools.push(Box::new(
                 crate::extras::subagents::background::ResultTool::new(

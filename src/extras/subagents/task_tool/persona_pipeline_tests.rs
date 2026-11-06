@@ -354,6 +354,7 @@ fn alias_persona(alias: &str) -> ResolvedSpecialization {
         required_tools: Vec::new(),
         model: Some(alias.into()),
         turn_budget: None,
+        inline_images: None,
         #[cfg(feature = "mcp")]
         mcp_servers: None,
     }

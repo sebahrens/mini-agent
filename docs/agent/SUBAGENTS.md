@@ -488,6 +488,9 @@ mode: review
   `[reasoning] effort`. The older `effort` key is still accepted as a
   deprecated alias and logs a warning; setting both `turn_budget` and `effort`
   rejects the definition.
+- `inline_images` is an integer from 0 to 3 that narrows
+  `[subagents] task_inline_images` for this persona (it can never widen it);
+  see [Inline image lane](#inline-image-lane).
 - `isolation` is `worktree` or `none` (default). With `mode: write`,
   `worktree` runs each child in its own git worktree and branch; see
   [Worktree-isolated write children](#worktree-isolated-write-children).
@@ -689,11 +692,11 @@ Results (default seed, 2026-11-06):
 | distractor_citation | cites the wrong file's record | wrong | right | 66 | 291 | 1 (probe) |
 | unknown_citation_repaired | cites E4 of 1, repair cites E1 | right | right | 61 | 278 | 1 |
 | withheld_after_failed_repair | unknown citation twice, report withheld | wrong | right | 56 | 374 | 1 |
-| image_dims_vision_parent | wrong image size, vision parent | wrong | right | 68 | 1,606 (1,323 image) | 1 |
-| image_dims_text_only_parent | wrong image size, text-only parent | wrong | wrong | 66 | 294 | 1 |
+| image_dims_vision_parent | wrong image size, vision parent | wrong | right | 72 | 1,610 (1,323 image) | 1 |
+| image_dims_text_only_parent | wrong image size, text-only parent | wrong | wrong | 69 | 298 | 1 |
 | uncited_correct_claim | right, no citation | right | right | 61 | 116 | 0 |
 | uncited_wrong_claim | wrong, no citation | wrong | wrong | 58 | 113 | 0 |
-| **total** | | **4/11** | **9/11** | **710** | **11,091** | 10 |
+| **total** | | **4/11** | **9/11** | **717** | **11,099** | 10 |
 
 Evidence handles raised parent accuracy from 4/11 to 9/11 at about 15x the
 parent-context tokens, almost all of it spent where the parent chose to verify
@@ -702,13 +705,60 @@ Evidence header (about 55 tokens). Handles cannot fix an uncited wrong claim or
 let a text-only parent check an image. Child cost rises only by the repair turn
 of an unknown citation (2 to 3 requests in two cases).
 
+The two image cases also run a third arm with the inline image lane
+(`task_inline_images = 1`; the child marks `[attach: E1]`, which the other
+arms treat as plain text):
+
+| case | on (dereference) | inline | parent tool calls on / inline |
+|---|---|---|---|
+| image_dims_vision_parent | right, 1,610 tokens | right, 1,527 tokens | 1 / 0 |
+| image_dims_text_only_parent | wrong, 298 tokens | wrong, 339 tokens | 1 / 1 |
+
 **Inline image lane: no-go as a default.** Only one of the 11 cases (a vision
-parent checking an image) could benefit, and dereferencing already gets it
-right for one `task_evidence` round trip (about 160 text tokens on top of the
-image). Inlining would save that round trip but bill the ~1.3k image tokens on
-every later parent turn even when the claim needed no checking, and it does
-nothing for a text-only parent. The lane (mini-agent-6m0om) therefore ships
-opt-in with a default of zero.
+parent checking an image) benefits, and dereferencing already gets it right:
+inlining saves one `task_evidence` round trip, about 83 tokens (5%) on that
+turn. In exchange the ~1.3k image tokens enter the parent context whether or
+not the parent would have checked the image, and they are re-billed on every
+later parent turn. A text-only parent gains nothing and pays the notes. The
+lane (mini-agent-6m0om) therefore ships opt-in with a default of zero.
+
+#### Inline image lane
+
+`[subagents] task_inline_images = N` (default 0, at most 3 per child; a
+persona's `inline_images` may narrow it) lets a child return up to `N` of its
+host-recorded **image** results inline. The lane needs `task_evidence = true`
+and a foreground call; background results stay text. When it is on, the child
+is told (host policy after the citation rules) that it may end a Findings
+entry with `[attach: E5]`. After validation the host decides, per attached
+record and in attachment order:
+
+- The record must exist and hold images; text results are never inlined
+  (raw text tool output only travels by handle).
+- The parent model must accept the image (`read`'s captured image support).
+  A text-only parent gets the record as an ordinary Evidence row with a note.
+- The longer side must be at most 1,568 px. The build has no image decoder, so
+  nothing is resampled: a larger image is omitted with a note pointing at
+  `task_evidence`, using the dimensions recorded from its header.
+- The parent's own read rule must allow a recorded `read` path without asking,
+  as for `task_evidence`; otherwise the record is listed, not inlined.
+- At most 5 images and 1.5 MiB of base64 per call (inside the 2 MiB frame and
+  4 MiB aggregate ceilings of [IMAGE_READ.md](IMAGE_READ.md)), shared by all
+  children of the call.
+- Each image is charged to the call's `task_max_cost_units` at its
+  patch-formula estimate (`ceil(w/28) * ceil(h/28)`, as in
+  `image_cost.rs`), converted with the task's cost weights; an image the
+  remaining budget cannot cover is omitted.
+
+Every attached record is listed in the Evidence table, and an `Inline images`
+block there states what was attached or why not. If at least one image was
+admitted, the `task` output is the same `{"response": …, "parts": [...]}`
+envelope `read` uses: `response` is the complete quoted text report and the
+images follow it at the end of `parts`, so earlier prompt-cache prefixes are
+undisturbed. Only the host builds the envelope; on the text path the host
+also prefixes `[task output]` to any output that would parse as a JSON
+object, so a child report can never be lifted into image content. A
+withheld report's attachments are ignored. Images of a child whose Evidence
+section was dropped for the output budget are not attached.
 
 ### Designer → implementer → reviewer pipeline
 
@@ -1158,6 +1208,7 @@ Key files:
 | `src/extras/subagents/task_tool.rs`          | `TaskTool` implementation             |
 | `src/extras/subagents/builder.rs`            | Subagent construction (`build_explore_agent`) |
 | `src/extras/subagents/isolation.rs`          | Worktree-isolated write children (`isolation: worktree`) |
+| `src/extras/subagents/inline_images.rs`      | Opt-in inline image lane (`task_inline_images`) |
 | `src/extras/subagents/prompt.rs`             | Subagent system prompt                |
 | `src/agent/runner.rs` (`run_subagent`)       | Silent agent execution                |
 | `src/agent/builder.rs`                       | Wires `TaskTool` into main agent      |

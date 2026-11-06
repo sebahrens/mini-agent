@@ -9,6 +9,17 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct SubagentPolicy {
     pub allow_write: bool,
+    /// Image evidence records one child may attach inline to its `task`
+    /// result (`[attach: E5]`) for a vision-capable parent. Default 0 (off);
+    /// clamped to 3 per child, and a call inlines at most 5 images in total.
+    /// Omitted when 0, so saving a config never adds the key.
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    pub task_inline_images: u8,
+}
+
+#[cfg(feature = "subagents")]
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
 }
 
 /// Proxy-unit strategy for task budgets; independent of monetary accounting.

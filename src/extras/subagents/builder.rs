@@ -116,6 +116,9 @@ pub(crate) struct PersonaExecution {
     /// Host evidence handles are on for this delegation: the child is told
     /// how to cite `[evidence: En]` (see `prompt::EVIDENCE_CITATION_RULES`).
     pub(crate) evidence: bool,
+    /// Image results this child may mark `[attach: E<n>]` for inline return
+    /// (0: the inline image lane is off and the child is not told about it).
+    pub(crate) inline_images: usize,
     /// `None` installs the complete read-only child tool set. `Some` is always
     /// a narrowing parsed from trusted persona metadata.
     pub(crate) tools: Option<Vec<AgentTool>>,
@@ -784,6 +787,10 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     if persona.evidence {
         preamble.push_str("\n\n");
         preamble.push_str(prompt::EVIDENCE_CITATION_RULES);
+        if persona.inline_images > 0 {
+            preamble.push_str("\n\n");
+            preamble.push_str(&super::inline_images::attach_rules(persona.inline_images));
+        }
     }
 
     #[cfg(feature = "agent-skills")]
@@ -2494,6 +2501,7 @@ mod provider_param_tests {
             write_mode: false,
             tools: None,
             evidence: false,
+            inline_images: 0,
             provider_extra_body: config.extra_body.clone(),
             additional_params: Some(serde_json::json!({"user": "persona-tenant"})),
             #[cfg(feature = "mcp")]

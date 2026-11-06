@@ -104,7 +104,7 @@
       "parent": "vision",
       "turns": [
         {"tools": [{"name": "read", "args": {"path": "assets/architecture.png"}}]},
-        {"text": "## Findings\n- [confidence: high] ANSWER: {{cw}}x{{ch}} are the pixel dimensions of assets/architecture.png. [evidence: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: assets/architecture.png.\n- Skipped: None."}
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{cw}}x{{ch}} are the pixel dimensions of assets/architecture.png. [evidence: E1] [attach: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: assets/architecture.png.\n- Skipped: None."}
       ]
     },
     {
@@ -115,7 +115,7 @@
       "parent": "text",
       "turns": [
         {"tools": [{"name": "read", "args": {"path": "screens/login.png"}}]},
-        {"text": "## Findings\n- [confidence: high] ANSWER: {{cw}}x{{ch}} are the pixel dimensions of screens/login.png. [evidence: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: screens/login.png.\n- Skipped: None."}
+        {"text": "## Findings\n- [confidence: high] ANSWER: {{cw}}x{{ch}} are the pixel dimensions of screens/login.png. [evidence: E1] [attach: E1]\n\n## Unverified\n- None.\n\n## Coverage\n- Covered: screens/login.png.\n- Skipped: None."}
       ]
     },
     {

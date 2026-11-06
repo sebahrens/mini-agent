@@ -63,11 +63,12 @@ class HarnessEvalCiTests(unittest.TestCase):
         self.assertIn("--marker PERSONA_EVAL", workflow)
         self.assertIn("--expect 5", workflow)
         self.assertIn("--expect 9", workflow)
-        # Evidence-handle axis: 11 cases x {on, off}, plus one summary.
+        # Evidence-handle axis: 11 cases x {on, off} + 2 inline-lane image arms.
         self.assertIn("--marker EVIDENCE_EVAL\n", workflow.replace(" \\\n", "\n"))
-        self.assertIn("--expect 22", workflow)
+        self.assertIn("--expect 24", workflow)
         self.assertIn("--require arm=on", workflow)
         self.assertIn("--require arm=off", workflow)
+        self.assertIn("--require arm=inline", workflow)
         self.assertIn("--marker EVIDENCE_EVAL_SUMMARY", workflow)
         self.assertIn("evidence-eval.jsonl", workflow)
         self.assertIn("harness-eval.jsonl", workflow)
@@ -223,8 +224,12 @@ class HarnessEvalExtractorTests(unittest.TestCase):
         fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
         names = [case["name"] for case in fixture["cases"]]
         self.assertEqual(len(names), len(set(names)))
-        # One record per case and arm (task_evidence on and off).
-        self.assertIn(f"--expect {2 * len(names)}", WORKFLOW.read_text(encoding="utf-8"))
+        # One record per case and arm (task_evidence on and off), plus the
+        # inline image lane arm of every case with images.
+        images = sum(1 for case in fixture["cases"] if case.get("images"))
+        self.assertIn(
+            f"--expect {2 * len(names) + images}", WORKFLOW.read_text(encoding="utf-8")
+        )
         kinds = {case["question"]["kind"] for case in fixture["cases"]}
         self.assertEqual(kinds, {"value", "count", "image"})
         self.assertEqual({case["parent"] for case in fixture["cases"]}, {"vision", "text"})
@@ -246,6 +251,9 @@ class HarnessEvalExtractorTests(unittest.TestCase):
             "off_correct": 0,
             "on_est_tokens": 3,
             "off_est_tokens": 1,
+            "inline_cases": 0,
+            "inline_correct": 0,
+            "inline_est_tokens": 0,
         }
         lines = [
             "test tests::x ... EVIDENCE_EVAL " + json.dumps(record),

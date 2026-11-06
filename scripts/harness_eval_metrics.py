@@ -42,6 +42,9 @@ REQUIRED_KEYS = {
         "off_correct",
         "on_est_tokens",
         "off_est_tokens",
+        "inline_cases",
+        "inline_correct",
+        "inline_est_tokens",
     ),
 }
 

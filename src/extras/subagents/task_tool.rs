@@ -504,6 +504,8 @@ struct ResolvedSpecialization {
     required_tools: Vec<String>,
     model: Option<String>,
     turn_budget: Option<crate::context::agents::AgentTurnBudget>,
+    /// Persona narrowing of the inline image lane.
+    inline_images: Option<u8>,
     #[cfg(feature = "mcp")]
     mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
@@ -635,6 +637,7 @@ fn resolve_persona_runtime_with(
             tools: specialization.tools.clone(),
             // Set per delegation from `task_evidence`.
             evidence: false,
+            inline_images: 0,
             // The same global or quick-model `extra_body` the main agent
             // would send for this model; persona params are merged on top.
             provider_extra_body: crate::config::resolve_extra_body(config, &model_name),
@@ -696,6 +699,7 @@ fn resolve_specialization(
         required_tools,
         model: definition.model,
         turn_budget: definition.turn_budget,
+        inline_images: definition.inline_images,
         #[cfg(feature = "mcp")]
         mcp_servers: definition.mcp_servers,
     }))
@@ -742,6 +746,9 @@ pub struct TaskTool {
         crate::sandbox::Sandbox,
         crate::sandbox::worker::WorkerContainmentStatus,
     )>,
+    /// The parent model's captured image support: decides whether attached
+    /// child images are inlined or degrade to evidence rows.
+    parent_image_support: super::inline_images::ParentSupport,
 }
 
 impl TaskTool {
@@ -826,7 +833,18 @@ impl TaskTool {
             skill_services: None,
             #[cfg(feature = "js")]
             read_only_js: None,
+            parent_image_support: None,
         }
+    }
+
+    /// The parent model's image support, as captured for its own `read`.
+    #[cfg(feature = "multimodal")]
+    pub(crate) fn with_parent_image_support(
+        mut self,
+        support: crate::agent::tools::read_image::ImageReadSupport,
+    ) -> Self {
+        self.parent_image_support = Some(support);
+        self
     }
 
     /// Where worktree-isolated write children are created.
@@ -1190,6 +1208,25 @@ editing in a known location, grepping for a literal you will act on immediately.
             )
         });
         let evidence_enabled = super::evidence::enabled(&config);
+        // Opt-in inline image lane: per-child cap (configured, narrowed by the
+        // persona, hard-capped), a per-call image/byte budget shared by all
+        // children, and the selected images collected by prompt index.
+        let inline_cap = super::inline_images::child_cap(
+            config
+                .subagents
+                .as_ref()
+                .map_or(0, |policy| policy.task_inline_images),
+            specialization
+                .as_ref()
+                .and_then(|resolved| resolved.inline_images),
+            evidence_enabled,
+            args.run_in_background,
+        );
+        let inline_budget = super::inline_images::CallBudget::default();
+        let inline_sink = InlineSink::default();
+        let executor_inline_sink = inline_sink.clone();
+        let parent_image_support = self.parent_image_support;
+        let inline_permission = self.permission.clone();
         let config = Arc::new(config);
         let spend_profile = spend_profile.map(|run| match &observation {
             Some(observation) => run.with_background_observation(observation.clone()),
@@ -1327,6 +1364,10 @@ editing in a known location, grepping for a literal you will act on immediately.
             let max_turns = runtime.max_turns;
             let mut persona = runtime.execution.clone();
             persona.evidence = evidence_enabled;
+            persona.inline_images = inline_cap;
+            let inline_budget = inline_budget.clone();
+            let inline_sink = executor_inline_sink.clone();
+            let inline_permission = inline_permission.clone();
             let event_tx = subagent_event_tx.clone();
             #[cfg(feature = "archmd")]
             let architecture = architecture.clone();
@@ -1560,7 +1601,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                                 task_id: stored.task_id.clone(),
                                 records: stored.metas.len(),
                             });
-                            Some(stored)
+                            Some((stored, pool.session_id().to_string()))
                         }
                         _ => None,
                     };
@@ -1582,10 +1623,47 @@ editing in a known location, grepping for a literal you will act on immediately.
                 });
                 // Host metadata only (no tool content), rendered by the
                 // scheduler after the child's closing quote fence.
+                // Attachments of an accepted report only: a withheld report's
+                // child prose decides nothing. Each admitted image is charged
+                // to the task's cost units by its patch-formula estimate.
+                let selection = match (&stored_evidence, &output) {
+                    (Some((stored, session_id)), Ok(text)) if inline_cap > 0 && !withheld => {
+                        let lane = super::inline_images::Lane {
+                            cap: inline_cap,
+                            parent: parent_image_support,
+                            call: &inline_budget,
+                            session_id,
+                            permission: &inline_permission,
+                        };
+                        super::inline_images::select(lane, stored, text, |tokens| {
+                            let units = cost_policy.units(&Usage {
+                                input_tokens: tokens,
+                                total_tokens: tokens,
+                                ..Usage::new()
+                            });
+                            let used = task_budget.used.load(std::sync::atomic::Ordering::Acquire);
+                            if used.saturating_add(units) > task_budget.limit {
+                                return false;
+                            }
+                            task_budget.charge(units);
+                            child_budget.charge(units);
+                            true
+                        })
+                        .await
+                    }
+                    _ => super::inline_images::Selection::default(),
+                };
                 let host_suffix = match (&stored_evidence, &output) {
-                    (Some(stored), Ok(text)) => render_evidence_section(stored, text, withheld),
+                    (Some((stored, _)), Ok(text)) => render_evidence_section(
+                        stored,
+                        text,
+                        withheld,
+                        &selection.listed,
+                        &selection.notes,
+                    ),
                     _ => None,
                 };
+                inline_sink.record(index, selection.images);
                 let output = match isolated_worktree {
                     Some(worktree) => {
                         let section = worktree.finish().await.render();
@@ -1637,7 +1715,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         )
                         .await;
                         let failed = report.stop_reason.is_some();
-                        let text = report.render();
+                        let text = super::inline_images::guard_text_output(report.render());
                         let details = Some(details_sink.take());
                         (if failed { Err(text) } else { Ok(text) }, details)
                     },
@@ -1658,7 +1736,10 @@ editing in a known location, grepping for a literal you will act on immediately.
                 details_sink.take(),
             );
         }
-        Ok(report.render())
+        // Only the host builds the envelope: the quoted text report first,
+        // the admitted images appended after it, in prompt order.
+        let images = inline_sink.take(&report);
+        Ok(super::inline_images::envelope(report.render(), &images))
     }
 }
 
@@ -1669,6 +1750,40 @@ enum Continuation {
     WriteUp,
     /// A child that broke the report contract restates its findings.
     Repair,
+}
+
+/// Per-call collector of the inline images each child's report attached.
+#[derive(Clone, Default)]
+struct InlineSink(
+    Arc<
+        std::sync::Mutex<std::collections::BTreeMap<usize, Vec<super::inline_images::InlineImage>>>,
+    >,
+);
+
+impl InlineSink {
+    fn record(&self, index: usize, images: Vec<super::inline_images::InlineImage>) {
+        if !images.is_empty() {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(index, images);
+        }
+    }
+
+    /// Images of children whose report reached the parent with its Evidence
+    /// section (which says what was attached), in prompt order.
+    fn take(&self, report: &TaskReport) -> Vec<super::inline_images::InlineImage> {
+        let mut children = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut images = Vec::new();
+        for (index, outcome) in report.outcomes.iter().enumerate() {
+            let delivered = matches!(outcome, TaskOutcome::Success(_) | TaskOutcome::Partial(_))
+                && report.suffixes.get(index).is_some_and(Option::is_some);
+            if delivered && let Some(attached) = children.remove(&index) {
+                images.extend(attached);
+            }
+        }
+        images
+    }
 }
 
 /// Per-call collector of what each child did, keyed by prompt index.
@@ -2356,6 +2471,8 @@ fn render_evidence_section(
     stored: &super::evidence::StoredEvidence,
     report: &str,
     withheld: bool,
+    attached: &std::collections::BTreeSet<usize>,
+    inline_notes: &[String],
 ) -> Option<String> {
     use super::evidence::Retention;
     let total = stored.metas.len();
@@ -2369,7 +2486,7 @@ fn render_evidence_section(
         stored
             .metas
             .iter()
-            .filter(|meta| scan.cited.contains(&meta.number))
+            .filter(|meta| scan.cited.contains(&meta.number) || attached.contains(&meta.number))
             .collect()
     };
     let mut section = format!(
@@ -2427,6 +2544,14 @@ fn render_evidence_section(
             "Note: {} high-confidence finding(s) cite no evidence.\n",
             scan.uncited_high
         ));
+    }
+    if !inline_notes.is_empty() {
+        section.push_str("Inline images (host decision; images follow the whole report):\n");
+        for note in inline_notes {
+            section.push_str("- ");
+            section.push_str(note);
+            section.push('\n');
+        }
     }
     Some(section)
 }
@@ -4310,6 +4435,7 @@ mod tests {
             required_tools: Vec::new(),
             model: None,
             turn_budget: None,
+            inline_images: None,
             #[cfg(feature = "mcp")]
             mcp_servers: None,
         };
@@ -4346,6 +4472,7 @@ mod tests {
             required_tools: Vec::new(),
             model: Some("fast-review".into()),
             turn_budget: Some(crate::context::agents::AgentTurnBudget::Medium),
+            inline_images: None,
             #[cfg(feature = "mcp")]
             mcp_servers: None,
         }
@@ -4474,7 +4601,10 @@ mod tests {
         assert_eq!(definition.tools.as_ref().unwrap().len(), 4);
         for allow in [false, true] {
             let mut config = crate::config::Config::default();
-            config.subagents = Some(crate::config::types::SubagentPolicy { allow_write: allow });
+            config.subagents = Some(crate::config::types::SubagentPolicy {
+                allow_write: allow,
+                ..Default::default()
+            });
             let client = crate::provider::create_client(
                 "openrouter",
                 Some("unused-local-test-key"),
@@ -6823,7 +6953,8 @@ mod evidence_contract_tests {
     #[tokio::test]
     async fn evidence_section_lists_only_cited_metadata_and_never_content() {
         let stored = stored().await;
-        let section = render_evidence_section(&stored, REPORT, false).unwrap();
+        let section =
+            render_evidence_section(&stored, REPORT, false, &Default::default(), &[]).unwrap();
         assert!(section.starts_with("## Evidence\n"), "{section}");
         assert!(section.contains("\"task_id\":\"task-xyz\""));
         assert!(section.contains("| E1 | read | src/a.rs |"), "{section}");
@@ -6834,7 +6965,8 @@ mod evidence_contract_tests {
         assert!(!section.contains("SECRET"), "no tool content in the table");
 
         // A withheld report still offers the index, with sanitized targets.
-        let withheld = render_evidence_section(&stored, "replaced", true).unwrap();
+        let withheld =
+            render_evidence_section(&stored, "replaced", true, &Default::default(), &[]).unwrap();
         assert!(withheld.contains("report was withheld"));
         assert!(
             withheld.contains("| E3 | read | notes...x.. |"),
@@ -6847,7 +6979,8 @@ mod evidence_contract_tests {
     #[tokio::test]
     async fn the_evidence_section_follows_the_closing_quote_fence() {
         let stored = stored().await;
-        let suffix = render_evidence_section(&stored, REPORT, false).unwrap();
+        let suffix =
+            render_evidence_section(&stored, REPORT, false, &Default::default(), &[]).unwrap();
         let expected_suffix = suffix.clone();
         let executor: TaskExecutor = Arc::new(move |_, _| {
             let suffix = suffix.clone();

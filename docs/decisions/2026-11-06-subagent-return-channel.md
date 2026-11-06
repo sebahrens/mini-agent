@@ -93,7 +93,8 @@ as directional.
   never read.
 - **Resizing images in `task_evidence`.** The build intentionally links no image decoder
   (`docs/agent/IMAGE_READ.md`), so `max_px` is a ceiling that omits oversized images rather than a
-  resampler. Downscaling belongs with the inline image lane (mini-agent-6m0om) if that lane is adopted.
+  resampler. The inline image lane (mini-agent-6m0om) applies the same rule: it omits an image over
+  1,568 px instead of adding a decoder dependency.
 
 ## Open points
 
@@ -104,7 +105,11 @@ as directional.
   at about 15x the parent-context tokens, spent almost entirely on records the parent chose to
   dereference. The parent is a scripted policy, not a model, so this bounds what the handles make
   available rather than how a model uses them. Verdict for the inline image lane: no-go as a
-  default; it ships opt-in with `task_inline_images = 0`.
+  default. Measured, it saves one `task_evidence` round trip (about 5% of that turn) in the one case
+  that needs an image, while billing the image on every later turn. mini-agent-6m0om ships it opt-in
+  with `task_inline_images = 0` (at most 3 per child and 5 per call, 1,568 px and 1.5 MiB limits,
+  charged to `task_max_cost_units`, text-only parents degrade to evidence rows); without an image
+  decoder an oversized image is omitted with a pointer to `task_evidence` rather than downscaled.
 - Image support on the Copilot, Azure, Bedrock and Vertex routes is unverified, so images stay gated on
   the same `image_read_support` capture that `read` uses.
 - The host-authored `## Isolated worktree` section of write children is still appended inside the

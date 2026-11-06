@@ -136,6 +136,8 @@ struct AgentMetadata {
     turn_budget: Option<AgentTurnBudget>,
     /// `isolation: worktree` was requested.
     isolation_worktree: bool,
+    /// `inline_images: N` (0-3) narrows `[subagents] task_inline_images`.
+    inline_images: Option<u8>,
     /// The turn budget came from the deprecated `effort` alias.
     deprecated_effort_alias: bool,
     #[cfg(feature = "mcp")]
@@ -301,6 +303,13 @@ fn normalize_agent_definition(
             None => return Err("frontmatter isolation must be a string"),
         },
     };
+    let inline_images = match mapping.get(serde_yaml_ng::Value::String("inline_images".into())) {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(count @ 0..=3) => Some(count as u8),
+            _ => return Err("frontmatter inline_images must be an integer from 0 to 3"),
+        },
+    };
     #[cfg(feature = "mcp")]
     let mcp_servers = mapping
         .get(serde_yaml_ng::Value::String("mcp_servers".into()))
@@ -317,6 +326,7 @@ fn normalize_agent_definition(
         "model",
         "turn_budget",
         "effort",
+        "inline_images",
         "mcp_servers",
     ];
     #[cfg(not(feature = "mcp"))]
@@ -330,6 +340,7 @@ fn normalize_agent_definition(
         "model",
         "turn_budget",
         "effort",
+        "inline_images",
     ];
     let mut unknown_keys = mapping
         .keys()
@@ -356,6 +367,7 @@ fn normalize_agent_definition(
                     model,
                     turn_budget,
                     isolation_worktree,
+                    inline_images,
                     deprecated_effort_alias,
                     #[cfg(feature = "mcp")]
                     mcp_servers,
@@ -608,6 +620,8 @@ pub struct AgentDefinition {
     /// git worktree and branch instead of the parent workspace. Meaningless
     /// (and ignored) without `mode: write`.
     pub(crate) isolation_worktree: bool,
+    /// `inline_images: N`: narrows the configured inline image lane cap.
+    pub(crate) inline_images: Option<u8>,
     pub source: AgentDefinitionSource,
     project_notes_path: Option<PathBuf>,
     ignored_definition_notices: Vec<String>,
@@ -634,6 +648,7 @@ fn merge_definitions(
                 #[cfg(feature = "mcp")]
                 mcp_servers: metadata.mcp_servers,
                 isolation_worktree: metadata.isolation_worktree,
+                inline_images: metadata.inline_images,
                 source: source.clone(),
                 project_notes_path: None,
                 ignored_definition_notices: notices,
@@ -676,6 +691,7 @@ impl AgentDefinition {
             #[cfg(feature = "mcp")]
             mcp_servers: None,
             isolation_worktree: false,
+            inline_images: None,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -1049,6 +1065,7 @@ fn merge_external_definitions(
                         #[cfg(feature = "mcp")]
                         mcp_servers: metadata.mcp_servers,
                         isolation_worktree: metadata.isolation_worktree,
+                        inline_images: metadata.inline_images,
                         source: source.clone(),
                         project_notes_path: None,
                         ignored_definition_notices: notices,
@@ -2338,6 +2355,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn persona_inline_images_is_a_bounded_integer_narrowing() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition(
+                "shots".into(),
+                format!("---\nname: shots\n{frontmatter}\n---\nbody"),
+            )
+        };
+        assert_eq!(parse("tools: Read").unwrap().2.inline_images, None);
+        assert_eq!(parse("inline_images: 0").unwrap().2.inline_images, Some(0));
+        assert_eq!(parse("inline_images: 3").unwrap().2.inline_images, Some(3));
+        assert!(parse("inline_images: 4").unwrap_err().contains("0 to 3"));
+        assert!(parse("inline_images: many").unwrap_err().contains("0 to 3"));
+        assert!(parse("inline_images: 2").unwrap().2.unknown_keys.is_empty());
+    }
+
+    #[test]
     fn persona_isolation_is_an_explicit_worktree_opt_in() {
         let parse = |frontmatter: &str| {
             normalize_agent_definition(
@@ -2548,6 +2581,7 @@ pub(crate) mod tests {
             #[cfg(feature = "mcp")]
             mcp_servers: None,
             isolation_worktree: false,
+            inline_images: None,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -2563,6 +2597,7 @@ pub(crate) mod tests {
             #[cfg(feature = "mcp")]
             mcp_servers: None,
             isolation_worktree: false,
+            inline_images: None,
             source: AgentDefinitionSource::UserGlobal,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -2584,6 +2619,7 @@ pub(crate) mod tests {
             #[cfg(feature = "mcp")]
             mcp_servers: None,
             isolation_worktree: false,
+            inline_images: None,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
