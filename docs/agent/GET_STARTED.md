@@ -332,6 +332,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | Flag | Action |
 | ---- | ------ |
 | `-p <msg>` | Sends a message |
+| `update [--check] [--release X.Y.Z]` | Not a flag: `mini-agent update` replaces the binary with a checksum-verified release (see `update_check` in [CONFIG.md](CONFIG.md)); `--check` only reports. Refuses package-manager, VS Code extension and Windows installs with the right command. |
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
 | `--max-budget-usd AMOUNT` | Finite nonnegative recorded-spend ceiling for the logical session, including auxiliary requests. Refused required continuation reports `budget` and exits nonzero; admitted work can exceed the estimate. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `--output-schema FILE` | With plain `-p`, validate an answer against a bounded offline JSON schema; default JSON envelope, at most two tool-free repairs. |

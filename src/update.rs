@@ -29,7 +29,7 @@ impl Drop for CheckLease {
     }
 }
 
-fn stable_version(value: &str) -> Option<[u64; 3]> {
+pub(crate) fn stable_version(value: &str) -> Option<[u64; 3]> {
     if value.len() > 64 {
         return None;
     }
@@ -48,12 +48,12 @@ fn stable_version(value: &str) -> Option<[u64; 3]> {
     parts.next().is_none().then_some(version)
 }
 
-fn normalized_version(value: &str) -> Option<String> {
+pub(crate) fn normalized_version(value: &str) -> Option<String> {
     let [major, minor, patch] = stable_version(value)?;
     Some(format!("{major}.{minor}.{patch}"))
 }
 
-fn github_latest_url(repository: &str) -> Option<String> {
+pub(crate) fn github_latest_url(repository: &str) -> Option<String> {
     let repository = repository.strip_prefix("https://github.com/")?;
     let repository = repository.strip_suffix(".git").unwrap_or(repository);
     let mut parts = repository.split('/');
@@ -105,6 +105,31 @@ pub(crate) fn should_check(
         return false;
     }
     true
+}
+
+/// One-line stderr notice for a `-p` run, from the cached daily check only (no
+/// network, so a headless run never waits). Interactive sessions refresh the
+/// cache; `update_check = true` and `--quiet` unset are both required.
+pub(crate) fn headless_notice(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    state: &Path,
+) -> Option<String> {
+    if !cli.print || cli.quiet || !cfg.update_check.unwrap_or(false) {
+        return None;
+    }
+    #[cfg(feature = "loop")]
+    if cli.loop_mode {
+        return None;
+    }
+    cached_headless_notice(state, env!("CARGO_PKG_VERSION"))
+}
+
+fn cached_headless_notice(state: &Path, current: &str) -> Option<String> {
+    let cache = read_cache(&state.join("update").join("latest.json")).ok()??;
+    let version = normalized_version(cache.latest_version.as_deref()?)?;
+    (stable_version(&version)? > stable_version(current)?)
+        .then(|| format!("[update] v{version} available; run `mini-agent update`."))
 }
 
 static PENDING_STARTUP_NOTICE: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<String>>> =
@@ -276,10 +301,16 @@ pub(crate) async fn verify_cross_process_admission(
 }
 
 async fn fetch_latest(endpoint: &str) -> Option<String> {
+    fetch_latest_within(endpoint, REQUEST_TIMEOUT).await
+}
+
+/// [`fetch_latest`] with a caller-chosen deadline (an explicit `update` can wait longer
+/// than the startup notice).
+pub(crate) async fn fetch_latest_within(endpoint: &str, timeout: Duration) -> Option<String> {
     let client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(REQUEST_TIMEOUT)
-        .connect_timeout(REQUEST_TIMEOUT)
+        .timeout(timeout)
+        .connect_timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("mini-agent/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -323,6 +354,40 @@ async fn fetch_latest(endpoint: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn headless_notice_reads_only_the_cache_and_ignores_stale_or_hostile_values() {
+        let dir = std::env::temp_dir().join(format!("update-notice-{}", uuid::Uuid::new_v4()));
+        let update = dir.join("update");
+        crate::fs::ensure_private_directory(&update).unwrap();
+        assert_eq!(
+            cached_headless_notice(&dir, "1.0.0"),
+            None,
+            "no cache, no network"
+        );
+        let write = |version: &str| {
+            let cache = Cache {
+                schema: 1,
+                checked_at: 1,
+                latest_version: Some(version.into()),
+            };
+            save_cache(&update.join("latest.json"), &cache).unwrap();
+        };
+        write("1.2.0");
+        assert_eq!(
+            cached_headless_notice(&dir, "1.0.0").as_deref(),
+            Some("[update] v1.2.0 available; run `mini-agent update`.")
+        );
+        assert_eq!(cached_headless_notice(&dir, "1.2.0"), None);
+        assert_eq!(cached_headless_notice(&dir, "2.0.0"), None);
+        std::fs::write(
+            update.join("latest.json"),
+            br#"{"schema":1,"checked_at":1,"latest_version":"1.2.0; rm -rf /"}"#,
+        )
+        .unwrap();
+        assert_eq!(cached_headless_notice(&dir, "1.0.0"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn update_versions_compare_numerically_and_reject_command_text() {

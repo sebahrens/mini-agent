@@ -8,6 +8,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### ACP, IDE and headless
 
+- `mini-agent update [--check] [--release X.Y.Z]` downloads the matching release archive, checks it
+  against `SHA256SUMS` with `install.sh`'s fail-closed rules, runs the new binary's `--version`,
+  and replaces the installed executable atomically (Unix). It refuses Homebrew, npm, cargo, Nix,
+  system-package, VS Code extension, local-build and Windows installs and prints the right command.
+  With `update_check = true`, `-p` now prints a one-line stderr update notice from the cached check.
 - Headless `-p` accepts images: `-i/--image FILE` (repeatable) and `image` content blocks
   (base64 or path source) on `--input-format stream-json`. They use `/add`'s size limits and
   downscaling, persist as a typed user message, and are refused with a clear error for a model the

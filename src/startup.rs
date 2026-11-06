@@ -3122,6 +3122,9 @@ impl Startup {
         } = self;
 
         crate::update::spawn_startup_notice(&cli, &cfg, is_interactive, &paths.state_dir);
+        if let Some(notice) = crate::update::headless_notice(&cli, &cfg, &paths.state_dir) {
+            eprintln!("{notice}");
+        }
         if let Some(days) = cfg.session_retention_days.filter(|days| *days > 0) {
             // The current session is already claimed, so it is never pruned.
             std::thread::spawn(move || {

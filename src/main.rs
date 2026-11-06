@@ -29,6 +29,7 @@ mod provider_listing;
 mod question;
 mod retry;
 mod sandbox;
+mod self_update;
 mod session;
 mod setup;
 mod spend;
@@ -76,6 +77,14 @@ fn main() -> anyhow::Result<ExitCode> {
     // largest single stack frame at startup (hundreds of KiB in an unoptimized
     // build); here it sits directly on `main` rather than on top of the
     // runtime and startup frames, all under the 1 MiB Windows default stack.
+    // `mini-agent update` is handled before clap so that only its exact forms
+    // are a subcommand; `mini-agent update the docs` stays an ordinary prompt.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(update) = self_update::parse_update_args(&argv) {
+        let runtime = normal_runtime().context("failed to initialize the async runtime")?;
+        let code = runtime.block_on(self_update::run(update));
+        return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+    }
     let cli = cli::Cli::parse_command_line();
     if let Some(shell) = cli.completions {
         match cli::write_completions(shell, &mut std::io::stdout().lock()) {
