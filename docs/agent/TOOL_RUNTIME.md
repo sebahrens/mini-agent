@@ -755,13 +755,22 @@ by `read` for `.ipynb` files. Notebook source is literal data; these operations
 never run a kernel, shell, or cell. The builtin name is reserved against MCP
 shadowing and included in cold context schema estimates. Select exactly one
 zero-based `cell_index`
-or `cell_id`. `replace` updates source while preserving type, execution count,
-outputs, attachments, metadata and unknown fields. `insert` adds before the
+or `cell_id`. `replace` updates source while preserving type, attachments,
+metadata and unknown fields; when it changes a code cell's source it also
+clears that cell's `outputs` and sets `execution_count` to `null`, since the old
+results no longer belong to the new source. `insert` adds before the
 selected cell (index equal to the cell count appends), with an optional
 `cell_type` of `code`, `markdown` or `raw`; `delete` removes that cell. Source
 strings remain strings, and source arrays remain arrays. Inserts into notebook
 4.0–4.4 do not mint cell IDs or change the format version; 4.5+ requires valid
 unique IDs and receives a new ID on insertion.
+
+The rewritten file keeps the original layout: the indentation unit is detected
+from the file (nbformat/Jupyter writes one space), single-line files stay
+compact, keys are written in sorted order like nbformat, and a final newline is
+kept when the original had one. Unchanged fields are written from their raw
+source fragments, so for a Jupyter-written notebook only the edited cell's lines
+change in a git diff.
 
 Untouched JSON field payloads remain validated raw JSON, preserving large
 integers and opaque metadata. Opaque nesting is not recursively traversed;

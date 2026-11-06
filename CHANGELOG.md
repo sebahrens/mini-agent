@@ -80,6 +80,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   limits are configurable under `[file_checkpoints]` (`max_file_bytes` defaulting to the edit/write
   size limit, `max_total_bytes` 64 MiB, `max_records` 2048; previously fixed at 1 MiB / 16 MiB /
   512) (mini-agent-m4au3).
+- `notebook_edit` replace now clears a changed code cell's stale `outputs` and `execution_count`,
+  and notebooks are rewritten in their original layout (detected indent, nbformat's sorted keys,
+  final newline) with untouched fields copied verbatim, so editing a Jupyter-written notebook
+  changes only the edited cell in `git diff` instead of re-indenting the whole file
+  (mini-agent-mnhpz).
 
 ### Added
 
