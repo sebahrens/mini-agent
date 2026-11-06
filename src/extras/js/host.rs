@@ -2706,10 +2706,17 @@ impl SpawnEffectService {
         timeout: Duration,
     ) -> Self {
         Self {
-            sandbox,
+            // Brokered JS spawn never inherits the shell-only
+            // `sandbox-network = "allow"` opt-in.
+            sandbox: sandbox.with_network(crate::sandbox::SandboxNetwork::Deny),
             permission_bridge,
             timeout,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sandbox_network(&self) -> crate::sandbox::SandboxNetwork {
+        self.sandbox.network()
     }
 
     #[cfg(test)]

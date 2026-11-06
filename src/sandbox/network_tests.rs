@@ -183,3 +183,20 @@ async fn sandbox_network_seatbelt_live_default_denies_and_opt_in_reaches_the_net
         );
     }
 }
+
+#[cfg(feature = "js")]
+#[tokio::test]
+async fn sandbox_network_opt_in_never_reaches_brokered_js_spawn() {
+    let sandbox = Sandbox::new(true, "seatbelt").with_network(SandboxNetwork::Allow);
+    let owner = crate::extras::js::tool::PermissionBridgeOwner::new(
+        None,
+        None,
+        std::time::Duration::from_secs(1),
+    );
+    let service = crate::extras::js::host::SpawnEffectService::new(
+        sandbox,
+        owner.bridge(),
+        std::time::Duration::from_secs(1),
+    );
+    assert_eq!(service.sandbox_network(), SandboxNetwork::Deny);
+}
