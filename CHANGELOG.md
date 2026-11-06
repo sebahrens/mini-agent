@@ -30,6 +30,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   configurable with `tool_result_spill_chars`, `tool_result_spill_head_chars` and
   `tool_result_spill_tail_chars`, and by default scales with the context window
   (`window / 10` characters, 12,000–50,000) instead of a fixed 12,000 (mini-agent-bjiqr).
+- Compaction summaries scale with the context window: up to `window / 32` response tokens
+  (4,096–20,000) and a matching stored rolling summary (at least 16 KiB), so large-window sessions
+  no longer squeeze all state into 4,096 tokens (mini-agent-wu3uc).
 
 ### Security
 

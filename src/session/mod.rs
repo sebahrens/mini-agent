@@ -2762,16 +2762,14 @@ impl Session {
         token_savings: u64,
         summary_byte_budget: usize,
     ) {
-        if summary_byte_budget >= 16 * 1024 {
-            self.compress(summary, first_kept_index, token_savings);
-        } else {
-            self.apply_compaction(
-                summary,
-                first_kept_index,
-                token_savings,
-                summary_byte_budget,
-            );
-        }
+        // The budget is already bounded by the window-scaled rolling-summary
+        // cap (mini-agent-wu3uc), so a large-window session keeps more.
+        self.apply_compaction(
+            summary,
+            first_kept_index,
+            token_savings,
+            summary_byte_budget,
+        );
     }
 
     fn apply_compaction(

@@ -1365,9 +1365,14 @@ on mid-turn compaction (real provider usage) rather than the between-turn check.
 The summarizer processes oversized history as bounded recent chunks with a
 rolling summary, at most 16 provider requests, and a five-minute aggregate
 deadline. Request byte budgets use the same conservative 3.25-character token
-estimate as session accounting. When a rolling summary exceeds its storage
-bound, each structured summary section retains its heading and prefix instead
-of dropping the middle sections. Compaction boundaries also snap backward to a
+estimate as session accounting. The summary response and the stored rolling
+summary scale with the context window: the response may use up to
+`context_window / 32` tokens (at least 4,096, at most 20,000, and never more than
+the configured reserve unless the reserve is below 256), and the stored summary
+keeps up to four bytes per such token (at least 16 KiB; 80,000 bytes for a 1M
+window). A 128k window keeps the historical 4,096-token / 16 KiB bounds. When a
+rolling summary exceeds its storage bound, each structured summary section
+retains its heading and prefix instead of dropping the middle sections. Compaction boundaries also snap backward to a
 user or assistant message so a retained tool result is never separated from
 its call. If a provider still rejects an ordinary headless request (`-p`, `--loop`
 or goal rounds) for exceeding its context limit, mini-agent records the progress the
