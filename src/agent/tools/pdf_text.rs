@@ -1929,13 +1929,14 @@ pub(crate) fn render_with_images(
             format!("Cannot read page {page} of '{path}' as PDF text: {error}.")
         })?;
         let notes = content.notes.join("; ");
+        let mut pending_without_text = None;
         let mut block = if content.text.is_empty() {
             let block = if notes.is_empty() {
                 format!("--- page {page} ---\n[no text layer on this page]\n\n")
             } else {
                 format!("--- page {page} ---\n[page {page}: {notes}]\n\n")
             };
-            without_text.push((page, content));
+            pending_without_text = Some(content);
             block
         } else if notes.is_empty() {
             format!("--- page {page} ---\n{}\n\n", content.text)
@@ -1964,6 +1965,11 @@ pub(crate) fn render_with_images(
         body_chars += block_chars;
         body.push_str(&block);
         shown.push(page);
+        // Only pages actually emitted are candidates for image lifting or the
+        // all-scanned report; a page cut by the budget is re-read on continue.
+        if let Some(content) = pending_without_text {
+            without_text.push((page, content));
+        }
     }
     #[cfg_attr(not(feature = "multimodal"), allow(unused_mut))]
     let mut attached = Attached::default();
@@ -2429,6 +2435,39 @@ mod tests {
             output.contains("some content was not extracted: content stream uses CCITTFaxDecode"),
             "{output}"
         );
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn budget_cut_scan_page_is_not_attached_as_an_image() {
+        let image = first_extra_object(2);
+        let jpeg = include_bytes!("fixtures/read-image64/3x2.jpg");
+        let mut object = format!(
+            "<< /Type /XObject /Subtype /Image /Width 3 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
+            jpeg.len()
+        )
+        .into_bytes();
+        object.extend_from_slice(jpeg);
+        object.extend_from_slice(b"\nendstream");
+        let pdf = build_with(
+            &[
+                Content::Plain(HELLO_PAGE.into()),
+                Content::Plain("q 612 0 0 792 0 0 cm /Im0 Do Q".into()),
+            ],
+            false,
+            &format!("/XObject << /Im0 {image} 0 R >>"),
+            vec![object],
+        );
+        // Unconstrained: the scan page is lifted as an image.
+        let full = render_with_images(&pdf, "doc.pdf", None, 10_000, 4, false).unwrap();
+        assert_eq!(full.images.len(), 1, "{}", full.text);
+        // Budget fits page 1 only: the scan page is cut, named for
+        // continuation, and must not also be attached.
+        let cut = render_with_images(&pdf, "doc.pdf", None, 60, 4, false).unwrap();
+        assert!(cut.text.contains("[truncated before page 2"), "{}", cut.text);
+        assert!(cut.text.contains("Hello filters"), "{}", cut.text);
+        assert!(cut.images.is_empty(), "{}", cut.text);
+        assert!(!cut.text.contains("image"), "{}", cut.text);
     }
 
     #[test]
