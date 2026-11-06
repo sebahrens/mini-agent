@@ -4495,7 +4495,7 @@ async fn native_replay_headless_pressure_ends_the_turn_at_the_tool_boundary() {
     assert!(error.to_string().contains(&sid), "{error}");
     assert!(
         !format!("{error:#}").contains("ProviderError")
-            && error.to_string().contains("Start a fresh context"),
+            && error.to_string().contains("start a fresh context"),
         "an explicit stop, not a provider error: {error}"
     );
     assert_eq!(wire.finish().len(), 1, "no request after the boundary");
@@ -4509,6 +4509,152 @@ async fn native_replay_headless_pressure_ends_the_turn_at_the_tool_boundary() {
             .iter()
             .any(|row| row.content.contains("boundary read")),
         "the completed tool result is saved"
+    );
+}
+
+/// mini-agent-tmysj: a native Anthropic headless turn that fills the context
+/// mid-turn closes its native epoch at the tool-batch boundary, compacts the
+/// saved transcript, restarts the thinking chain in a new epoch and finishes
+/// the task, instead of stopping with "start a fresh context".
+#[tokio::test]
+async fn native_replay_headless_pressure_compacts_and_continues_in_a_new_epoch() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = crate::tests::OwnedTestDirectory::new("native-mid-turn-continue");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "MINI_AGENT_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
+    ]);
+    #[cfg(feature = "hooks")]
+    let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
+    let tool_turn = start()
+        + &thinking(0, "", "NATIVE_RELIEF_SIGNATURE")
+        + &event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_relief","name":"read","input":{}}}),
+        )
+        + &event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"held.txt\"}"}}),
+        )
+        + &event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":1}),
+        )
+        + &event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":2}}),
+        )
+        + &event("message_stop", json!({"type":"message_stop"}));
+    let summary = start() + &text(0, "RELIEF SUMMARY OF EARLIER WORK") + &finish();
+    let answer = start() + &text(0, "task finished after relief") + &finish();
+    let wire = Wire::new(vec![(true, tool_turn), (true, summary), (true, answer)]);
+    let cfg: crate::config::Config = serde_json::from_value(json!({
+        "session_title_model":"off","compact_enabled":true,"mid_turn_compact_threshold":0.00001,
+        "keep_recent_tokens":1,
+        "custom_providers":{"native-relief":{"provider_type":"anthropic","base_url":wire.base}},
+        "quick_models":{"native-relief-model":{"provider":"native-relief","model":"claude-opus-5-5","input_token_cost":2.0,"output_token_cost":4.0}}
+    })).unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
+    std::fs::write(roots.path().join("held.txt"), "boundary read").unwrap();
+    let paths = crate::paths::process_paths_ref().unwrap();
+    let mut seed = crate::session::Session::new("native-relief", "claude-opus-5-5", 128_000, "");
+    seed.working_dir = workspace.root().to_string_lossy().into_owned().into();
+    seed.set_input_output_prices(Some((2.0, 4.0)));
+    for index in 0..3 {
+        seed.add_message(
+            crate::session::MessageRole::User,
+            &format!("earlier question {index} {}", "context ".repeat(40)),
+        );
+        seed.add_message(
+            crate::session::MessageRole::Assistant,
+            &format!("earlier answer {index} {}", "detail ".repeat(40)),
+        );
+    }
+    let sid = seed.id.to_string();
+    crate::session::storage::save_session(&seed).unwrap();
+    crate::session::lock::release_session(&sid);
+    let cli = crate::cli::Cli {
+        api_key: Some("owned-native-key".into()),
+        quick_model: Some("native-relief-model".into()),
+        session: Some(sid.clone()),
+        print: true,
+        quiet: true,
+        no_context_files: true,
+        tools: vec!["read".into()],
+        no_sandbox: true,
+        message: vec!["read the held file".into()],
+        ..Default::default()
+    };
+    let mut startup = crate::startup::heap_future(|| async {
+        Box::new(
+            crate::startup::Startup::init(
+                cli,
+                cfg.clone(),
+                paths.clone(),
+                workspace.clone(),
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap(),
+        )
+    })
+    .await;
+    crate::startup::heap_future(|| startup.init_features())
+        .await
+        .unwrap();
+    crate::startup::heap_future(|| startup.resolve_prompts())
+        .await
+        .unwrap();
+    let result = crate::startup::heap_future(|| startup.dispatch()).await;
+    crate::session::lock::release_session(&sid);
+    result.unwrap_or_else(|error| panic!("relief must continue the task: {error:#}"));
+    let bodies = wire.finish();
+    assert_eq!(bodies.len(), 3, "tool turn, summarizer, continuation");
+    let continuation = bodies[2]["messages"].to_string();
+    assert!(
+        continuation.contains("RELIEF SUMMARY OF EARLIER WORK"),
+        "{continuation}"
+    );
+    assert!(
+        !continuation.contains("NATIVE_RELIEF_SIGNATURE"),
+        "the old epoch's signed thinking is not replayed: {continuation}"
+    );
+    assert!(
+        continuation.contains("boundary read"),
+        "tool result survives"
+    );
+    let sessions = crate::paths::WorkspaceBinding::capture(&paths.sessions_dir()).unwrap();
+    let saved = crate::session::storage::load_session_exact_read_only(&sessions, &sid, &workspace)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !saved.compactions.is_empty(),
+        "the transcript was compacted"
+    );
+    assert_eq!(saved.native_frontier.refusal(), None);
+    assert!(
+        saved
+            .messages
+            .iter()
+            .any(|row| row.content.contains("task finished after relief")),
+        "the continued answer is saved"
     );
 }
 

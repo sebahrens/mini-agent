@@ -15,6 +15,7 @@ const ui = vi.hoisted(() => ({
   showWarningMessage: vi.fn(),
   showInformationMessage: vi.fn(),
   showQuickPick: vi.fn(),
+  showInputBox: vi.fn(),
 }));
 const logMock = vi.hoisted(() => ({
   info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(),
@@ -36,6 +37,7 @@ vi.mock('vscode', () => ({
     showWarningMessage: ui.showWarningMessage,
     showInformationMessage: ui.showInformationMessage,
     showQuickPick: ui.showQuickPick,
+    showInputBox: ui.showInputBox,
   },
 }));
 vi.mock('../src/log', () => ({ log: logMock }));
@@ -113,6 +115,102 @@ describe('AgentSession saved-session public adapter', () => {
       expect(offered).toEqual(['s1', 's2', 's3', 's4']);
       expect(cursors).toEqual([undefined, 'c2', 'c3']);
     } finally { await session.stop(); session.dispose(); }
+  });
+
+  // mini-agent-bftfm: session/list reports catalogue_truncated / skipped_entries in _meta.
+  // The picker must say older sessions are unlisted and let the user load one by id.
+  it('shows the catalogue notice and loads a session entered by id when the listing is truncated', async () => {
+    successfulProbe();
+    spawnMock.mockReturnValueOnce(new FakeProtocolProcess());
+    const loads: unknown[] = [];
+    const agent = {
+      request: vi.fn(async (method: string, params: Record<string, unknown>) => {
+        switch (method) {
+          case 'initialize': return { protocolVersion: 1, agentCapabilities: { loadSession: true } };
+          case 'session/new': return { sessionId: 'current' };
+          case 'session/list': return {
+            sessions: [{ sessionId: 's1', cwd: '/w' }],
+            _meta: { catalogue_truncated: true, skipped_entries: 2 },
+          };
+          case 'session/load': loads.push(params.sessionId); return {};
+          default: return {};
+        }
+      }),
+      notify: vi.fn(async () => undefined),
+    };
+    protocol.connect.mockReturnValue({ agent, close: vi.fn() });
+    let shown: { label: string; detail?: string; sessionId?: string }[] = [];
+    ui.showQuickPick.mockImplementationOnce(async (items: typeof shown) => {
+      shown = items;
+      return items[items.length - 1];
+    });
+    ui.showInputBox.mockResolvedValueOnce('  older-session-id  ');
+    const session = makeSession();
+    try {
+      await session.resumeSavedSession();
+      expect(shown.map(item => item.sessionId)).toEqual(['s1', undefined]);
+      const footer = shown[shown.length - 1]!;
+      expect(footer.label).toMatch(/Enter session id/);
+      expect(footer.detail).toContain('Older saved sessions exist but are not listed');
+      expect(footer.detail).toContain('at most 100 of the newest sessions');
+      expect(footer.detail).toContain('2 unsafe, invalid or oversized entries were skipped.');
+      expect(loads).toEqual(['older-session-id']);
+    } finally { await session.stop(); session.dispose(); }
+  });
+
+  it('offers the notice for skipped entries alone, and nothing extra for a complete listing', async () => {
+    const offered: string[][] = [];
+    for (const meta of [{ catalogue_truncated: false, skipped_entries: 3 }, { catalogue_truncated: false, skipped_entries: 0 }, undefined]) {
+      successfulProbe();
+      spawnMock.mockReturnValueOnce(new FakeProtocolProcess());
+      const agent = {
+        request: vi.fn(async (method: string) => {
+          switch (method) {
+            case 'initialize': return { protocolVersion: 1, agentCapabilities: { loadSession: true } };
+            case 'session/new': return { sessionId: 'current' };
+            case 'session/list': return { sessions: [{ sessionId: 's1', cwd: '/w' }], ...(meta ? { _meta: meta } : {}) };
+            default: return {};
+          }
+        }),
+        notify: vi.fn(async () => undefined),
+      };
+      protocol.connect.mockReturnValue({ agent, close: vi.fn() });
+      ui.showQuickPick.mockImplementationOnce(async (items: { label: string; detail?: string }[]) => {
+        offered.push(items.map(item => item.detail ?? item.label));
+        return undefined;
+      });
+      const session = makeSession();
+      try { await session.resumeSavedSession(); } finally { await session.stop(); session.dispose(); }
+    }
+    expect(offered[0]).toHaveLength(2);
+    expect(offered[0]![1]).toBe('3 unsafe, invalid or oversized entries were skipped.');
+    expect(offered[1]).toEqual(['s1']);
+    expect(offered[2]).toEqual(['s1']);
+  });
+
+  it('does not load anything when the entered session id is empty or cancelled', async () => {
+    successfulProbe();
+    spawnMock.mockReturnValueOnce(new FakeProtocolProcess());
+    const agent = {
+      request: vi.fn(async (method: string) => {
+        switch (method) {
+          case 'initialize': return { protocolVersion: 1, agentCapabilities: { loadSession: true } };
+          case 'session/new': return { sessionId: 'current' };
+          case 'session/list': return { sessions: [], _meta: { catalogue_truncated: true } };
+          default: return {};
+        }
+      }),
+      notify: vi.fn(async () => undefined),
+    };
+    protocol.connect.mockReturnValue({ agent, close: vi.fn() });
+    ui.showQuickPick.mockImplementation(async (items: unknown[]) => items[0]);
+    ui.showInputBox.mockResolvedValueOnce('   ').mockResolvedValueOnce(undefined);
+    const session = makeSession();
+    try {
+      await session.resumeSavedSession();
+      await session.resumeSavedSession();
+      expect(agent.request.mock.calls.some(call => call[0] === 'session/load')).toBe(false);
+    } finally { ui.showQuickPick.mockReset(); await session.stop(); session.dispose(); }
   });
 
   it('does not list or load while the current prompt owns retirement', async () => {

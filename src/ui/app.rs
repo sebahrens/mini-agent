@@ -7768,7 +7768,33 @@ impl<'a> App<'a> {
                 self.restore_pending_steering(&steering)?;
             }
             self.run.steering = None;
-            self.renderer.write_line("Context is full. Tool results are saved; start a fresh context before compacting this unfinished reply.", C_ERROR)?;
+            // The native epoch is closed at the tool-batch boundary, so the
+            // saved transcript can be compacted and the thinking chain
+            // restarted from it right away (the same path as between turns).
+            // The restored prompt then continues on the compacted context
+            // without /clear (mini-agent-tmysj).
+            let reasoning_enabled = self.slash.reasoning_enabled;
+            let compacted = crate::ui::slash::handle_compress_with_force(
+                None,
+                true,
+                true,
+                &mut self.run,
+                &mut self.renderer,
+                &mut self.ui,
+                reasoning_enabled,
+            )
+            .await;
+            let notice = match compacted {
+                Ok(()) => {
+                    "Context was full. Tool results are saved and the conversation was compacted; press Enter to continue on the compacted context."
+                }
+                Err(error) => {
+                    self.renderer
+                        .write_line(&format!("auto-compact error: {error:#}"), C_ERROR)?;
+                    "Context is full. Tool results are saved; send a follow-up prompt to retry the compaction, or start a fresh context."
+                }
+            };
+            self.renderer.write_line(notice, C_ERROR)?;
             return Ok(());
         }
         mid_turn_compact_and_respawn(

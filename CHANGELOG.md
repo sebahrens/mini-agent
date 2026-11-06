@@ -16,6 +16,19 @@ Notable changes to mini-agent are documented in this file. The format follows
 - A managed policy that sets `permissions.deny`, `allowed_modes` or `disable_yolo` now also refuses
   `--dangerously-skip-permissions`, since skipping checks would void those rules (mini-agent-khizh).
 - `job_status` `wait` with `until=` scans unread output once more after the job ends or the deadline hits, and walks backlogs larger than 256 KiB in chunks (reporting bytes that were neither retained nor logged) instead of skipping the middle (mini-agent-d1v5g, mini-agent-kjdud). `--import-agent-skill`, `--import-learned-skill`, `--distill-learned-skill-out` and `--sandbox-toolchain-root` resolve against the launch directory (mini-agent-zn9i2). The bwrap network forwarder answers connections beyond its relay cap with an HTTP 503 and a one-line stderr notice, and the cap is configurable with `MINI_AGENT_NET_MAX_RELAYS` (mini-agent-tgmxc).
+- VS Code `Mini Agent: Resume` reads the `session/list` `catalogue_truncated` / `skipped_entries` flags, says when older
+  or unreadable sessions are not listed, and offers "Enter session id" to load one directly (mini-agent-bftfm).
+- A session entered with `/resume`, `/fork` or `/import` gets the same "child ids are no longer
+  resumable" and environment-change notices as a `--resume` launch, once (mini-agent-ji9iy).
+- `memory_search` also searches the project `SCRATCHPAD.md` (closed `- [x]` items included, labelled as the
+  scratchpad), so completed checklist items are findable (mini-agent-o7r8j).
+- ACP sessions on the Anthropic provider are auto-compacted between turns under token pressure like
+  the TUI (the thinking chain restarts over the compacted transcript) instead of dying at the
+  context window or byte guard (mini-agent-ewkrr). A native Anthropic turn that fills the context
+  mid-turn compacts and continues in a new native epoch in headless runs, and the TUI compacts at
+  the stop so Enter continues (mini-agent-tmysj). Headless context relief has no fixed three-per-turn
+  cap; it stops, naming the reason, when nothing is left to compact, a compaction frees no space, or
+  two reliefs happen with no tool progress between them (mini-agent-sfbv9).
 - Relative `--add-dir`, `--image`, `--output-schema`, `--loop-plan` and `--log-file` paths keep
   resolving against the launch directory under `project_root_discovery` (mini-agent-k8w51). The
   `--stream-json-control` sandbox network ask is per `host:port` (concurrent connections share one

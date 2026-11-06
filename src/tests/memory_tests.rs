@@ -185,6 +185,35 @@ fn scratchpad_write_then_inject_open_items_only() {
     cleanup(&m);
 }
 
+// mini-agent-o7r8j: a closed `- [x]` item is not injected into the prompt, but
+// memory_search must still find it, labelled as the scratchpad.
+#[test]
+fn search_finds_closed_scratchpad_items_and_labels_them() {
+    let m = fresh("sp-search");
+    m.write(
+        WriteTarget::Scratchpad,
+        "- [ ] open task\n- [x] migrated the ZEBRAFISH schema",
+        WriteMode::Overwrite,
+        None,
+    )
+    .unwrap();
+    assert!(!m.context_block().unwrap().contains("ZEBRAFISH"));
+    let results = m.search("zebrafish");
+    assert_eq!(results.hits.len(), 1);
+    assert!(results.hits[0].path.ends_with("SCRATCHPAD.md"));
+    assert!(results.hits[0].body.contains("ZEBRAFISH"));
+    let rendered = results.render(8 * 1024);
+    assert!(
+        rendered.contains("project scratchpad") && rendered.contains("source=scratchpad"),
+        "{rendered}"
+    );
+    // A missing scratchpad is neither a hit nor an unreadable-file warning.
+    fs::remove_file(scratchpad(&m)).unwrap();
+    let gone = m.search("zebrafish");
+    assert!(gone.hits.is_empty() && gone.warnings.is_empty());
+    cleanup(&m);
+}
+
 #[test]
 fn scratchpad_filter_handles_indent_and_star_bullets() {
     let m = fresh("spf");

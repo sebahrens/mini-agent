@@ -1583,12 +1583,15 @@ and *within* a turn when real prompt pressure crosses `mid_turn_compact_threshol
 (default `0.9`) in the TUI, headless `-p`, `/loop`, goal rounds, `--no-session` and ACP
 prompts. A headless or ACP turn stops at the next complete tool batch, records its progress,
 compacts the session history (in memory under `--no-session`) and continues with a
-continuation prompt, at most three times per turn; ACP also sends a short agent-thought
-notice. Between turns a provider-native (Anthropic replay) session compacts like any other (TUI
-auto-compaction and `/compact`, headless pre-turn compaction): its signed thinking chain cannot be
+continuation prompt; ACP also sends a short agent-thought notice and compacts at most
+three times per prompt. Headless relief has no fixed per-turn cap: it continues while each
+compaction frees space and tools ran since the previous relief, and stops with a named reason
+(nothing left to compact, a compaction freed no space or failed, or two reliefs with no tool
+progress between them). Between turns a provider-native (Anthropic replay) session compacts like any other (TUI
+auto-compaction and `/compact`, headless pre-turn compaction, and ACP prompts under token pressure): its signed thinking chain cannot be
 summarized in place, so the compaction restarts the chain from the compacted transcript as a new
-replay epoch, with a one-line notice (earlier thinking blocks are dropped). It is not compacted
-mid-turn, and ACP refuses to compact one with a visible message before any summarizer spend. Tools with their own output limits (`read`,
+replay epoch, with a one-line notice (earlier thinking blocks are dropped). Mid-turn, headless
+and TUI turns on one compact too (see below); ACP does not compact mid-turn yet, but an ACP prompt is never refused for want of in-place compaction. Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
 and the subagent `task` tool) retain their documented line, byte, and result
 limits in both live and replayed history. Their
@@ -1704,14 +1707,21 @@ order, and pauses before another provider request can start. The TUI then
 compacts and resumes the same task. Headless `-p`, `--loop` and goal rounds do the
 same: the runner returns at that boundary, the turn's records are written to the
 session (in memory only under `--no-session`), the session is compacted and the
-task continues with a short continuation prompt, at most three times per turn. A
+task continues with a short continuation prompt, for as long as each compaction frees space
+(there is no fixed number of compactions per turn; a relief stops, naming the reason, when
+nothing older than the kept recent history is left to compact, a compaction freed no space or
+failed, or two consecutive reliefs occur with no tool progress between them). A
 boundary at which nothing older than the kept recent history exists continues
 without the mid-turn trigger. ACP turns do not compact mid-turn yet. A native Anthropic replay session
 cannot be summarized in place (its signed thinking blocks and tool pairing replay
-verbatim), so headless `-p`/`--loop` turns on one stop at the tool-batch boundary
-with an explicit "context is N% full ... start a fresh context" error and the
-completed tool results saved, instead of failing with a provider context error; the
-interactive UI does the same. It never aborts an in-flight tool merely to
+verbatim), so on one the relief closes the native epoch at the tool-batch boundary (every
+completed tool result is saved), compacts the saved transcript, restarts the thinking chain from
+it as a new epoch (earlier thinking blocks are dropped, with a one-line notice) and resumes the
+task with the continuation prompt, in headless `-p`/`--loop` and goal rounds. The interactive UI
+closes the epoch and compacts there too, then restores your prompt so Enter continues on the
+compacted context. When nothing can be compacted, headless stops with an explicit "context is N%
+full ... follow-up prompt ... or start a fresh context" error and the completed tool results
+saved, instead of failing with a provider context error; a follow-up prompt compacts first. It never aborts an in-flight tool merely to
 create a compaction boundary.
 
 Tool calls and results are persisted as structured session messages before the

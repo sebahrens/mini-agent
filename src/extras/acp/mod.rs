@@ -170,7 +170,7 @@ impl Default for AcpHistoryLimits {
 }
 
 impl AcpHistoryLimits {
-    fn from_config(cfg: &Config, window: u64, reserve: u64, native: bool) -> Self {
+    fn from_config(cfg: &Config, window: u64, reserve: u64) -> Self {
         let scaled = usize::try_from(window.saturating_mul(4)).unwrap_or(usize::MAX);
         Self {
             max_turns: cfg.acp_history_max_turns.unwrap_or(0),
@@ -178,9 +178,12 @@ impl AcpHistoryLimits {
                 .acp_history_max_bytes
                 .unwrap_or_else(|| scaled.max(MAX_ACP_HISTORY_BYTES))
                 .max(64 * 1024),
-            // Native (provider-owned) history is never auto-compacted in
-            // place, exactly as in the TUI; only hard bounds apply to it.
-            token_pressure: (cfg.resolve_compact_enabled() && !native && window > 0).then(|| {
+            // Native (Anthropic) history compacts between turns under token
+            // pressure exactly as in the TUI: the summary replaces the old
+            // transcript and the thinking chain is restarted from it
+            // (`restart_native_after_compaction`). Only the mid-turn path
+            // stays off for native history.
+            token_pressure: (cfg.resolve_compact_enabled() && window > 0).then(|| {
                 AcpTokenPressure {
                     window,
                     reserve,
@@ -559,6 +562,33 @@ impl SessionHistory {
                 .compress(Self::EMERGENCY_RECAP.to_owned(), cut, 0);
         }
     }
+}
+
+/// After a compaction rewrote a native (Anthropic) session's transcript, drop
+/// the thinking chain built over the old one and republish the compacted
+/// transcript as a new epoch, through the same path the TUI uses
+/// (`reconcile_native_chain`). A no-op when the chain is still replayable.
+pub(crate) async fn restart_native_after_compaction(
+    session: &mut crate::session::Session,
+    owner: Option<&mut crate::provider::NativeRunOwner>,
+) -> anyhow::Result<()> {
+    if session.native_restart_cause().is_none() {
+        return Ok(());
+    }
+    match owner.and_then(|owner| owner.ticket.as_mut().map(|ticket| (ticket, &owner.scope))) {
+        Some((ticket, scope)) => {
+            crate::session::native_publication::restart_with_ticket(session, ticket, scope).await
+        }
+        None => Ok(session.restart_native_chain()?),
+    }
+}
+
+/// Test hook: whether native-session history limits carry token pressure.
+#[cfg(test)]
+pub(crate) fn acp_native_limits_for_test(cfg: &Config, window: u64, reserve: u64) -> bool {
+    AcpHistoryLimits::from_config(cfg, window, reserve)
+        .token_pressure
+        .is_some()
 }
 
 fn acp_capabilities() -> AgentCapabilities {
@@ -5075,14 +5105,9 @@ async fn execute_prompt(
         let reserve = state
             .cfg
             .resolve_reserve_tokens(&model_str, quick_models, window);
-        history.limits = AcpHistoryLimits::from_config(&state.cfg, window, reserve, native);
+        history.limits = AcpHistoryLimits::from_config(&state.cfg, window, reserve);
     }
     let needs_compaction = history.needs_compaction();
-    if native && needs_compaction {
-        return Ok(PromptOutcome::failed(
-            "native history cannot be compacted in place; start a new ACP session".into(),
-        ));
-    }
     let work_scope = crate::agent::runner::AgentWorkScope::new();
     #[cfg(feature = "hooks")]
     work_scope.set_hook_execution_root(workspace.root());
@@ -5202,6 +5227,14 @@ async fn execute_prompt(
         let Some(usage) = compacted else {
             return Ok(PromptOutcome::cancelled(None));
         };
+        if native
+            && let Err(error) =
+                restart_native_after_compaction(&mut history.session, native_owner.as_mut()).await
+        {
+            return Ok(PromptOutcome::failed(persona::bounded_message(&format!(
+                "could not restart the native thinking context after compaction: {error:#}"
+            ))));
+        }
         if history.exceeds_hard_bound() || history.over_turn_cap() {
             return Ok(PromptOutcome::failed(
                 "retained historical image evidence exceeds the ACP history limit; start a fresh session or provide fewer/smaller images".into(),
@@ -6349,7 +6382,7 @@ mod history_tests {
     fn mv5wx_configured_history_has_no_default_turn_cap() {
         let cfg = Config::default();
         let mut history = SessionHistory {
-            limits: AcpHistoryLimits::from_config(&cfg, 1_000_000, 16_384, false),
+            limits: AcpHistoryLimits::from_config(&cfg, 1_000_000, 16_384),
             ..Default::default()
         };
         assert_eq!(history.limits.max_turns, 0);
@@ -6363,7 +6396,7 @@ mod history_tests {
         }
         assert!(!history.needs_compaction());
         // The byte guard never drops below its documented floor.
-        let small = AcpHistoryLimits::from_config(&cfg, 1_000, 100, false);
+        let small = AcpHistoryLimits::from_config(&cfg, 1_000, 100);
         assert_eq!(small.max_bytes, MAX_ACP_HISTORY_BYTES);
         let explicit = AcpHistoryLimits::from_config(
             &Config {
@@ -6373,7 +6406,6 @@ mod history_tests {
             },
             1_000_000,
             0,
-            false,
         );
         assert_eq!((explicit.max_turns, explicit.max_bytes), (5, 64 * 1024));
         history.limits = explicit;
@@ -6389,7 +6421,7 @@ mod history_tests {
             ..Default::default()
         };
         let mut history = SessionHistory {
-            limits: AcpHistoryLimits::from_config(&cfg, 20_000, 2_000, false),
+            limits: AcpHistoryLimits::from_config(&cfg, 20_000, 2_000),
             ..Default::default()
         };
         assert!(history.limits.token_pressure.is_some());
@@ -6410,11 +6442,11 @@ mod history_tests {
             "token pressure drops more than one interval"
         );
         assert!(cut <= *starts.last().unwrap(), "recent turns are kept");
-        // Native history is never auto-compacted on token pressure.
-        let native = AcpHistoryLimits::from_config(&cfg, 20_000, 2_000, true);
-        assert!(native.token_pressure.is_none());
+        // Native (Anthropic) history is subject to the same token pressure.
+        let native = AcpHistoryLimits::from_config(&cfg, 20_000, 2_000);
+        assert!(native.token_pressure.is_some());
         history.limits = native;
-        assert!(!history.needs_compaction());
+        assert!(history.needs_compaction());
     }
 
     #[tokio::test]
