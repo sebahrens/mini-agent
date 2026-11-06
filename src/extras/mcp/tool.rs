@@ -63,24 +63,146 @@ impl McpTool {
 
     pub(super) fn bounded_model_metadata(
         definition: &rmcp::model::Tool,
-    ) -> Result<(String, serde_json::Value, bool), &'static str> {
+    ) -> Result<FittedMetadata, &'static str> {
         let description = definition.description.as_deref().unwrap_or("");
-        let (description, truncated) = truncate_utf8_bytes(
+        let (mut description, truncated) = truncate_utf8_bytes(
             description,
             MCP_TOOL_DESCRIPTION_MAX_BYTES,
             "\n[description truncated]",
         );
-        // One serialization for the size bound; the model value is the same
-        // object, so it is cloned rather than serialized a second time.
-        if serde_json::to_vec(&*definition.input_schema)
+        let size = serde_json::to_vec(&*definition.input_schema)
             .map_err(|_| "input schema could not be serialized")?
-            .len()
-            > MCP_TOOL_SCHEMA_MAX_BYTES
-        {
-            return Err("input schema exceeds 16 KiB");
+            .len();
+        let mut schema = serde_json::Value::Object((*definition.input_schema).clone());
+        let mut schema_fit = SchemaFit::Verbatim;
+        if size > MCP_TOOL_SCHEMA_MAX_BYTES {
+            // Keep the tool callable: first drop examples and comments, then
+            // prose (descriptions, titles, defaults), and only as a last
+            // resort accept any object, saying so in the description.
+            strip_schema(&mut schema, StripLevel::Examples);
+            schema_fit = SchemaFit::Reduced { original: size };
+            if serialized_len(&schema) > MCP_TOOL_SCHEMA_MAX_BYTES {
+                strip_schema(&mut schema, StripLevel::Prose);
+            }
+            if serialized_len(&schema) > MCP_TOOL_SCHEMA_MAX_BYTES {
+                schema = serde_json::json!({"type": "object", "additionalProperties": true});
+                schema_fit = SchemaFit::Replaced { original: size };
+                description.push_str(&format!(
+                    "\n[input schema of {size} bytes omitted (limit {MCP_TOOL_SCHEMA_MAX_BYTES}); pass the arguments the server documents, they are not validated locally]"
+                ));
+            }
         }
-        let schema = serde_json::Value::Object((*definition.input_schema).clone());
-        Ok((description, schema, truncated))
+        Ok(FittedMetadata {
+            description,
+            parameters: schema,
+            description_truncated: truncated,
+            schema_fit,
+        })
+    }
+}
+
+/// How a tool's input schema was fitted to the model-facing size bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SchemaFit {
+    Verbatim,
+    /// Examples (and, if needed, descriptions/titles/defaults) removed.
+    Reduced {
+        original: usize,
+    },
+    /// Still too large: replaced by a permissive object schema.
+    Replaced {
+        original: usize,
+    },
+}
+
+pub(super) struct FittedMetadata {
+    pub(super) description: String,
+    pub(super) parameters: serde_json::Value,
+    pub(super) description_truncated: bool,
+    pub(super) schema_fit: SchemaFit,
+}
+
+fn serialized_len(value: &serde_json::Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StripLevel {
+    Examples,
+    Prose,
+}
+
+/// Drop non-validating annotation keywords from a JSON schema. Keys of
+/// `properties`-style maps are property names, never keywords, and the
+/// values of `enum`/`const`/`default`/`examples` are data, so none of those
+/// are descended into as schemas.
+fn strip_schema(schema: &mut serde_json::Value, level: StripLevel) {
+    const SCHEMA_MAPS: [&str; 5] = [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ];
+    const SCHEMA_VALUES: [&str; 12] = [
+        "items",
+        "additionalProperties",
+        "additionalItems",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "propertyNames",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "contentSchema",
+    ];
+    const SCHEMA_LISTS: [&str; 4] = ["allOf", "anyOf", "oneOf", "prefixItems"];
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    for key in ["examples", "example", "$comment", "deprecated"] {
+        object.remove(key);
+    }
+    if level == StripLevel::Prose {
+        for key in ["description", "title", "default", "readOnly", "writeOnly"] {
+            object.remove(key);
+        }
+    }
+    for key in SCHEMA_MAPS {
+        if let Some(map) = object
+            .get_mut(key)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for child in map.values_mut() {
+                strip_schema(child, level);
+            }
+        }
+    }
+    for key in SCHEMA_VALUES {
+        if let Some(child) = object.get_mut(key) {
+            strip_schema(child, level);
+        }
+    }
+    for key in SCHEMA_LISTS {
+        if let Some(list) = object
+            .get_mut(key)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for child in list {
+                strip_schema(child, level);
+            }
+        }
+    }
+    // Draft-04 style `items` arrays.
+    if let Some(list) = object
+        .get_mut("items")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for child in list {
+            strip_schema(child, level);
+        }
     }
 }
 
@@ -321,11 +443,18 @@ impl ToolDyn for McpTool {
                 .await
                 .map_err(|e| {
                     let message = match e {
+                        ServiceError::Timeout { timeout } if timeout > call_timeout => format!(
+                            "MCP tool '{tool_name}' on server '{server_name}' was stopped after \
+                             reaching the {} s absolute limit for calls that report progress; \
+                             retry with a narrower request.",
+                            timeout.as_secs()
+                        ),
                         ServiceError::Timeout { .. } => format!(
-                            "MCP tool '{tool_name}' on server '{server_name}' timed out after {} ms; \
-                             the server may be hung or the request too large. Retry with a \
-                             narrower request, or raise `mcp_tool_timeout_secs` (or this server's \
-                             `tool_timeout_sec`) in the config.",
+                            "MCP tool '{tool_name}' on server '{server_name}' timed out after {} ms \
+                             with no response or progress notification; the server may be hung or \
+                             the request too large. Retry with a narrower request, or raise \
+                             `mcp_tool_timeout_secs` (or this server's `tool_timeout_sec`) in the \
+                             config.",
                             call_timeout.as_millis()
                         ),
                         other => format!("MCP tool error: {other}"),
@@ -692,30 +821,92 @@ mod tests {
             "inputSchema": {"type": "object"}
         }))
         .unwrap();
-        let (description, schema, truncated) =
-            McpTool::bounded_model_metadata(&definition).unwrap();
+        let fitted = McpTool::bounded_model_metadata(&definition).unwrap();
 
-        assert!(truncated);
-        assert!(description.len() <= MCP_TOOL_DESCRIPTION_MAX_BYTES);
-        assert!(description.ends_with("[description truncated]"));
-        assert_eq!(schema["type"], "object");
+        assert!(fitted.description_truncated);
+        assert!(fitted.description.len() <= MCP_TOOL_DESCRIPTION_MAX_BYTES);
+        assert!(fitted.description.ends_with("[description truncated]"));
+        assert_eq!(fitted.parameters["type"], "object");
+    }
+
+    fn fit(schema: serde_json::Value) -> FittedMetadata {
+        let definition: rmcp::model::Tool = serde_json::from_value(serde_json::json!({
+            "name": "big", "inputSchema": schema
+        }))
+        .unwrap();
+        McpTool::bounded_model_metadata(&definition).unwrap()
     }
 
     #[test]
-    fn model_metadata_rejects_oversized_schemas() {
-        let definition: rmcp::model::Tool = serde_json::from_value(serde_json::json!({
-            "name": "chatty",
-            "inputSchema": {
-                "type": "object",
-                "description": "x".repeat(MCP_TOOL_SCHEMA_MAX_BYTES)
-            }
-        }))
-        .unwrap();
-
-        assert_eq!(
-            McpTool::bounded_model_metadata(&definition),
-            Err("input schema exceeds 16 KiB")
+    fn oversized_schemas_are_reduced_not_dropped() {
+        // Examples alone push it over; stripping them keeps full validation.
+        let fitted = fit(serde_json::json!({
+            "type": "object",
+            "properties": {"q": {"type": "string", "description": "query", "examples": ["x".repeat(MCP_TOOL_SCHEMA_MAX_BYTES)]}},
+            "required": ["q"]
+        }));
+        assert!(matches!(fitted.schema_fit, SchemaFit::Reduced { .. }));
+        assert_eq!(fitted.parameters["required"][0], "q");
+        assert_eq!(fitted.parameters["properties"]["q"]["description"], "query");
+        assert!(
+            fitted.parameters["properties"]["q"]
+                .get("examples")
+                .is_none()
         );
+
+        // Prose is the next to go; a property *named* description survives.
+        let props: serde_json::Map<String, serde_json::Value> = (0..400)
+            .map(|i| {
+                (
+                    format!("p{i}"),
+                    serde_json::json!({"type": "string", "description": "d".repeat(80)}),
+                )
+            })
+            .chain([(
+                "description".to_owned(),
+                serde_json::json!({"type": "string", "title": "keep me out"}),
+            )])
+            .collect();
+        let fitted = fit(serde_json::json!({"type": "object", "properties": props}));
+        assert!(
+            matches!(fitted.schema_fit, SchemaFit::Reduced { .. }),
+            "{:?}",
+            fitted.schema_fit
+        );
+        assert!(serialized_len(&fitted.parameters) <= MCP_TOOL_SCHEMA_MAX_BYTES);
+        assert_eq!(
+            fitted.parameters["properties"]["description"]["type"],
+            "string"
+        );
+        assert!(
+            fitted.parameters["properties"]["description"]
+                .get("title")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn schemas_too_large_even_after_stripping_become_a_permissive_object_with_a_notice() {
+        let props: serde_json::Map<String, serde_json::Value> = (0..4000)
+            .map(|i| {
+                (
+                    format!("property_{i}"),
+                    serde_json::json!({"type": "integer"}),
+                )
+            })
+            .collect();
+        let fitted = fit(serde_json::json!({"type": "object", "properties": props}));
+        assert!(matches!(fitted.schema_fit, SchemaFit::Replaced { .. }));
+        assert_eq!(fitted.parameters["additionalProperties"], true);
+        assert!(fitted.description.contains("omitted"));
+        // Deeply nested input cannot blow the stack: serde_json already bounds
+        // parse depth, and the walk is over the same bounded value.
+        let mut nested = serde_json::json!({"type": "string", "examples": ["x"]});
+        for _ in 0..100 {
+            nested = serde_json::json!({"type": "object", "properties": {"n": nested}});
+        }
+        let fitted = fit(nested);
+        assert_eq!(fitted.schema_fit, SchemaFit::Verbatim);
     }
 
     fn png_data() -> String {

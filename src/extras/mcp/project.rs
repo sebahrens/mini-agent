@@ -671,9 +671,26 @@ pub(crate) fn parse_definition(mut value: Value) -> Result<McpServerConfig, &'st
             kind == "http" || kind == "streamable-http"
         };
         if !valid {
-            return Err("MCP server transport type is unsupported");
+            return Err(match (command, kind.as_str()) {
+                (false, Some("sse")) => {
+                    "MCP server type \"sse\" (legacy SSE transport) is not supported; set type \"http\" (streamable HTTP) and use the server's streamable-HTTP URL, or remove `type`"
+                }
+                (false, Some("ws" | "websocket")) => {
+                    "MCP server type \"ws\" is not supported; use a URL server with type \"http\""
+                }
+                (true, _) => "MCP command servers must have type \"stdio\" (or no type)",
+                (false, _) => {
+                    "MCP URL servers must have type \"http\" or \"streamable-http\" (or no type)"
+                }
+            });
         }
     }
+    if object.contains_key("headersHelper") || object.contains_key("headers_helper") {
+        return Err(
+            "headersHelper is not supported because it would run a command named by a project file; use `headers` with ${VAR}, `bearerTokenEnvVar`, or `envHttpHeaders`",
+        );
+    }
+    header_env_fields(object, url)?;
     if let Some(allow) = object.remove("allowLocal")
         && object.insert("allow_local".into(), allow).is_some()
     {
@@ -689,7 +706,77 @@ pub(crate) fn parse_definition(mut value: Value) -> Result<McpServerConfig, &'st
     Ok(server)
 }
 
+fn env_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+}
+
+/// Fold the environment-sourced header fields into `headers` as ordinary
+/// `${VAR}` references, so they get the same one-pass expansion, bounds and
+/// missing-variable behavior and cannot run any command:
+/// `bearerTokenEnvVar` (also `bearer_token_env_var`) becomes
+/// `Authorization: Bearer ${VAR}`; `envHttpHeaders` (also
+/// `env_http_headers`) maps header names to variable names.
+fn header_env_fields(
+    object: &mut serde_json::Map<String, Value>,
+    url: bool,
+) -> Result<(), &'static str> {
+    let mut additions: Vec<(String, String)> = Vec::new();
+    for key in ["bearerTokenEnvVar", "bearer_token_env_var"] {
+        if let Some(value) = object.remove(key) {
+            let name = value
+                .as_str()
+                .filter(|name| env_name_ok(name))
+                .ok_or("bearerTokenEnvVar must name an environment variable")?;
+            additions.push(("Authorization".into(), format!("Bearer ${{{name}}}")));
+        }
+    }
+    for key in ["envHttpHeaders", "env_http_headers"] {
+        if let Some(value) = object.remove(key) {
+            let map = value
+                .as_object()
+                .filter(|map| map.len() <= 64)
+                .ok_or("envHttpHeaders must be an object of at most 64 header names")?;
+            for (header, var) in map {
+                let name = var
+                    .as_str()
+                    .filter(|name| env_name_ok(name))
+                    .ok_or("envHttpHeaders values must name environment variables")?;
+                additions.push((header.clone(), format!("${{{name}}}")));
+            }
+        }
+    }
+    if additions.is_empty() {
+        return Ok(());
+    }
+    if !url {
+        return Err("bearerTokenEnvVar and envHttpHeaders apply only to URL servers");
+    }
+    let headers = object
+        .entry("headers")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()
+        .ok_or("MCP server fields have invalid types")?;
+    for (header, value) in additions {
+        let duplicate = headers
+            .keys()
+            .any(|existing| existing.eq_ignore_ascii_case(&header));
+        if duplicate {
+            return Err("MCP header is set both in `headers` and by an environment field");
+        }
+        headers.insert(header, Value::String(value));
+    }
+    Ok(())
+}
+
 /// One pass: environment text is literal data, never recursively expanded or evaluated.
+/// `${NAME}` requires the variable; `${NAME:-default}` uses the literal
+/// `default` (up to the first `}`, never itself expanded) when the variable is
+/// unset or empty.
 fn expand(value: &str, lookup: &impl Fn(&str) -> Option<String>) -> Result<String, String> {
     if value.len() > MAX_VALUE_BYTES {
         return Err("MCP value exceeds 64 KiB".into());
@@ -702,18 +789,21 @@ fn expand(value: &str, lookup: &impl Fn(&str) -> Option<String>) -> Result<Strin
         let end = rest
             .find('}')
             .ok_or("malformed MCP environment reference")?;
-        let name = &rest[..end];
-        if name.is_empty()
-            || name.len() > 128
-            || !name
-                .bytes()
-                .enumerate()
-                .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
-        {
+        let (name, default) = match rest[..end].split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (&rest[..end], None),
+        };
+        if !env_name_ok(name) {
             return Err("invalid MCP environment variable name".into());
         }
-        let replacement =
-            lookup(name).ok_or_else(|| format!("missing MCP environment variable {name}"))?;
+        let replacement = match (
+            lookup(name).filter(|v| default.is_none() || !v.is_empty()),
+            default,
+        ) {
+            (Some(value), _) => value,
+            (None, Some(default)) => default.to_owned(),
+            (None, None) => return Err(format!("missing MCP environment variable {name}")),
+        };
         if replacement.contains('\0')
             || out.len().saturating_add(replacement.len()) > MAX_VALUE_BYTES
         {
@@ -1013,6 +1103,10 @@ mod tests {
         ] {
             assert!(definitions(content).is_err());
         }
+        let sse =
+            parse_definition(serde_json::json!({"type":"sse","url":"https://example.com/sse"}))
+                .unwrap_err();
+        assert!(sse.contains("\"http\"") && sse.contains("sse"), "{sse}");
         assert!(definitions(&" ".repeat(MAX_PROJECT_MCP_BYTES + 1)).is_err());
     }
     #[test]
@@ -1031,8 +1125,65 @@ mod tests {
             "missing MCP environment variable MISSING"
         );
         assert!(expand("${BIG}", &lookup).is_err());
-        for invalid in ["${}", "${X:-secret}", "${1BAD}", "${UNFINISHED"] {
+        for invalid in ["${}", "${1BAD}", "${UNFINISHED", "${:-x}", "${A B:-x}"] {
             assert!(expand(invalid, &lookup).is_err());
+        }
+    }
+    #[test]
+    fn default_values_apply_to_unset_or_empty_variables_and_are_literal_and_bounded() {
+        let lookup = |name: &str| match name {
+            "SET" => Some("real".into()),
+            "EMPTY" => Some(String::new()),
+            "BIG" => Some("x".repeat(MAX_VALUE_BYTES)),
+            _ => None,
+        };
+        assert_eq!(expand("${SET:-d}", &lookup).unwrap(), "real");
+        assert_eq!(expand("${UNSET:-d}", &lookup).unwrap(), "d");
+        assert_eq!(expand("${EMPTY:-d}", &lookup).unwrap(), "d");
+        assert_eq!(expand("${EMPTY}", &lookup).unwrap(), "");
+        assert_eq!(expand("${UNSET:-}x", &lookup).unwrap(), "x");
+        // The default is data: `${` inside it is not expanded, and a second
+        // `:-` stays part of the default.
+        assert_eq!(expand("${UNSET:-a:-b}", &lookup).unwrap(), "a:-b");
+        assert!(expand("${UNSET:-${SET}}", &lookup).unwrap().ends_with('}'));
+        // Bounds hold for defaults and for a set variable beside a default.
+        let big_default = format!("${{UNSET:-{}}}", "y".repeat(MAX_VALUE_BYTES));
+        assert!(expand(&big_default, &lookup).is_err());
+        assert!(expand("${BIG}${UNSET:-zz}", &lookup).is_err());
+        assert!(expand("${UNSET:-a\0b}", &lookup).is_err());
+    }
+    #[test]
+    fn environment_header_fields_fold_into_headers_without_running_anything() {
+        let lookup = |name: &str| (name == "TOK").then(|| "s3cret".to_string());
+        let server = resolve_definition(
+            serde_json::json!({"url":"https://example.com/mcp","bearerTokenEnvVar":"TOK",
+                "envHttpHeaders":{"X-Api":"TOK"},"headers":{"X-Static":"1"}}),
+            &lookup,
+        )
+        .unwrap();
+        let McpServerConfig::Url { headers, .. } = server else {
+            panic!("url server")
+        };
+        assert_eq!(headers["Authorization"], "Bearer s3cret");
+        assert_eq!(headers["X-Api"], "s3cret");
+        assert_eq!(headers["X-Static"], "1");
+        // A missing variable disables the server rather than sending a partial header.
+        assert!(
+            resolve_definition(
+                serde_json::json!({"url":"https://example.com/mcp","bearerTokenEnvVar":"NOPE"}),
+                &lookup
+            )
+            .is_err()
+        );
+        for bad in [
+            serde_json::json!({"url":"https://e.com","bearerTokenEnvVar":"A}B"}),
+            serde_json::json!({"url":"https://e.com","bearerTokenEnvVar":"X","headers":{"authorization":"x"}}),
+            serde_json::json!({"command":"c","bearerTokenEnvVar":"X"}),
+            serde_json::json!({"url":"https://e.com","envHttpHeaders":{"H":"1BAD"}}),
+            serde_json::json!({"url":"https://e.com","envHttpHeaders":"x"}),
+            serde_json::json!({"url":"https://e.com","headersHelper":"./get-token.sh"}),
+        ] {
+            assert!(parse_definition(bad).is_err());
         }
     }
 }

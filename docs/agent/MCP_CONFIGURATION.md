@@ -42,12 +42,24 @@ Existing project TOML trust does not authorize `.mcp.json`.
 
 `${VAR}` substitution occurs after raw project content is trusted, on supported
 command, argument, working-directory, environment, URL and header values. It is
-bounded, one-pass literal substitution. A missing variable leaves that server
+bounded, one-pass literal substitution. `${VAR:-default}` uses the literal
+`default` (up to the first `}`, never expanded itself, same size bounds) when
+`VAR` is unset or empty. A missing variable without a default leaves that server
 inactive and reports the variable name, without its value. Raw placeholders
 remain on disk and in trust fingerprints; expanded credentials are not copied
 to notices or origin metadata. Literal secrets explicitly placed in a project
 file remain file content; review redaction does not make those bytes inaccessible
 to another reader already authorized to read that file.
+
+Project URL servers may use `"type": "http"` or `"streamable-http"`; the legacy
+`"type": "sse"` (and `ws`) is rejected with a message naming the `http`
+alternative. For auth headers sourced from the environment, `bearerTokenEnvVar`
+(`Authorization: Bearer ${VAR}`) and `envHttpHeaders` (`{"Header": "VAR"}`) are
+folded into `headers` as ordinary `${VAR}` references, with the same
+substitution, bounds and missing-variable behavior. `headersHelper` (a command
+run to mint headers) is deliberately not supported: a project file must not
+name a command that runs outside the server sandbox. Use an environment
+variable that your own tooling refreshes.
 
 URL servers require public addresses by default. Explicit `allow_local=true`
 also permits loopback-only endpoints: IPv4 `127/8`, IPv6 `::1`, normalized mapped
@@ -177,10 +189,30 @@ Command and URL entries also accept:
 | `disabled_tools` | `[]` | These exact server tool names are never registered (applied after `enabled_tools`). |
 | `parallel_read_only` | `false` | Opt in: this server's tools that advertise `readOnlyHint: true` share the parallel tool lane instead of the exclusive one, so several can run alongside reads and each other. A server's hint is its own claim, so it is ignored unless you set this. |
 
-Selection runs on each `tools/list` page before the 128-tool per-server cap, so
-the cap counts only admitted tools and a selected tool past index 128 is still
-reached. `/mcp <server>` shows how many listed tools the selection excluded.
+Selection runs on each `tools/list` page before the per-server tool cap (128
+with `defer = false`, 1024 with `true`/`auto`), so the cap counts only admitted
+tools and a selected tool past the cap's index is still reached. When the cap
+omits tools, the startup notice counts them and names the first 16. `/mcp <server>` shows how many listed tools the selection excluded.
 Selection only narrows the registered set; it grants no permission.
+
+## Resource tools (`list_mcp_resources`, `read_mcp_resource`)
+
+Servers that advertise resources get two model tools. The catalogue is
+discovered at connection and bounded to 128 entries / 256 KiB of metadata. A
+malformed, over-long or duplicate entry is skipped individually (the listing
+reports how many were skipped and how many fell beyond the bound) rather than
+discarding the whole catalogue. `list_mcp_resources` takes `server`, a
+case-insensitive `query` over URI, name and description, and `offset`/`limit`
+paging; a truncated listing names the `offset` that continues it.
+`read_mcp_resource` returns up to 256 KiB per call for any textual MIME type
+(the `web_fetch` set: `text/*`, JSON, XML, YAML, TOML, JavaScript, `+json`,
+`+xml`, with parameters ignored). Longer text is cut at a character boundary
+with a marker naming the `offset` to pass back (`length` is optional); at most
+4 MiB of a resource is retained, and a server that sends more is flagged.
+Binary parts and non-text MIME types are omitted with a note stating the part
+size and MIME type, and a resource with nothing readable is refused with that
+reason. Operator `@mcp:` attachments stay strict: text over 256 KiB is refused
+with its size and the limit, since it must fit the prompt snapshot.
 
 ## MCP server mode (`--mcp-server`)
 
@@ -194,8 +226,17 @@ child therefore applies exactly the provider, model, sandbox, permission and
 tool flags the server was started with, and the ordinary headless policy:
 permission asks cannot be answered over MCP and fail closed unless those flags
 allow the action. A non-zero exit returns `isError: true` with stdout and a
-bounded stderr tail; a run is stopped after 30 minutes. Calls are handled one
-at a time. The server process itself runs no tools and opens no connections.
+bounded stderr tail; a run is stopped after 30 minutes. Requests are read while
+a run executes: `ping` is answered, `notifications/cancelled` for the call's
+request id kills the child's whole process group and sends no reply (per the MCP
+cancellation utility), and a `_meta.progressToken` on the call yields
+`notifications/progress` heartbeats every 15 s. Up to 4 runs may overlap; a
+fifth is refused with error `-32000`. A persisted run reports its session id
+(`structuredContent.session_id` and a trailing `[session_id: …]` line); pass it
+back as `session_id` to continue that conversation (`--session` on the child).
+`--mcp-server-allow-model-override` (default off) adds a per-call `model`
+argument; without it `model` is rejected. The server owns the child's
+`--output`, so a forwarded `--output` is dropped. The server process itself runs no tools and opens no connections.
 `--mcp-server` cannot be combined with `-p`, a prompt, `--acp` or `--loop`.
 
 ```json
@@ -258,8 +299,10 @@ returns at most eight names, descriptions and schemas, limited to 128 KiB total,
 and publishes those exact schemas for subsequent model requests. Queries are
 limited to 2 KiB and 32 words; invalid or oversized input fails explicitly. The
 names index is limited to 64 KiB and labels omitted names; search still considers
-the complete bounded catalogue. Existing 4 KiB description/16 KiB schema limits
-remain unchanged.
+the complete bounded catalogue. The 4 KiB description limit is unchanged; an input
+schema over 16 KiB is reduced (examples, then descriptions/titles/defaults, are
+removed) or, as a last resort, replaced by a permissive object schema with a
+note in the description, instead of the tool being dropped.
 
 Search changes no permissions. Enabled tools retain the original captured
 client, ordinary Ask/deny policy, hook invocation identity, cost admission,

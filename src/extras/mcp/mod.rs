@@ -542,6 +542,7 @@ impl McpClientManager {
                 let list_timeout = handle.options.list_timeout(timeouts.list);
                 let call_timeout = handle.options.tool_timeout(timeouts.call);
                 let options = handle.options.clone();
+                let defer = handle.defer;
                 let live_peer = peer.clone();
                 let client_is_live: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                     liveness.upgrade().is_some() && !live_peer.is_transport_closed()
@@ -552,7 +553,9 @@ impl McpClientManager {
                 async move {
                     let _permit = sem.acquire_owned().await;
                     let cached = listed
-                        .get_or_list(|| client::list_bounded_tools(&peer, list_timeout, &options))
+                        .get_or_list(|| {
+                            client::list_bounded_tools(&peer, list_timeout, &options, defer)
+                        })
                         .await;
                     let (result, kept_previous) = match cached {
                         Ok(cached) => (Ok(cached.listed), cached.kept_previous),
@@ -613,11 +616,18 @@ impl McpClientManager {
                     let reached_tool_cap = tools.reached_tool_cap;
                     let mut truncated_descriptions = 0usize;
                     let mut rejected_schemas = 0usize;
+                    let mut reduced_schemas = 0usize;
+                    let mut replaced_schemas = 0usize;
                     for listed in &tools.entries {
                         let Some(bounded) = &listed.bounded else {
                             rejected_schemas += 1;
                             continue;
                         };
+                        match bounded.schema_fit {
+                            tool::SchemaFit::Verbatim => {}
+                            tool::SchemaFit::Reduced { .. } => reduced_schemas += 1,
+                            tool::SchemaFit::Replaced { .. } => replaced_schemas += 1,
+                        }
                         let definition = listed.definition.clone();
                         truncated_descriptions += usize::from(bounded.description_truncated);
                         all_tools.push(McpTool {
@@ -639,9 +649,39 @@ impl McpClientManager {
                         });
                     }
                     if reached_tool_cap {
+                        let over = &tools.over_cap;
+                        let mut notice = format!(
+                            "MCP server '{server_name}' tool catalog is limited to {} tools",
+                            tools.entries.len(),
+                        );
+                        if over.count > 0 {
+                            notice.push_str(&format!(
+                                "; {}{} tool(s) omitted: {}{}",
+                                over.count,
+                                if over.exact { "" } else { "+" },
+                                over.names.join(", "),
+                                if over.count > over.names.len() {
+                                    ", ..."
+                                } else {
+                                    ""
+                                },
+                            ));
+                        }
+                        notice.push_str(
+                            "; use enabled_tools/disabled_tools to select which tools to keep",
+                        );
+                        self.push_tool_notice(notice);
+                    }
+                    if reduced_schemas > 0 {
                         self.push_tool_notice(format!(
-                            "MCP server '{server_name}' tool catalog is limited to at most {} tools",
-                            client::MCP_LIST_TOOLS_MAX_TOOLS,
+                            "MCP server '{server_name}' had {reduced_schemas} tool input schema(s) over {} bytes reduced (examples/descriptions removed)",
+                            tool::MCP_TOOL_SCHEMA_MAX_BYTES,
+                        ));
+                    }
+                    if replaced_schemas > 0 {
+                        self.push_tool_notice(format!(
+                            "MCP server '{server_name}' had {replaced_schemas} tool input schema(s) still over {} bytes after reduction; those tools accept any object and the server validates arguments",
+                            tool::MCP_TOOL_SCHEMA_MAX_BYTES,
                         ));
                     }
                     if truncated_descriptions > 0 {

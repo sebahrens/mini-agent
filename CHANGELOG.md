@@ -86,6 +86,33 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Hook handlers `mcp_tool`, `prompt` and `agent` run when `hooks_mcp_tool_enabled` /
   `hooks_model_enabled` are set (default off).
 - ACP advertises and expands custom prompt commands (`.mini-agent/commands`, `.claude/commands`).
+### MCP
+
+- `.mcp.json` accepts `${VAR:-default}` (literal default when the variable is unset or empty, same
+  bounds), `bearerTokenEnvVar` and `envHttpHeaders` for environment-sourced auth headers, and
+  reports legacy `"type": "sse"` with a message naming the `http` alternative. `headersHelper` is
+  rejected with an explanation because it would run a command named by a project file.
+- `mcp_tool_timeout_secs` / `tool_timeout_sec` are now idle timeouts for MCP tool calls: every
+  `notifications/progress` from the server restarts the clock, so long-running tools that report
+  progress are no longer killed at 120 s. An absolute 30 minute ceiling still applies, and the
+  timeout error says whether the idle or the absolute limit fired. (Progress is not yet shown in
+  the TUI.)
+- MCP tools whose input schema exceeds 16 KiB are no longer dropped: examples and then prose are
+  stripped, and a schema that is still too large becomes a permissive object schema (the server
+  validates), with a startup notice. Servers using `defer = true`/`auto` may list up to 1024 tools
+  (eager servers keep 128), and the tool-cap notice now counts and names the omitted tools.
+- `list_mcp_resources` skips malformed or duplicate entries individually instead of dropping a
+  server's whole resource catalogue, reports how many were skipped or fell past the 128-entry /
+  256 KiB bound, and accepts `query`, `offset` and `limit`. `read_mcp_resource` pages long text
+  (`offset`/`length`, with a continue marker) instead of refusing above 256 KiB, accepts the same
+  textual MIME types as `web_fetch` (YAML, TOML, JavaScript, `+json`, ...), and names the specific
+  reason (binary part, non-text MIME type, size limit) when it cannot return a resource.
+- `--mcp-server` handles requests while a `run` executes: `ping` is answered, `notifications/cancelled`
+  kills the run's child process group and sends no reply, a client `progressToken` receives
+  `notifications/progress` heartbeats every 15 s, and up to 4 runs may overlap (a fifth is refused,
+  not queued). `run` now returns the child's session id (also as `structuredContent.session_id`) and
+  accepts `session_id` to continue that conversation; `--mcp-server-allow-model-override` (default
+  off) lets a call pick `model`.
 
 ### Subagents
 

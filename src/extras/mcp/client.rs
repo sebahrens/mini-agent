@@ -39,8 +39,34 @@ pub(crate) const MCP_LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on `tools/list` pages so a server that keeps returning a cursor cannot
 /// spin the enumeration loop forever within the time budget.
 pub(crate) const MCP_LIST_TOOLS_MAX_PAGES: usize = 64;
-/// Maximum number of model-visible tools accepted from one server.
+/// Maximum number of model-visible tools accepted from one server whose
+/// schemas are loaded eagerly (`defer = false`).
 pub(crate) const MCP_LIST_TOOLS_MAX_TOOLS: usize = 128;
+/// Ceiling for a server whose schemas may be deferred (`defer = true`/`auto`):
+/// tool search loads a schema only on demand, so a large catalogue stays
+/// usable. Memory stays bounded (tools x 16 KiB schema).
+pub(crate) const MCP_LIST_TOOLS_MAX_DEFERRED_TOOLS: usize = 1024;
+/// Names of cap-omitted tools quoted in the notice.
+pub(crate) const MCP_OMITTED_TOOL_NAMES: usize = 16;
+
+/// Tool-count ceiling for a server's `defer` setting.
+pub(crate) const fn tool_cap_for(defer: super::config::McpDefer) -> usize {
+    match defer {
+        super::config::McpDefer::Eager => MCP_LIST_TOOLS_MAX_TOOLS,
+        _ => MCP_LIST_TOOLS_MAX_DEFERRED_TOOLS,
+    }
+}
+
+/// Tools a listing could not keep because of the tool-count cap.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OverCap {
+    /// Tools counted beyond the cap (a lower bound if `exact` is false).
+    pub(crate) count: usize,
+    /// The first few omitted names.
+    pub(crate) names: Vec<String>,
+    /// Pagination finished, so `count` is the whole overflow.
+    pub(crate) exact: bool,
+}
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
 const MCP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -56,6 +82,8 @@ pub(crate) struct BoundedModelMetadata {
     pub(crate) description: Arc<str>,
     pub(crate) parameters: Arc<serde_json::Value>,
     pub(crate) description_truncated: bool,
+    /// How the input schema was fitted to the model-facing bound.
+    pub(crate) schema_fit: super::tool::SchemaFit,
 }
 
 /// A successful `tools/list` of one connection generation with every tool's
@@ -65,6 +93,7 @@ pub(crate) struct BoundedModelMetadata {
 pub struct ListedTools {
     pub entries: Vec<ListedTool>,
     pub(crate) reached_tool_cap: bool,
+    pub(crate) over_cap: OverCap,
     /// Tools the server listed that the entry's `enabled_tools` /
     /// `disabled_tools` selection excluded (they do not count toward the cap).
     pub(crate) filtered_by_config: usize,
@@ -74,28 +103,35 @@ pub(crate) async fn list_bounded_tools(
     peer: &Peer<RoleClient>,
     timeout: Duration,
     options: &super::config::McpServerOptions,
+    defer: super::config::McpDefer,
 ) -> Result<Arc<ListedTools>, ServiceError> {
-    let (tools, filtered) =
-        list_all_tools_selected(peer, timeout, &|name| options.admits_tool(name)).await?;
-    let mut listed = bound_listed_tools(tools);
-    listed.filtered_by_config = filtered;
+    let found = list_all_tools_selected(
+        peer,
+        timeout,
+        &|name| options.admits_tool(name),
+        tool_cap_for(defer),
+    )
+    .await?;
+    let mut listed = bound_listed_tools_capped(found.tools, tool_cap_for(defer));
+    listed.filtered_by_config = found.filtered;
+    listed.over_cap = found.over_cap;
+    listed.reached_tool_cap |= listed.over_cap.count > 0;
     Ok(Arc::new(listed))
 }
 
-pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
-    let reached_tool_cap = tools.len() == MCP_LIST_TOOLS_MAX_TOOLS;
+pub(crate) fn bound_listed_tools_capped(tools: Vec<Tool>, cap: usize) -> ListedTools {
+    let reached_tool_cap = tools.len() == cap;
     let entries = tools
         .into_iter()
         .map(|definition| {
             let bounded = super::tool::McpTool::bounded_model_metadata(&definition)
                 .ok()
-                .map(
-                    |(description, parameters, description_truncated)| BoundedModelMetadata {
-                        description: Arc::from(description),
-                        parameters: Arc::new(parameters),
-                        description_truncated,
-                    },
-                );
+                .map(|fitted| BoundedModelMetadata {
+                    description: Arc::from(fitted.description),
+                    parameters: Arc::new(fitted.parameters),
+                    description_truncated: fitted.description_truncated,
+                    schema_fit: fitted.schema_fit,
+                });
             ListedTool {
                 definition,
                 bounded,
@@ -105,6 +141,7 @@ pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
     ListedTools {
         entries,
         reached_tool_cap,
+        over_cap: OverCap::default(),
         filtered_by_config: 0,
     }
 }
@@ -205,6 +242,9 @@ pub struct McpClientHandle {
     pub(crate) tools: Arc<ToolListCache>,
     /// Per-server options captured from the configuration that connected.
     pub(crate) options: super::config::McpServerOptions,
+    /// Schema-loading mode of the connecting configuration; it sets the
+    /// tool-count ceiling of this server's listing.
+    pub(crate) defer: super::config::McpDefer,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -663,6 +703,7 @@ impl McpClientHandle {
                     auxiliary: Arc::new(tokio::sync::OnceCell::new()),
                     tools: Arc::new(ToolListCache::with_flag(tools_changed)),
                     options: Default::default(),
+                    defer: Default::default(),
                 })
             }
             McpServerConfig::Url {
@@ -707,6 +748,7 @@ impl McpClientHandle {
         };
         let mut handle = result?;
         handle.options = config.options();
+        handle.defer = config.defer();
         if validate().is_err() || crate::agent::runner::current_work_scope_is_cancelled() {
             // A completed handshake cannot confer authority after its retained
             // workspace changed. Join this exact candidate before rejecting it.
@@ -807,6 +849,7 @@ impl McpClientHandle {
             auxiliary: Arc::new(tokio::sync::OnceCell::new()),
             tools: Arc::new(ToolListCache::with_flag(tools_changed)),
             options: Default::default(),
+            defer: Default::default(),
         })
     }
 
@@ -861,6 +904,7 @@ impl McpClientHandle {
                     peer,
                     self.options.list_timeout(MCP_LIST_TOOLS_TIMEOUT),
                     &self.options,
+                    self.defer,
                 )
             })
             .await
@@ -905,61 +949,84 @@ pub(crate) async fn list_all_tools_bounded(
     peer: &Peer<RoleClient>,
     timeout: Duration,
 ) -> Result<Vec<Tool>, ServiceError> {
-    list_all_tools_selected(peer, timeout, &|_| true)
+    list_all_tools_selected(peer, timeout, &|_| true, MCP_LIST_TOOLS_MAX_TOOLS)
         .await
-        .map(|(tools, _)| tools)
+        .map(|found| found.tools)
+}
+
+/// Result of one bounded `tools/list` enumeration.
+pub(crate) struct FoundTools {
+    pub(crate) tools: Vec<Tool>,
+    /// Tools excluded by the entry's selection.
+    pub(crate) filtered: usize,
+    pub(crate) over_cap: OverCap,
 }
 
 /// Bounded `tools/list` keeping only tools `admit` accepts. Selection
 /// runs per page before the tool cap, so excluded tools never displace an
-/// admitted one; the second value counts excluded tools.
+/// admitted one. Pagination continues past `cap` (within the time and page
+/// bounds) only to count and name the tools the cap omits.
 pub(crate) async fn list_all_tools_selected(
     peer: &Peer<RoleClient>,
     timeout: Duration,
     admit: &(dyn Fn(&str) -> bool + Sync),
-) -> Result<(Vec<Tool>, usize), ServiceError> {
+    cap: usize,
+) -> Result<FoundTools, ServiceError> {
     let mut filtered = 0_usize;
     let deadline = tokio::time::Instant::now() + timeout;
     let mut tools = Vec::new();
+    let mut over_cap = OverCap::default();
     let mut cursor: Option<String> = None;
     let mut pages = 0_usize;
     loop {
+        let counting_overflow = tools.len() >= cap;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            if counting_overflow {
+                break;
+            }
             return Err(ServiceError::Timeout { timeout });
         }
         let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
             PaginatedRequestParams::default().with_cursor(cursor.take()),
         ));
-        let handle = peer
+        let sent = peer
             .send_cancellable_request(request, PeerRequestOptions::with_timeout(remaining))
-            .await?;
-        let result = match handle.await_response().await {
+            .await;
+        let response = match sent {
+            Ok(handle) => handle.await_response().await,
+            Err(error) => Err(error),
+        };
+        let result = match response {
             Ok(ServerResult::ListToolsResult(result)) => result,
+            // Past the cap only counting is lost; keep the usable tools.
+            Ok(_) | Err(_) if counting_overflow => break,
             Ok(_) => return Err(ServiceError::UnexpectedResponse),
             // Report the whole budget rather than the remaining slice.
             Err(ServiceError::Timeout { .. }) => return Err(ServiceError::Timeout { timeout }),
             Err(error) => return Err(error),
         };
-        let page: Vec<Tool> = result
-            .tools
-            .into_iter()
-            .filter(|tool| {
-                let admitted = admit(tool.name.as_ref());
-                filtered += usize::from(!admitted);
-                admitted
-            })
-            .collect();
-        let reached_tool_cap = extend_tools_capped(&mut tools, page);
-        pages += 1;
-        if reached_tool_cap {
-            tracing::debug!(
-                "MCP tools/list stopped after reaching the {MCP_LIST_TOOLS_MAX_TOOLS}-tool cap"
-            );
-            break;
+        let page = result.tools.into_iter().filter(|tool| {
+            let admitted = admit(tool.name.as_ref());
+            filtered += usize::from(!admitted);
+            admitted
+        });
+        for tool in page {
+            if tools.len() < cap {
+                tools.push(tool);
+            } else {
+                over_cap.count += 1;
+                if over_cap.names.len() < MCP_OMITTED_TOOL_NAMES {
+                    over_cap.names.push(tool.name.to_string());
+                }
+            }
         }
+        pages += 1;
         match result.next_cursor {
-            None => break,
+            None => {
+                over_cap.exact = true;
+                break;
+            }
             Some(_) if pages >= MCP_LIST_TOOLS_MAX_PAGES => {
                 tracing::debug!(
                     "MCP tools/list stopped after {pages} pages; ignoring further cursors"
@@ -969,26 +1036,48 @@ pub(crate) async fn list_all_tools_selected(
             next => cursor = next,
         }
     }
-    Ok((tools, filtered))
+    Ok(FoundTools {
+        tools,
+        filtered,
+        over_cap,
+    })
 }
 
-fn extend_tools_capped(tools: &mut Vec<Tool>, page: Vec<Tool>) -> bool {
-    let remaining = MCP_LIST_TOOLS_MAX_TOOLS.saturating_sub(tools.len());
-    tools.extend(page.into_iter().take(remaining));
-    tools.len() >= MCP_LIST_TOOLS_MAX_TOOLS
-}
+/// Absolute ceiling for one `tools/call` that keeps sending progress
+/// notifications (the call is otherwise bounded by its idle timeout).
+pub(crate) const MCP_TOOL_PROGRESS_CEILING: Duration = Duration::from_secs(30 * 60);
 
-/// `tools/call` bounded by `timeout`. On expiry rmcp notifies the server that
-/// the request was cancelled and the error is [`ServiceError::Timeout`].
+/// `tools/call` with an idle timeout of `timeout` that every matching
+/// `notifications/progress` restarts, under an absolute ceiling of
+/// `max(timeout, MCP_TOOL_PROGRESS_CEILING)`. rmcp attaches a progress token
+/// to every request, so a server that streams progress keeps a long call
+/// alive while a silent one is still cut off after `timeout`. On expiry rmcp
+/// notifies the server that the request was cancelled and the error is
+/// [`ServiceError::Timeout`] carrying whichever bound fired.
 pub(crate) async fn call_tool_bounded(
     peer: &Peer<RoleClient>,
     params: CallToolRequestParams,
     timeout: Duration,
 ) -> Result<CallToolResult, ServiceError> {
+    call_tool_with_ceiling(
+        peer,
+        params,
+        timeout,
+        timeout.max(MCP_TOOL_PROGRESS_CEILING),
+    )
+    .await
+}
+
+pub(crate) async fn call_tool_with_ceiling(
+    peer: &Peer<RoleClient>,
+    params: CallToolRequestParams,
+    idle_timeout: Duration,
+    ceiling: Duration,
+) -> Result<CallToolResult, ServiceError> {
     let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
-    let handle = peer
-        .send_cancellable_request(request, PeerRequestOptions::with_timeout(timeout))
-        .await?;
+    let mut options = PeerRequestOptions::with_timeout(idle_timeout).reset_timeout_on_progress();
+    options.max_total_timeout = Some(ceiling);
+    let handle = peer.send_cancellable_request(request, options).await?;
     match handle.await_response().await? {
         ServerResult::CallToolResult(result) => Ok(result),
         _ => Err(ServiceError::UnexpectedResponse),
@@ -1605,23 +1694,11 @@ mod tests {
     }
 
     #[test]
-    fn paginated_tool_collection_never_exceeds_the_per_server_cap() {
-        let tool = || {
-            serde_json::from_value::<rmcp::model::Tool>(serde_json::json!({
-                "name": "probe",
-                "inputSchema": {"type": "object"}
-            }))
-            .unwrap()
-        };
-        let mut tools = (0..100).map(|_| tool()).collect::<Vec<_>>();
-
-        assert!(super::extend_tools_capped(
-            &mut tools,
-            (0..100).map(|_| tool()).collect(),
-        ));
-        assert_eq!(tools.len(), super::MCP_LIST_TOOLS_MAX_TOOLS);
-        assert!(super::extend_tools_capped(&mut tools, vec![tool()]));
-        assert_eq!(tools.len(), super::MCP_LIST_TOOLS_MAX_TOOLS);
+    fn eager_servers_keep_the_small_tool_cap_and_deferrable_servers_a_larger_one() {
+        use super::super::config::McpDefer;
+        assert_eq!(super::tool_cap_for(McpDefer::Eager), 128);
+        assert_eq!(super::tool_cap_for(McpDefer::Auto), 1024);
+        assert_eq!(super::tool_cap_for(McpDefer::Deferred), 1024);
     }
 }
 

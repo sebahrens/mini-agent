@@ -227,6 +227,16 @@ fn main() {
             write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"prompts\":[{{\"name\":\"review\",\"arguments\":[{{\"name\":\"topic\",\"required\":true}}]}}]}}}}"));
         } else if compact.contains("\"method\":\"resources/list\"") {
             let id=request_id(&compact);
+            if mode == "aux-messy" {
+                let mut items = Vec::new();
+                for n in 0..140 {
+                    items.push(format!("{{\"uri\":\"urn:ok:{n}\",\"name\":\"ok{n}\"}}"));
+                }
+                items.push("{\"uri\":\"urn:bad:noname\",\"name\":\"\"}".to_string());
+                items.push("{\"uri\":\"urn:ok:3\",\"name\":\"duplicate\"}".to_string());
+                write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[{}]}}}}", items.join(",")));
+                continue;
+            }
             write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[{{\"uri\":\"urn:owned:notes\",\"name\":\"notes\",\"mimeType\":\"text/plain\"}}]}}}}"));
         } else if compact.contains("\"method\":\"prompts/get\"") {
             let id=request_id(&compact);
@@ -290,6 +300,16 @@ fn main() {
                 );
             }
             let id = request_id(&compact);
+            if mode == "progress-call" {
+                let token = compact
+                    .split_once("\"progressToken\":")
+                    .map(|(_, rest)| request_id(&format!("\"id\":{rest}")))
+                    .unwrap_or_else(|| "null".to_string());
+                for step in 1..=4 {
+                    thread::sleep(Duration::from_millis(250));
+                    write_response(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":{token},\"progress\":{step}}}}}"));
+                }
+            }
             if mode == "aux-roots" {
                 pending_aux = Some(id);
                 write_response(
@@ -1617,6 +1637,53 @@ async fn mcp_tools_list_error_produces_notice() {
 }
 
 #[tokio::test]
+async fn mcp_tool_call_with_progress_outlives_the_idle_timeout_but_not_the_ceiling() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("progress-call");
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "progress-call",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let params =
+        || rmcp::model::CallToolRequestParams::new("probe").with_arguments(serde_json::Map::new());
+    // 4 x 250 ms of progress: well past the 600 ms idle timeout in total.
+    let started = std::time::Instant::now();
+    crate::extras::mcp::client::call_tool_with_ceiling(
+        &handle.peer(),
+        params(),
+        Duration::from_millis(600),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("progress notifications must keep the call alive");
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    // The absolute ceiling still applies to a call that keeps reporting progress.
+    let error = crate::extras::mcp::client::call_tool_with_ceiling(
+        &handle.peer(),
+        params(),
+        Duration::from_millis(600),
+        Duration::from_millis(500),
+    )
+    .await
+    .expect_err("the ceiling must stop a call that is still reporting progress");
+    assert!(
+        matches!(error, rmcp::ServiceError::Timeout { timeout } if timeout == Duration::from_millis(500)),
+        "{error}"
+    );
+    McpClientManager::from_handles(vec![handle])
+        .shutdown()
+        .await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
 async fn mcp_tool_call_hang_times_out_with_tool_error() {
     let fixture = FixtureBuild::compile();
     let lease = fixture.lease("hang-tools-call");
@@ -1757,6 +1824,21 @@ async fn mcp_enabled_and_disabled_tools_apply_before_the_cap_and_enabled_false_s
         unreachable!()
     };
     options.disabled_tools = (0..50).map(|index| format!("t{index}")).collect();
+    // A deferrable (default `auto`) server keeps all 150 remaining tools.
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .unwrap();
+    let listed = handle.cached_tools().await.unwrap();
+    assert_eq!(listed.entries.len(), 150);
+    assert!(!listed.reached_tool_cap);
+    let pid = wait_for_pid(&lease).await;
+    shutdown(McpClientManager::from_handles(vec![handle])).await;
+    assert_process_reaped(pid).await;
+    // An eager server keeps the 128-tool cap and names what it omitted.
+    let McpServerConfig::Command { defer, .. } = &mut config else {
+        unreachable!()
+    };
+    *defer = crate::extras::mcp::config::McpDefer::Eager;
     let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
         .await
         .unwrap();
@@ -1764,6 +1846,8 @@ async fn mcp_enabled_and_disabled_tools_apply_before_the_cap_and_enabled_false_s
     assert_eq!(listed.entries.len(), 128);
     assert_eq!(listed.entries[0].definition.name, "t50");
     assert!(listed.reached_tool_cap);
+    assert_eq!(listed.over_cap.count, 22);
+    assert!(listed.over_cap.exact && listed.over_cap.names.len() == 16);
     let pid = wait_for_pid(&lease).await;
     shutdown(McpClientManager::from_handles(vec![handle])).await;
     assert_process_reaped(pid).await;
@@ -2680,6 +2764,32 @@ async fn mcp_auxiliary_stdio_catalogue_and_selected_literal_reads_are_bounded_an
     let (prompt, resource) = result.unwrap();
     assert!(prompt.contains("Prompt BODY 雪") && prompt.contains("/commit %%next code"));
     assert_eq!(resource, "Resource BODY 雪");
+}
+
+#[tokio::test]
+async fn mcp_resource_listing_skips_bad_entries_individually_and_counts_the_bound_overflow() {
+    let fixture = FixtureBuild::compile();
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux-messy",
+        &fixture.lease("auxiliary-messy"),
+    );
+    let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+        .await
+        .unwrap();
+    handle.discover_auxiliary().await;
+    let captured = handle.auxiliary.get().unwrap().clone();
+    McpClientManager::from_handles(vec![handle])
+        .shutdown()
+        .await;
+    fixture.cleanup();
+    // 128 kept; 140 valid unique entries minus 128 are over the bound; the
+    // empty-name entry and the duplicate URI are skipped individually.
+    assert_eq!(captured.resources.len(), 128);
+    assert_eq!(captured.resources_omitted.invalid, 2);
+    assert_eq!(captured.resources_omitted.over_bound, 12);
+    assert!(captured.resources_incomplete);
 }
 
 #[tokio::test]
