@@ -593,7 +593,8 @@ impl McpClientHandle {
         if crate::agent::runner::current_work_scope_is_cancelled() {
             anyhow::bail!("MCP connection cancelled");
         }
-        crate::config::managed::check_mcp_server(&server_name).map_err(anyhow::Error::msg)?;
+        crate::config::managed::check_mcp_server(&server_name, config)
+            .map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
             config.options().is_enabled(),
             "MCP server '{server_name}' is disabled by configuration (enabled = false)"

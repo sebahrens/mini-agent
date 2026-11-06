@@ -23,6 +23,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Managed `mcp.allowed_servers` / `denied_servers` entries can be tables pinning `command` and `args` or `url`
+  next to the name, so a same-named user or project server with another launch spec is refused; bare
+  names keep matching by name only (mini-agent-pqeki).
 - Managed policy `[sandbox]` gains `max_profile`, `max_network`, `allowed_hosts` and `forbid_home_mounts`: user, project
   and CLI settings can no longer widen the sandbox beyond them; `--sandbox-profile` above the ceiling is refused
   and `/doctor` lists the pins (mini-agent-hjg3d).

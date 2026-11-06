@@ -22,7 +22,9 @@
 //!
 //! [mcp]
 //! disabled = false
-//! allowed_servers = ["github"]                          # absent = no allowlist
+//! allowed_servers = ["github"]                          # absent = no allowlist; a bare name matches the name only
+//! # entries may be tables that also pin what runs:
+//! # { name = "gh", command = "npx", args = ["-y", "gh-mcp"] }  or  { name = "docs", url = "https://docs.example/mcp" }
 //! denied_servers = ["scratch"]
 //!
 //! [providers]
@@ -69,12 +71,104 @@ struct SandboxPolicy {
     forbid_home_mounts: bool,
 }
 
+/// One `allowed_servers` / `denied_servers` entry: a bare name (matches the
+/// server name only) or a table whose present fields must all match.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum McpEntry {
+    Name(String),
+    Spec(McpEntrySpec),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct McpEntrySpec {
+    name: Option<String>,
+    /// Stdio servers: the exact `command`.
+    command: Option<String>,
+    /// With `command`: the exact argument list. Omitted means no arguments for
+    /// an allow entry and any arguments for a deny entry.
+    args: Option<Vec<String>>,
+    /// URL servers: the exact `url` (a trailing `/` is ignored).
+    url: Option<String>,
+}
+
+impl McpEntry {
+    fn texts(&self) -> Vec<&str> {
+        match self {
+            Self::Name(name) => vec![name],
+            Self::Spec(spec) => spec
+                .name
+                .iter()
+                .chain(&spec.command)
+                .chain(&spec.url)
+                .chain(spec.args.iter().flatten())
+                .map(String::as_str)
+                .collect(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let Self::Spec(spec) = self else {
+            return Ok(());
+        };
+        if spec.name.is_none() && spec.command.is_none() && spec.url.is_none() {
+            return Err("an MCP entry table needs name, command or url".into());
+        }
+        if spec.command.is_some() && spec.url.is_some() {
+            return Err("an MCP entry cannot pin both command and url".into());
+        }
+        if spec.args.is_some() && spec.command.is_none() {
+            return Err("an MCP entry sets args without command".into());
+        }
+        Ok(())
+    }
+
+    /// Whether this entry matches the server `name` defined as `config`.
+    /// `strict_args` makes an omitted `args` mean "no arguments".
+    #[cfg(feature = "mcp")]
+    fn matches(
+        &self,
+        name: &str,
+        config: &crate::extras::mcp::config::McpServerConfig,
+        strict_args: bool,
+    ) -> bool {
+        use crate::extras::mcp::config::McpServerConfig;
+        let spec = match self {
+            Self::Name(entry) => return entry == name,
+            Self::Spec(spec) => spec,
+        };
+        if spec.name.as_deref().is_some_and(|entry| entry != name) {
+            return false;
+        }
+        match config {
+            // Built-in registrations carry a fixed, trusted identity.
+            McpServerConfig::BuiltIn { .. } => spec.command.is_none() && spec.url.is_none(),
+            McpServerConfig::Command { command, args, .. } => {
+                spec.url.is_none()
+                    && spec.command.as_deref().is_none_or(|entry| entry == command)
+                    && match (&spec.command, &spec.args) {
+                        (Some(_), Some(entry)) => entry == args,
+                        (Some(_), None) => !strict_args || args.is_empty(),
+                        _ => true,
+                    }
+            }
+            McpServerConfig::Url { url, .. } => {
+                spec.command.is_none()
+                    && spec.url.as_deref().is_none_or(|entry| {
+                        entry.trim_end_matches('/') == url.trim_end_matches('/')
+                    })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct McpPolicy {
     disabled: bool,
-    allowed_servers: Option<Vec<String>>,
-    denied_servers: Vec<String>,
+    allowed_servers: Option<Vec<McpEntry>>,
+    denied_servers: Vec<McpEntry>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -145,9 +239,12 @@ pub(crate) fn clamp_mode(mode: SecurityMode) -> SecurityMode {
 
 /// Refuse an MCP server the active policy does not allow.
 #[cfg(feature = "mcp")]
-pub(crate) fn check_mcp_server(name: &str) -> Result<(), String> {
+pub(crate) fn check_mcp_server(
+    name: &str,
+    config: &crate::extras::mcp::config::McpServerConfig,
+) -> Result<(), String> {
     match active() {
-        Some(policy) => policy.check_mcp_server(name),
+        Some(policy) => policy.check_mcp_server(name, config),
         None => Ok(()),
     }
 }
@@ -236,6 +333,25 @@ impl ManagedPolicy {
         for (what, list) in [
             ("mcp.denied_servers", Some(&file.mcp.denied_servers)),
             ("mcp.allowed_servers", file.mcp.allowed_servers.as_ref()),
+        ] {
+            let Some(list) = list else { continue };
+            if list.len() > MAX_ENTRIES
+                || list
+                    .iter()
+                    .flat_map(McpEntry::texts)
+                    .any(|text| text.len() > MAX_PATTERN_BYTES)
+            {
+                return Err(format!(
+                    "managed policy {shown}: {what} exceeds the size limit"
+                ));
+            }
+            for entry in list {
+                entry
+                    .validate()
+                    .map_err(|e| format!("managed policy {shown}: {what}: {e}"))?;
+            }
+        }
+        for (what, list) in [
             ("providers.allowed", file.providers.allowed.as_ref()),
             ("providers.denied", Some(&file.providers.denied)),
             ("sandbox.allowed_hosts", file.sandbox.allowed_hosts.as_ref()),
@@ -369,15 +485,17 @@ impl ManagedPolicy {
             return false;
         };
         pinned.iter().any(|pin| {
-            crate::sandbox::net_proxy::HostRule::parse(pin)
-                .is_ok_and(|pin| rule.covered_by(&pin))
+            crate::sandbox::net_proxy::HostRule::parse(pin).is_ok_and(|pin| rule.covered_by(&pin))
         })
     }
 
     pub(crate) fn permission_checks_required(&self) -> bool {
         let permissions = &self.file.permissions;
         permissions.require_permission_checks
-            || permissions.deny.values().any(|patterns| !patterns.is_empty())
+            || permissions
+                .deny
+                .values()
+                .any(|patterns| !patterns.is_empty())
             || permissions.allowed_modes.is_some()
             || permissions.disable_yolo
     }
@@ -402,20 +520,33 @@ impl ManagedPolicy {
         }
     }
 
+    /// Whether server `name`, defined as `config`, may run. Bare-name entries
+    /// match the name only; table entries also pin `command`/`args` or `url`.
     #[cfg(feature = "mcp")]
-    pub(crate) fn mcp_allowed(&self, name: &str) -> bool {
+    pub(crate) fn mcp_allowed(
+        &self,
+        name: &str,
+        config: &crate::extras::mcp::config::McpServerConfig,
+    ) -> bool {
         let mcp = &self.file.mcp;
         !mcp.disabled
-            && !mcp.denied_servers.iter().any(|denied| denied == name)
+            && !mcp
+                .denied_servers
+                .iter()
+                .any(|denied| denied.matches(name, config, false))
             && mcp
                 .allowed_servers
                 .as_ref()
-                .is_none_or(|allowed| allowed.iter().any(|item| item == name))
+                .is_none_or(|allowed| allowed.iter().any(|item| item.matches(name, config, true)))
     }
 
     #[cfg(feature = "mcp")]
-    pub(crate) fn check_mcp_server(&self, name: &str) -> Result<(), String> {
-        if self.mcp_allowed(name) {
+    pub(crate) fn check_mcp_server(
+        &self,
+        name: &str,
+        config: &crate::extras::mcp::config::McpServerConfig,
+    ) -> Result<(), String> {
+        if self.mcp_allowed(name, config) {
             Ok(())
         } else {
             Err(self.refusal(&format!(
@@ -546,9 +677,9 @@ impl ManagedPolicy {
         #[cfg(feature = "mcp")]
         if let Some(servers) = cfg.mcp_servers.as_mut() {
             let removed: Vec<String> = servers
-                .keys()
-                .filter(|name| !self.mcp_allowed(name))
-                .cloned()
+                .iter()
+                .filter(|(name, config)| !self.mcp_allowed(name, config))
+                .map(|(name, _)| name.clone())
                 .collect();
             for name in removed {
                 servers.remove(&name);
@@ -674,17 +805,108 @@ mod tests {
     }
 
     #[cfg(feature = "mcp")]
+    fn server(text: &str) -> crate::extras::mcp::config::McpServerConfig {
+        toml::from_str(text).unwrap()
+    }
+
+    #[cfg(feature = "mcp")]
     #[test]
     fn mcp_lists_deny_over_allow_and_disable_everything() {
+        let any = server("command = \"a\"\n");
         let policy = policy("[mcp]\ndenied_servers = [\"x\"]\n");
-        assert!(policy.check_mcp_server("y").is_ok());
-        assert!(policy.check_mcp_server("x").is_err());
+        assert!(policy.check_mcp_server("y", &any).is_ok());
+        assert!(policy.check_mcp_server("x", &any).is_err());
         let off = super::ManagedPolicy::from_file(
             PathBuf::from("/m.toml"),
             toml::from_str("[mcp]\ndisabled = true\n").unwrap(),
         )
         .unwrap();
-        assert!(off.check_mcp_server("anything").is_err());
+        assert!(off.check_mcp_server("anything", &any).is_err());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_entries_pin_what_runs_not_just_the_name() {
+        let policy = policy(
+            "[mcp]\nallowed_servers = [\"plain\", { name = \"github\", command = \"npx\", args = [\"-y\", \"gh-mcp\"] }, { name = \"docs\", url = \"https://docs.example/mcp\" }]\n",
+        );
+        let ok = |name: &str, text: &str| policy.check_mcp_server(name, &server(text));
+        // Name-only entries keep matching by name alone.
+        assert!(ok("plain", "command = \"anything\"\n").is_ok());
+        assert!(ok("plain", "url = \"https://evil.example\"\n").is_ok());
+        // Pinned command and args.
+        assert!(ok("github", "command = \"npx\"\nargs = [\"-y\", \"gh-mcp\"]\n").is_ok());
+        let swapped = ok("github", "command = \"sh\"\nargs = [\"-c\", \"evil\"]\n").unwrap_err();
+        assert!(swapped.contains("managed-config.toml"), "{swapped}");
+        assert!(ok("github", "command = \"npx\"\nargs = [\"-y\", \"evil\"]\n").is_err());
+        assert!(
+            ok(
+                "github",
+                "command = \"npx\"\nargs = [\"-y\", \"gh-mcp\", \"--x\"]\n"
+            )
+            .is_err()
+        );
+        assert!(ok("github", "url = \"https://github.example/mcp\"\n").is_err());
+        // Pinned url, trailing slash ignored; other command or url refused.
+        assert!(ok("docs", "url = \"https://docs.example/mcp/\"\n").is_ok());
+        assert!(ok("docs", "url = \"https://other.example/mcp\"\n").is_err());
+        assert!(ok("docs", "command = \"sh\"\n").is_err());
+        // Unlisted names stay refused.
+        assert!(ok("other", "command = \"npx\"\n").is_err());
+
+        // A pinned command with no args allows only an argument-free launch.
+        let bare = super::ManagedPolicy::from_file(
+            PathBuf::from("/m.toml"),
+            toml::from_str("[mcp]\nallowed_servers = [{ command = \"srv\" }]\n").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            bare.check_mcp_server("any", &server("command = \"srv\"\n"))
+                .is_ok()
+        );
+        assert!(
+            bare.check_mcp_server("any", &server("command = \"srv\"\nargs = [\"--x\"]\n"))
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_deny_entries_match_by_identity_and_apply_drops_mismatches() {
+        let policy = policy(
+            "[mcp]\ndenied_servers = [{ command = \"sh\" }, { url = \"https://bad.example\" }]\nallowed_servers = [{ name = \"ok\", command = \"a\" }]\n",
+        );
+        // Deny entries ignore args when none are pinned and ignore the name.
+        assert!(policy.mcp_allowed("ok", &server("command = \"a\"\n")));
+        assert!(!policy.mcp_allowed("ok", &server("command = \"sh\"\nargs = [\"-c\", \"x\"]\n")));
+        assert!(!policy.mcp_allowed("ok", &server("url = \"https://bad.example/\"\n")));
+        let mut cfg: super::super::Config = toml::from_str(
+            "[mcp_servers.ok]\ncommand = \"a\"\n[mcp_servers.fake]\ncommand = \"a\"\n",
+        )
+        .unwrap();
+        let mut spoof: super::super::Config =
+            toml::from_str("[mcp_servers.ok]\ncommand = \"b\"\n").unwrap();
+        policy.apply(&mut cfg);
+        policy.apply(&mut spoof);
+        assert!(cfg.mcp_servers.as_ref().unwrap().contains_key("ok"));
+        assert!(!cfg.mcp_servers.as_ref().unwrap().contains_key("fake"));
+        assert!(!spoof.mcp_servers.as_ref().unwrap().contains_key("ok"));
+    }
+
+    #[test]
+    fn invalid_mcp_entries_are_rejected() {
+        for bad in [
+            "[mcp]\nallowed_servers = [{}]\n",
+            "[mcp]\nallowed_servers = [{ command = \"a\", url = \"https://x\" }]\n",
+            "[mcp]\nallowed_servers = [{ name = \"a\", args = [\"x\"] }]\n",
+        ] {
+            let parsed =
+                ManagedPolicy::from_file(PathBuf::from("/m.toml"), toml::from_str(bad).unwrap());
+            assert!(parsed.is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<ManagedFile>("[mcp]\nallowed_servers = [{ nme = \"a\" }]\n").is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -821,7 +1043,10 @@ mod tests {
         );
         let cfg: super::super::Config = toml::from_str("").unwrap();
         let error = authority(&policy, &["--sandbox-profile", "host-full"], &cfg).unwrap_err();
-        assert!(error.contains("managed-config.toml") && error.contains("host-full"), "{error}");
+        assert!(
+            error.contains("managed-config.toml") && error.contains("host-full"),
+            "{error}"
+        );
         assert!(authority(&policy, &["--sandbox-profile", "workspace"], &cfg).is_ok());
         assert!(authority(&policy, &[], &cfg).is_ok());
 
@@ -831,20 +1056,32 @@ mod tests {
         )
         .unwrap();
         policy.apply(&mut cfg);
-        assert_eq!(cfg.sandbox_profile, Some(crate::sandbox::SandboxProfile::Workspace));
-        assert_eq!(cfg.sandbox_network, Some(crate::sandbox::SandboxNetwork::Allowlist));
+        assert_eq!(
+            cfg.sandbox_profile,
+            Some(crate::sandbox::SandboxProfile::Workspace)
+        );
+        assert_eq!(
+            cfg.sandbox_network,
+            Some(crate::sandbox::SandboxNetwork::Allowlist)
+        );
         assert!(cfg.sandbox_home_mounts.is_empty());
         assert_eq!(
             cfg.sandbox_network_hosts,
             ["registry.npmjs.org", "*.github.com", "api.github.com"]
         );
-        assert!(cfg.load_warnings.iter().all(|w| w.contains("managed-config.toml")));
+        assert!(
+            cfg.load_warnings
+                .iter()
+                .all(|w| w.contains("managed-config.toml"))
+        );
         assert_eq!(cfg.load_warnings.len(), 4);
         assert!(policy.network_hosts_pinned());
         let summary = policy.summary();
         assert!(
-            summary.contains("max profile workspace") && summary.contains("max network allowlist")
-                && summary.contains("2 allowed host(s)") && summary.contains("no home mounts"),
+            summary.contains("max profile workspace")
+                && summary.contains("max network allowlist")
+                && summary.contains("2 allowed host(s)")
+                && summary.contains("no home mounts"),
             "{summary}"
         );
     }
@@ -868,7 +1105,10 @@ mod tests {
         )
         .unwrap();
         open.apply(&mut cfg);
-        assert_eq!(cfg.sandbox_profile, Some(crate::sandbox::SandboxProfile::HostFull));
+        assert_eq!(
+            cfg.sandbox_profile,
+            Some(crate::sandbox::SandboxProfile::HostFull)
+        );
         assert_eq!(cfg.sandbox_home_mounts.len(), 1);
         assert_eq!(cfg.sandbox_network_hosts.len(), 1);
         assert!(!open.network_hosts_pinned());

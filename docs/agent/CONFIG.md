@@ -1144,8 +1144,11 @@ forbid_home_mounts = true                             # ignore sandbox-home-moun
 
 [mcp]
 disabled = false                                      # true refuses every MCP server
-allowed_servers = ["github"]                          # absent = no allowlist
+allowed_servers = ["github"]                          # absent = no allowlist; a bare name vets the NAME only
 denied_servers = ["scratch"]
+# Entries may be tables that also pin what runs; every present field must match:
+#   { name = "gh", command = "npx", args = ["-y", "gh-mcp"] }   # stdio: exact command and args
+#   { name = "docs", url = "https://docs.example/mcp" }          # URL: exact url (trailing / ignored)
 
 [providers]
 allowed = ["anthropic", "openai"]                     # absent = no allowlist
@@ -1160,7 +1163,13 @@ directive is ignored; Shift+Tab skips disallowed modes; the permission checker a
 change to the nearest permitted one. MCP servers outside the policy are dropped from the merged
 configuration (with a warning) and refused at connect time, including servers from `.mcp.json`. A
 provider outside the policy is refused wherever it is resolved. `/doctor` (`--doctor`) shows the
-`managed policy` path and a values-free summary of what it enforces. Sandbox pins only matter while the sandbox
+`managed policy` path and a values-free summary of what it enforces. A bare-name MCP entry is name-only: any user or project server with that name runs, whatever its
+command or URL, so pin `command`/`args` or `url` where the administrator must vet what executes. An
+allow entry that pins `command` without `args` permits only an argument-free launch; a deny entry
+without `args` matches any arguments, and a deny entry may omit `name` to block a command or URL
+under any name. `env`, `cwd` and headers are not compared.
+
+Sandbox pins only matter while the sandbox
 is on, so combine them with `required = true`. `max_profile` refuses `--sandbox-profile` above the
 ceiling and lowers a configured `sandbox-profile`; `max_network` lowers `sandbox-network`;
 `allowed_hosts` drops `sandbox-network-hosts` entries that are not covered by a pinned entry (a
