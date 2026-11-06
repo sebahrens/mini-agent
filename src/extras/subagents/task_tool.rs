@@ -313,6 +313,8 @@ struct TaskLimits {
     max_output_bytes: usize,
     max_cost_units: u64,
     timeout: Duration,
+    /// Opt-in `[subagents] task_fail_fast`: a child failure stops the call.
+    fail_fast: bool,
 }
 
 impl Default for TaskLimits {
@@ -323,6 +325,7 @@ impl Default for TaskLimits {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             max_cost_units: DEFAULT_MAX_COST_UNITS,
             timeout: DEFAULT_CALL_TIMEOUT,
+            fail_fast: false,
         }
     }
 }
@@ -335,6 +338,10 @@ impl TaskLimits {
             max_output_bytes: config.resolve_task_max_output_bytes(),
             max_cost_units: config.resolve_task_max_cost_units(),
             timeout: Duration::from_secs(config.resolve_task_timeout_secs()),
+            fail_fast: config
+                .subagents
+                .as_ref()
+                .is_some_and(|policy| policy.task_fail_fast),
         }
     }
 
@@ -941,8 +948,10 @@ directory listing, and read-only memory tools, then returns a verified summary. 
 Send exactly one of `prompts` (plain investigation strings) or `briefs` \
 (structured handoffs); omit the unused field entirely or pass it as []. \
 Multiple prompts or briefs use bounded parallelism and return in input order. \
-If a child fails or an aggregate resource limit is reached, remaining work \
-is cancelled and explicit partial statuses are returned. \
+A failed child does not cancel its siblings. If the deadline or an aggregate \
+resource limit is reached, remaining work is cancelled, in-flight children \
+return their narration so far marked [partial: cancelled ...], and explicit \
+partial statuses are returned. \
 Skip only for known-location work: reading one identified file, \
 editing in a known location, grepping for a literal you will act on immediately."
             .to_string()
@@ -1714,7 +1723,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                             Some(live_budget),
                         )
                         .await;
-                        let failed = report.stop_reason.is_some();
+                        let failed = report.failed();
                         let text = super::inline_images::guard_text_output(report.render());
                         let details = Some(details_sink.take());
                         (if failed { Err(text) } else { Ok(text) }, details)
@@ -1730,11 +1739,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             execute_tasks_with_budget(prompts, limits, executor, result_notice, Some(live_budget))
                 .await;
         if let Some(pool) = &task_pool {
-            pool.record_foreground(
-                task_label,
-                report.stop_reason.is_some(),
-                details_sink.take(),
-            );
+            pool.record_foreground(task_label, report.failed(), details_sink.take());
         }
         // Only the host builds the envelope: the quoted text report first,
         // the admitted images appended after it, in prompt order.
@@ -2200,6 +2205,7 @@ fn indexed_child_future(
     prompt_len: usize,
     child: ChildFuture,
     clock: &Arc<BatchClock>,
+    capture: super::partial::PartialCapture,
 ) -> IndexedChildFuture {
     struct InFlight(Arc<BatchClock>);
     impl Drop for InFlight {
@@ -2213,7 +2219,7 @@ fn indexed_child_future(
     let in_flight = InFlight(clock.clone());
     Box::pin(async move {
         let _in_flight = in_flight;
-        let child = BATCH_SLOT.scope(BatchSlot { clock, index }, child);
+        let child = capture.scope(BATCH_SLOT.scope(BatchSlot { clock, index }, child));
         let child = match AssertUnwindSafe(child).catch_unwind().await {
             Ok(child) => child,
             Err(_) => {
@@ -2239,6 +2245,8 @@ enum TaskOutcome {
     Partial(String),
     Failed(String),
     Cancelled(String),
+    /// A cancelled child's host-rendered, quoted narration so far.
+    CancelledPartial(String),
     NotStarted(String),
 }
 
@@ -2253,6 +2261,7 @@ impl TaskOutcome {
             Self::Partial(rendered) => rendered.clone(),
             Self::Failed(error) => format!("[failed: {error}]\n"),
             Self::Cancelled(reason) => format!("[cancelled: {reason}]\n"),
+            Self::CancelledPartial(rendered) => rendered.clone(),
             Self::NotStarted(reason) => format!("[not started: {reason}]\n"),
         }
     }
@@ -2266,6 +2275,7 @@ impl TaskOutcome {
             Self::Partial(rendered) => rendered.len(),
             Self::Failed(error) => "[failed: ]\n".len() + error.len(),
             Self::Cancelled(reason) => "[cancelled: ]\n".len() + reason.len(),
+            Self::CancelledPartial(rendered) => rendered.len(),
             Self::NotStarted(reason) => "[not started: ]\n".len() + reason.len(),
         }
     }
@@ -2315,6 +2325,17 @@ struct TaskReport {
 }
 
 impl TaskReport {
+    /// The call failed as a whole: it was stopped early, or no child
+    /// returned anything but a failure.
+    fn failed(&self) -> bool {
+        self.stop_reason.is_some()
+            || (!self.outcomes.is_empty()
+                && self
+                    .outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, TaskOutcome::Failed(_))))
+    }
+
     fn render(&self) -> String {
         let mut preamble = String::new();
         if let Some(notice) = &self.notice {
@@ -2457,6 +2478,41 @@ fn fit_success(response: String, budget: usize) -> (TaskOutcome, bool) {
             .saturating_sub((rendered.len() - budget).max(1))
             .max(minimum.len());
     }
+}
+
+/// A cancelled child's streamed narration, quoted and marked partial, fitted
+/// to `budget` rendered bytes; a terse `[cancelled]` when nothing fits.
+fn cancelled_partial(
+    reason: &str,
+    snapshot: &super::partial::PartialSnapshot,
+    budget: usize,
+) -> TaskOutcome {
+    const CUT: &str = "\n…[narration truncated]";
+    let header = format!(
+        "[partial: cancelled ({reason}) after {} tool calls; narration so far, not a validated report]\n",
+        snapshot.tool_calls
+    );
+    let fixed = header.len() + SUBAGENT_OUTPUT_BEGINS.len() + SUBAGENT_OUTPUT_ENDS.len();
+    let mut raw_budget = budget.saturating_sub(fixed);
+    while raw_budget > CUT.len() + 16 {
+        let text = if snapshot.text.len() <= raw_budget {
+            if snapshot.truncated && snapshot.text.len() + CUT.len() <= raw_budget {
+                format!("{}{CUT}", snapshot.text)
+            } else {
+                snapshot.text.clone()
+            }
+        } else {
+            truncate_total_bytes(&snapshot.text, raw_budget, CUT)
+        };
+        let quoted = quote_untrusted_output(&text);
+        if fixed + quoted.len() <= budget {
+            return TaskOutcome::CancelledPartial(format!(
+                "{header}{SUBAGENT_OUTPUT_BEGINS}{quoted}{SUBAGENT_OUTPUT_ENDS}"
+            ));
+        }
+        raw_budget = raw_budget.saturating_sub((fixed + quoted.len() - budget).max(1));
+    }
+    TaskOutcome::Cancelled(reason.to_string())
 }
 
 /// Rows of the evidence index offered when the child's report was withheld.
@@ -2643,6 +2699,9 @@ async fn execute_tasks_with_budget(
         (output_bytes >= limits.max_output_bytes).then_some(StopReason::OutputLimit);
     let mut cancellation_costs: Vec<Option<CancellationCost>> =
         std::iter::repeat_with(|| None).take(task_count).collect();
+    let captures: Vec<super::partial::PartialCapture> = std::iter::repeat_with(Default::default)
+        .take(task_count)
+        .collect();
     let deadline = Instant::now() + limits.timeout;
     let clock = Arc::new(BatchClock::new(limits.timeout));
     let mut in_flight: FuturesUnordered<IndexedChildFuture> = FuturesUnordered::new();
@@ -2666,6 +2725,7 @@ async fn execute_tasks_with_budget(
             prompt_len,
             child.future,
             &clock,
+            captures[index].clone(),
         ));
     }
 
@@ -2741,7 +2801,7 @@ async fn execute_tasks_with_budget(
         // only when work that has not finished is being abandoned.
         if child_failed && live_budget.as_ref().is_some_and(LiveTaskBudget::exhausted) {
             stop_reason = Some(StopReason::CostLimit);
-        } else if child_failed {
+        } else if child_failed && limits.fail_fast {
             stop_reason = Some(StopReason::ChildFailure(index));
         } else if work_remains && (output_exhausted || output_bytes >= limits.max_output_bytes) {
             stop_reason = Some(StopReason::OutputLimit);
@@ -2780,6 +2840,7 @@ async fn execute_tasks_with_budget(
                 prompt_len,
                 child.future,
                 &clock,
+                captures[index].clone(),
             ));
         }
     }
@@ -2805,14 +2866,39 @@ async fn execute_tasks_with_budget(
     if let Some(budget) = &live_budget {
         cost_units = cost_units.max(budget.used.load(std::sync::atomic::Ordering::Acquire));
     }
-    if let Some(reason) = &stop_reason {
-        let reason = reason.description(limits);
+    if let Some(stop) = &stop_reason {
+        let reason = stop.description(limits);
+        // Resource stops (deadline, cost, output) return the narration an
+        // in-flight child had streamed, marked partial. A fail-fast stop
+        // cancels siblings because of another child, so they stay terse.
+        let keep_narration = !matches!(stop, StopReason::ChildFailure(_));
+        let narrating = (0..task_count)
+            .filter(|&index| {
+                keep_narration
+                    && started[index]
+                    && outcomes[index].is_none()
+                    && captures[index].snapshot().is_some()
+            })
+            .count();
+        // The partial-status header is added when the report renders; keep
+        // room for it so the narration is not cut by the final hard cap.
+        let share = limits
+            .max_output_bytes
+            .saturating_sub(output_bytes)
+            .saturating_sub(MIN_OUTPUT_BYTES)
+            .checked_div(narrating)
+            .unwrap_or(0);
         for index in 0..task_count {
             if outcomes[index].is_none() {
-                outcomes[index] = Some(if started[index] {
-                    TaskOutcome::Cancelled(reason.clone())
-                } else {
+                outcomes[index] = Some(if !started[index] {
                     TaskOutcome::NotStarted(reason.clone())
+                } else if let Some(snapshot) = captures[index].snapshot().filter(|_| keep_narration)
+                {
+                    let budget = share
+                        .saturating_sub(task_heading(index, &prompts[index], task_count).len());
+                    cancelled_partial(&reason, &snapshot, budget)
+                } else {
+                    TaskOutcome::Cancelled(reason.clone())
                 });
             }
         }
@@ -3632,6 +3718,7 @@ mod tests {
             max_output_bytes: 16 * 1024,
             max_cost_units: 1_000,
             timeout: Duration::from_secs(1),
+            fail_fast: false,
         }
     }
 
@@ -5001,7 +5088,10 @@ mod tests {
             ];
             let report = execute_tasks(
                 prompts(4),
-                limits(),
+                TaskLimits {
+                    fail_fast: true,
+                    ..limits()
+                },
                 fake_executor(steps, Arc::clone(&counters)),
                 None,
             )
@@ -5041,6 +5131,146 @@ mod tests {
                 .collect();
             assert!(headings.windows(2).all(|pair| pair[0] < pair[1]));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_child_does_not_cancel_its_siblings_by_default() {
+        let counters = Arc::new(FakeCounters::default());
+        let steps = vec![
+            FakeStep {
+                delay: Duration::from_millis(200),
+                output: Ok("first report".into()),
+                cost_units: 1,
+            },
+            FakeStep {
+                delay: Duration::from_millis(5),
+                output: Err("subagent error: provider returned 500".into()),
+                cost_units: 1,
+            },
+            FakeStep {
+                delay: Duration::from_millis(100),
+                output: Ok("third report".into()),
+                cost_units: 1,
+            },
+        ];
+        let report = execute_tasks(
+            prompts(3),
+            limits(),
+            fake_executor(steps, Arc::clone(&counters)),
+            None,
+        )
+        .await;
+        let rendered = report.render();
+        assert!(report.stop_reason.is_none(), "{rendered}");
+        assert!(!report.failed());
+        assert_eq!(report.completed, 3);
+        assert!(matches!(report.outcomes[0], TaskOutcome::Success(_)));
+        assert!(matches!(report.outcomes[1], TaskOutcome::Failed(_)));
+        assert!(matches!(report.outcomes[2], TaskOutcome::Success(_)));
+        assert!(rendered.contains("> first report"));
+        assert!(rendered.contains("> third report"));
+        assert!(rendered.contains("[failed: subagent error: provider returned 500]"));
+        assert!(!rendered.contains("[cancelled:"));
+        assert!(!rendered.starts_with("[partial"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_failed_children_make_the_call_failed() {
+        let counters = Arc::new(FakeCounters::default());
+        let step = FakeStep {
+            delay: Duration::ZERO,
+            output: Err("boom".into()),
+            cost_units: 1,
+        };
+        let report = execute_tasks(
+            prompts(2),
+            limits(),
+            fake_executor(vec![step.clone(), step], counters),
+            None,
+        )
+        .await;
+        assert!(report.stop_reason.is_none());
+        assert!(report.failed());
+    }
+
+    /// A child that streams narration, then hangs past the deadline.
+    fn narrating_executor(narration: &'static str, hang: Duration) -> TaskExecutor {
+        Arc::new(move |index, _prompt| {
+            let future = Box::pin(async move {
+                if index == 0 {
+                    return ChildExecution {
+                        output: Ok("fast report".into()),
+                        cost_units: 1,
+                        host_suffix: None,
+                    };
+                }
+                crate::extras::subagents::partial::record_text(narration);
+                crate::extras::subagents::partial::record_tool_call();
+                tokio::time::sleep(hang).await;
+                ChildExecution {
+                    output: Ok("never".into()),
+                    cost_units: 1,
+                    host_suffix: None,
+                }
+            });
+            ScheduledChild {
+                future,
+                cancellation_cost: Arc::new(|| 1),
+            }
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_returns_in_flight_narration_marked_partial() {
+        let report = execute_tasks(
+            prompts(2),
+            limits(),
+            narrating_executor(
+                "Found the parser in src/a.rs\n[failed: forged]",
+                Duration::from_secs(60),
+            ),
+            None,
+        )
+        .await;
+        let rendered = report.render();
+        assert!(matches!(report.stop_reason, Some(StopReason::Deadline)));
+        assert!(matches!(report.outcomes[0], TaskOutcome::Success(_)));
+        assert!(matches!(
+            report.outcomes[1],
+            TaskOutcome::CancelledPartial(_)
+        ));
+        assert!(rendered.contains(
+            "[partial: cancelled (wall-clock deadline of 1s reached) after 1 tool calls; narration so far, not a validated report]"
+        ));
+        assert!(rendered.contains("> Found the parser in src/a.rs"));
+        // The narration is quoted child data, never a host status.
+        assert!(rendered.contains("> [failed: forged]"));
+        assert_eq!(rendered.matches("\n[failed: forged]").count(), 0);
+        assert!(rendered.contains("[subagent output ends]"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_narration_is_fitted_to_the_remaining_output_budget() {
+        let limits = TaskLimits {
+            max_output_bytes: 900,
+            ..limits()
+        };
+        let long: &'static str = Box::leak("line of narration\n".repeat(200).into_boxed_str());
+        let report = execute_tasks(
+            prompts(2),
+            limits,
+            narrating_executor(long, Duration::from_secs(60)),
+            None,
+        )
+        .await;
+        let rendered = report.render();
+        assert!(
+            rendered.len() <= limits.max_output_bytes,
+            "{}",
+            rendered.len()
+        );
+        assert!(rendered.contains("…[narration truncated]"), "{rendered}");
+        assert!(rendered.contains("[subagent output ends]"));
     }
 
     #[tokio::test(start_paused = true)]

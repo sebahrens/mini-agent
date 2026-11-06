@@ -13,6 +13,7 @@ pub(crate) mod evidence;
 pub(crate) mod image_cost;
 pub(crate) mod inline_images;
 pub(crate) mod isolation;
+pub(crate) mod partial;
 pub(crate) mod prompt;
 pub(crate) mod task_tool;
 

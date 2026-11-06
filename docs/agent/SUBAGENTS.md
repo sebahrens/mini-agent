@@ -982,7 +982,7 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_cost_weighting`       | `string` | `"auto"`                 | Model-aware ratios; `"fixed"` uses configured weights |
 | `task_cost_weights`         | `object` | See below                | Token-category weights and automatic-mode fallbacks |
 | `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
-| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline; completed sibling results are retained when it expires |
+| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline; completed sibling results and in-flight narration are retained when it expires |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `task_evidence`             | `bool`   | `true`                   | Host-minted evidence handles, citations, the Evidence section and `task_evidence` ([details](#evidence-handles)); tool registration follows a restart |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
@@ -1243,15 +1243,30 @@ estimate's patch-formula image charge. A child's history admits at most 4 MiB
 of encoded image data; see [IMAGE_READ.md](IMAGE_READ.md) for the formula and
 the omission behaviour.
 
-The first child failure stops new launches and cancels in-flight siblings.
-Aggregate output exhaustion, aggregate cost exhaustion, and the whole-call
-deadline do the same. Every prompt still receives one deterministic status in
-original prompt order:
+A child failure (for example a provider error) is that child's outcome only:
+it is reported as `[failed: ...]` and its queued and in-flight siblings run to
+completion (mini-agent-xwsaa). Set `[subagents] task_fail_fast = true` to
+restore the older behaviour where the first failure stops new launches and
+cancels in-flight siblings. Aggregate output exhaustion, aggregate cost
+exhaustion, and the whole-call deadline stop new launches and cancel in-flight
+children. Every prompt still receives one deterministic status in original
+prompt order:
 
 - completed children contain their response;
-- the triggering failure contains `[failed: ...]`;
-- started siblings contain `[cancelled: ...]`;
+- a failed child contains `[failed: ...]`;
+- an in-flight child cancelled by the deadline or an output/cost limit that
+  had already streamed text returns that narration, quoted like any child
+  output, under the host header
+  `[partial: cancelled (<reason>) after N tool calls; narration so far, not a validated report]`
+  (at most 32 KiB per child, sharing the remaining output budget with the
+  other cancelled children and marked `…[narration truncated]` when cut);
+- other started children contain `[cancelled: ...]` (a fail-fast stop always
+  uses this terse form for its siblings);
 - queued prompts contain `[not started: ...]`.
+
+A background task is recorded as `failed` only when the call stopped early or
+every child failed; a batch with some failed children is `completed` and shows
+their `[failed: ...]` sections.
 
 The scheduler checks the absolute deadline before admitting each child.
 A result already ready when the scheduler resumes is

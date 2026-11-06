@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Subagents
+
+- A failed `task` child no longer cancels its siblings: the other children run to completion and
+  the failure is reported only in its own section (`[subagents] task_fail_fast = true` restores
+  fail-fast). Children cancelled by the deadline or an output/cost limit return their streamed
+  narration as a quoted `[partial: cancelled ...]` section instead of only `[cancelled: ...]`.
+
 **Fork release 1.14.2 (2026-10-28)**
 
 ### Security

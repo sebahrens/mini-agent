@@ -4003,6 +4003,11 @@ charged to `task_max_cost_units`. It needs `task_evidence = true`. A persona's
 `inline_images` frontmatter can only narrow it. See
 [Inline image lane](SUBAGENTS.md#inline-image-lane).
 
+`[subagents] task_fail_fast = true` (default false) makes the first failed
+child of a `task` call cancel its in-flight siblings and stop queued launches.
+By default a failed child is only that child's outcome. See
+[Bounded execution](SUBAGENTS.md#bounded-execution-and-partial-results).
+
 ### Hook event parity
 
 `PreCompact` observes an actual compaction before summarization. Its envelope has

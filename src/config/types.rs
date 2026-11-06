@@ -15,6 +15,11 @@ pub struct SubagentPolicy {
     /// Omitted when 0, so saving a config never adds the key.
     #[serde(skip_serializing_if = "is_zero_u8")]
     pub task_inline_images: u8,
+    /// Opt-in: the first child failure cancels its in-flight siblings and
+    /// stops queued launches. Default false: a failed child is only that
+    /// child's outcome and its siblings run to completion.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub task_fail_fast: bool,
 }
 
 #[cfg(feature = "subagents")]
