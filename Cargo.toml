@@ -125,6 +125,8 @@ tokio = { version = "1", features = [
     "fs",
     "net",
     "io-util",
+    # `--mcp-server` serves JSON-RPC on the process's stdio.
+    "io-std",
 ] }
 anyhow = "1"
 cap-std = "4.0.2"

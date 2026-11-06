@@ -10,6 +10,7 @@ pub(crate) mod health;
 pub mod oauth;
 pub(crate) mod project;
 pub(crate) mod resource_tools;
+pub(crate) mod server;
 pub mod tool;
 
 use std::collections::HashMap;

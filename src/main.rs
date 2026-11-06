@@ -353,6 +353,21 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "mcp")]
+    if cli.mcp_server {
+        #[cfg(feature = "acp")]
+        anyhow::ensure!(
+            !cli.acp_enabled,
+            "--mcp-server cannot be combined with --acp"
+        );
+        #[cfg(feature = "loop")]
+        anyhow::ensure!(
+            !cli.loop_mode,
+            "--mcp-server cannot be combined with --loop"
+        );
+        return extras::mcp::server::serve_stdio().await;
+    }
+
     let is_interactive =
         !cli.print && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     #[cfg(feature = "acp")]

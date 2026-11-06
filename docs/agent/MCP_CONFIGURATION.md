@@ -181,6 +181,27 @@ the cap counts only admitted tools and a selected tool past index 128 is still
 reached. `/mcp <server>` shows how many listed tools the selection excluded.
 Selection only narrows the registered set; it grants no permission.
 
+## MCP server mode (`--mcp-server`)
+
+`mini-agent --mcp-server [flags]` serves mini-agent itself to another agent or
+IDE over MCP on stdio (newline-delimited JSON-RPC: `initialize`, `ping`,
+`tools/list`, `tools/call`). It is opt-in and off by default. It offers one
+tool, `run` (`prompt`, at most 256 KiB), which launches this executable as
+`mini-agent [flags] -p -- <prompt>` in the server's working directory and
+returns the final answer (stdout, at most 1 MiB, with a truncation note). The
+child therefore applies exactly the provider, model, sandbox, permission and
+tool flags the server was started with, and the ordinary headless policy:
+permission asks cannot be answered over MCP and fail closed unless those flags
+allow the action. A non-zero exit returns `isError: true` with stdout and a
+bounded stderr tail; a run is stopped after 30 minutes. Calls are handled one
+at a time. The server process itself runs no tools and opens no connections.
+`--mcp-server` cannot be combined with `-p`, a prompt, `--acp` or `--loop`.
+
+```json
+{"mcpServers": {"mini-agent": {"command": "mini-agent",
+  "args": ["--mcp-server", "--read-only"]}}}
+```
+
 ## Captured source checks at tool dispatch
 
 Each configured connection retains its captured workspace, selected server and

@@ -73,6 +73,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Opt-in `mini-agent --mcp-server` serves mini-agent over MCP on stdio with one `run` tool; each
+  call runs the prompt as a headless `-p` child with the server's own sandbox, permission,
+  provider and tool flags (asks fail closed) (mini-agent-ybwl5).
 - Model-facing `list_mcp_resources` and `read_mcp_resource` tools reuse the bounded resource
   catalogue and text-only read path under auxiliary (non-tool) permission identities, so
   headless and autonomous runs can use resource-oriented MCP servers (mini-agent-ir8af).

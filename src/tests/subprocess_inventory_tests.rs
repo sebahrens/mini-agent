@@ -1660,6 +1660,21 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-MCP-STDIO",
     ),
+    // `--mcp-server` relaunches this executable as a headless `-p` child
+    // with the operator's own flags and the client prompt as one literal
+    // argv element after `--`.
+    (
+        "src/extras/mcp/server.rs",
+        "let mut child = tokio::process::Command::new(&command.program);",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "let mut child = match child.spawn() {",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
     (
         "src/sandbox.rs",
         "let mut cmd = Command::new(&self.shell);",
@@ -6461,6 +6476,7 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
+    ("src/extras/mcp/server.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/clipboard_image.rs", "TC-SUPPORT-UTILITY"),

@@ -919,6 +919,16 @@ pub struct Cli {
     )]
     pub acp_enabled: bool,
 
+    /// Opt-in MCP server mode. Each `run` call launches this executable as a
+    /// headless `-p` child with the remaining flags, so it honours them.
+    #[cfg(feature = "mcp")]
+    #[arg(
+        long = "mcp-server",
+        conflicts_with_all = ["print", "message"],
+        help = "Serve mini-agent as an MCP server on stdio (one `run` tool; each call runs the prompt headlessly with these flags)"
+    )]
+    pub mcp_server: bool,
+
     #[cfg(any(feature = "acp", feature = "loop"))]
     #[arg(
         long = "idle-exit",
