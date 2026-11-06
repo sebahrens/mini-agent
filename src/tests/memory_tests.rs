@@ -9,8 +9,8 @@
 //! fields (Mem's own helpers are private).
 
 use crate::extras::memory::{
-    MAX_INJECT_BYTES, Mem, WriteMode, WriteTarget, append_memory_block, compaction_heading,
-    effective_reserve, flush_compaction_summary,
+    MAX_INJECT_BYTES, Mem, MemoryReadArgs, WriteMode, WriteTarget, append_memory_block,
+    compaction_heading, effective_reserve, flush_compaction_summary,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -2170,4 +2170,115 @@ fn esuz5_notes_index_lists_newest_first_and_survives_500_notes() {
     assert!(first < second, "newest first");
     assert!(block.contains("more project notes"));
     assert!(!block.contains("index unavailable"));
+}
+
+fn read_args(source: &str, offset: Option<usize>, tail: Option<bool>) -> MemoryReadArgs {
+    MemoryReadArgs {
+        source: source.into(),
+        name: None,
+        offset,
+        limit: None,
+        tail,
+    }
+}
+
+#[test]
+fn memory_read_pages_and_tails_a_long_term_file_past_32_kib() {
+    let m = fresh("read-paging");
+    let mut body = String::from("OLDEST-ENTRY\n");
+    body.push_str(&"filler line of memory\n".repeat(3000));
+    body.push_str("NEWEST-APPENDED-ENTRY\n");
+    let total = body.len();
+    assert!(total > 2 * MAX_INJECT_BYTES);
+    fs::write(m.root.join("MEMORY.md"), &body).unwrap();
+
+    // Default: head, with a marker naming the total, the remainder and the offset.
+    let head = m
+        .read_for_args(&read_args("long_term", None, None))
+        .unwrap();
+    assert!(head.starts_with("OLDEST-ENTRY"));
+    assert!(!head.contains("NEWEST-APPENDED-ENTRY"));
+    assert!(
+        head.contains(&format!("of {total}")),
+        "{}",
+        &head[head.len() - 200..]
+    );
+    assert!(head.contains("bytes remain; continue with offset="));
+
+    // tail=true reads the last appended entry.
+    let tail = m
+        .read_for_args(&read_args("long_term", None, Some(true)))
+        .unwrap();
+    assert!(tail.contains("NEWEST-APPENDED-ENTRY"));
+    assert!(!tail.contains("OLDEST-ENTRY"));
+    assert!(tail.contains("older entries omitted"));
+
+    // Following the continuation offsets reaches the end and reassembles the file.
+    let mut offset = 0usize;
+    let mut rebuilt = String::new();
+    loop {
+        let page = m
+            .read_for_args(&read_args("long_term", Some(offset), Some(false)))
+            .unwrap();
+        let content = page
+            .split_once('\n')
+            .filter(|_| page.starts_with("…[memory:"))
+            .map_or(page.as_str(), |(_, rest)| rest);
+        let (content, next) = match content.rfind("\n…[memory truncated:") {
+            Some(at) => {
+                let marker = &content[at..];
+                let next = marker
+                    .split("offset=")
+                    .nth(1)
+                    .unwrap()
+                    .split(',')
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                (&content[..at], Some(next))
+            }
+            None => (content, None),
+        };
+        rebuilt.push_str(content);
+        match next {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(rebuilt, body);
+
+    // Past-the-end offset is reported, not silently empty.
+    let past = m
+        .read_for_args(&read_args("long_term", Some(total + 10), None))
+        .unwrap();
+    assert!(past.contains("past the end"));
+    // Small file: unchanged, no marker.
+    fs::write(m.root.join("MEMORY.md"), "tiny\n").unwrap();
+    assert_eq!(
+        m.read_for_args(&read_args("long_term", None, None))
+            .unwrap(),
+        "tiny\n"
+    );
+    cleanup(&m);
+}
+
+#[test]
+fn memory_read_windows_respect_character_boundaries() {
+    let m = fresh("read-cjk");
+    fs::write(m.root.join("MEMORY.md"), "記憶實作".repeat(20_000)).unwrap();
+    for offset in [1usize, 2, 3, 32_767] {
+        let page = m
+            .read_for_args(&read_args("long_term", Some(offset), Some(false)))
+            .unwrap();
+        assert!(page.contains('記') || page.contains('憶') || page.contains('實'));
+    }
+    let limited = m
+        .read_for_args(&MemoryReadArgs {
+            limit: Some(20),
+            ..read_args("long_term", Some(0), None)
+        })
+        .unwrap();
+    assert!(limited.contains("continue with offset=18"), "{limited}");
+    cleanup(&m);
 }

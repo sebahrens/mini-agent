@@ -8,6 +8,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `memory_read` accepts `offset`, `limit` and `tail`, and its truncation marker states the total
+  size, remaining bytes and the offset to continue from, so entries appended past 32 KiB stay
+  readable (mini-agent-zcipw).
 - `claude_user_agents = true` (default off, project-trust gated) also reads `~/.claude/agents`
   below mini-agent's own user agents (mini-agent-xt7qy).
 - Claude Code subagent files load when the description is over 160 characters (shortened with a

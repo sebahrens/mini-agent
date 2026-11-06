@@ -155,6 +155,13 @@ and an explicit deny remains effective in every mode.
 |---|---|---|
 | `source` | string | `long_term`, `scratchpad`, `daily`, `note`, or `list` |
 | `name` | string (opt) | Note stem or YYYY-MM-DD for daily |
+| `offset` | integer (opt) | Byte offset to start at (default 0; a daily log defaults to its newest bytes) |
+| `limit` | integer (opt) | Maximum bytes returned, 16 to 32768 (default 32768) |
+| `tail` | boolean (opt) | Return the newest bytes instead of the head (default `true` for `daily`, else `false`) |
+
+A file larger than the window is truncated visibly: the marker states the shown byte range, the file's
+total size, the bytes remaining and the `offset=N` to continue from. Page with `offset`, or read
+`tail=true` to see newest appended entries of an oversized `MEMORY.md`, scratchpad or note.
 
 `source=list` enumerates all `.md` files in the store (global MEMORY.md + current project's notes + daily logs).
 
