@@ -1555,6 +1555,14 @@ fn lsp_command_with_search_path(
     Ok(command)
 }
 
+#[cfg(test)]
+pub(crate) fn delegated_environment_for_test(
+    inherit_env: &[String],
+    explicit: &HashMap<String, String>,
+) -> anyhow::Result<Vec<(OsString, OsString)>> {
+    delegated_environment(inherit_env, explicit)
+}
+
 fn delegated_environment(
     inherit_env: &[String],
     explicit: &HashMap<String, String>,

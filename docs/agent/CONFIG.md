@@ -3910,7 +3910,7 @@ enabled = "auto"          # omitted also means auto; false disables, true is exp
 [lsp.servers.rust]          # override a built-in default
 command = "rust-analyzer"
 extensions = [".rs"]
-inherit_env = ["PATH"]      # named parent values only
+inherit_env = ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"]  # named parent values only; replaces the built-in list (PATH, HOME, XDG_*, GOPATH, GOCACHE, CARGO_HOME, VIRTUAL_ENV, ...)
 
 [lsp.servers.myserver]      # fully custom server
 command = "my-ls"
@@ -3959,7 +3959,10 @@ Behavior notes:
   cooldown. The watcher sleeps until the deadline and does not poll.
 - The child environment is cleared. `inherit_env` delegates named parent
   values and `env` supplies explicit values; explicit values win. Built-ins
-  delegate only `PATH` so they can find project toolchains.
+  delegate `PATH`, `HOME`, `XDG_*`, temp dirs and non-secret toolchain
+  variables (`GOPATH`, `GOCACHE`, `GOMODCACHE`, `GOFLAGS`, `CARGO_HOME`,
+  `RUSTUP_HOME`, `VIRTUAL_ENV`, `JAVA_HOME`) so they find project toolchains
+  and caches; setting `inherit_env` on a server replaces that list.
 - Omitting `sandbox` explicitly trusts the configured workspace service. A
   requested backend fails closed when unavailable. `network = "deny"` starts
   only when that backend can enforce network denial; it never falls back to an
