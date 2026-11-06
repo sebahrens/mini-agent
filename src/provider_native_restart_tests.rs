@@ -232,6 +232,55 @@ async fn compact_restarts_the_native_chain_and_the_next_prompt_completes() {
     assert_eq!(last.native_frontier.refusal(), None);
 }
 
+// mini-agent-ewkrr: an ACP native session over the window reserve is compacted
+// like any other, and the thinking chain built over the old transcript is
+// restarted from the compacted one so the next prompt reaches the provider.
+#[cfg(feature = "acp")]
+#[tokio::test]
+async fn acp_native_compaction_restarts_the_chain_over_the_compacted_transcript() {
+    let cfg = crate::config::Config {
+        compact_enabled: Some(true),
+        keep_recent_tokens: Some(1),
+        ..Default::default()
+    };
+    // The ACP gate no longer exempts native history from token pressure.
+    let limits = crate::extras::acp::acp_native_limits_for_test(&cfg, 20_000, 2_000);
+    assert!(limits, "native ACP history must be subject to token pressure");
+    let run = drive(
+        "native-acp-compact",
+        vec![
+            response("acp-signature-one", "first answer"),
+            response("acp-signature-two", "second answer"),
+        ],
+        vec!["first prompt".into(), "second prompt".into()],
+        true,
+        json!({"compact_enabled": false}),
+    )
+    .await;
+    let mut session = run.saved.last().unwrap().clone();
+    assert!(session.native_history_snapshot().is_some());
+    assert!(session.native_restart_cause().is_none(), "healthy chain");
+    // No compaction happened: restarting is a no-op that keeps the chain.
+    crate::extras::acp::restart_native_after_compaction(&mut session, None)
+        .await
+        .unwrap();
+    assert!(session.native_history_snapshot().is_some());
+    // Compaction rewrites the transcript under the signed chain.
+    let cut = session.messages.len();
+    session.compress("COMPACTED SUMMARY".into(), cut, 0);
+    assert!(
+        session.native_restart_cause().is_some(),
+        "compaction invalidates the chain"
+    );
+    let epoch = session.native_frontier.current();
+    crate::extras::acp::restart_native_after_compaction(&mut session, None)
+        .await
+        .unwrap();
+    assert!(session.native_history_snapshot().is_none());
+    assert!(session.native_restart_cause().is_none());
+    assert!(session.native_frontier.current() > epoch, "new epoch");
+}
+
 // mini-agent-9xucp: a persisted session runs past both finite bounds (128
 // frames) without a refusal. The chain restarts in a new epoch near the bound.
 #[tokio::test]

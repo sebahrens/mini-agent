@@ -1565,10 +1565,10 @@ prompts. A headless or ACP turn stops at the next complete tool batch, records i
 compacts the session history (in memory under `--no-session`) and continues with a
 continuation prompt, at most three times per turn; ACP also sends a short agent-thought
 notice. Between turns a provider-native (Anthropic replay) session compacts like any other (TUI
-auto-compaction and `/compact`, headless pre-turn compaction): its signed thinking chain cannot be
+auto-compaction and `/compact`, headless pre-turn compaction, and ACP prompts under token pressure): its signed thinking chain cannot be
 summarized in place, so the compaction restarts the chain from the compacted transcript as a new
 replay epoch, with a one-line notice (earlier thinking blocks are dropped). It is not compacted
-mid-turn, and ACP refuses to compact one with a visible message before any summarizer spend. Tools with their own output limits (`read`,
+mid-turn in ACP (see below); an ACP prompt is never refused for want of in-place compaction. Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
 and the subagent `task` tool) retain their documented line, byte, and result
 limits in both live and replayed history. Their
