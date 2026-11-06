@@ -294,6 +294,20 @@ mod persistence_tests {
                 .default_max_turns(4)
                 .build();
             let agent = AnyAgent::without_skills(crate::provider::AnyAgentInner::OpenRouter(agent));
+            // The goal engine re-runs a failed round, and the provider (this
+            // server stops listening after two replies) refuses connections
+            // from then on. The default retry budget (six attempts, ~15 s of
+            // backoff per round, mini-agent-dqa0y) made that exceed the
+            // test's 20 s bound, so keep the retry path but make it quick.
+            let cfg = Config {
+                retry: crate::retry::RetryConfig {
+                    max_attempts: 2,
+                    initial_backoff_ms: 1,
+                    max_backoff_ms: 5,
+                    max_retry_after_ms: 5,
+                },
+                ..Config::default()
+            };
             let mut cli = Cli::parse_from(["mini-agent"]);
             cli.loop_prompt = Some("write the file".into());
             cli.loop_plan = Some(root.path.join("plan.md"));
@@ -305,7 +319,7 @@ mod persistence_tests {
             // The same two steps production takes: the goal is installed
             // before the agent would be built, then the rounds run.
             assert!(
-                install_loop_goal(&cli, &Config::default(), &session)
+                install_loop_goal(&cli, &cfg, &session)
                     .await
                     .expect("the loop goal installs")
             );
@@ -314,7 +328,7 @@ mod persistence_tests {
                 run_headless_loop(
                     agent,
                     &cli,
-                    &Config::default(),
+                    &cfg,
                     &crate::context::load(true),
                     &session,
                     None,
