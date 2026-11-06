@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `job_status` `wait` with `until=` scans unread output once more after the job ends or the deadline hits, and walks backlogs larger than 256 KiB in chunks (reporting bytes that were neither retained nor logged) instead of skipping the middle (mini-agent-d1v5g, mini-agent-kjdud). `--import-agent-skill`, `--import-learned-skill`, `--distill-learned-skill-out` and `--sandbox-toolchain-root` resolve against the launch directory (mini-agent-zn9i2). The bwrap network forwarder answers connections beyond its relay cap with an HTTP 503 and a one-line stderr notice, and the cap is configurable with `MINI_AGENT_NET_MAX_RELAYS` (mini-agent-tgmxc).
 - Relative `--add-dir`, `--image`, `--output-schema`, `--loop-plan` and `--log-file` paths keep
   resolving against the launch directory under `project_root_discovery` (mini-agent-k8w51). The
   `--stream-json-control` sandbox network ask is per `host:port` (concurrent connections share one

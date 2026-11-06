@@ -3071,7 +3071,7 @@ impl Sandbox {
             matrix.requested_network_policy = "allow for shell commands (sandbox-network opt-in)";
         }
         if policy == SandboxPolicy::RequiredAndAvailable && self.shell_network_proxied() {
-            matrix.network = "shell commands reach only sandbox-network-hosts (and prompted hosts) through a local filtering proxy; hooks, workspace services and JS spawn remain denied";
+            matrix.network = "shell commands reach only sandbox-network-hosts (and prompted hosts) through a local filtering proxy; hooks, workspace services and JS spawn remain denied; on Linux bwrap at most 256 connections are relayed at once (MINI_AGENT_NET_MAX_RELAYS), extra ones get an HTTP 503 naming the cap";
             matrix.requested_network_policy =
                 "allowlist for shell commands (sandbox-network = allowlist)";
         }
@@ -7340,6 +7340,12 @@ fn bwrap_forwarder_launcher(
     cmd.arg("--bind").arg(socket).arg(BWRAP_FORWARDER_SOCKET);
     for (key, value) in proxy.env_for_forwarder() {
         cmd.arg("--setenv").arg(key).arg(value);
+    }
+    // Operator-set relay cap (host environment only; never project config).
+    if let Ok(raw) = std::env::var(net_forwarder::MAX_RELAYS_ENV) {
+        cmd.arg("--setenv")
+            .arg(net_forwarder::MAX_RELAYS_ENV)
+            .arg(net_forwarder::parse_max_relays(Some(&raw)).to_string());
     }
     Ok(vec![
         OsString::from(BWRAP_FORWARDER_EXECUTABLE),
