@@ -294,6 +294,7 @@ async fn pdf_block_reaches_each_provider_wire_format() {
     );
 }
 
+#[cfg(feature = "subagents")]
 #[tokio::test]
 async fn pdf_block_in_history_costs_pages_not_base64_text() {
     let root = super::OwnedTestDirectory::new("pdf-native-cost");

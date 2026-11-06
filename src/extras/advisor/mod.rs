@@ -321,6 +321,7 @@ fn append_message(messages: &mut Vec<SessionMessage>, message: &rig::completion:
                             let text = match item {
                                 ToolResultContent::Text(text) => text.text.as_str(),
                                 ToolResultContent::Image(_) => "[image]",
+                                ToolResultContent::Document(_) => "[document]",
                             };
                             append_context(messages, MessageRole::ToolResult, text.to_owned());
                         }
