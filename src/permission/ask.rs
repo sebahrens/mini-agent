@@ -308,18 +308,65 @@ pub(crate) async fn send_permission_request(
             crate::extras::hooks::dispatcher::PermissionHookDecision::Allow => {
                 UserDecision::AllowOnce
             }
-            crate::extras::hooks::dispatcher::PermissionHookDecision::Deny(_) => UserDecision::Deny,
+            crate::extras::hooks::dispatcher::PermissionHookDecision::Deny(reason) => {
+                UserDecision::deny_with_reason(&reason)
+            }
         });
         return Ok(());
     }
     sender.send(request.into()).await
 }
 
+/// Longest deny note (in characters) that reaches the model.
+pub(crate) const MAX_DENY_REASON_CHARS: usize = 500;
+
 #[derive(Debug, Clone)]
 pub enum UserDecision {
     AllowOnce,
     AllowAlways(String),
     Deny,
+    /// Deny and tell the model why or what to do instead. The text is already
+    /// sanitized and bounded (see [`UserDecision::deny_with_reason`]).
+    DenyWithReason(String),
+}
+
+impl UserDecision {
+    /// Build a denial from untrusted text (a user note or a hook message):
+    /// control characters become spaces, whitespace is collapsed, and the
+    /// result is capped at [`MAX_DENY_REASON_CHARS`]. Empty text is a plain
+    /// [`UserDecision::Deny`].
+    pub(crate) fn deny_with_reason(reason: &str) -> Self {
+        let flat: String = reason
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.is_empty() {
+            return Self::Deny;
+        }
+        let mut chars = flat.chars();
+        let mut bounded: String = chars.by_ref().take(MAX_DENY_REASON_CHARS).collect();
+        if chars.next().is_some() {
+            bounded.push('…');
+        }
+        Self::DenyWithReason(bounded)
+    }
+
+    /// The model-facing denial note, when one was given.
+    pub(crate) fn deny_reason(&self) -> Option<&str> {
+        match self {
+            Self::DenyWithReason(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Model-facing text for a denied request.
+pub(crate) fn denial_message(decision: &UserDecision) -> String {
+    match decision.deny_reason() {
+        Some(reason) => format!("Permission denied by user: {reason}"),
+        None => "Permission denied by user".to_string(),
+    }
 }
 
 #[cfg(all(test, feature = "acp"))]
@@ -729,5 +776,79 @@ mod diagnostic_tests {
             "Permission denied (non-interactive mode); effective mode: yolo; selected mode: yolo; cause: configured Ask rule"
         );
         assert!(!error.to_string().contains("README"));
+    }
+}
+
+#[cfg(test)]
+mod deny_reason_tests {
+    use super::*;
+    use crate::agent::tools::check_perm;
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn deny_reason_is_sanitized_bounded_and_empty_is_plain_deny() {
+        assert!(matches!(
+            UserDecision::deny_with_reason("  \n\t "),
+            UserDecision::Deny
+        ));
+        let decision = UserDecision::deny_with_reason("use pnpm\x1b[31m\nnot npm\r\n");
+        let reason = decision.deny_reason().unwrap();
+        assert_eq!(reason, "use pnpm [31m not npm");
+        assert!(!reason.chars().any(char::is_control));
+        let long = UserDecision::deny_with_reason(&"x".repeat(5000));
+        let long = long.deny_reason().unwrap();
+        assert_eq!(long.chars().count(), MAX_DENY_REASON_CHARS + 1);
+        assert!(long.ends_with('…'));
+    }
+
+    async fn denial_text(decision: UserDecision) -> String {
+        let permission: crate::permission::checker::PermCheck = Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(PermissionConfig {
+                    bash: Some(ToolPerm::Simple(Action::Ask)),
+                    ..Default::default()
+                }),
+                SecurityMode::Standard,
+                std::env::current_dir().ok(),
+                None,
+            )
+            .unwrap(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UserRequest>(1);
+        let responder = tokio::spawn(async move {
+            let request = rx.recv().await.unwrap().into_permission();
+            request.reply.send(decision).unwrap();
+        });
+        let sender: Option<AskSender> = Some(tx);
+        let error = check_perm(&Some(permission), &sender, "bash", "npm install")
+            .await
+            .unwrap_err();
+        responder.await.unwrap();
+        error.to_string()
+    }
+
+    #[tokio::test]
+    async fn the_model_sees_the_deny_note() {
+        let text = denial_text(UserDecision::deny_with_reason("use pnpm, not npm")).await;
+        assert!(
+            text.contains("Permission denied by user: use pnpm, not npm"),
+            "{text}"
+        );
+        assert_eq!(
+            denial_text(UserDecision::Deny).await,
+            "Permission denied by user"
+        );
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn hook_deny_reason_is_kept_as_the_note() {
+        let decision = UserDecision::deny_with_reason("blocked by policy: use make test");
+        assert_eq!(
+            decision.deny_reason(),
+            Some("blocked by policy: use make test")
+        );
     }
 }

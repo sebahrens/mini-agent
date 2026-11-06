@@ -672,7 +672,9 @@ async fn resolve_permission(
                         .add_session_allowlist(request.tool().to_string(), &pattern);
                     PermOutcome::Allowed
                 }
-                Ok(UserDecision::Deny) => PermOutcome::Denied(PermissionDenial::User),
+                Ok(UserDecision::Deny | UserDecision::DenyWithReason(_)) => {
+                    PermOutcome::Denied(PermissionDenial::User)
+                }
                 Err(_) => PermOutcome::BackendFailure(PermissionBackendFailure::AskResponseDropped),
             }
         }

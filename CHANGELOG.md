@@ -8,6 +8,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- The permission prompt has a `t` (deny and tell the model why) path; the note, or an opted-in
+  `PermissionRequest` hook's deny reason, reaches the model as the tool-denial text via the new
+  `UserDecision::DenyWithReason` (mini-agent-rirdm).
+- When the shell line cap omits lines and the byte cap did not, the full output is saved to a private
+  log named in the footer (mini-agent-iypjy).
 - Agent hook file reads (`hooks_agent_read_files`) now obey `read` permission rules (deny and ask
   both refuse), `.gitignore`/`.ignore` and a wider credential list (mini-agent-m9txi). `update`
   and `install.sh` pin build-provenance verification to the release workflow and tag

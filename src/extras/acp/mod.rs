@@ -3822,7 +3822,7 @@ async fn drive_permission_bridge(
         if synthetic_tool_call_id {
             let status = match &decision {
                 UserDecision::AllowOnce | UserDecision::AllowAlways(_) => ToolCallStatus::Completed,
-                UserDecision::Deny => ToolCallStatus::Failed,
+                UserDecision::Deny | UserDecision::DenyWithReason(_) => ToolCallStatus::Failed,
             };
             let fields =
                 ToolCallUpdateFields::new()
@@ -8650,7 +8650,7 @@ mod protocol_tests {
                     .map(|decision| match decision {
                         UserDecision::AllowOnce => "once".to_owned(),
                         UserDecision::AllowAlways(pattern) => format!("always:{pattern}"),
-                        UserDecision::Deny => "deny".to_owned(),
+                        UserDecision::Deny | UserDecision::DenyWithReason(_) => "deny".to_owned(),
                     })
                     .collect();
                 let expected_decisions = match case {

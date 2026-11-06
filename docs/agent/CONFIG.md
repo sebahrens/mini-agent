@@ -2603,7 +2603,9 @@ When a rule resolves to `ask`, the TUI shows the request and these keys:
   for this session in one approval: the directory itself for `list_dir`,
   otherwise the file's parent. It does not cover `write`, so creating files
   still asks.
-- `n` denies this call; `Esc`, `Ctrl+C`, or `Ctrl+D` deny and stop the run.
+- `n` denies this call; `t` denies it and opens a one-line note (at most 500 characters, control characters
+  stripped) that is returned to the model as the denial text (`Permission denied by user: <note>`);
+  an opted-in `PermissionRequest` hook's deny reason is passed through the same way; `Esc`, `Ctrl+C`, or `Ctrl+D` deny and stop the run.
   `s` stops the run and offers an optional instruction as the next editable
   user draft; it is sent only after a separate Enter.
 
