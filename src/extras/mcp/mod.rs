@@ -431,12 +431,17 @@ impl McpClientManager {
                     handle.spawn_auxiliary_discovery();
                     handles.push(handle);
                 }
-                Err(_) => {
+                Err(error) => {
                     // Transport errors may contain an expanded URL or header
                     // credential. Health retains the typed outcome separately.
+                    // A refused redirect is the exception: its bounded,
+                    // generated text names only the target origin and path.
                     tracing::debug!("Failed to connect to MCP server '{}'", name);
+                    let detail = bounded_http::redirect_refusal(&error)
+                        .map(|refusal| format!(": {refusal}"))
+                        .unwrap_or_else(|| " (credential values omitted)".to_string());
                     notices.push(McpNotice::error(format!(
-                        "MCP server '{name}' not connected (credential values omitted)"
+                        "MCP server '{name}' not connected{detail}"
                     )));
                 }
             }

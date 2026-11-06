@@ -15,6 +15,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- HTTP MCP servers behind same-origin redirects (e.g. `/mcp` -> `/mcp/` 307/308) now connect;
+  other redirects stay refused and the connection notice names the target origin and path
+  (mini-agent-iqjva).
 - MCP tool results now render `resource_link` blocks (name, title, URI, MIME, size,
   description) and audio blocks (`[audio: mime, N bytes]`) instead of counting them as
   unrenderable (mini-agent-7wieg).

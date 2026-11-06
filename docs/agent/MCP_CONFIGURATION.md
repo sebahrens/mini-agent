@@ -53,8 +53,15 @@ URL servers require public addresses by default. Explicit `allow_local=true`
 also permits loopback-only endpoints: IPv4 `127/8`, IPv6 `::1`, normalized mapped
 loopback and DNS names resolving exclusively to loopback. DNS results remain
 pinned. Mixed public/loopback sets, LAN/private addresses, link-local/metadata
-addresses and wildcard listeners remain forbidden. Local clients bypass proxies;
-MCP redirects remain forbidden. OAuth may contact the exact captured local server
+addresses and wildcard listeners remain forbidden. Local clients bypass proxies.
+MCP transport requests follow at most five same-origin redirects (same scheme,
+host and port, so the pinned, policy-checked destination and the request's
+credentials are unchanged): `307`/`308` replay the POST body, and GET streams
+also follow `301`/`302`/`303`. Every other redirect (another host, port or
+scheme, including private or metadata targets, or a method-changing POST
+redirect) is refused, and the connection notice names the target as
+`scheme://host:port/path` (no query) so the configured URL can be corrected.
+OAuth may contact the exact captured local server
 origin, while other authorization hosts retain the public-address policy.
 
 Live edit, trust, reconnect, shutdown and OAuth callback stages are owned by the
