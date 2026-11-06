@@ -96,6 +96,8 @@ pub(crate) struct SubagentAuthorization {
     read_only_shell: ReadOnlyShellState,
     /// Opt-in parent web tools of a persona (`[subagents] allow_web`).
     web: Option<ParentWebTools>,
+    /// Parent Git / LSP capabilities a persona may name in `tools`.
+    code: Option<ParentCodeTools>,
 }
 
 /// The parent's eligible web tools and their settings, captured by the
@@ -112,6 +114,23 @@ pub(crate) struct ParentWebTools {
     pub(crate) search_provider: Option<String>,
     /// Session whose private tool-output directory keeps large pages.
     pub(crate) session_id: String,
+}
+
+/// The parent's code-intelligence capabilities, captured by the parent
+/// builder from its own tool eligibility. A child receives one only when its
+/// persona names the tool in `tools` (default closed); Git is always the
+/// read-only subset, and LSP uses the parent's manager and permission checker.
+#[derive(Clone, Default)]
+pub(crate) struct ParentCodeTools {
+    /// The parent's sandbox when its structured Git tool is eligible.
+    #[cfg(feature = "git-worktree")]
+    pub(crate) git_sandbox: Option<crate::sandbox::Sandbox>,
+    #[cfg(feature = "lsp")]
+    pub(crate) lsp: Option<crate::extras::lsp::LspManager>,
+    #[cfg(feature = "lsp")]
+    pub(crate) lsp_navigate: bool,
+    #[cfg(feature = "lsp")]
+    pub(crate) lsp_diagnostics: bool,
 }
 
 /// A read-only child shell: the parent's sandbox rebound to a private scratch
@@ -234,7 +253,14 @@ impl SubagentAuthorization {
             spill_limits: Default::default(),
             read_only_shell: ReadOnlyShellState::None,
             web: None,
+            code: None,
         }
+    }
+
+    /// Parent Git / LSP capabilities for a persona that names them.
+    pub(crate) fn with_code_tools(mut self, code: Option<ParentCodeTools>) -> Self {
+        self.code = code;
+        self
     }
 
     /// Mark the opt-in read-only shell as eligible (see [`ReadOnlyShellState`]).
@@ -353,6 +379,9 @@ impl SubagentAuthorization {
         isolated.write_tools = Some(write_tools);
         isolated.workspace = Some(worktree);
         isolated.instructions = None;
+        // The parent's LSP manager and Git sandbox are bound to the parent
+        // tree, not this worktree.
+        isolated.code = None;
         #[cfg(feature = "js")]
         {
             isolated.read_only_js = None;
@@ -760,6 +789,25 @@ pub(crate) fn persona_tool_kinds(
     if enabled(AgentTool::Js) && authorization.read_only_js_available() {
         kinds.push(AgentTool::Js);
     }
+    // Code-intelligence tools need an explicit persona entry and a parent
+    // that has them.
+    if let (Some(code), Some(selected)) = (&authorization.code, selected) {
+        #[cfg(feature = "git-worktree")]
+        if code.git_sandbox.is_some() && selected.contains(&AgentTool::Git) {
+            kinds.push(AgentTool::Git);
+        }
+        #[cfg(feature = "lsp")]
+        if code.lsp.is_some() {
+            if code.lsp_diagnostics && selected.contains(&AgentTool::LspDiagnostics) {
+                kinds.push(AgentTool::LspDiagnostics);
+            }
+            if code.lsp_navigate && selected.contains(&AgentTool::LspNavigate) {
+                kinds.push(AgentTool::LspNavigate);
+            }
+        }
+        #[cfg(not(any(feature = "git-worktree", feature = "lsp")))]
+        let _ = code;
+    }
     // Web tools need the opt-in and an explicit persona entry.
     if let (Some(web), Some(selected)) = (&authorization.web, selected) {
         if web.fetch && selected.contains(&AgentTool::WebFetch) {
@@ -852,6 +900,40 @@ pub(crate) fn persona_tools(
         )
     {
         tools.push(tool);
+    }
+    #[cfg(feature = "git-worktree")]
+    if kinds.contains(&AgentTool::Git)
+        && let (Some(code), Some(workspace)) = (&authorization.code, &authorization.workspace)
+        && let Some(sandbox) = &code.git_sandbox
+    {
+        match crate::git::tool::GitTool::capture(
+            workspace.clone(),
+            sandbox.clone(),
+            authorization.permission.clone(),
+            authorization.ask_tx.clone(),
+        ) {
+            Ok(tool) => tools.push(Box::new(tool.read_only())),
+            Err(error) => tracing::warn!(%error, "subagent Git tool unavailable"),
+        }
+    }
+    #[cfg(feature = "lsp")]
+    if let Some(code) = &authorization.code
+        && let Some(lsp) = &code.lsp
+    {
+        if kinds.contains(&AgentTool::LspDiagnostics) {
+            tools.push(Box::new(tools::lsp::LspTool::new(
+                lsp.clone(),
+                authorization.permission.clone(),
+                authorization.ask_tx.clone(),
+            )));
+        }
+        if kinds.contains(&AgentTool::LspNavigate) {
+            tools.push(Box::new(tools::lsp::LspNavigateTool::new(
+                lsp.clone(),
+                authorization.permission.clone(),
+                authorization.ask_tx.clone(),
+            )));
+        }
     }
     if let Some(web) = &authorization.web {
         if kinds.contains(&AgentTool::WebFetch) {
@@ -2351,6 +2433,50 @@ mod tests {
             "child shell must keep an output log: {output}"
         );
         assert!(output.contains(logs.to_str().unwrap()), "{output}");
+    }
+
+    #[cfg(feature = "git-worktree")]
+    #[test]
+    fn git_and_lsp_tools_are_granted_only_to_personas_that_name_them() {
+        use crate::context::agents::AgentTool;
+        let root = TempDir::new("child-git");
+        let authorization =
+            parent_authorization(root.path(), None).with_code_tools(Some(super::ParentCodeTools {
+                git_sandbox: Some(
+                    crate::sandbox::Sandbox::new(false, "auto").with_workspace_binding(Arc::new(
+                        crate::paths::WorkspaceBinding::capture(root.path()).unwrap(),
+                    )),
+                ),
+                ..Default::default()
+            }));
+        let kinds = |tools: Option<Vec<AgentTool>>| {
+            super::persona_tool_kinds(
+                &authorization,
+                &super::PersonaExecution {
+                    tools,
+                    ..super::PersonaExecution::default()
+                },
+                #[cfg(feature = "skills")]
+                false,
+            )
+        };
+        // Default closed: no narrowing, or one that does not name git.
+        assert!(!kinds(None).contains(&AgentTool::Git));
+        assert!(!kinds(Some(vec![AgentTool::Read])).contains(&AgentTool::Git));
+        assert!(kinds(Some(vec![AgentTool::Read, AgentTool::Git])).contains(&AgentTool::Git));
+        // A parent without the tool (not eligible) grants nothing.
+        let without =
+            parent_authorization(root.path(), None).with_code_tools(Some(Default::default()));
+        let granted = super::persona_tool_kinds(
+            &without,
+            &super::PersonaExecution {
+                tools: Some(vec![AgentTool::Git]),
+                ..super::PersonaExecution::default()
+            },
+            #[cfg(feature = "skills")]
+            false,
+        );
+        assert!(!granted.contains(&AgentTool::Git));
     }
 
     #[tokio::test]

@@ -923,6 +923,7 @@ pub struct TaskTool {
     local_resume: Arc<super::resume::ResumeStore>,
     /// The parent's eligible web tools, for `[subagents] allow_web` personas.
     parent_web: Option<builder::ParentWebTools>,
+    parent_code: Option<builder::ParentCodeTools>,
 }
 
 impl TaskTool {
@@ -941,6 +942,7 @@ impl TaskTool {
             self.deny_repeated_reads,
         )
         .with_workspace_binding(self.workspace.clone())
+        .with_code_tools(self.parent_code.clone())
         .with_write_tools(if persona.write_mode {
             self.write_tools.clone()
         } else {
@@ -1015,10 +1017,17 @@ impl TaskTool {
             parent_image_support: None,
             local_resume: Default::default(),
             parent_web: None,
+            parent_code: None,
         }
     }
 
     /// The parent's eligible web tools, captured by the parent builder.
+    /// Git / LSP capabilities of the parent that a persona may name in `tools`.
+    pub(crate) fn with_parent_code_tools(mut self, code: builder::ParentCodeTools) -> Self {
+        self.parent_code = Some(code);
+        self
+    }
+
     pub(crate) fn with_parent_web_tools(mut self, web: builder::ParentWebTools) -> Self {
         self.parent_web = Some(web);
         self
@@ -1623,6 +1632,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         )
         .with_workspace_binding(self.workspace.clone())
         .with_workspace_instructions(self.instructions.clone())
+        .with_code_tools(self.parent_code.clone())
         .with_write_tools(if write_mode {
             self.write_tools.clone()
         } else {

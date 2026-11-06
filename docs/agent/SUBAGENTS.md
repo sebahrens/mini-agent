@@ -545,6 +545,13 @@ mode: review
   `list_dir`, `js` when JS support is compiled, and `skills_search` when skills support is compiled, plus
   `memory_read` and `memory_search` when memory support is compiled.
   Claude-style `Read`, `Grep`, and `Glob` spellings are accepted.
+  `git`, `lsp_navigate` and `lsp_diagnostics` are granted only when the persona names them here
+  (default closed) and the parent itself has the tool eligible and, for LSP, running. The child's
+  `git` is the read-only subset (status, diff, log, show, blame, branches, stash_list; every
+  mutation is refused and not even offered in the schema) bound to the child's workspace and
+  sandbox; the LSP tools use the parent's language-server manager. Both run under the child's
+  permission checker (the parent's rules, `git/<operation>` and read permission keys, same
+  prompts). A worktree-isolated child gets neither, because both are bound to the parent tree.
   Empty lists create a tool-free child. Mutating, unknown, and feature-disabled
   tools are ignored while preserving the persona and its supported declared
   read tools. An all-unsupported list also creates a tool-free child; it never

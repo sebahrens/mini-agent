@@ -1325,6 +1325,19 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     #[cfg(feature = "lsp")]
                     lsp: lsp_manager.clone(),
                 });
+            // Git / LSP a persona may name in `tools` (default closed).
+            let task_tool = task_tool.with_parent_code_tools(
+                crate::extras::subagents::builder::ParentCodeTools {
+                    #[cfg(feature = "git-worktree")]
+                    git_sandbox: cli.tool_is_eligible(cfg, "git").then(|| sandbox.clone()),
+                    #[cfg(feature = "lsp")]
+                    lsp: lsp_manager.clone(),
+                    #[cfg(feature = "lsp")]
+                    lsp_navigate: cli.tool_is_eligible(cfg, "lsp_navigate"),
+                    #[cfg(feature = "lsp")]
+                    lsp_diagnostics: cli.tool_is_eligible(cfg, "lsp_diagnostics"),
+                },
+            );
             #[cfg(feature = "agent-skills")]
             let task_tool =
                 task_tool.with_instruction_discovery_disabled(cli.resolve_no_context_files(cfg));

@@ -105,6 +105,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   history are no longer resumable (child conversations are memory-only), instead of leaving dead
   resume ids on offer (mini-agent-csk01).
 
+- Subagent personas can name `git` (read-only: status, diff, log, show, blame, branches,
+  stash_list), `lsp_navigate` and `lsp_diagnostics` in `tools`; default closed, parent-eligible
+  only, under the parent's permission rules, not for worktree-isolated children (mini-agent-f4ds9).
+
 ### Shell and pty jobs (round 7, group P)
 
 - `job_status` input no longer accepts TAB or shell history expansion (`!` followed by text, a

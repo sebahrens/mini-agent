@@ -102,6 +102,14 @@ pub(crate) enum AgentTool {
     Shell,
     WebFetch,
     WebSearch,
+    /// Read-only structured Git (status, diff, log, show, blame, branches,
+    /// stash_list) under the parent's permission checker.
+    #[cfg(feature = "git-worktree")]
+    Git,
+    #[cfg(feature = "lsp")]
+    LspNavigate,
+    #[cfg(feature = "lsp")]
+    LspDiagnostics,
     #[cfg(feature = "js")]
     Js,
     #[cfg(feature = "skills")]
@@ -129,6 +137,12 @@ impl AgentTool {
             "bash" | "shell" => Some(Self::Shell),
             "web_fetch" | "webfetch" => Some(Self::WebFetch),
             "web_search" | "websearch" => Some(Self::WebSearch),
+            #[cfg(feature = "git-worktree")]
+            "git" => Some(Self::Git),
+            #[cfg(feature = "lsp")]
+            "lsp_navigate" | "lspnavigate" => Some(Self::LspNavigate),
+            #[cfg(feature = "lsp")]
+            "lsp_diagnostics" | "lspdiagnostics" => Some(Self::LspDiagnostics),
             #[cfg(feature = "js")]
             "js" | "javascript" => Some(Self::Js),
             #[cfg(feature = "skills")]
@@ -152,6 +166,12 @@ impl AgentTool {
             Self::Shell => "shell",
             Self::WebFetch => "web_fetch",
             Self::WebSearch => "web_search",
+            #[cfg(feature = "git-worktree")]
+            Self::Git => "git",
+            #[cfg(feature = "lsp")]
+            Self::LspNavigate => "lsp_navigate",
+            #[cfg(feature = "lsp")]
+            Self::LspDiagnostics => "lsp_diagnostics",
             #[cfg(feature = "js")]
             Self::Js => "js",
             #[cfg(feature = "skills")]
@@ -660,21 +680,21 @@ fn parse_disallowed_tools(
             );
         }
         match AgentTool::parse(name) {
-            Some(tool) => {
-                if !denied.contains(&tool) {
-                    denied.push(tool);
-                }
-            }
-            None if unsupported.len() < MAX_NOTICE_NAMES => {
-                if !unsupported.iter().any(|existing| existing == name) {
-                    unsupported.push(name.to_string());
-                }
+            Some(tool) if !denied.contains(&tool) => denied.push(tool),
+            Some(_) => {}
+            None if unsupported.len() < MAX_NOTICE_NAMES
+                && !unsupported.iter().any(|existing| existing == name) =>
+            {
+                unsupported.push(name.to_string());
             }
             None => {}
         }
     }
     Ok((denied, unsupported))
 }
+
+#[cfg(feature = "mcp")]
+type McpServerRefs = std::collections::BTreeMap<String, Vec<String>>;
 
 /// Claude Code `mcpServers`: a list of configured server names (each grants
 /// all tools of that server, stored as an empty tool list) or a mapping. A
@@ -684,7 +704,7 @@ fn parse_disallowed_tools(
 #[cfg(feature = "mcp")]
 fn parse_claude_mcp_servers(
     value: &serde_yaml_ng::Value,
-) -> Result<(std::collections::BTreeMap<String, Vec<String>>, Vec<String>), &'static str> {
+) -> Result<(McpServerRefs, Vec<String>), &'static str> {
     const MAX_SERVERS: usize = 8;
     const MAX_NAME_CHARS: usize = 256;
     let valid_name = |name: &str| {
