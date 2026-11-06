@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Administrator-managed policy layer: a root-owned `managed-config.toml` (permission deny rules, selectable
+  security modes / yolo ban, forced sandbox, MCP and provider allow/deny lists) is applied after every other
+  source; flags, project config and prompt directives that widen it are refused naming the file, and
+  `/doctor` shows the managed source (mini-agent-33500).
 - The permission prompt has a `t` (deny and tell the model why) path; the note, or an opted-in
   `PermissionRequest` hook's deny reason, reaches the model as the tool-denial text via the new
   `UserDecision::DenyWithReason` (mini-agent-rirdm).

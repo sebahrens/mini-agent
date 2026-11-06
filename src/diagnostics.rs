@@ -226,6 +226,13 @@ impl DoctorReport {
         } else {
             report.row("project file", "no applied project layer");
         }
+        match crate::config::managed::active() {
+            Some(policy) => {
+                report.row("managed policy", policy.path().to_string_lossy());
+                report.row("managed policy enforces", policy.summary());
+            }
+            None => report.row("managed policy", "none"),
+        }
         report.row("load warnings", cfg.load_warnings.len().to_string());
         report.section("Config key sources (values omitted; merged tables can use both layers)");
         for key in cfg

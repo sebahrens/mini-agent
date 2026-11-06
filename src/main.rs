@@ -272,6 +272,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     );
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
+    config::managed::install().map_err(anyhow::Error::msg)?;
     // Freeze operator Git source authority before hooks/MCP/project/model work.
     // Git retains a closed diagnostic if capture fails; other modes can run.
     // The capture overlaps read-only config/docs/context loading and is joined

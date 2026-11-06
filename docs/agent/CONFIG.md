@@ -1111,6 +1111,54 @@ Use cases: inject persistent rules, style preferences, team-wide policies,
 or provider-specific output formatting that should always be present
 regardless of which prompt or mode is active.
 
+## Managed policy (administrator-enforced settings)
+
+An administrator can pin permissions, sandbox, MCP and providers with a root-owned
+`managed-config.toml`, read once at startup and applied **after** user config, project config,
+`--config` overrides, CLI flags and prompt directives. Nothing those sources set can widen it.
+
+| OS | Path |
+| -- | ---- |
+| Linux | `/etc/mini-agent/managed-config.toml` |
+| macOS | `/Library/Application Support/mini-agent/managed-config.toml` |
+| Windows (experimental) | `C:\ProgramData\mini-agent\managed-config.toml` (no ownership check) |
+
+On Unix the file and its directory must be owned by root and not group- or world-writable, and the
+file must be a regular file (not a symlink) of at most 256 KiB. A present file that is unreadable,
+invalid, has an unknown key, or fails these checks is a **startup error** (fail closed), not a skipped
+layer. A missing file means no managed policy.
+
+```toml
+[permissions]
+deny = { shell = ["rm -rf *"], write = ["/etc/**"] }  # appended to permission-deny; wins over allow rules
+allowed_modes = ["standard", "guarded", "readonly"]   # security modes users may select (default: all)
+disable_yolo = true                                   # shorthand: remove `yolo` from the modes
+require_permission_checks = true                      # refuse --dangerously-skip-permissions
+
+[sandbox]
+required = true                                       # force sandbox on; refuses --no-sandbox, sandbox = false
+
+[mcp]
+disabled = false                                      # true refuses every MCP server
+allowed_servers = ["github"]                          # absent = no allowlist
+denied_servers = ["scratch"]
+
+[providers]
+allowed = ["anthropic", "openai"]                     # absent = no allowlist
+denied = ["openrouter"]
+```
+
+Enforcement: a disallowed mode from `--yolo`, `yolo = true`, `default_permission_mode`, a project
+layer or startup flags, `--dangerously-skip-permissions`, `--no-sandbox` and a disallowed provider
+are refused at startup with a message naming the managed file. `/mode`, `/permissions` and the
+stream-json control channel refuse a disallowed mode with the same message; a `%%mode=` prompt
+directive is ignored; Shift+Tab skips disallowed modes; the permission checker also lowers any mode
+change to the nearest permitted one. MCP servers outside the policy are dropped from the merged
+configuration (with a warning) and refused at connect time, including servers from `.mcp.json`. A
+provider outside the policy is refused wherever it is resolved. `/doctor` (`--doctor`) shows the
+`managed policy` path and a values-free summary of what it enforces. Managed hooks keep their own
+`managed-settings.json` (see Hooks).
+
 ## Hooks
 
 The default/full binary includes the `hooks` Cargo feature; lite/no-default builds require

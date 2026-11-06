@@ -836,7 +836,11 @@ pub(crate) fn load_in_workspace(
         interactive,
         &confirm_project_persona_trust,
     );
-    result
+    let (mut cfg, first_startup) = result;
+    if let Some(policy) = super::managed::active() {
+        policy.apply(&mut cfg);
+    }
+    (cfg, first_startup)
 }
 
 /// Inspect configuration without creating files, repairing permissions,
@@ -865,7 +869,11 @@ pub(crate) fn load_for_diagnostics_in_workspace(
     workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
 ) -> Config {
     let sources = super::layers::discover(workspace, crate::paths::process_home_dir().as_deref());
-    load_for_diagnostics_with_sources(paths, sources)
+    let mut cfg = load_for_diagnostics_with_sources(paths, sources);
+    if let Some(policy) = super::managed::active() {
+        policy.apply(&mut cfg);
+    }
+    cfg
 }
 
 fn load_for_diagnostics_with_sources(

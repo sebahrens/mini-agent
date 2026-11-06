@@ -238,6 +238,7 @@ pub fn resolve_provider_config(
     name: &str,
     custom_providers: &HashMap<String, CustomProviderConfig>,
 ) -> anyhow::Result<ProviderConfig> {
+    crate::config::managed::check_provider(name).map_err(anyhow::Error::msg)?;
     if let Some(custom) = custom_providers.get(name) {
         let kind = ProviderKind::from_name(&custom.provider_type).ok_or_else(|| {
             anyhow::anyhow!(
