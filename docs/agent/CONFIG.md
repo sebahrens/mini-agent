@@ -433,7 +433,7 @@ so fixture names remain visible without advertising them as product configuratio
 | Command-file fixtures | `MINI_AGENT_TEST_COMMAND_FIFO`: test-only bounded child probe for command-file and project-trust FIFO reads. |
 | Harness evaluation seed | `HARNESS_EVAL_SEED`: optional generator seed for the ignored evidence-axis harness evaluation (drift runs); test-only, never read by the product. |
 | Process-env lock fixture | `ZS_SHARED_READER_TEST`: test-only variable set under the exclusive process-env scope to prove a shared reader never observes a mutator scope; never read by production code. |
-| MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `MINI_AGENT_NETWORK_TESTS`, `MINI_AGENT_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_NAV_BEHAVIOR`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_PUBLISH_DELAY_MS`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_SAVE_LOG`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYMBOL_URI`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
+| MCP/LSP fixtures | `MINI_AGENT_ACP_MCP_NETWORK_MARKER`, `MINI_AGENT_ACP_MCP_NETWORK_PORT`, `MCP_FIXTURE_CONFIGURED`, `MCP_FIXTURE_DESCENDANT_FILE`, `MCP_FIXTURE_EXCLUSIVE_FILE`, `MCP_FIXTURE_LEASE_FILE`, `MCP_FIXTURE_MODE`, `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_STDERR_BYTES`, `MCP_FIXTURE_TOOL_NAME`, `MINI_AGENT_NETWORK_TESTS`, `MINI_AGENT_TEST_PREBUILD_CASE`; `LSP_FIXTURE_CANONICAL_URI`, `LSP_FIXTURE_CONFIG_LOG`, `LSP_FIXTURE_DELAY_VERSION`, `LSP_FIXTURE_DESCENDANT_FILE`, `LSP_FIXTURE_LAUNCH_LOG`, `LSP_FIXTURE_LEASE_FILE`, `LSP_FIXTURE_MODE`, `LSP_FIXTURE_NAV_BEHAVIOR`, `LSP_FIXTURE_OUTSIDE_URI`, `LSP_FIXTURE_PROBE_FILE`, `LSP_FIXTURE_PUBLISH_DELAY_MS`, `LSP_FIXTURE_READY_FILE`, `LSP_FIXTURE_RELEASE_FILE`, `LSP_FIXTURE_REQUEST_FILE`, `LSP_FIXTURE_RESTART_MARKER`, `LSP_FIXTURE_SAVE_LOG`, `LSP_FIXTURE_STDIN_CLOSED_FILE`, `LSP_FIXTURE_SYMBOL_URI`, `LSP_FIXTURE_SYNC_LOG`, `MINI_AGENT_LSP_AMBIENT_CANARY`, `MINI_AGENT_LSP_EXPLICIT_CANARY`, `MINI_AGENT_LSP_INHERITED_CANARY`, `RUSTC`: protocol test fixtures and their compiler. |
 
 mini-agent sends no analytics or network telemetry. Learned-skill telemetry is stored in the
 local skill store; provider, embedding, MCP, sharing and explicitly invoked tool requests
@@ -4202,6 +4202,10 @@ extensions = [".my"]
 # initialization = { ... }   # server-specific initializationOptions
 # disabled = false           # true removes a same-named built-in
 # wait_ms = 1000             # post-edit diagnostics wait (default 1000, max 60000)
+# startup_timeout_ms = 15000 # initialize handshake deadline (default 15000, clamped 1000-300000)
+# request_timeout_ms = 10000 # per navigation request deadline for the lsp tool (default 10000, clamped 1000-300000)
+# [lsp.servers.myserver.settings.python.analysis]  # answered for workspace/configuration and pushed
+# typeCheckingMode = "strict"                      # via workspace/didChangeConfiguration
 ```
 
 ### YAML
@@ -4253,6 +4257,19 @@ Behavior notes:
   A relative `command` with a directory component (`./my-ls`) is rejected; use
   an absolute path. mini-agent never auto-installs a language server. A missing
   binary is skipped with a debug log.
+- `settings` (a table, at most 64 KiB serialized; anything else is ignored) is what the
+  server reads through `workspace/configuration`: an item with a `section` such as
+  `python.analysis` gets the value at that dotted path (or a literal top-level key of the same
+  name), an item without a section gets the whole table, and anything unset gets `null`. When
+  `settings` is set the client also declares `workspace.configuration` and sends
+  `workspace/didChangeConfiguration` with the table after `initialized`. Without `settings`
+  behaviour is unchanged (every item answered `null`). It is neutral to capability: it is
+  delivered only to the server you already configured, and like the rest of `[lsp.servers]` a
+  project config's `lsp` table is ignored until the project config is trusted.
+- `startup_timeout_ms` bounds the `initialize` handshake and `request_timeout_ms` each navigation
+  request of the `lsp` tool; raise `startup_timeout_ms` for slow cold starts (`jdtls`,
+  `kotlin-language-server`, `omnisharp`, large `rust-analyzer` workspaces) that otherwise fail
+  initialization and enter the failure cooldown.
 - Servers start lazily on the first edit touching one of their extensions
   using the canonical session cwd for both process cwd and `rootUri`.
 - A started server that sees no edit or request for `idle_timeout_secs`

@@ -209,6 +209,9 @@ fn main() {
             if mode == "navigate" && nav_behavior.starts_with("indexing") {
                 write_frame(&mut stdout, "{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":\"idx\",\"value\":{\"kind\":\"begin\",\"title\":\"Indexing\"}}}");
             }
+            if mode == "configuration" {
+                write_frame(&mut stdout, "{\"jsonrpc\":\"2.0\",\"id\":\"cfg-1\",\"method\":\"workspace/configuration\",\"params\":{\"items\":[{\"section\":\"python.analysis\"},{\"section\":\"gopls\"},{\"section\":\"unset.section\"}]}}");
+            }
             if mode == "stop-reading" {
                 // Stay alive with stdin open but never read again: the client's
                 // pipe fills and its writes block.
@@ -391,6 +394,13 @@ fn main() {
                 "null".to_string()
             };
             write_frame(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}"));
+        } else if body.contains("\"method\":\"workspace/didChangeConfiguration\"")
+            || body.contains("\"id\":\"cfg-1\"")
+        {
+            if let Some(path) = env::var_os("LSP_FIXTURE_CONFIG_LOG") {
+                let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
+                writeln!(file, "{body}").unwrap();
+            }
         } else if body.contains("\"method\":\"mini-agent/test\"") {
             if let Some(path) = env::var_os("LSP_FIXTURE_REQUEST_FILE") {
                 fs::write(path, "seen").unwrap();
@@ -477,6 +487,9 @@ impl FixtureBuild {
             initialization: None,
             disabled: false,
             wait_ms: None,
+            settings: None,
+            startup_timeout_ms: None,
+            request_timeout_ms: None,
         }
     }
 
@@ -710,6 +723,60 @@ async fn lsp_process_initialization_failures_are_bounded_and_reaped() {
         assert!(client.is_none(), "{mode} server unexpectedly initialized");
         assert_process_reaped(wait_for_pid(&lease).await).await;
     }
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn lsp_process_settings_answer_workspace_configuration_and_push_did_change() {
+    let fixture = FixtureBuild::compile("settings-configuration");
+    let workspace = fixture.workspace("workspace");
+    let lease = fixture.path("settings.lease");
+    let log = fixture.path("settings.log");
+    let mut cfg = fixture.config("configuration", &lease);
+    cfg.env.insert(
+        "LSP_FIXTURE_CONFIG_LOG".to_string(),
+        log.display().to_string(),
+    );
+    cfg.settings = Some(serde_json::json!({
+        "python": {"analysis": {"typeCheckingMode": "strict"}},
+        "gopls": {"staticcheck": true}
+    }));
+    let client = spawn_client(&cfg, &workspace, Duration::from_secs(5))
+        .await
+        .expect("fixture must initialize");
+    let logged = wait_for_file_contains(&log, "didChangeConfiguration").await;
+    let logged = wait_for_file_contains(&log, "cfg-1").await + &logged;
+    // Dotted section resolved through nesting; literal key; unset is null.
+    assert!(
+        logged
+            .contains("\"result\":[{\"typeCheckingMode\":\"strict\"},{\"staticcheck\":true},null]"),
+        "{logged}"
+    );
+    assert!(logged.contains("\"settings\":{"), "{logged}");
+    client.shutdown().await;
+    drop(client);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn lsp_process_without_settings_answers_null_and_sends_no_did_change() {
+    let fixture = FixtureBuild::compile("no-settings-configuration");
+    let workspace = fixture.workspace("workspace");
+    let lease = fixture.path("nosettings.lease");
+    let log = fixture.path("nosettings.log");
+    let mut cfg = fixture.config("configuration", &lease);
+    cfg.env.insert(
+        "LSP_FIXTURE_CONFIG_LOG".to_string(),
+        log.display().to_string(),
+    );
+    let client = spawn_client(&cfg, &workspace, Duration::from_secs(5))
+        .await
+        .expect("fixture must initialize");
+    let logged = wait_for_file_contains(&log, "cfg-1").await;
+    assert!(logged.contains("\"result\":[null,null,null]"), "{logged}");
+    assert!(!logged.contains("didChangeConfiguration"), "{logged}");
+    client.shutdown().await;
+    drop(client);
     fixture.cleanup().await;
 }
 

@@ -2498,6 +2498,44 @@ fn edit_wait_defaults_to_one_second_and_is_clamped() {
 }
 
 #[test]
+fn lsp_timeouts_have_documented_defaults_and_are_clamped() {
+    let mut cfg = LspServerConfig::default();
+    assert_eq!(cfg.startup_timeout(), Duration::from_secs(15));
+    assert_eq!(cfg.request_timeout(), Duration::from_secs(10));
+    cfg.startup_timeout_ms = Some(120_000);
+    cfg.request_timeout_ms = Some(45_000);
+    assert_eq!(cfg.startup_timeout(), Duration::from_secs(120));
+    assert_eq!(cfg.request_timeout(), Duration::from_secs(45));
+    cfg.startup_timeout_ms = Some(0);
+    cfg.request_timeout_ms = Some(u64::MAX);
+    assert_eq!(cfg.startup_timeout(), Duration::from_secs(1));
+    assert_eq!(cfg.request_timeout(), Duration::from_secs(300));
+    let parsed: LspServerConfig = toml::from_str(
+        "command = \"x\"\nstartup_timeout_ms = 60000\n[settings.python.analysis]\ntypeCheckingMode = \"strict\"",
+    )
+    .unwrap();
+    assert_eq!(parsed.startup_timeout(), Duration::from_secs(60));
+    assert_eq!(
+        parsed.workspace_settings().unwrap()["python"]["analysis"]["typeCheckingMode"],
+        "strict"
+    );
+}
+
+#[test]
+fn lsp_settings_must_be_a_small_object() {
+    let mut cfg = LspServerConfig {
+        settings: Some(serde_json::json!("not an object")),
+        ..Default::default()
+    };
+    assert!(cfg.workspace_settings().is_none());
+    cfg.settings =
+        Some(serde_json::json!({"blob": "x".repeat(LspServerConfig::MAX_SETTINGS_BYTES)}));
+    assert!(cfg.workspace_settings().is_none());
+    cfg.settings = Some(serde_json::json!({"a": 1}));
+    assert!(cfg.workspace_settings().is_some());
+}
+
+#[test]
 fn idle_timeout_defaults_to_fifteen_minutes_and_zero_disables_retirement() {
     let mut cfg = LspConfig::default();
     assert_eq!(cfg.idle_timeout(), Some(Duration::from_secs(900)));

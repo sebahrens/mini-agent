@@ -54,6 +54,9 @@ fn server(command: &str, args: &[&str], extensions: &[&str]) -> LspServerConfig 
         initialization: None,
         disabled: false,
         wait_ms: None,
+        settings: None,
+        startup_timeout_ms: None,
+        request_timeout_ms: None,
     }
 }
 

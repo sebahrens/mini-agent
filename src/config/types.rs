@@ -910,12 +910,58 @@ pub struct LspServerConfig {
     /// [`LspServerConfig::DEFAULT_WAIT_MS`]; values are clamped to
     /// [`LspServerConfig::MAX_WAIT_MS`].
     pub wait_ms: Option<u64>,
+    /// Settings the server reads through `workspace/configuration` (looked up
+    /// by dotted section, e.g. `python.analysis`) and receives in
+    /// `workspace/didChangeConfiguration` after `initialized`. An object of
+    /// at most [`LspServerConfig::MAX_SETTINGS_BYTES`] serialized bytes;
+    /// anything else is ignored.
+    pub settings: Option<serde_json::Value>,
+    /// Milliseconds the `initialize` handshake may take. Absent selects
+    /// [`LspServerConfig::DEFAULT_STARTUP_TIMEOUT_MS`]; clamped to
+    /// 1000..=[`LspServerConfig::MAX_TIMEOUT_MS`].
+    pub startup_timeout_ms: Option<u64>,
+    /// Milliseconds one navigation request (`lsp` tool) may take. Absent
+    /// selects [`LspServerConfig::DEFAULT_REQUEST_TIMEOUT_MS`]; clamped to
+    /// 1000..=[`LspServerConfig::MAX_TIMEOUT_MS`].
+    pub request_timeout_ms: Option<u64>,
 }
 
 #[cfg(feature = "lsp")]
 impl LspServerConfig {
     pub const DEFAULT_WAIT_MS: u64 = 1_000;
     pub const MAX_WAIT_MS: u64 = 60_000;
+    pub const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 15_000;
+    pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
+    pub const MIN_TIMEOUT_MS: u64 = 1_000;
+    pub const MAX_TIMEOUT_MS: u64 = 300_000;
+    pub const MAX_SETTINGS_BYTES: usize = 64 * 1024;
+
+    /// The effective `initialize` deadline.
+    pub fn startup_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.startup_timeout_ms
+                .unwrap_or(Self::DEFAULT_STARTUP_TIMEOUT_MS)
+                .clamp(Self::MIN_TIMEOUT_MS, Self::MAX_TIMEOUT_MS),
+        )
+    }
+
+    /// The effective per-request deadline of navigation queries.
+    pub fn request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.request_timeout_ms
+                .unwrap_or(Self::DEFAULT_REQUEST_TIMEOUT_MS)
+                .clamp(Self::MIN_TIMEOUT_MS, Self::MAX_TIMEOUT_MS),
+        )
+    }
+
+    /// `settings` when it is a JSON object within the size bound.
+    pub fn workspace_settings(&self) -> Option<&serde_json::Value> {
+        self.settings.as_ref().filter(|value| {
+            value.is_object()
+                && serde_json::to_vec(value)
+                    .is_ok_and(|bytes| bytes.len() <= Self::MAX_SETTINGS_BYTES)
+        })
+    }
 
     /// The effective post-edit diagnostics wait.
     pub fn edit_wait(&self) -> std::time::Duration {

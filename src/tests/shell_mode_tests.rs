@@ -477,7 +477,10 @@ async fn explicit_shell_spools_large_output_instead_of_killing_the_command() {
     assert_eq!(run.output.exit_status.unwrap().code(), Some(4));
     let rendered = run.rendered_output();
     assert!(rendered.contains("END-MARKER"), "tail survives");
-    assert!(rendered.contains("[output truncated:"), "visible truncation");
+    assert!(
+        rendered.contains("[output truncated:"),
+        "visible truncation"
+    );
     assert!(rendered.contains("full output log:"), "names the log");
     assert!(rendered.contains("exited with status 4"));
     let logs: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
@@ -502,7 +505,11 @@ async fn explicit_shell_infinite_output_stops_at_the_hard_ceiling_with_a_tail() 
     // Memory stays at head + tail, not the 64 MiB that was produced.
     assert!(run.output.stdout.len() < 2 * 1024 * 1024);
     let rendered = run.rendered_output();
-    assert!(rendered.contains("64 MiB hard ceiling"), "{}", &rendered[rendered.len().saturating_sub(300)..]);
+    assert!(
+        rendered.contains("64 MiB hard ceiling"),
+        "{}",
+        &rendered[rendered.len().saturating_sub(300)..]
+    );
     assert!(rendered.contains("[output truncated:"));
     assert_eq!(sandbox.active_group_count(), 0);
 }

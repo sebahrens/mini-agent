@@ -1633,12 +1633,12 @@ impl Cli {
         self.loop_plan.iter_mut().for_each(|p| fix(p, base));
         // CLI value only: the config `wt-base-dir` stays config-relative.
         #[cfg(feature = "git-worktree")]
-        if let Some(dir) = self.wt_base_dir.as_mut() {
-            if !dir.starts_with('~') {
-                let mut path = std::path::PathBuf::from(&*dir);
-                fix(&mut path, base);
-                *dir = path.to_string_lossy().into_owned();
-            }
+        if let Some(dir) = self.wt_base_dir.as_mut()
+            && !dir.starts_with('~')
+        {
+            let mut path = std::path::PathBuf::from(&*dir);
+            fix(&mut path, base);
+            *dir = path.to_string_lossy().into_owned();
         }
     }
 

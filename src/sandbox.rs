@@ -1410,6 +1410,15 @@ pub(crate) fn spooled_output_note(transcript: &OutputTranscript) -> Option<Strin
     })
 }
 
+/// Optional parts of one captured command run.
+#[derive(Default)]
+struct PendingExtras {
+    audit: Option<OwnedExplicitShellAudit>,
+    input: Option<Vec<u8>>,
+    progress: Option<CommandProgress>,
+    capture: Option<ShellOutputCapture>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SupportCommandLimits {
     pub timeout: std::time::Duration,
@@ -4939,14 +4948,16 @@ impl Sandbox {
                 },
                 limits,
                 cancellation,
-                Some(OwnedExplicitShellAudit::capture(
-                    audit.clone(),
-                    #[cfg(test)]
-                    self.explicit_shell_audit_receipts.clone(),
-                )),
-                None,
-                progress,
-                Some(capture.clone()),
+                PendingExtras {
+                    audit: Some(OwnedExplicitShellAudit::capture(
+                        audit.clone(),
+                        #[cfg(test)]
+                        self.explicit_shell_audit_receipts.clone(),
+                    )),
+                    progress,
+                    capture: Some(capture.clone()),
+                    ..PendingExtras::default()
+                },
             )
             .await?;
         Ok(ExplicitShellRun {
@@ -5544,10 +5555,10 @@ impl Sandbox {
             },
             limits,
             Some(cancellation.subscribe()),
-            None,
-            None,
-            None,
-            Some(capture.clone()),
+            PendingExtras {
+                capture: Some(capture.clone()),
+                ..PendingExtras::default()
+            },
         )
         .await
     }
@@ -5628,10 +5639,7 @@ impl Sandbox {
             },
             limits,
             cancellation,
-            None,
-            None,
-            None,
-            None,
+            PendingExtras::default(),
         )
         .await
     }
@@ -5714,10 +5722,11 @@ impl Sandbox {
             PendingCommand::Built(cmd),
             limits,
             cancellation,
-            audit,
-            input,
-            None,
-            None,
+            PendingExtras {
+                audit,
+                input,
+                ..PendingExtras::default()
+            },
         )
         .await
     }
@@ -5727,11 +5736,14 @@ impl Sandbox {
         cmd: PendingCommand,
         limits: CommandLimits,
         cancellation: Option<watch::Receiver<bool>>,
-        audit: Option<OwnedExplicitShellAudit>,
-        input: Option<Vec<u8>>,
-        progress: Option<CommandProgress>,
-        capture: Option<ShellOutputCapture>,
+        extras: PendingExtras,
     ) -> std::io::Result<CommandOutput> {
+        let PendingExtras {
+            audit,
+            input,
+            progress,
+            capture,
+        } = extras;
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
         let capture = capture.map(|capture| capture.0);

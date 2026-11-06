@@ -502,9 +502,8 @@ impl LspManager {
         let cancelled = scope.is_cancelled();
         cleanup.settle().await;
         let servers = result.ok()?;
-        let (servers, withheld) = registry::split_untrusted_builtins(servers, &user, || {
-            workspace_is_trusted(&workspace)
-        });
+        let (servers, withheld) =
+            registry::split_untrusted_builtins(servers, &user, || workspace_is_trusted(&workspace));
         // A manager with only withheld servers is still returned so the `lsp`
         // tool and `/doctor` can say why nothing runs.
         if cancelled || (servers.is_empty() && withheld.is_empty()) || workspace.validate().is_err()
@@ -520,7 +519,7 @@ impl LspManager {
         self.inner
             .withheld
             .iter()
-            .find(|entry| entry.extensions.iter().any(|e| *e == ext))
+            .find(|entry| entry.extensions.contains(&ext))
             .map(registry::WithheldBuiltin::explanation)
     }
 
@@ -1741,9 +1740,11 @@ mod untrusted_builtin_tests {
         let kt = fixture.workspace.join("A.kt");
         assert!(!manager.handles(&kt));
         assert!(manager.withheld_explanation(&kt).is_some());
-        assert!(manager
-            .withheld_explanation(&fixture.workspace.join("a.txt"))
-            .is_none());
+        assert!(
+            manager
+                .withheld_explanation(&fixture.workspace.join("a.txt"))
+                .is_none()
+        );
 
         // Explicit mode applies the same gate.
         let explicit = LspManager::new(&LspConfig::default(), workspace.clone());

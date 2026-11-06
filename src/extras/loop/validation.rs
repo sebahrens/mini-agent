@@ -673,7 +673,10 @@ mod tests {
             ValidationStatus::NonZeroExit { exit_code: Some(3) }
         );
         let rendered = result.render();
-        assert!(rendered.contains("diagnostic_truncated=true"), "{rendered:.300}");
+        assert!(
+            rendered.contains("diagnostic_truncated=true"),
+            "{rendered:.300}"
+        );
         assert!(rendered.contains("END-MARKER"), "tail must survive");
         let log = result.log.clone().expect("log path");
         assert!(rendered.contains(&log.display().to_string()));
