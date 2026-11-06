@@ -264,6 +264,19 @@ pub(crate) async fn generate_for_session(
     cfg: &crate::config::Config,
     client: &crate::provider::AnyClient,
 ) -> (crate::event::UsageDelta, bool) {
+    generate_for_session_in(session, cfg, client, true).await
+}
+
+/// [`generate_for_session`] for a caller that owns its own signal handling:
+/// with `headless` false the request runs directly instead of inside the
+/// headless command wrapper (ACP servers speak a protocol on stdio and must
+/// not install process-wide interrupt listeners for an optional title).
+pub(crate) async fn generate_for_session_in(
+    session: &mut Session,
+    cfg: &crate::config::Config,
+    client: &crate::provider::AnyClient,
+    headless: bool,
+) -> (crate::event::UsageDelta, bool) {
     let Some(request) = title_request(cfg, session) else {
         return (Default::default(), false);
     };
@@ -297,7 +310,7 @@ pub(crate) async fn generate_for_session(
         )
     };
     let ledger = UsageLedger::with_spend(spend.clone());
-    let result = crate::print::run_headless_command(async {
+    let command = async {
         match title_client {
             Ok(client) => crate::spend::run::scope(
                 Some(spend),
@@ -307,8 +320,12 @@ pub(crate) async fn generate_for_session(
             .map_err(std::io::Error::other),
             Err(error) => Err(std::io::Error::other(error)),
         }
-    })
-    .await;
+    };
+    let result = if headless {
+        crate::print::run_headless_command(command).await
+    } else {
+        command.await
+    };
     let interrupted = result.as_ref().err().is_some_and(|error| {
         error.kind() == std::io::ErrorKind::Interrupted || crate::print::headless_force_stopped()
     });

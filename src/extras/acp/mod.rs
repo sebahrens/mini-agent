@@ -125,6 +125,12 @@ struct SessionHistory {
     /// Compaction triggers, refreshed from config and the routed model's
     /// context window before each prompt.
     limits: AcpHistoryLimits,
+    /// Context window of the model the last prompt was routed to; the `size`
+    /// of the session's `usage_update`. Zero until the first prompt.
+    context_window: u64,
+    /// The last title sent in a `session_info_update`, so a title is pushed
+    /// only when it changes.
+    last_title_sent: Option<String>,
 }
 
 /// When ACP live history is summarized. Token pressure mirrors the TUI's
@@ -278,6 +284,8 @@ impl Default for SessionHistory {
             manual_compact: false,
             reuse: Default::default(),
             limits: Default::default(),
+            context_window: 0,
+            last_title_sent: None,
         }
     }
 }
@@ -2007,6 +2015,8 @@ async fn install_session(
                 manual_compact: false,
                 reuse: Default::default(),
                 limits: Default::default(),
+                context_window: 0,
+                last_title_sent: None,
             })),
             workspace,
             base_context: Arc::new(base_context),
@@ -4201,6 +4211,11 @@ async fn run_prompt(
         ));
     });
 
+    // Context meter and cost, then the title when it changed. Both are
+    // best-effort display data and never fail the prompt.
+    send_usage_update(state, &history, &session_id, &cx);
+    send_session_info(&mut history, &session_id, &cx);
+
     // Report the decision twice: as a thought chunk a person can read, and as
     // `_meta` a client can act on without parsing prose. Clients routinely hide
     // thoughts, and an agent that kept working with no visible reason is the
@@ -4236,6 +4251,9 @@ async fn run_prompt(
         notification.meta = Some(meta);
         let _ = cx.send_notification(notification);
     }
+    let title_eligible = outcome.error.is_none()
+        && outcome.question.is_none()
+        && outcome.reason == StopReason::EndTurn;
     // An internal failure (provider, runner, workspace or configuration) is
     // not a model refusal: it is answered as a JSON-RPC error so a client can
     // tell the two apart. Progress the turn made is still committed above.
@@ -4259,7 +4277,97 @@ async fn run_prompt(
     } else {
         let _ = respond_terminal(registration, responder, outcome.reason);
     }
+    if title_eligible {
+        generate_session_title(state, &mut history, &session_id, &cx).await;
+    }
     Ok(())
+}
+
+/// Push the context meter: tokens in context, the routed model's window and
+/// the session's cumulative cost. Skipped until a window is known.
+fn send_usage_update(
+    state: &AcpState,
+    history: &SessionHistory,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+) {
+    if history.context_window == 0 {
+        return;
+    }
+    let used = history
+        .session
+        .effective_context_tokens_after_tool_result_pruning(
+            state.cfg.resolve_keep_recent_tool_results(),
+        );
+    let mut update = UsageUpdate::new(used, history.context_window);
+    if history.session.total_cost.is_finite() && history.session.total_cost > 0.0 {
+        update = update.cost(Cost::new(history.session.total_cost, "USD"));
+    }
+    let _ = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::UsageUpdate(update),
+    ));
+}
+
+/// Push the session title when it differs from the last one sent.
+fn send_session_info(
+    history: &mut SessionHistory,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+) {
+    let title = history.session.list_title();
+    let title = title.trim();
+    if title.is_empty() || history.last_title_sent.as_deref() == Some(title) {
+        return;
+    }
+    let title = title.to_owned();
+    let _ = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title.clone())),
+    ));
+    history.last_title_sent = Some(title);
+}
+
+/// Opt-in model-written title (`session_title_model` must be set): runs once,
+/// after the first completed turn has been answered, never for native history,
+/// and is pushed as a `session_info_update`. A failure keeps the derived title.
+async fn generate_session_title(
+    state: &AcpState,
+    history: &mut SessionHistory,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+) {
+    if !matches!(
+        state.cfg.session_title_model.as_deref().map(str::trim),
+        Some(alias) if !alias.is_empty() && alias != "off"
+    ) || state.cli.no_session
+        || crate::session::native_publication::is_native_bearing(&history.session)
+        || history.session.generated_title.is_some()
+    {
+        return;
+    }
+    let Ok(client) = state
+        .provider_clients
+        .get(&state.cli, &state.cfg, &history.session.provider)
+    else {
+        return;
+    };
+    if matches!(client, crate::provider::AnyClient::Anthropic(_)) {
+        return;
+    }
+    let _ = crate::session::title::generate_for_session_in(
+        &mut history.session,
+        &state.cfg,
+        &client,
+        false,
+    )
+    .await;
+    if history.session.generated_title.is_none() {
+        return;
+    }
+    let _ = sessions::checkpoint(history, |_| {}).await;
+    send_session_info(history, session_id, cx);
+    send_usage_update(state, history, session_id, cx);
 }
 
 /// Judge the goal round this ACP prompt turn was.
@@ -4517,6 +4625,11 @@ async fn execute_prompt(
     if let Err(error) = persona::check_route(&state.cli, &state.cfg, &route) {
         return Ok(PromptOutcome::failed(error));
     }
+    history.context_window = state.cfg.resolve_context_window(
+        &route.provider,
+        &route.model,
+        crate::config::quick_models_map(&state.cfg),
+    );
     #[cfg(test)]
     lock_unpoisoned(&state.turn_routes).push(route.clone());
     // The relay reads the same session-local store the actual tool mutates.
@@ -6890,6 +7003,40 @@ mod protocol_tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1, "local commands cannot launch a model runner");
             Ok(())
         }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn kqsvd_prompt_pushes_usage_update_and_session_title() {
+        let state = fixture_state(Arc::new(|_, _| {
+            Box::pin(async {
+                Ok(vec![AgentEvent::Done {
+                    response: "answer".into(),
+                    interactions: vec![Message::assistant("answer")],
+                }])
+            })
+        }));
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client.builder().on_receive_notification(async move |notification: SessionNotification, _cx| {
+            sink.lock().unwrap().push(notification); Ok(())
+        }, agent_client_protocol::on_receive_notification!()).connect_with(InMemoryAgent(state), async move |cx| {
+            let id = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?.session_id;
+            cx.send_request(prompt(id.clone(), "name this session please")).block_task().await?;
+            cx.send_request(prompt(id.clone(), "second prompt keeps the title")).block_task().await?;
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+            Ok(())
+        }).await.unwrap();
+        let updates = updates.lock().unwrap();
+        let usage: Vec<_> = updates.iter().filter_map(|n| match &n.update {
+            SessionUpdate::UsageUpdate(u) => Some(u.clone()), _ => None }).collect();
+        assert_eq!(usage.len(), 2, "one usage_update after each prompt");
+        assert!(usage[0].size > 0, "the routed model's context window is reported");
+        let titles: Vec<_> = updates.iter().filter_map(|n| match &n.update {
+            SessionUpdate::SessionInfoUpdate(u) => Some(format!("{:?}", u.title)), _ => None }).collect();
+        assert_eq!(titles.len(), 1, "the title is pushed once, when it first exists: {titles:?}");
+        assert!(titles[0].contains("name this session please"));
     }
 
     #[tokio::test]
