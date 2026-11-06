@@ -300,7 +300,12 @@ dot to match newlines (`(?-s:...)` can disable that flag locally). Output keeps 
 existing numbered source-line format, showing each touched line once plus requested
 context. In multiline mode `count` counts non-overlapping regex matches; ordinary
 line mode continues counting matching source lines. Result limits still apply if
-one match spans many lines.
+one match spans many lines. `offset` (default `0`) skips that many result lines, or
+matching files in `files_only` and `count` modes, so a truncated result can be paged:
+the truncation notice ends with `continue with offset=N`, the header names the
+returned window (`151-300 after offset 150`), and an offset past the end reports how
+many results the search produced. Results follow directory-walk order, which is
+stable while the tree is unchanged.
 
 Both recursive searches visit at most 100,000 directory entries and descend at
 most 256 directories. Grep additionally reads at most 100 MiB per call, loads at

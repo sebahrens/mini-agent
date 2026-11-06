@@ -230,6 +230,7 @@ async fn directory_tools_resolve_home_paths_through_the_ambient_path() {
     let grep = GrepTool::new(None, None, 100)
         .with_workspace(fixture.workspace.clone())
         .call(GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "needle".into(),

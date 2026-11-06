@@ -420,3 +420,93 @@ async fn grep_one_multiline_match_cannot_collect_unbounded_source_line_ranges() 
     assert!(output.contains("search work limit reached"), "{output}");
     assert!(output.contains("matches/touched lines"), "{output}");
 }
+
+/// mini-agent-o4iie: `offset` pages through results without overlap, and the
+/// truncation notice names the exact offset that continues.
+#[tokio::test]
+async fn grep_offset_pages_lines_files_only_and_count_without_overlap() {
+    use rig::tool::Tool;
+    let root = crate::tests::OwnedTestDirectory::new("grep-offset-pages");
+    let body: String = (1..=400).map(|n| format!("needle {n}\n")).collect();
+    std::fs::write(root.path().join("hits.txt"), body).unwrap();
+    let tool = GrepTool::new(None, None, 150);
+    assert_eq!(tool.parameters()["properties"]["offset"]["type"], "integer");
+
+    let first = tool
+        .call(search_args(root.path(), serde_json::json!({})))
+        .await
+        .unwrap();
+    assert!(first.contains("continue with offset=150 "), "{first}");
+    assert!(first.contains("hits.txt:150:needle 150\n"), "{first}");
+    let second = tool
+        .call(search_args(root.path(), serde_json::json!({"offset":150})))
+        .await
+        .unwrap();
+    assert!(
+        second.starts_with("150 results (151-300 after offset 150, "),
+        "{second}"
+    );
+    assert!(second.contains("continue with offset=300 "), "{second}");
+    assert!(!second.contains("hits.txt:150:"), "{second}");
+    assert!(second.contains("hits.txt:151:needle 151\n"), "{second}");
+    assert!(second.contains("hits.txt:300:needle 300\n"), "{second}");
+    assert!(!second.contains("hits.txt:301:"), "{second}");
+    let last = tool
+        .call(search_args(root.path(), serde_json::json!({"offset":300})))
+        .await
+        .unwrap();
+    assert!(
+        last.starts_with("100 results (301-400 after offset 300, "),
+        "{last}"
+    );
+    assert!(!last.contains("truncated"), "{last}");
+    let past = tool
+        .call(search_args(root.path(), serde_json::json!({"offset":400})))
+        .await
+        .unwrap();
+    assert!(
+        past.starts_with("No results at offset 400: this search produced 400 results"),
+        "{past}"
+    );
+
+    // Context paging never starts a page with a dangling separator.
+    let context = tool
+        .call(search_args(
+            root.path(),
+            serde_json::json!({"offset":2,"max_results":2,"context_lines":1}),
+        ))
+        .await
+        .unwrap();
+    assert!(context.contains("hits.txt:3: needle 3"), "{context}");
+    assert!(!context.contains("\n--\n"), "{context}");
+
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(root.path().join(name), "needle\n").unwrap();
+    }
+    for mode in ["files_only", "count"] {
+        let mut page_one = serde_json::json!({"max_results":2});
+        page_one[mode] = true.into();
+        let page_one = tool.call(search_args(root.path(), page_one)).await.unwrap();
+        assert!(
+            page_one.contains("continue with offset=2 "),
+            "{mode}: {page_one}"
+        );
+        let mut page_two = serde_json::json!({"max_results":2,"offset":2});
+        page_two[mode] = true.into();
+        let page_two = tool.call(search_args(root.path(), page_two)).await.unwrap();
+        let files = |output: &str| -> Vec<String> {
+            output
+                .lines()
+                .filter(|line| line.contains(".txt"))
+                .map(|line| line.split(".txt").next().unwrap().to_owned())
+                .collect()
+        };
+        let (one, two) = (files(&page_one), files(&page_two));
+        assert_eq!(one.len(), 2, "{mode}: {page_one}");
+        assert_eq!(two.len(), 2, "{mode}: {page_two}");
+        assert!(
+            one.iter().all(|file| !two.contains(file)),
+            "{mode}: {one:?} {two:?}"
+        );
+    }
+}

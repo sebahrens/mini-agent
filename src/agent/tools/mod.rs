@@ -761,6 +761,9 @@ pub struct GrepArgs {
     pub max_results: Option<u64>,
     #[serde(default)]
     pub multiline: bool,
+    /// Result lines (or matching files) to skip, for paging.
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]

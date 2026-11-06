@@ -61,6 +61,7 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
         let grep = GrepTool::new(None, None, 100)
             .with_workspace(&root)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "SENTINEL".into(),
@@ -105,6 +106,7 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
         let explicit_grep = GrepTool::new(None, None, 100)
             .with_workspace(&root)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "VCS_SENTINEL".into(),

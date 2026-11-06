@@ -25,6 +25,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `grep` no longer reports skipped files as match-free: a directory search appends a
   `[skipped N files not searched: ...]` line for files over the 10 MiB per-file limit, binary or
   unreadable files, and naming such a file as `path` returns an error naming the limit.
+- `grep` accepts `offset` to page past its result cap; the truncation notice names the exact
+  `offset` that continues, in line, `files_only` and `count` modes.
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

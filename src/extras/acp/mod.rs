@@ -11753,6 +11753,7 @@ mod workspace_tests {
             GrepTool::new(None, None, 100).with_workspace_binding(second_workspace.clone());
         let (first_grep, second_grep) = tokio::join!(
             first_grep_tool.call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "first-only".into(),
@@ -11764,6 +11765,7 @@ mod workspace_tests {
                 count: false,
             }),
             second_grep_tool.call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "second-only".into(),

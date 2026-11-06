@@ -25,6 +25,8 @@ struct GrepSearchResult {
     files_with_matches: usize,
     results: Vec<String>,
     emitted_results: usize,
+    /// Result lines (or files) produced before `offset` skipping.
+    seen_results: usize,
     limit_hit: bool,
     work_limit_hit: bool,
 }
@@ -101,6 +103,8 @@ impl SkippedFiles {
 #[derive(Clone, Copy)]
 struct GrepSearchOptions {
     max_results: usize,
+    /// Result lines (or matching files in files_only/count mode) to skip.
+    offset: usize,
     context: usize,
     files_only: bool,
     count: bool,
@@ -377,6 +381,7 @@ struct GrepSearch {
     files_with_matches: usize,
     results: Vec<String>,
     emitted_results: usize,
+    seen_results: usize,
     limit_hit: bool,
     work_limit_hit: bool,
     remaining_bytes: u64,
@@ -395,11 +400,19 @@ impl GrepSearch {
             files_with_matches: 0,
             results: Vec::with_capacity(options.max_results.min(64)),
             emitted_results: 0,
+            seen_results: 0,
             limit_hit: false,
             work_limit_hit: false,
             remaining_bytes: MAX_SEARCH_TOTAL_BYTES,
             read_buffer: Vec::with_capacity(64 * 1024),
         }
+    }
+
+    /// Count one produced result; `true` while it falls before `offset` and
+    /// must be skipped rather than emitted.
+    fn skip_result(seen_results: &mut usize, offset: usize) -> bool {
+        *seen_results += 1;
+        *seen_results <= offset
     }
 
     /// Search one file. `include_root` anchors path-aware include globs.
@@ -491,11 +504,17 @@ impl GrepSearch {
         let path_str = entry.path.to_string_lossy().to_string();
 
         if options.files_only {
+            if Self::skip_result(&mut self.seen_results, options.offset) {
+                return ControlFlow::Continue(());
+            }
             self.results.push(path_str);
             self.emitted_results += 1;
             return ControlFlow::Continue(());
         }
         if options.count {
+            if Self::skip_result(&mut self.seen_results, options.offset) {
+                return ControlFlow::Continue(());
+            }
             self.results.push(format!("{}:{}", path_str, match_count));
             self.emitted_results += 1;
             return ControlFlow::Continue(());
@@ -503,6 +522,9 @@ impl GrepSearch {
 
         if options.context == 0 {
             for (match_index, &matched_line) in match_lines.iter().enumerate() {
+                if Self::skip_result(&mut self.seen_results, options.offset) {
+                    continue;
+                }
                 let matched = match_ranges.get(&matched_line).cloned();
                 let displayed = truncate_output_line(lines[matched_line], matched);
                 self.results
@@ -537,11 +559,16 @@ impl GrepSearch {
                     continue;
                 }
 
-                if !self.results.is_empty() {
-                    self.results.push("--".to_string());
-                }
-
+                let mut separator_pending = !self.results.is_empty();
                 while index < total && shown[index] && self.emitted_results < options.max_results {
+                    if Self::skip_result(&mut self.seen_results, options.offset) {
+                        index += 1;
+                        continue;
+                    }
+                    if separator_pending {
+                        self.results.push("--".to_string());
+                        separator_pending = false;
+                    }
                     let is_match = match_lines.binary_search(&index).is_ok();
                     let separator = if is_match { ':' } else { '-' };
                     let matched = match_ranges.get(&index).cloned();
@@ -580,6 +607,7 @@ impl GrepSearch {
             files_with_matches: self.files_with_matches,
             results: self.results,
             emitted_results: self.emitted_results,
+            seen_results: self.seen_results,
             limit_hit: self.limit_hit,
             work_limit_hit: self.work_limit_hit || walker_work_limit_hit,
         }
@@ -755,6 +783,11 @@ impl Tool for GrepTool {
                 "count": {
                     "type": "boolean",
                     "description": "Return each matching path and its match count (default false)"
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Skip this many result lines (matching files in files_only/count mode) to page past a truncated result; the truncation notice names the next offset. Results follow directory-walk order, stable while the tree is unchanged"
                 }
             },
             "required": ["pattern"]
@@ -881,6 +914,9 @@ impl Tool for GrepTool {
             .transpose()?;
 
         let max_results = usize::try_from(max_results).unwrap_or(usize::MAX);
+        let offset = args
+            .offset
+            .map_or(0, |offset| usize::try_from(offset).unwrap_or(usize::MAX));
         let multiline = args.multiline;
         let files_only = args.files_only;
         let count = args.count;
@@ -892,6 +928,7 @@ impl Tool for GrepTool {
                 include_re,
                 GrepSearchOptions {
                     max_results,
+                    offset,
                     context,
                     files_only,
                     count,
@@ -908,6 +945,7 @@ impl Tool for GrepTool {
             files_with_matches,
             results: all_results,
             emitted_results,
+            seen_results,
             limit_hit,
             work_limit_hit,
         } = search;
@@ -918,6 +956,15 @@ impl Tool for GrepTool {
         };
         let skipped_notice = skipped.notice();
         let work_notice = format!("{skipped_notice}{work_notice}");
+        if all_results.is_empty() && offset > 0 && seen_results > 0 {
+            let msg = format!(
+                "No results at offset {offset}: this search produced {seen_results} results in total; use a smaller offset.{work_notice}"
+            );
+            return Ok(match coaching {
+                Some(c) => format!("{}\n\n{}", c, msg),
+                None => msg,
+            });
+        }
         if all_results.is_empty() {
             let msg = format!("No matches found.{work_notice}");
             return Ok(match coaching {
@@ -938,23 +985,35 @@ impl Tool for GrepTool {
         } else {
             "unknown number of additional matches"
         };
+        let window = if offset > 0 {
+            format!(
+                "{}-{} after offset {offset}, ",
+                offset.saturating_add(1),
+                offset.saturating_add(total)
+            )
+        } else {
+            String::new()
+        };
         let result = if truncated {
             format!(
-                "{} {} (showing first {}, searched {} files):\n{}\n\n[truncated after {} {} — {}; narrow the pattern or restrict to a path]",
+                "{} {} ({}showing first {}, searched {} files):\n{}\n\n[truncated after {} {} — {}; continue with offset={} (same pattern, path and options), or narrow the pattern or restrict to a path]",
                 total,
                 result_label,
+                window,
                 max_results,
                 file_count,
                 all_results.join("\n"),
                 max_results,
                 result_label,
                 truncation_detail,
+                offset.saturating_add(total),
             )
         } else {
             format!(
-                "{} {} (searched {} files):\n{}",
+                "{} {} ({}searched {} files):\n{}",
                 total,
                 result_label,
+                window,
                 file_count,
                 all_results.join("\n")
             )
@@ -1056,6 +1115,7 @@ mod tests {
                     .run(async move {
                         GrepTool::new(None, None, 10)
                             .call(GrepArgs {
+                                offset: None,
                                 max_results: None,
                                 multiline: false,
                                 pattern: "needle".to_owned(),
@@ -1258,6 +1318,7 @@ mod tests {
         );
 
         let call = tool.call(GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "needle".to_string(),
@@ -1291,6 +1352,7 @@ mod tests {
 
     fn grep_args(pattern: &str, path: Option<&str>, include: Option<&str>) -> GrepArgs {
         GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: pattern.to_string(),
@@ -1343,6 +1405,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1396,6 +1459,7 @@ mod tests {
 
         let result = GrepTool::new(Some(permission), None, 10)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: marker.to_string(),
@@ -1427,6 +1491,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1455,6 +1520,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(workspace.path()),
             GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1488,6 +1554,7 @@ mod tests {
         let result = call_answering_path_permission(
             standard_permission(&workspace),
             GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1529,6 +1596,7 @@ mod tests {
         let tool = GrepTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "binding_marker".to_string(),
@@ -1574,6 +1642,7 @@ mod tests {
         let tool = GrepTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "must_not_be_returned".to_string(),
@@ -1649,6 +1718,7 @@ mod tests {
 
         let output = GrepTool::new(Some(standard_permission(&workspace)), None, 10)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: marker.to_string(),
@@ -1696,6 +1766,7 @@ mod tests {
 
         let result = tool
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1730,6 +1801,7 @@ mod tests {
 
         let result = tool
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: marker.to_string(),
@@ -1757,6 +1829,7 @@ mod tests {
 
         let output = tool
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1783,6 +1856,7 @@ mod tests {
 
         let output = tool
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1809,6 +1883,7 @@ mod tests {
 
         let output = GrepTool::new(None, None, 10)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1849,6 +1924,7 @@ mod tests {
 
         let output = GrepTool::new(None, None, 10)
             .call(GrepArgs {
+                offset: None,
                 max_results: None,
                 multiline: false,
                 pattern: "needle".to_string(),
@@ -1911,6 +1987,7 @@ mod tests {
 
     fn ergonomic_args(path: &Path, include: Option<&str>) -> GrepArgs {
         GrepArgs {
+            offset: None,
             max_results: None,
             multiline: false,
             pattern: "needle".to_string(),
