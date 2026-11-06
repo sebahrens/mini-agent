@@ -2363,10 +2363,63 @@ fn apply_message_cache_control(
         return;
     }
 
-    if let Some(last_msg) = messages.last_mut() {
-        set_content_cache_control(last_msg.content.last_mut(), Some(cache_control.clone()));
-        *remaining_cache_markers -= 1;
+    let Some(last_msg) = messages.last_mut() else {
+        return;
+    };
+    set_content_cache_control(last_msg.content.last_mut(), Some(cache_control.clone()));
+    *remaining_cache_markers -= 1;
+
+    // Anthropic looks back at most 20 content blocks from a breakpoint for an
+    // earlier cache write. One assistant turn with many tool calls adds
+    // 20+ blocks (text, tool_use and tool_result), so a lone tail breakpoint
+    // would miss the previous request's write and re-bill the whole prefix.
+    // Place the spare breakpoints every `MESSAGE_CACHE_STEP` blocks behind the
+    // tail: the previous tail is then always within 20 blocks of one marker.
+    let blocks: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .flat_map(|(message, msg)| (0..msg.content.len()).map(move |block| (message, block)))
+        .collect();
+    let mut position = blocks.len().saturating_sub(1);
+    while *remaining_cache_markers > 0 {
+        let Some(target) = position.checked_sub(MESSAGE_CACHE_STEP) else {
+            break;
+        };
+        // The nearest markable block (tool_use blocks cannot carry a marker),
+        // preferring one between the target and the previous breakpoint so the
+        // gap never grows past `MESSAGE_CACHE_STEP`.
+        let markable = |index: &usize| {
+            let (message, block) = blocks[*index];
+            content_accepts_cache_control(messages[message].content.iter().nth(block))
+        };
+        let Some(candidate) = (target..position)
+            .find(markable)
+            .or_else(|| (0..target).rev().find(markable))
+        else {
+            break;
+        };
+        let (message, block) = blocks[candidate];
+        if let Some(content) = messages[message].content.iter_mut().nth(block) {
+            set_content_cache_control(content, Some(cache_control.clone()));
+            *remaining_cache_markers -= 1;
+        }
+        position = candidate;
     }
+}
+
+/// Blocks per breakpoint behind the tail: below the 20-block lookback window.
+const MESSAGE_CACHE_STEP: usize = 18;
+
+fn content_accepts_cache_control(content: Option<&Content>) -> bool {
+    matches!(
+        content,
+        Some(
+            Content::Text { .. }
+                | Content::Image { .. }
+                | Content::ToolResult { .. }
+                | Content::Document { .. }
+        )
+    )
 }
 
 pub(super) fn apply_prompt_cache_control(

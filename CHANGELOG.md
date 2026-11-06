@@ -16,6 +16,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Context compaction
 
+- Anthropic five-minute prompt caching now spends its spare cache breakpoints on earlier
+  message blocks, spaced 18 blocks behind the tail, so a turn that adds 20+ content blocks (for
+  example ten parallel tool calls) still finds the previous request's cache write inside the
+  20-block lookback window.
+
 - The default retry policy is now 6 attempts with 500 ms doubling backoff capped at 30 s (was 3
   attempts, 10 s), so a short 529/5xx overload burst no longer ends a turn after about 1.5 s.
   The hard cap of 10 attempts and project-config tightening are unchanged.
