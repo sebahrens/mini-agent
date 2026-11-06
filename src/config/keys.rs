@@ -141,6 +141,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("extra_body").described("Provider-specific JSON shallow-merged into every completion request body as a global default.").shaped(ConfigShape::Any),
     key("reasoning").described("First-class reasoning controls for the OpenAI family: `effort` and `summary` map to the Responses API's `reasoning` object (and `effort` alone to Chat Completions' `reasoning_effort`),…").shaped(ConfigShape::Object),
     key("retry").shaped(ConfigShape::Object),
+    key("models_catalog_refresh_days").described("Opt-in network refresh: at startup, when the model catalog cache is older than this many days, fetch models.dev in the background into the cache (used from the next start). Unset (default) never fetches; /models catalog-refresh refreshes on demand.").shaped(ConfigShape::Integer),
     key("fallback_model").described("Same-provider model id or quick-model alias that a headless (-p) turn switches to when the primary fails with retries exhausted before any progress (overload, rate limit, 5xx). Never used for context, auth or budget errors. --fallback-model wins.").shaped(ConfigShape::String),
     key("provider_timeouts").described("Provider HTTP deadlines in seconds for built-in and custom providers: connect_timeout_secs (default 30) and stream_idle_timeout_secs (default 300, the wait for headers and between streamed events). A custom provider's own values win. Read at startup.").shaped(ConfigShape::Object),
     key("no_tools").shaped(ConfigShape::Bool),

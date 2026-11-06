@@ -107,5 +107,9 @@ echo "$api" | jq --argjson orv "$OPENROUTER_VENDORS" --argjson cut "$CUTOFFS" '
   }
 ' > "$OUT"
 
+# Generation instant, embedded as the snapshot's age (src/models_catalog.rs)
+# and compared against a newer user-cache overlay.
+date -u +%Y-%m-%dT%H:%M:%SZ > "$SCRIPT_DIR/../data/models.generated"
+
 echo "Wrote $OUT" >&2
 jq -r 'to_entries[] | "  \(.key): \(.value | length) models"' "$OUT" >&2

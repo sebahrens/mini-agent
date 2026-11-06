@@ -32,12 +32,12 @@ impl Default for CacheMultipliers {
 /// A prompt-size premium: requests whose prompt exceeds `threshold` tokens
 /// are billed at these rates instead of the base rates (Gemini Pro above
 /// 200k, GPT-5.x above 272k, ...). Applied per request, never retroactively.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct LongContextPrices {
     pub threshold: u64,
     pub input_price: f64,
     pub output_price: f64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_price: Option<f64>,
 }
 
@@ -72,10 +72,7 @@ impl LongContextPrices {
     /// silently replaced by catalog premiums.
     pub(crate) fn for_model(provider: &str, model: &str, base_input: Option<f64>) -> Option<Self> {
         let tier = crate::models_catalog::model_long_context(provider, model)?;
-        let catalog_input = crate::models_catalog::catalog_entries(provider)?
-            .iter()
-            .find(|entry| entry.id == model)?
-            .input_price?;
+        let catalog_input = crate::models_catalog::catalog_entry(provider, model)?.input_price?;
         let base = base_input?;
         ((base - catalog_input).abs() <= 1e-9).then_some(tier)
     }
@@ -295,8 +292,7 @@ impl CachePrices {
         } else {
             provider
         };
-        crate::models_catalog::catalog_entries(provider)
-            .and_then(|models| models.iter().find(|entry| entry.id == model))
+        crate::models_catalog::catalog_entry(provider, model)
             .map(|entry| {
                 let scale = |cache: Option<f64>| {
                     let base = entry

@@ -35,6 +35,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   `long_context` tier, e.g. Gemini 2.5 Pro over 200k prompt tokens) at the premium rate, so
   `/cost` and `max_budget_usd` no longer undercount large prompts; `/cost` names the premium and
   COST_TRACKING.md lists the tiers still unsupported.
+- The model catalog can be refreshed from models.dev into the user cache (`/models catalog-refresh`,
+  or opt-in `models_catalog_refresh_days` at startup); a newer cache overlays the embedded
+  snapshot, a corrupt one is ignored, and `/models` shows the catalog's source and age. Every
+  embedded entry now records `max_output`, and Bedrock/Vertex Claude ids use their native
+  Anthropic metadata (context window, output ceiling, prices).
 
 **Fork release 1.14.2 (2026-10-28)**
 

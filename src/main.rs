@@ -379,6 +379,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
     provider::set_provider_timeouts(cfg.provider_timeouts);
     provider::set_cli_fallback_model(cli.fallback_model.clone());
+    models_catalog::spawn_refresh_if_stale(cfg.models_catalog_refresh_days);
     for warning in &cfg.load_warnings[loaded_warning_count..] {
         eprintln!("warning: {warning}");
     }

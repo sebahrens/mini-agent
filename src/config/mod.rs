@@ -201,6 +201,10 @@ pub struct Config {
     /// progress (overload, rate limit, 5xx). `--fallback-model` wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_model: Option<CompactString>,
+    /// Opt-in: refresh the model catalog cache from models.dev at startup
+    /// when it is older than this many days (network access; default off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_catalog_refresh_days: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_tools: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -937,10 +941,7 @@ impl Config {
     /// ignores the config override and the 128k fallback, so callers can tell a
     /// real catalog value apart from the default.
     pub fn catalog_context_window(provider: &str, model_id: &str) -> Option<u64> {
-        let entries = crate::models_catalog::catalog_entries(provider)?;
-        entries
-            .iter()
-            .find(|e| e.id == model_id)
+        crate::models_catalog::catalog_entry(provider, model_id)
             .and_then(|e| e.context_length)
             .map(|cl| cl as u64)
     }
@@ -950,10 +951,7 @@ impl Config {
     /// carries no baked-in pricing (e.g. OpenRouter, which prices live via
     /// `fetch_openrouter_pricing` instead).
     pub fn catalog_input_output_cost(provider: &str, model_id: &str) -> Option<(f64, f64)> {
-        let entries = crate::models_catalog::catalog_entries(provider)?;
-        entries
-            .iter()
-            .find(|e| e.id == model_id)
+        crate::models_catalog::catalog_entry(provider, model_id)
             .and_then(|e| e.input_price.zip(e.output_price))
     }
 

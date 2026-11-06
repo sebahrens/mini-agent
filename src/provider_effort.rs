@@ -121,27 +121,7 @@ fn claude(model: &str) -> Option<Claude> {
             })
         })
 }
-/// Native Claude id behind a Bedrock / Vertex / gateway spelling:
-/// `us.anthropic.claude-sonnet-5-v1:0` -> `claude-sonnet-5`,
-/// `claude-sonnet-4-5@20250929` -> `claude-sonnet-4-5-20250929`.
-fn native_claude_id(model: &str) -> String {
-    let mut name = model.trim();
-    if let Some(index) = name.find("anthropic.") {
-        name = &name[index + "anthropic.".len()..];
-    }
-    let mut name = name.replace('@', "-");
-    if let Some(index) = name.rfind("-v") {
-        let suffix = &name[index + 2..];
-        let (major, minor) = suffix.split_once(':').unwrap_or((suffix, "0"));
-        if !major.is_empty()
-            && major.bytes().all(|b| b.is_ascii_digit())
-            && minor.bytes().all(|b| b.is_ascii_digit())
-        {
-            name.truncate(index);
-        }
-    }
-    name
-}
+use crate::models_catalog::native_claude_id;
 
 /// Forward-compatible profile for an official-looking Claude id the exact
 /// table does not list yet (`claude-<family>-<major>[-<minor>][-YYYYMMDD]`):
