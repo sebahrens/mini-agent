@@ -581,7 +581,7 @@ pub(super) fn rich_default_config() -> Config {
         // Keep the main response fallback implicit, including in generated
         // config files; only authored max_tokens limits constrain children.
         max_tokens: None,
-        compact_enabled: Some(false),
+        compact_enabled: Some(true),
         // Omission preserves every historical result until context compaction.
         // A finite authored value explicitly opts into count-only pruning.
         keep_recent_tool_results: None,

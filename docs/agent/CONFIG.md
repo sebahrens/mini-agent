@@ -742,9 +742,9 @@ Accepted top-level keys:
 | `subagent_max_list_dir_entries` | integer | Optional per-subagent directory-entry cap; requires `subagents`. |
 | `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section while its prior result remains in the current conversation. The section's served-content CRC joins file length and modification time in the version key, so same-length or mtime-preserving edits remain readable. Editing or writing the target, compaction, failed-turn rollback, clear, undo/rewind, and redo reset the relevant session tracker. Ordinary agent rebuilds retain it; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
 | `show_cost_always`        | boolean | Show the session cost in the status bar even when it is `$0.0000` (for example when the model has no per-token pricing configured). Default: `false`, which hides the cost until it is above zero. |
-| `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, and opt-in mid-turn compaction). Default: `false`. When `false`, nothing is ever compacted automatically.            |
+| `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, headless context relief, and mid-turn compaction). Default: `true`. An explicit `false` is honored: nothing is ever compacted automatically.            |
 | `claude_project_agents`   | boolean | Read project `.claude/agents/*.md` as specialist definitions (Claude Code compatibility). `false` makes mini-agent ignore that layer entirely (no loading, no validation warnings), leaving `.mini-agent/agents`, the user-global and the built-in definitions. Default: `true`. Restart required. |
-| `mid_turn_compact_threshold` | number | Opt-in mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Unset by default, meaning no mid-turn compaction. Honored only when `compact_enabled` is `true`. Recommended starting value: `0.80`. See Mid-turn compaction below.            |
+| `mid_turn_compact_threshold` | number | Mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Default when unset: `0.9`; `0` disables mid-turn compaction. Honored only when `compact_enabled` is `true`. See Mid-turn compaction below.            |
 | `always_show_welcome`     | boolean | Always show the welcome banner on startup, bypassing the one-shot marker file. Default: `false`.                                                                               |
 | `auto-update-prompts`     | boolean | When `true`, always regenerate prompts on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `auto-update-themes`      | boolean | When `true`, always regenerate themes on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
@@ -1325,10 +1325,11 @@ Context pressure accounts for the selected policy. If the complete default conte
 budget, compaction summarizes the retained session prefix under its separate bounded rolling
 input budget. It does not open recorded spill files; only output retained in the session is sent.
 
-Automatic compaction is off by default. With `compact_enabled = true`, mini-agent
-only compacts the conversation *between* turns unless mid-turn compaction is also
-configured: after a response finishes, when the accumulated session history exceeds
-`context_window - reserve_tokens`. Tools with their own output limits (`read`,
+Automatic compaction is on by default (`compact_enabled = true`; set it to `false`
+to turn it off). mini-agent compacts the conversation *between* turns after a response
+finishes, when the accumulated session history exceeds `context_window - reserve_tokens`,
+and *within* a turn when real prompt pressure crosses `mid_turn_compact_threshold`
+(default `0.9`). Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
 and the subagent `task` tool) retain their documented line, byte, and result
 limits in both live and replayed history. Their
@@ -1362,8 +1363,13 @@ estimate as session accounting. When a rolling summary exceeds its storage
 bound, each structured summary section retains its heading and prefix instead
 of dropping the middle sections. Compaction boundaries also snap backward to a
 user or assistant message so a retained tool result is never separated from
-its call. If a provider still rejects an ordinary request for exceeding its
-context limit, the error points to `/compress` and `compact_enabled` recovery.
+its call. If a provider still rejects an ordinary headless request (`-p`, `--loop`
+or goal rounds) for exceeding its context limit, mini-agent records the progress the
+turn already made, compacts the session once and retries once (continuing the task
+when tools already ran). A second rejection, or a session with nothing older than the
+kept recent history, surfaces the error, which points to `/compress` and
+`compact_enabled` recovery. Native Anthropic replay history cannot be compacted in
+place, so those turns surface the error directly.
 
 Compaction is paid for like any other completion. The summarizer runs on the
 session's model, so the usage of every rolling request is summed and charged to
@@ -1423,19 +1429,19 @@ conservative 3.25 characters per token instead of 4. This safety margin targets
 code and JSON, which tokenize more densely; real usage replaces the estimate as
 soon as a complete provider snapshot arrives.
 
-- **Unset by default.** With no value set, behavior is unchanged: no mid-turn
-  compaction. Setting a value is the opt-in.
+- **On by default.** With no value set the threshold is `0.9`. Set `0` to turn
+  mid-turn compaction off while keeping between-turn compaction.
 - **Gated by `compact_enabled`.** `compact_enabled` is the master switch. If it
   is `false`, `mid_turn_compact_threshold` is ignored and nothing compacts.
-- **Range.** A fraction in `(0.0, 1.0]`. An out-of-range value is ignored
-  (mid-turn compaction stays off) and mini-agent prints a warning at startup
+- **Range.** A fraction in `(0.0, 1.0]`. An out-of-range value disables
+  mid-turn compaction and mini-agent prints a warning at startup
   explaining the correct form, rather than failing silently. `0.80` is a
   reasonable starting value; it leaves headroom below the
   context window while still keeping the live prompt small enough to avoid the
   attention degradation ("context rot") that large, full context windows suffer.
 
 ```toml
-compact_enabled = true            # master switch (default false)
+compact_enabled = true            # master switch (default true)
 context_window = 24576
 mid_turn_compact_threshold = 0.80 # compact mid-turn at 80% real prompt pressure
 ```

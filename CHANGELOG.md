@@ -8,6 +8,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 **Fork release 1.14.2 (2026-10-28)**
 
+### Changed (context management)
+
+- Automatic compaction is now on by default (`compact_enabled` defaults to `true`, and
+  `mid_turn_compact_threshold` defaults to `0.9`; `0` disables the mid-turn trigger). An explicit
+  `compact_enabled: false` is still honored. A headless request the provider rejects for exceeding
+  its context window now records the turn's progress, compacts once and retries once before the
+  error is surfaced (mini-agent-3mswy).
+
 ### Security
 
 - `pulldown-cmark` is updated to 0.13.5 for RUSTSEC-2026-0414 (exponential event growth with

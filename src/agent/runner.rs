@@ -711,6 +711,15 @@ fn goal_hook_info() -> Option<crate::extras::hooks::GoalHookInfo> {
 /// comparison against a message someone later rewords.
 pub const HEADLESS_INTERRUPTED: &str = "headless agent interrupted";
 
+/// Continuation prompt after headless context relief (a compaction inside a
+/// turn). Like the TUI's mid-turn prompt it frames the summary as work already
+/// done rather than as new instructions.
+pub(crate) const HEADLESS_CONTEXT_RELIEF_PROMPT: &str = "[Context was compacted to save space; \
+the full prior history is in the system summary above.]\n\nContinue with the \
+user's original task. Do not redo work already completed per the summary; focus \
+on what remains. Context was tight, so prefer narrower follow-up tool calls over \
+wide ones until pressure subsides.";
+
 pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
     !matches!(
         name,

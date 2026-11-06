@@ -50,9 +50,12 @@ fn is_anthropic_native_resolves_custom_provider_type() {
 }
 
 #[test]
-fn mid_turn_threshold_unset_by_default() {
+fn mid_turn_threshold_defaults_when_unset() {
     let cfg = Config::default();
-    assert_eq!(cfg.resolve_mid_turn_compact_threshold(), None);
+    assert_eq!(
+        cfg.resolve_mid_turn_compact_threshold(),
+        Some(crate::config::DEFAULT_MID_TURN_COMPACT_THRESHOLD)
+    );
 }
 
 #[test]
@@ -74,10 +77,9 @@ fn mid_turn_threshold_upper_bound_inclusive() {
 }
 
 #[test]
-fn mid_turn_threshold_out_of_range_treated_as_unset() {
-    // Zero would compact constantly; negatives and >1 are nonsense. All map to
-    // "unset" so a misconfigured value silently disables the feature rather
-    // than wedging the agent.
+fn mid_turn_threshold_out_of_range_disables_mid_turn_compaction() {
+    // Zero is the documented opt-out; negatives and >1 are nonsense. All
+    // disable the mid-turn trigger rather than wedging the agent.
     for bad in [0.0, -0.1, 1.5, 2.0] {
         let cfg = Config {
             mid_turn_compact_threshold: Some(bad),
@@ -86,14 +88,19 @@ fn mid_turn_threshold_out_of_range_treated_as_unset() {
         assert_eq!(
             cfg.resolve_mid_turn_compact_threshold(),
             None,
-            "threshold {bad} should be treated as unset"
+            "threshold {bad} should disable mid-turn compaction"
         );
     }
 }
 
 #[test]
-fn compact_enabled_default_false() {
-    assert!(!Config::default().resolve_compact_enabled());
+fn compact_enabled_defaults_true_and_explicit_false_is_honored() {
+    assert!(Config::default().resolve_compact_enabled());
+    let disabled = Config {
+        compact_enabled: Some(false),
+        ..Config::default()
+    };
+    assert!(!disabled.resolve_compact_enabled());
 }
 
 #[test]

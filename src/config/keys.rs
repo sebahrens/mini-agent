@@ -191,7 +191,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("subagents", "subagent_max_list_dir_entries").shaped(ConfigShape::Integer),
     key("compact_enabled").shaped(ConfigShape::Bool),
     key("claude_project_agents").shaped(ConfigShape::Bool),
-    key("mid_turn_compact_threshold").described("Opt-in mid-turn compaction threshold, as a fraction of the context window (0.0–1.0) of real provider prompt pressure.").shaped(ConfigShape::Number),
+    key("mid_turn_compact_threshold").described("Mid-turn compaction threshold, as a fraction of the context window (0.0–1.0) of real provider prompt pressure. Default 0.9; 0 disables.").shaped(ConfigShape::Number),
     key("always_show_welcome").shaped(ConfigShape::Bool),
     aliased("auto-update-prompts", &["auto_update_prompts"]).shaped(ConfigShape::Bool),
     aliased("auto-update-themes", &["auto_update_themes"]).shaped(ConfigShape::Bool),
