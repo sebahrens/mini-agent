@@ -8,6 +8,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Model-authored shell commands start with `PAGER`/`GIT_PAGER`/`GH_PAGER=cat`, `GIT_TERMINAL_PROMPT=0` and a
+  no-op `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR` so pty and editor-launching commands fail fast instead of hanging;
+  `shell-env` overrides them (mini-agent-aseut).
 - Administrator-managed policy layer: a root-owned `managed-config.toml` (permission deny rules, selectable
   security modes / yolo ban, forced sandbox, MCP and provider allow/deny lists) is applied after every other
   source; flags, project config and prompt directives that widen it are refused naming the file, and

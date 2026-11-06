@@ -1794,6 +1794,20 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn shell_commands_start_with_a_non_interactive_environment() {
+        let output = test_tool()
+            .call(BashArgs {
+                command: "echo \"$PAGER $GIT_PAGER $GH_PAGER $GIT_TERMINAL_PROMPT $GIT_EDITOR\""
+                    .to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.trim(), "cat cat cat 0 :");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn line_cap_saves_the_full_output_to_a_log_even_under_the_byte_cap() {
         let dir = crate::tests::support::temp::TempDir::new("line-cap-log");
         let logs = dir.path().join("logs");

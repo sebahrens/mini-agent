@@ -7201,8 +7201,29 @@ fn essential_env() -> Vec<(&'static str, String)> {
             vars.push((*name, val));
         }
     }
+    vars.extend(
+        NONINTERACTIVE_ENV
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_string())),
+    );
+    if !vars.iter().any(|(name, _)| *name == "TERM") {
+        vars.push(("TERM", "dumb".to_string()));
+    }
     vars
 }
+
+/// Fixed defaults so a model-authored command never waits for a human: no
+/// pager, no credential prompt, and a no-op commit/rebase editor. An operator
+/// overrides any of them with `shell-env`/`shell-inherit-env`, which layer
+/// after this allowlist. A user-set `TERM` is kept; `dumb` only fills a gap.
+const NONINTERACTIVE_ENV: &[(&str, &str)] = &[
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_EDITOR", ":"),
+    ("GIT_SEQUENCE_EDITOR", ":"),
+];
 
 /// Resolver, host and CA files bound read-only into the workspace profile
 /// when `sandbox-network = "allow"`.
@@ -12445,6 +12466,41 @@ echo PRIVATE_TEMP_PASS"#,
                 "zerobox command restored non-allow-listed variable {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn model_shell_environment_is_non_interactive_unless_the_operator_overrides_it() {
+        let sandbox = Sandbox::new(false, "none");
+        let base: std::collections::BTreeMap<_, _> = sandbox
+            .get_essential_env()
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        for (key, value) in [
+            ("PAGER", "cat"),
+            ("GIT_PAGER", "cat"),
+            ("GH_PAGER", "cat"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_EDITOR", ":"),
+        ] {
+            assert_eq!(base.get(key), Some(&value), "{key}");
+        }
+        assert!(base.contains_key("TERM"));
+        let overridden = Sandbox::new(false, "none").with_shell_env(ShellEnvPolicy {
+            set: [("GIT_PAGER".to_string(), "less".to_string())].into(),
+            ..ShellEnvPolicy::default()
+        });
+        let command = overridden.wrap_command("true").unwrap();
+        let value = |name: &str| {
+            command
+                .as_std()
+                .get_envs()
+                .filter(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .last()
+                .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        };
+        assert_eq!(value("GIT_PAGER").as_deref(), Some("less"));
+        assert_eq!(value("PAGER").as_deref(), Some("cat"));
     }
 
     /// `shell-inherit-env` / `shell-env` reach shell commands on every spawn
