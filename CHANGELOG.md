@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Foreground `shell` commands that print more than 1 MiB are no longer killed: the capture keeps
+  a 768 KiB head and 256 KiB tail, the command runs to completion with its real exit status, and
+  the complete output is spooled to a private log in the session tool-output directory that the
+  result names for `read`/`grep`. Only a 64 MiB total stops the command (mini-agent-ghs4t).
+
 **Fork release 1.14.2 (2026-10-28)**
 
 ### Security

@@ -180,33 +180,101 @@ async fn bash_output_within_line_cap_is_returned_with_a_stream_label() {
 }
 
 #[tokio::test]
-async fn bash_resource_limit_error_bounds_partial_output_to_line_cap() {
+async fn bash_large_output_runs_to_completion_with_head_tail_and_line_cap() {
     let tool = bash_tool_with_line_cap(Some(20));
-    // 2,000,000 two-byte lines exceed the 1 MiB stdout cap, so the command is
-    // stopped with a partial prefix that must still be line-bounded.
-    let error = tool
+    // 4 MB of output used to kill the command at the 1 MiB stdout cap. It now
+    // completes and keeps a bounded head/tail.
+    let output = tool
         .call(BashArgs {
-            command: "yes | head -n 2000000".to_string(),
+            command: "yes | head -n 2000000; echo finished".to_string(),
             timeout: None,
             background: false,
         })
         .await
-        .expect_err("output limit must surface as a tool error");
+        .expect("large output must not stop the command");
+    assert!(
+        output.lines().count() <= 20 + 8,
+        "{} lines",
+        output.lines().count()
+    );
+    assert!(output.contains("lines omitted"), "line marker missing");
+    assert!(output.contains("finished"), "tail must keep the last line");
+    assert!(
+        output.contains("4000009 bytes of output in total"),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn bash_five_mebibytes_completes_and_spools_the_complete_output_to_a_private_log() {
+    let dir = crate::tests::support::temp::TempDir::new("shell-log");
+    let tool = bash_tool_with_line_cap(None).with_output_log_dir(Some(dir.path().join("logs")));
+    let output = tool
+        .call(BashArgs {
+            command: "yes | head -c 5000000".to_string(),
+            timeout: None,
+            background: false,
+        })
+        .await
+        .expect("5 MiB of output completes");
+    assert!(output.starts_with("[stdout]\ny\ny\n"));
+    assert!(
+        output.contains("bytes of output omitted between the retained head and tail"),
+        "omitted marker missing"
+    );
+    assert!(!output.contains("Exit code"), "exit status 0 is preserved");
+    let path = output
+        .rsplit_once("saved to ")
+        .and_then(|(_, rest)| rest.split_once("; use read"))
+        .map(|(path, _)| std::path::PathBuf::from(path))
+        .unwrap_or_else(|| panic!("log footer missing: {}", &output[output.len() - 400..]));
+    assert!(path.starts_with(dir.path()));
+    let log = std::fs::read(&path).unwrap();
+    assert_eq!(log.len(), 5_000_000);
+    assert!(log.chunks(2).all(|pair| pair == b"y\n"));
+}
+
+#[tokio::test]
+async fn bash_build_like_script_keeps_its_real_exit_status_and_final_lines() {
+    let tool = bash_tool_with_line_cap(Some(50));
+    let output = tool
+        .call(BashArgs {
+            command: "i=0; while [ $i -lt 120000 ]; do echo \"   Compiling crate-$i v0.1.0\"; i=$((i+1)); done; echo 'error: build failed' >&2; exit 3".to_string(),
+            timeout: None,
+            background: false,
+        })
+        .await
+        .expect("a nonzero exit is a completed result");
+    assert!(output.contains("Compiling crate-0 v0.1.0"));
+    assert!(output.contains("Compiling crate-119999 v0.1.0"));
+    assert!(output.contains("error: build failed"));
+    assert!(
+        output.contains("Exit code: 3"),
+        "{}",
+        &output[output.len().saturating_sub(600)..]
+    );
+}
+
+#[tokio::test]
+async fn bash_output_beyond_the_hard_ceiling_is_stopped_with_a_clear_status() {
+    let tool = bash_tool_with_line_cap(Some(20));
+    let error = tool
+        .call(BashArgs {
+            command: "yes | head -c 80000000; echo never-reached".to_string(),
+            timeout: None,
+            background: false,
+        })
+        .await
+        .expect_err("pathological volume must still be stopped");
     let message = error.to_string();
     assert!(
-        message.contains("[status: output_truncated"),
+        message.contains("[status: output_truncated; limit: combined; byte_cap: 67108864"),
         "unexpected error: {}",
         &message[..message.len().min(300)]
     );
-    assert!(
-        message.lines().count() <= 20 + 6,
-        "partial output was not line-bounded: {} lines",
-        message.lines().count()
-    );
-    assert!(
-        message.contains("lines omitted"),
-        "omitted-count marker missing"
-    );
+    assert!(message.contains("hard ceiling"));
+    assert!(!message.contains("never-reached"));
+    assert!(message.lines().count() <= 20 + 8);
 }
 
 #[tokio::test]

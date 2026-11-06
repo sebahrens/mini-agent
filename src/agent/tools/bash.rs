@@ -7,7 +7,8 @@ use crate::extras::truncate::head_tail_lines;
 use crate::sandbox::{
     BackgroundJobSnapshot, CommandLimits, CommandOutput, CommandOutputLimit, CommandProgress,
     CommandStatus, DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS,
-    MAX_BACKGROUND_JOB_WAIT_MILLIS, Sandbox,
+    MAX_BACKGROUND_JOB_WAIT_MILLIS, OutputChannel, OutputTranscript, SHELL_HARD_OUTPUT_BYTES,
+    Sandbox, ShellOutputCapture, SpoolPolicy, TranscriptPart,
 };
 use compact_str::CompactString;
 
@@ -134,13 +135,14 @@ async fn output_with_progress(
     sandbox: &Sandbox,
     command: &str,
     limits: CommandLimits,
+    capture: &ShellOutputCapture,
     id: CompactString,
     events: tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
 ) -> std::io::Result<CommandOutput> {
     let progress = CommandProgress::new();
     let mut changes = progress.subscribe();
     let command_run =
-        sandbox.output_command_with_limits_and_progress(command, limits, Some(progress.clone()));
+        sandbox.output_shell_command_captured(command, limits, Some(progress.clone()), capture);
     tokio::pin!(command_run);
     let mut last_sent: Option<tokio::time::Instant> = None;
     let mut pending = false;
@@ -201,6 +203,9 @@ pub struct ShellTool {
     /// is [`crate::config::DEFAULT_MAX_BASH_OUTPUT_LINES`].
     pub max_output_lines: Option<u64>,
     foreground_timeout: std::time::Duration,
+    /// Private directory (the session tool-output directory) receiving
+    /// full-output logs when a command's output exceeds in-memory retention.
+    output_log_dir: Option<std::path::PathBuf>,
 }
 
 impl ShellTool {
@@ -218,7 +223,15 @@ impl ShellTool {
             foreground_timeout: std::time::Duration::from_secs(
                 crate::config::DEFAULT_SHELL_TIMEOUT_SECS,
             ),
+            output_log_dir: None,
         }
+    }
+
+    /// Spool oversized output to private logs in `dir` so the model can
+    /// recover the omitted middle with `read`/`grep`.
+    pub fn with_output_log_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.output_log_dir = dir;
+        self
     }
 
     pub fn with_foreground_timeout_secs(mut self, seconds: u64) -> Self {
@@ -371,6 +384,13 @@ impl ShellTool {
         if let Some(timeout_ms) = args.timeout {
             limits.timeout = std::time::Duration::from_millis(timeout_ms);
         }
+        // Retention never stops the child; only this ceiling does.
+        limits.combined_bytes = usize::try_from(SHELL_HARD_OUTPUT_BYTES).unwrap_or(usize::MAX);
+        let capture = ShellOutputCapture::new(SpoolPolicy::foreground_shell(
+            self.output_log_dir
+                .as_deref()
+                .map(|dir| ShellOutputCapture::log_path_in(dir, "shell-output")),
+        ));
         let live = SHELL_CALL_ID
             .try_with(Clone::clone)
             .ok()
@@ -378,30 +398,41 @@ impl ShellTool {
             .zip(crate::agent::tools::mutation_diff::scoped_event_sender());
         let output = match live {
             Some((id, events)) => {
-                output_with_progress(&self.sandbox, &args.command, limits, id, events).await?
+                output_with_progress(&self.sandbox, &args.command, limits, &capture, id, events)
+                    .await?
             }
             None => {
                 self.sandbox
-                    .output_command_with_limits(&args.command, limits)
+                    .output_shell_command_captured(&args.command, limits, None, &capture)
                     .await?
             }
         };
+        let transcript = capture.transcript();
 
         if output.status != CommandStatus::Completed {
             tracing::debug!("tool shell stopped before completion: {:?}", output.status);
-            return Err(resource_limit_error(output, limits, self.max_output_lines));
+            return Err(resource_limit_error(
+                output.status,
+                &transcript,
+                limits,
+                self.max_output_lines,
+            ));
         }
 
         #[cfg(any(feature = "git-worktree", test))]
         const METADATA_STDOUT_BYTES: usize = 64 * 1024;
         #[cfg(any(feature = "git-worktree", test))]
-        let metadata = Some(ForegroundResult {
-            status: output.status,
-            exit_code: output.exit_status.and_then(|status| status.code()),
-            descendants_escaped: output.descendants_escaped,
-            stdout: output.stdout[..output.stdout.len().min(METADATA_STDOUT_BYTES)].to_vec(),
-            stdout_complete: output.stdout.len() <= METADATA_STDOUT_BYTES,
-        });
+        let metadata = {
+            let stdout = transcript.channel_bytes(OutputChannel::Stdout);
+            Some(ForegroundResult {
+                status: output.status,
+                exit_code: output.exit_status.and_then(|status| status.code()),
+                descendants_escaped: output.descendants_escaped,
+                stdout_complete: transcript.omitted_bytes == 0
+                    && stdout.len() <= METADATA_STDOUT_BYTES,
+                stdout: stdout[..stdout.len().min(METADATA_STDOUT_BYTES)].to_vec(),
+            })
+        };
         #[cfg(not(any(feature = "git-worktree", test)))]
         let metadata = None;
         let termination = render_termination(output.exit_status);
@@ -409,8 +440,8 @@ impl ShellTool {
             tracing::debug!("tool shell: {termination}");
         }
 
-        let output_len = output.stdout.len() + output.stderr.len();
-        let mut result = render_streams(&output.stdout, &output.stderr);
+        let output_len = transcript.total_bytes;
+        let mut result = render_transcript(&transcript);
         if output.descendants_escaped {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
@@ -426,7 +457,8 @@ impl ShellTool {
             result.push_str(&termination);
         }
 
-        let result = bound_output_lines(result, self.max_output_lines);
+        let mut result = bound_output_lines(result, self.max_output_lines);
+        push_log_footer(&mut result, &transcript);
 
         let result = match coaching {
             Some(msg) => format!("{}\n\n{}", msg, result),
@@ -641,11 +673,12 @@ fn bound_output_lines(text: String, max_output_lines: Option<u64>) -> String {
 }
 
 fn resource_limit_error(
-    output: CommandOutput,
+    status: CommandStatus,
+    transcript: &OutputTranscript,
     limits: CommandLimits,
     max_output_lines: Option<u64>,
 ) -> ToolError {
-    let metadata = match output.status {
+    let metadata = match status {
         CommandStatus::TimedOut => format!(
             "[status: timed_out; timeout_ms: {}]",
             limits.timeout.as_millis()
@@ -657,15 +690,15 @@ fn resource_limit_error(
                 CommandOutputLimit::Stderr => ("stderr", limits.stderr_bytes),
                 CommandOutputLimit::Combined => ("combined", limits.combined_bytes),
             };
-            format!("[status: output_truncated; limit: {name}; byte_cap: {bytes}]")
+            format!(
+                "[status: output_truncated; limit: {name}; byte_cap: {bytes}; the command was stopped because its total output reached this hard ceiling]"
+            )
         }
         CommandStatus::Failed => "[status: failed]".to_string(),
         CommandStatus::Completed => unreachable!("completed output is handled before this helper"),
     };
-    let partial = bound_output_lines(
-        render_streams(&output.stdout, &output.stderr),
-        max_output_lines,
-    );
+    let mut partial = bound_output_lines(render_transcript(transcript), max_output_lines);
+    push_log_footer(&mut partial, transcript);
     let message = if partial.is_empty() {
         metadata
     } else {
@@ -674,6 +707,77 @@ fn resource_limit_error(
         )
     };
     ToolError::Msg(message)
+}
+
+/// Render a spooled transcript in arrival order. A `[stdout]`/`[stderr]`
+/// label starts each run of one separately captured stream; merged
+/// (`2>&1`/pty) output is unlabelled. The dropped middle is marked in place.
+fn render_transcript(transcript: &OutputTranscript) -> String {
+    let mut result = String::new();
+    let mut current: Option<OutputChannel> = None;
+    for part in &transcript.parts {
+        match part {
+            TranscriptPart::Output(channel, bytes) => {
+                if current != Some(*channel) {
+                    let label = match channel {
+                        OutputChannel::Stdout => Some("[stdout]\n"),
+                        OutputChannel::Stderr => Some("[stderr]\n"),
+                        OutputChannel::Merged => None,
+                    };
+                    if let Some(label) = label {
+                        if !result.is_empty() && !result.ends_with('\n') {
+                            result.push('\n');
+                        }
+                        result.push_str(label);
+                    }
+                    current = Some(*channel);
+                }
+                result.push_str(&String::from_utf8_lossy(bytes));
+            }
+            TranscriptPart::Omitted(bytes) => {
+                if !result.is_empty() && !result.ends_with('\n') {
+                    result.push('\n');
+                }
+                result.push_str(&format!(
+                    "[... {bytes} bytes of output omitted between the retained head and tail ...]\n"
+                ));
+            }
+        }
+    }
+    result
+}
+
+/// Tell the model where the complete output lives when bytes were dropped,
+/// or that it could not be saved.
+fn push_log_footer(result: &mut String, transcript: &OutputTranscript) {
+    let footer = if let Some(log) = &transcript.log {
+        let completeness = if log.complete {
+            "complete output"
+        } else {
+            "output up to the log size limit"
+        };
+        format!(
+            "[{} bytes of output in total; {completeness} ({} bytes) saved to {}; use read with offset/limit or character_offset, or grep, to inspect it]",
+            transcript.total_bytes,
+            log.bytes,
+            log.path.display()
+        )
+    } else if transcript.omitted_bytes > 0 {
+        let reason = transcript.log_error.as_deref().map_or_else(
+            || "no output log is configured".to_string(),
+            |error| format!("the output log could not be written: {error}"),
+        );
+        format!(
+            "[{} bytes of output in total; the omitted middle is not recoverable because {reason}; re-run with a narrower invocation or redirect to a file]",
+            transcript.total_bytes
+        )
+    } else {
+        return;
+    };
+    if !result.is_empty() && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(&footer);
 }
 
 #[cfg(test)]

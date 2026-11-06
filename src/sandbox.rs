@@ -20,6 +20,10 @@ use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 mod general_profile;
+mod output_capture;
+pub(crate) use output_capture::{
+    OutputChannel, OutputTranscript, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy, TranscriptPart,
+};
 mod git_metadata;
 mod read_roots;
 pub(crate) use read_roots::default_sandbox_read_roots;
@@ -4707,27 +4711,44 @@ impl Sandbox {
             .await
     }
 
-    /// [`Self::output_command_with_limits`] that also publishes display-only
-    /// output progress. The returned output is identical to the variant
-    /// without progress.
-    pub(crate) async fn output_command_with_limits_and_progress(
+    /// Run a model-authored shell command into a caller-owned spooled
+    /// capture. Unlike the bounded capture, retention never stops the child:
+    /// only the policy's hard ceiling reports `OutputLimitExceeded`.
+    pub(crate) async fn output_shell_command_captured(
         &self,
         command: &str,
         limits: CommandLimits,
         progress: Option<CommandProgress>,
+        capture: &ShellOutputCapture,
     ) -> std::io::Result<CommandOutput> {
-        self.output_pending_command_scoped(
-            PendingCommand::Shell {
-                command: command.to_string(),
-                cwd: None,
-            },
-            limits,
-            None,
-            None,
-            None,
-            progress,
-        )
-        .await
+        let (response_tx, response_rx) = oneshot::channel();
+        let sandbox = self.clone();
+        let pending = PendingCommand::Shell {
+            command: command.to_string(),
+            cwd: None,
+        };
+        let capture = capture.0.clone();
+        std::mem::drop(crate::agent::runner::spawn_async_scoped(
+            crate::startup::heap_future(|| async move {
+                sandbox
+                    .run_built_output_command(
+                        pending,
+                        limits,
+                        OutputCommandOptions {
+                            cancellation: None,
+                            audit: None,
+                            input: None,
+                            capture: Some(capture),
+                            progress,
+                        },
+                        response_tx,
+                    )
+                    .await;
+            }),
+        ));
+        response_rx.await.map_err(|_| {
+            std::io::Error::other("command output worker stopped before returning a result")
+        })
     }
 
     async fn output_command_with_limits_scoped(
@@ -5716,6 +5737,34 @@ struct RollingCommandOutput {
 enum CommandCapture {
     Bounded(CapturedCommandOutput),
     Rolling(RollingCommandOutput),
+    Spooled(output_capture::SpooledCapture),
+}
+
+/// Caller-owned handle to a spooled shell capture. The caller keeps it after
+/// the command finished to render the arrival-ordered transcript, the
+/// omitted-byte count and the full-output log location.
+#[derive(Clone, Debug)]
+pub(crate) struct ShellOutputCapture(SharedCommandCapture);
+
+impl ShellOutputCapture {
+    pub(crate) fn new(policy: SpoolPolicy) -> Self {
+        Self(SharedCommandCapture(Arc::new(Mutex::new(
+            CommandCapture::Spooled(output_capture::SpooledCapture::new(policy)),
+        ))))
+    }
+
+    /// A unique private log path inside `dir`.
+    pub(crate) fn log_path_in(dir: &Path, prefix: &str) -> PathBuf {
+        output_capture::new_log_path(dir, prefix)
+    }
+
+    pub(crate) fn transcript(&self) -> OutputTranscript {
+        let capture = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &*capture {
+            CommandCapture::Spooled(capture) => capture.transcript(),
+            _ => unreachable!("shell output captures are always spooled"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5750,6 +5799,9 @@ impl SharedCommandCapture {
                 }
                 Ok(())
             }
+            CommandCapture::Spooled(capture) => capture
+                .push(stream.channel(), bytes)
+                .map_err(|_| CommandOutputLimit::Combined),
         }
     }
 
@@ -5761,6 +5813,7 @@ impl SharedCommandCapture {
                 capture.stdout.snapshot("stdout"),
                 capture.stderr.snapshot("stderr"),
             ),
+            CommandCapture::Spooled(capture) => spooled_streams(capture),
         }
     }
 
@@ -5775,8 +5828,17 @@ impl SharedCommandCapture {
                 capture.stdout.snapshot("stdout"),
                 capture.stderr.snapshot("stderr"),
             ),
+            CommandCapture::Spooled(capture) => spooled_streams(capture),
         }
     }
+}
+
+fn spooled_streams(capture: &output_capture::SpooledCapture) -> (Vec<u8>, Vec<u8>) {
+    let transcript = capture.transcript();
+    (
+        transcript.channel_bytes(OutputChannel::Stdout),
+        transcript.channel_bytes(OutputChannel::Stderr),
+    )
 }
 
 impl CapturedCommandOutput {
@@ -5818,6 +5880,15 @@ impl CapturedCommandOutput {
 enum CommandOutputStream {
     Stdout,
     Stderr,
+}
+
+impl CommandOutputStream {
+    fn channel(self) -> OutputChannel {
+        match self {
+            Self::Stdout => OutputChannel::Stdout,
+            Self::Stderr => OutputChannel::Stderr,
+        }
+    }
 }
 
 #[derive(Debug)]

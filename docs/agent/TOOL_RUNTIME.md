@@ -53,6 +53,21 @@ be positive. Other sandbox command classes, including brokered JS `spawn`,
 retain their existing limits. A shell call with
 `background = true` instead returns a session-scoped job id immediately and
 uses a 24-hour maximum (again lowerable with `timeout`).
+
+Foreground shell output is not a reason to stop a command. The capture keeps an
+arrival-ordered 768 KiB head and 256 KiB rolling tail in memory and lets the
+child run to completion, so the result carries its real exit status. Dropped
+middle bytes are marked in place (`[... N bytes of output omitted ...]`) and a
+footer reports the total size. When the session's private tool-output directory
+is available, the first byte that would be dropped creates an owner-only log
+(`shell-output-<uuid>.log`) holding the complete stream (stdout and stderr in
+arrival order, no labels); the footer names it so `read` (offset/limit or
+`character_offset`) and `grep` can recover the middle. Only a pathological
+64 MiB total stops the command, reported as `[status: output_truncated; limit:
+combined; byte_cap: 67108864; ...]` with the partial transcript. The
+`max_bash_output_lines` head/tail line cap still bounds the rendered text; the
+log footer is appended after it so it is never cut. Hook, validation and other
+sandbox command classes keep their existing bounded 1 MiB/1.5 MiB capture.
 The companion `job_status` tool polls bounded live output, stops and reaps
 the job, or waits for completion. `action = "wait"` accepts `timeout_ms` from
 1 to 60000 (default 10000); expiration or dropping the wait leaves the job
