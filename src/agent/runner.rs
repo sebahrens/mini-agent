@@ -7252,6 +7252,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Stands in for `task` emitting the `read` image envelope
+    /// (`ImageRead::output`) from its `type Output = String`.
+    #[derive(Clone)]
+    struct TaskImageEnvelopeStub;
+
+    fn task_image_envelope() -> String {
+        use base64::Engine;
+        let png = include_bytes!("tools/fixtures/read-image64/3x2.png");
+        serde_json::json!({
+            "response": "[subagent 1 report]\nScreenshot attached.",
+            "parts": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": base64::engine::general_purpose::STANDARD.encode(png),
+            }],
+        })
+        .to_string()
+    }
+
+    impl Tool for TaskImageEnvelopeStub {
+        const NAME: &'static str = "task";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return a subagent report carrying the image envelope".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok(task_image_envelope())
+        }
+    }
+
+    /// mini-agent-lmik7: a `String` task output carrying the image envelope is
+    /// parsed by rig into text + image content, survives the parent spill hook,
+    /// reaches the next model request as an image, and is lifted into
+    /// persisted session images by `tool_image::from_result`.
+    #[tokio::test]
+    async fn task_string_output_image_envelope_is_lifted_into_image_content() {
+        let session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "task-image-id",
+                    TaskImageEnvelopeStub::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(TaskImageEnvelopeStub)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        let mut streamed_result = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(MultiTurnStreamItem::StreamUserItem(
+                rig::streaming::StreamedUserContent::ToolResult { tool_result, .. },
+            )) = item
+            {
+                streamed_result = Some(tool_result);
+            }
+        }
+
+        let tool_result = streamed_result.expect("stream surfaces the task result");
+        let texts: Vec<&str> = tool_result
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ToolResultContent::Text(text) => Some(text.text.as_str()),
+                ToolResultContent::Image(_) => None,
+            })
+            .collect();
+        assert_eq!(texts, ["[subagent 1 report]\nScreenshot attached."]);
+        let images = crate::session::tool_image::from_result(&tool_result)
+            .expect("the envelope image is a valid literal tool image");
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            images[0].to_rig().media_type,
+            Some(rig::message::ImageMediaType::PNG)
+        );
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let next_request_images = requests[1]
+            .chat_history
+            .iter()
+            .flat_map(|message| match message {
+                Message::User { content } => content.iter().collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .filter_map(|content| match content {
+                UserContent::ToolResult(result) => Some(
+                    result
+                        .content
+                        .iter()
+                        .filter(|part| matches!(part, ToolResultContent::Image(_)))
+                        .count(),
+                ),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(
+            next_request_images, 1,
+            "the parent model must see the image"
+        );
+    }
+
     fn tool_result_texts(interactions: &[Message]) -> Vec<&str> {
         interactions
             .iter()
