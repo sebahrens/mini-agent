@@ -531,6 +531,16 @@ pub struct Config {
         alias = "shell_env_allow_secrets"
     )]
     pub shell_env_allow_secrets: Option<bool>,
+    /// `shell-max-background-jobs`: running background shell jobs allowed at
+    /// once (1..=64; default 8). A full table makes `auto_background`
+    /// foreground calls run in the foreground instead of failing.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "shell-max-background-jobs",
+        alias = "shell_max_background_jobs"
+    )]
+    pub shell_max_background_jobs: Option<usize>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

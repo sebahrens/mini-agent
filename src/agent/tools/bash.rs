@@ -466,14 +466,17 @@ impl ShellTool {
             limits.timeout = std::time::Duration::from_millis(timeout_ms);
         }
         if args.auto_background.unwrap_or(self.auto_background) {
-            let result = self.run_auto_background(&args, limits.timeout).await?;
-            return Ok((
-                match coaching {
-                    Some(message) => format!("{message}\n\n{result}"),
-                    None => result,
-                },
-                None,
-            ));
+            // A full job table must not fail an ordinary short command: run it
+            // in the foreground (without promotion at the deadline) instead.
+            if let Some(result) = self.run_auto_background(&args, limits.timeout).await? {
+                return Ok((
+                    match coaching {
+                        Some(message) => format!("{message}\n\n{result}"),
+                        None => result,
+                    },
+                    None,
+                ));
+            }
         }
         // Retention never stops the child; only this ceiling does.
         limits.combined_bytes = usize::try_from(SHELL_HARD_OUTPUT_BYTES).unwrap_or(usize::MAX);
@@ -608,9 +611,9 @@ impl ShellTool {
         &self,
         args: &BashArgs,
         deadline: std::time::Duration,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Option<String>, ToolError> {
         let progress = CommandProgress::new();
-        let id = self
+        let id = match self
             .sandbox
             .start_background_command_logged(
                 args.command.clone(),
@@ -620,7 +623,12 @@ impl ShellTool {
                 args.separate_streams,
                 Some(progress.clone()),
             )
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(error) if error.kind() == std::io::ErrorKind::QuotaExceeded => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let mut pending = PendingAutoJob {
             sandbox: &self.sandbox,
             id: id.clone(),
@@ -657,9 +665,9 @@ impl ShellTool {
                 .map_err(ToolError::Msg)?;
             let rendered = render_background_job(so_far, self.max_output_lines);
             let deadline_ms = deadline.as_millis();
-            return Ok(format!(
+            return Ok(Some(format!(
                 "[status: promoted_to_background; job_id: {id}; the command reached its {deadline_ms} ms foreground deadline and keeps running as a background job. Use job_status with this id to poll (only new output), wait or stop it]\n{rendered}"
-            ));
+            )));
         }
         let transcript = snapshot.transcript.clone();
         self.sandbox.forget_background_job(&id);
@@ -702,7 +710,7 @@ impl ShellTool {
         }
         let mut result = bound_output_lines(result, self.max_output_lines);
         push_log_footer(&mut result, &transcript);
-        Ok(result)
+        Ok(Some(result))
     }
 }
 
@@ -2993,6 +3001,58 @@ mod tests {
         assert!(stopped.contains("Status: completed"), "{stopped}");
     }
 
+    /// mini-agent-tb3zw: the cap is configurable and a full job table runs an
+    /// auto_background call in the foreground instead of failing it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_background_runs_in_the_foreground_when_the_job_table_is_full() {
+        let shell = BashTool::new(
+            None,
+            None,
+            Sandbox::new(false, "bwrap").with_max_background_jobs(2),
+            None,
+        )
+        .with_auto_background(true);
+        assert_eq!(shell.sandbox.max_background_jobs(), 2);
+        for _ in 0..2 {
+            shell
+                .call(BashArgs {
+                    command: "while :; do sleep 1; done".to_string(),
+                    background: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let explicit = shell
+            .call(BashArgs {
+                command: "echo nope".to_string(),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(explicit.contains("maximum 2 running jobs"), "{explicit}");
+        let output = shell
+            .call(BashArgs {
+                command: "echo short-foreground".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(output.contains("short-foreground"), "{output}");
+        assert!(!output.contains("promoted_to_background"), "{output}");
+        assert_eq!(shell.sandbox.running_background_job_count(), 2);
+        shell.sandbox.cancel_background_jobs();
+        assert_eq!(
+            Sandbox::new(false, "bwrap")
+                .with_max_background_jobs(1000)
+                .max_background_jobs(),
+            crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn background_job_capacity_is_bounded_and_global_cancel_reaps_every_job() {
@@ -3025,7 +3085,7 @@ mod tests {
             .to_string();
         assert_eq!(
             overflow,
-            "background job capacity is full (maximum 8 running jobs)"
+            "background job capacity is full (maximum 8 running jobs; raise shell-max-background-jobs, at most 64)"
         );
 
         // Interrupting a turn kills foreground groups only; jobs survive.

@@ -257,6 +257,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("shell-env", &["shell_env"])
         .described("Literal environment variables set for contained shell commands. Project layers need trust.")
         .shaped(ConfigShape::StringMap),
+    aliased("shell-max-background-jobs", &["shell_max_background_jobs"])
+        .described("Running background shell jobs allowed at once (1..=64, default 8). A full table makes auto_background calls run in the foreground.")
+        .shaped(ConfigShape::Integer),
     aliased("shell-env-allow-secrets", &["shell_env_allow_secrets"])
         .described("Global-only: permit credential-looking names (GH_TOKEN, *_API_KEY) in shell-inherit-env and shell-env.")
         .shaped(ConfigShape::Bool),

@@ -2302,6 +2302,10 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     )
     .with_network(cfg.sandbox_network.unwrap_or_default())
     .with_shell_env(cfg.shell_env_policy())
+    .with_max_background_jobs(
+        cfg.shell_max_background_jobs
+            .unwrap_or(crate::sandbox::DEFAULT_MAX_BACKGROUND_JOBS),
+    )
     .with_shell(&shell)
     .with_windows_appcontainer_roots(
         cli.resolve_windows_appcontainer_read_roots(cfg),

@@ -429,6 +429,8 @@ pub struct SandboxConfig {
     /// `shell-inherit-env` / `shell-env`: variables layered after the fixed
     /// allowlist for contained shell commands. Default closed.
     shell_env: ShellEnvPolicy,
+    /// `shell-max-background-jobs`: running background jobs allowed at once.
+    max_background_jobs: usize,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     /// Raw HOME-relative `sandbox-home-mounts` entries, validated at capture.
@@ -880,7 +882,9 @@ pub(crate) struct CommandOutput {
     pub descendants_escaped: bool,
 }
 
-const MAX_CONCURRENT_BACKGROUND_JOBS: usize = 8;
+/// Default and ceiling of `shell-max-background-jobs`.
+pub const DEFAULT_MAX_BACKGROUND_JOBS: usize = 8;
+pub const MAX_BACKGROUND_JOBS_LIMIT: usize = 64;
 const MAX_RETAINED_BACKGROUND_JOBS: usize = 32;
 /// Pruned job ids whose log path stays discoverable through `job_status`.
 const MAX_PRUNED_BACKGROUND_LOGS: usize = 256;
@@ -2446,6 +2450,16 @@ impl Sandbox {
         self
     }
 
+    /// `shell-max-background-jobs`, clamped to `1..=MAX_BACKGROUND_JOBS_LIMIT`.
+    pub fn with_max_background_jobs(mut self, max: usize) -> Self {
+        self.max_background_jobs = max.clamp(1, MAX_BACKGROUND_JOBS_LIMIT);
+        self
+    }
+
+    pub fn max_background_jobs(&self) -> usize {
+        self.max_background_jobs
+    }
+
     pub fn shell_env_policy(&self) -> &ShellEnvPolicy {
         &self.shell_env
     }
@@ -2621,6 +2635,7 @@ impl Sandbox {
                 profile: SandboxProfile::Workspace,
                 network: SandboxNetwork::Deny,
                 shell_env: ShellEnvPolicy::default(),
+                max_background_jobs: DEFAULT_MAX_BACKGROUND_JOBS,
                 read_roots: Vec::new(),
                 write_roots: Vec::new(),
                 home_mounts: Vec::new(),
@@ -4744,11 +4759,13 @@ impl Sandbox {
                     }
                 }
             }
-            if self.background_jobs.running.load(Ordering::Acquire)
-                >= MAX_CONCURRENT_BACKGROUND_JOBS
-            {
-                return Err(std::io::Error::other(
-                    "background job capacity is full (maximum 8 running jobs)",
+            if self.background_jobs.running.load(Ordering::Acquire) >= self.max_background_jobs {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::QuotaExceeded,
+                    format!(
+                        "background job capacity is full (maximum {} running jobs; raise shell-max-background-jobs, at most {MAX_BACKGROUND_JOBS_LIMIT})",
+                        self.max_background_jobs
+                    ),
                 ));
             }
             jobs.insert(

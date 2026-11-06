@@ -211,6 +211,14 @@ pub(crate) fn validate_responses_extra_body(
 /// keys that would be dropped in silence.
 pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, String> {
     cfg.shell_env_policy().validate()?;
+    if let Some(max) = cfg.shell_max_background_jobs
+        && !(1..=crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT).contains(&max)
+    {
+        return Err(format!(
+            "shell-max-background-jobs must be between 1 and {}",
+            crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT
+        ));
+    }
     #[cfg(feature = "subagents")]
     cfg.validate_subagent_settings()?;
     let global_is_responses = cfg
