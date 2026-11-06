@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Resumable subagent conversations (`task {"resume": id}`) are persisted with the session in a private file bounded by `task_resume_max_children` / `task_resume_max_bytes` and restored on `--continue` / `--resume`; the stale-child notice now names only ids that could not be restored (mini-agent-jixxz).
 - Persona frontmatter `skills:` now preloads the named skills (resolved against the authorized catalogue, within the instruction budget, with a visible notice for unknown, unauthorized or over-budget names) into the child's system prompt instead of being ignored (mini-agent-ofr7l).
 - Agent Skills frontmatter keys `context`, `agent`, `model`, `effort`, `paths` and `hooks` (recognised from Claude Code but not applied) now produce one note per skill in `/skills` and the `--import-agent-skill` report (for example `context: fork not applied; skill runs inline`), and `argument-hint` is shown in the `/skills` listing; unknown non-Claude keys stay quiet (mini-agent-4dqan).
 - The sandbox HTTP proxy replaces the client's `Host` header with the allowlisted request-URI authority before
