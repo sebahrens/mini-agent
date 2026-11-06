@@ -144,7 +144,25 @@ struct PersistedId {
 /// deleted, pruned and swept together with the session. `None` when session
 /// artifacts are unavailable.
 pub(crate) fn session_store_path(session_id: &str) -> Option<PathBuf> {
-    let dir = crate::session::storage::command_log_dir(session_id)?;
+    store_path_in(
+        crate::paths::artifact_disabled(crate::paths::SUBAGENT_RESUME_ARTIFACT),
+        || crate::session::storage::command_log_dir(session_id),
+        session_id,
+    )
+}
+
+/// `--no-session` runs keep the resumable children in memory only: the
+/// conversations (file contents, tool output) must not reach disk, so a
+/// disabled artifact yields no path and the log directory is never consulted.
+fn store_path_in(
+    disabled: bool,
+    log_dir: impl FnOnce() -> Option<PathBuf>,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if disabled {
+        return None;
+    }
+    let dir = log_dir()?;
     let name =
         crate::paths::digest_filename("subagent-resume-store", &[session_id.as_bytes()], "json")
             .ok()?;
@@ -410,6 +428,29 @@ mod tests {
             insert_note(&store.insert_with(small, None, Vec::new()), small),
             None
         );
+    }
+
+    #[test]
+    fn no_session_keeps_resumable_children_off_disk() {
+        let dir = crate::tests::OwnedTestDirectory::new("resume-no-session");
+        let log = dir.path().join("tool-output");
+        let enabled = store_path_in(false, || Some(log.clone()), "s1").unwrap();
+        assert!(enabled.starts_with(&log));
+        let consulted = std::cell::Cell::new(false);
+        let path = store_path_in(
+            true,
+            || {
+                consulted.set(true);
+                Some(log.clone())
+            },
+            "s1",
+        );
+        assert!(path.is_none() && !consulted.get());
+        // The pool's store for a disabled run is the memory-only default: a
+        // stored child never creates the directory or any file.
+        let store = path.map_or_else(ResumeStore::default, ResumeStore::persistent);
+        assert!(store.insert(None, vec![Message::user("secret")]).is_some());
+        assert!(!log.exists(), "no resume store file or directory");
     }
 
     fn store_file(name: &str) -> (crate::tests::OwnedTestDirectory, PathBuf) {

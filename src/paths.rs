@@ -1922,6 +1922,7 @@ const MIGRATION_VERSION: u32 = 1;
 pub(crate) const PRIVATE_PATH_LINK_POLICY: &str = "reject symlinked path components";
 
 static PROCESS_PATHS: OnceLock<AppPaths> = OnceLock::new();
+pub(crate) const SUBAGENT_RESUME_ARTIFACT: &str = "subagent resume store";
 static DISABLED_ARTIFACTS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2658,6 +2659,8 @@ pub fn artifact_disabled(artifact: &'static str) -> bool {
 /// directory for a session that was never saved.
 pub fn disable_session_artifacts() {
     disable_artifact("goal transcripts");
+    // Resumable subagent conversations hold file contents and tool output.
+    disable_artifact(SUBAGENT_RESUME_ARTIFACT);
 }
 
 fn disable_artifact(artifact: &'static str) {
