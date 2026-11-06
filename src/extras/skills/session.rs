@@ -33,6 +33,7 @@ pub(crate) struct InstructionServices {
     permission: Option<PermCheck>,
     home: Option<PathBuf>,
     roots: OnceLock<Vec<SourceRoot>>,
+    extra: ExtraSkillRoots,
     no_context_files: bool,
     current: RwLock<Arc<Discovery>>,
     generation: AtomicU64,
@@ -99,6 +100,7 @@ impl InstructionOwner {
             #[cfg(not(test))]
             home: crate::paths::process_home_dir(),
             roots: OnceLock::new(),
+            extra: configured_extra_roots(),
             no_context_files,
             current: RwLock::new(Arc::new(Discovery::default())),
             generation: AtomicU64::new(0),
@@ -110,6 +112,80 @@ impl InstructionOwner {
         });
         *cached = Some(Arc::clone(&service));
         service
+    }
+}
+
+/// Operator-added skill locations beyond the workspace and home roots:
+/// `--add-dir` / `skills_extra_dirs` entries (each searched for
+/// `.claude/skills` and `.agents/skills`) and `skills_plugin_dirs` entries
+/// (each searched for `skills/`, the plugin layout). Both are empty by
+/// default and come only from the command line or user/trusted configuration
+/// (the config keys are outside the benign project-key list, so an untrusted
+/// project file cannot name them). They carry user authority like `~/.claude`
+/// roots and the same read-permission check, and rank below every other root.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExtraSkillRoots {
+    pub(crate) add_dirs: Vec<PathBuf>,
+    pub(crate) plugin_dirs: Vec<PathBuf>,
+}
+
+const MAX_EXTRA_DIRS: usize = 16;
+
+static EXTRA_ROOTS: OnceLock<ExtraSkillRoots> = OnceLock::new();
+
+/// Installs the process-wide extra roots once at startup. Relative entries
+/// resolve against the launch directory; empty entries are dropped.
+pub(crate) fn configure_extra_roots(add_dirs: Vec<PathBuf>, plugin_dirs: Vec<PathBuf>) {
+    let normalize = |dirs: Vec<PathBuf>| -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for dir in dirs {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let dir = if dir.is_absolute() {
+                dir
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(dir)
+            } else {
+                continue;
+            };
+            if !out.contains(&dir) && out.len() < MAX_EXTRA_DIRS {
+                out.push(dir);
+            }
+        }
+        out
+    };
+    let _ = EXTRA_ROOTS.set(ExtraSkillRoots {
+        add_dirs: normalize(add_dirs),
+        plugin_dirs: normalize(plugin_dirs),
+    });
+}
+
+fn configured_extra_roots() -> ExtraSkillRoots {
+    EXTRA_ROOTS.get().cloned().unwrap_or_default()
+}
+
+impl ExtraSkillRoots {
+    fn source_roots(&self) -> Vec<SourceRoot> {
+        let mut roots = Vec::new();
+        let mut push = |dir: &PathBuf, sub: &str, origin: &'static str| {
+            if let Ok(binding) = WorkspaceBinding::capture(dir) {
+                roots.push(SourceRoot {
+                    binding: Arc::new(binding),
+                    directory: sub.into(),
+                    origin,
+                    project: false,
+                });
+            }
+        };
+        for dir in &self.add_dirs {
+            push(dir, ".claude/skills", "added dir .claude");
+            push(dir, ".agents/skills", "added dir .agents");
+        }
+        for dir in &self.plugin_dirs {
+            push(dir, "skills", "plugin");
+        }
+        roots
     }
 }
 
@@ -210,8 +286,9 @@ impl InstructionServices {
                 };
                 // Precedence (first valid name wins): workspace-root roots,
                 // then nested directories between the launch directory and the
-                // workspace root (nearest first), then user roots. Every
-                // project root shares the workspace trust gate.
+                // workspace root (nearest first), then user roots, then
+                // operator-added `--add-dir`/plugin roots. Every project root
+                // shares the workspace trust gate.
                 let mut roots = vec![
                     project(".mini-agent/skills".into(), "project .mini-agent"),
                     project(".claude/skills".into(), "project .claude"),
@@ -245,6 +322,7 @@ impl InstructionServices {
                         });
                     }
                 }
+                roots.extend(self.extra.source_roots());
                 roots
             })
             .clone()
@@ -1160,6 +1238,7 @@ mod discovery_tests {
                 permission: None,
                 home: None,
                 roots: OnceLock::new(),
+                extra: ExtraSkillRoots::default(),
                 no_context_files: no_context,
                 current: RwLock::new(Arc::new(Discovery::default())),
                 generation: AtomicU64::new(0),
@@ -1519,6 +1598,53 @@ mod discovery_tests {
         assert!(nested_dirs(root, std::path::Path::new("/elsewhere/a")).is_empty());
         let deep = std::path::Path::new("/ws/1/2/3/4/5/6/7/8/9/10");
         assert_eq!(nested_dirs(root, deep).len(), 8);
+    }
+
+    #[tokio::test]
+    async fn added_and_plugin_roots_are_off_by_default_and_rank_last() {
+        let mut fixture = Fixture::new(false);
+        let outside = fixture.root.path().join("outside");
+        let write = |rel: &str, name: &str, body: &str| {
+            let dir = outside.join(rel).join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} d\n---\n{body}\n"),
+            )
+            .unwrap();
+        };
+        write("added/.claude/skills", "from-added", "ADDED");
+        write("added/.agents/skills", "clash", "ADDED_CLASH");
+        write("plug/skills", "from-plugin", "PLUGIN");
+        write("plug/skills", "clash", "PLUGIN_CLASH");
+        write("plug/other", "not-a-root", "NO");
+        fixture.skill(".claude/skills", "clash", "project clash", "PROJECT");
+        // Default closed: nothing outside the workspace is read.
+        let closed = fixture.services.refresh(false).await.unwrap();
+        assert!(closed.packages.contains_key("clash"));
+        assert!(!closed.packages.contains_key("from-added"));
+        assert!(!closed.packages.contains_key("from-plugin"));
+        Arc::get_mut(&mut fixture.services).unwrap().roots = OnceLock::new();
+        Arc::get_mut(&mut fixture.services).unwrap().extra = ExtraSkillRoots {
+            add_dirs: vec![outside.join("added"), outside.join("missing")],
+            plugin_dirs: vec![outside.join("plug")],
+        };
+        let open = fixture.services.refresh(false).await.unwrap();
+        assert_eq!(open.packages["from-added"].origin, "added dir .claude");
+        assert_eq!(open.packages["from-plugin"].origin, "plugin");
+        assert_eq!(open.packages["clash"].origin, "project .claude");
+        assert!(!open.packages.contains_key("not-a-root"));
+    }
+
+    #[test]
+    fn extra_roots_never_expand_outside_the_named_directories() {
+        // Adversarial: `..` and the filesystem root add nothing beyond what the
+        // named directory (canonicalized) really contains; "/" is refused.
+        let roots = ExtraSkillRoots {
+            add_dirs: vec![PathBuf::from("/")],
+            plugin_dirs: vec![PathBuf::from("/nonexistent-dir-for-test/../x")],
+        };
+        assert!(roots.source_roots().is_empty());
     }
 
     #[tokio::test]
