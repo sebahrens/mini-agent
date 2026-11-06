@@ -306,7 +306,12 @@ Both recursive searches visit at most 100,000 directory entries and descend at
 most 256 directories. Grep additionally reads at most 100 MiB per call, loads at
 most 10 MiB per file (including files that grow during a read), and inspects at most
 100,000 multiline matches and 100,000 touched source lines per file. A byte-budget-ending file is skipped rather
-than searched as an incomplete prefix. Binary sniffing consumes the same byte
+than searched as an incomplete prefix. Files skipped for the 10 MiB per-file limit,
+for binary content (a NUL byte in the first 8 KiB, which includes UTF-16 text) or
+for a read error are counted: a directory search appends `[skipped N files not
+searched: M larger than the 10 MiB per-file search limit, K binary ...]`, also after
+`No matches found.`, so absence of a match is never claimed for them. Naming such a
+file explicitly as `path` returns an error naming the limit instead of an empty result. Binary sniffing consumes the same byte
 budget. Work limits produce a partial-result notice, including when no matches
 were found; narrow the path or pattern to continue. These bounds leave path,
 read-deny, external-directory approval, ignore, and no-follow traversal policy

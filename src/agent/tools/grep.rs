@@ -21,11 +21,81 @@ const MAX_MULTILINE_MATCHES: usize = 100_000;
 
 struct GrepSearchResult {
     file_count: usize,
+    skipped: SkippedFiles,
     files_with_matches: usize,
     results: Vec<String>,
     emitted_results: usize,
     limit_hit: bool,
     work_limit_hit: bool,
+}
+
+/// Files a search could not inspect. They are reported instead of being
+/// silently treated as match-free.
+#[derive(Clone, Copy, Default)]
+struct SkippedFiles {
+    /// Larger than the per-file search limit (including files that grew).
+    large: usize,
+    /// A NUL byte in the first 8 KiB.
+    binary: usize,
+    /// The read failed.
+    unreadable: usize,
+}
+
+impl SkippedFiles {
+    fn total(self) -> usize {
+        self.large + self.binary + self.unreadable
+    }
+
+    /// One-line footer for a directory search; empty when nothing was skipped.
+    fn notice(self) -> String {
+        if self.total() == 0 {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        if self.large > 0 {
+            parts.push(format!(
+                "{} larger than the {} MiB per-file search limit",
+                self.large,
+                MAX_SEARCH_FILE_BYTES / (1024 * 1024)
+            ));
+        }
+        if self.binary > 0 {
+            parts.push(format!(
+                "{} binary (NUL byte in the first 8 KiB)",
+                self.binary
+            ));
+        }
+        if self.unreadable > 0 {
+            parts.push(format!("{} unreadable", self.unreadable));
+        }
+        format!(
+            "\n[skipped {} files not searched: {}; absence of a match does not cover them — inspect them with read offset/limit or a binary-aware shell command]",
+            self.total(),
+            parts.join(", ")
+        )
+    }
+
+    /// Error for an explicitly named file the search could not inspect.
+    fn explicit_file_error(self, path: &Path, len: u64) -> Option<ToolError> {
+        let path = path.display();
+        if self.large > 0 {
+            return Some(ToolError::Msg(format!(
+                "grep did not search '{path}': it is {len} bytes, larger than the {} MiB per-file search limit. Use read with offset/limit (or character_offset for long lines), or a shell command such as `grep -n` for a large file.",
+                MAX_SEARCH_FILE_BYTES / (1024 * 1024)
+            )));
+        }
+        if self.binary > 0 {
+            return Some(ToolError::Msg(format!(
+                "grep did not search '{path}': it looks binary (NUL byte in the first 8 KiB; UTF-16 text also triggers this). Use a binary-aware shell command such as `strings` or `iconv` before searching."
+            )));
+        }
+        if self.unreadable > 0 {
+            return Some(ToolError::Msg(format!(
+                "grep did not search '{path}': the file could not be read."
+            )));
+        }
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -303,6 +373,7 @@ struct GrepSearch {
     include_re: Option<(Regex, bool)>,
     options: GrepSearchOptions,
     file_count: usize,
+    skipped: SkippedFiles,
     files_with_matches: usize,
     results: Vec<String>,
     emitted_results: usize,
@@ -320,6 +391,7 @@ impl GrepSearch {
             include_re,
             options,
             file_count: 0,
+            skipped: SkippedFiles::default(),
             files_with_matches: 0,
             results: Vec::with_capacity(options.max_results.min(64)),
             emitted_results: 0,
@@ -360,6 +432,7 @@ impl GrepSearch {
         }
 
         if entry.metadata.len() > MAX_SEARCH_FILE_BYTES {
+            self.skipped.large += 1;
             return ControlFlow::Continue(());
         }
 
@@ -368,16 +441,27 @@ impl GrepSearch {
         // Bind the read itself, not only the earlier metadata length: the file
         // may grow while its descriptor remains open.
         let mut bounded = (&mut file).take(self.remaining_bytes);
-        let is_text = GrepTool::read_non_binary(&mut bounded, &mut self.read_buffer, capacity)
-            .unwrap_or(false);
+        let read = GrepTool::read_non_binary(&mut bounded, &mut self.read_buffer, capacity);
         self.remaining_bytes = bounded.limit();
         if self.remaining_bytes == 0 {
             self.work_limit_hit = true;
             // The final file may be only a prefix; never search that prefix.
             return ControlFlow::Break(());
         }
-        if !is_text {
-            return ControlFlow::Continue(());
+        match read {
+            Ok(true) => {}
+            Ok(false) if GrepTool::is_binary(&self.read_buffer) => {
+                self.skipped.binary += 1;
+                return ControlFlow::Continue(());
+            }
+            Ok(false) => {
+                self.skipped.large += 1;
+                return ControlFlow::Continue(());
+            }
+            Err(_) => {
+                self.skipped.unreadable += 1;
+                return ControlFlow::Continue(());
+            }
         }
         self.file_count += 1;
         let re = &self.re;
@@ -492,6 +576,7 @@ impl GrepSearch {
     fn finish(self, walker_work_limit_hit: bool) -> GrepSearchResult {
         GrepSearchResult {
             file_count: self.file_count,
+            skipped: self.skipped,
             files_with_matches: self.files_with_matches,
             results: self.results,
             emitted_results: self.emitted_results,
@@ -558,7 +643,12 @@ fn search_target(
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_default();
+            let path = entry.path.clone();
+            let len = entry.metadata.len();
             let _ = search.visit(entry, &include_root);
+            if let Some(error) = search.skipped.explicit_file_error(&path, len) {
+                return Err(error);
+            }
             Ok(search.finish(false))
         }
     }
@@ -618,7 +708,7 @@ impl Tool for GrepTool {
 
     fn description(&self) -> String {
         format!(
-            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped. Respects .gitignore. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly. `path` may name a single file to search only that file.",
+            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. Respects .gitignore. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly. `path` may name a single file to search only that file.",
             self.max_results, MAX_OUTPUT_LINE_CHARS
         )
     }
@@ -814,6 +904,7 @@ impl Tool for GrepTool {
         .map_err(|error| ToolError::Msg(format!("grep directory walker failed: {error}")))??;
         let GrepSearchResult {
             file_count,
+            skipped,
             files_with_matches,
             results: all_results,
             emitted_results,
@@ -825,6 +916,8 @@ impl Tool for GrepTool {
         } else {
             ""
         };
+        let skipped_notice = skipped.notice();
+        let work_notice = format!("{skipped_notice}{work_notice}");
         if all_results.is_empty() {
             let msg = format!("No matches found.{work_notice}");
             return Ok(match coaching {
@@ -2101,13 +2194,39 @@ mod tests {
             "{explicit}"
         );
 
-        for skipped in ["binary.bin", "large.txt"] {
-            let found = tool
-                .call(grep_args("needle", Some(skipped), None))
-                .await
-                .unwrap();
-            assert_eq!(found, "No matches found.", "{skipped}");
-        }
+        // mini-agent-u790d: an explicitly named file the search cannot
+        // inspect is an error naming the limit, never "No matches found.".
+        let large = tool
+            .call(grep_args("needle", Some("large.txt"), None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            large.contains("larger than the 10 MiB per-file search limit"),
+            "{large}"
+        );
+        let binary = tool
+            .call(grep_args("needle", Some("binary.bin"), None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(binary.contains("looks binary"), "{binary}");
+
+        // A directory search reports what it skipped in a footer.
+        assert!(
+            walked.contains(
+                "[skipped 2 files not searched: 1 larger than the 10 MiB per-file search limit, 1 binary (NUL byte in the first 8 KiB);"
+            ),
+            "{walked}"
+        );
+        let none = tool
+            .call(grep_args("absent-token", None, None))
+            .await
+            .unwrap();
+        assert!(
+            none.starts_with("No matches found.\n[skipped 2 files"),
+            "{none}"
+        );
     }
 
     #[tokio::test]

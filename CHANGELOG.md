@@ -22,6 +22,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `read` clips each displayed line to `[tool_limits] max_read_line_chars` (default 2,000) with a
   marker naming the exact `character_offset` that continues it; hashedit tags still cover the full
   line.
+- `grep` no longer reports skipped files as match-free: a directory search appends a
+  `[skipped N files not searched: ...]` line for files over the 10 MiB per-file limit, binary or
+  unreadable files, and naming such a file as `path` returns an error naming the limit.
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for
