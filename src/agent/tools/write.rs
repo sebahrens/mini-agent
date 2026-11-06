@@ -45,6 +45,20 @@ fn overwrite_not_authorized(path: &str) -> ToolError {
     ))
 }
 
+/// The not-authorized error plus, when the file cannot fit one read result,
+/// the real cause: windows do not compose into a complete read.
+fn overwrite_not_authorized_sized(path: &str, bytes: usize, lines: usize) -> ToolError {
+    let limits = crate::agent::tools::limits::current();
+    let chars_budget = limits.max_result_chars.saturating_sub(2_000);
+    if bytes <= chars_budget && lines <= 2_000 {
+        return overwrite_not_authorized(path);
+    }
+    ToolError::Msg(format!(
+        "Cannot overwrite '{path}': overwrite=true requires one complete read, but this file ({bytes} bytes, {lines} lines) is larger than a single read result can hold (max_result_chars={} characters, about {} bytes of text, and the read line limit, default 2000 lines); reading it in several windows does not add up to a complete read. Use the edit tool for targeted changes, or replace it with the shell tool (for example write the new content to a temporary file and move it over this path).",
+        limits.max_result_chars, chars_budget
+    ))
+}
+
 fn create_error(path: &str, error: std::io::Error) -> ToolError {
     if error.kind() == std::io::ErrorKind::AlreadyExists {
         ToolError::Msg(format!(
@@ -358,7 +372,11 @@ impl WriteTool {
                         .read_tracker
                         .permits_full_overwrite(&expanded, &metadata, crc, lines)
                     {
-                        return Err(overwrite_not_authorized(&expanded));
+                        return Err(overwrite_not_authorized_sized(
+                            &expanded,
+                            current.len(),
+                            lines,
+                        ));
                     }
                     let base = crate::fs::ContentDigest::of(&current);
                     // One shared copy of the preimage serves both the checkpoint
@@ -597,7 +615,11 @@ impl WriteTool {
                 crc,
                 lines,
             ) {
-                return Err(overwrite_not_authorized(&expanded));
+                return Err(overwrite_not_authorized_sized(
+                    &expanded,
+                    current.len(),
+                    lines,
+                ));
             }
             if self.diff_options.max_lines > 0
                 && current.len() <= super::mutation_diff::MAX_INPUT_BYTES
@@ -843,6 +865,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(target).unwrap(), "replacement\n");
+    }
+
+    #[tokio::test]
+    async fn overwrite_of_a_file_beyond_one_read_result_explains_the_ceiling() {
+        let temp = TempDir::new("write-big-overwrite");
+        let target = temp.path().join("big.txt");
+        let body: String = (0..6_000)
+            .map(|i| format!("line {i:05} {}\n", "x".repeat(40)))
+            .collect();
+        std::fs::write(&target, &body).unwrap();
+        let tracker = ReadTracker::new(true);
+        let read = ReadTool::new_with_tracker(None, None, None, 2000, tracker.clone())
+            .with_workspace(temp.path());
+        let write =
+            WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(temp.path());
+        for start in [1usize, 1501, 3001, 4501] {
+            read.call(ReadArgs {
+                pages: None,
+                raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
+                path: "big.txt".into(),
+                offset: Some(start),
+                limit: Some(1500),
+            })
+            .await
+            .unwrap();
+        }
+        let error = write
+            .call(WriteArgs {
+                path: "big.txt".into(),
+                content: "new\n".into(),
+                overwrite: true,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("larger than a single read result"),
+            "{error}"
+        );
+        assert!(error.contains("edit tool"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), body);
     }
 
     #[tokio::test]
