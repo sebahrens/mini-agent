@@ -15,7 +15,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   deny for 30 seconds (mini-agent-01l6q). The sandbox proxy refuses NAT64, 6to4, Teredo and
   IPv4-compatible addresses embedding forbidden IPv4, plus `198.18.0.0/15` and `192.0.0.0/24`
   (mini-agent-pges4). Proxy and bwrap-forwarder accept loops back off on errors and the forwarder
-  caps concurrent relays at 256 (mini-agent-y42nd).
+  caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
+  `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
+  verification (mini-agent-0cshc).
 
 ### Added
 

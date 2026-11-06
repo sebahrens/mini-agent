@@ -436,8 +436,21 @@ verify_attestation() {
         reason="the GitHub CLI ('gh') is not installed"
     elif ! gh auth status >/dev/null 2>&1; then
         reason="the GitHub CLI is not signed in (run 'gh auth login')"
-    elif ! gh attestation verify --help >/dev/null 2>&1; then
-        reason="this GitHub CLI does not support 'gh attestation verify'; upgrade gh"
+    else
+        # Probe the help text for the exact pin flags used below, so an older
+        # gh that has the subcommand but not these flags is "unavailable"
+        # (upgrade gh) instead of a failed verification.
+        local help_text flag
+        if ! help_text="$(gh attestation verify --help 2>&1)"; then
+            reason="this GitHub CLI does not support 'gh attestation verify'; upgrade gh"
+        else
+            for flag in "${ATTESTATION_PIN[@]}"; do
+                if [[ "$flag" == --* && "$help_text" != *"$flag"* ]]; then
+                    reason="this GitHub CLI's 'gh attestation verify' lacks ${flag}; upgrade gh"
+                    break
+                fi
+            done
+        fi
     fi
     if [[ -n "$reason" ]]; then
         echo "Warning: build provenance was not verified: ${reason}." >&2

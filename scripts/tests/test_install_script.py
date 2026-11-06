@@ -153,6 +153,7 @@ if [[ "$1 $2" == "auth status" ]]; then
 fi
 if [[ "$1 $2" == "attestation verify" ]]; then
     if [[ "$3" == "--help" ]]; then
+        printf '%s\\n' "${INSTALL_TEST_GH_HELP_TEXT---signer-workflow --source-ref --cert-identity-regex}"
         exit "${INSTALL_TEST_GH_ATTESTATION_HELP_STATUS:-0}"
     fi
     status="${INSTALL_TEST_GH_ATTESTATION_STATUS:-0}"
@@ -956,6 +957,32 @@ fi
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("upgrade gh", result.stderr)
             self.assertEqual([], self.attestation_calls(root))
+
+    def test_gh_lacking_the_pin_flags_installs_with_upgrade_warning(self) -> None:
+        for release_version, missing in (
+            ("1.7.2", "--source-ref"),
+            (None, "--cert-identity-regex"),
+        ):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                release, stub_bin = self.make_fixture(directory)
+                env = self.gh_env(
+                    root,
+                    INSTALL_TEST_GH_HELP_TEXT="--repo --signer-workflow --cert-oidc-issuer",
+                    INSTALL_TEST_GH_ATTESTATION_STATUS="1",
+                )
+                result = self.run_installer(
+                    root,
+                    release,
+                    stub_bin,
+                    extra_env=env,
+                    release_version=release_version,
+                )
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertIn("upgrade gh", result.stderr)
+                self.assertIn(missing, result.stderr)
+                self.assertEqual([], self.attestation_calls(root))
 
     def test_skip_attestation_switch_never_verifies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

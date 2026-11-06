@@ -540,6 +540,9 @@ pub(crate) fn check_attestation(
         }
         Ok(_) => {}
     }
+    // Probe the help text for the exact pin flags used below: a gh that has
+    // the subcommand but not `--signer-workflow`/`--source-ref` would fail
+    // with "unknown flag", which is not a rejection of the archive.
     let help = run_gh(
         program,
         &[
@@ -548,10 +551,23 @@ pub(crate) fn check_attestation(
             OsStr::new("--help"),
         ],
     );
-    if !help.is_ok_and(|output| output.status.success()) {
+    let Some(help) = help.ok().filter(|output| output.status.success()) else {
         return Attestation::Unavailable(
             "this GitHub CLI does not support 'gh attestation verify'; upgrade gh".into(),
         );
+    };
+    let help_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    if let Some(flag) = ["--signer-workflow", "--source-ref"]
+        .into_iter()
+        .find(|flag| !help_text.contains(flag))
+    {
+        return Attestation::Unavailable(format!(
+            "this GitHub CLI's 'gh attestation verify' lacks {flag}; upgrade gh"
+        ));
     }
     match run_gh(
         program,
@@ -1025,7 +1041,13 @@ mod tests {
             )
         };
         // A working gh that accepts the archive: the verify call names archive and repo.
-        let ok = stub_gh(&dir, &format!("echo \"$@\" >> {}\nexit 0", log.display()));
+        let ok = stub_gh(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {}\nif [ \"$3\" = --help ]; then echo '--signer-workflow --source-ref'; fi\nexit 0",
+                log.display()
+            ),
+        );
         assert_eq!(run(&ok, false, false), Attestation::Verified);
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
@@ -1039,7 +1061,7 @@ mod tests {
         // Rejected archive: failure carrying gh's message, and the action aborts.
         let reject = stub_gh(
             &dir,
-            "if [ \"$1\" = attestation ] && [ \"$3\" != --help ]; then echo 'no matching attestation' >&2; exit 1; fi\nexit 0",
+            "if [ \"$1\" = attestation ] && [ \"$3\" = --help ]; then echo '--signer-workflow --source-ref'; exit 0; fi\nif [ \"$1\" = attestation ]; then echo 'no matching attestation' >&2; exit 1; fi\nexit 0",
         );
         let outcome = run(&reject, false, false);
         assert!(
@@ -1058,6 +1080,31 @@ mod tests {
         let old = stub_gh(&dir, "if [ \"$1\" = attestation ]; then exit 2; fi\nexit 0");
         assert!(
             matches!(run(&old, false, false), Attestation::Unavailable(m) if m.contains("upgrade gh"))
+        );
+        // A gh with the subcommand but without the pin flags: unavailable, never
+        // a failed verification (the verify call must not even be made).
+        let no_flags_log = dir.join("no-flags.log");
+        let no_flags = stub_gh(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {}\nif [ \"$1\" = attestation ] && [ \"$3\" = --help ]; then echo '--repo --owner'; exit 0; fi\nif [ \"$1\" = attestation ]; then echo 'unknown flag: --signer-workflow' >&2; exit 1; fi\nexit 0",
+                no_flags_log.display()
+            ),
+        );
+        let outcome = run(&no_flags, false, false);
+        assert!(
+            matches!(&outcome, Attestation::Unavailable(m) if m.contains("--signer-workflow") && m.contains("upgrade gh")),
+            "{outcome:?}"
+        );
+        let calls = std::fs::read_to_string(&no_flags_log).unwrap();
+        assert!(!calls.contains("--repo owner/repo"), "{calls}");
+        // Only one of the two flags advertised is still unavailable.
+        let half = stub_gh(
+            &dir,
+            "if [ \"$1\" = attestation ] && [ \"$3\" = --help ]; then echo '--signer-workflow' >&2; fi\nexit 0",
+        );
+        assert!(
+            matches!(run(&half, false, false), Attestation::Unavailable(m) if m.contains("--source-ref"))
         );
         // Missing gh, MINI_AGENT_INSTALL_NO_GH and the skip switch.
         let missing = dir.join("nope");
