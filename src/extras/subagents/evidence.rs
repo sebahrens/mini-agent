@@ -8,7 +8,7 @@
 //! memory. Nothing here is model-visible by itself: the report renders
 //! metadata rows only, and the parent dereferences content on demand through
 //! the parent-only `task_evidence` tool under its own permissions.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
@@ -130,6 +130,14 @@ pub(crate) struct EvidenceMeta {
     pub tool: String,
     pub target: String,
     pub path: Option<String>,
+    /// Permission re-checks the parent repeats before returning the content:
+    /// `(rule key, absolute path)` for every path-bearing tool (`read`,
+    /// `grep`, `find_files`, `list_dir`, `lsp_*`, notebooks), anchored at the
+    /// child's own working directory (a worktree for isolated children).
+    pub path_checks: Vec<(&'static str, String)>,
+    /// `(server, tool)` of a persona MCP tool call, re-judged with the
+    /// parent's `mcp_tool` rules.
+    pub mcp: Option<(String, String)>,
     pub text_bytes: u64,
     pub images: Vec<ImageMeta>,
     /// Image parts that could not be validated (not retained).
@@ -201,9 +209,26 @@ pub(crate) struct ChildEvidence {
     unrecorded: usize,
     content_bytes: usize,
     limits: EvidenceLimits,
+    /// The child's working directory; relative tool paths are anchored here
+    /// when recorded, never at the parent's directory.
+    base_dir: Option<PathBuf>,
+    /// `(server, tool)` pairs of the persona's MCP allowlist.
+    mcp_tools: Vec<(String, String)>,
 }
 
 impl ChildEvidence {
+    /// Anchor relative paths at the child's directory and name the MCP tools
+    /// the child could call, so each record can be re-judged by the parent.
+    pub(crate) fn with_child_context(
+        mut self,
+        base_dir: Option<PathBuf>,
+        mcp_tools: Vec<(String, String)>,
+    ) -> Self {
+        self.base_dir = base_dir;
+        self.mcp_tools = mcp_tools;
+        self
+    }
+
     pub(crate) fn with_limits(limits: EvidenceLimits) -> Self {
         Self {
             limits,
@@ -328,17 +353,23 @@ impl ChildEvidence {
             })
         };
         let est_tokens = text_bytes.div_ceil(4) + images.iter().map(|i| i.est_tokens).sum::<u64>();
+        let path_checks = path_checks(tool, arguments, self.base_dir.as_deref());
         let path = (tool == "read")
-            .then(|| arguments.get("path").and_then(serde_json::Value::as_str))
-            .flatten()
-            .filter(|path| path.len() <= MAX_PATH_BYTES)
-            .map(str::to_owned);
+            .then(|| path_checks.first().map(|(_, path)| path.clone()))
+            .flatten();
+        let mcp = self
+            .mcp_tools
+            .iter()
+            .find(|(server, name)| tool == name || tool == format!("{server}__{name}"))
+            .cloned();
         self.records.push((
             EvidenceMeta {
                 number: self.records.len() + 1,
                 tool: sanitize(tool, MAX_TOOL_NAME_BYTES),
                 target: sanitize(&target_summary(arguments), MAX_TARGET_BYTES),
                 path,
+                path_checks,
+                mcp,
                 text_bytes,
                 images,
                 invalid_images,
@@ -348,6 +379,75 @@ impl ChildEvidence {
             content,
         ));
     }
+}
+
+/// The permission re-checks one recorded call needs. Search-style tools with
+/// no `path` run at the child's directory, so that directory is the subject.
+/// Paths are stored absolute and canonical (lexically normalized when they do
+/// not exist), anchored at the child's directory.
+fn path_checks(
+    tool: &str,
+    arguments: &serde_json::Value,
+    base_dir: Option<&Path>,
+) -> Vec<(&'static str, String)> {
+    let (key, default_to_root): (&'static str, bool) = match tool {
+        "read" => ("read", false),
+        "grep" => ("grep", true),
+        "find_files" => ("find_files", true),
+        "list_dir" => ("list_dir", true),
+        "lsp_diagnostics" | "lsp_navigate" | "notebook_edit" | "notebook_read" => ("read", false),
+        _ => return Vec::new(),
+    };
+    let raw = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty());
+    let raw = match raw {
+        Some(raw) => raw,
+        None if default_to_root => ".",
+        None => return Vec::new(),
+    };
+    if raw.len() > MAX_PATH_BYTES {
+        return Vec::new();
+    }
+    let Some(base) = base_dir else {
+        // No child directory known (unit fixtures): keep the spelling and let
+        // the parent's checker anchor it, as before.
+        return if raw == "." && default_to_root {
+            Vec::new()
+        } else {
+            vec![(key, raw.to_owned())]
+        };
+    };
+    let expanded = crate::fs::expand_tilde(raw);
+    let joined = if Path::new(&expanded).is_absolute() {
+        PathBuf::from(&expanded)
+    } else {
+        base.join(&expanded)
+    };
+    let resolved = std::fs::canonicalize(&joined).unwrap_or_else(|_| lexical_normalize(&joined));
+    match resolved.to_str() {
+        Some(text) if text.len() <= MAX_PATH_BYTES => vec![(key, text.to_owned())],
+        _ => Vec::new(),
+    }
+}
+
+/// Collapse `.` and `..` without touching the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Validate a literal base64 image part the same way history retention does.

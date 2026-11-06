@@ -1891,6 +1891,20 @@ editing in a known location, grepping for a literal you will act on immediately.
                             };
                         }
                     };
+                // Evidence is re-judged by the parent later: anchor relative
+                // paths at THIS child's directory (a worktree when isolated)
+                // and remember which MCP tools it could call.
+                let evidence_base_dir = authorization
+                    .workspace()
+                    .map(|workspace| workspace.root().to_path_buf());
+                let evidence_mcp: Vec<(String, String)> = persona
+                    .mcp_servers
+                    .iter()
+                    .flatten()
+                    .flat_map(|(server, tools)| {
+                        tools.iter().map(move |tool| (server.clone(), tool.clone()))
+                    })
+                    .collect();
                 let agent = builder::build_explore_agent_with_suffix(
                     model,
                     max_turns,
@@ -1995,7 +2009,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                 .await;
                 // Host-minted evidence comes from the child's actual tool
                 // results, in call order; the report contract can only cite it.
-                let mut evidence = super::evidence::ChildEvidence::with_limits(evidence_limits);
+                let mut evidence = super::evidence::ChildEvidence::with_limits(evidence_limits)
+                    .with_child_context(evidence_base_dir, evidence_mcp);
                 #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
                 let mut omitted_images = super::image_cost::omitted_images(&run.history);
                 if evidence_enabled {

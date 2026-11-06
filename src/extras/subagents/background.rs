@@ -2391,11 +2391,31 @@ impl rig::tool::Tool for EvidenceTool {
         })?;
         let meta = meta.clone();
         let path = path.cloned();
-        // Inherit, never widen: a recorded read is re-judged by the parent's
-        // own read rule for that path, as if the parent read it itself.
-        if let Some(target) = &meta.path {
-            crate::agent::tools::check_perm_path(&self.permission, &self.ask, "read", target)
-                .await?;
+        // Inherit, never widen: every recorded path-bearing call (read, grep,
+        // find_files, list_dir, lsp, notebook) is re-judged by the parent's
+        // current rule for that tool and its absolute path, and a recorded
+        // MCP call by the parent's `mcp_tool` rules, as if the parent made
+        // the call itself.
+        for (rule, target) in &meta.path_checks {
+            crate::agent::tools::check_perm_path(&self.permission, &self.ask, rule, target).await?;
+        }
+        #[cfg(feature = "mcp")]
+        if let Some((server, tool)) = &meta.mcp {
+            crate::agent::tools::check_mcp_perm(
+                &self.permission,
+                &self.ask,
+                &format!("mcp_tool:{server}:{tool}"),
+                None,
+                tool,
+            )
+            .await?;
+        }
+        #[cfg(not(feature = "mcp"))]
+        if meta.mcp.is_some() {
+            return Err(ToolError::Msg(
+                "task_evidence: this record came from an MCP tool and MCP support is not built in"
+                    .into(),
+            ));
         }
         validate().map_err(|error| ToolError::Msg(error.to_string()))?;
         let header = format!(
@@ -2794,5 +2814,171 @@ mod evidence_tool_tests {
             .await
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn task_evidence_rejudges_every_path_tool_and_mcp_record() {
+        let fixture = fixture("task-evidence-rejudge").await;
+        let mut history = Vec::new();
+        for (id, name, args) in [
+            (
+                "g1",
+                "grep",
+                serde_json::json!({"pattern": "x", "path": "secret"}),
+            ),
+            ("g2", "grep", serde_json::json!({"pattern": "x"})),
+            ("l1", "list_dir", serde_json::json!({"path": "../outside"})),
+            ("f1", "find_files", serde_json::json!({"pattern": "*.rs"})),
+            ("m1", "search", serde_json::json!({"query": "cache"})),
+            ("m2", "docs__search", serde_json::json!({"query": "cache"})),
+            (
+                "o1",
+                "not_a_path_tool",
+                serde_json::json!({"path": "secret"}),
+            ),
+        ] {
+            history.extend(exchange(
+                id,
+                name,
+                args,
+                vec![ToolResultContent::Text(Text::from("content"))],
+            ));
+        }
+        let child = fixture.workspace.root().join("child-worktree");
+        std::fs::create_dir_all(&child).unwrap();
+        let mut evidence = ChildEvidence::default()
+            .with_child_context(Some(child.clone()), vec![("docs".into(), "search".into())]);
+        evidence.record_history(&history);
+        let metas: Vec<_> = evidence.metas().cloned().collect();
+        // Absolute, anchored at the child's directory (not the parent's).
+        assert_eq!(metas[0].path_checks[0].0, "grep");
+        assert!(
+            metas[0].path_checks[0].1.ends_with("child-worktree/secret"),
+            "{:?}",
+            metas[0].path_checks
+        );
+        assert_eq!(
+            std::path::Path::new(&metas[1].path_checks[0].1),
+            std::fs::canonicalize(&child).unwrap(),
+            "grep without a path judges the child's directory"
+        );
+        assert_eq!(
+            std::path::Path::new(&metas[2].path_checks[0].1),
+            std::fs::canonicalize(fixture.workspace.root())
+                .unwrap()
+                .join("outside"),
+            "`..` is collapsed against the child's directory"
+        );
+        assert!(
+            metas[6].path_checks.is_empty(),
+            "unknown tools record no path"
+        );
+        assert_eq!(metas[4].mcp, Some(("docs".into(), "search".into())));
+        assert_eq!(metas[5].mcp, Some(("docs".into(), "search".into())));
+        assert_eq!(metas[0].mcp, None);
+        let task_id = uuid::Uuid::new_v4().to_string();
+        fixture
+            .pool
+            .evidence()
+            .store(fixture.pool.session_id(), task_id.clone(), evidence)
+            .await;
+
+        let checker = |rules: serde_json::Value| {
+            let mut config = crate::config::Config {
+                permission: Some(rules),
+                ..crate::config::Config::default()
+            };
+            config.permission_modes = Some(vec!["standard".to_string()]);
+            let permission_config = config.build_permission_config().unwrap();
+            Some(Arc::new(std::sync::Mutex::new(
+                crate::permission::checker::PermissionChecker::new(
+                    &permission_config,
+                    crate::permission::SecurityMode::Standard,
+                    Some(fixture.workspace.root().to_path_buf()),
+                    config.permission_modes.clone(),
+                )
+                .unwrap(),
+            )))
+        };
+        let open = |rules: serde_json::Value, id: &'static str| {
+            let tool = tool(&fixture, checker(rules), true);
+            let task_id = task_id.clone();
+            let fixture = &fixture;
+            async move {
+                call(
+                    fixture,
+                    &tool,
+                    serde_json::json!({"task_id": task_id, "id": id}),
+                )
+                .await
+            }
+        };
+        // Everything allowed: every record opens.
+        for id in ["E1", "E2", "E3", "E4", "E5", "E6", "E7"] {
+            open(serde_json::json!({"*": "allow"}), id)
+                .await
+                .unwrap_or_else(|error| panic!("{id}: {error}"));
+        }
+        // A denied tool rule now blocks records that previously slipped by
+        // because only recorded `read` calls were re-judged.
+        for (deny, ids) in [
+            ("grep", vec!["E1", "E2"]),
+            ("list_dir", vec!["E3"]),
+            ("find_files", vec!["E4"]),
+            ("mcp_tool", vec!["E5", "E6"]),
+        ] {
+            for id in ids {
+                assert!(
+                    open(serde_json::json!({"*": "allow", deny: "deny"}), id)
+                        .await
+                        .is_err(),
+                    "{deny} deny must block {id}"
+                );
+            }
+        }
+        // ...and only those: an unrelated denied tool leaves them readable.
+        assert!(
+            open(serde_json::json!({"*": "allow", "read": "deny"}), "E1")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn evidence_paths_are_absolute_canonical_and_bounded() {
+        use crate::extras::subagents::evidence::ChildEvidence;
+        let base = std::env::temp_dir().join(format!("ev-paths-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let mut history = Vec::new();
+        for (id, path) in [
+            ("a", "real/../real/./file.rs".to_string()),
+            ("b", "../../../../etc/passwd".to_string()),
+            ("c", "/abs/elsewhere".to_string()),
+            ("d", "x".repeat(5000)),
+        ] {
+            history.extend(exchange(
+                id,
+                "read",
+                serde_json::json!({"path": path}),
+                vec![ToolResultContent::Text(Text::from("c"))],
+            ));
+        }
+        let mut evidence = ChildEvidence::default().with_child_context(Some(base.clone()), vec![]);
+        evidence.record_history(&history);
+        let metas: Vec<_> = evidence.metas().cloned().collect();
+        assert_eq!(
+            metas[0].path.as_deref(),
+            Some(base.join("real/file.rs").to_str().unwrap())
+        );
+        // Traversal is collapsed, never left as a relative spelling.
+        let escaped = metas[1].path.as_deref().unwrap();
+        assert!(
+            std::path::Path::new(escaped).is_absolute() && !escaped.contains(".."),
+            "{escaped}"
+        );
+        assert_eq!(metas[2].path.as_deref(), Some("/abs/elsewhere"));
+        assert_eq!(metas[3].path, None, "oversized paths are not recorded");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
