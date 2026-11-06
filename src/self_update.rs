@@ -1034,7 +1034,10 @@ mod tests {
             refresh_notice_documents(&directory, &documents),
             NoticeRefresh::Refreshed(2)
         );
-        assert_eq!(std::fs::read_to_string(directory.join("LICENSE")).unwrap(), "new gpl");
+        assert_eq!(
+            std::fs::read_to_string(directory.join("LICENSE")).unwrap(),
+            "new gpl"
+        );
         assert_eq!(
             std::fs::read_to_string(directory.join("THIRD_PARTY_LICENSES")).unwrap(),
             "new inventory"

@@ -369,6 +369,9 @@ impl ShellTool {
     }
 }
 
+/// Linux bubblewrap gives every command its own RAM-backed `/tmp`.
+pub(crate) const SHELL_PRIVATE_TMP_NOTE: &str = " /tmp (and $TMPDIR) is a private in-memory tmpfs discarded when each command ends, including background jobs' own copy: files written there do not survive to the next shell call and large temp files use RAM. Keep anything needed across calls in the workspace.";
+
 impl Tool for ShellTool {
     const NAME: &'static str = "shell";
 
@@ -395,6 +398,9 @@ impl Tool for ShellTool {
                 " Sandboxed shell commands see this workspace at {}; file tools keep the working-directory path stated in the system prompt.",
                 alias.display()
             ));
+        }
+        if self.sandbox.shell_private_tmp() {
+            description.push_str(SHELL_PRIVATE_TMP_NOTE);
         }
         if self.allow_escalation {
             description.push_str(
@@ -2110,6 +2116,19 @@ mod tests {
         assert!(bounded.contains("lines omitted"), "{bounded}");
         assert!(bounded.contains("bytes 0..900 are in the log"), "{bounded}");
         assert!(crate::session::tool_result_is_self_bounded("job_status"));
+    }
+
+    #[test]
+    fn shell_description_discloses_the_private_tmp_only_under_bwrap() {
+        let off = ShellTool::new(None, None, Sandbox::new(false, "bwrap"), None).description();
+        assert!(!off.contains("private in-memory tmpfs"), "{off}");
+        let on = ShellTool::new(None, None, Sandbox::new(true, "bwrap"), None).description();
+        assert_eq!(
+            on.contains("private in-memory tmpfs discarded when each command ends"),
+            cfg!(target_os = "linux"),
+            "{on}"
+        );
+        assert!(SHELL_PRIVATE_TMP_NOTE.contains("workspace"));
     }
 
     fn test_tool() -> BashTool {
