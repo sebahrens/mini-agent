@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Providers
+
+- Provider retry hints are honoured beyond `retry.max_backoff_ms`: `retry-after-ms` and
+  `Retry-After` may extend a retry up to the new `retry.max_retry_after_ms` ceiling (default
+  5 minutes, at most 10), `x-should-retry` overrides the status classification, and the retry
+  notice shows the actual wait.
+
 **Fork release 1.14.2 (2026-10-28)**
 
 ### Security

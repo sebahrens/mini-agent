@@ -254,13 +254,54 @@ impl ProviderHttpClient {
     }
 }
 
+/// A failed provider response together with the retry-relevant response
+/// headers (`Retry-After`, `retry-after-ms`, `x-should-retry`). Only those
+/// headers are kept, so credentials or cookies never ride the error chain.
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub(crate) struct ProviderRetryAfterError {
     pub(crate) status: http::StatusCode,
-    pub(crate) retry_after: http::HeaderValue,
+    pub(crate) headers: http::HeaderMap,
     #[source]
     source: http_client::Error,
+}
+
+#[cfg(test)]
+impl ProviderRetryAfterError {
+    /// A synthetic failed response carrying `headers`, for classifier tests.
+    pub(crate) fn for_test(status: u16, headers: &[(&str, &str)], body: &str) -> Self {
+        let status = http::StatusCode::from_u16(status).unwrap();
+        Self {
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                        http::HeaderValue::from_str(value).unwrap(),
+                    )
+                })
+                .collect(),
+            source: http_client::Error::InvalidStatusCodeWithMessage(status, body.to_owned()),
+        }
+    }
+}
+
+/// Whether a response header carries retry guidance worth preserving.
+pub(crate) fn is_retry_hint_header(name: &http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "retry-after" | "retry-after-ms" | "x-should-retry"
+    )
+}
+
+fn retry_hint_headers(headers: &http::HeaderMap) -> http::HeaderMap {
+    headers
+        .iter()
+        .filter(|(name, _)| is_retry_hint_header(name))
+        .take(32)
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 async fn response_error(
@@ -268,7 +309,7 @@ async fn response_error(
     private_auth: Option<&'static str>,
 ) -> http_client::Error {
     let status = response.status();
-    let retry_after = response.headers().get(http::header::RETRY_AFTER).cloned();
+    let hint_headers = retry_hint_headers(response.headers());
     let body = if let Some(message) = private_auth {
         message.to_owned()
     } else {
@@ -278,13 +319,14 @@ async fn response_error(
             .unwrap_or_else(|error| format!("failed to read error response body: {error}"))
     };
     let source = http_client::Error::InvalidStatusCodeWithMessage(status, body);
-    match retry_after {
-        Some(retry_after) => http_client::Error::Instance(Box::new(ProviderRetryAfterError {
+    if hint_headers.is_empty() {
+        source
+    } else {
+        http_client::Error::Instance(Box::new(ProviderRetryAfterError {
             status,
-            retry_after,
+            headers: hint_headers,
             source,
-        })),
-        None => source,
+        }))
     }
 }
 
@@ -919,6 +961,7 @@ pub(crate) mod tests {
                     max_attempts: 2,
                     initial_backoff_ms: 0,
                     max_backoff_ms: 40,
+                    max_retry_after_ms: 0,
                 };
                 let mut notices = Vec::new();
                 let mut stream = crate::retry::retry_stream_chat_with(

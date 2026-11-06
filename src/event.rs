@@ -170,6 +170,8 @@ pub enum AgentEvent {
     Retrying {
         attempt: usize,
         max: usize,
+        /// The sleep before this retry, including any provider wait hint.
+        delay_ms: u64,
     },
     Verification {
         attempt: u32,
@@ -198,6 +200,17 @@ pub enum AgentEvent {
         /// never need to reconstruct model interactions from display events.
         interactions: Vec<rig::completion::Message>,
     },
+}
+
+/// User-visible text for a provider retry, naming the actual wait so a
+/// long provider `Retry-After` does not look like a hang.
+pub fn retry_notice_text(attempt: usize, max: usize, delay_ms: u64) -> String {
+    let secs = delay_ms as f64 / 1000.0;
+    if delay_ms >= 10_000 {
+        format!("retrying in {secs:.0}s... ({attempt}/{max})")
+    } else {
+        format!("retrying in {secs:.1}s... ({attempt}/{max})")
+    }
 }
 
 impl AgentEvent {

@@ -1548,6 +1548,10 @@ fn warn_unknown_stream_item<R: serde::Serialize>(item: &MultiTurnStreamItem<R>) 
     tracing::warn!("unknown stream item variant: {detail}");
 }
 
+fn duration_millis(delay: std::time::Duration) -> u64 {
+    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+}
+
 const MAX_PENDING_TOOL_CALLS: usize = 256;
 pub(crate) const UNKNOWN_TOOL_OUTCOME: &str =
     "[Tool execution outcome is unknown because the agent stream ended before a result.]";
@@ -1559,6 +1563,7 @@ struct CompletionRetryState {
     failures: usize,
     backoff: std::time::Duration,
     max_backoff: std::time::Duration,
+    hint_ceiling: std::time::Duration,
 }
 
 impl CompletionRetryState {
@@ -1568,6 +1573,7 @@ impl CompletionRetryState {
             failures: 0,
             backoff: std::time::Duration::from_millis(config.initial_backoff_ms),
             max_backoff: std::time::Duration::from_millis(config.max_backoff_ms),
+            hint_ceiling: config.hint_ceiling(),
         }
     }
 
@@ -1592,7 +1598,12 @@ impl CompletionRetryState {
             return None;
         }
 
-        let delay = retry::retry_delay_for_error(self.backoff, self.max_backoff, error);
+        let delay = retry::retry_delay_for_error_with_hint_ceiling(
+            self.backoff,
+            self.max_backoff,
+            self.hint_ceiling,
+            error,
+        );
         self.backoff = (self.backoff * 2).min(self.max_backoff);
         Some((self.failures, delay))
     }
@@ -2436,8 +2447,9 @@ fn midstream_retry(
 ) -> Option<(usize, std::time::Duration)> {
     let (attempt, delay) = completion_retry.retry_delay(retry_config, error)?;
     tracing::warn!(
-        "agent retry {attempt}/{max} after mid-stream error: {error}",
+        "agent retry {attempt}/{max} in {secs:.1}s after mid-stream error: {error}",
         max = retry_config.max_attempts,
+        secs = delay.as_secs_f64(),
     );
     Some((attempt, delay))
 }
@@ -3986,6 +3998,7 @@ where
                             .send(AgentEvent::Retrying {
                                 attempt: notice.attempt,
                                 max: notice.max_attempts,
+                                delay_ms: duration_millis(notice.delay),
                             })
                             .await;
                     }
@@ -4562,6 +4575,7 @@ where
                                 .send(AgentEvent::Retrying {
                                     attempt,
                                     max: retry_config.max_attempts,
+                                    delay_ms: duration_millis(delay),
                                 })
                                 .await;
                             tokio::time::sleep(delay).await;
@@ -6455,6 +6469,7 @@ mod tests {
                 max_attempts: 2,
                 initial_backoff_ms: 0,
                 max_backoff_ms: 50,
+                max_retry_after_ms: 0,
             };
             let mut state = super::CompletionRetryState::new(&config);
             assert_eq!(
@@ -6471,6 +6486,7 @@ mod tests {
             max_attempts: 4_000_000_000,
             initial_backoff_ms: 9_000_000_000_000_000,
             max_backoff_ms: 9_000_000_000_000_000,
+            max_retry_after_ms: 0,
         };
         let error = rig::agent::StreamingError::Completion(
             rig::completion::CompletionError::ProviderError("HTTP 429 Too Many Requests".into()),
@@ -6493,6 +6509,7 @@ mod tests {
             max_attempts,
             initial_backoff_ms: 0,
             max_backoff_ms: 0,
+            max_retry_after_ms: 0,
         }
     }
 
@@ -6519,7 +6536,11 @@ mod tests {
 
         assert!(matches!(
             runner.event_rx.recv().await,
-            Some(crate::event::AgentEvent::Retrying { attempt: 1, max: 3 })
+            Some(crate::event::AgentEvent::Retrying {
+                attempt: 1,
+                max: 3,
+                ..
+            })
         ));
         loop {
             match runner.event_rx.recv().await.expect("terminal event") {
@@ -6573,7 +6594,7 @@ mod tests {
         let mut retry_events = 0;
         let interactions = loop {
             match runner.event_rx.recv().await.expect("runner terminal event") {
-                crate::event::AgentEvent::Retrying { attempt, max } => {
+                crate::event::AgentEvent::Retrying { attempt, max, .. } => {
                     retry_events += 1;
                     assert_eq!((attempt, max), (1, 3));
                 }
@@ -6760,7 +6781,7 @@ mod tests {
         let mut retries = Vec::new();
         let error = loop {
             match runner.event_rx.recv().await.expect("runner terminal event") {
-                crate::event::AgentEvent::Retrying { attempt, max } => {
+                crate::event::AgentEvent::Retrying { attempt, max, .. } => {
                     retries.push((attempt, max));
                 }
                 crate::event::AgentEvent::Error { message: error, .. } => break error.to_string(),

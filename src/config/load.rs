@@ -1693,6 +1693,7 @@ fn clamped_retry_warnings(
             let value = match field {
                 "max_attempts" => cfg.retry.max_attempts as u64,
                 "initial_backoff_ms" => cfg.retry.initial_backoff_ms,
+                "max_retry_after_ms" => cfg.retry.max_retry_after_ms,
                 _ => cfg.retry.max_backoff_ms,
             };
             format!(

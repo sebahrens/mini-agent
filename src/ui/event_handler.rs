@@ -438,7 +438,7 @@ pub async fn handle_agent_event(
                 run.request_tool_results_cleared,
             );
         }
-        AgentEvent::Retrying { attempt, max } => {
+        AgentEvent::Retrying { attempt, max, delay_ms } => {
             run.was_reasoning = false;
             finalize_response_segment(renderer, run)?;
             if run.agent_line_started {
@@ -446,7 +446,7 @@ pub async fn handle_agent_event(
                 run.agent_line_started = false;
             }
             run.response_start_block = None;
-            renderer.write_line(&format!("retrying... ({}/{})", attempt, max), Color::Yellow)?;
+            renderer.write_line(&crate::event::retry_notice_text(attempt, max, delay_ms), Color::Yellow)?;
         }
         AgentEvent::CompactionBoundary { .. } => {}
         AgentEvent::AwaitingUser { question, interactions } => {
