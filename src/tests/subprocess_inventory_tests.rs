@@ -1321,7 +1321,14 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/web_http.rs",
         "status: response.status().as_u16(),",
-        2,
+        1,
+        "NON-PROCESS",
+    ),
+    // Native web exchange: the HTTP status code of a response.
+    (
+        "src/agent/tools/web_http.rs",
+        "let status = response.status().as_u16();",
+        1,
         "NON-PROCESS",
     ),
     (
@@ -3342,7 +3349,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/extras/js/host.rs", "output.status,", 2, "NON-PROCESS"),
-    ("src/agent/tools/web_http.rs", "status,", 1, "NON-PROCESS"),
+    ("src/agent/tools/web_http.rs", "status,", 3, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 200,", 7, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 204,", 1, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 304,", 1, "NON-PROCESS"),
@@ -6033,7 +6040,14 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/web_http.rs",
         "status: response.status().as_u16(),",
-        2,
+        1,
+        "NON-PROCESS",
+    ),
+    // Native web exchange: the HTTP status code of a response.
+    (
+        "src/agent/tools/web_http.rs",
+        "let status = response.status().as_u16();",
+        1,
         "NON-PROCESS",
     ),
     (
