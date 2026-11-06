@@ -467,6 +467,30 @@ pub async fn handle_compress(
     ui: &mut UiContext<'_>,
     reasoning_enabled: bool,
 ) -> anyhow::Result<()> {
+    handle_compress_with_force(
+        instructions,
+        auto,
+        false,
+        run,
+        renderer,
+        ui,
+        reasoning_enabled,
+    )
+    .await
+}
+
+/// [`handle_compress`] with an optional `force` that skips the local budget
+/// estimate while keeping the automatic announcement and hook semantics. Used
+/// when the provider itself rejected the prompt as too long.
+pub async fn handle_compress_with_force(
+    instructions: Option<&str>,
+    auto: bool,
+    force: bool,
+    run: &mut AgentRunState,
+    renderer: &mut Renderer,
+    ui: &mut UiContext<'_>,
+    reasoning_enabled: bool,
+) -> anyhow::Result<()> {
     // Mirror the auto-compaction trigger's reserve exactly (including memory's
     // effective_reserve) so the budget gate here can never disagree with the
     // gate that decided to call us.
@@ -489,7 +513,7 @@ pub async fn handle_compress(
 
     let cut_idx = match plan_tui_compaction(
         ui.session,
-        auto,
+        auto && !force,
         max_tokens,
         keep_recent,
         keep_recent_tool_results,

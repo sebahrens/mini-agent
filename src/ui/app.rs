@@ -4525,7 +4525,47 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    /// Whether a terminal provider error should instead trigger the one
+    /// compact-and-retry of this turn (mini-agent-cj9oh): a context-length
+    /// rejection, automatic compaction enabled, not already spent this turn,
+    /// and an ordinary (non-native, non-worktree-controller) main run.
+    fn reactive_context_relief_applies(&self, event: &AgentEvent) -> bool {
+        let AgentEvent::Error { message, .. } = event else {
+            return false;
+        };
+        #[cfg(feature = "git-worktree")]
+        if self.chain.git.work.is_some() {
+            return false;
+        }
+        self.run.is_running
+            && !self.run.reactive_relief_used
+            && self.run.native_owner.is_none()
+            && self.run.pending_turn.is_some()
+            && self.ui.cfg.resolve_compact_enabled()
+            && crate::retry::is_context_length_error_message(message)
+    }
+
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
+        if self.reactive_context_relief_applies(&event)
+            && let AgentEvent::Error { interactions, .. } = &event
+        {
+            self.run.reactive_relief_used = true;
+            self.ui.session.adopt_provider_tool_identity(interactions);
+            if let Err(error) = crate::ui::reactive_compact_and_respawn(
+                interactions,
+                &mut self.renderer,
+                &mut self.run,
+                &mut self.ui,
+                &self.slash,
+            )
+            .await
+            {
+                self.fail_pending_main_turn().await;
+                return Err(error);
+            }
+            self.refresh()?;
+            return Ok(());
+        }
         let terminal_steering = matches!(
             &event,
             AgentEvent::Done { .. } | AgentEvent::Error { .. } | AgentEvent::AwaitingUser { .. }
@@ -14886,6 +14926,8 @@ mod plan_approval_tests {
                         }
                         let (status, body, kind) = if text == "error" {
                             ("400 Bad Request", "{\"error\":{\"message\":\"owned planning failure\"}}".into(), "application/json")
+                        } else if text == "context-error" {
+                            ("400 Bad Request", "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"This model's maximum context length is 1000 tokens\"}}".into(), "application/json")
                         } else {
                             let delta = if matches!(text, "question-batch" | "question-again") {
                                 serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":format!("{text}-id"),"type":"function","function":{"name":"ask_user_question","arguments":serde_json::json!({"questions":[
@@ -18947,6 +18989,125 @@ mod plan_approval_tests {
                 && app.ui.session.permission_allowlist.is_empty()
         );
         provider.finish().await;
+    }
+
+    /// Drives a TUI turn until it ends, returning how many terminal errors the
+    /// event stream produced after relief had been spent (those are surfaced).
+    async fn drive_context_relief_turn(app: &mut App<'_>) -> (usize, bool) {
+        let mut surfaced_errors = 0;
+        let mut done = false;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let Some(rx) = app.run.agent_rx.as_mut() else {
+                    break;
+                };
+                let event = rx.recv().await.unwrap();
+                let terminal_error = matches!(event, AgentEvent::Error { .. });
+                let spent = app.run.reactive_relief_used;
+                let compact = app.ui.cfg.resolve_compact_enabled();
+                let is_done = matches!(event, AgentEvent::Done { .. });
+                crate::startup::heap_future(|| app.handle_agent_event(event))
+                    .await
+                    .unwrap();
+                if terminal_error && (spent || !compact) {
+                    surfaced_errors += 1;
+                    break;
+                }
+                if is_done {
+                    done = true;
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        (surfaced_errors, done)
+    }
+
+    /// mini-agent-cj9oh: a provider context-length 400 compacts once and resumes
+    /// the TUI turn; a second rejection (or `compact_enabled = false`) surfaces.
+    #[tokio::test]
+    async fn context_length_rejection_compacts_once_and_resumes_the_tui_turn() {
+        for (script, compact, expect_done, expect_calls) in [
+            (
+                vec![
+                    "context-error",
+                    "COMPACTION_SUMMARY",
+                    "FINISHED_AFTER_RELIEF",
+                ],
+                true,
+                true,
+                3,
+            ),
+            (
+                vec!["context-error", "COMPACTION_SUMMARY", "context-error"],
+                true,
+                false,
+                3,
+            ),
+            (vec!["context-error"], false, false, 1),
+        ] {
+            #[cfg(feature = "hooks")]
+            let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+            let roots = Roots::new();
+            let provider = Provider::new(script).await;
+            let mut cfg = provider.config();
+            cfg.compact_enabled = Some(compact);
+            cfg.keep_recent_tokens = Some(1_000);
+            let cli = crate::cli::Cli {
+                no_tools: true,
+                ..Default::default()
+            };
+            let workspace = roots.workspace();
+            let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+            let mut session = Session::new(
+                "plan80",
+                "owned-model",
+                128_000,
+                workspace.root().to_str().unwrap(),
+            );
+            session.add_message(MessageRole::User, &"x".repeat(40_000));
+            session.add_message(MessageRole::Assistant, &"y".repeat(40_000));
+            let ui = ui(
+                &cli,
+                &cfg,
+                &mut session,
+                &mut context,
+                workspace.clone(),
+                SecurityMode::Standard,
+            );
+            let mut app = owned_app(ui);
+            user(
+                &mut app,
+                UserEvent::Paste("Continue this ordinary turn".into()),
+            )
+            .await;
+            key(&mut app, KeyCode::Enter).await;
+            let (surfaced, done) = drive_context_relief_turn(&mut app).await;
+            assert_eq!(done, expect_done, "script outcome (compact={compact})");
+            assert_eq!(surfaced, usize::from(!expect_done), "surfaced errors");
+            assert_eq!(provider.calls().len(), expect_calls);
+            assert_eq!(app.run.reactive_relief_used, compact);
+            if expect_done {
+                let last = serde_json::to_string(&provider.calls()[2]).unwrap();
+                assert!(
+                    last.contains("COMPACTION_SUMMARY"),
+                    "summary reaches the retried request"
+                );
+                assert!(
+                    last.contains("Context was compacted"),
+                    "continuation prompt is sent"
+                );
+                assert!(
+                    app.ui
+                        .session
+                        .messages
+                        .iter()
+                        .any(|m| m.content.contains("FINISHED_AFTER_RELIEF"))
+                );
+            }
+            provider.finish().await;
+        }
     }
 
     #[tokio::test]

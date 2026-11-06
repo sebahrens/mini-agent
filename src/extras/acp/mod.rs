@@ -3920,6 +3920,10 @@ async fn run_prompt(
     // a continuation prompt. At most `MAX_MID_TURN_RELIEFS` per prompt.
     let mut current_input = prompt_input.clone();
     let mut reliefs = 0usize;
+    // The provider rejecting a request as exceeding its context window gets
+    // one compact-and-resume per prompt (mini-agent-cj9oh); a second rejection
+    // surfaces unchanged.
+    let mut reactive_used = false;
     #[cfg(feature = "goal")]
     let mut carried_usage = rig::completion::Usage::default();
     let result = loop {
@@ -3956,7 +3960,19 @@ async fn run_prompt(
         // forced-compaction flag armed for the next prompt.
         history.manual_compact = false;
         let mut outcome = match result {
-            Ok(outcome) if outcome.compaction_boundary => outcome,
+            Ok(outcome)
+                if outcome.compaction_boundary
+                    || (!reactive_used
+                        && native_owner.is_none()
+                        && state.cfg.resolve_compact_enabled()
+                        && !control.is_cancelled()
+                        && outcome
+                            .error
+                            .as_deref()
+                            .is_some_and(crate::retry::is_context_length_error_message)) =>
+            {
+                outcome
+            }
             other => {
                 #[cfg(feature = "goal")]
                 let other = other.map(|mut outcome| {
@@ -3977,6 +3993,8 @@ async fn run_prompt(
                 break other;
             }
         };
+        let reactive = outcome.error.take().is_some();
+        reactive_used |= reactive;
         let progress = outcome.progress.take().unwrap_or_default();
         if control.is_cancelled() {
             // Cancellation won: keep what already ran, never continue.
@@ -4015,9 +4033,11 @@ async fn run_prompt(
         let _ = cx.send_notification(SessionNotification::new(
             session_id.clone(),
             SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new(
-                    "mid-turn context relief: compacting the session and continuing...",
-                ),
+                TextContent::new(if reactive {
+                    "the provider rejected the prompt as too long: compacting the session and retrying once..."
+                } else {
+                    "mid-turn context relief: compacting the session and continuing..."
+                }),
             ))),
         ));
         // The next segment compacts the whole persisted history first.
@@ -8663,6 +8683,135 @@ mod protocol_tests {
         assert!(text.contains("mid-turn context relief"), "{text}");
         assert!(text.contains("finished"), "{text}");
         assert!(!text.contains("must not start"), "{text}");
+    }
+
+    /// Runs one ACP prompt whose runner segments fail with a provider
+    /// context-length rejection `rejections` times before answering. Returns
+    /// the (prompt, history length) of every segment, the notifications and
+    /// the prompt result.
+    async fn context_rejection_acp_prompt(
+        cfg: Config,
+        rejections: usize,
+    ) -> (
+        Vec<(String, usize)>,
+        Vec<SessionNotification>,
+        Result<PromptResponse, agent_client_protocol::Error>,
+    ) {
+        let segments = Arc::new(StdMutex::new(Vec::<(String, usize)>::new()));
+        let fixture: RunnerFixture = {
+            let segments = segments.clone();
+            Arc::new(move |prompt, history| {
+                let segments = segments.clone();
+                Box::pin(async move {
+                    let index = {
+                        let mut segments = segments.lock().unwrap();
+                        segments.push((prompt.clone(), history.len()));
+                        segments.len() - 1
+                    };
+                    let events = if index < rejections {
+                        vec![rig::test_utils::MockStreamEvent::error(
+                            "prompt is too long: 213500 tokens > 200000 maximum",
+                        )]
+                    } else {
+                        vec![
+                            rig::test_utils::MockStreamEvent::text("finished after relief"),
+                            rig::test_utils::MockStreamEvent::final_response_with_default_usage(),
+                        ]
+                    };
+                    let model =
+                        rig::test_utils::MockCompletionModel::from_stream_turns(vec![events]);
+                    let agent = rig::agent::AgentBuilder::new(model).build();
+                    crate::agent::runner::spawn_agent_paused(
+                        agent,
+                        prompt,
+                        history,
+                        crate::retry::RetryConfig::default(),
+                        None,
+                        #[cfg(feature = "skills")]
+                        None,
+                        #[cfg(feature = "hooks")]
+                        None,
+                    )
+                })
+            })
+        };
+        let state = runner_fixture_state_with(cfg, fixture);
+        let notifications = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = notifications.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let result = Arc::new(StdMutex::new(None));
+        let captured = result.clone();
+        let connection = Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                *captured.lock().unwrap() = Some(
+                    cx.send_request(prompt(session, "do the long task"))
+                        .block_task()
+                        .await,
+                );
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(10), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let segments = segments.lock().unwrap().clone();
+        let notifications = notifications.lock().unwrap().clone();
+        let result = result.lock().unwrap().take().expect("prompt answered");
+        (segments, notifications, result)
+    }
+
+    // mini-agent-cj9oh: a provider context-length 400 compacts once and resumes
+    // the ACP turn; a second rejection (or compact_enabled = false) surfaces.
+    #[tokio::test]
+    async fn acp_context_length_rejection_compacts_once_and_resumes() {
+        let (segments, notifications, result) =
+            context_rejection_acp_prompt(Config::default(), 1).await;
+        assert_eq!(result.unwrap().stop_reason, StopReason::EndTurn);
+        assert_eq!(segments.len(), 2, "{segments:?}");
+        assert_eq!(segments[0].0, "do the long task");
+        assert_eq!(
+            segments[1].0,
+            crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT
+        );
+        let text = format!("{notifications:?}");
+        assert!(text.contains("rejected the prompt as too long"), "{text}");
+        assert!(text.contains("finished after relief"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn acp_second_context_length_rejection_surfaces_unchanged() {
+        let (segments, _, result) = context_rejection_acp_prompt(Config::default(), 2).await;
+        assert_eq!(segments.len(), 2, "exactly one relief: {segments:?}");
+        let error = result.expect_err("the second rejection is not retried");
+        assert!(error.to_string().contains("prompt is too long"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn acp_context_length_rejection_is_not_relieved_when_compaction_is_off() {
+        let cfg = Config {
+            compact_enabled: Some(false),
+            ..Config::default()
+        };
+        let (segments, _, result) = context_rejection_acp_prompt(cfg, 1).await;
+        assert_eq!(segments.len(), 1, "{segments:?}");
+        assert!(result.is_err());
     }
 
     #[tokio::test]
