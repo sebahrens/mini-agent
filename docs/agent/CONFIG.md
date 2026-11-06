@@ -4008,6 +4008,11 @@ child of a `task` call cancel its in-flight siblings and stop queued launches.
 By default a failed child is only that child's outcome. See
 [Bounded execution](SUBAGENTS.md#bounded-execution-and-partial-results).
 
+`[subagents] task_background_timeout_secs = N` (default 3600, 1 to 86400) is
+the whole-call deadline of `run_in_background` task calls; foreground calls
+keep `task_timeout_secs` (default 300). See
+[Background tasks](SUBAGENTS.md#background-tasks).
+
 ### Hook event parity
 
 `PreCompact` observes an actual compaction before summarization. Its envelope has

@@ -20,6 +20,10 @@ pub struct SubagentPolicy {
     /// child's outcome and its siblings run to completion.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub task_fail_fast: bool,
+    /// Whole-call deadline of `run_in_background` task calls, in seconds
+    /// (default 3600, at most 86400). Foreground calls keep `task_timeout_secs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_background_timeout_secs: Option<u64>,
 }
 
 #[cfg(feature = "subagents")]

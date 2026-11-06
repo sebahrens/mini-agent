@@ -30,6 +30,9 @@ const DEFAULT_MAX_CONCURRENCY: usize = 4;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 131_072;
 const DEFAULT_MAX_COST_UNITS: u64 = 4_000_000;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default deadline of a `run_in_background` call (`[subagents]
+/// task_background_timeout_secs`): background work is meant to be long.
+const DEFAULT_BACKGROUND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const MIN_OUTPUT_BYTES: usize = 256;
 const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BRIEF_BYTES: usize = 64 * 1024;
@@ -343,6 +346,23 @@ impl TaskLimits {
                 .as_ref()
                 .is_some_and(|policy| policy.task_fail_fast),
         }
+    }
+
+    /// Background calls use their own, longer deadline; everything else is
+    /// shared with the foreground limits.
+    fn for_background(mut self, config: &crate::config::Config) -> Result<Self, ToolError> {
+        self.timeout = config
+            .subagents
+            .as_ref()
+            .and_then(|policy| policy.task_background_timeout_secs)
+            .map_or(DEFAULT_BACKGROUND_TIMEOUT, Duration::from_secs);
+        if self.timeout.is_zero() || self.timeout > MAX_CALL_TIMEOUT {
+            return Err(ToolError::Msg(format!(
+                "task: [subagents] task_background_timeout_secs must be between 1 and {}",
+                MAX_CALL_TIMEOUT.as_secs()
+            )));
+        }
+        Ok(self)
     }
 
     fn validate(self) -> Result<Self, ToolError> {
@@ -1072,6 +1092,9 @@ editing in a known location, grepping for a literal you will act on immediately.
         };
 
         let mut limits = limits.validate()?;
+        if args.run_in_background {
+            limits = limits.for_background(&config)?;
+        }
         let prompts = prepare_task_prompts(&args, limits)?;
 
         let agent_type = args.agent_type.clone();
@@ -5271,6 +5294,75 @@ mod tests {
         );
         assert!(rendered.contains("…[narration truncated]"), "{rendered}");
         assert!(rendered.contains("[subagent output ends]"));
+    }
+
+    #[test]
+    fn background_calls_get_their_own_longer_deadline() {
+        let mut config = crate::config::Config::default();
+        let foreground = TaskLimits::from_config(&config).validate().unwrap();
+        assert_eq!(foreground.timeout, Duration::from_secs(300));
+        let background = foreground.for_background(&config).unwrap();
+        assert_eq!(background.timeout, Duration::from_secs(3600));
+        assert_eq!(background.max_prompts, foreground.max_prompts);
+
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_background_timeout_secs: Some(7200),
+            ..Default::default()
+        });
+        assert_eq!(
+            foreground.for_background(&config).unwrap().timeout,
+            Duration::from_secs(7200)
+        );
+        assert_eq!(
+            TaskLimits::from_config(&config).timeout,
+            Duration::from_secs(300),
+            "the background key never changes foreground calls"
+        );
+        for invalid in [0, 86_401] {
+            config.subagents = Some(crate::config::types::SubagentPolicy {
+                task_background_timeout_secs: Some(invalid),
+                ..Default::default()
+            });
+            assert!(foreground.for_background(&config).is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_child_runs_past_300s_under_a_longer_background_deadline() {
+        let slow = || FakeStep {
+            delay: Duration::from_secs(400),
+            output: Ok("slow report".into()),
+            cost_units: 1,
+        };
+        let config = crate::config::Config::default();
+        let background = TaskLimits {
+            timeout: Duration::from_secs(300),
+            ..limits()
+        }
+        .for_background(&config)
+        .unwrap();
+        let report = execute_tasks(
+            prompts(1),
+            background,
+            fake_executor(vec![slow()], Arc::new(FakeCounters::default())),
+            None,
+        )
+        .await;
+        assert!(report.stop_reason.is_none());
+        assert!(report.render().contains("> slow report"));
+
+        let foreground = TaskLimits {
+            timeout: Duration::from_secs(300),
+            ..limits()
+        };
+        let report = execute_tasks(
+            prompts(1),
+            foreground,
+            fake_executor(vec![slow()], Arc::new(FakeCounters::default())),
+            None,
+        )
+        .await;
+        assert!(matches!(report.stop_reason, Some(StopReason::Deadline)));
     }
 
     #[tokio::test(start_paused = true)]

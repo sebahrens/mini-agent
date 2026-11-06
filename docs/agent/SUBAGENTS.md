@@ -50,8 +50,12 @@ Main-agent definition loading remains available when subagents are disabled.
 ## Background tasks
 
 Set `run_in_background: true` on an ordinary `task` call to return a task ID
-immediately. The same persona, tools, permission checks, deadlines, captured
-prices and session cost cap apply. The session keeps at most 32 tasks, including
+immediately. The same persona, tools, permission checks, captured prices and
+session cost cap apply. A background call has its own whole-call deadline,
+`[subagents] task_background_timeout_secs` (default 3600 seconds, at most
+86400), instead of the foreground `task_timeout_secs` (300 s); when it expires,
+in-flight children return their narration so far as `[partial: cancelled ...]`
+sections (see [Bounded execution](#bounded-execution-and-partial-results)). The session keeps at most 32 tasks, including
 finished reports; start a new session when that bounded history is full.
 Background batches share one lane of `task_max_concurrency` children, while the
 parent turn's own foreground `task` call uses a separate lane of the same size,
@@ -982,7 +986,8 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_cost_weighting`       | `string` | `"auto"`                 | Model-aware ratios; `"fixed"` uses configured weights |
 | `task_cost_weights`         | `object` | See below                | Token-category weights and automatic-mode fallbacks |
 | `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
-| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline; completed sibling results and in-flight narration are retained when it expires |
+| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline of foreground calls; completed sibling results and in-flight narration are retained when it expires |
+| `[subagents] task_background_timeout_secs` | `u64` | `3600` | Whole-call deadline of `run_in_background` calls (at most 86400) |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `task_evidence`             | `bool`   | `true`                   | Host-minted evidence handles, citations, the Evidence section and `task_evidence` ([details](#evidence-handles)); tool registration follows a restart |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |

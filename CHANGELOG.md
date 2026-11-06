@@ -12,6 +12,8 @@ Notable changes to mini-agent are documented in this file. The format follows
   the failure is reported only in its own section (`[subagents] task_fail_fast = true` restores
   fail-fast). Children cancelled by the deadline or an output/cost limit return their streamed
   narration as a quoted `[partial: cancelled ...]` section instead of only `[cancelled: ...]`.
+- Background `task` calls get their own deadline, `[subagents] task_background_timeout_secs`
+  (default 3600 s), instead of sharing the 300 s foreground `task_timeout_secs`.
 
 **Fork release 1.14.2 (2026-10-28)**
 
