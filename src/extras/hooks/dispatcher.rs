@@ -863,6 +863,52 @@ impl HookDispatcher {
             let Some(command) = handler.command.clone() else {
                 continue;
             };
+            if matches!(handler.kind.as_str(), "mcp_tool" | "prompt" | "agent") {
+                // In-process backend handlers are separate operator opt-ins:
+                // an MCP call, or sending the event to a model provider.
+                let (enabled, key) = if handler.kind == "mcp_tool" {
+                    (
+                        super::backend::mcp_tool_hooks_enabled(),
+                        "hooks_mcp_tool_enabled",
+                    )
+                } else {
+                    (super::backend::model_hooks_enabled(), "hooks_model_enabled")
+                };
+                if !enabled {
+                    tracing::warn!(
+                        event,
+                        kind = handler.kind.as_str(),
+                        "hooks: {} hook skipped (set {key} = true to allow it)",
+                        handler.kind
+                    );
+                    continue;
+                }
+                let once_key = handler
+                    .once
+                    .then(|| (event.to_string(), (*handler).clone()));
+                let Some(mut once_reservation) =
+                    OnceReservation::reserve(Arc::clone(&self.once_ran), once_key)
+                else {
+                    continue;
+                };
+                let timeout = super::backend::timeout_for(handler);
+                let is_async = handler.is_async;
+                let handler = (*handler).clone();
+                let body = stdin.clone();
+                let request = async move {
+                    let output = super::backend::run_backend_hook(&handler, &body, timeout).await;
+                    once_reservation.consume_if_started(&output);
+                    output
+                };
+                if is_async {
+                    std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
+                        let _ = request.await;
+                    }));
+                } else {
+                    futures.push(Box::pin(request));
+                }
+                continue;
+            }
             if handler.kind == "http" {
                 // Network egress from hooks is an explicit operator opt-in.
                 if !super::http_hooks_enabled() {

@@ -73,6 +73,19 @@ Notable changes to mini-agent are documented in this file. The format follows
   `/cost` and session budgets keep exact all-time totals. A capped run that stops because spend
   cannot be recorded now says "cost tracking failed (<ledger error>)" instead of only claiming the
   USD budget ran out.
+### Skills, hooks and ACP (round 3, group C)
+
+- `SKILL.md` frontmatter keys this build does not know (`disable-model-invocation`, `argument-hint`,
+  `model`, `hooks`, `paths`, ...) are ignored instead of rejecting the skill; `allowed-tools` may be
+  a list and `metadata` any scalars. Rejected skills are reported by name with the reason.
+- Skill discovery budgets are per package (1,024 entries, 8 MiB) and per root rather than shared;
+  one oversized skill no longer drops the rest. `skills_max_resource_bytes` raises the 1 MiB
+  per-resource limit (at most 8 MiB).
+- Skill discovery also reads `.agents/skills`, `~/.agents/skills` and `.claude`/`.agents` skills in
+  directories between the launch directory and the workspace root.
+- Hook handlers `mcp_tool`, `prompt` and `agent` run when `hooks_mcp_tool_enabled` /
+  `hooks_model_enabled` are set (default off).
+- ACP advertises and expands custom prompt commands (`.mini-agent/commands`, `.claude/commands`).
 
 ### Subagents
 

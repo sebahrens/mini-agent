@@ -76,10 +76,90 @@ pub(crate) const KNOWN_UNDISPATCHED_HOOK_EVENTS: &[&str] = &[
     "PostToolBatch",
 ];
 
-/// Handler `type` values this build runs. `http` additionally requires the
-/// `hooks_http_enabled` opt-in; other Claude Code types (`prompt`, `agent`,
-/// `mcp_tool`) are skipped per handler with a warning.
-pub(crate) const SUPPORTED_HOOK_TYPES: &[&str] = &["command", "http"];
+/// Handler `type` values this build runs. `http` requires the
+/// `hooks_http_enabled` opt-in, `mcp_tool` the `hooks_mcp_tool_enabled` opt-in
+/// and `prompt`/`agent` the `hooks_model_enabled` opt-in; unknown types are
+/// skipped per handler with a warning.
+pub(crate) const SUPPORTED_HOOK_TYPES: &[&str] =
+    &["command", "http", "mcp_tool", "prompt", "agent"];
+
+const MAX_MODEL_HOOK_PROMPT_BYTES: usize = 32 * 1024;
+const MAX_MCP_HOOK_INPUT_BYTES: usize = 64 * 1024;
+
+fn reject_subprocess_fields(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    kind: &str,
+) -> Result<(), String> {
+    for field in ["command", "args", "env", "if", "url", "headers"] {
+        if raw.get(field).is_some_and(|value| !value.is_null()) {
+            return Err(format!("{kind} hook does not accept `{field}`"));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a `prompt` or `agent` handler. The prompt text is stored in
+/// `command` and the optional `model` in `args`, so the existing trust
+/// identity, approval description and dedupe keys cover both.
+fn model_binding(
+    raw: Option<&serde_json::Value>,
+    kind: &str,
+) -> Result<(String, Option<Vec<String>>), String> {
+    let raw = raw
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("{kind} hook must be an object"))?;
+    reject_subprocess_fields(raw, kind)?;
+    let prompt = raw
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .ok_or_else(|| format!("{kind} hook requires a non-empty string `prompt`"))?;
+    if prompt.len() > MAX_MODEL_HOOK_PROMPT_BYTES || prompt.contains('\0') {
+        return Err(format!("{kind} hook prompt is too long or invalid"));
+    }
+    let model = match raw.get("model") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let model = value
+                .as_str()
+                .filter(|model| {
+                    !model.is_empty() && model.len() <= 256 && !model.chars().any(char::is_control)
+                })
+                .ok_or_else(|| format!("{kind} hook `model` must be a short string"))?;
+            Some(vec![model.to_owned()])
+        }
+    };
+    Ok((prompt.to_owned(), model))
+}
+
+/// Validates an `mcp_tool` handler: `server` goes to `command`, and `tool`
+/// plus the canonical JSON `input` object to `args`.
+fn mcp_tool_binding(raw: Option<&serde_json::Value>) -> Result<(String, Vec<String>), String> {
+    let raw = raw
+        .and_then(serde_json::Value::as_object)
+        .ok_or("mcp_tool hook must be an object")?;
+    reject_subprocess_fields(raw, "mcp_tool")?;
+    let name = |field: &str| {
+        raw.get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| {
+                !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+            })
+            .map(str::to_owned)
+            .ok_or_else(|| format!("mcp_tool hook requires a short string `{field}`"))
+    };
+    let (server, tool) = (name("server")?, name("tool")?);
+    let input = match raw.get("input") {
+        None | Some(serde_json::Value::Null) => serde_json::json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => return Err("mcp_tool hook `input` must be an object".into()),
+    };
+    let input = serde_json::to_string(&input).map_err(|_| "mcp_tool hook input is invalid")?;
+    if input.len() > MAX_MCP_HOOK_INPUT_BYTES {
+        return Err("mcp_tool hook input is too large".into());
+    }
+    Ok((server, vec![tool, input]))
+}
 
 const MAX_HTTP_HOOK_HEADERS: usize = 32;
 const MAX_HTTP_HOOK_HEADER_BYTES: usize = 8 * 1024;
@@ -204,6 +284,34 @@ pub(crate) fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfi
                             "hooks: skipping one http hook for event {event:?}: {error}"
                         ),
                     },
+                    "mcp_tool" => {
+                        match mcp_tool_binding(raw_hooks.and_then(|hooks| hooks.get(index))) {
+                            Ok((server, args)) => {
+                                handler.command = Some(server);
+                                handler.args = Some(args);
+                                handler.condition = None;
+                                handler.env.clear();
+                                kept.push(handler);
+                            }
+                            Err(error) => tracing::warn!(
+                                "hooks: skipping one mcp_tool hook for event {event:?}: {error}"
+                            ),
+                        }
+                    }
+                    kind @ ("prompt" | "agent") => {
+                        match model_binding(raw_hooks.and_then(|hooks| hooks.get(index)), kind) {
+                            Ok((prompt, args)) => {
+                                handler.command = Some(prompt);
+                                handler.args = args;
+                                handler.condition = None;
+                                handler.env.clear();
+                                kept.push(handler);
+                            }
+                            Err(error) => tracing::warn!(
+                                "hooks: skipping one {kind} hook for event {event:?}: {error}"
+                            ),
+                        }
+                    }
                     other => tracing::warn!(
                         "hooks: skipping one hook of unsupported type {other:?} for event {event:?}; this build runs {} (other hooks in the file stay loaded)",
                         SUPPORTED_HOOK_TYPES.join(", ")

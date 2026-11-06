@@ -59,6 +59,8 @@ pub(crate) struct CommandTemplate {
     /// Existing quick-model alias or raw id; normal model persistence applies.
     pub(crate) model: Option<String>,
     pub(crate) security_mode: Option<String>,
+    /// Claude Code `argument-hint`, shown as the input hint (display only).
+    pub(crate) argument_hint: Option<String>,
     segments: Vec<Segment>,
 }
 
@@ -110,6 +112,7 @@ impl CommandTemplate {
         let mut description = String::new();
         let mut mode = None;
         let mut model = None;
+        let mut argument_hint = None;
         if text
             .lines()
             .next()
@@ -142,7 +145,11 @@ impl CommandTemplate {
                     Some("model") => model = Some(bounded_field(value, 256)?),
                     // Claude Code fields accepted for portability. They grant
                     // nothing here: `allowed-tools` never widens permissions.
-                    Some("argument-hint" | "allowed-tools" | "disable-model-invocation") => {}
+                    Some("argument-hint") => {
+                        // Display-only: a malformed hint is dropped, not fatal.
+                        argument_hint = bounded_field(value, 128).ok();
+                    }
+                    Some("allowed-tools" | "disable-model-invocation") => {}
                     _ => {
                         return Err(
                             "unsupported frontmatter field (only description, mode, model)".into(),
@@ -174,8 +181,17 @@ impl CommandTemplate {
             mode,
             model,
             security_mode,
+            argument_hint,
             segments,
         })
+    }
+
+    /// Whether expansion reads workspace files (and so needs a read policy).
+    #[cfg(any(feature = "acp", test))]
+    pub(crate) fn has_includes(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| matches!(segment, Segment::Include(_)))
     }
 
     /// Includes are authorized against the pre-command read policy. Ask is
@@ -676,6 +692,19 @@ mod tests {
         ] {
             assert!(CommandTemplate::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn argument_hint_is_display_only_and_includes_are_detected() {
+        let template = CommandTemplate::parse(
+            "---\nargument-hint: \"[issue-number]\"\n---\nFix $1 using @README.md",
+        )
+        .unwrap();
+        assert_eq!(template.argument_hint.as_deref(), Some("[issue-number]"));
+        assert!(template.has_includes());
+        let plain = CommandTemplate::parse("---\nargument-hint: [a, b]\n---\nFix $1").unwrap();
+        assert_eq!(plain.argument_hint, None);
+        assert!(!plain.has_includes());
     }
 
     #[test]

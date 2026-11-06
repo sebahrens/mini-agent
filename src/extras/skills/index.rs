@@ -54,6 +54,9 @@ pub struct AgentSkillSearchPolicy {
     pub catalog_byte_budget: usize,
     /// Discovered/imported packages across all roots (`skills_max_packages`).
     pub max_packages: usize,
+    /// Largest non-`SKILL.md` file in a discovered package
+    /// (`skills_max_resource_bytes`).
+    pub max_resource_bytes: usize,
 }
 
 static CONFIGURED_POLICY: std::sync::OnceLock<AgentSkillSearchPolicy> = std::sync::OnceLock::new();
@@ -77,6 +80,11 @@ impl AgentSkillSearchPolicy {
             max_packages: cfg
                 .skills_max_packages
                 .map_or(defaults.max_packages, |value| value.clamp(1, 1024)),
+            max_resource_bytes: cfg
+                .skills_max_resource_bytes
+                .map_or(defaults.max_resource_bytes, |value| {
+                    value.clamp(1, 8 * 1024 * 1024)
+                }),
             ..defaults
         });
     }
@@ -98,6 +106,7 @@ impl Default for AgentSkillSearchPolicy {
             instruction_byte_budget: super::MAX_SKILL_INSTRUCTION_BYTES as usize,
             catalog_byte_budget: 0,
             max_packages: 64,
+            max_resource_bytes: 1024 * 1024,
         }
     }
 }

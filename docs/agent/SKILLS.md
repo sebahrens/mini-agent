@@ -5,8 +5,10 @@ learned retrieval dependencies. The opt-in `skills` feature additionally enables
 skills. The two types keep their existing authority boundaries:
 
 - Agent Skills are content-addressed instruction packages. Explicit imports take precedence,
-  followed by captured project `.mini-agent/skills`, `.claude/skills`, and
-  the captured user's `~/.claude/skills`. Project roots require the existing project-config trust
+  followed by captured project `.mini-agent/skills`, `.claude/skills`, `.agents/skills`, the same
+  two (`.claude`, `.agents`) in each directory between the launch directory and the workspace
+  root (nearest first, at most 8 levels), and the captured user's `~/.claude/skills` then
+  `~/.agents/skills`. The first valid name wins in that order. Project and nested roots require the existing project-config trust
   fingerprint; original files require current read authority. Ask/Deny sources are omitted without
   prompting. Links, hard links, special files and escaping resources are refused. Only
   bounded metadata is indexed; a selected `SKILL.md` is loaded progressively, and resource content

@@ -1779,7 +1779,7 @@ async fn handle_new_session(
     // Permission modes are the ACP session modes; the persona (prompt and its
     // `[prompt_to_model]` route) is the `mode` session config option.
     let config_options = persona_config_options(state, &session_id).await;
-    commands::announce(&session_id, &cx)?;
+    commands::announce(state, &session_id, &cx).await?;
     let resp = NewSessionResponse::new(session_id)
         .modes(modes)
         .config_options(config_options);
@@ -2583,7 +2583,31 @@ async fn handle_prompt(
     }
 
     let command = commands::classify(&req.prompt)?;
-    let prompt_input = parse_prompt_blocks(&req.prompt)?;
+    // A user-defined prompt command expands to one ordinary user text block;
+    // everything downstream (and agent-mention routing) sees that block.
+    let mut prompt_blocks = req.prompt.clone();
+    #[cfg_attr(
+        not(feature = "subagents"),
+        allow(unused_variables, unused_assignments)
+    )]
+    let mut expanded_custom = false;
+    if command.is_none() && commands::invocation(&req.prompt).is_some() {
+        let workspace = state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|sess| sess.workspace.clone());
+        if let Some(workspace) = workspace
+            && let Some(text) =
+                commands::expand_custom(&state.cli, &state.cfg, workspace, &req.prompt).await?
+        {
+            prompt_blocks = vec![ContentBlock::Text(TextContent::new(text))];
+            expanded_custom = true;
+        }
+    }
+    let prompt_input = parse_prompt_blocks(&prompt_blocks)?;
+    let _ = expanded_custom; // read only by agent-mention routing (`subagents`)
 
     let snapshot = {
         let sessions = state.sessions.lock().await;
@@ -2598,11 +2622,12 @@ async fn handle_prompt(
     // invalid prompt, and before `_meta.goal` so a refused prompt changes
     // nothing. Commands are never parsed.
     #[cfg(feature = "subagents")]
-    let prompt_input = if command.is_none() && state.cfg.resolve_headless_agent_mentions() {
-        route_prompt_agent_mentions(&req.prompt, &snapshot.workspace, prompt_input)?
-    } else {
-        prompt_input
-    };
+    let prompt_input =
+        if command.is_none() && !expanded_custom && state.cfg.resolve_headless_agent_mentions() {
+            route_prompt_agent_mentions(&req.prompt, &snapshot.workspace, prompt_input)?
+        } else {
+            prompt_input
+        };
 
     // A client sets or clears the session's goal through the request's `_meta`
     // rather than through prompt text: the objective is a long-lived

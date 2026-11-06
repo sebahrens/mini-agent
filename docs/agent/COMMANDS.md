@@ -167,7 +167,7 @@ startup config. See Prompts & Themes below.
 
 ## Hooks
 
-Requires the `hooks` feature (default-off; see [CONFIG.md](CONFIG.md#hooks)).
+Requires the `hooks` feature (default-on; absent in lite/no-default builds; see [CONFIG.md](CONFIG.md#hooks)).
 
 | Command | Description |
 | ------- | ----------- |
@@ -941,6 +941,15 @@ Includes and supplied arguments cannot introduce another include or directive.
 Arguments are limited to 64 KiB and the expanded message to 256 KiB, followed by
 the normal context-budget check. Templates submit prompts through normal tools
 and permissions; they never execute their body as shell or slash commands.
+
+Over ACP, `session/new` and `session/load` advertise the same trusted command set for the session
+workspace (description, and `argument-hint` as the input hint), and a `session/prompt` that is one
+text block `/name args` is expanded with the same trust rules and limits (64 KiB arguments, 8
+includes, 256 KiB expansion) into one ordinary user message. Include reads need existing read
+permission and fail closed when approval would be required. `mode` and `model` frontmatter and an
+authored `%%mode` are not applied over ACP (the editor owns those selections). An unknown name is
+sent to the model as literal text, as before. Headless `-p` does not expand custom commands: a
+leading `/name` stays literal prompt text.
 ### Context composition
 
 `/context` shows estimates by section and the five largest live retained tool
@@ -971,9 +980,10 @@ user turn, including its automatic continuations. The arguments are literal user
 expand shell variables, file includes or permission directives. A later explicit user prompt removes
 the pin. Built-in commands and custom command templates take precedence over skill names.
 
-Discovery checks explicitly imported packages first, then captured project `.mini-agent/skills`
-and `.claude/skills`, then the captured user's `~/.claude/skills`. First valid name
-wins. Project sources use the existing project-config trust fingerprint; each original source also
+Discovery checks explicitly imported packages first, then captured project `.mini-agent/skills`,
+`.claude/skills` and `.agents/skills`, nested `.claude/skills` / `.agents/skills` between the launch
+directory and the workspace root, then the captured user's `~/.claude/skills` and
+`~/.agents/skills`. First valid name wins. Project sources use the existing project-config trust fingerprint; each original source also
 requires current read authority. An Ask or Deny source is omitted without prompting or granting.
 Links, special files, hard links and escaping resources are refused. Scripts and `allowed-tools`
 remain inert. A pin that has changed, lost authority or cannot fit the shared context budget fails

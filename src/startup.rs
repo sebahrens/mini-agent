@@ -1748,6 +1748,15 @@ impl Startup {
         self.ask_rx = ask_rx;
 
         // Advisor setup
+        #[cfg(feature = "hooks")]
+        crate::extras::hooks::backend::install_model_runner(
+            crate::extras::hooks::backend::ModelRunner {
+                client: self.client.clone(),
+                provider: self.provider.to_string(),
+                model: self.model.to_string(),
+                cfg: std::sync::Arc::new(self.cfg.clone()),
+            },
+        );
         #[cfg(feature = "advisor")]
         {
             let enabled = self.cli.resolve_advisor_enabled(&self.cfg);
