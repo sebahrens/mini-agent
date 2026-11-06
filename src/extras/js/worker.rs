@@ -1383,24 +1383,40 @@ const CONSOLE_WRAPPER_SOURCE: &str = r#"
 })
 "#;
 
+/// Bounds a string completion value to `MAX_RESULT_BYTES` (65536) UTF-8
+/// bytes. An oversized string is cut at a code-point boundary and ends with a
+/// visible marker that states its full size and the cap, so the model never
+/// receives silently truncated text and never loses the whole value.
 const STRING_GATE_SOURCE: &str = r#"
 (() => {
     const uncurryThis = Function.prototype.bind.bind(Function.prototype.call);
     const charCodeAt = uncurryThis(String.prototype.charCodeAt);
+    const slice = uncurryThis(String.prototype.slice);
+    const LIMIT = 65536;
+    const BUDGET = LIMIT - 512;
     return value => {
         let bytes = 0;
+        let cut = -1;
+        let shown = 0;
         for (let index = 0; index < value.length; index += 1) {
             const unit = charCodeAt(value, index);
-            if (unit <= 0x7f) bytes += 1;
-            else if (unit <= 0x7ff) bytes += 2;
+            let width;
+            let pair = false;
+            if (unit <= 0x7f) width = 1;
+            else if (unit <= 0x7ff) width = 2;
             else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < value.length) {
                 const next = charCodeAt(value, index + 1);
-                if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; index += 1; }
-                else bytes += 3;
-            } else bytes += 3;
-            if (bytes > 65536) throw 0;
+                if (next >= 0xdc00 && next <= 0xdfff) { width = 4; pair = true; }
+                else width = 3;
+            } else width = 3;
+            if (cut < 0 && bytes + width > BUDGET) { cut = index; shown = bytes; }
+            bytes += width;
+            if (pair) index += 1;
         }
-        return value;
+        if (bytes <= LIMIT) return value;
+        return slice(value, 0, cut) + "\n[... js result truncated: " + bytes +
+            " UTF-8 bytes in total, the first " + shown +
+            " shown; returned values are capped at 65536 bytes. Return a narrower projection or a slice, use result() for structured data up to 256 KiB, or keep the value with scratch_put and read it in parts ...]";
     };
 })()
 "#;
@@ -1645,6 +1661,7 @@ fn trusted_bootstrap_source() -> String {
     format!(
         "export const strictClone = {STRICT_CLONE_SOURCE};\n\
          export const sessionJsonClone = {session_json_clone};\n\
+         export const modelResultClone = sessionJsonClone;\n\
          const sessionJsonParse = JSON.parse;\n\
          export const sessionResultWrapper = dispatch => value => dispatch(sessionJsonClone(value));\n\
          export const scratchPutWrapper = dispatch => (key, value) => dispatch(key, sessionJsonClone(value));\n\
@@ -1680,6 +1697,9 @@ fn trusted_bootstrap_bytecode() -> Option<&'static [u8]> {
 
 struct TrustedBootstrapFunctions {
     strict_clone: Persistent<Function<'static>>,
+    /// Model completion values may encode up to 1 MiB; the parent-visible
+    /// value is then cut to `MAX_RESULT_BYTES` with a size marker.
+    model_result_clone: Persistent<Function<'static>>,
     session_result_wrapper: Persistent<Function<'static>>,
     scratch_put_wrapper: Persistent<Function<'static>>,
     scratch_get_wrapper: Persistent<Function<'static>>,
@@ -1702,6 +1722,7 @@ fn load_trusted_bootstrap_functions(
         let (module, evaluation) = module.eval()?;
         evaluation.finish::<()>()?;
         let clone = module.get::<_, Function>("strictClone")?;
+        let model_result_clone = module.get::<_, Function>("modelResultClone")?;
         let session_result_wrapper = module.get::<_, Function>("sessionResultWrapper")?;
         let scratch_put_wrapper = module.get::<_, Function>("scratchPutWrapper")?;
         let scratch_get_wrapper = module.get::<_, Function>("scratchGetWrapper")?;
@@ -1711,6 +1732,7 @@ fn load_trusted_bootstrap_functions(
         let async_completion_value = module.get::<_, Function>("asyncCompletionValue")?;
         Ok(TrustedBootstrapFunctions {
             strict_clone: Persistent::save(&ctx, clone),
+            model_result_clone: Persistent::save(&ctx, model_result_clone),
             session_result_wrapper: Persistent::save(&ctx, session_result_wrapper),
             scratch_put_wrapper: Persistent::save(&ctx, scratch_put_wrapper),
             scratch_get_wrapper: Persistent::save(&ctx, scratch_get_wrapper),
@@ -1784,6 +1806,25 @@ mod trusted_bootstrap_bytecode_tests {
         ordered.sort_unstable();
         let rank = (ordered.len() * percentile).div_ceil(100);
         ordered[rank.saturating_sub(1)].as_secs_f64() * 1_000_000.0
+    }
+
+    #[test]
+    fn oversized_encoded_results_are_cut_for_the_model_and_rejected_for_verification() {
+        let small = "{\"a\":1}".to_string();
+        assert_eq!(
+            bound_encoded_result(small.clone(), ScriptRole::Model),
+            Some(small)
+        );
+        let exact = format!("\"{}\"", "z".repeat(MAX_RESULT_BYTES - 2));
+        assert_eq!(
+            bound_encoded_result(exact.clone(), ScriptRole::Model).as_deref(),
+            Some(exact.as_str())
+        );
+        let over = format!("\"{}\"", "é".repeat(MAX_RESULT_BYTES));
+        let bounded = bound_encoded_result(over.clone(), ScriptRole::Model).unwrap();
+        assert!(bounded.len() <= MAX_RESULT_BYTES);
+        assert!(bounded.contains(&format!("the JSON value is {} bytes", over.len())));
+        assert_eq!(bound_encoded_result(over, ScriptRole::EmbeddedTest), None);
     }
 
     #[test]
@@ -3354,7 +3395,11 @@ fn execute_fresh_step(
                 )
             })?;
         }
-        let clone = functions.strict_clone;
+        let clone = if role == ScriptRole::Model {
+            functions.model_result_clone
+        } else {
+            functions.strict_clone
+        };
         let string_gate = functions.string_gate;
         let exception_inspector = functions.exception_inspector;
         let async_completion_value = functions.async_completion_value;
@@ -3866,14 +3911,41 @@ fn convert_value<'js>(
             ),
         }
     })?;
-    if encoded.len() > MAX_RESULT_BYTES {
-        return Err(ClosedFailure::error(
-            JsErrorCode::InvalidResult,
-            DiagnosticStage::ResultConversion,
-            role,
-        ));
+    bound_encoded_result(encoded, role)
+        .map(StepOutcome::Value)
+        .ok_or_else(|| {
+            ClosedFailure::error(
+                JsErrorCode::InvalidResult,
+                DiagnosticStage::ResultConversion,
+                role,
+            )
+        })
+}
+
+/// Bound a JSON-encoded completion value. A model step's oversized value is
+/// cut on a character boundary with a marker naming its size and the cap
+/// (the text is then no longer valid JSON, and says so); verification roles
+/// keep the strict contract and fail.
+fn bound_encoded_result(encoded: String, role: ScriptRole) -> Option<String> {
+    if encoded.len() <= MAX_RESULT_BYTES {
+        return Some(encoded);
     }
-    Ok(StepOutcome::Value(encoded))
+    if role != ScriptRole::Model {
+        return None;
+    }
+    let marker = format!(
+        "\n[... js result truncated: the JSON value is {} bytes, the first {{shown}} shown (no longer valid JSON); returned values are capped at {} bytes. Return a narrower projection, use result() for structured data up to 256 KiB, or keep it with scratch_put and read it in parts ...]",
+        encoded.len(),
+        MAX_RESULT_BYTES
+    );
+    let mut end = MAX_RESULT_BYTES - marker.len() - 16;
+    while !encoded.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = encoded[..end].to_string();
+    bounded.push_str(&marker.replace("{shown}", &end.to_string()));
+    debug_assert!(bounded.len() <= MAX_RESULT_BYTES);
+    Some(bounded)
 }
 
 fn initialization_failure(error: Error, role: ScriptRole) -> ClosedFailure {

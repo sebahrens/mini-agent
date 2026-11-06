@@ -407,7 +407,23 @@ descriptor-only plain JSON up to 256 KiB, is parent-validated and durably
 audited, and stops later JavaScript/effects after acknowledgement. The tool
 returns that JSON directly without another model round trip. Ordinary final
 expressions remain limited to strings, finite scalars, or plain JSON and use the
-smaller 64 KiB result channel.
+smaller 64 KiB result channel. A model step whose final value is larger is not
+failed: a string is cut on a code-point boundary and a plain JSON value (encoded
+up to 1 MiB, 100,000 nodes) is cut on a character boundary, each followed by a
+marker naming the full size in bytes and the 64 KiB cap (a cut JSON value says it
+is no longer valid JSON). Verification roles (embedded, mutation, inherited and
+held-out skill tests) keep the strict 64 KiB contract and fail with
+`invalid_result`. Non-JSON values still fail with `invalid_result`.
+
+#### JavaScript step output limits
+
+| Limit | Value | When exceeded |
+|-------|-------|---------------|
+| Final expression value | 64 KiB UTF-8 (`MAX_RESULT_BYTES`) | Model steps: truncated with a size marker; verification roles: `invalid_result` |
+| `result(value)` structured result | 256 KiB | The call throws `too_large` |
+| Console records | 256 per step | Later records are dropped; the last kept record is marked `[truncated]` and the result ends with a cap notice |
+| Console total | 256 KiB per step | As above |
+| Console record | 8 KiB each | The record is cut and marked `[truncated]` |
 
 
 ## Turn-scoped cron tool

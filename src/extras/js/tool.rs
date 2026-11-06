@@ -1132,7 +1132,8 @@ impl Tool for JsTool {
                  `read_lines`. {} `console.log` is available for bounded diagnostics. {} Writer, network, process, session-state, proposal, batch-read, and \
                  glob globals are absent. Return a string, finite number, boolean, or \
                  accessor-free plain JSON value. Limits per call: {} s total, {} MiB JavaScript \
-                 heap, {} KiB JavaScript stack, {} KiB result, and {} read effects.",
+                 heap, {} KiB JavaScript stack, {} KiB result (excess is cut with a size \
+                 note), and {} read effects.",
                 helper_globals_doc().join(" "),
                 READ_ONLY_IDIOMS,
                 STEP_TIMEOUT.as_secs(),
@@ -1239,7 +1240,7 @@ impl Tool for JsTool {
              a validated structured result and `scratch_put`/`scratch_get` for JSON values that \
              must survive the next fresh-runtime call. {} \
              Limits per call: {} s total, {} MiB JavaScript heap, {} KiB JavaScript stack, {} KiB \
-             result, and {} effect calls. The next effect returns a closed effect-limit error while \
+             result (excess is cut with a size note), and {} effect calls. The next effect returns a closed effect-limit error while \
              preserving bounded console output. Catchable effect failures are plain `Error` \
              objects with a stable `.code` such as `not_found`, `is_directory`, `denied`, \
              `invalid_target`, or `too_large`; messages never include the target. Runtime failures \
@@ -2009,7 +2010,7 @@ fn render_failure(headline: &str, result: &StepResult) -> String {
 fn js_error_headline(code: JsErrorCode, diagnostic: Option<&Diagnostic>) -> String {
     if code == JsErrorCode::InvalidResult {
         return format!(
-            "JS error: invalid result; return a string/plain JSON value of at most {} KiB or end with JSON.stringify(value) (cap for returned values; result(value), where available, allows {} KiB)",
+            "JS error: invalid result; return a string, finite number, boolean or accessor-free plain JSON value, or end with JSON.stringify(value). Values larger than {} KiB are returned truncated with a size marker; result(value), where available, allows {} KiB of structured data",
             MAX_RESULT_BYTES / 1024,
             STRUCTURED_RESULT_MAX_BYTES / 1024
         );
@@ -2056,6 +2057,18 @@ fn render_console(records: &[ConsoleRecord], text: &mut String) {
             text.push_str(" [truncated]");
         }
         text.push('\n');
+    }
+    // The worker marks the last kept record when it drops later ones; make
+    // reaching the cap explicit instead of leaving only that flag.
+    let total: usize = records.iter().map(|record| record.text.len()).sum();
+    let capped = records.len() >= MAX_CONSOLE_RECORDS
+        || total + MAX_CONSOLE_RECORD_BYTES > MAX_CONSOLE_BYTES;
+    if capped && records.last().is_some_and(|record| record.truncated) {
+        text.push_str(&format!(
+            "[console output reached its cap ({MAX_CONSOLE_RECORDS} records, {} KiB total, {} KiB per record); later console output was dropped. Log less, aggregate before logging, or return the data as the result]\n",
+            MAX_CONSOLE_BYTES / 1024,
+            MAX_CONSOLE_RECORD_BYTES / 1024
+        ));
     }
 }
 
@@ -3201,6 +3214,73 @@ mod js_permission_bridge {
     }
 
     #[tokio::test]
+    async fn oversized_results_are_truncated_with_size_and_console_cap_is_visible() {
+        use rig::tool::Tool;
+
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor,
+            shared_effect_audit().expect("test effect audit"),
+        );
+        let run = |code: String| {
+            let tool = &tool;
+            async move { tool.call(JsArgs { code }).await.unwrap() }
+        };
+        assert_eq!(
+            MAX_RESULT_BYTES, 65_536,
+            "the JS string gate hard-codes this cap"
+        );
+        let exact = run(format!("'x'.repeat({MAX_RESULT_BYTES})")).await;
+        assert_eq!(exact.len(), MAX_RESULT_BYTES);
+        assert!(!exact.contains("truncated"));
+        let over = run(format!("'x'.repeat({})", MAX_RESULT_BYTES + 1)).await;
+        assert!(over.len() <= MAX_RESULT_BYTES, "{}", over.len());
+        assert!(
+            over.contains("js result truncated: 65537 UTF-8 bytes in total"),
+            "{}",
+            &over[over.len() - 300..]
+        );
+        let large = run("'é'.repeat(102400)".to_string()).await;
+        assert!(
+            large.contains("204800 UTF-8 bytes in total"),
+            "{}",
+            &large[large.len() - 300..]
+        );
+        assert!(large.starts_with("éé"));
+        let object = run("({data: 'y'.repeat(70000)})".to_string()).await;
+        assert!(object.len() <= MAX_RESULT_BYTES);
+        assert!(object.contains("yyyy"), "{}", &object[..200]);
+        assert!(
+            object.contains("the JSON value is 70011 bytes"),
+            "{}",
+            &object[object.len() - 300..]
+        );
+
+        let console =
+            run("for (let i = 0; i < 257; i += 1) console.log('rec-' + i); 'done'".to_string())
+                .await;
+        assert!(console.contains("rec-255"), "{console}");
+        assert!(!console.contains("rec-256"), "{console}");
+        assert!(
+            console.contains("console output reached its cap (256 records"),
+            "{console}"
+        );
+        let within =
+            run("for (let i = 0; i < 256; i += 1) console.log('ok-' + i); 1".to_string()).await;
+        assert!(within.contains("ok-255"));
+        assert!(
+            !within.contains("reached its cap"),
+            "256 records fit exactly"
+        );
+    }
+
+    #[tokio::test]
     async fn structured_result_expands_the_legacy_limit_but_keeps_its_own_cap() {
         use rig::tool::Tool;
 
@@ -3500,11 +3580,12 @@ mod js_permission_bridge {
         // baseline plus 227 bytes for toml_parse/csv_parse (4831 measured); it must stay modest.
         // The bound later absorbed other work (4956 bytes before the help() sentence) and rises
         // by exactly the 43 bytes of " Other pure helpers are listed by `help()`." (4999 measured).
+        // The oversized-result note " (excess is cut with a size note)" adds 33 bytes.
         let full = helper_tool(ModelEffectProfile::Full, &root)
             .description()
             .len();
         assert!(
-            full < 3384 + 1350 + 230 + 43,
+            full < 3384 + 1350 + 230 + 43 + 33,
             "full description is {full} bytes"
         );
     }
@@ -4304,7 +4385,7 @@ mod step_result_rendering {
         );
         assert_eq!(
             render_step_result(&invalid_result),
-            "JS error: invalid result; return a string/plain JSON value of at most 64 KiB or end with JSON.stringify(value) (cap for returned values; result(value), where available, allows 256 KiB) (stage: result_conversion; script: model)"
+            "JS error: invalid result; return a string, finite number, boolean or accessor-free plain JSON value, or end with JSON.stringify(value). Values larger than 64 KiB are returned truncated with a size marker; result(value), where available, allows 256 KiB of structured data (stage: result_conversion; script: model)"
         );
         let oom = step(
             StepOutcome::OutOfMemory,
@@ -4661,7 +4742,11 @@ mod error_ergonomics_tests {
             js_error_headline(JsErrorCode::EffectLimit, diag),
             "JS error: effect limit exceeded (256 per call); batch with read_files(paths) or glob()"
         );
-        assert!(js_error_headline(JsErrorCode::InvalidResult, diag).contains("at most 64 KiB"));
+        let invalid = js_error_headline(JsErrorCode::InvalidResult, diag);
+        assert!(
+            invalid.contains("64 KiB") && invalid.contains("truncated"),
+            "{invalid}"
+        );
     }
 
     #[test]

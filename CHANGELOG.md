@@ -35,6 +35,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   tool-output directory, and `job_status` poll/wait/stop return only output not returned before
   (64 KiB per call) with a `since` offset for re-reading any range. Pruned job records keep their
   log path (mini-agent-qlef1).
+- A `js` step whose final value exceeds 64 KiB now returns the value truncated with a marker that
+  states its full size and the cap instead of failing with `invalid_result` (verification roles keep
+  the strict contract), and reaching the console cap (256 records / 256 KiB) adds a visible notice.
+  The output limits are tabulated in `docs/agent/TOOL_RUNTIME.md` (mini-agent-6tcp3).
 
 **Fork release 1.14.2 (2026-10-28)**
 
