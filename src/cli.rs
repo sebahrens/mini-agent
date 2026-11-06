@@ -180,7 +180,7 @@ pub struct Cli {
         long = "add-dir",
         value_name = "DIR",
         action = clap::ArgAction::Append,
-        help = "Also discover Agent Skills in DIR/.claude/skills and DIR/.agents/skills; repeatable (adds to skills_extra_dirs)"
+        help = "Also discover Agent Skills in DIR/.claude/skills and DIR/.agents/skills; repeatable (adds to skills_extra_dirs). Unlike Claude Code it grants no file access to DIR unless add_dir_tool_access = true"
     )]
     pub add_dir: Vec<std::path::PathBuf>,
 

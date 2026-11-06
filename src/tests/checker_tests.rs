@@ -1352,6 +1352,86 @@ fn external_directory_deny_remains_active_in_readonly_mode() {
 }
 
 #[test]
+fn add_dir_access_is_default_closed_scoped_and_still_permission_checked() {
+    use crate::permission::grant_add_dir_access;
+    let root = crate::tests::OwnedTestDirectory::new("adddiracc");
+    let added = root.path().join("lib");
+    let sibling = root.path().join("lib-other");
+    std::fs::create_dir_all(added.join("secret")).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    let file = |dir: &std::path::Path, name: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, "x").unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let (in_added, in_secret, in_sibling) = (
+        file(&added, "a.rs"),
+        file(&added.join("secret"), "k.txt"),
+        file(&sibling, "b.rs"),
+    );
+    let make = || {
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [("**/secret/**".to_string(), Action::Deny)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        PermissionChecker::new(
+            &configs_from(config),
+            SecurityMode::Standard,
+            Some(test_workspace()),
+            None,
+        )
+        .expect("valid permission test configuration")
+    };
+    let cli = crate::cli::Cli {
+        add_dir: vec![added.clone()],
+        ..Default::default()
+    };
+    // Default closed: --add-dir alone (key unset or false) grants nothing.
+    for flag in [None, Some(false)] {
+        let mut checker = make();
+        let cfg = crate::config::Config {
+            add_dir_tool_access: flag,
+            ..Default::default()
+        };
+        grant_add_dir_access(&mut checker, &cli, &cfg);
+        assert_eq!(checker.check_path("read", &in_added), CheckResult::Ask);
+    }
+    // Opted in: the added tree is reachable, a prefix-sharing sibling is not,
+    // and the user's own read deny inside the tree still wins.
+    let mut checker = make();
+    let cfg = crate::config::Config {
+        add_dir_tool_access: Some(true),
+        ..Default::default()
+    };
+    grant_add_dir_access(&mut checker, &cli, &cfg);
+    assert_eq!(checker.check_path("read", &in_added), CheckResult::Allowed);
+    assert!(matches!(
+        checker.check_path("read", &in_secret),
+        CheckResult::Denied(_)
+    ));
+    assert_eq!(checker.check_path("read", &in_sibling), CheckResult::Ask);
+    // An explicit external_directory deny beats the added-directory allow.
+    let config = PermissionConfig {
+        external_directory: Some([(format!("{}/**", added.display()), Action::Deny)].into()),
+        ..PermissionConfig::default()
+    };
+    let mut denied = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        Some(test_workspace()),
+        None,
+    )
+    .unwrap();
+    grant_add_dir_access(&mut denied, &cli, &cfg);
+    assert!(matches!(
+        denied.check_path("read", &in_added),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[test]
 fn check_path_normalizes_parent_components_before_policy_matching() {
     let config = PermissionConfig {
         write: Some(ToolPerm::Granular(
