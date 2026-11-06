@@ -1808,3 +1808,44 @@ fn saved_cron_schedules_round_trip_and_unknown_fields_are_ignored() {
     assert_eq!(tolerant.cron_schedule, s.cron_schedule);
     drop(env);
 }
+
+// mini-agent-p5o61: `session_retention_days` removes only stale, unowned
+// UUID-named snapshots; 0 keeps everything.
+#[test]
+fn session_retention_prunes_only_stale_unowned_sessions() {
+    let env = setup_test_env();
+    let stale = Session::new("openai", "gpt-4", 128_000, "stale");
+    save_session(&stale).unwrap();
+    let owned = Session::new("openai", "gpt-4", 128_000, "owned");
+    save_session(&owned).unwrap();
+    let fresh = Session::new("openai", "gpt-4", 128_000, "fresh");
+    save_session(&fresh).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+    for id in [&stale.id, &owned.id] {
+        std::fs::File::options()
+            .write(true)
+            .open(crate::session::storage::session_path(id).unwrap())
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let now = std::time::SystemTime::now();
+    assert_eq!(
+        crate::session::storage::prune_sessions_older_than(0, now).unwrap(),
+        0
+    );
+    assert!(load_session_exact(&stale.id).unwrap().is_some());
+    // Saving claims a session; only `owned` stays held by this process.
+    crate::session::lock::release_session(&stale.id);
+    crate::session::lock::release_session(&fresh.id);
+    crate::session::lock::claim_session(&owned.id).unwrap();
+    assert_eq!(
+        crate::session::storage::prune_sessions_older_than(30, now).unwrap(),
+        1
+    );
+    assert!(load_session_exact(&stale.id).unwrap().is_none());
+    assert!(load_session_exact(&owned.id).unwrap().is_some());
+    assert!(load_session_exact(&fresh.id).unwrap().is_some());
+    crate::session::lock::release_session(&owned.id);
+    drop(env);
+}

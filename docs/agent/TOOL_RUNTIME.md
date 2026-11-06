@@ -503,7 +503,12 @@ Executing a custom command always uses the uncached loader.
 
 [`src/session/catalogue.rs`](../../src/session/catalogue.rs) reads private,
 no-follow, single-link UUID session files through bounded metadata discovery:
-2,048 directory entries, 32 MiB per file, 256 MiB total, and 100 displayed rows.
+up to 50,000 directory entries are stat'ed and sorted newest-first by mtime
+before any cap applies; then at most 2,048 full header reads, 32 MiB per file,
+256 MiB total, and 100 displayed rows. A workspace-scoped listing first peeks the
+4 KiB file head for `working_dir`, so other workspaces' sessions are skipped
+without spending the header or byte budget. `session_retention_days` (CONFIG.md)
+optionally prunes stale snapshots.
 Discovery streams the complete JSON, accepting legacy field order even when
 workspace metadata follows messages. It retains at most 4,096 preview characters
 per string and refuses exact identity/workspace/provider metadata above 64 KiB;

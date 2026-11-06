@@ -746,6 +746,10 @@ pub struct Config {
     #[cfg(feature = "advisor")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advisor: Option<types::AdvisorConfig>,
+    /// Delete saved session snapshots not modified for this many days at
+    /// interactive startup. `None`/`0` (default) keeps sessions forever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_retention_days: Option<u32>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///

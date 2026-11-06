@@ -15,6 +15,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `/sessions` and the `--resume` picker sort the whole sessions directory by mtime before applying
+  the 2,048-entry cap, and a workspace listing skips other workspaces' sessions via a 4 KiB head
+  peek instead of charging them to the 256 MiB budget, so the newest current-workspace sessions are
+  always listed. New `session_retention_days` (default 0: keep forever) prunes stale, unlocked
+  session snapshots at interactive startup.
 - Nested `AGENTS.md`/`CLAUDE.md` loading no longer makes `read`/`edit`/`write` fail after 64
   distinct directories, 64 sources or 128 KiB: directories without instruction files no longer
   count, budget overflow skips the directory with a visible "sources not shown" notice, a source

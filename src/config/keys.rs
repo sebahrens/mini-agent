@@ -315,6 +315,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("subagents", "agent_mention_tool_choice").described("@agent:<name> mention turns: hint (default) attaches only the routing note; force also sets tool_choice to the task tool on the turn's first request where the provider supports it.").shaped(ConfigShape::Enum(&["hint", "force"])),
     key("colors").shaped(ConfigShape::Object),
     key("chain").shaped(ConfigShape::Object),
+    key("session_retention_days").described("Delete saved sessions not modified for this many days at interactive startup (default 0: keep forever). Sessions open in a live process are never removed.").shaped(ConfigShape::Integer),
     gated("lsp", "lsp").shaped(ConfigShape::Object),
     gated("advisor", "advisor").shaped(ConfigShape::Object),
 ];

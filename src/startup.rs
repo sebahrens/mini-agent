@@ -2844,6 +2844,17 @@ impl Startup {
         } = self;
 
         crate::update::spawn_startup_notice(&cli, &cfg, is_interactive, &paths.state_dir);
+        if let Some(days) = cfg.session_retention_days.filter(|days| *days > 0) {
+            // The current session is already claimed, so it is never pruned.
+            std::thread::spawn(move || {
+                if let Err(error) = crate::session::storage::prune_sessions_older_than(
+                    days,
+                    std::time::SystemTime::now(),
+                ) {
+                    tracing::warn!("session retention skipped: {error:#}");
+                }
+            });
+        }
         // Creating a context-file template is a filesystem setup action, not
         // permission to start an agent turn. Only an explicit CLI message may
         // auto-trigger interactive execution.
