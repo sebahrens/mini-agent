@@ -237,6 +237,15 @@ pub struct Cli {
     pub max_stdin_bytes: Option<u32>,
 
     #[arg(
+        long = "stdin-idle-secs",
+        value_name = "SECS",
+        requires = "print",
+        value_parser = clap::value_parser!(u32).range(0..=86_400),
+        help = "With -p and an explicit prompt: seconds to wait for a silent piped stdin to produce data or EOF before running without it (0 = wait for EOF; default 2)"
+    )]
+    pub stdin_idle_secs: Option<u32>,
+
+    #[arg(
         long,
         value_name = "FILE",
         requires = "print",

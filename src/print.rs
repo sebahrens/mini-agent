@@ -174,6 +174,12 @@ static PROGRESS_BYTES: std::sync::atomic::AtomicUsize =
 static STDIN_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(HEADLESS_STDIN_BYTES);
 
+/// Default idle wait (`--stdin-idle-secs`) before an explicit `-p` prompt
+/// proceeds without a silent stdin pipe.
+pub(crate) const HEADLESS_STDIN_IDLE_SECS: u32 = 2;
+static STDIN_IDLE_SECS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(HEADLESS_STDIN_IDLE_SECS);
+
 static PARTIAL_MESSAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Completions finished so far this process; a delta's `message_id` names the
 /// completion in progress (`msg_<n>`, 1-based), so a driver can group deltas.
@@ -202,6 +208,9 @@ pub(crate) fn configure_headless_limits(cli: &cli::Cli) {
     }
     if let Some(bytes) = cli.max_stdin_bytes {
         STDIN_BYTES.store(bytes as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(secs) = cli.stdin_idle_secs {
+        STDIN_IDLE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -566,9 +575,24 @@ fn read_stdin_bounded(mut reader: impl io::Read) -> anyhow::Result<String> {
     String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("piped stdin is not UTF-8"))
 }
 
-/// How long an explicit `-p` prompt waits for an open stdin pipe to show data
-/// or EOF before running without stdin.
-const HEADLESS_STDIN_IDLE_MS: i32 = 2000;
+/// Effective idle wait in milliseconds; 0 means wait for data or EOF.
+fn stdin_idle_ms() -> i32 {
+    let secs = STDIN_IDLE_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    i32::try_from(u64::from(secs) * 1000).unwrap_or(i32::MAX)
+}
+
+/// Whether `fd` shows data or EOF within `idle_ms`; 0 never gives up.
+fn stdin_ready_within(fd: i32, idle_ms: i32) -> bool {
+    idle_ms == 0 || fd_readable_within(fd, idle_ms)
+}
+
+/// The stderr line printed when a silent stdin is abandoned.
+fn stdin_idle_notice(idle_ms: i32) -> String {
+    format!(
+        "Warning: no stdin data within {} s; running without it. For a slow producer, raise --stdin-idle-secs N or use 0 to wait for EOF.\n",
+        idle_ms / 1000
+    )
+}
 
 /// Whether `fd` is readable (data, EOF or error) within `timeout_ms`. Always
 /// true where it cannot be probed, which keeps the blocking read.
@@ -592,7 +616,7 @@ fn fd_readable_within(_fd: i32, _timeout_ms: i32) -> bool {
 }
 
 /// Read piped stdin for a headless run. With an explicit prompt, a pipe that
-/// stays silent for [`HEADLESS_STDIN_IDLE_MS`] (an open stdin that never closes,
+/// stays silent for the `--stdin-idle-secs` wait (default 2 s; an open stdin that never closes,
 /// as under a supervisor or subagent) is treated as empty instead of hanging.
 pub(crate) async fn read_headless_stdin(
     quiet: bool,
@@ -600,7 +624,11 @@ pub(crate) async fn read_headless_stdin(
 ) -> anyhow::Result<String> {
     let turn = run_headless_turn(async {
         let read = crate::agent::runner::spawn_blocking_scoped(move || {
-            if explicit_prompt && !fd_readable_within(0, HEADLESS_STDIN_IDLE_MS) {
+            let idle_ms = stdin_idle_ms();
+            if explicit_prompt && !stdin_ready_within(0, idle_ms) {
+                if !quiet {
+                    headless_stderr(format_args!("{}", stdin_idle_notice(idle_ms)));
+                }
                 return Ok(String::new());
             }
             // This notice shares the reader's owned blocking job. Emitting it
@@ -2876,6 +2904,35 @@ mod tests {
         unsafe { libc::close(w) };
         assert!(super::fd_readable_within(r, 50), "closed pipe is EOF");
         unsafe { libc::close(r) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn slow_stdin_producer_is_waited_for_only_with_longer_or_zero_idle() {
+        let mut fds = [0i32; 2];
+        // SAFETY: fds is a valid two-element array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            // SAFETY: w is a live descriptor owned by this thread.
+            unsafe {
+                libc::write(w, b"x".as_ptr().cast(), 1);
+                libc::close(w);
+            }
+        });
+        // Short idle gives up before the producer writes.
+        assert!(!super::stdin_ready_within(r, 50));
+        // A longer wait sees the late write.
+        assert!(super::stdin_ready_within(r, 5000));
+        // Zero means wait for data or EOF without a deadline.
+        assert!(super::stdin_ready_within(r, 0));
+        writer.join().unwrap();
+        // SAFETY: closing the descriptor this test opened.
+        unsafe { libc::close(r) };
+        let notice = super::stdin_idle_notice(2000);
+        assert!(notice.contains("2 s") && notice.contains("--stdin-idle-secs"));
     }
 
     use std::io;
