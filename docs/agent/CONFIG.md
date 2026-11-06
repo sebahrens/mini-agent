@@ -734,7 +734,7 @@ Accepted top-level keys:
 | `max_session_input_tokens` | integer | Optional global ceiling on input tokens (cached input included) observed across the logical session, its subagents and `/cron` fires. Needs no model prices, so it bounds unpriced providers. Once reached, further model requests and model-dispatched effects are refused like an exhausted USD budget (`stop_reason: "budget"` headless). Resumed sessions count their ledger history. An admitted request can overshoot. Project layers cannot set it. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `max_session_total_tokens` | integer | As `max_session_input_tokens`, over input plus output tokens. |
 | `max_budget_usd`          | number | Optional finite nonnegative USD ceiling for recorded logical-session spend, including auxiliary models. CLI `--max-budget-usd` overrides this global-only setting; project layers cannot change it. Unknown prices or incomplete tracking block capped continuation. Already admitted work can exceed it; this is not a vendor billing limit. See [COST_TRACKING.md](COST_TRACKING.md). |
-| `max_agent_turns`         | integer | Maximum model round trips (agent turns) per user prompt. Default: `1000` (was 200); spend caps (`turn_token_budget`, `max_budget_usd`, session token ceilings) are the primary safety net. When reached, the turn fails with an "exhausted its maximum turn budget" error, but completed tool work and messages stay in the session: ask the agent to continue (or rerun with `--continue`) or raise the limit. `--max-agent-turns` overrides it.                                                                                                                           |
+| `max_agent_turns`         | integer | Maximum model round trips (agent turns) per user prompt. Default: `1000` (was 200); spend caps (`turn_token_budget`, `max_budget_usd`, session token ceilings) are the primary safety net. When reached, the turn fails with an "exhausted its maximum turn budget" error, but completed tool work and messages stay in the session: ask the agent to continue (or rerun with `--continue`) or raise the limit. Headless context-relief segments of one prompt share this budget (and `turn_token_budget`), so relief never multiplies the cap. `--max-agent-turns` overrides it.                                                                                                                           |
 | `verify_command`          | string  | Optional trusted command that must pass before a turn which invoked a potentially mutating tool may complete. Unset or blank disables the gate. Project-local values are sensitive and require content-bound trust. |
 | `goal_checks`             | array   | Commands that must exit zero before a goal may be reported complete. Sensitive: an untrusted project config cannot supply one, exactly as for `verify_command`. Additive with `--goal-check` and `/goal check`. |
 | `goal_judge_model`        | string  | A `quick_models` entry name used to judge goal completion claims. Sensitive: the judge receives a bounded transcript tail, so naming its endpoint decides where that text is sent. |
@@ -802,6 +802,8 @@ Accepted top-level keys:
 | `tool_result_spill_head_chars` | integer | Characters of a spilled result kept from its start. Default: a sixth of the threshold. If head + tail would not stay below the threshold, both fall back to the default split. |
 | `tool_result_spill_tail_chars` | integer | Characters of a spilled result kept from its end. Default: two thirds of the threshold. |
 | `compact_restore_read_tokens` | integer | Token budget for re-attaching the newest file windows read in the compacted history (at most 5, one per path) to the compaction summary. Default: `context_window / 20`, at most `25000`. `0` disables. |
+| `api_key_commands`        | table   | Opt in (default none) to command-backed, refreshable API credentials for short-lived gateway tokens. Keyed by provider name (a built-in such as `anthropic` or a `custom_providers` entry): `[api_key_commands.my-gateway]` with `command = ["print-token", "--audience", "gw"]` (argv, run directly with no shell; use `["sh", "-c", "..."]` to opt in to one), `ttl_secs` (how long a result is reused; default `300`, `0` = only after a `401`) and `timeout_secs` (1–120, default `10`; the command is killed after it). The command runs with your environment, outside the model sandbox, only from your own configuration (a project config can set it only after project trust); its stdout, at most 16 KiB, must be one line, the key or token (stderr is discarded). It outranks an environment variable or `api_keys` for that provider but not `--api-key`. A request that gets a `401` re-runs the command once and is resent once with the new token; the next request from an already-built client carries it too, so a session survives token expiry. Failures name the provider and the program, never its output or arguments; the token stays out of logs and saved sessions. Bedrock, Vertex and Copilot keep their own credential flows. See [PROVIDERS.md](PROVIDERS.md#api-key-resolution). |
+| `user_instruction_files`  | boolean | Opt in (default `false`) to reading the user-level instruction files that Claude Code and Codex users already keep: `~/.claude/CLAUDE.md`, then `~/.codex/AGENTS.md`. They load after mini-agent's own global `AGENTS.md` and before the project's files, under the same `context_files_max_bytes` budget and the same captured, symlink-safe read as the global file, are framed as `user ~/.claude/CLAUDE.md` / `user ~/.codex/AGENTS.md`, and `/context` lists each with its full path. `@path` includes inside them resolve in their own directory. A project `.mini-agent/config.toml` can set it only after project trust (not a benign project key); `no_context_files` still disables every context file. |
 | `context_files_max_bytes` | integer | Combined byte budget for root context files (global and workspace `AGENTS.md`, `CLAUDE.md`, `ARCHITECTURE.md`). Default: the startup model's context window in tokens, clamped to `16384`–`524288`. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, headless context relief, and mid-turn compaction). In the TUI, headless and ACP, a provider context-length rejection (`prompt is too long`, `context_length_exceeded`) compacts once per turn and resumes it; a second rejection is shown unchanged. Default: `true`. An explicit `false` is honored: nothing is ever compacted automatically.            |
 | `claude_project_agents`   | boolean | Read project `.claude/agents/*.md` as specialist definitions (Claude Code compatibility). `false` makes mini-agent ignore that layer entirely (no loading, no validation warnings), leaving `.mini-agent/agents`, the user-global and the built-in definitions. Default: `true`. Restart required. |
@@ -1725,12 +1727,12 @@ task continues with a short continuation prompt, for as long as each compaction 
 nothing older than the kept recent history is left to compact, a compaction freed no space or
 failed, or two consecutive reliefs occur with no tool progress between them). A
 boundary at which nothing older than the kept recent history exists continues
-without the mid-turn trigger. ACP turns do not compact mid-turn yet. A native Anthropic replay session
+without the mid-turn trigger. ACP prompts relieve the same way and continue the same prompt (non-native sessions stop at most three times per prompt; native sessions follow the headless stop rules below). A native Anthropic replay session
 cannot be summarized in place (its signed thinking blocks and tool pairing replay
 verbatim), so on one the relief closes the native epoch at the tool-batch boundary (every
 completed tool result is saved), compacts the saved transcript, restarts the thinking chain from
 it as a new epoch (earlier thinking blocks are dropped, with a one-line notice) and resumes the
-task with the continuation prompt, in headless `-p`/`--loop` and goal rounds. The interactive UI
+task with the continuation prompt, in headless `-p`/`--loop`, goal rounds and ACP prompts (an ACP relief stops, with an error naming the reason, when the segment since the last one ran no tools or its compaction found nothing to compact). The interactive UI
 closes the epoch and compacts there too, then restores your prompt so Enter continues on the
 compacted context. When nothing can be compacted, headless stops with an explicit "context is N%
 full ... follow-up prompt ... or start a fresh context" error and the completed tool results
@@ -3430,6 +3432,22 @@ window has tokens (about a quarter of the window at four bytes per token), withi
 sets it explicitly (same bounds). A file that does not fit in what remains is
 truncated with a visible notice (`[context file truncated: ...]`) rather than loaded
 whole, and files after the budget is spent are skipped.
+
+Claude Code's modular project layout is read too. The root also loads `.claude/CLAUDE.md`
+(after `CLAUDE.md`) and every `.md` file under `.claude/rules/` (recursively, at most 64
+files and 4 levels, symlinks skipped) through the same budget, trust and data framing as
+`CLAUDE.md`, framed with their relative path. A rule without frontmatter, or whose
+frontmatter does not parse, is unconditional and loads at session start. A rule whose YAML
+frontmatter has a `paths:` list (or a comma-separated string) of globs, for example
+`paths: ["src/api/**/*.ts"]`, is instead delivered the first time `read`, `edit`, `write` or
+`notebook_edit` touches a workspace-relative path matching one of the globs (`*` does not cross
+`/`, `**` does, `{a,b}` alternatives work), once per run, like a nested `CLAUDE.md`: it requires a
+trusted project config and existing read authority, and `/context` lists it after delivery. The
+frontmatter is stripped, and keys other than `paths` are ignored. Load order of instruction
+sources: mini-agent global `AGENTS.md`, then with `user_instruction_files = true`
+`~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`, then the workspace `AGENTS.md`, `CLAUDE.md`,
+`ARCHITECTURE.md`, `.claude/CLAUDE.md`, the unconditional `.claude/rules` files and
+`CLAUDE.local.md`; path-scoped rules and nested directory files arrive on first touch.
 
 Root `CLAUDE.local.md` and authored `@path` or `@{path with spaces}` includes are
 captured at agent construction. Native `read`, `edit`, `write` and `notebook_edit`

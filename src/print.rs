@@ -180,6 +180,29 @@ pub(crate) const HEADLESS_STDIN_IDLE_SECS: u32 = 2;
 static STDIN_IDLE_SECS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(HEADLESS_STDIN_IDLE_SECS);
 
+/// Idle seconds of a piped stdin this process abandoned (0: none). Machine
+/// output reports it on the `system` record and the final result so a driver
+/// can tell the model ran without the piped input (mini-agent-54j41).
+static STDIN_ABANDONED_SECS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Idle seconds after which this run abandoned a silent piped stdin.
+pub(crate) fn stdin_abandoned_secs() -> Option<u32> {
+    match STDIN_ABANDONED_SECS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        secs => Some(secs),
+    }
+}
+
+/// Add `stdin_abandoned: true` and `stdin_idle_secs` to a machine-output
+/// record when this run abandoned its piped stdin. The fields are absent
+/// otherwise.
+pub(crate) fn annotate_stdin_abandoned(value: &mut serde_json::Value) {
+    if let Some(secs) = stdin_abandoned_secs() {
+        value["stdin_abandoned"] = true.into();
+        value["stdin_idle_secs"] = secs.into();
+    }
+}
+
 static PARTIAL_MESSAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Completions finished so far this process; a delta's `message_id` names the
 /// completion in progress (`msg_<n>`, 1-based), so a driver can group deltas.
@@ -586,14 +609,6 @@ fn stdin_ready_within(fd: i32, idle_ms: i32) -> bool {
     idle_ms == 0 || fd_readable_within(fd, idle_ms)
 }
 
-/// The stderr line printed when a silent stdin is abandoned.
-fn stdin_idle_notice(idle_ms: i32) -> String {
-    format!(
-        "Warning: no stdin data within {} s; running without it. For a slow producer, raise --stdin-idle-secs N or use 0 to wait for EOF.\n",
-        idle_ms / 1000
-    )
-}
-
 /// Whether `fd` is readable (data, EOF or error) within `timeout_ms`. Always
 /// true where it cannot be probed, which keeps the blocking read.
 #[cfg(unix)]
@@ -615,32 +630,66 @@ fn fd_readable_within(_fd: i32, _timeout_ms: i32) -> bool {
     true
 }
 
+/// The stderr line printed when a silent stdin is abandoned.
+fn stdin_idle_notice(idle_ms: i32) -> String {
+    format!(
+        "Warning: no stdin data within {} s; running without it (piped input was NOT read). For a slow producer, raise --stdin-idle-secs N or use 0 to wait for EOF.\n",
+        idle_ms / 1000
+    )
+}
+
+/// The blocking half of [`read_headless_stdin`]: wait up to `idle_ms` for
+/// `fd` to show data or EOF (an explicit prompt only; 0 waits forever), then
+/// read `reader` to its bound. A silent pipe is abandoned, recorded and warned
+/// about unless `quiet`.
+fn read_stdin_gated(
+    fd: i32,
+    idle_ms: i32,
+    explicit_prompt: bool,
+    quiet: bool,
+    reader: impl io::Read,
+) -> anyhow::Result<String> {
+    if explicit_prompt && !stdin_ready_within(fd, idle_ms) {
+        STDIN_ABANDONED_SECS.store(
+            u32::try_from(idle_ms / 1000).unwrap_or(u32::MAX).max(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if !quiet {
+            headless_stderr(format_args!("{}", stdin_idle_notice(idle_ms)));
+        }
+        return Ok(String::new());
+    }
+    // This notice shares the reader's owned blocking job. Emitting it
+    // here gates readiness without an async gap before the read; even
+    // a stalled stderr write cannot hold the event-loop thread.
+    if !quiet {
+        headless_stderr(format_args!(
+            "Reading piped stdin (limit {} bytes)\n",
+            stdin_bytes()
+        ));
+    }
+    read_stdin_bounded(reader)
+}
+
 /// Read piped stdin for a headless run. With an explicit prompt, a pipe that
 /// stays silent for the `--stdin-idle-secs` wait (default 2 s; an open stdin that never closes,
 /// as under a supervisor or subagent) is treated as empty instead of hanging.
+/// An abandoned stdin is recorded (`stdin_abandoned` on machine output) and
+/// warned about on stderr unless `quiet`; callers pass `quiet = false` in
+/// machine-output modes so `--quiet` cannot hide the dropped input.
 pub(crate) async fn read_headless_stdin(
     quiet: bool,
     explicit_prompt: bool,
 ) -> anyhow::Result<String> {
     let turn = run_headless_turn(async {
         let read = crate::agent::runner::spawn_blocking_scoped(move || {
-            let idle_ms = stdin_idle_ms();
-            if explicit_prompt && !stdin_ready_within(0, idle_ms) {
-                if !quiet {
-                    headless_stderr(format_args!("{}", stdin_idle_notice(idle_ms)));
-                }
-                return Ok(String::new());
-            }
-            // This notice shares the reader's owned blocking job. Emitting it
-            // here gates readiness without an async gap before the read; even
-            // a stalled stderr write cannot hold the event-loop thread.
-            if !quiet {
-                headless_stderr(format_args!(
-                    "Reading piped stdin (limit {} bytes)\n",
-                    stdin_bytes()
-                ));
-            }
-            read_stdin_bounded(io::stdin().lock())
+            read_stdin_gated(
+                0,
+                stdin_idle_ms(),
+                explicit_prompt,
+                quiet,
+                io::stdin().lock(),
+            )
         })
         .await;
         match read {
@@ -692,6 +741,7 @@ pub(crate) async fn emit_headless_result(
     persisted: bool,
 ) -> anyhow::Result<()> {
     let mut value: serde_json::Value = serde_json::from_str(rendered)?;
+    annotate_stdin_abandoned(&mut value);
     value["session_id"] = session.map_or(serde_json::Value::Null, |(id, _)| id.into());
     value["session_name"] = session.map_or(serde_json::Value::Null, |(_, name)| name.into());
     value["session_persisted"] = persisted.into();
@@ -2933,6 +2983,41 @@ mod tests {
         unsafe { libc::close(r) };
         let notice = super::stdin_idle_notice(2000);
         assert!(notice.contains("2 s") && notice.contains("--stdin-idle-secs"));
+    }
+
+    // mini-agent-54j41: a producer that writes after the idle window is
+    // abandoned visibly: the run is marked, even under --quiet, and machine
+    // records carry the marker. A patient wait receives the data.
+    #[cfg(unix)]
+    #[test]
+    fn late_stdin_producer_is_abandoned_and_marked() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixStream;
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(900));
+            writer.write_all(b"late log line").unwrap();
+        });
+        assert_eq!(super::stdin_abandoned_secs(), None);
+        let mut value = serde_json::json!({"type":"system"});
+        super::annotate_stdin_abandoned(&mut value);
+        assert!(value.get("stdin_abandoned").is_none(), "{value}");
+        // Quiet and idle 300 ms: the producer is too slow.
+        let read = super::read_stdin_gated(reader.as_raw_fd(), 300, true, true, &reader).unwrap();
+        assert_eq!(read, "");
+        // The idle window is whole seconds on the CLI; a sub-second test wait
+        // still reports at least one second.
+        assert_eq!(super::stdin_abandoned_secs(), Some(1));
+        super::annotate_stdin_abandoned(&mut value);
+        assert_eq!(value["stdin_abandoned"], true);
+        assert_eq!(value["stdin_idle_secs"], 1);
+        // The abandoned data is still there: waiting for it works.
+        let patient =
+            super::read_stdin_gated(reader.as_raw_fd(), 5000, true, true, &reader).unwrap();
+        assert_eq!(patient, "late log line");
+        producer.join().unwrap();
+        super::STDIN_ABANDONED_SECS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     use std::io;

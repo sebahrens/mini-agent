@@ -43,6 +43,11 @@ impl CredentialReport {
         use crate::auth::LoginRecordState as S;
         match self {
             Self::Source(CredentialSource::Cli) => "CLI --api-key (value omitted)".into(),
+            Self::Source(CredentialSource::Command(name)) => {
+                format!(
+                    "command api_key_commands.{name} (not run by read-only inspection; output never shown)"
+                )
+            }
             Self::Source(CredentialSource::Environment(name)) => {
                 format!("environment {name} (value omitted)")
             }
@@ -107,6 +112,8 @@ where
             return CredentialReport::ChatGpt(state);
         }
     }
+    // Reporting names a configured credential command without running it.
+    let _ = crate::key_command::configure(cfg.api_key_commands.as_ref());
     let source = AuthResolver::new(route.kind)
         .with_cli_key(cli_key)
         .with_env_override(route.api_key_env.as_deref())

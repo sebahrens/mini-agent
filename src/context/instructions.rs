@@ -120,6 +120,10 @@ pub(crate) struct InstructionRoot {
     path: PathBuf,
     text: Arc<str>,
     identity: Option<crate::fs::CheckedMetadata>,
+    /// `Some` for a `.claude/rules` file scoped by `paths:` globs: it is not
+    /// part of the static context and is delivered on first touch of a
+    /// matching file (mini-agent-dzrup).
+    scoped: Option<Vec<String>>,
 }
 #[derive(Clone)]
 enum RootOrigin {
@@ -151,6 +155,7 @@ impl InstructionRoot {
             path,
             text: Arc::from(text),
             identity: None,
+            scoped: None,
         })
     }
     #[cfg(test)]
@@ -172,7 +177,15 @@ impl InstructionRoot {
             path,
             text: Arc::from(text),
             identity: None,
+            scoped: None,
         }
+    }
+
+    /// Marks a workspace `.claude/rules` file as delivered only when a tool
+    /// touches a file matching `patterns`.
+    pub(super) fn scoped_to(mut self, patterns: Vec<String>) -> Self {
+        self.scoped = Some(patterns);
+        self
     }
 
     pub(super) fn with_identity(mut self, identity: crate::fs::CheckedMetadata) -> Self {
@@ -226,7 +239,14 @@ struct Initial {
     overlay: String,
     sources: Vec<Source>,
     roots: Vec<RootMetadata>,
+    /// `.claude/rules` files scoped by `paths:` globs.
+    scoped_rules: Vec<ScopedRule>,
     error: Option<String>,
+}
+#[derive(Debug)]
+struct ScopedRule {
+    path: PathBuf,
+    globs: globset::GlobSet,
 }
 #[derive(Debug)]
 struct RootMetadata {
@@ -394,7 +414,14 @@ impl WorkspaceInstructions {
                 source_count += 1;
                 if sources.len() < 32 {
                     sources.push((
-                        root.path.clone(),
+                        // A global source is shown with its directory so a
+                        // home-level file is distinguishable from the
+                        // project's file of the same name.
+                        if root.project {
+                            root.path.clone()
+                        } else {
+                            root.root.join(&root.path)
+                        },
                         root.scope.clone(),
                         root.project,
                         root.bytes,
@@ -505,68 +532,33 @@ impl WorkspaceInstructions {
             return Err(error.clone());
         }
         for directory in directories {
-            let (cached, was_omitted) = {
-                let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                (
-                    state.directories.get(&directory).cloned(),
-                    state.omitted.contains(&directory),
-                )
-            };
-            if was_omitted {
-                omitted.push(directory);
-                continue;
-            }
-            if let Some(cached) = cached {
-                result.extend(cached?);
-                continue;
-            }
-            // Filesystem work never holds the mutex used by the event-loop hook.
-            let loaded = self.load_directory(&directory);
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(cached) = state.directories.get(&directory) {
-                result.extend(cached.clone()?);
-                continue;
-            }
-            if matches!(&loaded, Ok(sources) if sources.is_empty()) {
-                // Most directories have no instruction file. Cache that
-                // cheaply; past the cap, re-probe instead of failing.
-                if state.empty_directories < MAX_EMPTY_DIRECTORIES {
-                    state.empty_directories += 1;
-                    state.directories.insert(directory, Ok(Vec::new()));
-                }
-                continue;
-            }
-            if matches!(&loaded, Err(error) if error == BUDGET_EXHAUSTED) {
-                state.omitted.insert(directory.clone());
-                omitted.push(directory);
-                continue;
-            }
-            let populated = state
-                .directories
-                .values()
-                .filter(|entry| !matches!(entry, Ok(sources) if sources.is_empty()))
-                .count();
-            let loaded = match loaded {
-                Ok(sources) => {
-                    let bytes = source_json(&sources)?.len();
-                    if populated >= MAX_DIRECTORIES
-                        || state.count.saturating_add(sources.len()) > MAX_SOURCES
-                        || state.retained.saturating_add(bytes) > state.limit
-                    {
-                        // Degrade: skip this directory's guidance with a
-                        // visible notice; the triggering tool still runs.
-                        state.omitted.insert(directory.clone());
-                        omitted.push(directory);
-                        continue;
-                    }
-                    state.count += sources.len();
-                    state.retained += bytes;
-                    Ok(sources)
-                }
-                Err(error) => Err(error),
-            };
-            state.directories.insert(directory, loaded.clone());
-            result.extend(loaded?);
+            self.collect_cached(
+                directory,
+                |this, key| this.load_directory(key),
+                &mut result,
+                &mut omitted,
+            )?;
+        }
+        // `.claude/rules` files scoped by `paths:` globs are delivered on the
+        // first touch of a matching file, subject to the same caches, budgets
+        // and authorization as a nested directory's sources (mini-agent-dzrup).
+        let matching_rules: Vec<PathBuf> = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .initial
+                .scoped_rules
+                .iter()
+                .filter(|rule| rule.globs.is_match(target))
+                .map(|rule| rule.path.clone())
+                .collect()
+        };
+        for rule in matching_rules {
+            self.collect_cached(
+                rule,
+                |this, key| this.load_rule(key),
+                &mut result,
+                &mut omitted,
+            )?;
         }
         // Snapshot reuse never freezes read/trust authority. This runs in the
         // same owned blocking preparation as the initial bounded file reads.
@@ -582,6 +574,100 @@ impl WorkspaceInstructions {
         self.authorize_sources(&result)?;
         Ok((result, omitted))
     }
+    /// The sources cached under `key` (a directory or a scoped rule file),
+    /// loading them with `load` on first use. A budget or cap that cannot hold
+    /// them marks `key` omitted instead of failing the triggering tool.
+    fn collect_cached(
+        &self,
+        key: PathBuf,
+        load: impl FnOnce(&Self, &Path) -> Result<Vec<Source>, String>,
+        result: &mut Vec<Source>,
+        omitted: &mut Vec<PathBuf>,
+    ) -> Result<(), String> {
+        let (cached, was_omitted) = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            (
+                state.directories.get(&key).cloned(),
+                state.omitted.contains(&key),
+            )
+        };
+        if was_omitted {
+            omitted.push(key);
+            return Ok(());
+        }
+        if let Some(cached) = cached {
+            result.extend(cached?);
+            return Ok(());
+        }
+        // Filesystem work never holds the mutex used by the event-loop hook.
+        let loaded = load(self, &key);
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(cached) = state.directories.get(&key) {
+            result.extend(cached.clone()?);
+            return Ok(());
+        }
+        if matches!(&loaded, Ok(sources) if sources.is_empty()) {
+            // Most directories have no instruction file. Cache that
+            // cheaply; past the cap, re-probe instead of failing.
+            if state.empty_directories < MAX_EMPTY_DIRECTORIES {
+                state.empty_directories += 1;
+                state.directories.insert(key, Ok(Vec::new()));
+            }
+            return Ok(());
+        }
+        if matches!(&loaded, Err(error) if error == BUDGET_EXHAUSTED) {
+            state.omitted.insert(key.clone());
+            omitted.push(key);
+            return Ok(());
+        }
+        let populated = state
+            .directories
+            .values()
+            .filter(|entry| !matches!(entry, Ok(sources) if sources.is_empty()))
+            .count();
+        let loaded = match loaded {
+            Ok(sources) => {
+                let bytes = source_json(&sources)?.len();
+                if populated >= MAX_DIRECTORIES
+                    || state.count.saturating_add(sources.len()) > MAX_SOURCES
+                    || state.retained.saturating_add(bytes) > state.limit
+                {
+                    // Degrade: skip this key's guidance with a
+                    // visible notice; the triggering tool still runs.
+                    state.omitted.insert(key.clone());
+                    omitted.push(key);
+                    return Ok(());
+                }
+                state.count += sources.len();
+                state.retained += bytes;
+                Ok(sources)
+            }
+            Err(error) => Err(error),
+        };
+        state.directories.insert(key, loaded.clone());
+        result.extend(loaded?);
+
+        Ok(())
+    }
+
+    fn load_rule(&self, path: &Path) -> Result<Vec<Source>, String> {
+        let mut loaded = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut nodes = 0;
+        self.load_tree(
+            &self.workspace,
+            true,
+            path,
+            self.workspace.root(),
+            0,
+            true,
+            &mut seen,
+            &mut nodes,
+            &mut loaded,
+        )?;
+        Ok(loaded)
+    }
+
     fn authorize_sources(&self, sources: &[Source]) -> Result<(), String> {
         if sources.is_empty() {
             return Ok(());
@@ -762,6 +848,12 @@ impl WorkspaceInstructions {
         if truncated && budget_short {
             return Err(BUDGET_EXHAUSTED.into());
         }
+        // Rule frontmatter scopes a rule; it is not guidance for the model.
+        let text = if super::rules::is_rule_path(&source.path) {
+            super::rules::strip_frontmatter(&text)
+        } else {
+            text
+        };
         source.text = Arc::from(fit_instruction_source(text, truncated, delivery_room)?);
         binding
             .validate()
@@ -805,6 +897,7 @@ impl WorkspaceInstructions {
         #[cfg(feature = "hooks")]
         let root_paths: Vec<String> = roots
             .iter()
+            .filter(|root| root.scoped.is_none())
             .map(|root| root.path.to_string_lossy().into_owned())
             .collect();
         let result = instruction_blocking(move || cache.capture_initial(roots, old_bytes)).await;
@@ -851,14 +944,17 @@ impl WorkspaceInstructions {
         self.workspace.validate()?;
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // A scoped rule is not in the static context, so its physical file
+            // must stay deliverable when a matching file is touched.
             state.root_identities = roots
                 .iter()
+                .filter(|root| root.scoped.is_none())
                 .filter_map(|root| root.identity.clone())
                 .collect();
         }
         // Original authored roots are already present in the higher-priority
         // static context. An include cycle must not duplicate them.
-        for root in &roots {
+        for root in roots.iter().filter(|root| root.scoped.is_none()) {
             let origin = match &root.origin {
                 RootOrigin::Workspace { root, .. } => root,
                 RootOrigin::Global(binding) => binding.root(),
@@ -866,7 +962,19 @@ impl WorkspaceInstructions {
             seen.insert((origin.to_owned(), normal_relative(&root.path)?));
         }
         let mut root_metadata = Vec::new();
+        let mut scoped_rules = Vec::new();
         for root in roots {
+            if let Some(patterns) = &root.scoped {
+                // Delivered on first touch of a matching file; nothing is
+                // read or retained until then.
+                if let Some(globs) = super::rules::compile(patterns) {
+                    scoped_rules.push(ScopedRule {
+                        path: normal_relative(&root.path)?,
+                        globs,
+                    });
+                }
+                continue;
+            }
             let (origin, project, scope) = match &root.origin {
                 RootOrigin::Global(binding) => (
                     binding.root().to_owned(),
@@ -962,6 +1070,7 @@ impl WorkspaceInstructions {
             overlay,
             sources: loaded,
             roots: root_metadata,
+            scoped_rules,
             error: None,
         });
         Ok(())
@@ -1659,6 +1768,114 @@ mod tests {
             "small"
         );
         assert!(fit_instruction_source("x".repeat(100), true, 10).is_err());
+    }
+
+    fn scoped_root(
+        service: &WorkspaceInstructions,
+        path: &str,
+        patterns: &[&str],
+    ) -> InstructionRoot {
+        InstructionRoot::workspace(&service.workspace, PathBuf::from(path), "")
+            .unwrap()
+            .scoped_to(patterns.iter().map(|p| (*p).to_owned()).collect())
+    }
+
+    // mini-agent-dzrup: a `paths:`-scoped rule is delivered only for a touched
+    // file that matches, with its frontmatter stripped and not in the static
+    // overlay; a non-matching target gets nothing.
+    #[test]
+    fn scoped_rule_is_delivered_only_for_matching_touched_files() {
+        let (_owned, service) = fixture();
+        let root = service.workspace.root().to_owned();
+        std::fs::create_dir_all(root.join(".claude/rules")).unwrap();
+        std::fs::write(
+            root.join(".claude/rules/api.md"),
+            "---\npaths:\n  - \"src/api/**/*.ts\"\n---\nAPI_RULE_BODY\n",
+        )
+        .unwrap();
+        service
+            .capture_initial(
+                vec![scoped_root(
+                    &service,
+                    ".claude/rules/api.md",
+                    &["src/api/**/*.ts"],
+                )],
+                0,
+            )
+            .unwrap();
+        assert!(!service.initial_overlay().contains("API_RULE_BODY"));
+        assert!(
+            service
+                .load(Path::new("src/ui/button.ts"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            service
+                .load(Path::new("src/api/deep/routes.rs"))
+                .unwrap()
+                .is_empty()
+        );
+        let delivered = service.load(Path::new("src/api/users/get.ts")).unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].path, Path::new(".claude/rules/api.md"));
+        assert_eq!(&*delivered[0].text, "API_RULE_BODY\n");
+        assert!(delivered[0].project);
+        // An absolute target resolves to the same workspace-relative match.
+        assert_eq!(service.load(&root.join("src/api/x.ts")).unwrap().len(), 1);
+        // Reported by /context metadata once delivered.
+        assert!(service.diagnostics().unwrap().source_count >= 1);
+    }
+
+    // The same trust gate as a nested CLAUDE.md: an untrusted project config
+    // refuses scoped-rule delivery.
+    #[test]
+    fn scoped_rule_requires_trusted_project_config() {
+        let root = crate::tests::OwnedTestDirectory::new("scoped-rule-untrusted");
+        let path = root.path().join("workspace");
+        std::fs::create_dir_all(path.join(".mini-agent")).unwrap();
+        std::fs::create_dir_all(path.join(".claude/rules")).unwrap();
+        std::fs::write(path.join(".mini-agent/config.toml"), "model='fixture'\n").unwrap();
+        std::fs::write(
+            path.join(".claude/rules/api.md"),
+            "---\npaths: [\"src/**\"]\n---\nUNTRUSTED_RULE\n",
+        )
+        .unwrap();
+        let mut paths = crate::paths::AppPaths::from_process(Some(path.clone())).unwrap();
+        paths.state_dir = root.path().join("state");
+        let workspace = Arc::new(WorkspaceBinding::capture(&path).unwrap());
+        let service = Arc::new(
+            Arc::try_unwrap(WorkspaceInstructions::new(
+                workspace,
+                None,
+                InstructionProtocol::Anthropic,
+            ))
+            .unwrap()
+            .with_test_paths(paths),
+        );
+        service
+            .capture_initial(
+                vec![scoped_root(&service, ".claude/rules/api.md", &["src/**"])],
+                0,
+            )
+            .unwrap();
+        let error = service.load(Path::new("src/main.rs")).unwrap_err();
+        assert!(error.contains("require trust"), "{error}");
+    }
+
+    #[test]
+    fn scoped_rule_that_vanishes_or_has_bad_globs_never_breaks_the_tool() {
+        let (_owned, service) = fixture();
+        service
+            .capture_initial(
+                vec![
+                    scoped_root(&service, ".claude/rules/gone.md", &["src/**"]),
+                    scoped_root(&service, ".claude/rules/bad.md", &["["]),
+                ],
+                0,
+            )
+            .unwrap();
+        assert!(service.load(Path::new("src/main.rs")).unwrap().is_empty());
     }
 
     #[test]

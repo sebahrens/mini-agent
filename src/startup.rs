@@ -1297,8 +1297,11 @@ impl Startup {
         #[cfg(feature = "acp")]
         let read_stdin = read_stdin && !cli.acp_enabled;
         if read_stdin {
+            // `--quiet` silences the warning for text output only: machine
+            // output must not hide that the piped input was dropped
+            // (mini-agent-54j41).
             let stdin = match crate::print::read_headless_stdin(
-                cli.quiet,
+                cli.quiet && cli.output_format() == crate::cli::OutputFormat::Text,
                 !cli.message.join(" ").trim().is_empty(),
             )
             .await
@@ -1340,6 +1343,10 @@ impl Startup {
             ),
             cfg.context_files_max_bytes,
         ));
+        context::set_user_instruction_files(cfg.user_instruction_files == Some(true));
+        if let Err(error) = crate::key_command::configure(cfg.api_key_commands.as_ref()) {
+            anyhow::bail!(error);
+        }
         let no_context_files = cli.resolve_no_context_files(&cfg);
         // Persistent memory is read once below, after the session is known,
         // so a resumed session's compaction exclusion is applied in one pass.
@@ -2561,7 +2568,29 @@ impl Startup {
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
         let json_output = output.format != OutputFormat::Text;
         let identity = (self.session.id.to_string(), self.session.name.to_string());
-        output.emit_event(serde_json::json!({"type":"system", "session_id":identity.0, "session_name":identity.1, "ephemeral":self.cli.no_session, "provider":self.session.provider, "model":self.session.model})).await?;
+        // The effective mode and containment: project config or a policy can
+        // differ from what the caller asked for (mini-agent-f71r6).
+        let permission_mode = self
+            .permission
+            .as_ref()
+            .map(|permission| {
+                permission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .mode()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "standard".to_owned());
+        let mut system = serde_json::json!({
+            "type":"system", "subtype":"init", "session_id":identity.0,
+            "session_name":identity.1, "ephemeral":self.cli.no_session,
+            "provider":self.session.provider, "model":self.session.model,
+            "cwd":self.workspace.root().to_string_lossy(),
+            "permission_mode":permission_mode,
+            "sandbox":self.sandbox.effective_summary(),
+        });
+        crate::print::annotate_stdin_abandoned(&mut system);
+        output.emit_event(system).await?;
         // The `git status` baseline runs concurrently with the work that
         // cannot change the workspace (compaction, MCP connect, agent build)
         // and is joined before anything that can: the `!` command below, or
@@ -2790,6 +2819,41 @@ impl Startup {
             let agent = agent.with_headless_turn_directive(self.headless_agent_directive.take());
             #[cfg(feature = "mcp")]
             report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
+            // What the model can actually use, and which configured MCP
+            // servers did not connect, before the first request
+            // (mini-agent-f71r6).
+            if json_output {
+                let mut tools: Vec<String> = agent
+                    .context_tool_definitions()
+                    .await
+                    .map(|definitions| {
+                        definitions
+                            .into_iter()
+                            .map(|definition| definition.name)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                tools.sort();
+                #[cfg(feature = "mcp")]
+                let mcp_servers = match (&mcp_manager, self.cfg.mcp_servers.as_ref()) {
+                    (Some(manager), Some(configured)) => manager.server_statuses(configured),
+                    // MCP did not start for this run (`--no-tools` or a
+                    // `--tools` list naming no MCP tool): say so rather than
+                    // implying the configured servers are absent.
+                    (None, Some(configured)) => {
+                        crate::extras::mcp::McpClientManager::not_started_statuses(configured)
+                    }
+                    _ => Vec::new(),
+                };
+                #[cfg(not(feature = "mcp"))]
+                let mcp_servers: Vec<serde_json::Value> = Vec::new();
+                output
+                    .emit_event(serde_json::json!({
+                        "type":"system", "subtype":"capabilities",
+                        "session_id":identity.0, "tools":tools, "mcp_servers":mcp_servers,
+                    }))
+                    .await?;
+            }
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_start();
             }
@@ -3992,25 +4056,31 @@ async fn run_bound_headless_round(
     let mut history = history;
     let mut reliefs = 0usize;
     let mut last_freed_nothing = false;
+    // Turns and tokens spent by earlier segments of this prompt count against
+    // the later ones (mini-agent-djjua).
+    let budget_carry = std::sync::Arc::new(crate::agent::runner::HeadlessBudgetCarry::default());
     loop {
-        let (mut turn, persisted) = run_bound_headless_segment(
-            agent,
-            session,
-            cli,
-            cfg,
-            &prompt,
-            history.clone(),
-            output,
-            question_turn.clone(),
-            native_ticket,
-            native_owner,
-            true,
-            #[cfg(feature = "hooks")]
-            startup_context,
-            #[cfg(feature = "agent-skills")]
-            instruction_turn.clone(),
-            #[cfg(feature = "hooks")]
-            loop_info,
+        let (mut turn, persisted) = crate::agent::runner::with_headless_budget_carry(
+            budget_carry.clone(),
+            run_bound_headless_segment(
+                agent,
+                session,
+                cli,
+                cfg,
+                &prompt,
+                history.clone(),
+                output,
+                question_turn.clone(),
+                native_ticket,
+                native_owner,
+                true,
+                #[cfg(feature = "hooks")]
+                startup_context,
+                #[cfg(feature = "agent-skills")]
+                instruction_turn.clone(),
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
         )
         .await;
         let Some(full) = turn
@@ -4879,6 +4949,9 @@ async fn relieve_headless_turn(
     let mut reliefs = 0usize;
     let mut reactive_used = false;
     let mut mid_turn_available = true;
+    // Turns and tokens spent by earlier segments of this prompt count against
+    // the later ones (mini-agent-djjua).
+    let budget_carry = std::sync::Arc::new(crate::agent::runner::HeadlessBudgetCarry::default());
     loop {
         let mid_turn =
             (mid_turn_available && cfg.resolve_compact_enabled() && session.context_window > 0)
@@ -4889,7 +4962,11 @@ async fn relieve_headless_turn(
                     threshold,
                     anthropic_native: cfg.is_anthropic_native(&session.provider),
                 });
-        let turn = run_segment(session, &prompt, history.clone(), mid_turn).await;
+        let turn = crate::agent::runner::with_headless_budget_carry(
+            budget_carry.clone(),
+            run_segment(session, &prompt, history.clone(), mid_turn),
+        )
+        .await;
         let cause = if cfg.resolve_compact_enabled() {
             headless_relief_cause(&turn, reactive_used)
         } else {

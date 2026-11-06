@@ -15,6 +15,7 @@ mod git;
 mod headless_control;
 mod headless_media;
 mod hex;
+mod key_command;
 mod logging;
 mod models_catalog;
 mod output_schema;

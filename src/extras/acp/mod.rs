@@ -181,8 +181,8 @@ impl AcpHistoryLimits {
             // Native (Anthropic) history compacts between turns under token
             // pressure exactly as in the TUI: the summary replaces the old
             // transcript and the thinking chain is restarted from it
-            // (`restart_native_after_compaction`). Only the mid-turn path
-            // stays off for native history.
+            // (`restart_native_after_compaction`). The mid-turn path closes
+            // the native epoch at a tool-batch boundary and does the same.
             token_pressure: (cfg.resolve_compact_enabled() && window > 0).then(|| {
                 AcpTokenPressure {
                     window,
@@ -3939,6 +3939,31 @@ fn respond_terminal_error(
 /// Cap on mid-turn compaction reliefs per ACP prompt.
 const MAX_MID_TURN_RELIEFS: usize = 3;
 
+/// Why native mid-turn relief must stop instead of compacting again
+/// (mini-agent-wkzav), mirroring headless relief: the segment since the last
+/// relief ran no tools, or the last relief's compaction found nothing to
+/// compact, so another one cannot help. `None` lets relief proceed.
+fn native_relief_stop(reliefs: usize, progress: &[Message], compacted: bool) -> Option<String> {
+    if reliefs == 0 {
+        return None;
+    }
+    let ran_tools = progress.iter().any(|message| {
+        matches!(message, Message::User { content }
+            if content.iter().any(|item| matches!(item, rig::message::UserContent::ToolResult(_))))
+    });
+    if !ran_tools {
+        return Some(format!(
+            "context relief stopped after {reliefs} compaction(s): the segment since the last one ran no tools, so another compaction cannot help; completed tool results are saved, send a follow-up prompt to continue"
+        ));
+    }
+    if !compacted {
+        return Some(format!(
+            "context relief stopped after {reliefs} compaction(s): the last compaction found nothing to compact; completed tool results are saved, start a fresh session to continue"
+        ));
+    }
+    None
+}
+
 /// Text of the final assistant message of `progress`, if it ends with one.
 fn last_assistant_text(progress: &[Message]) -> String {
     match progress.last() {
@@ -4140,6 +4165,10 @@ async fn run_prompt(
     let usage_before = run
         .as_ref()
         .map_or_else(Default::default, |run| run.accepted_usage());
+    // Usage already committed to the session by native relief segments; the
+    // end-of-prompt commit charges only what came after
+    // (mini-agent-wkzav).
+    let mut usage_committed = usage_before;
     let pricing = crate::print::HeadlessPricing::from_session(&history.session, &state.cfg);
     history.pending_question = None;
     let mut native_owner = None;
@@ -4149,6 +4178,9 @@ async fn run_prompt(
     // a continuation prompt. At most `MAX_MID_TURN_RELIEFS` per prompt.
     let mut current_input = prompt_input.clone();
     let mut reliefs = 0usize;
+    // Native relief has no fixed cap (as in headless): it stops when a relief
+    // segment ran no tools or its compaction found nothing to compact.
+    let mut native_relieving = false;
     // The provider rejecting a request as exceeding its context window gets
     // one compact-and-resume per prompt (mini-agent-cj9oh); a second rejection
     // surfaces unchanged.
@@ -4156,12 +4188,13 @@ async fn run_prompt(
     #[cfg(feature = "goal")]
     let mut carried_usage = rig::completion::Usage::default();
     let result = loop {
+        let compactions_at_segment_start = history.session.compactions.len();
         let result = crate::startup::heap_future(|| {
             execute_prompt(
                 state,
                 &current_input,
                 matches!(command, Some(commands::Command::Compact)),
-                reliefs < MAX_MID_TURN_RELIEFS,
+                reliefs < MAX_MID_TURN_RELIEFS || native_relieving,
                 session_id.clone(),
                 &mut history,
                 &mut native_owner,
@@ -4233,7 +4266,59 @@ async fn run_prompt(
             break Ok(outcome);
         }
         let response = last_assistant_text(&progress);
-        if crate::print::persist_headless_turn_input(
+        if outcome.compaction_boundary && native_owner.is_some() {
+            // Provider-native replay history cannot be summarized in place:
+            // close the epoch at this tool-batch boundary (every result is
+            // saved), then let the next segment compact the saved transcript
+            // and restart the thinking chain from it as a new epoch
+            // (mini-agent-wkzav).
+            let compacted = history.session.compactions.len() > compactions_at_segment_start;
+            if let Some(why) = native_relief_stop(reliefs, &progress, compacted) {
+                outcome.compaction_boundary = false;
+                outcome.error = Some(why);
+                outcome.progress = Some(progress);
+                break Ok(outcome);
+            }
+            let accepted = run
+                .as_ref()
+                .map_or_else(Default::default, |run| run.accepted_usage());
+            let segment_usage = accepted.nonnegative_difference(usage_committed);
+            usage_committed = accepted;
+            let owner = native_owner.as_mut().expect("checked above");
+            owner.outcome = crate::session::native_replay::RetiredNativeOutcome::LiveToolReply;
+            let committed = match &owner.binding {
+                Some(binding) => binding
+                    .commit_canonical_input_into_with_outcome(
+                        &mut history.session,
+                        &current_input,
+                        &response,
+                        &progress,
+                        segment_usage,
+                        pricing,
+                        owner.outcome,
+                    )
+                    .map(drop)
+                    .map_err(|reason| reason.to_string()),
+                None => Err("native context owner lost its binding".to_owned()),
+            };
+            let committed = match committed {
+                Ok(()) => owner
+                    .finish(&mut history.session)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(reason) => Err(reason),
+            };
+            if let Err(reason) = committed {
+                outcome.compaction_boundary = false;
+                outcome.error = Some(persona::bounded_message(&format!(
+                    "native context relief could not close the epoch: {reason}"
+                )));
+                outcome.progress = None;
+                break Ok(outcome);
+            }
+            native_owner = None;
+            native_relieving = true;
+        } else if crate::print::persist_headless_turn_input(
             &mut history.session,
             &current_input,
             &response,
@@ -4375,7 +4460,7 @@ async fn run_prompt(
         history.session.goal_store = goal_store_for_gate;
     }
     let usage = run.as_ref().map_or_else(Default::default, |run| {
-        run.accepted_usage().nonnegative_difference(usage_before)
+        run.accepted_usage().nonnegative_difference(usage_committed)
     });
     let response = outcome
         .progress
@@ -5496,10 +5581,11 @@ async fn execute_prompt(
     else {
         return Ok(PromptOutcome::cancelled(None));
     };
-    // Mid-turn compaction: only for ordinary (non-native) history, whose token
-    // pressure limits are set (compaction enabled, window known), and only
-    // while this prompt still has relief budget.
-    let mid_turn = (mid_turn_enabled && !native)
+    // Mid-turn compaction: only when the token pressure limits are set
+    // (compaction enabled, window known), and only while this prompt still has
+    // relief budget. Native history relieves too: `run_prompt` closes the
+    // native epoch at the boundary (mini-agent-wkzav).
+    let mid_turn = mid_turn_enabled
         .then(|| {
             let pressure = history.limits.token_pressure?;
             let threshold = state.cfg.resolve_mid_turn_compact_threshold()?;
@@ -9198,6 +9284,217 @@ mod protocol_tests {
         assert!(text.contains("mid-turn context relief"), "{text}");
         assert!(text.contains("finished"), "{text}");
         assert!(!text.contains("must not start"), "{text}");
+    }
+
+    fn sse(kind: &str, body: serde_json::Value) -> String {
+        format!("event: {kind}\ndata: {body}\n\n")
+    }
+
+    fn sse_start() -> String {
+        sse(
+            "message_start",
+            serde_json::json!({"type":"message_start","message":{"id":"msg_acp","type":"message","role":"assistant","content":[],"model":"claude-opus-5-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}),
+        )
+    }
+
+    fn sse_text(text: &str) -> String {
+        sse(
+            "content_block_start",
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        ) + &sse(
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+        ) + &sse(
+            "content_block_stop",
+            serde_json::json!({"type":"content_block_stop","index":0}),
+        )
+    }
+
+    fn sse_stop(reason: &str) -> String {
+        sse(
+            "message_delta",
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":reason,"stop_sequence":null},"usage":{"output_tokens":2}}),
+        ) + &sse("message_stop", serde_json::json!({"type":"message_stop"}))
+    }
+
+    fn sse_read_tool_call(id: &str) -> String {
+        sse(
+            "content_block_start",
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":"read","input":{}}}),
+        ) + &sse(
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"held.txt\"}"}}),
+        ) + &sse(
+            "content_block_stop",
+            serde_json::json!({"type":"content_block_stop","index":0}),
+        )
+    }
+
+    /// Serves scripted Anthropic SSE responses on loopback and records every
+    /// request body.
+    async fn scripted_anthropic(
+        responses: Vec<String>,
+    ) -> (String, Arc<StdMutex<Vec<serde_json::Value>>>) {
+        use crate::tests::support::loopback_http::asynchronous as http;
+        let (listener, base) = http::bind().await;
+        let bodies = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = bodies.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, request) = http::accept_request(&listener).await;
+                recorded.lock().unwrap().push(request.json());
+                http::respond_sse(&mut socket, &response).await;
+            }
+        });
+        (base, bodies)
+    }
+
+    // mini-agent-wkzav: an ACP prompt on a provider-native Anthropic session
+    // that fills the window mid-turn closes its native epoch at the tool-batch
+    // boundary, compacts, restarts the thinking chain and finishes the same
+    // prompt instead of ending in a provider context error.
+    #[tokio::test]
+    async fn acp_native_mid_turn_pressure_compacts_and_continues_the_prompt() {
+        let tool_turn = sse_start()
+            + &sse(
+                "content_block_start",
+                serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            )
+            + &sse(
+                "content_block_delta",
+                serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"ACP_OLD_EPOCH_SIGNATURE"}}),
+            )
+            + &sse(
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":0}),
+            )
+            + &sse_read_tool_call("toolu_acp_relief").replace("\"index\":0", "\"index\":1")
+            + &sse_stop("tool_use");
+        let summary = sse_start() + &sse_text("ACP RELIEF SUMMARY") + &sse_stop("end_turn");
+        let answer =
+            sse_start() + &sse_text("finished after native relief") + &sse_stop("end_turn");
+        let (base, bodies) = scripted_anthropic(vec![tool_turn, summary, answer]).await;
+        // Native sessions are persisted: the relief publishes the retired
+        // epoch and opens a new one.
+        let roots = crate::tests::OwnedTestDirectory::new("acp-native-relief");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(roots.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(roots.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(roots.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(roots.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider":"acp-native","model":"claude-opus-5-5",
+            "compact_enabled":true,"mid_turn_compact_threshold":0.00001,
+            "session_title_model":"off",
+            "custom_providers":{"acp-native":{"provider_type":"anthropic","base_url":base}}
+        }))
+        .unwrap();
+        let state = Arc::new(AcpState {
+            idle: idle::Idle::new(None).unwrap(),
+            cli: Cli {
+                no_sandbox: true,
+                tools: vec!["read".into()],
+                ..fixture_cli()
+            },
+            cfg,
+            context: crate::context::load(true),
+            leases: Arc::default(),
+            provider_clients: Default::default(),
+            sessions: Mutex::new(HashMap::new()),
+            cancel_routes: StdMutex::new(HashMap::new()),
+            shell_search_path: std::env::var_os("PATH"),
+            hook_roots: None,
+            client_mcp: ClientMcpPolicy::Sandboxed,
+            client_fs: Default::default(),
+            prompt_fixture: None,
+            runner_fixture: None,
+            #[cfg(feature = "mcp")]
+            mcp_fixture: StdMutex::new(None),
+            prompt_exit_barrier: None,
+            turn_routes: StdMutex::new(Vec::new()),
+        });
+        let workspace = ProtocolTempDir::new();
+        std::fs::write(workspace.path().join("held.txt"), "boundary read").unwrap();
+        let cwd = workspace.path().to_path_buf();
+        let notifications = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = notifications.clone();
+        let connection = Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let outcome = cx
+                    .send_request(prompt(session, "read the held file"))
+                    .block_task()
+                    .await?;
+                assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(20), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3, "tool turn, summarizer, continuation");
+        let continuation = bodies[2]["messages"].to_string();
+        assert!(
+            continuation.contains("ACP RELIEF SUMMARY"),
+            "{continuation}"
+        );
+        assert!(
+            !continuation.contains("ACP_OLD_EPOCH_SIGNATURE"),
+            "the old epoch's signed thinking is not replayed: {continuation}"
+        );
+        let summarized = bodies[1]["messages"].to_string();
+        assert!(
+            summarized.contains("boundary read"),
+            "the saved tool result reached the summarizer: {summarized}"
+        );
+        let text = format!("{:?}", notifications.lock().unwrap());
+        assert!(text.contains("mid-turn context relief"), "{text}");
+        assert!(text.contains("finished after native relief"), "{text}");
+    }
+
+    #[test]
+    fn native_relief_stops_without_tool_progress_or_a_compaction() {
+        let tool_result = |text: &str| Message::User {
+            content: rig::OneOrMany::one(rig::message::UserContent::tool_result(
+                "call",
+                rig::OneOrMany::one(rig::message::ToolResultContent::text(text)),
+            )),
+        };
+        // The first boundary of a prompt is never refused.
+        assert!(native_relief_stop(0, &[], false).is_none());
+        let ran = [tool_result("ok")];
+        assert!(native_relief_stop(1, &ran, true).is_none());
+        let idle = [Message::assistant("thinking")];
+        let why = native_relief_stop(1, &idle, true).expect("no tools since the last relief");
+        assert!(why.contains("ran no tools"), "{why}");
+        let why = native_relief_stop(2, &ran, false).expect("nothing was compacted");
+        assert!(why.contains("found nothing to compact"), "{why}");
     }
 
     /// Runs one ACP prompt whose runner segments fail with a provider

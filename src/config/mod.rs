@@ -860,6 +860,11 @@ pub struct Config {
     pub editor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<HashMap<String, String>>,
+    /// Per-provider trusted commands that print an API key or bearer token, for
+    /// short-lived gateway credentials. Opt-in, global or trusted-project only;
+    /// see `key_command` (mini-agent-toywy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_commands: Option<HashMap<String, crate::key_command::ApiKeyCommandSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quick_models: Option<HashMap<String, types::QuickModelConfig>>,
     /// Map prompt names to quick-model names. When switching to a prompt,
@@ -987,6 +992,13 @@ pub struct Config {
     /// (mini-agent-59sgr).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_files_max_bytes: Option<u64>,
+    /// Opt in to reading the user-level instruction files Claude Code and
+    /// Codex users already keep: `~/.claude/CLAUDE.md` and
+    /// `~/.codex/AGENTS.md`, after mini-agent's own global `AGENTS.md`. Default
+    /// off. A project config can only set it after project trust
+    /// (mini-agent-4l9rf).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_instruction_files: Option<bool>,
     /// Tool calls of one model turn that run at once (default 4, clamped to 1..=16).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_concurrency: Option<usize>,

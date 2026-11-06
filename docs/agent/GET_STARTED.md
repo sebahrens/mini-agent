@@ -343,7 +343,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--include-partial-messages` | With `-p --output stream-json`, also emit `{"type":"text_delta"\|"reasoning_delta","message_id":"msg_<n>","text":...,"truncated":bool}` records as the model streams (coalesced per ready burst, each bounded by `--stream-json-preview-bytes`). `message_id` names the completion in progress. `assistant_text`, `usage` and `result` are unchanged, so each fragment also appears as `assistant_text`; without the flag the output is byte-identical to before. |
 | `--stream-json-control` | With `-p --input-format stream-json --output stream-json`, opt in to the stdin control channel (see below). Default off: control lines are ordinary `input_error`s and headless asks stay denied. |
 | `--max-stdin-bytes N` | With `-p`, piped-stdin limit (per input line with `--input-format stream-json`; 1,024–67,108,864; default 1,048,576). |
-| `--stdin-idle-secs N` | With `-p` and an explicit prompt, seconds to wait for a silent piped stdin to produce data or EOF (0-86,400; default 2). On timeout the run proceeds without stdin and prints a `Warning: no stdin data within N s` line on stderr (suppressed by `--quiet`). `0` waits for EOF, for slow producers such as builds or `kubectl logs`. |
+| `--stdin-idle-secs N` | With `-p` and an explicit prompt, seconds to wait for a silent piped stdin to produce data or EOF (0-86,400; default 2). On timeout the run proceeds without stdin (the piped input is NOT read), prints a `Warning: no stdin data within N s` line on stderr (`--quiet` silences it for text output only, never for `--output json`/`stream-json`) and marks machine output: the stream-json `system` `init` record and the final `json`/`stream-json` result carry `"stdin_abandoned":true` and `"stdin_idle_secs":N` (absent when stdin was read normally). `0` waits for EOF, for slow producers such as builds, test runs or `kubectl logs`. |
 | `--quiet` | With `-p`, silence reasoning, stdin notices, and tool progress on stderr. Errors and operational warnings remain visible. Conflicts with `--pure-stdout`. |
 | `-c`, `--continue` | Continue the most recent session saved for the current workspace. Use `--session` to select one from another workspace. If another running mini-agent process owns that session, continue in a forked copy under a new ID (with a notice) instead of overwriting its turns. |
 | `-r`, `--resume` | Open a workspace-scoped session picker in a terminal. Tab explicitly toggles All workspaces, Enter resumes, and Esc cancels. Without a terminal, list bounded current-workspace rows and exit without provider work. |
@@ -467,6 +467,27 @@ the process with status 130. A kernel-blocked write cannot be canceled portably;
 until its exact join or forced process exit. Forced transport shutdown can leave a partial NDJSON
 line. An interrupted output transport cannot promise delivery of a final record. This output path
 does not change inherited blocking, append, async, or access modes.
+
+### stream-json `system` records
+
+`--output stream-json` starts with `system` records that describe the run the driver actually got.
+They are additive: unknown fields must be ignored.
+
+```json
+{"type":"system","subtype":"init","session_id":"...","session_name":"...","ephemeral":false,"provider":"anthropic","model":"claude-sonnet-5-5","cwd":"/work/repo","permission_mode":"standard","sandbox":{"enabled":true,"backend":"seatbelt","profile":"workspace","network":"deny"}}
+{"type":"system","subtype":"capabilities","session_id":"...","tools":["edit","read","write"],"mcp_servers":[{"name":"docs","status":"connected"},{"name":"db","status":"failed","error":"not connected (credential values omitted)"}]}
+```
+
+- `init` comes first. `permission_mode` is the effective mode after flags, project config and policy;
+  `sandbox` names the effective containment (`enabled`, `backend`, `profile`, `network`; no paths).
+  `stdin_abandoned` and `stdin_idle_secs` appear when a silent piped stdin was dropped (see
+  `--stdin-idle-secs`).
+- `capabilities` follows once the agent is built and MCP servers have connected, before the first model
+  request: `tools` is the sorted list of tool names the model was given, and `mcp_servers` lists every
+  configured server with a `status` of `connected`, `failed`, `timed_out`, `cancelled`, `pending`,
+  `disabled`, `not_started` (MCP was not enabled for this run, for example by `--no-tools`) or
+  `not_connected`. A non-connected server carries a bounded `error` that never contains credential values.
+  The same connection failures still go to stderr as text.
 
 Final JSON and NDJSON results include `session_id`, `session_name`, and `session_persisted`.
 IDs identify the actual selected or forked session; `--no-session` still has a logical ID but
