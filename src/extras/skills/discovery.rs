@@ -20,8 +20,14 @@ fn max_packages() -> usize {
 }
 const MAX_ENTRIES: usize = 1024;
 const MAX_DEPTH: usize = 8;
-const MAX_RESOURCE_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_RESOURCE_BYTES: usize = 1024 * 1024;
+/// Per-package content budget (not shared across packages or roots).
 const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+
+/// `skills_max_resource_bytes` (default 1 MiB, at most the 8 MiB package budget).
+fn max_resource_bytes() -> usize {
+    super::index::AgentSkillSearchPolicy::configured().max_resource_bytes
+}
 
 #[derive(Clone)]
 pub(crate) struct SourceRoot {
@@ -367,6 +373,15 @@ fn signature_node(
     Some(())
 }
 
+/// Keeps a rejection reason to one short printable line for diagnostics.
+fn sanitize_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(200)
+        .collect()
+}
+
 /// Whether every source root that exists is still authorized. A cached
 /// discovery is only reusable when none of its roots lost (or newly gained)
 /// the trust and read authority it was built under; a root that cannot even be
@@ -430,9 +445,10 @@ pub(crate) fn discover(
             .push("imported catalogue unavailable".into()),
     }
     let mut packages = result.packages.len();
-    let mut entries = 0usize;
-    let mut bytes = 0usize;
     for source in roots {
+        // Entry and byte budgets are per root (scan) and per package (content):
+        // one oversized package or root never starves the ones after it.
+        let mut entries = 0usize;
         let directory = match source.binding.open_dir_relative(&source.directory) {
             Ok(directory) => directory,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -482,7 +498,7 @@ pub(crate) fn discover(
             result
                 .diagnostics
                 .push(format!("{}: {error}", source.origin));
-            break;
+            continue;
         }
         for name in names {
             packages = packages.saturating_add(1);
@@ -493,6 +509,8 @@ pub(crate) fn discover(
                 return result;
             }
             let package_path = source.directory.join(&name);
+            let mut package_entries = 0usize;
+            let mut bytes = 0usize;
             let attempt = (|| -> Result<(), String> {
                 let root_file = source
                     .binding
@@ -508,7 +526,7 @@ pub(crate) fn discover(
                     &package_path,
                     &package_path,
                     0,
-                    &mut entries,
+                    &mut package_entries,
                     &mut bytes,
                     &mut tree,
                     &mut files,
@@ -572,14 +590,13 @@ pub(crate) fn discover(
                 result.catalogues.push(catalogue);
                 Ok(())
             })();
-            if attempt.is_err() {
+            if let Err(reason) = attempt {
                 result.diagnostics.push(format!(
-                    "{}: package rejected by validation or source policy",
-                    source.origin
+                    "{} skill '{}' rejected: {}",
+                    source.origin,
+                    name,
+                    sanitize_reason(&reason)
                 ));
-                if entries > MAX_ENTRIES || bytes > MAX_SOURCE_BYTES {
-                    return result;
-                }
             }
         }
     }
@@ -676,12 +693,23 @@ fn collect(
             let cap = if relative == "SKILL.md" {
                 super::MAX_SKILL_INSTRUCTION_BYTES as usize
             } else {
-                MAX_RESOURCE_BYTES
+                max_resource_bytes()
             };
-            if before.len() > cap as u64
-                || before.len() > MAX_SOURCE_BYTES.saturating_sub(*bytes) as u64
-            {
-                return Err("skill content byte limit exceeded".into());
+            if before.len() > cap as u64 {
+                return Err(format!(
+                    "{relative} is {} bytes, above the {cap}-byte per-file limit{}",
+                    before.len(),
+                    if relative == "SKILL.md" {
+                        ""
+                    } else {
+                        " (raise skills_max_resource_bytes)"
+                    }
+                ));
+            }
+            if before.len() > MAX_SOURCE_BYTES.saturating_sub(*bytes) as u64 {
+                return Err(format!(
+                    "package content exceeds the {MAX_SOURCE_BYTES}-byte per-package limit"
+                ));
             }
             let mut content = Vec::new();
             file.take(cap as u64 + 1)

@@ -971,9 +971,10 @@ user turn, including its automatic continuations. The arguments are literal user
 expand shell variables, file includes or permission directives. A later explicit user prompt removes
 the pin. Built-in commands and custom command templates take precedence over skill names.
 
-Discovery checks explicitly imported packages first, then captured project `.mini-agent/skills`
-and `.claude/skills`, then the captured user's `~/.claude/skills`. First valid name
-wins. Project sources use the existing project-config trust fingerprint; each original source also
+Discovery checks explicitly imported packages first, then captured project `.mini-agent/skills`,
+`.claude/skills` and `.agents/skills`, nested `.claude/skills` / `.agents/skills` between the launch
+directory and the workspace root, then the captured user's `~/.claude/skills` and
+`~/.agents/skills`. First valid name wins. Project sources use the existing project-config trust fingerprint; each original source also
 requires current read authority. An Ask or Deny source is omitted without prompting or granting.
 Links, special files, hard links and escaping resources are refused. Scripts and `allowed-tools`
 remain inert. A pin that has changed, lost authority or cannot fit the shared context budget fails

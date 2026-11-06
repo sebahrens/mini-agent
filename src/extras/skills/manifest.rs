@@ -37,19 +37,62 @@ pub enum ManifestError {
     InvalidLearnedJs,
 }
 
+/// Unknown frontmatter keys are ignored (Claude Code compatibility); only the
+/// keys below are interpreted, and none of them grants a capability.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawManifest {
     name: String,
     description: String,
     license: Option<String>,
     compatibility: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_metadata")]
     metadata: BTreeMap<String, String>,
-    #[serde(rename = "allowed-tools")]
+    #[serde(default, rename = "allowed-tools", deserialize_with = "string_or_list")]
     allowed_tools: Option<String>,
     #[serde(default, rename = "learned-js")]
     learned_js: Vec<String>,
+}
+
+fn scalar_to_string(value: &serde_yaml_ng::Value) -> Option<String> {
+    use serde_yaml_ng::Value;
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// `metadata` accepts arbitrary scalar values (rendered as text); null and
+/// non-scalar values are dropped instead of rejecting the package.
+fn lenient_metadata<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<BTreeMap<String, serde_yaml_ng::Value>> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, value)| scalar_to_string(&value).map(|text| (key, text)))
+        .collect())
+}
+
+/// `allowed-tools` accepts a space-separated string or a YAML list of scalars
+/// (joined with single spaces). It stays descriptive and never grants anything.
+fn string_or_list<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_yaml_ng::Value;
+    let raw: Option<Value> = Option::deserialize(deserializer)?;
+    Ok(match raw {
+        None | Some(Value::Null) => None,
+        Some(Value::Sequence(items)) => {
+            let parts: Vec<String> = items.iter().filter_map(scalar_to_string).collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        Some(other) => scalar_to_string(&other),
+    })
 }
 
 pub(super) fn parse_skill_markdown(bytes: &[u8]) -> Result<AgentSkillManifest, ManifestError> {
@@ -153,13 +196,44 @@ mod tests {
     }
 
     #[test]
-    fn agent_skill_manifest_rejects_invalid_names_and_unknown_fields() {
+    fn agent_skill_manifest_rejects_invalid_names_but_ignores_unknown_fields() {
         let bad_name = b"---\nname: Bad--Name\ndescription: Invalid name.\n---\nInstructions\n";
         assert!(parse_skill_markdown(bad_name).is_err());
 
         let unknown =
             b"---\nname: valid\ndescription: Valid description.\ncapabilities: all\n---\n";
-        assert!(parse_skill_markdown(unknown).is_err());
+        let manifest = parse_skill_markdown(unknown).unwrap();
+        assert_eq!(manifest.name, "valid");
+        // An ignored key never grants anything.
+        assert!(manifest.allowed_tools.is_none());
+    }
+
+    #[test]
+    fn agent_skill_manifest_loads_claude_code_frontmatter() {
+        let markdown = b"---\nname: fix-issue\ndescription: Fix an issue.\ndisable-model-invocation: true\nuser-invocable: false\nargument-hint: \"[issue]\"\nmodel: opus\neffort: high\ncontext: fork\nagent: Explore\npaths:\n  - \"src/**\"\nhooks:\n  PreToolUse:\n    - matcher: Bash\nallowed-tools:\n  - Read\n  - Bash(git:*)\nmetadata:\n  version: 2\n  stable: true\n  nested:\n    a: b\n  empty:\n---\nBody\n";
+        let manifest = parse_skill_markdown(markdown).unwrap();
+        assert_eq!(manifest.name, "fix-issue");
+        assert_eq!(manifest.allowed_tools.as_deref(), Some("Read Bash(git:*)"));
+        assert_eq!(
+            manifest.metadata.get("version").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            manifest.metadata.get("stable").map(String::as_str),
+            Some("true")
+        );
+        assert!(!manifest.metadata.contains_key("nested"));
+        assert!(!manifest.metadata.contains_key("empty"));
+    }
+
+    #[test]
+    fn agent_skill_manifest_still_validates_known_fields_with_unknown_keys_present() {
+        let long = "d".repeat(1025);
+        let markdown = format!("---\nname: ok\ndescription: {long}\nmodel: x\n---\n");
+        assert!(matches!(
+            parse_skill_markdown(markdown.as_bytes()),
+            Err(ManifestError::InvalidDescription)
+        ));
     }
 
     #[test]

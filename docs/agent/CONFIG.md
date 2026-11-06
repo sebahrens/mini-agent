@@ -760,6 +760,7 @@ Accepted top-level keys:
 | `skills_score_floor` | number | Minimum relevance score for automatic Agent Skill selection, 0.0–1.0. Default: `0.20`. |
 | `skills_catalog_bytes` | integer | Bytes of an always-visible name/description catalog of every authorized skill in the skill context. Default: `0` (off); at most 65,536. |
 | `skills_max_packages` | integer | Agent Skill packages discovered across all roots. Default: `64` (1–1,024). |
+| `skills_max_resource_bytes` | integer | Largest resource file in a discovered Agent Skill package. Default: `1048576` (1 byte–8 MiB). |
 | `acp_history_max_turns` | integer | ACP only: summarize live history after this many user turns. Default: unset/`0` (no turn cap; compaction follows token pressure under `compact_enabled` and the byte guard). |
 | `acp_history_max_bytes` | integer | ACP only: serialized live-history memory guard. Default: max(2 MiB, 4 bytes per context-window token); minimum 64 KiB. |
 | `acp_max_sessions` | integer | ACP only: concurrently loaded sessions per process. Default: `64`. |
@@ -4169,9 +4170,13 @@ for the bounded format and output limits.
 
 Instruction-only Agent Skills are available with the default `agent-skills` Cargo feature. Their
 captured project sources share the existing `.mini-agent/config.toml` trust approval; no new trust
-file or `allowed-tools` permission authority exists. Imported selections and all compatibility skill roots share a `skills_max_packages` ceiling (default 64). Directory roots share a scan
-budget of 1,024 entries, depth 8, 48 KiB per `SKILL.md`, 1 MiB per resource and 8 MiB of
-content. Selected instruction bodies share a 48 KiB budget, referenced resources 32 KiB, and the
+file or `allowed-tools` permission authority exists. Imported selections and all compatibility skill roots share a `skills_max_packages` ceiling (default 64). Each directory root has its own scan
+budget of 1,024 entries, and each package its own budget of 1,024 entries, depth 8, 48 KiB for
+`SKILL.md`, 1 MiB per resource (`skills_max_resource_bytes`, at most 8 MiB) and 8 MiB of content.
+A package over a limit is skipped with a diagnostic naming it and the limit; later packages and
+roots still load. Unknown `SKILL.md` frontmatter keys (for example `disable-model-invocation`,
+`argument-hint`, `model`, `hooks`, `paths`) are ignored; `allowed-tools` may be a string or a list
+and `metadata` may hold any scalar values. Selected instruction bodies share a 48 KiB budget, referenced resources 32 KiB, and the
 post-escape instruction/learned manifest block 64 KiB. Discovered packages are copied into isolated
 content-addressed cache namespaces and never repoint explicitly imported packages' `ACTIVE` files.
 

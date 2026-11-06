@@ -346,6 +346,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("skills_score_floor").described("Minimum relevance score for automatic Agent Skill selection (default 0.20)").shaped(ConfigShape::Number),
     key("skills_catalog_bytes").described("Bytes of an always-visible Agent Skill name/description catalog in the skill context (default 0: off; at most 65536)").shaped(ConfigShape::Integer),
     key("skills_max_packages").described("Agent Skill packages discovered across all roots (default 64, at most 1024)").shaped(ConfigShape::Integer),
+    key("skills_max_resource_bytes").described("Largest resource file in a discovered Agent Skill package (default 1048576, at most 8388608)").shaped(ConfigShape::Integer),
     key("persist_project_approvals").described("Offer (p) always allow in this project on TUI approval prompts; rules are stored privately per workspace in the state directory and loaded at interactive startup (default false)").shaped(ConfigShape::Bool),
     key("session_retention_days").described("Delete saved sessions not modified for this many days at interactive startup (default 0: keep forever). Sessions open in a live process are never removed.").shaped(ConfigShape::Integer),
     gated("lsp", "lsp").shaped(ConfigShape::Object),

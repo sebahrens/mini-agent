@@ -113,6 +113,31 @@ impl InstructionOwner {
     }
 }
 
+/// Directories strictly between the workspace `root` and `cwd` (relative to
+/// `root`), nearest to `cwd` first, so a monorepo package launched from a
+/// subdirectory also sees that subdirectory's skills. Empty when `cwd` is not
+/// below `root`; at most 8 levels.
+fn nested_dirs(root: &std::path::Path, cwd: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(relative) = cwd.strip_prefix(root) else {
+        return Vec::new();
+    };
+    let mut current = relative.to_path_buf();
+    let mut dirs = Vec::new();
+    while !current.as_os_str().is_empty() && dirs.len() < 8 {
+        if current
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Vec::new();
+        }
+        dirs.push(current.clone());
+        if !current.pop() {
+            break;
+        }
+    }
+    dirs
+}
+
 fn same_permission(left: &Option<PermCheck>, right: &Option<PermCheck>) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -177,29 +202,48 @@ impl InstructionServices {
         }
         self.roots
             .get_or_init(|| {
+                let project = |directory: PathBuf, origin: &'static str| SourceRoot {
+                    binding: Arc::clone(&self.workspace),
+                    directory,
+                    origin,
+                    project: true,
+                };
+                // Precedence (first valid name wins): workspace-root roots,
+                // then nested directories between the launch directory and the
+                // workspace root (nearest first), then user roots. Every
+                // project root shares the workspace trust gate.
                 let mut roots = vec![
-                    SourceRoot {
-                        binding: Arc::clone(&self.workspace),
-                        directory: ".mini-agent/skills".into(),
-                        origin: "project .mini-agent",
-                        project: true,
-                    },
-                    SourceRoot {
-                        binding: Arc::clone(&self.workspace),
-                        directory: ".claude/skills".into(),
-                        origin: "project .claude",
-                        project: true,
-                    },
+                    project(".mini-agent/skills".into(), "project .mini-agent"),
+                    project(".claude/skills".into(), "project .claude"),
+                    project(".agents/skills".into(), "project .agents"),
                 ];
+                if let Ok(cwd) = std::env::current_dir() {
+                    for nested in nested_dirs(self.workspace.root(), &cwd) {
+                        roots.push(project(
+                            nested.join(".claude/skills"),
+                            "project nested .claude",
+                        ));
+                        roots.push(project(
+                            nested.join(".agents/skills"),
+                            "project nested .agents",
+                        ));
+                    }
+                }
                 if let Some(home) = &self.home
                     && let Ok(binding) = WorkspaceBinding::capture(home)
                 {
-                    roots.push(SourceRoot {
-                        binding: Arc::new(binding),
-                        directory: ".claude/skills".into(),
-                        origin: "user .claude",
-                        project: false,
-                    });
+                    let binding = Arc::new(binding);
+                    for (directory, origin) in [
+                        (".claude/skills", "user .claude"),
+                        (".agents/skills", "user .agents"),
+                    ] {
+                        roots.push(SourceRoot {
+                            binding: Arc::clone(&binding),
+                            directory: directory.into(),
+                            origin,
+                            project: false,
+                        });
+                    }
                 }
                 roots
             })
@@ -1461,6 +1505,96 @@ mod discovery_tests {
                 .matches("SHARED_PIN_CONTEXT")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn nested_dirs_walk_from_cwd_up_to_but_excluding_the_workspace_root() {
+        let root = std::path::Path::new("/ws");
+        assert_eq!(
+            nested_dirs(root, std::path::Path::new("/ws/a/b")),
+            vec![PathBuf::from("a/b"), PathBuf::from("a")]
+        );
+        assert!(nested_dirs(root, std::path::Path::new("/ws")).is_empty());
+        assert!(nested_dirs(root, std::path::Path::new("/elsewhere/a")).is_empty());
+        let deep = std::path::Path::new("/ws/1/2/3/4/5/6/7/8/9/10");
+        assert_eq!(nested_dirs(root, deep).len(), 8);
+    }
+
+    #[tokio::test]
+    async fn agents_skills_roots_are_discovered_with_documented_precedence() {
+        let mut fixture = Fixture::new(false);
+        let home = fixture.root.path().join("owned-home");
+        std::fs::create_dir_all(&home).unwrap();
+        Arc::get_mut(&mut fixture.services).unwrap().home = Some(home.clone());
+        std::fs::create_dir_all(home.join(".agents/skills/user-agent")).unwrap();
+        std::fs::write(
+            home.join(".agents/skills/user-agent/SKILL.md"),
+            "---\nname: user-agent\ndescription: user agents\n---\nUSER\n",
+        )
+        .unwrap();
+        fixture.skill(".agents/skills", "proj-agent", "project agents", "PROJ");
+        fixture.skill(".agents/skills", "clash", "agents clash", "FROM_AGENTS");
+        fixture.skill(".claude/skills", "clash", "claude clash", "FROM_CLAUDE");
+        let snapshot = fixture.services.refresh(false).await.unwrap();
+        assert_eq!(snapshot.packages["proj-agent"].origin, "project .agents");
+        assert_eq!(snapshot.packages["user-agent"].origin, "user .agents");
+        assert_eq!(snapshot.packages["clash"].origin, "project .claude");
+    }
+
+    #[tokio::test]
+    async fn one_oversized_package_does_not_starve_later_packages_or_roots() {
+        let mut fixture = Fixture::new(false);
+        let home = fixture.root.path().join("owned-home");
+        std::fs::create_dir_all(home.join(".claude/skills/home-ok")).unwrap();
+        std::fs::write(
+            home.join(".claude/skills/home-ok/SKILL.md"),
+            "---\nname: home-ok\ndescription: home ok\n---\nHOME\n",
+        )
+        .unwrap();
+        Arc::get_mut(&mut fixture.services).unwrap().home = Some(home);
+        let big = fixture.skill(".claude/skills", "aaa-big", "big resources", "BIG");
+        let dir = big.parent().unwrap();
+        for n in 0..9 {
+            std::fs::write(dir.join(format!("r{n}.bin")), vec![0u8; 1024 * 1024]).unwrap();
+        }
+        let over = fixture.skill(".claude/skills", "bbb-over", "over one file", "OVER");
+        std::fs::write(
+            over.parent().unwrap().join("huge.bin"),
+            vec![0u8; 1024 * 1024 + 1],
+        )
+        .unwrap();
+        fixture.skill(".claude/skills", "zzz-ok", "fine", "OK");
+        let snapshot = fixture.services.refresh(false).await.unwrap();
+        assert!(snapshot.packages.contains_key("zzz-ok"));
+        assert!(snapshot.packages.contains_key("home-ok"));
+        assert!(!snapshot.packages.contains_key("aaa-big"));
+        assert!(!snapshot.packages.contains_key("bbb-over"));
+        let text = snapshot.diagnostics.join("\n");
+        assert!(
+            text.contains("'aaa-big'") && text.contains("per-package limit"),
+            "{text}"
+        );
+        assert!(
+            text.contains("'bbb-over'") && text.contains("skills_max_resource_bytes"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_frontmatter_skill_is_discovered() {
+        let fixture = Fixture::new(false);
+        let path = fixture.skill(".claude/skills", "cc-skill", "claude code skill", "CC");
+        std::fs::write(
+            &path,
+            "---\nname: cc-skill\ndescription: claude code skill\ndisable-model-invocation: true\nargument-hint: \"[x]\"\nallowed-tools:\n  - Read\n---\nCC\n",
+        )
+        .unwrap();
+        let snapshot = fixture.services.refresh(false).await.unwrap();
+        assert!(
+            snapshot.packages.contains_key("cc-skill"),
+            "{:?}",
+            snapshot.diagnostics
         );
     }
 
