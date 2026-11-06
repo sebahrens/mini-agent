@@ -160,6 +160,9 @@ upstream changes that are new relative to this fork.
 
 ### Changed
 
+- `web_fetch` converts HTML to Markdown: links keep absolute targets resolved against the final
+  URL, and headings (h1-h6), nested lists, fenced code, inline code, simple tables and image alt
+  text are preserved, so the model can follow links from a docs index (mini-agent-bksyr).
 - Add `gemini-pro-latest` to the embedded model catalog.
 - Web fetches reuse up to two idle keep-alive connections per host for 30 s, and `grep` reuses
   one read buffer across files instead of allocating per file.

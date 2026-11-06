@@ -1572,7 +1572,11 @@ stack budget. No production stack-size override is introduced.
 `src/agent/tools/web_http.rs` owns the parent-only URL/origin policy, public-address
 checks, process-wide DNS budget, request/response caps and pinned HTTP transports
 shared by native web tools and the JS broker. `web_fetch.rs` implements GET-only
-page retrieval and minimal HTML-to-text conversion; `web_search.rs` implements
+page retrieval and a bounded, non-executing HTML-to-Markdown conversion (links as
+`[text](absolute-url)` resolved against the final URL, `#` headings for h1-h6,
+`-`/`1.` lists, fenced `pre` blocks, inline code, simple pipe tables and image
+alt text; script/style/noscript/template bodies and comments omitted; output at
+most twice the input and link targets at most 2 KiB); `web_search.rs` implements
 fixed-endpoint Exa search. These tools are available without the `js`, `sandbox`
 or `mcp` Cargo features and use the same mandatory model-tool decorators as other
 built-ins. `--no-tools` and named `--tools` selection apply normally.

@@ -126,7 +126,7 @@ impl Tool for WebFetchTool {
             Some(t) if t != "text/html" && t != "application/xhtml+xml" => {
                 safe_text(&response.text)
             }
-            _ => page_text(&response.text),
+            _ => page_markdown(&response.text, Some(&url)),
         };
         let mut chars = text.chars();
         let excerpt: String = chars.by_ref().take(MAX_TEXT_CHARS).collect();
@@ -191,18 +191,317 @@ pub(crate) fn safe_text(text: &str) -> String {
     text.chars().map(|c| if (c.is_control() && !matches!(c, '\n' | '\t')) || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { '\u{fffd}' } else { c }).collect()
 }
 
-/// Deliberately small non-executing HTML-to-text adapter. Tags are discarded;
-/// script/style bodies are omitted, common/numeric entities decoded once.
-/// The HTTP input cap bounds allocation and scanning, including malformed HTML.
+/// Resolved link targets longer than this are dropped (link text is kept), so
+/// a long base URL cannot amplify many tiny anchors into unbounded output.
+const MAX_LINK_URL_BYTES: usize = 2048;
+
+#[cfg(test)]
 fn page_text(input: &str) -> String {
+    page_markdown(input, None)
+}
+
+/// Value of attribute `name` in a raw tag body (`a href="x" ...`), unquoted.
+fn tag_attribute(tag: &str, name: &str) -> Option<String> {
+    let mut rest = tag.split_once(|c: char| c.is_ascii_whitespace())?.1;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
+        if rest.is_empty() {
+            return None;
+        }
+        let key_end = rest
+            .find(|c: char| c.is_ascii_whitespace() || c == '=' || c == '/')
+            .unwrap_or(rest.len());
+        let key = &rest[..key_end];
+        rest = rest[key_end..].trim_start();
+        let mut value = None;
+        if let Some(after) = rest.strip_prefix('=') {
+            let after = after.trim_start();
+            let (raw, next) = match after.chars().next() {
+                Some(q @ ('"' | '\'')) => match after[1..].find(q) {
+                    Some(close) => (&after[1..1 + close], &after[close + 2..]),
+                    None => (&after[1..], ""),
+                },
+                _ => {
+                    let stop = after
+                        .find(|c: char| c.is_ascii_whitespace())
+                        .unwrap_or(after.len());
+                    (&after[..stop], &after[stop..])
+                }
+            };
+            value = Some(raw);
+            rest = next;
+        }
+        if key.eq_ignore_ascii_case(name) {
+            return value.map(|v| decode_entities(v.trim()));
+        }
+    }
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" | "#39" => Some('\''),
+        "nbsp" => Some(' '),
+        e if e.starts_with("#x") || e.starts_with("#X") => u32::from_str_radix(&e[2..], 16)
+            .ok()
+            .and_then(char::from_u32),
+        e if e.starts_with('#') => e[1..].parse().ok().and_then(char::from_u32),
+        _ => None,
+    }
+}
+
+fn decode_entities(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if c == '&'
+            && let Some(end) = rest.as_bytes().iter().take(13).position(|b| *b == b';')
+            && let Some(decoded) = decode_entity(&rest[1..end])
+        {
+            output.push(decoded);
+            rest = &rest[end + 1..];
+            continue;
+        }
+        output.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    output
+}
+
+/// Absolute link target for `href`, or `None` for fragments, script/data
+/// URLs and over-long results.
+fn link_target(href: &str, base: Option<&reqwest::Url>) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with('#') {
+        return None;
+    }
+    let url = match base {
+        Some(base) => base.join(href).ok()?,
+        None => reqwest::Url::parse(href).ok()?,
+    };
+    (matches!(url.scheme(), "http" | "https" | "mailto")
+        && url.as_str().len() <= MAX_LINK_URL_BYTES)
+        .then(|| url.to_string())
+}
+
+struct MarkdownWriter {
+    output: String,
+    limit: usize,
+    pre: usize,
+    lists: Vec<(bool, usize)>,
+    link: Option<(String, usize)>,
+    row_cells: usize,
+    row_has_header: bool,
+    header_rule_done: bool,
+}
+
+impl MarkdownWriter {
+    fn ends_with_newlines(&self, count: usize) -> bool {
+        self.output.is_empty() || self.output.ends_with(&"\n".repeat(count))
+    }
+    fn newline(&mut self) {
+        while self.output.ends_with(' ') {
+            self.output.pop();
+        }
+        if !self.ends_with_newlines(1) {
+            self.output.push('\n');
+        }
+    }
+    fn blank_line(&mut self) {
+        self.newline();
+        if !self.ends_with_newlines(2) {
+            self.output.push('\n');
+        }
+    }
+    fn text(&mut self, c: char) {
+        if self.pre > 0 {
+            self.output.push(c);
+        } else if c.is_whitespace() && c != '\n' {
+            if !(self.output.is_empty() || self.output.ends_with([' ', '\n', '['])) {
+                self.output.push(' ');
+            }
+        } else if c == '\n' {
+            if !self.ends_with_newlines(2) {
+                self.newline();
+            }
+        } else {
+            self.output.push(c);
+        }
+    }
+    fn tag(&mut self, raw: &str, name: &str, base: Option<&reqwest::Url>) {
+        let closing = name.starts_with('/');
+        let bare = name.trim_start_matches('/');
+        match bare {
+            "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "nav"
+            | "aside" | "blockquote" | "figure" | "figcaption" | "dl" | "form" | "table" => {
+                self.blank_line()
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                self.blank_line();
+                if !closing {
+                    let level = usize::from(bare.as_bytes()[1] - b'0');
+                    self.output.push_str(&"#".repeat(level));
+                    self.output.push(' ');
+                }
+            }
+            "br" => self.newline(),
+            "hr" => {
+                self.blank_line();
+                self.output.push_str("---");
+                self.blank_line();
+            }
+            "ul" | "ol" => {
+                if closing {
+                    self.lists.pop();
+                } else {
+                    self.lists.push((bare == "ol", 0));
+                }
+                self.newline();
+            }
+            "li" if !closing => {
+                self.newline();
+                let depth = self.lists.len().saturating_sub(1);
+                self.output.push_str(&"  ".repeat(depth.min(8)));
+                match self.lists.last_mut() {
+                    Some((true, counter)) => {
+                        *counter += 1;
+                        let counter = *counter;
+                        self.output.push_str(&format!("{counter}. "));
+                    }
+                    _ => self.output.push_str("- "),
+                }
+            }
+            "dt" | "dd" | "li" => self.newline(),
+            "pre" => {
+                if closing {
+                    self.pre = self.pre.saturating_sub(1);
+                    if self.pre == 0 {
+                        self.newline();
+                        self.output.push_str("```");
+                        self.blank_line();
+                    }
+                } else {
+                    if self.pre == 0 {
+                        self.blank_line();
+                        self.output.push_str("```\n");
+                    }
+                    self.pre += 1;
+                }
+            }
+            "code" | "kbd" | "samp" if self.pre == 0 => self.output.push('`'),
+            "strong" | "b" => self.output.push_str("**"),
+            "tr" => {
+                if closing {
+                    if self.row_cells > 0 {
+                        while self.output.ends_with(' ') {
+                            self.output.pop();
+                        }
+                        self.output.push_str(" |");
+                    }
+                    if self.row_has_header && !self.header_rule_done && self.row_cells > 0 {
+                        self.output.push('\n');
+                        self.output.push('|');
+                        self.output
+                            .push_str(&" --- |".repeat(self.row_cells.min(64)));
+                        self.header_rule_done = true;
+                    }
+                    self.newline();
+                } else {
+                    self.newline();
+                    self.row_cells = 0;
+                    self.row_has_header = false;
+                }
+            }
+            "td" | "th" => {
+                if !closing {
+                    if bare == "th" {
+                        self.row_has_header = true;
+                    }
+                    self.output
+                        .push_str(if self.row_cells == 0 { "| " } else { " | " });
+                    self.row_cells += 1;
+                }
+            }
+            "a" => {
+                if closing {
+                    if let Some((target, start)) = self.link.take() {
+                        while self.output.ends_with(' ') {
+                            self.output.pop();
+                        }
+                        if self.output.len() == start {
+                            self.output.push_str("link");
+                        }
+                        self.output.push_str("](");
+                        self.output.push_str(&target);
+                        self.output.push(')');
+                    }
+                } else if self.link.is_none()
+                    && let Some(target) =
+                        tag_attribute(raw, "href").and_then(|href| link_target(&href, base))
+                {
+                    self.output.push('[');
+                    self.link = Some((target, self.output.len()));
+                }
+            }
+            "img" if !closing => {
+                let alt = tag_attribute(raw, "alt").unwrap_or_default();
+                let alt = alt.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !alt.is_empty() {
+                    match tag_attribute(raw, "src").and_then(|src| link_target(&src, base)) {
+                        Some(src) if self.link.is_none() => {
+                            self.output.push_str(&format!("![{alt}]({src})"))
+                        }
+                        _ => self.output.push_str(&format!("[image: {alt}]")),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Deliberately small, non-executing HTML-to-Markdown adapter. Links become
+/// `[text](absolute-url)` resolved against `base`; headings, lists, fenced
+/// `pre` blocks, inline code, simple tables and image alt text are kept.
+/// Script/style/noscript/template bodies and comments are omitted; common and
+/// numeric entities are decoded once. Output is bounded to twice the input
+/// plus a small constant, and the HTTP input cap bounds the scan.
+fn page_markdown(input: &str, base: Option<&reqwest::Url>) -> String {
     if !input.contains('<') {
         return safe_text(input);
     }
-    let mut output = String::with_capacity(input.len());
+    let mut writer = MarkdownWriter {
+        output: String::with_capacity(input.len().min(1 << 20)),
+        limit: input.len().saturating_mul(2).saturating_add(4096),
+        pre: 0,
+        lists: Vec::new(),
+        link: None,
+        row_cells: 0,
+        row_has_header: false,
+        header_rule_done: false,
+    };
     let mut position = 0;
     let mut ignored: Option<String> = None;
     while position < input.len() {
+        if writer.output.len() > writer.limit {
+            writer
+                .output
+                .push_str("\n[HTML conversion stopped at its output bound]\n");
+            break;
+        }
         let rest = &input[position..];
+        if rest.starts_with("<!--") {
+            match rest.find("-->") {
+                Some(end) => {
+                    position += end + 3;
+                    continue;
+                }
+                None => break,
+            }
+        }
         if rest.starts_with('<') {
             let mut quoted = None;
             let mut end = None;
@@ -220,7 +519,8 @@ fn page_text(input: &str) -> String {
             let Some(end) = end else {
                 break;
             };
-            let tag = rest[1..end].trim().to_ascii_lowercase();
+            let raw = rest[1..end].trim();
+            let tag = raw.to_ascii_lowercase();
             let name = tag
                 .split_ascii_whitespace()
                 .next()
@@ -228,28 +528,12 @@ fn page_text(input: &str) -> String {
                 .trim_end_matches('/');
             if ignored.as_deref().is_some_and(|n| name == format!("/{n}")) {
                 ignored = None;
-            } else if ignored.is_none() && matches!(name, "script" | "style") {
-                ignored = Some(name.to_owned());
             } else if ignored.is_none()
-                && matches!(
-                    name,
-                    "p" | "/p"
-                        | "br"
-                        | "div"
-                        | "/div"
-                        | "li"
-                        | "/li"
-                        | "h1"
-                        | "/h1"
-                        | "h2"
-                        | "/h2"
-                        | "pre"
-                        | "/pre"
-                        | "tr"
-                        | "/tr"
-                )
+                && matches!(name, "script" | "style" | "noscript" | "template")
             {
-                output.push('\n');
+                ignored = Some(name.to_owned());
+            } else if ignored.is_none() {
+                writer.tag(raw, name, base);
             }
             position += end + 1;
         } else {
@@ -257,35 +541,22 @@ fn page_text(input: &str) -> String {
             if ignored.is_none() {
                 if c == '&'
                     && let Some(end) = rest.as_bytes().iter().take(13).position(|b| *b == b';')
+                    && let Some(decoded) = decode_entity(&rest[1..end])
                 {
-                    let entity = &rest[1..end];
-                    let decoded = match entity {
-                        "amp" => Some('&'),
-                        "lt" => Some('<'),
-                        "gt" => Some('>'),
-                        "quot" => Some('"'),
-                        "apos" | "#39" => Some('\''),
-                        "nbsp" => Some(' '),
-                        e if e.starts_with("#x") || e.starts_with("#X") => {
-                            u32::from_str_radix(&e[2..], 16)
-                                .ok()
-                                .and_then(char::from_u32)
-                        }
-                        e if e.starts_with('#') => e[1..].parse().ok().and_then(char::from_u32),
-                        _ => None,
-                    };
-                    if let Some(decoded) = decoded {
-                        output.push(decoded);
-                        position += end + 1;
-                        continue;
-                    }
+                    writer.text(decoded);
+                    position += end + 1;
+                    continue;
                 }
-                output.push(c);
+                writer.text(c);
             }
             position += c.len_utf8();
         }
     }
-    safe_text(&output)
+    let mut text = writer.output;
+    while text.ends_with(['\n', ' ']) {
+        text.pop();
+    }
+    safe_text(text.trim_start_matches('\n'))
 }
 
 /// Dropping a cancelled save waiter destroys the returned uncommitted artifact
@@ -324,6 +595,70 @@ mod web_fetch_tests {
         assert_eq!(page_text(&large).trim().len(), 1024 * 1024 - 7);
         assert_eq!(page_text("<p title='unfinished"), "");
     }
+    #[test]
+    fn web_fetch_html_renders_markdown_links_headings_lists_code_and_tables() {
+        let base = reqwest::Url::parse("https://docs.example/guide/intro.html").unwrap();
+        let html = r##"<html><head><title>T</title><style>.x{}</style></head><body>
+            <h3>Install  <em>now</em></h3>
+            <p>See <a href="../api/index.html">the  API</a>, <a href='https://other.example/x?a=1&amp;b=2'>other</a>,
+            <a href="#frag">here</a> and <a href="javascript:alert(1)">bad</a>.</p>
+            <!-- a comment with > inside -->
+            <ul><li>one</li><li>two<ol><li>nested</li><li>second</li></ol></li></ul>
+            <pre><code>fn main() {
+    println!("hi");
+}</code></pre>
+            <p>Inline <code>x &lt; y</code> and <img src="/logo.png" alt="Logo"></p>
+            <table><tr><th>Name</th><th>Value</th></tr><tr><td>a</td><td>1</td></tr></table>
+            <h6>Deep</h6><noscript>enable js</noscript>
+            </body></html>"##;
+        let page = page_markdown(html, Some(&base));
+        assert!(page.contains("### Install now"), "{page}");
+        assert!(
+            page.contains("[the API](https://docs.example/api/index.html)"),
+            "{page}"
+        );
+        assert!(
+            page.contains("[other](https://other.example/x?a=1&b=2)"),
+            "{page}"
+        );
+        assert!(page.contains("\nhere and bad."), "{page}");
+        assert!(!page.contains("javascript:"));
+        assert!(!page.contains("comment"));
+        assert!(
+            page.contains("- one\n- two\n  1. nested\n  2. second"),
+            "{page}"
+        );
+        assert!(
+            page.contains("```\nfn main() {\n    println!(\"hi\");\n}\n```"),
+            "{page}"
+        );
+        assert!(page.contains("Inline `x < y`"), "{page}");
+        assert!(
+            page.contains("![Logo](https://docs.example/logo.png)"),
+            "{page}"
+        );
+        assert!(
+            page.contains("| Name | Value |\n| --- | --- |\n| a | 1 |"),
+            "{page}"
+        );
+        assert!(page.contains("###### Deep"), "{page}");
+        assert!(!page.contains("enable js"));
+        assert!(!page.contains(".x{}"));
+    }
+
+    #[test]
+    fn web_fetch_markdown_links_cannot_amplify_output_past_its_bound() {
+        let base =
+            reqwest::Url::parse(&format!("https://e.example/{}/", "p".repeat(1500))).unwrap();
+        let html = "<a href=x>y</a>".repeat(20_000);
+        let page = page_markdown(&html, Some(&base));
+        assert!(page.len() <= html.len() * 2 + 8192, "{}", page.len());
+        assert!(page.contains("[HTML conversion stopped at its output bound]"));
+        // Over-long resolved targets keep the text only.
+        let long = format!("<a href=\"/{}\">kept</a>", "q".repeat(MAX_LINK_URL_BYTES));
+        assert_eq!(page_markdown(&long, Some(&base)), "kept");
+    }
+
     #[tokio::test]
     async fn web_fetch_actual_native_tool_reads_html_without_reinterpreting_prompt() {
         let peer = Peer::new(vec![Peer::response(
