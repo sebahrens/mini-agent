@@ -740,7 +740,7 @@ Accepted top-level keys:
 | `subagent_max_grep_results` | integer | Per-subagent grep-result cap. Default: `200`; requires `subagents`. |
 | `subagent_max_find_results` | integer | Per-subagent file-result cap. Default: `200`; requires `subagents`. |
 | `subagent_max_list_dir_entries` | integer | Optional per-subagent directory-entry cap; requires `subagents`. |
-| `tool_limits`             | object  | Output and traversal bounds for built-in tools. `max_result_chars` (default `100000`, about 25k tokens; minimum `4000`) is the final per-result character backstop for the self-bounded tools (`read`, `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`, `task`, `task_evidence`): a larger result keeps a head (a quarter of the backstop) and tail (half of it) around a notice naming the backstop and the private spill path, in live and replayed history. `read` applies the same budget itself and stops line mode before the first line that would exceed it, naming the exact next `offset`. Benign in project configuration. See [Tool Limits](#tool-limits). |
+| `tool_limits`             | object  | Output and traversal bounds for built-in tools. `max_result_chars` (default `100000`, about 25k tokens; minimum `4000`) is the final per-result character backstop for the self-bounded tools (`read`, `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`, `task`, `task_evidence`): a larger result keeps a head (a quarter of the backstop) and tail (half of it) around a notice naming the backstop and the private spill path, in live and replayed history. `read` applies the same budget itself and stops line mode before the first line that would exceed it, naming the exact next `offset`. `max_read_line_chars` (default `2000`, minimum `80`) clips each displayed `read` line with a `[line N truncated: M chars, showing W; continue with character_offset=X]` marker; hashedit tags still cover the complete line. Benign in project configuration. See [Tool Limits](#tool-limits). |
 | `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section while its prior result remains in the current conversation. The section's served-content CRC joins file length and modification time in the version key, so same-length or mtime-preserving edits remain readable. Editing or writing the target, compaction, failed-turn rollback, clear, undo/rewind, and redo reset the relevant session tracker. Ordinary agent rebuilds retain it; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
 | `show_cost_always`        | boolean | Show the session cost in the status bar even when it is `$0.0000` (for example when the model has no per-token pricing configured). Default: `false`, which hides the cost until it is above zero. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, and opt-in mid-turn compaction). Default: `false`. When `false`, nothing is ever compacted automatically.            |
@@ -1366,9 +1366,16 @@ the backstop and spill path, and a tail. `read` budgets its own excerpt
 N` instead; a single line longer than the budget is clipped with the exact
 `character_offset` that continues it. Image envelopes are never rewritten.
 
+Independently, each displayed `read` line is clipped to `max_read_line_chars`
+(default `2000`), so minified bundles, lockfiles and JSONL do not dump whole
+lines. The marker names the line's full length and the exact 1-indexed
+`character_offset` of the first omitted character. Hashedit tags are computed
+over the complete line, so a clipped line can still be edited by tag.
+
 ```toml
 [tool_limits]
 max_result_chars = 100000
+max_read_line_chars = 2000
 ```
 
 A single long turn with

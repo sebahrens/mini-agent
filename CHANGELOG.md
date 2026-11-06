@@ -19,6 +19,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   character backstop, `[tool_limits] max_result_chars` (default 100,000). Larger results keep a
   head and tail around a notice with the private spill path, live and on replay; `read` stops line
   mode at the budget and names the exact next `offset`.
+- `read` clips each displayed line to `[tool_limits] max_read_line_chars` (default 2,000) with a
+  marker naming the exact `character_offset` that continues it; hashedit tags still cover the full
+  line.
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

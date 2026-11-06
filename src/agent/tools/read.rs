@@ -220,8 +220,9 @@ impl Tool for ReadTool {
             ),
         };
         format!(
-            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization.",
-            super::limits::current().max_result_chars
+            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views; offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization.",
+            super::limits::current().max_result_chars,
+            super::limits::current().max_read_line_chars
         )
     }
 
@@ -589,7 +590,10 @@ impl ReadTool {
         let char_budget = tool_limits
             .max_result_chars
             .saturating_sub(READ_RESULT_RESERVE_CHARS);
-        let clip_width = char_budget.saturating_sub(200).max(1);
+        let clip_width = tool_limits
+            .max_read_line_chars
+            .min(char_budget.saturating_sub(200))
+            .max(1);
         let mut selection_end = requested_end;
         let mut budget_stop: Option<usize> = None;
         let mut excerpt_chars = 0_usize;
@@ -1566,6 +1570,50 @@ mod tests {
             "{}",
             &output[output.len() - 300..]
         );
+    }
+
+    /// mini-agent-xm2o6: a single 500 KB line is clipped to the configured
+    /// width with a character_offset marker; the hashedit tag still covers
+    /// the complete line, so tag-based edits remain valid.
+    #[tokio::test]
+    async fn long_line_is_clipped_to_line_width_and_keeps_a_full_line_hashedit_tag() {
+        let dir = crate::tests::support::temp::TempDir::new("read-line-clip");
+        let path = dir.path().join("bundle.min.js");
+        let line = "x".repeat(500_000);
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let width = crate::agent::tools::limits::DEFAULT_MAX_READ_LINE_CHARS;
+        let read = || async {
+            ReadTool::new(None, None, None, 2000)
+                .call(read_args(&path))
+                .await
+                .unwrap()
+        };
+
+        let output = read().await;
+        let marker = format!(
+            "[line 1 truncated: 500000 chars, showing {width}; continue with character_offset={}]",
+            width + 1
+        );
+        assert!(output.contains(&marker), "{output:.300}");
+        assert!(output.chars().count() <= width + 400, "{}", output.len());
+        let resumed = ReadTool::new(None, None, None, 2000)
+            .call(ReadArgs {
+                character_offset: Some(width + 1),
+                character_limit: Some(10),
+                ..read_args(&path)
+            })
+            .await
+            .unwrap();
+        assert!(resumed.contains(&format!("Characters {}-{}", width + 1, width + 10)));
+
+        assert!(crate::agent::tools::set_edit_system(
+            crate::config::types::EditSystem::Hashedit
+        ));
+        let tagged = read().await;
+        crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
+        let tag = crate::agent::tools::crc::crc32_hex(line.as_bytes());
+        assert!(tagged.contains(&format!("  1|{tag} ")), "{tagged:.300}");
+        assert!(tagged.contains(&marker), "{tagged:.300}");
     }
 
     #[tokio::test]

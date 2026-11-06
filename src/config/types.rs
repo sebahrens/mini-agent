@@ -1054,4 +1054,7 @@ pub struct ToolLimitsConfig {
     /// Final per-result character backstop for self-bounded tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_result_chars: Option<u64>,
+    /// Characters of one `read` line shown before it is clipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_read_line_chars: Option<u64>,
 }

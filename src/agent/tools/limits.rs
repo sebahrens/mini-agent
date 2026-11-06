@@ -15,17 +15,24 @@ use crate::config::Config;
 pub const DEFAULT_MAX_RESULT_CHARS: usize = 100_000;
 /// Smallest accepted backstop; smaller values would leave no useful head/tail.
 pub const MIN_MAX_RESULT_CHARS: usize = 4_000;
+/// Default display width for one `read` line before it is clipped.
+pub const DEFAULT_MAX_READ_LINE_CHARS: usize = 2_000;
+/// Smallest accepted read line width.
+pub const MIN_MAX_READ_LINE_CHARS: usize = 80;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolLimits {
     /// Final character backstop for a self-bounded tool result.
     pub max_result_chars: usize,
+    /// Characters of one `read` line shown before a clip marker.
+    pub max_read_line_chars: usize,
 }
 
 impl Default for ToolLimits {
     fn default() -> Self {
         Self {
             max_result_chars: DEFAULT_MAX_RESULT_CHARS,
+            max_read_line_chars: DEFAULT_MAX_READ_LINE_CHARS,
         }
     }
 }
@@ -45,6 +52,10 @@ impl ToolLimits {
                 .max_result_chars
                 .map_or(defaults.max_result_chars, to_usize)
                 .max(MIN_MAX_RESULT_CHARS),
+            max_read_line_chars: table
+                .max_read_line_chars
+                .map_or(defaults.max_read_line_chars, to_usize)
+                .max(MIN_MAX_READ_LINE_CHARS),
         }
     }
 
@@ -62,6 +73,7 @@ impl ToolLimits {
 
 static CURRENT: RwLock<ToolLimits> = RwLock::new(ToolLimits {
     max_result_chars: DEFAULT_MAX_RESULT_CHARS,
+    max_read_line_chars: DEFAULT_MAX_READ_LINE_CHARS,
 });
 
 /// Install the limits resolved from the active configuration.
@@ -92,6 +104,8 @@ mod tests {
             MIN_MAX_RESULT_CHARS
         );
         assert!(toml::from_str::<Config>("[tool_limits]\nunknown = 1\n").is_err());
+        let width: Config = toml::from_str("[tool_limits]\nmax_read_line_chars = 500\n").unwrap();
+        assert_eq!(ToolLimits::from_config(&width).max_read_line_chars, 500);
         let limits = ToolLimits::default();
         assert!(
             limits.backstop_head_chars() + limits.backstop_tail_chars() + 1_000
