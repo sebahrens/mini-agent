@@ -30,6 +30,7 @@ OPTIONAL_PACKAGE_OWNERS = {
     "blocking": "acp",
     "fastembed": "skills-embed",
     "hnsw_rs": "skills",
+    "image": "multimodal",
     "lsp-types": "lsp",
     "matrixmultiply": "skills",
     "native-tls": "acp",
@@ -60,7 +61,9 @@ SKILLS_PACKAGES = JS_PACKAGES | {
 ACP_PACKAGES = frozenset({"agent-client-protocol", "blocking"})
 MCP_PACKAGES = frozenset({"process-wrap", "rmcp", "sse-stream"})
 LSP_PACKAGES = frozenset({"lsp-types", "process-wrap", "url", "which"})
-EMBED_PACKAGES = SKILLS_PACKAGES | {"fastembed", "ort"}
+MULTIMODAL_PACKAGES = frozenset({"image"})
+# fastembed itself depends on image, so embedding rows always contain it.
+EMBED_PACKAGES = SKILLS_PACKAGES | {"fastembed", "ort", "image"}
 
 
 @dataclass(frozen=True)
@@ -101,7 +104,7 @@ FEATURE_ROWS = (
     row("lsp", "lsp", LSP_PACKAGES),
     # Explicit no-default composition of default integrations and optional
     # advisor/PDF; `lsp` is the only member that activates optional packages.
-    row("extras", "hooks,advisor,lsp,multimodal,pdf", LSP_PACKAGES),
+    row("extras", "hooks,advisor,lsp,multimodal,pdf", LSP_PACKAGES | MULTIMODAL_PACKAGES),
     row(
         "hooks-js-subagents-skills",
         "hooks,js,subagents,skills,sandbox",

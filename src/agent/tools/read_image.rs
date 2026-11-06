@@ -52,7 +52,7 @@ impl ImageRead {
 }
 
 pub(crate) const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-const MAX_IMAGE_SIDE: u32 = 8_000;
+pub(crate) const MAX_IMAGE_SIDE: u32 = 8_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImageFormat {

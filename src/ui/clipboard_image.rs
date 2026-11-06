@@ -10,12 +10,15 @@ use crate::extras::multimodal::{ClipboardImageInfo, MediaAttachment};
 use crate::sandbox::{CommandLimits, CommandStatus, Sandbox};
 use crate::session::user::{MAX_USER_IMAGE_BYTES, MAX_USER_IMAGE_TOTAL, MAX_USER_IMAGES};
 
-const ENCODED_LIMIT: usize = MAX_USER_IMAGE_BYTES.div_ceil(3) * 4;
+/// Raw clipboard PNG accepted before downscaling to `MAX_USER_IMAGE_BYTES`.
+const MAX_CLIPBOARD_BYTES: usize = 24 * 1024 * 1024;
+const ENCODED_LIMIT: usize = MAX_CLIPBOARD_BYTES.div_ceil(3) * 4;
 const MAX_PIXELS: u64 = 16 * 1024 * 1024;
 
 pub(super) struct ClipboardImage {
     data: Vec<u8>,
     info: ClipboardImageInfo,
+    mime: &'static str,
 }
 
 pub(super) trait ClipboardImageReader {
@@ -35,7 +38,7 @@ fn invalid() -> io::Error {
 }
 
 pub(super) fn decode_png(data: Vec<u8>) -> io::Result<ClipboardImage> {
-    if data.len() > MAX_USER_IMAGE_BYTES
+    if data.len() > MAX_CLIPBOARD_BYTES
         || data.len() < 33
         || !data.starts_with(b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR")
     {
@@ -51,9 +54,28 @@ pub(super) fn decode_png(data: Vec<u8>) -> io::Result<ClipboardImage> {
     {
         return Err(invalid());
     }
+    if data.len() > MAX_USER_IMAGE_BYTES {
+        // A Retina screenshot routinely exceeds the per-image limit; shrink
+        // it rather than refusing the paste.
+        let fitted = crate::agent::tools::image_fit::fit(
+            &data,
+            MAX_USER_IMAGE_BYTES,
+            crate::agent::tools::read_image::MAX_IMAGE_SIDE,
+        )
+        .map_err(|_| invalid())?;
+        return Ok(ClipboardImage {
+            info: ClipboardImageInfo {
+                width: fitted.width,
+                height: fitted.height,
+            },
+            mime: fitted.format.mime(),
+            data: fitted.data,
+        });
+    }
     Ok(ClipboardImage {
         data,
         info: ClipboardImageInfo { width, height },
+        mime: "image/png",
     })
 }
 
@@ -76,7 +98,7 @@ fn decode_output(bytes: Vec<u8>, encoded: bool) -> io::Result<Option<ClipboardIm
         let padding = text.bytes().rev().take_while(|byte| *byte == b'=').count();
         if text.len() % 4 != 0
             || padding > 2
-            || (text.len() / 4 * 3).saturating_sub(padding) > MAX_USER_IMAGE_BYTES
+            || (text.len() / 4 * 3).saturating_sub(padding) > MAX_CLIPBOARD_BYTES
         {
             return Err(invalid());
         }
@@ -119,7 +141,7 @@ async fn read_helper(
     let stdout_bytes = if encoded {
         ENCODED_LIMIT + 2
     } else {
-        MAX_USER_IMAGE_BYTES
+        MAX_CLIPBOARD_BYTES
     };
     let result = sandbox
         .output_support_command(
@@ -258,7 +280,7 @@ pub(super) fn stage_image(
         // Display identity only: clipboard bytes are never reopened by name.
         path: format!("clipboard-{}.png", uuid::Uuid::new_v4()).into(),
         data: image.data,
-        mime: "image/png".into(),
+        mime: image.mime.into(),
         clipboard: Some(image.info),
     });
     Ok(label)
@@ -349,8 +371,8 @@ pub(super) mod tests {
         assert_eq!(image.data, raw);
         assert!(decode_output(vec![b'A'; ENCODED_LIMIT + 3], true).is_err());
         let one_over =
-            base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_USER_IMAGE_BYTES + 1]);
-        assert_eq!(one_over.len(), ENCODED_LIMIT);
+            base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_CLIPBOARD_BYTES + 1]);
+        assert_eq!(one_over.len(), ENCODED_LIMIT + 4);
         assert!(decode_output(one_over.into_bytes(), true).is_err());
         assert!(decode_output(b"invalid base64".to_vec(), true).is_err());
         assert!(decode_output(b"\n".to_vec(), true).unwrap().is_none());
@@ -360,7 +382,18 @@ pub(super) mod tests {
             raw[20..24].copy_from_slice(&u32::to_be_bytes(height));
             assert!(decode_png(raw).is_err());
         }
-        assert!(decode_png(vec![0; MAX_USER_IMAGE_BYTES + 1]).is_err());
+        assert!(decode_png(vec![0; MAX_CLIPBOARD_BYTES + 1]).is_err());
+        // mini-agent-4hupe: a valid PNG over the per-image limit is shrunk.
+        let large = crate::agent::tools::image_fit::tests::noisy_png(1100, 1000);
+        assert!(large.len() > MAX_USER_IMAGE_BYTES);
+        let shrunk = decode_png(large).unwrap();
+        assert!(shrunk.data.len() <= MAX_USER_IMAGE_BYTES);
+        assert!(shrunk.info.width <= 2000 && shrunk.info.width < 1100 + 1);
+        assert_eq!(
+            crate::agent::tools::read_image::ImageFormat::from_magic(&shrunk.data)
+                .map(|format| format.mime()),
+            Some(shrunk.mime)
+        );
         assert!(decode_png(b"file:///private/image.png".to_vec()).is_err());
     }
 

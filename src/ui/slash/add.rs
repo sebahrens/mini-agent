@@ -95,8 +95,21 @@ async fn add_one(arg: &str, ctx: &mut SlashCtx<'_>) -> bool {
 
     #[cfg(feature = "multimodal")]
     if crate::extras::multimodal::detect_media(&path).is_some() {
-        match crate::extras::multimodal::load_attachment(&path) {
-            Ok(attachment) => {
+        let loaded =
+            crate::extras::multimodal::load_attachment(&path).map_err(|error| error.to_string());
+        // Oversized images are downscaled off the async executor.
+        let loaded = match loaded {
+            Ok(attachment) => crate::agent::runner::spawn_blocking_scoped(move || {
+                let mut attachment = attachment;
+                crate::extras::multimodal::fit_image_attachment(&mut attachment)
+                    .map(|note| (attachment, note))
+            })
+            .await
+            .unwrap_or_else(|_| Err("image resize job failed".to_owned())),
+            Err(error) => Err(error),
+        };
+        match loaded {
+            Ok((attachment, note)) => {
                 let size = attachment.size();
                 let mime_str: &str = match &attachment {
                     crate::extras::multimodal::MediaAttachment::Image { mime, .. }
@@ -109,7 +122,11 @@ async fn add_one(arg: &str, ctx: &mut SlashCtx<'_>) -> bool {
                 ctx.session.pending_media.push(attachment);
                 write_ok(
                     ctx.renderer,
-                    format!("attached: {} ({mime_str}, {size}B)", path.display()),
+                    format!(
+                        "attached: {} ({mime_str}, {size}B){}",
+                        path.display(),
+                        note.map(|note| format!("; {note}")).unwrap_or_default()
+                    ),
                 );
             }
             Err(e) => {

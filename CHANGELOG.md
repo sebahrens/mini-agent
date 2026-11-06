@@ -41,6 +41,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `grep`, `find_files` and `list_dir` no longer hide every directory named `target`: only one beside
   a build manifest (`Cargo.toml`, `pom.xml`, ...) is skipped, skipped dependency/build directories
   are named in a notice, and `[tool_limits] skip_dirs` makes the set configurable.
+- Oversized images are downscaled instead of refused: `read` resizes images over 5 MiB or 8000 px
+  (up to 64 MiB input) to a 2000 px long edge and reports the new size, and `/add` and clipboard
+  images over 2 MiB are shrunk to fit the per-image limit (multimodal; `image` is the version
+  fastembed already resolves).
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

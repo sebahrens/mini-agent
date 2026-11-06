@@ -3,8 +3,13 @@
 With the default `multimodal` feature, `read` recognizes PNG, JPEG, GIF and WebP
 from the bytes of the file admitted by the existing read permission path. It
 returns one image block and a text summary containing dimensions and byte size.
-Names and extensions do not decide the format. Images require a regular file,
-at most 5 MiB, dimensions from 1 to 8000 pixels, and no text `offset`/`limit`.
+Names and extensions do not decide the format. Images require a regular file
+and no text `offset`/`limit`. An image within 5 MiB and 1 to 8000 pixels per side
+is sent unchanged. A larger one (up to 64 MiB encoded) is decoded with bounded
+side and allocation limits, downscaled to at most 2000 pixels on its long edge
+and re-encoded (PNG while transparency fits, otherwise JPEG at quality 85); the
+summary ends with `resized from W x H to W2 x H2 (...)`. Only undecodable or
+unsupported data is refused. Animated GIFs are reduced to their first frame.
 An image read never establishes the raw full-read proof required for a text
 overwrite. Text, notebook and CRC reading retain their existing behavior.
 
@@ -17,6 +22,9 @@ Use a vision-capable model and one of these entrypoints:
   press Enter to send the image alone. File images and clipboard images use the
   same ordered, inline user-image format and survive canonical save/reload.
   They share the existing limits: 2 MiB per image, 4 MiB total and eight images.
+  A file or clipboard image over 2 MiB (clipboard PNGs up to 24 MiB) is
+  downscaled and re-encoded to fit when it is staged, and `/add` reports the new
+  size; the 4 MiB total and eight-image limits still apply.
   An oversized or invalid submission retains the staged image and text draft.
 - Paste a clipboard image into an idle TUI prompt. Clipboard capture remains an
   explicit operator action; it does not run a model request until submission.

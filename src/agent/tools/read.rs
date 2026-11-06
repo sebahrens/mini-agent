@@ -220,7 +220,7 @@ impl Tool for ReadTool {
             ),
         };
         format!(
-            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks (whole regular file, at most 5 MiB) when the captured model/transport supports them; line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per cell and 16 KiB per view; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); scanned PDFs without a text layer are reported as such.",
+            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB or 8000 px per side are downscaled to at most 2000 px and re-encoded; the summary names the new size); line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per cell and 16 KiB per view; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); scanned PDFs without a text layer are reported as such.",
             super::limits::current().max_result_chars,
             super::limits::current().max_read_line_chars
         )
@@ -474,11 +474,14 @@ impl ReadTool {
                     "Image reads do not accept text offset/limit or character_offset/character_limit; read the whole image".into(),
                 ));
             }
-            let cap = super::read_image::MAX_IMAGE_BYTES;
+            // Oversized images are downscaled rather than refused; only the
+            // encoded input read for that is bounded here.
+            let cap = super::image_fit::MAX_FIT_INPUT_BYTES;
             if !metadata.is_file() || metadata.len() > cap as u64 {
-                return Err(ToolError::Msg(
-                    "Image reads require a regular file no larger than 5 MiB".into(),
-                ));
+                return Err(ToolError::Msg(format!(
+                    "Image reads require a regular file no larger than {} MiB",
+                    cap / (1024 * 1024)
+                )));
             }
             let mut bytes = Vec::with_capacity(metadata.len() as usize);
             reader
@@ -486,20 +489,41 @@ impl ReadTool {
                 .read_to_end(&mut bytes)
                 .await?;
             if bytes.len() > cap {
-                return Err(ToolError::Msg(
-                    "Image grew beyond the 5 MiB input limit".into(),
-                ));
+                return Err(ToolError::Msg("Image grew beyond the input limit".into()));
             }
-            let info = super::read_image::inspect(&bytes)
-                .map_err(|message| ToolError::Msg(message.into()))?
-                .ok_or_else(|| ToolError::Msg("Image signature changed during the read".into()))?;
+            let (bytes, info, note) = match super::read_image::inspect(&bytes) {
+                Ok(Some(info)) => (bytes, info, None),
+                Ok(None) => {
+                    return Err(ToolError::Msg(
+                        "Image signature changed during the read".into(),
+                    ));
+                }
+                Err(_) => {
+                    let fitted = crate::agent::runner::spawn_blocking_scoped(move || {
+                        super::image_fit::fit(
+                            &bytes,
+                            super::read_image::MAX_IMAGE_BYTES,
+                            super::read_image::MAX_IMAGE_SIDE,
+                        )
+                    })
+                    .await
+                    .map_err(|_| ToolError::Msg("Image resize job failed".into()))?
+                    .map_err(ToolError::Msg)?;
+                    let note = fitted.note();
+                    let info = super::read_image::inspect(&fitted.data)
+                        .map_err(|message| ToolError::Msg(message.into()))?
+                        .ok_or_else(|| ToolError::Msg("Resized image is invalid".into()))?;
+                    (fitted.data, info, Some(note))
+                }
+            };
             self.read_tracker.untrack_read_path(&permission_path);
             let summary = format!(
-                "Image: {path} ({}; {} x {}; {} bytes)",
+                "Image: {path} ({}; {} x {}; {} bytes{})",
                 info.format.mime(),
                 info.width,
                 info.height,
-                info.bytes
+                info.bytes,
+                note.map(|note| format!("; {note}")).unwrap_or_default()
             );
             *image = Some(super::read_image::ImageRead {
                 mime: info.format.mime(),

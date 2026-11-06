@@ -3226,6 +3226,7 @@ dependencies = [
  "http",
  "httpdate",
  "ignore",
+ "image",
  "include_dir",
  "jsonschema",
  "libc",

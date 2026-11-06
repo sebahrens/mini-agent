@@ -903,7 +903,9 @@ async fn image_read64_existing_read_deny_and_byte_limit_precede_payload() {
         .write(true)
         .open(root.path().join("image"))
         .unwrap();
-    file.set_len(crate::agent::tools::read_image::MAX_IMAGE_BYTES as u64 + 1)
+    // Images over 5 MiB are downscaled; only the encoded input read for
+    // that is refused above its own bound.
+    file.set_len(crate::agent::tools::image_fit::MAX_FIT_INPUT_BYTES as u64 + 1)
         .unwrap();
     drop(file);
     let error = ReadTool::new_with_tracker(None, None, None, 100, tracker)
@@ -912,7 +914,60 @@ async fn image_read64_existing_read_deny_and_byte_limit_precede_payload() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("5 MiB"), "{error}");
+    assert!(error.contains("64 MiB"), "{error}");
+}
+
+/// mini-agent-4hupe: an image over 5 MiB, or over 8000 px on a side, is
+/// downscaled and re-encoded instead of refused, and the summary says so.
+#[cfg(feature = "multimodal")]
+#[tokio::test]
+async fn oversized_image_reads_are_downscaled_and_report_the_new_size() {
+    use crate::agent::tools::{ReadArgs, ReadTool, ReadTracker, read_image::ImageReadSupport};
+    use rig::tool::Tool;
+    let root = super::OwnedTestDirectory::new("image-downscale");
+    let large = crate::agent::tools::image_fit::tests::noisy_png(1500, 1400);
+    assert!(large.len() > crate::agent::tools::read_image::MAX_IMAGE_BYTES);
+    std::fs::write(root.path().join("photo.png"), &large).unwrap();
+    let wide = {
+        let image = image::RgbImage::from_pixel(9000, 40, image::Rgb([10, 20, 30]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    };
+    std::fs::write(root.path().join("wide.png"), &wide).unwrap();
+    let mut tracker = ReadTracker::new(true);
+    tracker.image_support = ImageReadSupport::captured("anthropic", "claude-fable-5-1", false);
+    for (name, original) in [("photo.png", "1500 x 1400"), ("wide.png", "9000 x 40")] {
+        let output = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
+            .with_workspace(root.path())
+            .call(ReadArgs {
+                pages: None,
+                path: name.into(),
+                offset: None,
+                limit: None,
+                raw_notebook: false,
+                character_offset: None,
+                character_limit: None,
+            })
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let summary = envelope["response"].as_str().unwrap();
+        assert!(
+            summary.contains(&format!("resized from {original} to ")),
+            "{summary}"
+        );
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(envelope["parts"][0]["data"].as_str().unwrap())
+            .unwrap();
+        let info = crate::agent::tools::read_image::inspect(&data)
+            .unwrap()
+            .unwrap();
+        assert!(info.width <= 2000 && info.height <= 2000, "{info:?}");
+        assert_eq!(envelope["parts"][0]["mimeType"], info.format.mime());
+    }
 }
 
 #[cfg(feature = "multimodal")]

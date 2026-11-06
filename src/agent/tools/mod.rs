@@ -8,6 +8,8 @@ pub(crate) mod format_after_edit;
 pub(crate) mod grep;
 #[cfg(all(test, unix))]
 mod home_path_tests;
+#[cfg(feature = "multimodal")]
+pub(crate) mod image_fit;
 pub(crate) mod limits;
 pub(crate) mod list_dir;
 #[cfg(feature = "lsp")]
