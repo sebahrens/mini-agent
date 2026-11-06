@@ -16,6 +16,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Context compaction
 
+- The default retry policy is now 6 attempts with 500 ms doubling backoff capped at 30 s (was 3
+  attempts, 10 s), so a short 529/5xx overload burst no longer ends a turn after about 1.5 s.
+  The hard cap of 10 attempts and project-config tightening are unchanged.
+
 - Compaction summary requests are retried when the provider stream fails after the first chunk
   (only the failed rolling request restarts, keeping the earlier work). The 300 s whole-compaction
   cap is now a per-request timeout (default scaled with the summarizer input, `compaction_timeout_secs`
