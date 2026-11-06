@@ -84,6 +84,20 @@ pub(crate) enum GitOperation {
 }
 
 impl GitOperation {
+    /// Operations that only read repository state.
+    pub(crate) fn is_inspection(self) -> bool {
+        matches!(
+            self,
+            Self::Status
+                | Self::Diff
+                | Self::Log
+                | Self::Show
+                | Self::Blame
+                | Self::Branches
+                | Self::StashList
+        )
+    }
+
     // The native /diff and /commit actors (git-worktree) report the name.
     #[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
     pub(crate) fn name(self) -> &'static str {
@@ -259,6 +273,9 @@ pub(crate) struct GitTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     exact_files: bool,
+    /// Subagent mode: only the inspection operations run; every mutation is
+    /// refused before any permission prompt or process.
+    read_only: bool,
     filter_drivers: Arc<FilterDriverCache>,
     #[cfg(test)]
     test_uncontained: bool,
@@ -362,10 +379,19 @@ impl GitTool {
             permission,
             ask_tx,
             exact_files: false,
+            read_only: false,
             filter_drivers: Arc::default(),
             #[cfg(test)]
             test_uncontained: false,
         })
+    }
+
+    /// Restrict the tool to the inspection operations (status, diff, log,
+    /// show, blame, branches, stash_list), for subagents.
+    #[cfg(feature = "git-worktree")]
+    pub(crate) fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     #[cfg(feature = "git-worktree")]
@@ -1537,6 +1563,12 @@ impl GitTool {
     }
 
     async fn read_operation(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        if self.read_only && !args.operation.is_inspection() {
+            return Err(ToolError::Msg(format!(
+                "git {} is not available to this tool: it is read-only (status, diff, log, show, blame, branches, stash_list)",
+                args.operation.name()
+            )));
+        }
         let pages = matches!(
             args.operation,
             GitOperation::Diff | GitOperation::Show | GitOperation::Blame
@@ -1867,16 +1899,49 @@ impl Tool for GitTool {
     type Output = serde_json::Value;
 
     fn description(&self) -> String {
+        if self.read_only {
+            return "Inspect the bound Git repository through fixed read-only operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index), show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; author/grep are fixed strings), blame (one path, optional start_line/end_line/revision, paged like diff), branches (scope local|remote|all|tags; page with skip/max_count and next_skip) and stash_list. Nothing can be changed and nothing is fetched. No shell, raw argv, remotes, or network access is available.".to_string();
+        }
         "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; author/grep are fixed strings; a query that exceeds its 30 s budget returns the commits found so far, and log, blame, branches and stash_list accept timeout_secs up to 120), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches (scope local|remote|all|tags lists remote-tracking branches or tags without network access; page with skip/max_count and next_skip), branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; reset, revert, cherry-pick, merge, rebase, fetch, pull and push are intentionally not offered.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
+        let operations: &[&str] = if self.read_only {
+            &[
+                "status",
+                "diff",
+                "log",
+                "show",
+                "blame",
+                "branches",
+                "stash_list",
+            ]
+        } else {
+            &[
+                "status",
+                "diff",
+                "log",
+                "show",
+                "blame",
+                "stage",
+                "unstage",
+                "commit",
+                "branches",
+                "branch_create",
+                "switch",
+                "stash_push",
+                "stash_pop",
+                "stash_list",
+                "tag",
+                "restore",
+            ]
+        };
         serde_json::json!({
             "type": "object",
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "show", "blame", "stage", "unstage", "commit", "branches", "branch_create", "switch", "stash_push", "stash_pop", "stash_list", "tag", "restore"]
+                    "enum": operations
                 },
                 "name": { "type": "string", "maxLength": 255, "description": "Branch name for branch_create/switch, tag name for tag" },
                 "format": { "type": "string", "enum": ["patch", "stat", "name_status"], "description": "diff/show output format (default patch)" },
@@ -2367,6 +2432,7 @@ mod tests {
                 permission: None,
                 ask_tx: None,
                 exact_files: false,
+                read_only: false,
                 filter_drivers: Arc::default(),
                 test_uncontained: true,
             }
@@ -2401,6 +2467,60 @@ mod tests {
             max_count: None,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_refuses_every_mutation_and_offers_only_inspection() {
+        let repo = TestRepo::new();
+        repo.write("tracked.txt", "first\n");
+        let mut tool = repo.tool();
+        tool.read_only = true;
+        let schema = tool.parameters();
+        let operations = schema["properties"]["operation"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(operations.contains(&"status".to_string()));
+        for write in [
+            "stage",
+            "unstage",
+            "commit",
+            "branch_create",
+            "switch",
+            "stash_push",
+            "stash_pop",
+            "tag",
+            "restore",
+        ] {
+            assert!(!operations.contains(&write.to_string()), "{write} offered");
+        }
+        for operation in [
+            GitOperation::Stage,
+            GitOperation::Unstage,
+            GitOperation::Commit,
+            GitOperation::BranchCreate,
+            GitOperation::Switch,
+            GitOperation::StashPush,
+            GitOperation::StashPop,
+            GitOperation::Tag,
+            GitOperation::Restore,
+        ] {
+            let error = tool
+                .call(args(operation, &["tracked.txt"], Some("m")))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("read-only"), "{error}");
+        }
+        // Nothing was staged or committed, and inspection still works.
+        assert_eq!(repo.git(["diff", "--cached", "--name-only"]).trim(), "");
+        let status = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        assert!(status.to_string().contains("tracked.txt"), "{status}");
     }
 
     #[tokio::test]

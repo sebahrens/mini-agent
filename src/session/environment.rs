@@ -63,6 +63,74 @@ impl super::Session {
     }
 }
 
+/// Start of the system notice [`Session::note_stale_child_ids`] appends.
+const STALE_CHILD_NOTICE: &str = "Subagent child ids printed earlier in this session";
+/// Marker the task tool prints before a resumable child's id.
+const CHILD_ID_MARKER: &str = "[child id: ";
+/// Most ids named in the notice.
+const MAX_STALE_CHILD_IDS: usize = 8;
+
+impl super::Session {
+    /// Resumable subagent conversations are kept in memory only, so every
+    /// `[child id: ...]` line stored in a resumed session names a child that
+    /// no longer exists and `task` with `resume` would fail with "unknown or
+    /// expired". Append one system notice (once per resume, only for ids newer
+    /// than the last notice) saying so, so the model is not offered dead ids.
+    /// Returns whether a notice was added (mini-agent-csk01).
+    pub fn note_stale_child_ids(&mut self, resumed: bool) -> bool {
+        if !resumed {
+            return false;
+        }
+        let start = self
+            .messages
+            .iter()
+            .rposition(|message| {
+                message.role == super::MessageRole::System
+                    && message.content.starts_with(STALE_CHILD_NOTICE)
+            })
+            .map_or(0, |index| index + 1);
+        let mut ids: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        for message in &self.messages[start..] {
+            if !matches!(
+                message.role,
+                super::MessageRole::ToolResult | super::MessageRole::SubagentToolCall
+            ) {
+                continue;
+            }
+            for (index, _) in message.content.match_indices(CHILD_ID_MARKER) {
+                let rest = &message.content[index + CHILD_ID_MARKER.len()..];
+                let id: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .take(64)
+                    .collect();
+                if id.is_empty() || ids.contains(&id) {
+                    continue;
+                }
+                total += 1;
+                if ids.len() < MAX_STALE_CHILD_IDS {
+                    ids.push(id);
+                }
+            }
+        }
+        if total == 0 {
+            return false;
+        }
+        let more = if total > ids.len() {
+            format!(" (and {} more)", total - ids.len())
+        } else {
+            String::new()
+        };
+        let text = format!(
+            "{STALE_CHILD_NOTICE} are no longer resumable: {}{more}. Subagent conversations are kept in memory only and did not survive the restart, so a task call with `resume` for any of them fails. Start a new task instead and pass what the child found as context.",
+            ids.join(", ")
+        );
+        self.add_message(super::MessageRole::System, &text);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +205,38 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(back.environment, s.environment);
+    }
+
+    #[test]
+    fn restored_sessions_are_told_once_that_child_ids_are_dead() {
+        let mut s = session();
+        s.add_message(
+            MessageRole::ToolResult,
+            "report\n[child id: 1b2c-3d; continue this child's conversation with task {\"resume\": \"1b2c-3d\"}]",
+        );
+        // A live session keeps its store: nothing is said.
+        assert!(!s.note_stale_child_ids(false));
+        assert_eq!(system_notices(&s), 0);
+        assert!(s.note_stale_child_ids(true));
+        let text = s.messages.last().unwrap().content.to_string();
+        assert!(
+            text.contains("1b2c-3d") && text.contains("no longer resumable"),
+            "{text}"
+        );
+        // The notice does not itself look like an offer, and a second resume
+        // with no newer ids stays quiet.
+        assert!(!text.contains("[child id:"));
+        assert!(!s.note_stale_child_ids(true));
+        assert_eq!(system_notices(&s), 1);
+        // Ids from a later run are named by the next resume only.
+        s.add_message(MessageRole::ToolResult, "[child id: ffff; continue]");
+        assert!(s.note_stale_child_ids(true));
+        let text = s.messages.last().unwrap().content.to_string();
+        assert!(text.contains("ffff") && !text.contains("1b2c-3d"), "{text}");
+        assert_eq!(system_notices(&s), 2);
+        // Sessions without child ids are untouched.
+        let mut plain = session();
+        plain.add_message(MessageRole::ToolResult, "nothing here");
+        assert!(!plain.note_stale_child_ids(true));
     }
 }

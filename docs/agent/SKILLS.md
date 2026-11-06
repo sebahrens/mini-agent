@@ -56,7 +56,11 @@ skills are not re-scanned per touched file.
 
 Each turn injects at most `skills_max_selected` (default 3, at most 16) Agent Skills whose
 relevance to the prompt reaches `skills_score_floor` (default 0.20). Discovery accepts at most
-`skills_max_packages` (default 64, at most 1,024) packages across all roots. Skills that do not
+`skills_max_packages` (default 64, at most 1,024) packages across all roots. Only folders that
+hold a `SKILL.md` count. The budget is shared fairly: every root gets an equal share and unused
+share flows to larger roots, so a big project root cannot hide the user roots. When skills are
+skipped, one warning at launch (and `/skills`) names the limit, `skills_max_packages`, how many
+were skipped and in which root. Skills that do not
 match the prompt text are otherwise visible only through `skills_search`.
 
 Set `skills_catalog_bytes` (default 0: off; at most 65,536) to add a catalog-style listing of

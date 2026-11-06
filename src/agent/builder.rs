@@ -1316,11 +1316,28 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     max_text_file_size: max_edit_file_size,
                     max_shell_output_lines: max_bash_output_lines,
                     shell_timeout_secs: cfg.resolve_shell_timeout_secs(),
+                    shell_auto_background: cfg.shell_auto_background.unwrap_or(false),
+                    shell_output_log_dir: crate::session::storage::command_log_dir(
+                        tool_output_session_id,
+                    ),
                     diff_options: cfg.mutation_diff_options(),
                     formatter: formatter.clone(),
                     #[cfg(feature = "lsp")]
                     lsp: lsp_manager.clone(),
                 });
+            // Git / LSP a persona may name in `tools` (default closed).
+            let task_tool = task_tool.with_parent_code_tools(
+                crate::extras::subagents::builder::ParentCodeTools {
+                    #[cfg(feature = "git-worktree")]
+                    git_sandbox: cli.tool_is_eligible(cfg, "git").then(|| sandbox.clone()),
+                    #[cfg(feature = "lsp")]
+                    lsp: lsp_manager.clone(),
+                    #[cfg(feature = "lsp")]
+                    lsp_navigate: cli.tool_is_eligible(cfg, "lsp_navigate"),
+                    #[cfg(feature = "lsp")]
+                    lsp_diagnostics: cli.tool_is_eligible(cfg, "lsp_diagnostics"),
+                },
+            );
             #[cfg(feature = "agent-skills")]
             let task_tool =
                 task_tool.with_instruction_discovery_disabled(cli.resolve_no_context_files(cfg));

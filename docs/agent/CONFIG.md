@@ -4427,7 +4427,7 @@ for the bounded format and output limits.
 
 Instruction-only Agent Skills are available with the default `agent-skills` Cargo feature. Their
 captured project sources share the existing `.mini-agent/config.toml` trust approval; no new trust
-file or `allowed-tools` permission authority exists. Imported selections and all compatibility skill roots share a `skills_max_packages` ceiling (default 64). Each directory root has its own scan
+file or `allowed-tools` permission authority exists. Imported selections and all compatibility skill roots share a `skills_max_packages` ceiling (default 64; only folders with a `SKILL.md` count, shared fairly across roots, and a launch warning names the skipped count and roots). Each directory root has its own scan
 budget of 1,024 entries, and each package its own budget of 1,024 entries, depth 8, 48 KiB for
 `SKILL.md`, 1 MiB per resource (`skills_max_resource_bytes`, at most 8 MiB) and 8 MiB of content.
 A package over a limit is skipped with a diagnostic naming it and the limit; later packages and

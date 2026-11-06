@@ -111,6 +111,33 @@ Notable changes to mini-agent are documented in this file. The format follows
   `gh attestation verify`, honours `HTTPS_PROXY`, needs `--allow-downgrade` for older releases, and
   the update notice follows the install channel (mini-agent-skgg9, -zml6o, -x6nc9, -w7046, -17mth,
   -nfj5h, -t5ybs, -gwx1b, -e3bor).
+### Skills and subagents (round 9, group A)
+
+- Skill discovery counts only folders that hold a `SKILL.md` toward `skills_max_packages`, shares
+  the budget fairly across roots so a large project root cannot hide user roots, and reports the
+  limit, config key, skipped count and roots once at startup (mini-agent-hi8rm).
+
+- Subagents with a shell now also get `job_status`, restricted to their own jobs (which are stopped
+  when the child ends), plus the parent's `shell_auto_background` and a command-log directory so
+  oversized output stays recoverable (mini-agent-eqlme, mini-agent-ysugx).
+
+- The task tool's `agent_type` listing keeps up to 1,000 characters of each agent description
+  (was 160) under a 12,000-character combined budget, with an explicit shortened/omitted count
+  instead of a silent per-agent cut (mini-agent-767y1).
+
+- Claude Code agent files: `maxTurns`, `mcpServers` (a configured server name grants all its tools,
+  inline definitions are never started) and `disallowedTools` (subtracted from the child tool set)
+  are honoured; `skills`, `permissionMode`, `background`, `memory` and `hooks` now produce a notice
+  naming the behaviour that is not applied (mini-agent-syofy).
+
+- Resuming a saved session now tells the model once that the `[child id: ...]` subagent ids in its
+  history are no longer resumable (child conversations are memory-only), instead of leaving dead
+  resume ids on offer (mini-agent-csk01).
+
+- Subagent personas can name `git` (read-only: status, diff, log, show, blame, branches,
+  stash_list), `lsp_navigate` and `lsp_diagnostics` in `tools`; default closed, parent-eligible
+  only, under the parent's permission rules, not for worktree-isolated children (mini-agent-f4ds9).
+
 ### Shell and pty jobs (round 7, group P)
 
 - `job_status` input no longer accepts TAB or shell history expansion (`!` followed by text, a

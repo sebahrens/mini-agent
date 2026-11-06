@@ -209,8 +209,10 @@ new child id. Exactly one prompt is accepted.
 The conversations are bounded and in memory only: the session keeps the 16
 most recent (8 MiB of serialized conversation each; larger ones get no id),
 owned by the session's task pool (or the task tool without one). They do not
-survive a restart. An unknown or expired id is rejected with an explicit
-error. Worktree-isolated children are not resumable (their worktree ends with
+survive a restart: when a saved session is resumed (`--continue`, `--resume`), one system
+notice names the `[child id: ...]` ids stored in it as no longer resumable (ids from before the
+last such notice are not repeated), so the model starts a new task instead of using a dead id. An
+unknown or expired id is rejected with an explicit error. Worktree-isolated children are not resumable (their worktree ends with
 them); failed children get no id.
 
 ## Specialist Agent Types
@@ -532,13 +534,24 @@ mode: review
 ---
 ```
 
-- `description` is the bounded (160-character) summary shown in the task
-  tool's `agent_type` schema. Without it, the first prompt paragraph is used.
+- `description` is the delegation guidance shown in the task tool's `agent_type` schema. Up to
+  1,000 characters of it are listed per agent (4,096 are kept); when all listed descriptions
+  together exceed 12,000 characters the per-agent share shrinks (down to 160) and, last, trailing
+  agents lose their description. The listing then ends with a note counting how many descriptions
+  were shortened or omitted (also logged as a warning); the full text stays in the agent file.
+  Without a description, the first sentence of the prompt (at most 160 characters) is used.
 - `tools` narrows the installed child tools. It accepts a YAML list or a
   comma-separated string. Canonical names are `read`, `grep`, `find_files`,
   `list_dir`, `js` when JS support is compiled, and `skills_search` when skills support is compiled, plus
   `memory_read` and `memory_search` when memory support is compiled.
   Claude-style `Read`, `Grep`, and `Glob` spellings are accepted.
+  `git`, `lsp_navigate` and `lsp_diagnostics` are granted only when the persona names them here
+  (default closed) and the parent itself has the tool eligible and, for LSP, running. The child's
+  `git` is the read-only subset (status, diff, log, show, blame, branches, stash_list; every
+  mutation is refused and not even offered in the schema) bound to the child's workspace and
+  sandbox; the LSP tools use the parent's language-server manager. Both run under the child's
+  permission checker (the parent's rules, `git/<operation>` and read permission keys, same
+  prompts). A worktree-isolated child gets neither, because both are bound to the parent tree.
   Empty lists create a tool-free child. Mutating, unknown, and feature-disabled
   tools are ignored while preserving the persona and its supported declared
   read tools. An all-unsupported list also creates a tool-free child; it never
@@ -570,6 +583,18 @@ mode: review
   and installs only tools returned under the exact allowlist. An unknown
   server or missing tool fails the child instead of widening or silently
   degrading its capability.
+- Claude Code camelCase frontmatter in `.claude/agents` files: `maxTurns` is read as `max_turns`
+  (same 1 to 10,000 bound; setting both spellings is an error); `disallowedTools` removes the
+  named child tools (`Read`, `Grep`, `Glob`, `Bash`, `Edit`, ... ) from the explicit `tools` list
+  or, without one, from the default set, and names that are not child tools are reported in the
+  result notice rather than ignored silently; `mcpServers` takes a list of configured server names
+  (each grants all of that server's tools; a mapping to a tool-name list is read like
+  `mcp_servers`), within the same 8-server limit, still child-only, trust-gated like any project
+  persona and permission-checked per call. A server that is not configured in mini-agent fails the
+  child, and an inline server definition is never started (it is reported as not applied).
+  `skills`, `permissionMode`, `background`, `memory` and `hooks` are recognised but have no effect;
+  each produces a `[specialist metadata: <key> not applied: ...]` notice naming the behaviour that
+  is missing.
 - `model` is first resolved as a configured quick-model alias, including its
   provider and `extra_body`. Otherwise it is a raw model ID on the current
   subagent provider. A provider switch that cannot authenticate fails the task
@@ -618,7 +643,7 @@ tool-result and `[subagent output ...]` report boundaries.
 
 The block is validated and removed before the prompt is installed. Malformed
 metadata, empty prompt bodies, invalid UTF-8, and oversized
-files are rejected. Claude Code compatibility: a frontmatter `name` that differs from the file name is not fatal (the file name stays the agent type and a `[specialist metadata: ...]` notice is recorded), and a `description` over 160 characters is shortened with an ellipsis and a notice. The loader emits a warning naming the file and reason. If the
+files are rejected. Claude Code compatibility: a frontmatter `name` that differs from the file name is not fatal (the file name stays the agent type and a `[specialist metadata: ...]` notice is recorded), and a `description` over 4,096 characters is cut with a notice (the listing budget above applies separately). The loader emits a warning naming the file and reason. If the
 rejected user or trusted-project file has the same valid stem as an available
 lower-priority persona, the task result is prefixed with a
 `[specialist source: ... definition ignored: ...]` notice and identifies the
@@ -1074,6 +1099,15 @@ Only active pure learned-JS exports can be installed in this realm.
 |-----------------|----------------------------------------|
 | `memory_read`   | Read memory files (long-term, notes…)  |
 | `memory_search` | Keyword search across all memory       |
+
+### Child shell jobs and output logs
+
+A child that has `shell` (write-capable or read-only shell) also gets `job_status`, scoped to the
+background jobs that child started: it cannot list, poll, wait for, stop or type into the parent's
+or a sibling's jobs, and it does not receive the parent's job-completion notices. Jobs still
+running when the child ends are stopped. Child shells honour the parent's `shell_auto_background`
+and spool output beyond the in-memory limit to the parent session's private command-log directory,
+so the omitted middle is recoverable with `read`/`grep` from the path named in the result.
 
 ### Opt-in read-only shell and web tools
 

@@ -923,6 +923,7 @@ pub struct TaskTool {
     local_resume: Arc<super::resume::ResumeStore>,
     /// The parent's eligible web tools, for `[subagents] allow_web` personas.
     parent_web: Option<builder::ParentWebTools>,
+    parent_code: Option<builder::ParentCodeTools>,
 }
 
 impl TaskTool {
@@ -941,6 +942,7 @@ impl TaskTool {
             self.deny_repeated_reads,
         )
         .with_workspace_binding(self.workspace.clone())
+        .with_code_tools(self.parent_code.clone())
         .with_write_tools(if persona.write_mode {
             self.write_tools.clone()
         } else {
@@ -1015,10 +1017,17 @@ impl TaskTool {
             parent_image_support: None,
             local_resume: Default::default(),
             parent_web: None,
+            parent_code: None,
         }
     }
 
     /// The parent's eligible web tools, captured by the parent builder.
+    /// Git / LSP capabilities of the parent that a persona may name in `tools`.
+    pub(crate) fn with_parent_code_tools(mut self, code: builder::ParentCodeTools) -> Self {
+        self.parent_code = Some(code);
+        self
+    }
+
     pub(crate) fn with_parent_web_tools(mut self, web: builder::ParentWebTools) -> Self {
         self.parent_web = Some(web);
         self
@@ -1192,9 +1201,10 @@ editing in a known location, grepping for a literal you will act on immediately.
             DEFAULT_MAX_PROMPTS,
             (DEFAULT_MAX_TURNS_CEILING, DEFAULT_TIMEOUT_CEILING_SECS),
         ));
-        let specialist_entries = crate::context::agents::available_schema_entries_for_workspace(
-            self.workspace.as_deref(),
-        );
+        let (specialist_entries, listing_note) =
+            crate::context::agents::available_schema_entries_for_workspace(
+                self.workspace.as_deref(),
+            );
         let specialist_names = specialist_entries
             .iter()
             .map(|(name, _, _)| name.clone())
@@ -1204,6 +1214,10 @@ editing in a known location, grepping for a literal you will act on immediately.
             .map(|(name, annotation, description)| format!("{name}{annotation}: {description}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let specialist_descriptions = match listing_note {
+            Some(note) => format!("{specialist_descriptions}\n[{note}]"),
+            None => specialist_descriptions,
+        };
         serde_json::json!({
             "type": "object",
             "description": "Provide exactly one of prompts or briefs. mini-agent validates this constraint when the tool call is decoded.",
@@ -1618,6 +1632,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         )
         .with_workspace_binding(self.workspace.clone())
         .with_workspace_instructions(self.instructions.clone())
+        .with_code_tools(self.parent_code.clone())
         .with_write_tools(if write_mode {
             self.write_tools.clone()
         } else {
@@ -1880,7 +1895,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 // the trusted persona names, with an independent permission
                 // checker; outer-agent MCP connections are never inherited.
                 #[cfg(feature = "mcp")]
-                let (mcp_manager, mcp_tools) =
+                let (mcp_manager, mcp_tools, mcp_granted) =
                     match builder::build_persona_mcp(&persona, &config, &authorization).await {
                         Ok(runtime) => runtime,
                         Err(error) => {
@@ -1900,10 +1915,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                 #[cfg(not(feature = "mcp"))]
                 let evidence_mcp: Vec<(String, String)> = Vec::new();
                 #[cfg(feature = "mcp")]
-                let evidence_mcp: Vec<(String, String)> = persona
-                    .mcp_servers
+                let evidence_mcp: Vec<(String, String)> = mcp_granted
                     .iter()
-                    .flatten()
                     .flat_map(|(server, tools)| {
                         tools.iter().map(move |tool| (server.clone(), tool.clone()))
                     })
@@ -6196,6 +6209,8 @@ mod tests {
                 max_text_file_size: None,
                 max_shell_output_lines: None,
                 shell_timeout_secs: 10,
+                shell_auto_background: false,
+                shell_output_log_dir: None,
                 diff_options: Default::default(),
                 formatter: None,
                 #[cfg(feature = "lsp")]

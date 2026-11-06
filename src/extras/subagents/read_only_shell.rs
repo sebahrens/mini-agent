@@ -70,6 +70,8 @@ pub(crate) fn prepare(
             sandbox,
             max_output_lines: parent.max_shell_output_lines,
             timeout_secs: parent.shell_timeout_secs,
+            auto_background: parent.shell_auto_background,
+            output_log_dir: parent.shell_output_log_dir.clone(),
         },
     ))
 }
@@ -99,6 +101,8 @@ mod tests {
             max_text_file_size: Some(1024 * 1024),
             max_shell_output_lines: Some(100),
             shell_timeout_secs: 10,
+            shell_auto_background: false,
+            shell_output_log_dir: None,
             diff_options: Default::default(),
             formatter: None,
             #[cfg(feature = "lsp")]

@@ -617,6 +617,8 @@ pub(crate) fn combine_coaching(first: Option<String>, second: Option<String>) ->
 
 #[cfg(test)]
 pub use bash::BashTool;
+#[cfg(feature = "subagents")]
+pub use bash::JobScope;
 pub use bash::JobStatusTool;
 pub use bash::ShellTool;
 pub use edit::EditTool;
