@@ -766,7 +766,7 @@ Only active pure learned-JS exports can be installed in this realm.
 | `memory_write` | Subagent should not persist memory      |
 | `todo`         | Not registered — no planning tool in child context |
 | `task`         | Nested subagents are deliberately unsupported |
-| `mcp_tool`     | External, unpredictable — out of scope  |
+| MCP tools      | Not inherited from the parent; a persona opts in per server and tool through its `mcp_servers` allowlist (persona frontmatter, described above: at most 8 servers and 32 tools, child-only, no fallback to the parent's connections) |
 
 ## Security & Permissions
 
@@ -779,7 +779,8 @@ same path-containment and approval rules as the parent:
   through the parent approval channel, exactly as they would be for the main
   agent.
 - **Default profile has no mutation tools**: the child has no `write`, `edit`, `bash`, or
-  `mcp_tool`. Its optional JS realm has no writer, network, process, or
+  MCP tools; a persona's exact `mcp_servers` allowlist is the only way a child
+  gets MCP access. Its optional JS realm has no writer, network, process, or
   session-state globals and its broker grant contains only read authority, so
   it cannot modify files, run commands, or reach external services regardless
   of permissions.
