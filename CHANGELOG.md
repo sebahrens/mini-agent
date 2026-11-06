@@ -15,6 +15,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   `compact_enabled: false` is still honored. A headless request the provider rejects for exceeding
   its context window now records the turn's progress, compacts once and retries once before the
   error is surfaced (mini-agent-3mswy).
+- Headless `-p`, `--loop`, goal rounds and `--no-session` runs now compact mid-turn: when real
+  prompt pressure crosses `mid_turn_compact_threshold`, the runner stops after the complete tool
+  batch, the session (in memory for `--no-session`) is compacted and the task continues
+  (mini-agent-sgzh0). ACP turns are not covered yet.
 
 ### Security
 

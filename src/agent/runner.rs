@@ -922,6 +922,75 @@ impl CompactionDecisionTx {
     }
 }
 
+/// Mid-turn compaction policy for a headless (`-p`, `--loop`, goal, ACP-free)
+/// run (mini-agent-sgzh0). The driver installs it around one
+/// [`run_print_with_output`](crate::provider::AnyAgent::run_print_with_output)
+/// call; the runner then stops at the first protocol-complete tool-batch
+/// boundary after a completion whose real prompt pressure crosses `threshold`,
+/// and returns [`MidTurnCompactionBoundary`] so the driver can compact and
+/// continue.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HeadlessMidTurnPolicy {
+    pub(crate) window: u64,
+    pub(crate) threshold: f64,
+    pub(crate) anthropic_native: bool,
+}
+
+impl HeadlessMidTurnPolicy {
+    /// Real prompt pressure of a completion as a fraction of the window, when
+    /// it crosses the threshold.
+    fn crossed(self, usage: &rig::completion::Usage) -> Option<f64> {
+        if self.window == 0 {
+            return None;
+        }
+        let real_input_tokens = crate::session::Session::real_input_tokens(
+            self.anthropic_native,
+            usage.input_tokens,
+            usage.total_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+        let pressure = real_input_tokens as f64 / self.window as f64;
+        (pressure > self.threshold).then_some(pressure)
+    }
+}
+
+tokio::task_local! {
+    static HEADLESS_MID_TURN: HeadlessMidTurnPolicy;
+}
+
+/// Run `work` with headless mid-turn compaction armed (`Some`) or not.
+pub(crate) async fn with_headless_mid_turn<F: std::future::Future>(
+    policy: Option<HeadlessMidTurnPolicy>,
+    work: F,
+) -> F::Output {
+    match policy {
+        Some(policy) => HEADLESS_MID_TURN.scope(policy, work).await,
+        None => work.await,
+    }
+}
+
+/// The headless turn stopped at a tool-batch boundary because real prompt
+/// pressure crossed the mid-turn threshold. Every tool call of the batch has
+/// its result in the returned interactions; nothing was aborted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MidTurnCompactionBoundary {
+    pub(crate) pressure: f64,
+}
+
+impl std::fmt::Display for MidTurnCompactionBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "mid-turn compaction boundary at {:.0}% context pressure",
+            self.pressure * 100.0
+        )
+    }
+}
+
+impl std::error::Error for MidTurnCompactionBoundary {}
+
 /// Decision channel capacity. A runner that did not park leaves its decision
 /// queued; at most one `UsageDelta` per completion can be in flight on the
 /// bounded event channel, so this can never fill and block the UI.
@@ -5104,6 +5173,10 @@ where
     let mut stop_hook_active = false;
     #[cfg(feature = "hooks")]
     let mut consecutive_stop_blocks: u32 = 0;
+    let mid_turn_policy = HEADLESS_MID_TURN.try_with(|policy| *policy).ok();
+    // Pressure of the latest completion that crossed the mid-turn threshold;
+    // honored at the next correlated tool result once the batch is complete.
+    let mut mid_turn_pressure: Option<f64> = None;
 
     while continue_turn {
         continue_turn = false;
@@ -5238,8 +5311,19 @@ where
                         {
                             fail_turn!(error);
                         }
+                        if let Some(pressure) = mid_turn_pressure
+                            && tool_calls.pending.is_empty()
+                            && crate::question::required().is_none()
+                        {
+                            fail_turn!(MidTurnCompactionBoundary { pressure });
+                        }
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                        if let Some(pressure) =
+                            mid_turn_policy.and_then(|policy| policy.crossed(&call.usage))
+                        {
+                            mid_turn_pressure = Some(pressure);
+                        }
                         let delta = record_completion_call(
                             &mut completion_retry,
                             retry_config,
@@ -5944,6 +6028,103 @@ mod tests {
                     "ordinary start lost the completion: {events:?}"
                 );
             }
+        }
+    }
+
+    async fn headless_mid_turn_probe(
+        policy: Option<super::HeadlessMidTurnPolicy>,
+    ) -> (super::HeadlessTurn, MockCompletionModel, usize) {
+        #[cfg(feature = "hooks")]
+        let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Usage rises from 30% to 95% of a 1000-token window on the
+        // tool-bearing completion.
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("mid-first", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::tool_call("mid-second", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response(usage(950, 8, 0, 0)),
+            ],
+            vec![
+                MockStreamEvent::text("finished"),
+                MockStreamEvent::final_response(usage(300, 4, 0, 0)),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let turn = super::with_headless_mid_turn(
+            policy,
+            super::run_print_with_stream_policy_and_verification(
+                &agent,
+                &crate::agent::input::PromptInput::text("work".to_owned()),
+                crate::print::HeadlessOutputPolicy::legacy(false, true),
+                None,
+                &crate::retry::RetryConfig::default(),
+                None,
+                Arc::from(Vec::new()),
+                super::RunnerStreamPolicy::default(),
+                None,
+                crate::agent::native_capture::NativeCaptureHook::default(),
+                #[cfg(feature = "hooks")]
+                None,
+            ),
+        )
+        .await;
+        (turn, model, calls.load(Ordering::SeqCst))
+    }
+
+    // mini-agent-sgzh0: a headless turn whose real prompt pressure crosses the
+    // mid-turn threshold stops after the complete tool batch, before another
+    // provider request, with every result in its interactions.
+    #[tokio::test]
+    async fn headless_mid_turn_pressure_stops_at_the_complete_tool_batch() {
+        let (turn, model, calls) = headless_mid_turn_probe(Some(super::HeadlessMidTurnPolicy {
+            window: 1000,
+            threshold: 0.9,
+            anthropic_native: false,
+        }))
+        .await;
+        let boundary = turn
+            .failure
+            .as_ref()
+            .and_then(|error| error.downcast_ref::<super::MidTurnCompactionBoundary>())
+            .copied()
+            .expect("pressure over the threshold must stop at a boundary");
+        assert!(boundary.pressure > 0.9);
+        assert_eq!(calls, 2, "both tools of the batch completed");
+        assert_eq!(model.requests().len(), 1, "no request after the boundary");
+        let results = turn
+            .interactions
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User { content }
+                    if content.iter().any(|item| matches!(item, UserContent::ToolResult(_))))
+            })
+            .count();
+        assert!(
+            results >= 1,
+            "tool results are retained: {:?}",
+            turn.interactions
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_turn_below_threshold_or_unarmed_runs_to_completion() {
+        for policy in [
+            None,
+            Some(super::HeadlessMidTurnPolicy {
+                window: 1000,
+                threshold: 0.99,
+                anthropic_native: false,
+            }),
+        ] {
+            let (turn, model, calls) = headless_mid_turn_probe(policy).await;
+            assert!(turn.failure.is_none(), "{:?}", turn.failure);
+            assert_eq!(turn.response, "finished");
+            assert_eq!(calls, 2);
+            assert_eq!(model.requests().len(), 2);
         }
     }
 

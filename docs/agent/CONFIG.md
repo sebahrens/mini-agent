@@ -1351,10 +1351,9 @@ directories, writes, JavaScript file reads, or symlink escapes; explicit tool
 and external-directory deny rules still apply. The artifact directory is bound
 to its identity and reads use its retained directory capability. If the spill
 write fails, the head/tail bound remains in force and the
-notice reports that the complete output is unavailable. A single long turn with
-many individually bounded results can still exceed the model's real context
-limit before the between-turn check runs, because aggregate in-flight tool
-traffic does not enter the session's token estimate.
+notice reports that the complete output is unavailable. Aggregate in-flight tool
+traffic does not enter the session's token estimate, so a single long turn relies
+on mid-turn compaction (real provider usage) rather than the between-turn check.
 
 The summarizer processes oversized history as bounded recent chunks with a
 rolling summary, at most 16 provider requests, and a five-minute aggregate
@@ -1395,7 +1394,13 @@ provider call mini-agent compares the real provider-reported prompt size against
 `context_window`. When a tool-bearing call crosses the threshold, the runner
 finishes every tool in that call's batch, emits their correlated results in
 order, and pauses before another provider request can start. The TUI then
-compacts and resumes the same task. It never aborts an in-flight tool merely to
+compacts and resumes the same task. Headless `-p`, `--loop` and goal rounds do the
+same: the runner returns at that boundary, the turn's records are written to the
+session (in memory only under `--no-session`), the session is compacted and the
+task continues with a short continuation prompt, at most three times per turn. A
+boundary at which nothing older than the kept recent history exists continues
+without the mid-turn trigger. ACP turns and native Anthropic replay sessions do
+not compact mid-turn yet. It never aborts an in-flight tool merely to
 create a compaction boundary.
 
 Tool calls and results are persisted as structured session messages before the
