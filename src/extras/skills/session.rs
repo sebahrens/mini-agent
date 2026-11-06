@@ -271,6 +271,51 @@ pub(crate) fn configure_extra_roots(
     notes
 }
 
+/// Startup check for the package cap: a cheap count of skill folders (those
+/// holding a `SKILL.md`) in the standard roots and the configured extra roots.
+/// Returns the one note shown at launch when the cap would skip skills; the
+/// same note is produced by discovery and listed by `/skills`.
+pub(crate) fn package_cap_startup_note(
+    launch: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut roots: Vec<(&'static str, PathBuf)> = vec![
+        ("project .mini-agent", launch.join(".mini-agent/skills")),
+        ("project .claude", launch.join(".claude/skills")),
+        ("project .agents", launch.join(".agents/skills")),
+    ];
+    if let Some(home) = home {
+        roots.push(("user .claude", home.join(".claude/skills")));
+        roots.push(("user .agents", home.join(".agents/skills")));
+    }
+    let extra = configured_extra_roots();
+    for dir in &extra.add_dirs {
+        roots.push(("added dir .claude", dir.join(".claude/skills")));
+    }
+    let counts = roots
+        .iter()
+        .map(|(_, dir)| {
+            std::fs::read_dir(dir).map_or(0, |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().join("SKILL.md").is_file())
+                    .count()
+            })
+        })
+        .collect::<Vec<_>>();
+    let allowance = super::discovery::allocate_budget(
+        &counts,
+        super::index::AgentSkillSearchPolicy::configured().max_packages,
+    );
+    let skipped = roots
+        .iter()
+        .zip(counts.iter().zip(allowance))
+        .filter(|(_, (count, allowed))| **count > *allowed)
+        .map(|((origin, _), (count, allowed))| (*origin, *count - allowed))
+        .collect::<Vec<_>>();
+    super::discovery::package_limit_note(&skipped)
+}
+
 /// Notes about extra-directory entries that were dropped or suspect at startup.
 pub(crate) fn extra_root_notes() -> Vec<String> {
     EXTRA_ROOTS
@@ -1871,6 +1916,54 @@ mod discovery_tests {
             text.contains("'bbb-over'") && text.contains("skills_max_resource_bytes"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn package_budget_is_shared_fairly_and_unused_share_flows_on() {
+        use super::super::discovery::allocate_budget;
+        assert_eq!(allocate_budget(&[100, 5], 64), vec![59, 5]);
+        assert_eq!(allocate_budget(&[100, 100], 64), vec![32, 32]);
+        assert_eq!(allocate_budget(&[3, 4], 64), vec![3, 4]);
+        assert_eq!(allocate_budget(&[10, 10, 10], 0), vec![0, 0, 0]);
+        assert_eq!(allocate_budget(&[10, 10, 10], 10), vec![4, 3, 3]);
+    }
+
+    #[tokio::test]
+    async fn package_cap_names_key_count_and_root_and_spares_user_root_and_non_skill_dirs() {
+        let mut fixture = Fixture::new(false);
+        let home = fixture.root.path().join("owned-home");
+        std::fs::create_dir_all(home.join(".claude/skills/user-late")).unwrap();
+        std::fs::write(
+            home.join(".claude/skills/user-late/SKILL.md"),
+            "---\nname: user-late\ndescription: user late\n---\nU\n",
+        )
+        .unwrap();
+        Arc::get_mut(&mut fixture.services).unwrap().home = Some(home);
+        let cap = super::super::index::AgentSkillSearchPolicy::configured().max_packages;
+        // Non-skill folders must not consume the budget.
+        for n in 0..(cap + 5) {
+            std::fs::create_dir_all(
+                fixture
+                    .root
+                    .path()
+                    .join(format!(".claude/skills/not-a-skill-{n}")),
+            )
+            .unwrap();
+        }
+        for n in 0..(cap + 3) {
+            fixture.skill(".claude/skills", &format!("s{n:03}"), "bulk skill", "B");
+        }
+        let snapshot = fixture.services.refresh(false).await.unwrap();
+        assert!(
+            snapshot.packages.contains_key("user-late"),
+            "user root starved"
+        );
+        assert!(!snapshot.packages.contains_key(&format!("s{:03}", cap + 2)));
+        assert!(snapshot.packages.contains_key("s000"));
+        let text = snapshot.diagnostics.join("\n");
+        assert!(text.contains("skills_max_packages"), "{text}");
+        assert!(text.contains("project .claude: 4"), "{text}");
+        assert!(text.contains(&format!("({cap} packages)")), "{text}");
     }
 
     #[tokio::test]

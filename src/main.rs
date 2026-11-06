@@ -702,6 +702,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         ) {
             eprintln!("warning: {note}");
         }
+        let home = paths::process_home_dir();
+        if let Some(note) =
+            extras::skills::session::package_cap_startup_note(&launch, home.as_deref())
+        {
+            eprintln!("warning: {note}");
+        }
     }
     // ── Hooks: load settings.json config, apply trust, install dispatcher ──
     // Done this early (before provider/API-key resolution) so `--hooks-test`

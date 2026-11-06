@@ -413,9 +413,11 @@ pub(crate) fn discover(
         Ok(index) => {
             for record in index.records() {
                 if result.packages.len() == max_packages() {
-                    result
-                        .diagnostics
-                        .push("skill package limit exceeded".into());
+                    result.diagnostics.push(format!(
+                        "skill package limit reached: {} imported skills kept, the rest were skipped (raise skills_max_packages, currently {}, at most 1024)",
+                        result.packages.len(),
+                        max_packages()
+                    ));
                     break;
                 }
                 #[cfg(not(feature = "skills"))]
@@ -443,7 +445,8 @@ pub(crate) fn discover(
             .diagnostics
             .push("imported catalogue unavailable".into()),
     }
-    let mut packages = result.packages.len();
+    let packages = result.packages.len();
+    let mut scanned: Vec<(&SourceRoot, Vec<String>)> = Vec::new();
     for source in roots {
         // Entry and byte budgets are per root (scan) and per package (content):
         // one oversized package or root never starves the ones after it.
@@ -488,6 +491,14 @@ pub(crate) fn discover(
                 {
                     continue;
                 }
+                // Only directories that hold a SKILL.md are skill packages;
+                // other folders never consume the package budget.
+                let has_manifest = directory
+                    .metadata(Path::new(&name).join("SKILL.md"))
+                    .is_ok_and(|metadata| metadata.is_file());
+                if !has_manifest {
+                    continue;
+                }
                 names.push(name);
             }
             names.sort();
@@ -499,14 +510,21 @@ pub(crate) fn discover(
                 .push(format!("{}: {error}", source.origin));
             continue;
         }
+        scanned.push((source, names));
+    }
+    // Fair budget: an earlier large root cannot starve later (user) roots.
+    let counts = scanned
+        .iter()
+        .map(|(_, names)| names.len())
+        .collect::<Vec<_>>();
+    let allowance = allocate_budget(&counts, max_packages().saturating_sub(packages));
+    let mut skipped = Vec::new();
+    for ((source, names), allowed_count) in scanned.into_iter().zip(allowance) {
+        if names.len() > allowed_count {
+            skipped.push((source.origin, names.len() - allowed_count));
+        }
+        let names = names.into_iter().take(allowed_count).collect::<Vec<_>>();
         for name in names {
-            packages = packages.saturating_add(1);
-            if packages > max_packages() {
-                result
-                    .diagnostics
-                    .push("skill package limit exceeded".into());
-                return result;
-            }
             let package_path = source.directory.join(&name);
             let mut package_entries = 0usize;
             let mut bytes = 0usize;
@@ -604,7 +622,49 @@ pub(crate) fn discover(
             }
         }
     }
+    if let Some(note) = package_limit_note(&skipped) {
+        result.diagnostics.push(note);
+    }
     result
+}
+
+/// Split `budget` across roots so every root gets an equal share first and
+/// unused share flows to the roots that need more (water-filling); the
+/// remainder from integer division goes to earlier (higher priority) roots.
+pub(crate) fn allocate_budget(counts: &[usize], budget: usize) -> Vec<usize> {
+    let mut allocation = vec![0usize; counts.len()];
+    let mut order = (0..counts.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| counts[index]);
+    let mut remaining = budget;
+    for (position, &index) in order.iter().enumerate() {
+        let share = remaining.div_ceil(counts.len() - position);
+        allocation[index] = counts[index].min(share);
+        remaining -= allocation[index];
+    }
+    for (index, count) in counts.iter().enumerate() {
+        let extra = (count - allocation[index]).min(remaining);
+        allocation[index] += extra;
+        remaining -= extra;
+    }
+    allocation
+}
+
+/// The one message shown for a hit cap: names the limit, the config key, how
+/// many skills were skipped and in which roots.
+pub(crate) fn package_limit_note(skipped: &[(&str, usize)]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let total = skipped.iter().map(|(_, count)| count).sum::<usize>();
+    let roots = skipped
+        .iter()
+        .map(|(origin, count)| format!("{origin}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "skill package limit reached ({} packages): {total} skills skipped ({roots}); raise skills_max_packages (at most 1024)",
+        max_packages()
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

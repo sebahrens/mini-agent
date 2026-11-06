@@ -82,6 +82,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   `gh attestation verify`, honours `HTTPS_PROXY`, needs `--allow-downgrade` for older releases, and
   the update notice follows the install channel (mini-agent-skgg9, -zml6o, -x6nc9, -w7046, -17mth,
   -nfj5h, -t5ybs, -gwx1b, -e3bor).
+### Skills and subagents (round 9, group A)
+
+- Skill discovery counts only folders that hold a `SKILL.md` toward `skills_max_packages`, shares
+  the budget fairly across roots so a large project root cannot hide user roots, and reports the
+  limit, config key, skipped count and roots once at startup (mini-agent-hi8rm).
+
 ### Shell and pty jobs (round 7, group P)
 
 - `job_status` input no longer accepts TAB or shell history expansion (`!` followed by text, a
