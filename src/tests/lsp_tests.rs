@@ -2515,13 +2515,13 @@ fn rename_preview_is_bounded_and_never_names_outside_files() {
     let edit = |n: usize| {
         serde_json::json!({
             "range": {"start": {"line": n, "character": 0}, "end": {"line": n, "character": 1}},
-            "newText": format!("line one\nforged {}", "x".repeat(10_000)),
+            "newText": format!("line one\nforged {}", "x".repeat(300)),
         })
     };
     let mut changes = serde_json::Map::new();
     changes.insert(
         "file:///ws/many.rs".into(),
-        serde_json::Value::Array((0..200).map(edit).collect()),
+        serde_json::Value::Array((0..MAX_EDITS_PER_FILE + 200).map(edit).collect()),
     );
     for index in 0..(MAX_EDIT_FILES + 5) {
         changes.insert(
@@ -2540,7 +2540,7 @@ fn rename_preview_is_bounded_and_never_names_outside_files() {
         .find(|file| file.path.ends_with("many.rs"))
         .unwrap();
     assert_eq!(many.edits.len(), MAX_EDITS_PER_FILE);
-    assert_eq!(many.omitted_edits, 200 - MAX_EDITS_PER_FILE);
+    assert_eq!(many.omitted_edits, 200);
     assert!(
         preview
             .files
@@ -2739,4 +2739,170 @@ fn single_file_diagnostics_page_states_hidden_count_and_post_edit_cap_stays_20()
     let rest = crate::extras::lsp::format_file_diags_for_test("rust", &diags, 0, rest).unwrap();
     assert_eq!(rest.matches(" error: m").count(), 50);
     assert!(!rest.contains("not shown"), "{rest}");
+}
+
+fn nav_items(count: u32) -> Vec<crate::extras::lsp::navigate::NavItem> {
+    // Deliberately unordered: the page order must not depend on server order.
+    (0..count)
+        .rev()
+        .map(|n| crate::extras::lsp::navigate::NavItem {
+            path: PathBuf::from(format!("/ws/f{:02}.rs", n % 5)),
+            line: n,
+            character: 0,
+            label: None,
+            depth: 0,
+            external: false,
+        })
+        .collect()
+}
+
+#[test]
+fn navigate_references_page_over_250_results_in_stable_order() {
+    use crate::agent::tools::lsp::LspNavigateTool;
+    use crate::extras::lsp::navigate::NavOp;
+    let root = TempDir::new("nav-paging");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let tool = LspNavigateTool::new(manager, None, None);
+    let rendered = |offset: usize, limit: usize, reverse: bool| {
+        let mut items = nav_items(250);
+        if reverse {
+            items.reverse();
+        }
+        tool.render_items(items, 0, 0, NavOp::References, (offset, limit))
+    };
+    let first = rendered(0, 100, false);
+    let locations = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.contains(".rs:"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(locations(&first).len(), 100, "{first}");
+    assert!(
+        first.contains(
+            "[showing 1-100 of 250 results; next_offset=100: pass offset=100 to continue]"
+        ),
+        "{first}"
+    );
+    assert!(
+        !first.contains("narrow the query"),
+        "references cannot be narrowed: {first}"
+    );
+    let second = rendered(100, 100, true);
+    let third = rendered(200, 100, false);
+    assert_eq!(locations(&second).len(), 100);
+    assert_eq!(locations(&third).len(), 50);
+    assert!(!third.contains("next_offset"), "{third}");
+    let mut all: Vec<String> = [&first, &second, &third]
+        .iter()
+        .flat_map(|page| locations(page))
+        .collect();
+    let count = all.len();
+    all.sort();
+    all.dedup();
+    assert_eq!(count, 250);
+    assert_eq!(
+        all.len(),
+        250,
+        "pages must not overlap, whatever the server order"
+    );
+    // Sorted by path then line across the page boundary.
+    let joined = locations(&first);
+    assert_eq!(joined[0], "/ws/f00.rs:1:1");
+    assert_eq!(joined[99], "/ws/f01.rs:247:1");
+    let key = |s: &String| {
+        let mut parts = s.rsplitn(3, ':');
+        let _column = parts.next();
+        let line = parts.next().unwrap().parse::<u32>().unwrap();
+        (parts.next().unwrap().to_string(), line)
+    };
+    assert!(joined.windows(2).all(|w| key(&w[0]) < key(&w[1])));
+    assert!(rendered(900, 100, false).contains("No results at offset 900 (250 in total)"));
+    // Name-driven ops may suggest narrowing; the hard ceiling is disclosed.
+    let symbols = tool.render_items(nav_items(150), 0, 7, NavOp::WorkspaceSymbols, (0, 100));
+    assert!(symbols.contains("or narrow the query"), "{symbols}");
+    assert!(
+        symbols.contains("7 more results beyond the 5000-result ceiling"),
+        "{symbols}"
+    );
+}
+
+#[test]
+fn rename_preview_pages_through_every_edit_up_to_the_hard_bound() {
+    use crate::agent::tools::lsp::render_edit_preview;
+    use crate::extras::lsp::navigate::{EditPreview, EditView, FileEdits};
+    let root = std::path::PathBuf::from("/ws");
+    let edit = |n: u32| EditView {
+        start: (n, 0),
+        end: (n, 3),
+        new_text: "renamed".into(),
+        cut: false,
+    };
+    // 120 sites in one file and 60 files of 3 sites: past the old caps of 50
+    // edits per file and 50 files.
+    let mut files = vec![FileEdits {
+        path: root.join("big.rs"),
+        edits: (0..120).rev().map(edit).collect(),
+        omitted_edits: 0,
+    }];
+    for index in 0..60 {
+        files.push(FileEdits {
+            path: root.join(format!("small{index:02}.rs")),
+            edits: (0..3).map(edit).collect(),
+            omitted_edits: 0,
+        });
+    }
+    let preview = EditPreview {
+        total_edits: 300,
+        files,
+        ..Default::default()
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut offset = 0;
+    let mut pages = 0;
+    loop {
+        let text = render_edit_preview(&preview, &root, None, true, "renamed", (offset, 100));
+        pages += 1;
+        assert!(
+            text.starts_with("Rename to `renamed`: 300 edits in 61 files."),
+            "{text}"
+        );
+        let mut current = String::new();
+        for line in text.lines() {
+            if line.ends_with(".rs") {
+                current = line.to_string();
+            } else if line.contains("-> \"renamed\"") {
+                assert!(seen.insert(format!("{current}{line}")), "duplicate: {line}");
+            }
+        }
+        match text.lines().find_map(|l| l.split("next_offset=").nth(1)) {
+            Some(rest) => {
+                offset = rest.split(':').next().unwrap().parse().unwrap();
+                assert!(text.contains("[showing edits"), "{text}");
+            }
+            None => break,
+        }
+        assert!(pages < 10);
+    }
+    assert_eq!(seen.len(), 300);
+    assert_eq!(pages, 3);
+    // Past the end is stated.
+    let past = render_edit_preview(&preview, &root, None, true, "renamed", (1000, 100));
+    assert!(
+        past.contains("No edits at offset 1000 (300 previewable in total)"),
+        "{past}"
+    );
+    // Over-bound excess is disclosed, not silent.
+    let mut over = preview.clone();
+    over.omitted_files = 4;
+    over.files[0].omitted_edits = 9;
+    let text = render_edit_preview(&over, &root, None, true, "renamed", (0, 1000));
+    assert!(
+        text.contains("4 more files beyond the 500-file bound"),
+        "{text}"
+    );
+    assert!(
+        text.contains("9 more edits in this file beyond the 5000-edit bound"),
+        "{text}"
+    );
 }

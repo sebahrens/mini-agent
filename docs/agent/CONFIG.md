@@ -3905,7 +3905,11 @@ mini-agent can run language servers for the files the agent edits and feed
 diagnostics (errors/warnings) back into `edit`/`write` tool results — the
 agent sees type errors immediately instead of discovering them on the next
 build. An `lsp_diagnostics` tool also lets the agent query one file or the
-whole project on demand.
+whole project on demand: the post-edit appendix keeps 20 lines, while an
+explicit query returns up to 200 (`limit`, at most 1000), errors first, with
+`offset`, `severity` (`error`/`warning`) and, project-wide, `directory`
+filters; the truncation line states the exact number of hidden diagnostics and
+files and the `offset` that continues the listing.
 
 For a file extension claimed by multiple servers, user-configured servers
 take precedence in alphabetical server-name order, followed by built-ins in
@@ -3928,8 +3932,11 @@ library source) is listed by its canonical absolute path and marked
 not deny, so it can be opened with `read` under the normal permission flow;
 denied ones are counted as hidden, and non-file URIs, missing files and paths
 with control characters are counted but never named. Symlink aliases of
-workspace files are counted but never named. Results are capped at 100 locations/symbols (excess is
-reported with a count), hover text at 8 KiB (marked when truncated), and
+workspace files are counted but never named. Results are sorted by path and
+position (document `symbols` keep outline order) and returned 100 per page;
+pass `offset` (the `next_offset` the truncation line names) and optionally
+`limit` (at most 1000) to reach the rest, up to 5000 retained results per
+request (the excess past that ceiling is counted). Hover text is capped at 8 KiB (marked when truncated), and
 each request at 10 seconds. An op the server does not advertise in its
 `initialize` capabilities (for example no `implementationProvider`) fails
 with a message naming the missing capability. Restrict the tool with
@@ -3942,8 +3949,10 @@ a single identifier of at most 256 bytes) and `code_actions` (optional
 `end_line`/`end_column`; `action`=N previews the edit of that action). The
 client now advertises `window.workDoneProgress`, call-hierarchy, rename,
 code-action and workspace-edit capabilities. `rename` and a previewed code
-action return the server's workspace edit as a bounded review (50 files, 50
-edits per file, 500 total, replacement text cut at 200 bytes, files outside
+action return the server's workspace edit as a bounded review of up to 500
+files, 5000 edits per file and 10000 edits in total, paged by `offset`/`limit`
+over the edits (200 per page, files in path order; the truncation line names the
+`next_offset`), replacement text cut at 200 bytes (marked), files outside
 the workspace counted but never named, `read`-denied files hidden); **no file is
 modified**. `rename` additionally requires `edit` permission for `path`
 (deny/ask rules for `edit` apply) so a project that forbids edits cannot even

@@ -306,7 +306,20 @@ pub struct LspNavigateArgs {
     /// code_actions: 1-based number of an action whose edit to preview.
     #[serde(default)]
     pub action: Option<u32>,
+    /// Results (or, for rename and a code action's edit, edits) to skip; pass
+    /// the `next_offset` named by the previous truncation line.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Most results or edits to return (default 100 results, 200 edits; at
+    /// most 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
+
+/// Largest `limit` of an `lsp_navigate` page.
+const NAV_LIMIT_MAX: usize = 1000;
+const NAV_ITEMS_DEFAULT: usize = 100;
+const NAV_EDITS_DEFAULT: usize = 200;
 
 impl LspNavigateTool {
     pub fn new(
@@ -330,7 +343,7 @@ impl Tool for LspNavigateTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Semantic code navigation through the project's language server. `op`: definition, type_definition, implementation, references (need `line` and `column`, 1-based, pointing at the symbol), hover (type/docs at that position), symbols (outline of `path`), workspace_symbols (search by `query`; `path` selects the language server), incoming_calls / outgoing_calls (call hierarchy of the function at `line`/`column`), rename (needs `new_name`; returns the server's workspace edit as a preview and changes NO file; it needs `edit` permission for `path`; apply the edits yourself with `edit`) and code_actions (quick fixes and refactors for `line`/`column`, optionally through `end_line`/`end_column`; pass `action`=N to preview that action's edit; server commands are never executed). An empty answer from a server that is still indexing says so instead of reporting no results. Returns workspace-relative `path:line:column` locations (1-based), capped at 100. Definitions in dependencies or the standard library come back as absolute paths marked `(outside workspace)`; open them with `read` (subject to read permission).".to_string()
+        "Semantic code navigation through the project's language server. `op`: definition, type_definition, implementation, references (need `line` and `column`, 1-based, pointing at the symbol), hover (type/docs at that position), symbols (outline of `path`), workspace_symbols (search by `query`; `path` selects the language server), incoming_calls / outgoing_calls (call hierarchy of the function at `line`/`column`), rename (needs `new_name`; returns the server's workspace edit as a preview and changes NO file; it needs `edit` permission for `path`; apply the edits yourself with `edit`) and code_actions (quick fixes and refactors for `line`/`column`, optionally through `end_line`/`end_column`; pass `action`=N to preview that action's edit; server commands are never executed). An empty answer from a server that is still indexing says so instead of reporting no results. Returns workspace-relative `path:line:column` locations (1-based), sorted by path and position (symbols keep outline order), 100 per page: pass `offset` (the `next_offset` a truncation line names) and optionally `limit` (at most 1000) to read the rest; at most 5000 results are retained per request. Rename and code-action edit previews page the same way over their edits (200 per page, up to 10000 edits in 500 files). Definitions in dependencies or the standard library come back as absolute paths marked `(outside workspace)`; open them with `read` (subject to read permission).".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -348,7 +361,9 @@ impl Tool for LspNavigateTool {
                 "new_name": { "type": "string", "maxLength": 256, "description": "rename: the new identifier" },
                 "end_line": { "type": "integer", "minimum": 1, "description": "code_actions: 1-based end line of the range" },
                 "end_column": { "type": "integer", "minimum": 1, "description": "code_actions: 1-based end column of the range" },
-                "action": { "type": "integer", "minimum": 1, "description": "code_actions: preview the edit of this action number" }
+                "action": { "type": "integer", "minimum": 1, "description": "code_actions: preview the edit of this action number" },
+                "offset": { "type": "integer", "minimum": 0, "description": "Results (rename / action previews: edits) to skip; pass the next_offset of the previous page" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Most results or edits per page (default 100 results, 200 edits)" }
             },
             "required": ["op", "path"]
         })
@@ -414,6 +429,31 @@ impl Tool for LspNavigateTool {
                 "action is supported only by code_actions.".to_string(),
             ));
         }
+        let pages = match op {
+            NavOp::Hover => false,
+            NavOp::CodeActions => args.action.is_some(),
+            _ => true,
+        };
+        if !pages && (args.offset.is_some() || args.limit.is_some()) {
+            return Err(ToolError::Msg(
+                "offset and limit are supported only by ops that return lists of results or edits (not hover, or code_actions without `action`).".to_string(),
+            ));
+        }
+        if args
+            .limit
+            .is_some_and(|limit| limit == 0 || limit > NAV_LIMIT_MAX)
+        {
+            return Err(ToolError::Msg(format!(
+                "limit must be between 1 and {NAV_LIMIT_MAX}."
+            )));
+        }
+        let offset = args.offset.unwrap_or(0);
+        let edit_op = matches!(op, NavOp::Rename | NavOp::CodeActions);
+        let limit = args.limit.unwrap_or(if edit_op {
+            NAV_EDITS_DEFAULT
+        } else {
+            NAV_ITEMS_DEFAULT
+        });
         let expanded = crate::fs::expand_tilde(&args.path);
         let path = self
             .manager
@@ -498,82 +538,7 @@ impl Tool for LspNavigateTool {
                 items,
                 outside,
                 truncated,
-            } => {
-                // Results are filtered like a workspace walk: a read deny
-                // rule hides the location rather than naming the file.
-                let deny = super::walk_deny_filter(&self.permission, "read", Some(&root));
-                let mut denied = 0usize;
-                let mut outside = outside;
-                let mut lines = Vec::new();
-                for item in items {
-                    if item.external {
-                        // A location the server placed outside the workspace
-                        // (dependency or standard library source) is named by
-                        // its absolute path only when the `read` rules do not
-                        // deny it, so the model can then `read` it under the
-                        // ordinary permission flow. Nothing is read here.
-                        if item.path.starts_with(&root) {
-                            outside += 1;
-                            continue;
-                        }
-                        let allowed = match (&self.permission, item.path.to_str()) {
-                            (_, None) => false,
-                            (None, Some(_)) => true,
-                            (Some(permission), Some(path)) => !matches!(
-                                permission
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .check_path("read", path),
-                                crate::permission::checker::CheckResult::Denied(_)
-                            ),
-                        };
-                        if !allowed {
-                            denied += 1;
-                            continue;
-                        }
-                    } else if deny.as_ref().is_some_and(|deny| deny(&item.path, false)) {
-                        denied += 1;
-                        continue;
-                    }
-                    let shown = item
-                        .path
-                        .strip_prefix(&root)
-                        .unwrap_or(&item.path)
-                        .display()
-                        .to_string()
-                        .replace('\\', "/");
-                    let mut location = format!("{shown}:{}:{}", item.line + 1, item.character + 1);
-                    if item.external {
-                        location.push_str(" (outside workspace)");
-                    }
-                    lines.push(match item.label {
-                        Some(label) => {
-                            format!("{}{label} — {location}", "  ".repeat(item.depth))
-                        }
-                        None => location,
-                    });
-                }
-                let mut output = if lines.is_empty() {
-                    "No results.".to_string()
-                } else {
-                    lines.join("\n")
-                };
-                if truncated > 0 {
-                    output.push_str(&format!(
-                        "\n[{truncated} more results not shown (limit {}); narrow the query]",
-                        crate::extras::lsp::navigate::MAX_NAV_ITEMS
-                    ));
-                }
-                if outside > 0 {
-                    output.push_str(&format!(
-                        "\n[{outside} results outside the workspace omitted]"
-                    ));
-                }
-                if denied > 0 {
-                    output.push_str(&format!("\n[{denied} results hidden by permission rules]"));
-                }
-                output
-            }
+            } => self.render_items(items, outside, truncated, op, (offset, limit)),
             NavAnswer::Edit(preview) => {
                 let deny = super::walk_deny_filter(&self.permission, "read", Some(&root));
                 render_edit_preview(
@@ -582,6 +547,7 @@ impl Tool for LspNavigateTool {
                     deny.as_ref(),
                     op == NavOp::Rename,
                     &query.new_name,
+                    (offset, limit),
                 )
             }
             NavAnswer::Actions { actions, truncated } => {
@@ -598,22 +564,159 @@ impl Tool for LspNavigateTool {
     }
 }
 
-fn render_edit_preview(
+impl LspNavigateTool {
+    /// Filters (permissions), orders and pages a location/symbol answer.
+    pub(crate) fn render_items(
+        &self,
+        items: Vec<crate::extras::lsp::navigate::NavItem>,
+        outside: usize,
+        truncated: usize,
+        op: crate::extras::lsp::navigate::NavOp,
+        (offset, limit): (usize, usize),
+    ) -> String {
+        use crate::extras::lsp::navigate::NavOp;
+        let root = self.manager.root().to_path_buf();
+        // Results are filtered like a workspace walk: a read deny
+        // rule hides the location rather than naming the file.
+        let deny = super::walk_deny_filter(&self.permission, "read", Some(&root));
+        let mut denied = 0usize;
+        let mut outside = outside;
+        let mut lines = Vec::new();
+        let mut items = items;
+        // Stable order across calls, so pages do not overlap. The
+        // outline of a document keeps its tree order.
+        if op != NavOp::Symbols {
+            items.sort_by(|a, b| {
+                (a.external, &a.path, a.line, a.character, &a.label).cmp(&(
+                    b.external,
+                    &b.path,
+                    b.line,
+                    b.character,
+                    &b.label,
+                ))
+            });
+        }
+        for item in items {
+            if item.external {
+                // A location the server placed outside the workspace
+                // (dependency or standard library source) is named by
+                // its absolute path only when the `read` rules do not
+                // deny it, so the model can then `read` it under the
+                // ordinary permission flow. Nothing is read here.
+                if item.path.starts_with(&root) {
+                    outside += 1;
+                    continue;
+                }
+                let allowed = match (&self.permission, item.path.to_str()) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(permission), Some(path)) => !matches!(
+                        permission
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .check_path("read", path),
+                        crate::permission::checker::CheckResult::Denied(_)
+                    ),
+                };
+                if !allowed {
+                    denied += 1;
+                    continue;
+                }
+            } else if deny.as_ref().is_some_and(|deny| deny(&item.path, false)) {
+                denied += 1;
+                continue;
+            }
+            let shown = item
+                .path
+                .strip_prefix(&root)
+                .unwrap_or(&item.path)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            let mut location = format!("{shown}:{}:{}", item.line + 1, item.character + 1);
+            if item.external {
+                location.push_str(" (outside workspace)");
+            }
+            lines.push(match item.label {
+                Some(label) => {
+                    format!("{}{label} — {location}", "  ".repeat(item.depth))
+                }
+                None => location,
+            });
+        }
+        let total = lines.len();
+        let end = offset.saturating_add(limit).min(total);
+        let mut output = if lines.is_empty() {
+            "No results.".to_string()
+        } else if offset >= total {
+            format!("No results at offset {offset} ({total} in total).")
+        } else {
+            lines[offset..end].join("\n")
+        };
+        if offset < total && end < total {
+            // Only the name-driven ops have a query to narrow.
+            let narrow = if matches!(op, NavOp::WorkspaceSymbols | NavOp::Symbols) {
+                ", or narrow the query"
+            } else {
+                ""
+            };
+            output.push_str(&format!(
+                "\n[showing {}-{end} of {total} results; next_offset={end}: pass offset={end} to continue{narrow}]",
+                offset + 1
+            ));
+        }
+        if truncated > 0 {
+            output.push_str(&format!(
+                "\n[{truncated} more results beyond the {}-result ceiling are not reachable by paging]",
+                crate::extras::lsp::navigate::MAX_NAV_ITEMS
+            ));
+        }
+        if outside > 0 {
+            output.push_str(&format!(
+                "\n[{outside} results outside the workspace omitted]"
+            ));
+        }
+        if denied > 0 {
+            output.push_str(&format!("\n[{denied} results hidden by permission rules]"));
+        }
+        output
+    }
+}
+
+pub(crate) fn render_edit_preview(
     preview: &crate::extras::lsp::navigate::EditPreview,
     root: &Path,
     deny: Option<&super::find_files::PathFilter>,
     rename: bool,
     new_name: &str,
+    (offset, limit): (usize, usize),
 ) -> String {
     let mut hidden = 0usize;
-    let mut body = String::new();
-    let mut files = 0usize;
+    let mut visible: Vec<&crate::extras::lsp::navigate::FileEdits> = Vec::new();
     for file in &preview.files {
         if deny.is_some_and(|deny| deny(&file.path, false)) {
             hidden += 1;
+        } else {
+            visible.push(file);
+        }
+    }
+    // Stable order across calls (path, then position) so pages do not overlap.
+    visible.sort_by(|a, b| a.path.cmp(&b.path));
+    let files = visible.len();
+    let shown_edits: usize = visible.iter().map(|file| file.edits.len()).sum();
+    let end = offset.saturating_add(limit).min(shown_edits);
+    let mut body = String::new();
+    let mut position = 0usize;
+    let mut files_in_page = 0usize;
+    for file in &visible {
+        let mut edits: Vec<_> = file.edits.iter().collect();
+        edits.sort_by_key(|edit| (edit.start, edit.end));
+        let first = position;
+        position += edits.len();
+        if position <= offset || first >= end {
             continue;
         }
-        files += 1;
+        files_in_page += 1;
         let shown = file
             .path
             .strip_prefix(root)
@@ -622,25 +725,39 @@ fn render_edit_preview(
             .to_string()
             .replace('\\', "/");
         body.push_str(&format!("{shown}\n"));
-        for edit in &file.edits {
+        for (index, edit) in edits.iter().enumerate() {
+            if !(offset..end).contains(&(first + index)) {
+                continue;
+            }
             body.push_str(&format!(
-                "  {}:{}-{}:{} -> {:?}\n",
+                "  {}:{}-{}:{} -> {:?}{}\n",
                 edit.start.0 + 1,
                 edit.start.1 + 1,
                 edit.end.0 + 1,
                 edit.end.1 + 1,
-                edit.new_text
+                edit.new_text,
+                if edit.cut {
+                    format!(
+                        " [replacement text cut at {} bytes]",
+                        crate::extras::lsp::navigate::MAX_EDIT_TEXT_BYTES
+                    )
+                } else {
+                    String::new()
+                }
             ));
         }
-        if file.omitted_edits > 0 {
+        if file.omitted_edits > 0 && position - 1 < end && position > offset {
             body.push_str(&format!(
-                "  [{} more edits in this file not shown]\n",
-                file.omitted_edits
+                "  [{} more edits in this file beyond the {}-edit bound are not previewable]\n",
+                file.omitted_edits,
+                crate::extras::lsp::navigate::MAX_EDITS_PER_FILE
             ));
         }
     }
-    for operation in &preview.file_ops {
-        body.push_str(&format!("file operation: {operation}\n"));
+    if offset == 0 {
+        for operation in &preview.file_ops {
+            body.push_str(&format!("file operation: {operation}\n"));
+        }
     }
     let heading = if rename {
         format!(
@@ -655,12 +772,20 @@ fn render_edit_preview(
     };
     let mut out = if files == 0 && preview.file_ops.is_empty() {
         format!("{heading}\n(the server returned no edits)")
+    } else if offset >= shown_edits && shown_edits > 0 {
+        format!("{heading}\nNo edits at offset {offset} ({shown_edits} previewable in total).")
     } else {
         format!("{heading}\n{body}")
     };
+    if offset < shown_edits && end < shown_edits {
+        out.push_str(&format!(
+            "[showing edits {}-{end} of {shown_edits} across {files} files ({files_in_page} in this page); next_offset={end}: pass offset={end} to continue]\n",
+            offset + 1
+        ));
+    }
     if preview.omitted_files > 0 {
         out.push_str(&format!(
-            "[{} more files not shown (limit {})]\n",
+            "[{} more files beyond the {}-file bound are not previewable; split the change]\n",
             preview.omitted_files,
             crate::extras::lsp::navigate::MAX_EDIT_FILES
         ));

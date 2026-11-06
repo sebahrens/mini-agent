@@ -27,18 +27,22 @@ const INDEX_WAIT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(8)
 };
-/// Rename/code-action previews: files, edits per file and total edits shown.
-pub(crate) const MAX_EDIT_FILES: usize = 50;
-pub(crate) const MAX_EDITS_PER_FILE: usize = 50;
-pub(crate) const MAX_EDITS_TOTAL: usize = 500;
+/// Hard bounds of a rename/code-action preview: files, edits per file and total
+/// edits retained. Everything up to these bounds is reachable through the
+/// tool's `offset`/`limit` paging; only the excess is dropped (and counted).
+pub(crate) const MAX_EDIT_FILES: usize = 500;
+pub(crate) const MAX_EDITS_PER_FILE: usize = 5_000;
+pub(crate) const MAX_EDITS_TOTAL: usize = 10_000;
 /// Most code actions listed.
 pub(crate) const MAX_ACTIONS: usize = 50;
 /// Replacement text in a preview is cut at this many bytes.
-const MAX_EDIT_TEXT_BYTES: usize = 200;
+pub(crate) const MAX_EDIT_TEXT_BYTES: usize = 200;
 /// Longest accepted `new_name`.
 pub(crate) const MAX_NEW_NAME_BYTES: usize = 256;
-/// Most locations or symbols returned in one result.
-pub(crate) const MAX_NAV_ITEMS: usize = 100;
+/// Hard bound on locations or symbols retained for one request; the tool pages
+/// through them (`offset`/`limit`). Only results beyond it are dropped (and
+/// counted).
+pub(crate) const MAX_NAV_ITEMS: usize = 5_000;
 /// Hover text is cut at this many bytes (UTF-8 safe).
 pub(crate) const MAX_HOVER_BYTES: usize = 8 * 1024;
 /// Symbol names and details are cut at this many bytes.
@@ -154,7 +158,7 @@ pub(crate) enum NavAnswer {
         items: Vec<NavItem>,
         /// Locations outside the workspace (or unmappable URIs), omitted.
         outside: usize,
-        /// Results dropped by [`MAX_NAV_ITEMS`].
+        /// Results dropped by the [`MAX_NAV_ITEMS`] hard bound.
         truncated: usize,
     },
     Hover {
@@ -175,6 +179,8 @@ pub(crate) struct EditView {
     pub start: (u32, u32),
     pub end: (u32, u32),
     pub new_text: String,
+    /// `new_text` was cut at [`MAX_EDIT_TEXT_BYTES`].
+    pub cut: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,14 +496,15 @@ pub(crate) fn edit_preview(edit: &Value, map: &dyn Fn(&str) -> Option<PathBuf>) 
                     .and_then(Value::as_u64)
                     .map_or(0, |value| value.min(u64::from(u32::MAX)) as u32)
             };
+            let (new_text, cut) = truncate(
+                entry.get("newText").and_then(Value::as_str).unwrap_or(""),
+                MAX_EDIT_TEXT_BYTES,
+            );
             file.edits.push(EditView {
                 start: position_of(range),
                 end: (get("line"), get("character")),
-                new_text: truncate(
-                    entry.get("newText").and_then(Value::as_str).unwrap_or(""),
-                    MAX_EDIT_TEXT_BYTES,
-                )
-                .0,
+                new_text,
+                cut,
             });
         }
     };
@@ -917,6 +924,17 @@ mod tests {
     #[test]
     fn locations_are_capped_with_a_count() {
         let many: Vec<Value> = (0..150)
+            .map(|line| json!({"uri": "file:///ws/a.rs", "range": {"start": {"line": line, "character": 0}}}))
+            .collect();
+        let NavAnswer::Items {
+            items, truncated, ..
+        } = locations_answer(&Value::Array(many), &map)
+        else {
+            panic!("items");
+        };
+        assert_eq!(items.len(), 150, "paging happens in the tool layer");
+        assert_eq!(truncated, 0);
+        let many: Vec<Value> = (0..MAX_NAV_ITEMS + 50)
             .map(|line| json!({"uri": "file:///ws/a.rs", "range": {"start": {"line": line, "character": 0}}}))
             .collect();
         let NavAnswer::Items {
