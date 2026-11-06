@@ -24,7 +24,7 @@
 //!
 //! The swap happens in the provider HTTP layer (`ProviderHttpClient`): a
 //! request that carries a secret this module issued gets the current secret in
-//! its place, so clients built earlier with an older token keep working without
+//! its place (in a header value, or in the URL's `key=` parameter for Gemini), so clients built earlier with an older token keep working without
 //! a restart. Bedrock, Vertex and Copilot use their own credential
 //! flows and ignore this table.
 use std::collections::HashMap;
@@ -210,7 +210,7 @@ impl CommandCredential {
     /// Rewrites a secret this credential issued in `headers` to the current
     /// one, renewing it first when its TTL ran out. `Some(generation)` when
     /// the request carries one of this credential's secrets.
-    async fn apply(&self, headers: &mut HeaderMap) -> Option<u64> {
+    async fn apply(&self, headers: &mut HeaderMap, uri: &mut http::Uri) -> Option<u64> {
         {
             let owns = |headers: &HeaderMap, state: &State| {
                 headers.values().any(|value| {
@@ -220,7 +220,10 @@ impl CommandCredential {
                     })
                 })
             };
-            if !owns(headers, &self.lock()) {
+            let owns_query = |uri: &http::Uri, state: &State| {
+                query_key(uri).is_some_and(|value| state.known.iter().any(|known| known == value))
+            };
+            if !owns(headers, &self.lock()) && !owns_query(uri, &self.lock()) {
                 return None;
             }
             let expired = !self.is_fresh(&self.lock());
@@ -231,6 +234,13 @@ impl CommandCredential {
                 let state = self.lock();
                 (state.current.clone()?, state.generation)
             };
+            if let Some(value) = query_key(uri)
+                && value != current
+                && self.lock().known.iter().any(|known| known == value)
+                && let Some(rewritten) = with_query_key(uri, &current)
+            {
+                *uri = rewritten;
+            }
             for value in headers.values_mut() {
                 let Ok(text) = value.to_str() else { continue };
                 let (prefix, secret) = match text.strip_prefix("Bearer ") {
@@ -267,6 +277,34 @@ impl CommandCredential {
             }
         }
     }
+}
+
+/// The value of the `key=` query parameter (Gemini passes its API key in the
+/// URL, not a header), if the URI has one.
+fn query_key(uri: &http::Uri) -> Option<&str> {
+    uri.query()?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("key="))
+}
+
+/// `uri` with its `key=` query parameter replaced by `secret`. `None` when the
+/// result is not a valid URI (a credential with URL-unsafe characters).
+fn with_query_key(uri: &http::Uri, secret: &str) -> Option<http::Uri> {
+    let query = uri.query()?;
+    let rebuilt: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.strip_prefix("key=") {
+            Some(_) => format!("key={secret}"),
+            None => pair.to_owned(),
+        })
+        .collect();
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(
+        format!("{}?{}", uri.path(), rebuilt.join("&"))
+            .parse()
+            .ok()?,
+    );
+    http::Uri::from_parts(parts).ok()
 }
 
 /// Whether `output` is acceptable as a credential: one nonempty line without
@@ -494,8 +532,8 @@ pub(crate) struct Applied {
 }
 
 /// Swaps every configured command credential's issued secrets in `headers`
-/// for the current ones. Empty (and free) when no command is configured.
-pub(crate) async fn apply_all(headers: &mut HeaderMap) -> Vec<Applied> {
+/// (and the `key=` query parameter, which Gemini uses) for the current ones. Empty (and free) when no command is configured.
+pub(crate) async fn apply_all(headers: &mut HeaderMap, uri: &mut http::Uri) -> Vec<Applied> {
     let credentials: Vec<Arc<CommandCredential>> = REGISTRY
         .read()
         .unwrap_or_else(|error| error.into_inner())
@@ -504,7 +542,7 @@ pub(crate) async fn apply_all(headers: &mut HeaderMap) -> Vec<Applied> {
         .unwrap_or_default();
     let mut applied = Vec::new();
     for credential in credentials {
-        if let Some(generation) = credential.apply(headers).await {
+        if let Some(generation) = credential.apply(headers, uri).await {
             applied.push(Applied {
                 credential,
                 generation,
@@ -1030,5 +1068,88 @@ mod tests {
         assert_eq!(run_async(&daemon).await.unwrap(), "tok");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!process_alive(marker));
+    }
+
+    #[test]
+    fn query_key_is_found_and_rewritten_without_touching_other_parameters() {
+        let uri: http::Uri = "http://h/v1beta/models/m:streamGenerateContent?alt=sse&key=old-1&x=y"
+            .parse()
+            .unwrap();
+        assert_eq!(query_key(&uri), Some("old-1"));
+        let rewritten = with_query_key(&uri, "new-2").unwrap();
+        assert_eq!(
+            rewritten.to_string(),
+            "http://h/v1beta/models/m:streamGenerateContent?alt=sse&key=new-2&x=y"
+        );
+        let plain: http::Uri = "http://h/p?monkey=1".parse().unwrap();
+        assert_eq!(query_key(&plain), None);
+        // A credential that cannot form a URI is refused, not smuggled in.
+        assert!(with_query_key(&uri, "a b\r\nHost: evil").is_none());
+    }
+
+    // mini-agent-dxbuy: Gemini carries its key in the URL; a stale key there is
+    // swapped for the current one and a 401 renews it and resends once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gemini_query_string_key_is_refreshed_and_renewed_on_401() {
+        use crate::tests::support::loopback_http::asynchronous as http;
+        use rig::completion::CompletionModel as _;
+        let _turn = REGISTRY_TESTS.lock().await;
+        let dir = crate::tests::OwnedTestDirectory::new("key-command-gemini");
+        let (listener, base) = http::bind().await;
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, request) = http::accept_request(&listener).await;
+                let line = request.head.lines().next().unwrap_or_default().to_owned();
+                let key = line
+                    .split(['?', '&', ' '])
+                    .find_map(|part| part.strip_prefix("key=").map(str::to_owned))
+                    .unwrap_or_default();
+                recorded.lock().unwrap().push(key.clone());
+                if key != "gem-2" {
+                    http::respond(
+                        &mut socket,
+                        "401 Unauthorized",
+                        "application/json",
+                        r#"{"error":{"code":401,"message":"expired","status":"UNAUTHENTICATED"}}"#,
+                    )
+                    .await;
+                } else {
+                    http::respond_json(&mut socket,
+                        r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#).await;
+                }
+            }
+        });
+        let mut specs = HashMap::new();
+        specs.insert(
+            "gem-gw".to_owned(),
+            counting_command(dir.path(), "gem", true),
+        );
+        configure(Some(&specs)).unwrap();
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "custom_providers":{"gem-gw":{"provider_type":"gemini","base_url":base}}
+        }))
+        .unwrap();
+        let crate::provider::AnyClient::Gemini(client) =
+            crate::provider::create_client("gem-gw", None, config.custom_providers_map(), None)
+                .unwrap()
+        else {
+            panic!("gemini route")
+        };
+        let model = rig::providers::gemini::completion::CompletionModel::new(client, "gemini-test");
+        let request = || model.completion_request("hello").build();
+        model
+            .completion(request())
+            .await
+            .expect("renewed request succeeds");
+        assert_eq!(*seen.lock().unwrap(), ["gem-1", "gem-2"]);
+        model
+            .completion(request())
+            .await
+            .expect("next request carries the new key");
+        assert_eq!(*seen.lock().unwrap(), ["gem-1", "gem-2", "gem-2"]);
+        configure(None).unwrap();
     }
 }

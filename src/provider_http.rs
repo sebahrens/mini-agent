@@ -200,7 +200,10 @@ impl ProviderHttpClient {
         &self,
         mut request: Request<Bytes>,
     ) -> http_client::Result<(reqwest::RequestBuilder, Vec<crate::key_command::Applied>)> {
-        let applied = crate::key_command::apply_all(request.headers_mut()).await;
+        let (mut headers, mut uri) = (std::mem::take(request.headers_mut()), request.uri().clone());
+        let applied = crate::key_command::apply_all(&mut headers, &mut uri).await;
+        *request.headers_mut() = headers;
+        *request.uri_mut() = uri;
         #[cfg(feature = "bedrock")]
         if let Some(auth) = &self.0.bedrock {
             auth.prepare(&mut request).await?;
