@@ -1628,6 +1628,18 @@ impl PausedAgentRunner {
         self.runner.steering.submit_after_boundary(text)
     }
 
+    /// Start with the compaction-boundary protocol on but steering off: the
+    /// ACP relay answers each usage report and the runner stops at a
+    /// protocol-complete tool-batch boundary when asked to compact
+    /// (mini-agent-sgzh0).
+    #[cfg(feature = "acp")]
+    pub(crate) fn start_with_compaction(self) -> AgentRunner {
+        self.runner
+            .compaction_enabled
+            .store(true, Ordering::Release);
+        self.start()
+    }
+
     pub(crate) fn start_interactive(self) -> AgentRunner {
         self.runner.steering.enable();
         self.runner

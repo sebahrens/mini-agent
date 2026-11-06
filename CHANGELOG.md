@@ -146,7 +146,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Headless `-p`, `--loop`, goal rounds and `--no-session` runs now compact mid-turn: when real
   prompt pressure crosses `mid_turn_compact_threshold`, the runner stops after the complete tool
   batch, the session (in memory for `--no-session`) is compacted and the task continues
-  (mini-agent-sgzh0). ACP turns are not covered yet.
+  (mini-agent-sgzh0). ACP turns now do the same: the prompt stops at the complete tool batch, the
+  progress is persisted, the session history is compacted and the turn continues with a
+  continuation prompt (at most three reliefs per prompt, a short notice is sent as an agent
+  thought; `mid_turn_compact_threshold: 0` or `compact_enabled: false` disables it). Sessions
+  whose history is provider-native (Anthropic replay) still do not compact mid-turn
+  (mini-agent-sgzh0).
 - A `task` child whose next request would exceed `subagent_context_window` now compacts its own
   conversation (oldest tool results trimmed, tool-free summary, continue) instead of failing, at
   most twice per child and charged to the task's weighted units; with `compact_enabled = false`
