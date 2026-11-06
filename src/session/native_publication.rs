@@ -300,10 +300,22 @@ impl NativeStartupPublication {
         self.ticket.as_mut().unwrap().fail_final_before_replace = true;
     }
 
+    /// Open startup ownership. A chain that cannot be replayed (a recoverable
+    /// refusal, a different model, a compacted transcript, or the finite
+    /// bounds) is dropped first and a new epoch starts from the transcript, so
+    /// such a session resumes instead of being refused; the one-line notice
+    /// goes to stderr.
     pub(crate) async fn begin(session: &mut Session) -> anyhow::Result<Self> {
         let scope = crate::agent::runner::AgentWorkScope::new();
         let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(Arc::clone(&scope));
-        let ticket = begin_owned(session, &scope).await?;
+        let restart = session.native_restart_cause();
+        if restart.is_some() {
+            session.restart_native_chain()?;
+        }
+        let ticket = begin_owned_with(session, &scope, restart.is_some()).await?;
+        if let Some(cause) = restart {
+            eprintln!("{}", cause.notice());
+        }
         Ok(Self {
             scope,
             cleanup: Some(cleanup),
@@ -634,8 +646,16 @@ fn write_encoded_projection(session: &Session, json: &str) -> anyhow::Result<()>
 }
 
 /// Synchronous core called only inside the exact owned blocking worker.
+///
+/// `restarted` is true only after the host dropped the native chain
+/// ([`Session::restart_native_chain`]). The previous publication's *body*
+/// digest is then not compared: the transcript may legitimately have changed
+/// since (compaction, a model switch), and there are no opaque frames left for
+/// that digest to protect. The retained owner, lease, publication revision and
+/// retired phase are still all required, so a stale clone cannot publish.
 fn begin_blocking(
     mut snapshot: Session,
+    restarted: bool,
 ) -> anyhow::Result<(NativePublication, NativePublicationTicket)> {
     anyhow::ensure!(
         snapshot.native_frontier.ready(),
@@ -650,13 +670,13 @@ fn begin_blocking(
         }),
     };
     #[cfg(feature = "subagents")]
-    let observations = if snapshot.native_publication.is_some() {
+    let observations = if snapshot.native_publication.is_some() && !restarted {
         observed_begin_snapshot(&mut snapshot)?
     } else {
         freeze_shared_observations(&mut snapshot)
     };
     #[cfg(not(feature = "subagents"))]
-    if snapshot.native_publication.is_some() {
+    if snapshot.native_publication.is_some() && !restarted {
         checked_publication(&snapshot)?;
     }
     snapshot.native_frontier.activate_publication();
@@ -736,10 +756,19 @@ pub(crate) async fn begin_owned(
     session: &mut Session,
     scope: &Arc<crate::agent::runner::AgentWorkScope>,
 ) -> anyhow::Result<NativePublicationTicket> {
+    begin_owned_with(session, scope, false).await
+}
+
+async fn begin_owned_with(
+    session: &mut Session,
+    scope: &Arc<crate::agent::runner::AgentWorkScope>,
+    restarted: bool,
+) -> anyhow::Result<NativePublicationTicket> {
     let snapshot = session.clone();
     let (publication, ticket) = scope
         .run(async move {
-            crate::agent::runner::spawn_blocking_scoped(move || begin_blocking(snapshot)).await
+            crate::agent::runner::spawn_blocking_scoped(move || begin_blocking(snapshot, restarted))
+                .await
         })
         .await
         .map_err(anyhow::Error::from)
@@ -748,6 +777,25 @@ pub(crate) async fn begin_owned(
     super::storage::adopt_native_encoding(session, publication.encoding);
     session.native_publication = Some(publication);
     Ok(ticket)
+}
+
+/// Drop the native chain under a retained idle ticket (a startup ticket that
+/// has not met a model yet) and republish the new epoch's transcript. The
+/// session stays denied on disk until the next model turn retires, exactly as
+/// before the restart; no completed boundary is minted.
+pub(crate) async fn restart_with_ticket(
+    session: &mut Session,
+    ticket: &mut NativePublicationTicket,
+    scope: &Arc<crate::agent::runner::AgentWorkScope>,
+) -> anyhow::Result<()> {
+    ensure_actor_value(session, ticket)?;
+    anyhow::ensure!(
+        !ticket.paired,
+        "native context restart requires the idle startup owner"
+    );
+    session.restart_native_chain()?;
+    ticket.epoch = session.native_frontier.current();
+    progress_owned(session, ticket, scope).await
 }
 
 /// Before the first model, only the retained, unpaired startup ticket may
@@ -1505,6 +1553,47 @@ impl RetiredSessionEndPermit {
         .await;
         cleanup.settle().await;
         result
+    }
+
+    /// Drop the native chain after an idle host change (compaction, a model
+    /// switch, bounds or a recoverable refusal) and durably republish the
+    /// transcript as a new epoch. The old value is denied on disk first, then
+    /// the healthy payload replaces it, as for an effort change; an interrupted
+    /// restart never leaves a healthy chain behind.
+    pub(crate) async fn restart_chain(&mut self, session: &mut Session) -> anyhow::Result<()> {
+        let publication = checked_publication_owner(session)?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&publication.owner, &self.publication.owner)
+                && publication.revision == self.publication.revision
+                && session.native_frontier.current() == self.epoch,
+            "finish or recover the current native context before restarting it"
+        );
+        session.restart_native_chain()?;
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let mut cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+        cleanup.retain_until_settled(self.publication.owner.lease.begin_write()?);
+        let result = async {
+            let ticket = begin_owned_with(session, &scope, true).await?;
+            retire_owned(session, ticket, RetiredNativeOutcome::Completed, &scope).await
+        }
+        .await;
+        cleanup.settle().await;
+        if let Err(error) = result {
+            // The in-memory chain is already gone but its replacement was not
+            // acknowledged: stay conservative instead of replaying a stale chain.
+            let _ = session.native_frontier.refuse_expected(
+                session.native_frontier.current(),
+                RestartReason::IncompleteTurn,
+            );
+            return Err(error);
+        }
+        self.publication = session
+            .native_publication
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("native restart was not published"))?;
+        self.epoch = session.native_frontier.current();
+        self.outcome = RetiredNativeOutcome::Completed;
+        Ok(())
     }
 
     #[cfg(any(feature = "hooks", feature = "subagents"))]

@@ -172,6 +172,22 @@ Notable changes to mini-agent are documented in this file. The format follows
   overrides it), and `compaction_model` names a same-provider `quick_models` entry for a
   faster or cheaper summarizer.
 
+- A provider-native Anthropic session no longer dies at its replay bounds or after a compaction or
+  `/model` switch: when the signed thinking chain is near its bounds (64 of 128 frames or 2 of 4 MiB),
+  belongs to another model, no longer matches a compacted transcript, or a recoverable refusal
+  was saved, the host drops it and continues from the transcript as a new epoch with a one-line
+  notice. Between-turn auto-compaction, `/compact` and headless pre-turn compaction now work on such
+  sessions instead of being skipped silently or leaving every later prompt failing (mini-agent-9xucp,
+  mini-agent-ydugt, mini-agent-9szqw). The manual cache policy's moving spare markers no longer count
+  as part of the chain's commitment, which refused the session after about 18 blocks.
+- Context-length rejections worded by Gemini ("input token count ... exceeds the maximum number of
+  tokens allowed"), Amazon Bedrock ("Input is too long for requested model") and GitHub Copilot
+  (`model_max_prompt_tokens_exceeded`, "prompt token count ... exceeds the limit") now get the
+  `/compress` hint, reactive compaction and the single retry (mini-agent-n1dwl).
+- The default `reserve_tokens` is at least the response cap the model is asked for plus 8000 tokens
+  of summarizer headroom (was `window/10` floored at 16,384), so a request sent just under the
+  compaction threshold still fits its own `max_tokens` in a 200k-class window (mini-agent-tzdjw).
+
 ### Cost tracking
 
 - The global usage ledger no longer has a permanent 65,536-record / 64 MiB wall: a full

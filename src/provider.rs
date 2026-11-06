@@ -8686,6 +8686,15 @@ impl NativeSessionEndOwner {
             .update_reasoning(session, self.host.as_ref(), next)
             .await
     }
+    /// Drop the idle native chain and republish the transcript as a new epoch.
+    /// The host guard is retained: it describes the live permission and
+    /// instruction owners, which a restart does not change.
+    pub(crate) async fn restart_chain(
+        &mut self,
+        session: &mut crate::session::Session,
+    ) -> anyhow::Result<()> {
+        self.permit.restart_chain(session).await
+    }
     #[cfg(any(feature = "hooks", feature = "subagents"))]
     pub(crate) async fn run(self, session: &mut crate::session::Session) -> anyhow::Result<()> {
         self.permit.run(session, self.host.as_ref()).await

@@ -277,7 +277,9 @@ fn openai_responses_block_list_is_a_visible_startup_warning() {
     .unwrap();
     let warnings = validate_extra_body(&mut c).unwrap();
     assert!(
-        warnings.iter().any(|w| w.contains("hosted-web-search-blocked-domains")),
+        warnings
+            .iter()
+            .any(|w| w.contains("hosted-web-search-blocked-domains")),
         "{warnings:?}"
     );
     // The same block-list on Anthropic is supported: no notice.

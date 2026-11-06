@@ -1318,6 +1318,44 @@ impl Session {
         Ok(())
     }
 
+    /// Whether the saved native thinking chain should be dropped and restarted
+    /// from the display transcript before the next request (it is near its
+    /// finite bounds, belongs to another model, no longer matches a compacted
+    /// transcript, or a recoverable refusal made it unreplayable). `None` for a
+    /// session without a chain, a healthy chain, and an unfinished (`InFlight`)
+    /// context, which must be recovered rather than discarded.
+    pub(crate) fn native_restart_cause(&self) -> Option<native_replay::NativeRestartCause> {
+        use native_replay::NativeRestartCause as Cause;
+        if let Some(reason) = self.native_frontier.refusal() {
+            return reason.restartable().then_some(Cause::Refused(reason));
+        }
+        let history = self.native_history.as_ref()?;
+        if history.near_bounds() {
+            return Some(Cause::Bounds);
+        }
+        if history
+            .configured_model()
+            .is_some_and(|model| model != self.model.as_str())
+        {
+            return Some(Cause::ModelChanged);
+        }
+        history
+            .validate_feed(&self.messages, &self.compactions)
+            .is_err()
+            .then_some(Cause::TranscriptChanged)
+    }
+
+    /// Drop the native chain: the next request replays the display transcript
+    /// (no signed thinking blocks) as a new epoch. Only the in-memory Session
+    /// changes; a saved-session owner republishes through
+    /// [`native_publication`]. Fails for an unfinished context.
+    pub(crate) fn restart_native_chain(&mut self) -> Result<(), native_replay::RestartReason> {
+        self.native_frontier.restart()?;
+        self.native_history = None;
+        self.retired_native_history.clear();
+        Ok(())
+    }
+
     pub(crate) fn validate_native_persistence(&self) -> Result<(), native_replay::RestartReason> {
         if let Some(history) = &self.native_history {
             history.validate_saved()?;

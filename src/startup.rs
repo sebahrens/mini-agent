@@ -2671,6 +2671,9 @@ impl Startup {
                     .await);
                 }
             };
+            // A pre-turn compaction (or any earlier change) can leave a native
+            // thinking chain that no longer matches the transcript: restart it.
+            self.reconcile_headless_native_chain().await?;
             let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
             let extra_body = provider::merge_extra_body(
                 config::resolve_extra_body(&self.cfg, &self.model),
@@ -2816,6 +2819,36 @@ impl Startup {
             .await?;
         }
 
+        Ok(())
+    }
+
+    /// Drop an unreplayable Anthropic-native thinking chain (compacted
+    /// transcript, other model, finite bounds, recoverable refusal) and
+    /// continue from the transcript as a new epoch, with a one-line notice on
+    /// stderr. The startup ticket republishes the new epoch.
+    async fn reconcile_headless_native_chain(&mut self) -> anyhow::Result<()> {
+        let Some(cause) = self.session.native_restart_cause() else {
+            return Ok(());
+        };
+        if self.cli.no_session {
+            self.session.restart_native_chain()?;
+        } else if let Some(ticket) = self.native_ticket.as_mut() {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+            let result = crate::session::native_publication::restart_with_ticket(
+                &mut self.session,
+                ticket,
+                &scope,
+            )
+            .await;
+            cleanup.settle().await;
+            result?;
+        } else {
+            anyhow::bail!(
+                "unfinished native context requires recovery before it can restart; start a fresh context to continue"
+            );
+        }
+        eprintln!("{}", cause.notice());
         Ok(())
     }
 
@@ -5201,7 +5234,11 @@ mod tests {
             },
         )
         .await;
-        assert!(relieved.turn.failure.is_none(), "{:?}", relieved.turn.failure);
+        assert!(
+            relieved.turn.failure.is_none(),
+            "{:?}",
+            relieved.turn.failure
+        );
         assert_eq!((runs, compactions), (2, 1));
     }
 

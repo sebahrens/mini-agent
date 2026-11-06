@@ -1499,8 +1499,11 @@ and *within* a turn when real prompt pressure crosses `mid_turn_compact_threshol
 prompts. A headless or ACP turn stops at the next complete tool batch, records its progress,
 compacts the session history (in memory under `--no-session`) and continues with a
 continuation prompt, at most three times per turn; ACP also sends a short agent-thought
-notice. Provider-native (Anthropic replay) sessions cannot be compacted in place and are
-not compacted mid-turn. Tools with their own output limits (`read`,
+notice. Between turns a provider-native (Anthropic replay) session compacts like any other (TUI
+auto-compaction and `/compact`, headless pre-turn compaction): its signed thinking chain cannot be
+summarized in place, so the compaction restarts the chain from the compacted transcript as a new
+replay epoch, with a one-line notice (earlier thinking blocks are dropped). It is not compacted
+mid-turn, and ACP refuses to compact one with a visible message before any summarizer spend. Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
 and the subagent `task` tool) retain their documented line, byte, and result
 limits in both live and replayed history. Their

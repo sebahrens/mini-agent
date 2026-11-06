@@ -6063,6 +6063,7 @@ impl<'a> App<'a> {
             self.ui.cfg,
         );
         self.chain.plan = Default::default();
+        self.reconcile_native_chain_for_prompt().await?;
         // The echo is already on screen; show the spinner and Working
         // activity before memory refresh, prebuild adoption and agent build.
         self.paint_submission_started()?;
@@ -6080,6 +6081,16 @@ impl<'a> App<'a> {
         .await?;
         if self.run.is_running && self.run.pending_turn.is_some() {
             self.chain.plan.run = planning;
+        }
+        Ok(())
+    }
+
+    /// Restart an unreplayable native thinking chain before a turn starts and
+    /// say so. A restart that cannot be published refuses the start, exactly as
+    /// a latched native refusal always did.
+    async fn reconcile_native_chain_for_prompt(&mut self) -> anyhow::Result<()> {
+        if let Some(notice) = super::reconcile_native_chain(&mut self.run, &mut self.ui).await? {
+            self.renderer.write_line(notice, C_RESULT)?;
         }
         Ok(())
     }
@@ -6840,6 +6851,23 @@ impl<'a> App<'a> {
                 .is_some()
         }) {
             return result;
+        }
+
+        // /model, /compact and friends change what the saved native thinking
+        // chain was built for. Restart it now, while the session is idle, so the
+        // next prompt starts a clean epoch instead of failing to replay.
+        if prior_question_session == self.ui.session.id {
+            match super::reconcile_native_chain(&mut self.run, &mut self.ui).await {
+                Ok(Some(notice)) => self.renderer.write_line(notice, C_RESULT)?,
+                Ok(None) => {}
+                Err(error) => self.renderer.write_line(
+                    &format!(
+                        "Could not restart the native thinking context: {}",
+                        sanitize_output(&error.to_string())
+                    ),
+                    C_ERROR,
+                )?,
+            }
         }
 
         if crate::ui::slash::config::is_command(text)
@@ -14924,6 +14952,15 @@ pub(crate) async fn drive_native_stale_session_end_fixture(ui: UiContext<'_>) ->
 }
 
 #[cfg(test)]
+pub(crate) async fn drive_native_script(
+    ui: UiContext<'_>,
+    steps: &[String],
+    observe: bool,
+) -> Vec<Session> {
+    plan_approval_tests::drive_native_script(ui, steps, observe).await
+}
+
+#[cfg(test)]
 pub(crate) async fn drive_native_effort_fixture(ui: UiContext<'_>) -> Vec<Session> {
     plan_approval_tests::drive_native_effort_fixture(ui).await
 }
@@ -15687,6 +15724,62 @@ mod plan_approval_tests {
         }
         #[cfg(not(feature = "hooks"))]
         assert!(!stale_end);
+        saved
+    }
+
+    /// One live App through a script of native steps. A step starting with `/`
+    /// is a slash command (`/model x`, `/compact`); anything else is a prompt
+    /// that must start an actor and complete without a native refusal. With
+    /// `observe`, the exact saved session is read back after every step.
+    pub(super) async fn drive_native_script(
+        ui: UiContext<'_>,
+        steps: &[String],
+        observe: bool,
+    ) -> Vec<Session> {
+        let mut app = owned_app(ui);
+        let mut saved = Vec::new();
+        for step in steps {
+            user(&mut app, UserEvent::Paste(step.clone())).await;
+            key(&mut app, KeyCode::Enter).await;
+            if step.starts_with('/') {
+                assert!(!app.run.is_running, "slash command started a turn: {step}");
+            } else {
+                assert!(
+                    app.run.is_running,
+                    "actual Enter did not start the native actor for {step:?}"
+                );
+                assert!(
+                    finish_turn(&mut app).await,
+                    "native actor did not complete step {step:?}"
+                );
+                assert!(app.run.native_owner.is_none());
+                assert!(
+                    app.run.pending_turn.is_none(),
+                    "completed literal turn did not settle"
+                );
+            }
+            assert!(
+                app.run.native_blocked.is_none(),
+                "native context was refused after {step:?}"
+            );
+            if observe {
+                let sessions = crate::paths::WorkspaceBinding::capture(
+                    &crate::paths::process_paths_ref().unwrap().sessions_dir(),
+                )
+                .unwrap();
+                saved.push(
+                    crate::session::storage::load_session_exact_read_only(
+                        &sessions,
+                        app.ui.session.id.as_ref(),
+                        &app.ui.workspace,
+                    )
+                    .unwrap()
+                    .unwrap(),
+                );
+            }
+        }
+        #[cfg(feature = "hooks")]
+        app.finish_session_end().await.unwrap();
         saved
     }
 
