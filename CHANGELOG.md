@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### MCP
 
+- `.mcp.json` accepts `${VAR:-default}` (literal default when the variable is unset or empty, same
+  bounds), `bearerTokenEnvVar` and `envHttpHeaders` for environment-sourced auth headers, and
+  reports legacy `"type": "sse"` with a message naming the `http` alternative. `headersHelper` is
+  rejected with an explanation because it would run a command named by a project file.
 - `mcp_tool_timeout_secs` / `tool_timeout_sec` are now idle timeouts for MCP tool calls: every
   `notifications/progress` from the server restarts the clock, so long-running tools that report
   progress are no longer killed at 120 s. An absolute 30 minute ceiling still applies, and the

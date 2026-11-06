@@ -42,12 +42,24 @@ Existing project TOML trust does not authorize `.mcp.json`.
 
 `${VAR}` substitution occurs after raw project content is trusted, on supported
 command, argument, working-directory, environment, URL and header values. It is
-bounded, one-pass literal substitution. A missing variable leaves that server
+bounded, one-pass literal substitution. `${VAR:-default}` uses the literal
+`default` (up to the first `}`, never expanded itself, same size bounds) when
+`VAR` is unset or empty. A missing variable without a default leaves that server
 inactive and reports the variable name, without its value. Raw placeholders
 remain on disk and in trust fingerprints; expanded credentials are not copied
 to notices or origin metadata. Literal secrets explicitly placed in a project
 file remain file content; review redaction does not make those bytes inaccessible
 to another reader already authorized to read that file.
+
+Project URL servers may use `"type": "http"` or `"streamable-http"`; the legacy
+`"type": "sse"` (and `ws`) is rejected with a message naming the `http`
+alternative. For auth headers sourced from the environment, `bearerTokenEnvVar`
+(`Authorization: Bearer ${VAR}`) and `envHttpHeaders` (`{"Header": "VAR"}`) are
+folded into `headers` as ordinary `${VAR}` references, with the same
+substitution, bounds and missing-variable behavior. `headersHelper` (a command
+run to mint headers) is deliberately not supported: a project file must not
+name a command that runs outside the server sandbox. Use an environment
+variable that your own tooling refreshes.
 
 URL servers require public addresses by default. Explicit `allow_local=true`
 also permits loopback-only endpoints: IPv4 `127/8`, IPv6 `::1`, normalized mapped
