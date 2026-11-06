@@ -26,6 +26,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- The project-notes memory index lists the newest notes first (by mtime) with an "N more" count and
+  keeps working with hundreds of notes, instead of 16 alphabetical rows that disappeared above 64
+  `.md` files or 256 entries.
 - `max_agent_turns` now defaults to 1000 model round trips per prompt (was 200), with spend caps as
   the safety net, and the exhaustion error says that completed work is kept and how to continue.
 - `/import` accepts the persisted-session bounds (100,000 messages; 48 MiB JSONL for the 32 MiB

@@ -84,6 +84,11 @@ pub(crate) struct WorkspaceBinding {
     validations: std::sync::atomic::AtomicUsize,
 }
 
+/// `(previews, markdown files seen, scan capped)` from
+/// [`WorkspaceBinding::read_relative_recent_first_lines`].
+#[cfg(feature = "memory")]
+pub(crate) type RecentFirstLines = (Vec<(String, String, bool)>, usize, bool);
+
 impl WorkspaceBinding {
     /// Bounded compatibility data, never a persisted workspace capability.
     /// Check the path size before canonicalization or any owned encoding, and
@@ -438,7 +443,7 @@ impl WorkspaceBinding {
     /// Bounded first-line previews from one retained directory. Enumeration is
     /// complete before selection; overfull directories never select a partial
     /// prefix based on filesystem iteration order. No links or special files.
-    #[cfg(feature = "memory")]
+    #[cfg(all(feature = "memory", test))]
     pub(crate) fn read_relative_first_lines(
         &self,
         path: &Path,
@@ -446,7 +451,6 @@ impl WorkspaceBinding {
         max_files: usize,
         max_line_bytes: usize,
     ) -> io::Result<Vec<(String, String, bool)>> {
-        use std::io::BufRead;
         let directory = self.open_dir_relative(path)?;
         let mut names = Vec::new();
         for (index, entry) in directory.read_dir(".")?.enumerate() {
@@ -464,12 +468,71 @@ impl WorkspaceBinding {
             names.push(name);
         }
         names.sort_unstable();
+        Self::first_lines_of(&directory, names, max_line_bytes)
+    }
+
+    /// Like [`Self::read_relative_first_lines`] but never fails on volume:
+    /// scans at most `max_entries` directory entries, keeps the `max_files`
+    /// most recently modified `.md` files (newest first, ties by name) and
+    /// returns their first lines plus the number of `.md` files seen and
+    /// whether the scan stopped at `max_entries` (the count is then a lower
+    /// bound).
+    #[cfg(feature = "memory")]
+    pub(crate) fn read_relative_recent_first_lines(
+        &self,
+        path: &Path,
+        max_entries: usize,
+        max_files: usize,
+        max_line_bytes: usize,
+    ) -> io::Result<RecentFirstLines> {
+        let directory = self.open_dir_relative(path)?;
+        let mut candidates = Vec::new();
+        let mut capped = false;
+        for (index, entry) in directory.read_dir(".")?.enumerate() {
+            if index >= max_entries {
+                capped = true;
+                break;
+            }
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            if Path::new(&name)
+                .extension()
+                .is_none_or(|value| value != "md")
+            {
+                continue;
+            }
+            // cap-std entry metadata never follows a final symlink.
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(cap_std::time::SystemTime::into_std);
+            candidates.push((modified, name));
+        }
+        let total = candidates.len();
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        candidates.truncate(max_files);
+        let names = candidates.into_iter().map(|(_, name)| name).collect();
+        Ok((
+            Self::first_lines_of(&directory, names, max_line_bytes)?,
+            total,
+            capped,
+        ))
+    }
+
+    #[cfg(feature = "memory")]
+    fn first_lines_of(
+        directory: &cap_std::fs::Dir,
+        names: Vec<std::ffi::OsString>,
+        max_line_bytes: usize,
+    ) -> io::Result<Vec<(String, String, bool)>> {
+        use std::io::BufRead;
         let mut previews = Vec::new();
         for name in names {
             let Some(stem) = Path::new(&name).file_stem().and_then(OsStr::to_str) else {
                 continue;
             };
-            let Ok(file) = open_file_no_follow_impl(&directory, &name, true) else {
+            let Ok(file) = open_file_no_follow_impl(directory, &name, true) else {
                 continue;
             };
             #[cfg(unix)]
