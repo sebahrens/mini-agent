@@ -126,7 +126,7 @@ impl TaskDetails {
                     && child.evidence.as_ref().is_none_or(|evidence| {
                         evidence.task_id.len() <= 64
                             && evidence.records
-                                <= crate::extras::subagents::evidence::MAX_EVIDENCE_RECORDS
+                                <= crate::extras::subagents::evidence::MAX_EVIDENCE_RECORDS_CEILING
                     })
             })
     }
@@ -1028,6 +1028,31 @@ impl Pool {
     pub(crate) fn evidence(&self) -> &crate::extras::subagents::evidence::EvidenceIndex {
         &self.evidence
     }
+    /// Why `task_id` has no evidence store: expired (evicted, or saved before
+    /// a restart) or unknown.
+    pub(crate) fn missing_evidence_message(&self, task_id: &str) -> String {
+        if self.evidence.was_evicted(task_id) {
+            return format!(
+                "evidence task {task_id} expired: its store was evicted after the session's newest [subagents] evidence_max_children children; the task report itself is unchanged"
+            );
+        }
+        let saved = self.list().into_iter().any(|row| {
+            row.details.as_ref().is_some_and(|details| {
+                details.children.iter().any(|child| {
+                    child
+                        .evidence
+                        .as_ref()
+                        .is_some_and(|evidence| evidence.task_id == task_id)
+                })
+            })
+        });
+        if saved {
+            return format!(
+                "evidence task {task_id} expired: evidence handles are kept in memory and do not survive a restart; the saved report is still available with task_result"
+            );
+        }
+        "unknown evidence task in this session (evidence does not survive a restart)".into()
+    }
     pub(crate) fn resumable(&self) -> &Arc<crate::extras::subagents::resume::ResumeStore> {
         &self.resumable
     }
@@ -1763,6 +1788,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evidence_handles_of_a_restored_task_read_as_expired() {
+        let root = crate::tests::OwnedTestDirectory::new("background-evidence-expired");
+        let (session, pool, workspace, run, recorder) = fixture(&root);
+        let evidence_id = uuid::Uuid::new_v4().to_string();
+        let mut details = sample_details();
+        details.children[0].evidence = Some(EvidenceSummary {
+            task_id: evidence_id.clone(),
+            records: 3,
+        });
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let id = admission
+            .start_with_details(async move { (Ok("report".into()), Some(details)) }, run)
+            .unwrap();
+        settled(&pool, &id).await;
+        let mut imported: crate::session::Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let reloaded = Pool::for_session(&mut imported, 1).unwrap();
+        let message = reloaded.missing_evidence_message(&evidence_id);
+        assert!(message.contains("expired"), "{message}");
+        assert!(message.contains("do not survive a restart"));
+        let unknown = reloaded.missing_evidence_message(&uuid::Uuid::new_v4().to_string());
+        assert!(unknown.starts_with("unknown evidence task"), "{unknown}");
+        pool.close().await;
+        reloaded.close().await;
+    }
+
+    #[tokio::test]
     async fn background56_closed_owner_refuses_reserved_but_not_registered_work() {
         let root = crate::tests::OwnedTestDirectory::new("background56-close-admission");
         let (_session, pool, workspace, run, recorder) = fixture(&root);
@@ -2174,12 +2226,10 @@ impl rig::tool::Tool for EvidenceTool {
         }
         let key = format!("{} {}", args.task_id, args.id);
         crate::agent::tools::check_perm(&self.permission, &self.ask, Self::NAME, &key).await?;
-        let stored = pool.evidence().get(&args.task_id).ok_or_else(|| {
-            ToolError::Msg(
-                "unknown evidence task in this session (evidence does not survive a restart)"
-                    .into(),
-            )
-        })?;
+        let stored = pool
+            .evidence()
+            .get(&args.task_id)
+            .ok_or_else(|| ToolError::Msg(pool.missing_evidence_message(&args.task_id)))?;
         let (meta, path) = stored.get(&args.id).ok_or_else(|| {
             ToolError::Msg(format!(
                 "unknown evidence ID; this task recorded E1-E{}",

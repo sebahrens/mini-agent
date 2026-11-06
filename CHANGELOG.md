@@ -33,6 +33,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Persona frontmatter `contract: none` returns a child's text verbatim (quoted, within the report
   cap) without the Findings/Unverified/Coverage contract or its repair turn; the raw text kept
   for `/tasks result` is configurable as `[subagents] task_unverified_bytes` (default 6 KiB).
+- Subagent evidence limits are configurable (`[subagents] evidence_max_records`,
+  `evidence_max_record_bytes`, `evidence_max_child_bytes`, `evidence_max_children`) and documented;
+  `task_evidence` for an evicted or pre-restart handle now reports it as expired.
 
 **Fork release 1.14.2 (2026-10-28)**
 

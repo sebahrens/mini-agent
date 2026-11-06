@@ -1484,6 +1484,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             )
         });
         let evidence_enabled = super::evidence::enabled(&config);
+        let evidence_limits = super::evidence::EvidenceLimits::from_config(&config);
         // Opt-in inline image lane: per-child cap (configured, narrowed by the
         // persona, hard-capped), a per-call image/byte budget shared by all
         // children, and the selected images collected by prompt index.
@@ -1880,7 +1881,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let mut run = result;
                 // Host-minted evidence comes from the child's actual tool
                 // results, in call order; the report contract can only cite it.
-                let mut evidence = super::evidence::ChildEvidence::default();
+                let mut evidence = super::evidence::ChildEvidence::with_limits(evidence_limits);
                 if evidence_enabled {
                     evidence.record_history(&run.history);
                 }

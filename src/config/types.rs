@@ -43,6 +43,18 @@ pub struct SubagentPolicy {
     /// (default 6144, at most 16384).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_unverified_bytes: Option<usize>,
+    /// Evidence records kept per child (default 64, at most 1024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_max_records: Option<usize>,
+    /// Text bytes kept per evidence record (default 262144, at most 4 MiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_max_record_bytes: Option<usize>,
+    /// Evidence content bytes kept per child (default 16 MiB, at most 256 MiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_max_child_bytes: Option<usize>,
+    /// Child evidence stores kept per session (default 64, at most 1024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_max_children: Option<usize>,
 }
 
 #[cfg(feature = "subagents")]

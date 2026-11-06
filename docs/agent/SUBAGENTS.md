@@ -660,12 +660,21 @@ result of each child, in tool-call order, as `E1`, `E2`, … (forced
 `SubagentStop` continuations continue the numbering). A record holds the text
 and validated image parts, the tool name, a sanitized argument summary, size,
 MIME type, image dimensions and an estimated token cost. Content is written to
-the session's private tool-output directory; the session keeps only metadata:
-at most 64 records per child (later results are counted), 256 KiB of text per
-record (a longer result keeps a prefix), 16 MiB of content per child, and 64
-children per session (the oldest is evicted and its files deleted). Handles are
-in memory only: they do not survive a restart. `/tasks <id>` shows each child's
-evidence `task_id` and record count.
+the session's private tool-output directory; the session keeps only metadata.
+The limits are configurable in `[subagents]` (each clamped to 1..ceiling):
+
+| Key | Default | Ceiling | Effect (source constant in `evidence.rs`) |
+|---|---:|---:|---|
+| `evidence_max_records` | 64 | 1024 | Records per child; later tool results are only counted and cannot be cited (`MAX_EVIDENCE_RECORDS`) |
+| `evidence_max_record_bytes` | 262144 | 4 MiB | Text kept per record; a longer result keeps a prefix, marked clipped (`MAX_RECORD_TEXT_BYTES`) |
+| `evidence_max_child_bytes` | 16 MiB | 256 MiB | Content per child; later records keep metadata only, marked over ceiling (`MAX_CHILD_EVIDENCE_BYTES`) |
+| `evidence_max_children` | 64 | 1024 | Child stores per session; the oldest is evicted and its files deleted (`MAX_EVIDENCE_TASKS`) |
+
+Handles are in memory only: they do not survive a restart. `task_evidence`
+for a handle whose store was evicted, or whose task was saved before a
+restart, fails with an explicit `evidence task <id> expired: ...` message (the
+task report itself stays available with `task_result`). `/tasks <id>` shows
+each child's evidence `task_id` and record count.
 
 Children are told, as host policy appended after the read-only or write-mode
 rules, that a Findings entry may end with `[evidence: E3, E7]`. The validator

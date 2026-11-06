@@ -4031,6 +4031,11 @@ raw text of a host-replaced child report that `/tasks result <id>` shows the
 user (never the model). Persona frontmatter `contract: none` skips the report
 contract entirely and returns the child's text verbatim.
 
+`[subagents] evidence_max_records` (64), `evidence_max_record_bytes` (262144),
+`evidence_max_child_bytes` (16777216) and `evidence_max_children` (64) bound
+the host-recorded child evidence store; see
+[Evidence handles](SUBAGENTS.md#evidence-handles) for ceilings and effects.
+
 ### Hook event parity
 
 `PreCompact` observes an actual compaction before summarization. Its envelope has
