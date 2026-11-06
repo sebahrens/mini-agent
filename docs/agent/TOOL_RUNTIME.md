@@ -68,14 +68,24 @@ combined; byte_cap: 67108864; ...]` with the partial transcript. The
 `max_bash_output_lines` head/tail line cap still bounds the rendered text; the
 log footer is appended after it so it is never cut. Hook, validation and other
 sandbox command classes keep their existing bounded 1 MiB/1.5 MiB capture.
-The companion `job_status` tool polls bounded live output, stops and reaps
-the job, or waits for completion. `action = "wait"` accepts `timeout_ms` from
+The companion `job_status` tool polls live output, stops and reaps
+the job, or waits for completion. `poll`, `wait` and `stop` return only output
+produced since the previous such call for that job (at most 64 KiB; a larger
+range shows its first 16 KiB and last 48 KiB around a reported byte gap) and
+name the offset the next call continues at; `since = N` re-reads the complete
+stream from byte `N` (from memory or the job log). Each job keeps a 48 KiB head
+and 16 KiB tail in memory and, when the session tool-output directory is
+available, tees its complete output (stdout and stderr in arrival order) to an
+owner-only `shell-<job id>.log` there, capped at 256 MiB, which `read`/`grep`
+can open. Logs are retained with the session's other tool outputs; a pruned job
+record keeps its log on disk and `job_status` on the pruned id reports the log
+path (the newest 256 pruned ids are remembered). `action = "wait"` accepts `timeout_ms` from
 1 to 60000 (default 10000); expiration or dropping the wait leaves the job
 running. `action = "list"` needs no id and returns bounded command summaries,
 ids, and statuses without copying captured output. The job registry belongs
 to the session's sandbox, so list can recover ids after transcript compaction
 and agent rebuilds. A session permits at most eight concurrent jobs and retains the newest
-32 job records; each stream keeps a 64 KiB rolling head/tail view. Background
+32 job records; `list` also shows each job's log path. Background
 commands use the same shell, workspace, sandbox, and permission decision as
 foreground commands, and all are cancelled on turn cancellation or session
 shutdown.

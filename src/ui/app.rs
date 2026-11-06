@@ -16798,7 +16798,8 @@ mod plan_approval_tests {
                     .sandbox
                     .background_job_snapshot(&id)
                     .unwrap()
-                    .stdout
+                    .transcript
+                    .channel_bytes(crate::sandbox::OutputChannel::Stdout)
                     .windows(10)
                     .any(|bytes| bytes == b"BG_READY67")
                 {

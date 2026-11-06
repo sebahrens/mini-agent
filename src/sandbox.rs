@@ -24,7 +24,8 @@ mod general_profile;
 mod network_tests;
 mod output_capture;
 pub(crate) use output_capture::{
-    OutputChannel, OutputTranscript, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy, TranscriptPart,
+    OutputChannel, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy,
+    TranscriptPart,
 };
 mod git_metadata;
 mod read_roots;
@@ -827,7 +828,8 @@ pub(crate) struct CommandOutput {
 
 const MAX_CONCURRENT_BACKGROUND_JOBS: usize = 8;
 const MAX_RETAINED_BACKGROUND_JOBS: usize = 32;
-const BACKGROUND_STREAM_BYTES: usize = 64 * 1024;
+/// Pruned job ids whose log path stays discoverable through `job_status`.
+const MAX_PRUNED_BACKGROUND_LOGS: usize = 256;
 pub(crate) const MAX_BACKGROUND_JOB_WAIT_MILLIS: u64 = 60_000;
 pub(crate) const DEFAULT_BACKGROUND_COMMAND_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
@@ -867,9 +869,16 @@ pub(crate) struct BackgroundJobSnapshot {
     pub command: String,
     pub status: BackgroundJobStatus,
     pub exit_code: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
     pub descendants_escaped: bool,
+    /// Arrival-ordered retained output, total size and full-output log.
+    pub transcript: OutputTranscript,
+}
+
+/// A window of a background job's complete output stream.
+#[derive(Debug, Clone)]
+pub(crate) struct BackgroundJobOutput {
+    pub snapshot: BackgroundJobSnapshot,
+    pub window: OutputWindow,
 }
 
 #[derive(Debug, Clone)]
@@ -878,14 +887,13 @@ pub(crate) struct BackgroundJobSummary {
     pub command: String,
     pub status: BackgroundJobStatus,
     pub exit_code: Option<i32>,
+    pub log_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 struct BackgroundJobTerminal {
     status: BackgroundJobStatus,
     exit_code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
     descendants_escaped: bool,
 }
 
@@ -894,7 +902,12 @@ struct BackgroundJobRecord {
     sequence: u64,
     command: String,
     cancellation: CommandCancellation,
-    capture: Option<SharedCommandCapture>,
+    /// Spooled capture, retained after completion so polls can still read
+    /// by offset; its log (when configured) holds the complete stream.
+    capture: SharedCommandCapture,
+    log_path: Option<PathBuf>,
+    /// Offset up to which `poll`/`wait` already delivered output.
+    delivered: u64,
     terminal: Option<BackgroundJobTerminal>,
     stop_requested: bool,
     changed: Arc<Notify>,
@@ -904,6 +917,8 @@ struct BackgroundJobRecord {
 struct BackgroundJobsInner {
     next_sequence: AtomicU64,
     jobs: Mutex<HashMap<String, BackgroundJobRecord>>,
+    /// Log paths of pruned records, newest last.
+    pruned_logs: Mutex<VecDeque<(String, PathBuf)>>,
     /// Records in `jobs` without a terminal state. Updated only while `jobs`
     /// is locked, so the redraw path can read it without the lock.
     running: AtomicUsize,
@@ -4520,10 +4535,23 @@ impl Sandbox {
         self.output_built_command_with_limits(cmd, limits).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_background_command(
         &self,
         command: String,
         timeout: std::time::Duration,
+    ) -> std::io::Result<String> {
+        self.start_background_command_logged(command, timeout, None)
+            .await
+    }
+
+    /// [`Self::start_background_command`] that spools the complete output
+    /// to a private log in `log_dir`, readable after the record is pruned.
+    pub(crate) async fn start_background_command_logged(
+        &self,
+        command: String,
+        timeout: std::time::Duration,
+        log_dir: Option<&Path>,
     ) -> std::io::Result<String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             std::io::Error::other("background commands require an active Tokio runtime")
@@ -4534,7 +4562,8 @@ impl Sandbox {
             .fetch_add(1, Ordering::Relaxed);
         let id = format!("job-{}", uuid::Uuid::new_v4());
         let cancellation = CommandCancellation::new();
-        let capture = SharedCommandCapture::rolling();
+        let log_path = log_dir.map(|dir| dir.join(format!("shell-{id}.log")));
+        let capture = SharedCommandCapture::spooled(SpoolPolicy::background(log_path.clone()));
         let changed = Arc::new(Notify::new());
         {
             let mut jobs = self
@@ -4542,7 +4571,19 @@ impl Sandbox {
                 .jobs
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            prune_background_jobs(&mut jobs);
+            for (pruned, log) in prune_background_jobs(&mut jobs) {
+                if let Some(log) = log {
+                    let mut logs = self
+                        .background_jobs
+                        .pruned_logs
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    logs.push_back((pruned, log));
+                    while logs.len() > MAX_PRUNED_BACKGROUND_LOGS {
+                        logs.pop_front();
+                    }
+                }
+            }
             if self.background_jobs.running.load(Ordering::Acquire)
                 >= MAX_CONCURRENT_BACKGROUND_JOBS
             {
@@ -4556,7 +4597,9 @@ impl Sandbox {
                     sequence,
                     command: summarize_background_command(&command),
                     cancellation: cancellation.clone(),
-                    capture: Some(capture.clone()),
+                    capture: capture.clone(),
+                    log_path,
+                    delivered: 0,
                     terminal: None,
                     stop_requested: false,
                     changed,
@@ -4573,17 +4616,33 @@ impl Sandbox {
         let run = crate::spend::run::Run::current();
         std::mem::drop(runtime.spawn(crate::spend::run::scope(run, async move {
             let terminal = match sandbox
-                .run_background_command(command, timeout, &cancellation, capture)
+                .run_background_command(command, timeout, &cancellation, capture.clone())
                 .await
             {
-                Ok(output) => background_terminal(output),
-                Err(error) => BackgroundJobTerminal {
-                    status: BackgroundJobStatus::Failed,
-                    exit_code: None,
-                    stdout: Vec::new(),
-                    stderr: format!("background command failed: {error}").into_bytes(),
-                    descendants_escaped: false,
-                },
+                Ok(output) => {
+                    if output.status == CommandStatus::Failed && capture.total_bytes() == 0 {
+                        // Preparation/spawn failures report through stderr
+                        // without ever reaching the capture.
+                        let _ = capture.push(
+                            CommandOutputStream::Stderr,
+                            &output.stderr,
+                            DEFAULT_COMMAND_LIMITS,
+                        );
+                    }
+                    background_terminal(output)
+                }
+                Err(error) => {
+                    let _ = capture.push(
+                        CommandOutputStream::Stderr,
+                        format!("background command failed: {error}").as_bytes(),
+                        DEFAULT_COMMAND_LIMITS,
+                    );
+                    BackgroundJobTerminal {
+                        status: BackgroundJobStatus::Failed,
+                        exit_code: None,
+                        descendants_escaped: false,
+                    }
+                }
             };
             finish_background_job(&owner, &task_id, terminal);
         })));
@@ -4603,8 +4662,50 @@ impl Sandbox {
             .unwrap_or_else(|error| error.into_inner());
         let job = jobs
             .get(id)
-            .ok_or_else(|| format!("background job not found: {id}"))?;
+            .ok_or_else(|| self.missing_background_job(id))?;
         Ok(snapshot_background_job(id, job))
+    }
+
+    fn missing_background_job(&self, id: &str) -> String {
+        let logs = self
+            .background_jobs
+            .pruned_logs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match logs.iter().rev().find(|(pruned, _)| pruned == id) {
+            Some((_, log)) => format!(
+                "background job record was pruned (only the newest {MAX_RETAINED_BACKGROUND_JOBS} are kept); its complete output log remains at {}",
+                log.display()
+            ),
+            None => format!("background job not found: {id}"),
+        }
+    }
+
+    /// Read a window of a job's complete output. With `since = None` the
+    /// window starts where the previous `None` read ended, so consecutive
+    /// polls return only new output. Windows larger than `max` return their
+    /// first quarter and last three quarters around a reported gap.
+    pub(crate) fn read_background_job_output(
+        &self,
+        id: &str,
+        since: Option<u64>,
+        max: usize,
+    ) -> Result<BackgroundJobOutput, String> {
+        validate_background_job_id(id)?;
+        let mut jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let job = jobs
+            .get_mut(id)
+            .ok_or_else(|| self.missing_background_job(id))?;
+        let snapshot = snapshot_background_job(id, job);
+        let window = job.capture.read_window(since.unwrap_or(job.delivered), max);
+        if since.is_none() {
+            job.delivered = window.next;
+        }
+        Ok(BackgroundJobOutput { snapshot, window })
     }
 
     /// Request cancellation of this registry's exact job. The task and launch
@@ -4621,7 +4722,7 @@ impl Sandbox {
             .unwrap_or_else(|e| e.into_inner());
         let job = jobs
             .get_mut(id)
-            .ok_or_else(|| format!("background job not found: {id}"))?;
+            .ok_or_else(|| self.missing_background_job(id))?;
         if job.terminal.is_none() {
             job.stop_requested = true;
             job.cancellation.cancel();
@@ -4654,7 +4755,7 @@ impl Sandbox {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             jobs.get(id)
-                .ok_or_else(|| format!("background job not found: {id}"))?
+                .ok_or_else(|| self.missing_background_job(id))?
                 .changed
                 .clone()
         };
@@ -4705,6 +4806,7 @@ impl Sandbox {
                         command: job.command.clone(),
                         status,
                         exit_code: terminal.and_then(|terminal| terminal.exit_code),
+                        log_path: job.log_path.clone(),
                     },
                 )
             })
@@ -4741,11 +4843,12 @@ impl Sandbox {
                 descendants_escaped: false,
             });
         }
+        // The spooled capture never stops a background job for volume.
         let limits = CommandLimits {
             timeout,
-            stdout_bytes: BACKGROUND_STREAM_BYTES,
-            stderr_bytes: BACKGROUND_STREAM_BYTES,
-            combined_bytes: BACKGROUND_STREAM_BYTES * 2,
+            stdout_bytes: usize::MAX,
+            stderr_bytes: usize::MAX,
+            combined_bytes: usize::MAX,
         };
         let (response_tx, response_rx) = oneshot::channel();
         self.run_built_output_command(
@@ -5672,7 +5775,12 @@ fn validate_background_job_id(id: &str) -> Result<(), String> {
     }
 }
 
-fn prune_background_jobs(jobs: &mut HashMap<String, BackgroundJobRecord>) {
+/// Drop the oldest terminal records over capacity, returning their ids and
+/// log paths (the log files themselves are kept).
+fn prune_background_jobs(
+    jobs: &mut HashMap<String, BackgroundJobRecord>,
+) -> Vec<(String, Option<PathBuf>)> {
+    let mut pruned = Vec::new();
     while jobs.len() >= MAX_RETAINED_BACKGROUND_JOBS {
         let Some(id) = jobs
             .iter()
@@ -5682,8 +5790,11 @@ fn prune_background_jobs(jobs: &mut HashMap<String, BackgroundJobRecord>) {
         else {
             break;
         };
-        jobs.remove(&id);
+        if let Some(job) = jobs.remove(&id) {
+            pruned.push((id, job.log_path));
+        }
     }
+    pruned
 }
 
 fn background_terminal(output: CommandOutput) -> BackgroundJobTerminal {
@@ -5697,8 +5808,6 @@ fn background_terminal(output: CommandOutput) -> BackgroundJobTerminal {
     BackgroundJobTerminal {
         status,
         exit_code: output.exit_status.and_then(|status| status.code()),
-        stdout: output.stdout,
-        stderr: output.stderr,
         descendants_escaped: output.descendants_escaped,
     }
 }
@@ -5716,7 +5825,6 @@ fn finish_background_job(
         let Some(job) = jobs.get_mut(id) else {
             return;
         };
-        job.capture = None;
         if job.terminal.replace(terminal).is_none() {
             owner.running.fetch_sub(1, Ordering::Release);
         }
@@ -5726,34 +5834,23 @@ fn finish_background_job(
 }
 
 fn snapshot_background_job(id: &str, job: &BackgroundJobRecord) -> BackgroundJobSnapshot {
-    if let Some(terminal) = &job.terminal {
-        return BackgroundJobSnapshot {
-            id: id.to_string(),
-            command: job.command.clone(),
-            status: terminal.status,
-            exit_code: terminal.exit_code,
-            stdout: terminal.stdout.clone(),
-            stderr: terminal.stderr.clone(),
-            descendants_escaped: terminal.descendants_escaped,
-        };
-    }
-    let (stdout, stderr) = job
-        .capture
-        .as_ref()
-        .expect("a nonterminal background job must retain its live capture")
-        .snapshot();
+    let transcript = job.capture.transcript();
+    let (status, exit_code, descendants_escaped) = match &job.terminal {
+        Some(terminal) => (
+            terminal.status,
+            terminal.exit_code,
+            terminal.descendants_escaped,
+        ),
+        None if job.stop_requested => (BackgroundJobStatus::Stopping, None, false),
+        None => (BackgroundJobStatus::Running, None, false),
+    };
     BackgroundJobSnapshot {
         id: id.to_string(),
         command: job.command.clone(),
-        status: if job.stop_requested {
-            BackgroundJobStatus::Stopping
-        } else {
-            BackgroundJobStatus::Running
-        },
-        exit_code: None,
-        stdout,
-        stderr,
-        descendants_escaped: false,
+        status,
+        exit_code,
+        descendants_escaped,
+        transcript,
     }
 }
 
@@ -5764,53 +5861,9 @@ struct CapturedCommandOutput {
     combined_bytes: usize,
 }
 
-#[derive(Debug, Default)]
-struct RollingStream {
-    head: Vec<u8>,
-    tail: VecDeque<u8>,
-    total_bytes: usize,
-}
-
-impl RollingStream {
-    fn push(&mut self, bytes: &[u8]) {
-        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
-        let head_limit = BACKGROUND_STREAM_BYTES * 3 / 4;
-        let tail_limit = BACKGROUND_STREAM_BYTES - head_limit;
-        let head_remaining = head_limit.saturating_sub(self.head.len());
-        let to_head = bytes.len().min(head_remaining);
-        self.head.extend_from_slice(&bytes[..to_head]);
-        self.tail.extend(&bytes[to_head..]);
-        let overflow = self.tail.len().saturating_sub(tail_limit);
-        if overflow > 0 {
-            self.tail.drain(..overflow);
-        }
-    }
-
-    fn snapshot(&self, stream: &str) -> Vec<u8> {
-        let retained = self.head.len().saturating_add(self.tail.len());
-        let omitted = self.total_bytes.saturating_sub(retained);
-        let mut output = Vec::with_capacity(retained.saturating_add(96));
-        output.extend_from_slice(&self.head);
-        if omitted > 0 {
-            output.extend_from_slice(
-                format!("\n[... {omitted} {stream} bytes omitted ...]\n").as_bytes(),
-            );
-        }
-        output.extend(self.tail.iter().copied());
-        output
-    }
-}
-
-#[derive(Debug, Default)]
-struct RollingCommandOutput {
-    stdout: RollingStream,
-    stderr: RollingStream,
-}
-
 #[derive(Debug)]
 enum CommandCapture {
     Bounded(CapturedCommandOutput),
-    Rolling(RollingCommandOutput),
     Spooled(output_capture::SpooledCapture),
 }
 
@@ -5833,11 +5886,7 @@ impl ShellOutputCapture {
     }
 
     pub(crate) fn transcript(&self) -> OutputTranscript {
-        let capture = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
-        match &*capture {
-            CommandCapture::Spooled(capture) => capture.transcript(),
-            _ => unreachable!("shell output captures are always spooled"),
-        }
+        self.0.transcript()
     }
 }
 
@@ -5851,10 +5900,47 @@ impl SharedCommandCapture {
         ))))
     }
 
-    fn rolling() -> Self {
-        Self(Arc::new(Mutex::new(CommandCapture::Rolling(
-            RollingCommandOutput::default(),
+    fn spooled(policy: SpoolPolicy) -> Self {
+        Self(Arc::new(Mutex::new(CommandCapture::Spooled(
+            output_capture::SpooledCapture::new(policy),
         ))))
+    }
+
+    fn total_bytes(&self) -> u64 {
+        let capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &*capture {
+            CommandCapture::Bounded(capture) => {
+                (capture.stdout.len() + capture.stderr.len()) as u64
+            }
+            CommandCapture::Spooled(capture) => capture.total_bytes(),
+        }
+    }
+
+    fn transcript(&self) -> OutputTranscript {
+        let capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &*capture {
+            CommandCapture::Bounded(capture) => OutputTranscript {
+                parts: [
+                    (OutputChannel::Stdout, &capture.stdout),
+                    (OutputChannel::Stderr, &capture.stderr),
+                ]
+                .into_iter()
+                .filter(|(_, bytes)| !bytes.is_empty())
+                .map(|(channel, bytes)| TranscriptPart::Output(channel, bytes.clone()))
+                .collect(),
+                total_bytes: (capture.stdout.len() + capture.stderr.len()) as u64,
+                ..OutputTranscript::default()
+            },
+            CommandCapture::Spooled(capture) => capture.transcript(),
+        }
+    }
+
+    fn read_window(&self, start: u64, max: usize) -> OutputWindow {
+        let capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &*capture {
+            CommandCapture::Bounded(_) => OutputWindow::default(),
+            CommandCapture::Spooled(capture) => capture.read_window(start, max),
+        }
     }
 
     fn push(
@@ -5866,28 +5952,9 @@ impl SharedCommandCapture {
         let mut capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
         match &mut *capture {
             CommandCapture::Bounded(capture) => capture.push(stream, bytes, limits),
-            CommandCapture::Rolling(capture) => {
-                match stream {
-                    CommandOutputStream::Stdout => capture.stdout.push(bytes),
-                    CommandOutputStream::Stderr => capture.stderr.push(bytes),
-                }
-                Ok(())
-            }
             CommandCapture::Spooled(capture) => capture
                 .push(stream.channel(), bytes)
                 .map_err(|_| CommandOutputLimit::Combined),
-        }
-    }
-
-    fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
-        let capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        match &*capture {
-            CommandCapture::Bounded(capture) => (capture.stdout.clone(), capture.stderr.clone()),
-            CommandCapture::Rolling(capture) => (
-                capture.stdout.snapshot("stdout"),
-                capture.stderr.snapshot("stderr"),
-            ),
-            CommandCapture::Spooled(capture) => spooled_streams(capture),
         }
     }
 
@@ -5897,10 +5964,6 @@ impl SharedCommandCapture {
             CommandCapture::Bounded(capture) => (
                 std::mem::take(&mut capture.stdout),
                 std::mem::take(&mut capture.stderr),
-            ),
-            CommandCapture::Rolling(capture) => (
-                capture.stdout.snapshot("stdout"),
-                capture.stderr.snapshot("stderr"),
             ),
             CommandCapture::Spooled(capture) => spooled_streams(capture),
         }
@@ -7074,12 +7137,12 @@ mod sandbox_tests {
             sequence,
             command: "fixture".to_string(),
             cancellation: CommandCancellation::new(),
-            capture: (!terminal).then_some(SharedCommandCapture::rolling()),
+            capture: SharedCommandCapture::spooled(SpoolPolicy::background(None)),
+            log_path: None,
+            delivered: 0,
             terminal: terminal.then_some(BackgroundJobTerminal {
                 status: BackgroundJobStatus::Completed,
                 exit_code: Some(0),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
                 descendants_escaped: false,
             }),
             stop_requested: false,

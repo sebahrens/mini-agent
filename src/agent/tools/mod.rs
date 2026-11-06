@@ -742,6 +742,9 @@ pub struct JobStatusArgs {
     pub action: JobAction,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Byte offset to read job output from instead of the previous read end.
+    #[serde(default)]
+    pub since: Option<u64>,
 }
 
 #[derive(Deserialize)]

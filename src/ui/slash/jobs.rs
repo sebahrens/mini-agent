@@ -60,6 +60,7 @@ mod tests {
             command: format!("雪\x1b[2J\n{}", "x".repeat(2000)),
             status: crate::sandbox::BackgroundJobStatus::Stopping,
             exit_code: None,
+            log_path: None,
         };
         let text = super::summary(&job);
         assert!(text.starts_with("job-fixture  stopping  雪"));
