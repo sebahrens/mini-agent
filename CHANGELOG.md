@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- A session entered with `/resume`, `/fork` or `/import` gets the same "child ids are no longer
+  resumable" and environment-change notices as a `--resume` launch, once (mini-agent-ji9iy).
 - `memory_search` also searches the project `SCRATCHPAD.md` (closed `- [x]` items included, labelled as the
   scratchpad), so completed checklist items are findable (mini-agent-o7r8j).
 - ACP sessions on the Anthropic provider are auto-compacted between turns under token pressure like

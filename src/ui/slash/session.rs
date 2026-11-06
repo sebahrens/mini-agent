@@ -161,6 +161,14 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     };
     let new_agent = ctx.build_agent_for_client(&new_client, &session).await;
+    crate::startup::note_entered_session(
+        &mut session,
+        ctx.sandbox,
+        ctx.permission.as_ref(),
+        ctx.workspace.root(),
+        ctx.cli,
+        ctx.cfg,
+    );
     let msg_count = session.messages.len();
     if let Err(e) = commit_staged_import(
         ctx.session,
@@ -602,6 +610,15 @@ pub(crate) async fn resume_selected_session(
     if previous_id != ctx.session.id {
         crate::session::lock::release_session(&previous_id);
     }
+    // Same notices a `--resume` launch gives the model (mini-agent-ji9iy).
+    crate::startup::note_entered_session(
+        ctx.session,
+        ctx.sandbox,
+        ctx.permission.as_ref(),
+        ctx.workspace.root(),
+        ctx.cli,
+        ctx.cfg,
+    );
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     if let Some(notice) = notice {
         write_error(ctx.renderer, notice);

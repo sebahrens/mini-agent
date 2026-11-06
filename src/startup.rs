@@ -2285,20 +2285,13 @@ impl Startup {
     /// Record the effective environment on the session and, on resume, tell
     /// the model once when it differs from the recorded one (mini-agent-1pi7h).
     fn sync_session_environment(&mut self) {
-        let permission_mode = self
-            .permission
-            .as_ref()
-            .map(|p| {
-                format!("{:?}", p.lock().unwrap_or_else(|e| e.into_inner()).mode()).to_lowercase()
-            })
-            .unwrap_or_else(|| "unspecified".into());
-        let tools = tool_set_label(self.cli.resolve_no_tools(&self.cfg), &self.cli.tools);
-        let now = session::environment::EnvironmentRecord {
-            sandbox: self.sandbox.environment_label(),
-            permission_mode,
-            workspace: self.workspace.root().display().to_string(),
-            tools,
-        };
+        let now = current_environment_record(
+            &self.sandbox,
+            self.permission.as_ref(),
+            self.workspace.root(),
+            &self.cli,
+            &self.cfg,
+        );
         self.session.sync_environment(now, self.session_resumed);
         // Resumable child conversations do not survive a restart.
         self.session.note_stale_child_ids(self.session_resumed);
@@ -5069,6 +5062,46 @@ pub(crate) struct HeadlessRounds {
 
 /// Comparable label for the tool set recorded in the session environment:
 /// `none`, `all`, or the sorted allowlist (so flag order never reads as a change).
+/// The effective environment of this process, as recorded on a session.
+pub(crate) fn current_environment_record(
+    sandbox: &Sandbox,
+    permission: Option<&PermCheck>,
+    workspace: &std::path::Path,
+    cli: &Cli,
+    cfg: &Config,
+) -> session::environment::EnvironmentRecord {
+    let permission_mode = permission
+        .map(|p| format!("{:?}", p.lock().unwrap_or_else(|e| e.into_inner()).mode()).to_lowercase())
+        .unwrap_or_else(|| "unspecified".into());
+    session::environment::EnvironmentRecord {
+        sandbox: sandbox.environment_label(),
+        permission_mode,
+        workspace: workspace.display().to_string(),
+        tools: tool_set_label(cli.resolve_no_tools(cfg), &cli.tools),
+    }
+}
+
+/// Notices a session entered after startup (the `/resume` picker, `/fork`,
+/// `/import`) owes the model, as a `--resume` launch already gives it: the
+/// environment-change notice and the "child ids are no longer resumable"
+/// notice. Subagent conversations live in memory only, so a saved
+/// `[child id: ...]` hint can never be resumed in this process. Idempotent:
+/// each notice is added once per distinct state (mini-agent-ji9iy).
+pub(crate) fn note_entered_session(
+    session: &mut Session,
+    sandbox: &Sandbox,
+    permission: Option<&PermCheck>,
+    workspace: &std::path::Path,
+    cli: &Cli,
+    cfg: &Config,
+) {
+    session.sync_environment(
+        current_environment_record(sandbox, permission, workspace, cli, cfg),
+        true,
+    );
+    session.note_stale_child_ids(true);
+}
+
 fn tool_set_label(no_tools: bool, allowlist: &[String]) -> String {
     if no_tools {
         "none".to_string()
@@ -5120,6 +5153,60 @@ mod tests {
     /// that `Session::sync_environment` compares on resume: an unchanged tool
     /// set must not look like a change, and a changed one must produce the
     /// resume notice (mini-agent-jn5e7).
+    // mini-agent-ji9iy: a session entered after startup (/resume picker, /fork,
+    // /import) gets the stale-child-id and environment-change notices exactly
+    // once, as a `--resume` launch does.
+    #[test]
+    fn entering_a_saved_session_adds_each_resume_notice_exactly_once() {
+        use crate::session::{MessageRole, Session};
+        let mut session = Session::new("p", "m", 1000, "s");
+        session.add_message(MessageRole::User, "delegate it");
+        session.add_message(
+            MessageRole::ToolResult,
+            "done [child id: abc123; task {resume: \"abc123\"}]",
+        );
+        // Recorded under a different environment than the one entering it.
+        session.sync_environment(
+            crate::session::environment::EnvironmentRecord {
+                sandbox: "other".into(),
+                permission_mode: "other".into(),
+                workspace: "/elsewhere".into(),
+                tools: "none".into(),
+            },
+            false,
+        );
+        let before = session.messages.len();
+        let sandbox = Sandbox::new(false, "bwrap");
+        let cli = Cli::default();
+        let cfg = Config::default();
+        let workspace = std::path::Path::new("/w");
+        for _ in 0..3 {
+            super::note_entered_session(&mut session, &sandbox, None, workspace, &cli, &cfg);
+        }
+        let notices: Vec<&str> = session.messages[before..]
+            .iter()
+            .filter(|message| message.role == MessageRole::System)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|text| text.starts_with("Subagent child ids printed earlier"))
+                .count(),
+            1,
+            "{notices:?}"
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|text| text.starts_with("The execution environment changed"))
+                .count(),
+            1,
+            "{notices:?}"
+        );
+        assert_eq!(notices.len(), 2, "{notices:?}");
+    }
+
     #[test]
     fn tool_set_label_is_order_insensitive_and_drives_the_resume_notice() {
         use crate::session::environment::EnvironmentRecord;
