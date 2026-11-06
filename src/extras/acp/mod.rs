@@ -3683,6 +3683,23 @@ fn respond_terminal_error(
     responder.respond_with_error(agent_client_protocol::Error::new(-32603, error))
 }
 
+/// Cap on mid-turn compaction reliefs per ACP prompt.
+const MAX_MID_TURN_RELIEFS: usize = 3;
+
+/// Text of the final assistant message of `progress`, if it ends with one.
+fn last_assistant_text(progress: &[Message]) -> String {
+    match progress.last() {
+        Some(Message::Assistant { content, .. }) => content
+            .iter()
+            .filter_map(|item| match item {
+                rig::message::AssistantContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        _ => String::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_prompt(
     state: &AcpState,
@@ -3839,34 +3856,124 @@ async fn run_prompt(
     let pricing = crate::print::HeadlessPricing::from_session(&history.session, &state.cfg);
     history.pending_question = None;
     let mut native_owner = None;
-    let result = crate::startup::heap_future(|| {
-        execute_prompt(
-            state,
-            prompt_input,
-            matches!(command, Some(commands::Command::Compact)),
-            session_id.clone(),
-            &mut history,
-            &mut native_owner,
-            workspace,
-            context,
-            read_tracker,
-            todo_store.clone(),
-            #[cfg(feature = "goal")]
-            goal_store,
-            sandbox,
-            #[cfg(feature = "js")]
-            js_session_state,
-            #[cfg(feature = "skills")]
-            skill_services,
-            cx.clone(),
-            control,
-            #[cfg(feature = "mcp")]
-            &mut mcp_manager,
-            #[cfg(feature = "goal")]
-            blocked_ms.clone(),
+    // Mid-turn compaction (mini-agent-sgzh0): a segment that stops at a
+    // tool-batch boundary under context pressure is persisted, the history is
+    // compacted at the start of the next segment, and the turn continues with
+    // a continuation prompt. At most `MAX_MID_TURN_RELIEFS` per prompt.
+    let mut current_input = prompt_input.clone();
+    let mut reliefs = 0usize;
+    #[cfg(feature = "goal")]
+    let mut carried_usage = rig::completion::Usage::default();
+    let result = loop {
+        let result = crate::startup::heap_future(|| {
+            execute_prompt(
+                state,
+                &current_input,
+                matches!(command, Some(commands::Command::Compact)),
+                reliefs < MAX_MID_TURN_RELIEFS,
+                session_id.clone(),
+                &mut history,
+                &mut native_owner,
+                workspace.clone(),
+                context.clone(),
+                read_tracker.clone(),
+                todo_store.clone(),
+                #[cfg(feature = "goal")]
+                goal_store.clone(),
+                sandbox.clone(),
+                #[cfg(feature = "js")]
+                js_session_state.clone(),
+                #[cfg(feature = "skills")]
+                skill_services.clone(),
+                cx.clone(),
+                control.clone(),
+                #[cfg(feature = "mcp")]
+                &mut mcp_manager,
+                #[cfg(feature = "goal")]
+                blocked_ms.clone(),
+            )
+        })
+        .await;
+        // A compaction that could not shrink the history must not leave the
+        // forced-compaction flag armed for the next prompt.
+        history.manual_compact = false;
+        let mut outcome = match result {
+            Ok(outcome) if outcome.compaction_boundary => outcome,
+            other => {
+                #[cfg(feature = "goal")]
+                let other = other.map(|mut outcome| {
+                    outcome.usage.input_tokens = outcome
+                        .usage
+                        .input_tokens
+                        .saturating_add(carried_usage.input_tokens);
+                    outcome.usage.output_tokens = outcome
+                        .usage
+                        .output_tokens
+                        .saturating_add(carried_usage.output_tokens);
+                    outcome.usage.total_tokens = outcome
+                        .usage
+                        .total_tokens
+                        .saturating_add(carried_usage.total_tokens);
+                    outcome
+                });
+                break other;
+            }
+        };
+        let progress = outcome.progress.take().unwrap_or_default();
+        if control.is_cancelled() {
+            // Cancellation won: keep what already ran, never continue.
+            outcome.compaction_boundary = false;
+            outcome.reason = StopReason::Cancelled;
+            outcome.progress = Some(progress);
+            break Ok(outcome);
+        }
+        let response = last_assistant_text(&progress);
+        if crate::print::persist_headless_turn_input(
+            &mut history.session,
+            &current_input,
+            &response,
+            &progress,
         )
-    })
-    .await;
+        .is_err()
+        {
+            outcome.compaction_boundary = false;
+            outcome.error = Some("canonical ACP user content could not be retained".into());
+            outcome.progress = None;
+            break Ok(outcome);
+        }
+        #[cfg(feature = "goal")]
+        {
+            carried_usage.input_tokens = carried_usage
+                .input_tokens
+                .saturating_add(outcome.usage.input_tokens);
+            carried_usage.output_tokens = carried_usage
+                .output_tokens
+                .saturating_add(outcome.usage.output_tokens);
+            carried_usage.total_tokens = carried_usage
+                .total_tokens
+                .saturating_add(outcome.usage.total_tokens);
+        }
+        reliefs += 1;
+        let _ = cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(
+                    "mid-turn context relief: compacting the session and continuing...",
+                ),
+            ))),
+        ));
+        // The next segment compacts the whole persisted history first.
+        history.manual_compact = true;
+        // A manager this segment connected stays at the session's disposal so
+        // the next segment reuses it instead of reconnecting.
+        #[cfg(feature = "mcp")]
+        if let Some(mcp) = mcp_manager.take() {
+            history.reuse.mcp = Some(mcp);
+        }
+        current_input = crate::agent::input::PromptInput::text(
+            crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT.to_owned(),
+        );
+    };
     // Keep the history lock and generation registered until every server this
     // prompt does not hand back to the session is closed, including
     // cancellation during agent/runner preparation. Only a prompt that ended
@@ -3965,20 +4072,8 @@ async fn run_prompt(
     });
     let response = outcome
         .progress
-        .as_ref()
-        .and_then(|progress| progress.last())
-        .and_then(|message| match message {
-            Message::Assistant { content, .. } => Some(
-                content
-                    .iter()
-                    .filter_map(|item| match item {
-                        rig::message::AssistantContent::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<String>(),
-            ),
-            _ => None,
-        })
+        .as_deref()
+        .map(last_assistant_text)
         .unwrap_or_default();
     if let Some(owner) = native_owner.as_mut() {
         use crate::session::native_replay::RetiredNativeOutcome;
@@ -3995,7 +4090,7 @@ async fn run_prompt(
         if let Some(binding) = &owner.binding
             && let Err(reason) = binding.commit_canonical_input_into_with_outcome(
                 &mut history.session,
-                prompt_input,
+                &current_input,
                 &response,
                 outcome.progress.as_deref().unwrap_or(&[]),
                 usage,
@@ -4010,7 +4105,7 @@ async fn run_prompt(
             && (outcome.reason == StopReason::EndTurn || !progress.is_empty())
             && crate::print::persist_headless_turn_input(
                 &mut history.session,
-                prompt_input,
+                &current_input,
                 &response,
                 progress,
             )
@@ -4242,6 +4337,33 @@ async fn settle_acp_goal_round(
     store.snapshot().map(|goal| (line, goal))
 }
 
+/// Mid-turn compaction trigger for one ACP segment (mini-agent-sgzh0): real
+/// prompt pressure above `threshold` of `window` stops the runner at the next
+/// tool-batch boundary.
+#[derive(Clone, Copy, Debug)]
+struct AcpMidTurn {
+    window: u64,
+    threshold: f64,
+    anthropic_native: bool,
+}
+
+impl AcpMidTurn {
+    fn crossed(&self, delta: &crate::event::UsageDelta) -> bool {
+        if self.window == 0 {
+            return false;
+        }
+        let real_input_tokens = crate::session::Session::real_input_tokens(
+            self.anthropic_native,
+            delta.input_tokens,
+            delta.total_tokens,
+            delta.output_tokens,
+            delta.cached_input_tokens,
+            delta.cache_creation_input_tokens,
+        );
+        real_input_tokens as f64 / self.window as f64 > self.threshold
+    }
+}
+
 struct PromptOutcome {
     /// Ignored when `error` is set: a failed turn is answered with a JSON-RPC
     /// error, never with a stop reason.
@@ -4250,6 +4372,11 @@ struct PromptOutcome {
     progress: Option<Vec<Message>>,
     /// An internal failure; the prompt request fails with this message.
     error: Option<String>,
+    /// The runner stopped at a tool-batch boundary because real prompt
+    /// pressure crossed `mid_turn_compact_threshold`; `progress` holds every
+    /// completed interaction and the driver compacts and continues
+    /// (mini-agent-sgzh0).
+    compaction_boundary: bool,
     /// Tokens this turn spent. A goal's token bound is enforced from here, so
     /// leaving it at zero would make the bound configurable and inert.
     #[cfg(feature = "goal")]
@@ -4277,6 +4404,7 @@ impl PromptOutcome {
             question: None,
             progress,
             error: None,
+            compaction_boundary: false,
             #[cfg(feature = "goal")]
             usage: rig::completion::Usage::default(),
         }
@@ -4288,6 +4416,7 @@ impl PromptOutcome {
             question: None,
             progress: None,
             error: Some(error),
+            compaction_boundary: false,
             #[cfg(feature = "goal")]
             usage: rig::completion::Usage::default(),
         }
@@ -4299,6 +4428,7 @@ async fn execute_prompt(
     state: &AcpState,
     prompt_input: &crate::agent::input::PromptInput,
     compact_only: bool,
+    mid_turn_enabled: bool,
     session_id: SessionId,
     history: &mut SessionHistory,
     native_owner: &mut Option<crate::provider::NativeRunOwner>,
@@ -4360,12 +4490,24 @@ async fn execute_prompt(
             }
             runner = fixture(prompt_text.to_owned(), prior_history.clone()) => runner,
         };
+        // Tests opt in by setting the threshold; the window is a fixed 1000.
+        let mid_turn = state
+            .cfg
+            .mid_turn_compact_threshold
+            .and(state.cfg.resolve_mid_turn_compact_threshold())
+            .filter(|_| mid_turn_enabled)
+            .map(|threshold| AcpMidTurn {
+                window: 1000,
+                threshold,
+                anthropic_native: false,
+            });
         return Ok(relay_paused_runner(
             session_id,
             cx,
             control,
             paused_runner,
             plan_store,
+            mid_turn,
             #[cfg(feature = "goal")]
             (&state.cfg, &usage_provider),
         )
@@ -4402,6 +4544,7 @@ async fn execute_prompt(
             control,
             event_rx,
             plan_store,
+            None,
             #[cfg(feature = "goal")]
             (&state.cfg, &usage_provider),
         )
@@ -4459,6 +4602,7 @@ async fn execute_prompt(
         model: model_str,
         ..
     } = route;
+    let provider_is_anthropic_native = state.cfg.is_anthropic_native(&provider_str);
 
     tracing::debug!(
         "ACP run_prompt: provider={}, model={}, prompt={:?}, prompt_len={}",
@@ -4607,6 +4751,7 @@ async fn execute_prompt(
             question: None,
             progress: None,
             error: None,
+            compaction_boundary: false,
             #[cfg(feature = "goal")]
             usage: compaction_usage.into(),
         });
@@ -4817,6 +4962,20 @@ async fn execute_prompt(
     else {
         return Ok(PromptOutcome::cancelled(None));
     };
+    // Mid-turn compaction: only for ordinary (non-native) history, whose token
+    // pressure limits are set (compaction enabled, window known), and only
+    // while this prompt still has relief budget.
+    let mid_turn = (mid_turn_enabled && !native)
+        .then(|| {
+            let pressure = history.limits.token_pressure?;
+            let threshold = state.cfg.resolve_mid_turn_compact_threshold()?;
+            Some(AcpMidTurn {
+                window: pressure.window,
+                threshold,
+                anthropic_native: provider_is_anthropic_native,
+            })
+        })
+        .flatten();
     #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
     let mut outcome = relay_paused_runner(
         session_id,
@@ -4824,6 +4983,7 @@ async fn execute_prompt(
         control,
         paused_runner,
         plan_store,
+        mid_turn,
         #[cfg(feature = "goal")]
         (&state.cfg, &usage_provider),
     )
@@ -4893,6 +5053,7 @@ async fn relay_paused_runner(
     control: Arc<TurnControl>,
     paused_runner: crate::agent::runner::PausedAgentRunner,
     plan_store: crate::agent::tools::TodoStore,
+    mid_turn: Option<AcpMidTurn>,
     #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
     #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
@@ -4900,7 +5061,12 @@ async fn relay_paused_runner(
     #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     let notices = paused_runner.take_hook_context();
     let attached = control.attach_runner(paused_runner.cancellation_handle());
-    let mut runner = paused_runner.start();
+    let mut runner = if mid_turn.is_some() {
+        paused_runner.start_with_compaction()
+    } else {
+        paused_runner.start()
+    };
+    let mid_turn = mid_turn.zip(runner.compaction_decision_tx.take());
     if !attached {
         let mut last_plan = Vec::new();
         return cancelled_after_runner_with_plan(
@@ -4918,6 +5084,7 @@ async fn relay_paused_runner(
         control,
         runner.event_rx,
         plan_store,
+        mid_turn,
         #[cfg(feature = "goal")]
         usage_provider,
     )
@@ -5082,9 +5249,17 @@ async fn relay_prompt_events(
     control: Arc<TurnControl>,
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     plan_store: crate::agent::tools::TodoStore,
+    mid_turn: Option<(AcpMidTurn, crate::agent::runner::CompactionDecisionTx)>,
     #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
     let mut last_plan = Vec::new();
+    if let Some((policy, decisions)) = &mid_turn {
+        decisions.publish_gate(crate::agent::runner::CompactionPressureGate::Limit {
+            window: policy.window,
+            threshold: policy.threshold,
+            anthropic_native: policy.anthropic_native,
+        });
+    }
     relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
     #[cfg(feature = "goal")]
     let mut usage = rig::completion::Usage::default();
@@ -5117,6 +5292,7 @@ async fn relay_prompt_events(
                 #[cfg(feature = "goal")]
                 usage: rig::completion::Usage::default(),
                 error: Some("agent runner stopped without a terminal event".to_string()),
+                compaction_boundary: false,
             };
         };
         match event {
@@ -5257,7 +5433,24 @@ async fn relay_prompt_events(
                     tracing::warn!("ACP failed to send verification notification: {}", e);
                 }
             }
-            AgentEvent::UsageDelta { usage: delta, .. } => {
+            AgentEvent::UsageDelta {
+                usage: delta,
+                context_complete,
+                awaits_compaction_decision,
+            } => {
+                // The runner waits for an answer to every boundary report once
+                // compaction is on: `Compact` only for a complete report whose
+                // real prompt pressure crosses the threshold (mini-agent-sgzh0).
+                if awaits_compaction_decision && let Some((policy, decisions)) = &mid_turn {
+                    let decision = if context_complete && policy.crossed(&delta) {
+                        crate::agent::runner::CompactionBoundaryDecision::Compact
+                    } else {
+                        crate::agent::runner::CompactionBoundaryDecision::Continue
+                    };
+                    // A closed channel means the runner already ended; its
+                    // terminal event follows.
+                    let _ = decisions.send(decision).await;
+                }
                 // ACP has no status bar to update, but a goal's token bound is
                 // enforced from this total, so it is accumulated rather than
                 // dropped.
@@ -5265,6 +5458,22 @@ async fn relay_prompt_events(
                 add_goal_usage(&mut usage, usage_provider.0, usage_provider.1, delta);
                 #[cfg(not(feature = "goal"))]
                 let _ = delta;
+            }
+            AgentEvent::CompactionBoundary { interactions } if mid_turn.is_some() => {
+                // Every tool call of the batch has its result in
+                // `interactions`; nothing was aborted. The driver persists
+                // them, compacts and continues.
+                while rx.recv().await.is_some() {}
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
+                return PromptOutcome {
+                    reason: StopReason::EndTurn,
+                    question: None,
+                    progress: Some(interactions),
+                    error: None,
+                    compaction_boundary: true,
+                    #[cfg(feature = "goal")]
+                    usage,
+                };
             }
             AgentEvent::SteerConsumed { .. }
             | AgentEvent::SteerRejected { .. }
@@ -5293,6 +5502,7 @@ async fn relay_prompt_events(
                     question: Some(*question),
                     progress: Some(interactions),
                     error: None,
+                    compaction_boundary: false,
                     #[cfg(feature = "goal")]
                     usage,
                 };
@@ -5305,6 +5515,7 @@ async fn relay_prompt_events(
                     question: None,
                     progress: Some(interactions),
                     error: None,
+                    compaction_boundary: false,
                     #[cfg(feature = "goal")]
                     usage,
                 };
@@ -5320,6 +5531,7 @@ async fn relay_prompt_events(
                     question: None,
                     progress: Some(interactions),
                     error: Some(message.to_string()),
+                    compaction_boundary: false,
                     #[cfg(feature = "goal")]
                     usage,
                 };
@@ -6760,13 +6972,17 @@ mod protocol_tests {
     }
 
     fn runner_fixture_state(runner_fixture: RunnerFixture) -> Arc<AcpState> {
+        runner_fixture_state_with(Config::default(), runner_fixture)
+    }
+
+    fn runner_fixture_state_with(cfg: Config, runner_fixture: RunnerFixture) -> Arc<AcpState> {
         Arc::new(AcpState {
             idle: idle::Idle::new(None).unwrap(),
             cli: Cli {
                 no_session: true,
                 ..fixture_cli()
             },
-            cfg: Config::default(),
+            cfg,
             context: crate::context::load(true),
             leases: Arc::default(),
             provider_clients: Default::default(),
@@ -7927,6 +8143,7 @@ mod protocol_tests {
                                     control,
                                     rx,
                                     store,
+                                    None,
                                     #[cfg(feature = "goal")]
                                     (&Config::default(), "openai"),
                                 )
@@ -8163,6 +8380,189 @@ mod protocol_tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[derive(Clone)]
+    struct MidTurnProbeTool;
+
+    #[derive(Debug)]
+    struct MidTurnProbeError;
+
+    impl std::fmt::Display for MidTurnProbeError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("mid-turn probe failed")
+        }
+    }
+
+    impl std::error::Error for MidTurnProbeError {}
+
+    impl rig::tool::Tool for MidTurnProbeTool {
+        const NAME: &'static str = "mid_turn_probe";
+        type Error = MidTurnProbeError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Probe tool for mid-turn compaction tests".to_owned()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok("probed".to_owned())
+        }
+    }
+
+    /// Runs one ACP prompt whose first model call reports `first_input` prompt
+    /// tokens (window 1000) and returns the (prompt, history length) of every
+    /// runner segment plus the notifications.
+    async fn mid_turn_acp_prompt(
+        cfg: Config,
+        first_input: u64,
+    ) -> (Vec<(String, usize)>, Vec<SessionNotification>) {
+        let segments = Arc::new(StdMutex::new(Vec::<(String, usize)>::new()));
+        let fixture: RunnerFixture = {
+            let segments = segments.clone();
+            Arc::new(move |prompt, history| {
+                let segments = segments.clone();
+                Box::pin(async move {
+                    let first = {
+                        let mut segments = segments.lock().unwrap();
+                        segments.push((prompt.clone(), history.len()));
+                        segments.len() == 1
+                    };
+                    let turns = if first {
+                        vec![
+                            vec![
+                                rig::test_utils::MockStreamEvent::tool_call(
+                                    "mid-turn-call",
+                                    <MidTurnProbeTool as rig::tool::Tool>::NAME,
+                                    serde_json::json!({}),
+                                ),
+                                rig::test_utils::MockStreamEvent::final_response(
+                                    rig::completion::Usage {
+                                        input_tokens: first_input,
+                                        output_tokens: 5,
+                                        total_tokens: first_input + 5,
+                                        ..rig::completion::Usage::new()
+                                    },
+                                ),
+                            ],
+                            vec![
+                                rig::test_utils::MockStreamEvent::text("must not start"),
+                                rig::test_utils::MockStreamEvent::final_response_with_default_usage(
+                                ),
+                            ],
+                        ]
+                    } else {
+                        vec![vec![
+                            rig::test_utils::MockStreamEvent::text("finished"),
+                            rig::test_utils::MockStreamEvent::final_response_with_default_usage(),
+                        ]]
+                    };
+                    let model = rig::test_utils::MockCompletionModel::from_stream_turns(turns);
+                    let agent = rig::agent::AgentBuilder::new(model)
+                        .tool(MidTurnProbeTool)
+                        .default_max_turns(3)
+                        .build();
+                    crate::agent::runner::spawn_agent_paused(
+                        agent,
+                        prompt,
+                        history,
+                        crate::retry::RetryConfig::default(),
+                        None,
+                        #[cfg(feature = "skills")]
+                        None,
+                        #[cfg(feature = "hooks")]
+                        None,
+                    )
+                })
+            })
+        };
+        let state = runner_fixture_state_with(cfg, fixture);
+        let notifications = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = notifications.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let connection = Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let outcome = cx
+                    .send_request(prompt(session, "do the long task"))
+                    .block_task()
+                    .await?;
+                assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(10), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let segments = segments.lock().unwrap().clone();
+        let notifications = notifications.lock().unwrap().clone();
+        (segments, notifications)
+    }
+
+    // mini-agent-sgzh0: real prompt pressure above the threshold stops the ACP
+    // runner at the tool-batch boundary; the turn is compacted and continues.
+    #[tokio::test]
+    async fn acp_mid_turn_pressure_stops_at_the_boundary_and_continues() {
+        let cfg = Config {
+            mid_turn_compact_threshold: Some(0.5),
+            ..Config::default()
+        };
+        let (segments, notifications) = mid_turn_acp_prompt(cfg, 800).await;
+        assert_eq!(segments.len(), 2, "{segments:?}");
+        assert_eq!(segments[0].0, "do the long task");
+        assert_eq!(
+            segments[1].0,
+            crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT
+        );
+        assert!(
+            segments[1].1 >= 3,
+            "the tool batch (prompt, call, result) must be persisted: {segments:?}"
+        );
+        let text = format!("{notifications:?}");
+        assert!(text.contains("mid-turn context relief"), "{text}");
+        assert!(text.contains("finished"), "{text}");
+        assert!(!text.contains("must not start"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn acp_mid_turn_below_threshold_runs_in_one_segment() {
+        let cfg = Config {
+            mid_turn_compact_threshold: Some(0.5),
+            ..Config::default()
+        };
+        let (segments, _) = mid_turn_acp_prompt(cfg, 100).await;
+        assert_eq!(segments.len(), 1, "{segments:?}");
+    }
+
+    #[tokio::test]
+    async fn acp_mid_turn_zero_threshold_disables_it() {
+        let cfg = Config {
+            mid_turn_compact_threshold: Some(0.0),
+            ..Config::default()
+        };
+        let (segments, _) = mid_turn_acp_prompt(cfg, 900).await;
+        assert_eq!(segments.len(), 1, "{segments:?}");
     }
 
     #[tokio::test]

@@ -1414,7 +1414,12 @@ Automatic compaction is on by default (`compact_enabled = true`; set it to `fals
 to turn it off). mini-agent compacts the conversation *between* turns after a response
 finishes, when the accumulated session history exceeds `context_window - reserve_tokens`,
 and *within* a turn when real prompt pressure crosses `mid_turn_compact_threshold`
-(default `0.9`). Tools with their own output limits (`read`,
+(default `0.9`) in the TUI, headless `-p`, `/loop`, goal rounds, `--no-session` and ACP
+prompts. A headless or ACP turn stops at the next complete tool batch, records its progress,
+compacts the session history (in memory under `--no-session`) and continues with a
+continuation prompt, at most three times per turn; ACP also sends a short agent-thought
+notice. Provider-native (Anthropic replay) sessions cannot be compacted in place and are
+not compacted mid-turn. Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
 and the subagent `task` tool) retain their documented line, byte, and result
 limits in both live and replayed history. Their
