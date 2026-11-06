@@ -3288,6 +3288,14 @@ pub struct AnyAgent {
     /// request, so later goal rounds never repeat it.
     #[cfg(feature = "subagents")]
     headless_turn_directive: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    /// Typed user content (text plus attached images) for the next headless
+    /// turn only, taken by the first `run_print_with_output` that starts a
+    /// request. The provider-native path sends it as one ordered User message
+    /// and records exactly that message in the session feed.
+    #[cfg(feature = "multimodal")]
+    headless_user: Option<
+        std::sync::Arc<std::sync::Mutex<Option<crate::session::user::PersistedUserMessage>>>,
+    >,
     completion_verification: Option<runner::CompletionVerification>,
     reasoning_controls: Option<CapturedReasoning>,
     /// Same-provider model used for the rest of a headless turn whose
@@ -4024,6 +4032,8 @@ impl AnyAgent {
             question_turn: None,
             #[cfg(feature = "subagents")]
             headless_turn_directive: None,
+            #[cfg(feature = "multimodal")]
+            headless_user: None,
             completion_verification: None,
             reasoning_controls: None,
             fallback: None,
@@ -4291,6 +4301,27 @@ impl AnyAgent {
         self.headless_turn_directive =
             directive.map(|directive| std::sync::Arc::new(std::sync::Mutex::new(Some(directive))));
         self
+    }
+
+    /// Send `user` (the turn's text plus its images, in order) instead of a
+    /// text-only prompt for the next headless turn this agent dispatches.
+    #[cfg(feature = "multimodal")]
+    pub(crate) fn with_headless_user(
+        mut self,
+        user: Option<crate::session::user::PersistedUserMessage>,
+    ) -> Self {
+        self.headless_user =
+            user.map(|user| std::sync::Arc::new(std::sync::Mutex::new(Some(user))));
+        self
+    }
+
+    #[cfg(feature = "multimodal")]
+    fn take_headless_user(&self) -> Option<crate::session::user::PersistedUserMessage> {
+        self.headless_user.as_ref().and_then(|cell| {
+            cell.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        })
     }
 
     #[cfg(feature = "subagents")]
@@ -4671,6 +4702,8 @@ impl AnyAgent {
             question_turn: None,
             #[cfg(feature = "subagents")]
             headless_turn_directive: None,
+            #[cfg(feature = "multimodal")]
+            headless_user: None,
             completion_verification: None,
             reasoning_controls: None,
             fallback: None,
@@ -4886,7 +4919,23 @@ impl AnyAgent {
                     return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(error));
                 }
             };
-            let prompt = crate::agent::input::PromptInput::text(prompt.to_string());
+            #[cfg(feature = "multimodal")]
+            let prompt_input = match self.take_headless_user() {
+                Some(user) => {
+                    let typed = crate::agent::input::PromptInput::user(user);
+                    // A UserPromptSubmit hook may not rewrite ordered media content.
+                    if typed.literal_text() != prompt {
+                        return runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+                            "a user-prompt hook cannot rewrite ordered media content; submit a text-only prompt or preserve the original text"
+                        ));
+                    }
+                    typed
+                }
+                None => crate::agent::input::PromptInput::text(prompt.to_string()),
+            };
+            #[cfg(not(feature = "multimodal"))]
+            let prompt_input = crate::agent::input::PromptInput::text(prompt.to_string());
+            let prompt = prompt_input;
             #[cfg(feature = "subagents")]
             let prompt = prompt.with_turn_directive(self.take_headless_turn_directive());
             #[cfg(not(feature = "agent-skills"))]

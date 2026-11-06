@@ -221,24 +221,65 @@ pub(crate) fn images_user_message(
     PersistedUserMessage::new(blocks).map_err(anyhow::Error::msg)
 }
 
-/// The refusal for headless image / stream-json input on a provider-native
-/// (persisted Anthropic) session: it names the combinations that do work.
-pub(crate) fn native_history_refusal(what: &str) -> String {
-    format!(
-        "{what} do not support provider-native (Anthropic) session history yet. Working \
-         combinations: add --no-session (nothing is saved), or use a non-Anthropic provider \
-         (see GET_STARTED.md, `-i`)."
-    )
+/// One ordered user message for a provider-native turn: the attached images
+/// followed by the prompt text. The provider-native feed records exactly this
+/// message, so a persisted Anthropic session can hold image turns.
+#[cfg(feature = "multimodal")]
+pub(crate) fn user_message_with_text(
+    media: &[Attachment],
+    text: &str,
+) -> anyhow::Result<crate::session::user::PersistedUserMessage> {
+    use crate::session::user::{ImageMime, PersistedUserMessage, UserBlock};
+    use base64::Engine as _;
+
+    let mut blocks = Vec::new();
+    for item in media {
+        if let Attachment::Image { data, mime, .. } = item {
+            blocks.push(UserBlock::Image {
+                data: base64::engine::general_purpose::STANDARD.encode(data),
+                mime_type: ImageMime::parse(mime)
+                    .ok_or_else(|| anyhow::anyhow!("unsupported image MIME type"))?,
+            });
+        }
+    }
+    if !text.is_empty() {
+        blocks.push(UserBlock::Text {
+            text: text.to_owned(),
+        });
+    }
+    PersistedUserMessage::new(blocks).map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]
 mod tests {
+    // mini-agent-siyos: one ordered user message, images first, then the text.
+    #[cfg(feature = "multimodal")]
     #[test]
-    fn native_history_refusal_names_the_working_combinations() {
-        let message = super::native_history_refusal("image attachments");
-        assert!(message.starts_with("image attachments do not support provider-native"));
-        assert!(message.contains("--no-session"), "{message}");
-        assert!(message.contains("non-Anthropic provider"), "{message}");
+    fn user_message_with_text_orders_images_before_the_prompt() {
+        use crate::session::user::UserBlock;
+        let image = |bytes: &[u8]| super::Attachment::Image {
+            path: std::path::PathBuf::from("a.png"),
+            data: bytes.to_vec(),
+            mime: "image/png".into(),
+            clipboard: None,
+        };
+        let message = super::user_message_with_text(
+            &[image(b"\x89PNG-one"), image(b"\x89PNG-two")],
+            "describe these",
+        )
+        .unwrap();
+        assert!(message.has_images());
+        assert_eq!(message.literal_text(), "describe these");
+        let kinds: Vec<_> = message
+            .blocks()
+            .iter()
+            .map(|block| matches!(block, UserBlock::Image { .. }))
+            .collect();
+        assert_eq!(kinds, [true, true, false]);
+        // Image-only input carries no text block.
+        let only = super::user_message_with_text(&[image(b"x")], "").unwrap();
+        assert_eq!(only.blocks().len(), 1);
+        assert_eq!(only.literal_text(), "");
     }
 
     use super::*;

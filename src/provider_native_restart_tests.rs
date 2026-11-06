@@ -413,3 +413,307 @@ async fn headless_resume_on_the_same_model_replays_the_native_chain() {
     );
     assert_eq!(saved.native_history_snapshot().unwrap().frames().len(), 2);
 }
+
+// ---- mini-agent-siyos: headless images and multi-turn input on a persisted
+// provider-native session ----
+
+/// A valid 1x1 PNG.
+const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+fn image_blocks(body: &Value) -> usize {
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter(|block| block["type"] == "image")
+        .count()
+}
+
+struct Headless {
+    roots: crate::tests::OwnedTestDirectory,
+    wire: Wire,
+    cfg: crate::config::Config,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+    paths: &'static crate::paths::AppPaths,
+}
+
+impl Headless {
+    async fn startup(
+        &self,
+        id: Option<String>,
+        prompt: &str,
+        image: bool,
+    ) -> Box<crate::startup::Startup> {
+        let cli = crate::cli::Cli {
+            api_key: Some("unused-native-key".into()),
+            quick_model: id.is_none().then(|| "model-a".to_owned()),
+            session: id,
+            print: true,
+            quiet: true,
+            message: vec![prompt.into()],
+            image: if image {
+                vec![std::path::PathBuf::from("shot.png")]
+            } else {
+                Vec::new()
+            },
+            no_context_files: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let mut startup = crate::startup::heap_future(|| async {
+            Box::new(
+                crate::startup::Startup::init(
+                    cli,
+                    self.cfg.clone(),
+                    self.paths.clone(),
+                    self.workspace.clone(),
+                    false,
+                    false,
+                    false,
+                )
+                .await
+                .unwrap(),
+            )
+        })
+        .await;
+        startup.init_features().await.unwrap();
+        startup.resolve_prompts().await.unwrap();
+        startup
+    }
+}
+
+fn headless_fixture(
+    name: &str,
+    responses: Vec<(bool, String)>,
+) -> (Headless, crate::tests::ScopedProcessEnv) {
+    let roots = crate::tests::OwnedTestDirectory::new(name);
+    let environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "MINI_AGENT_CONFIG_DIR",
+            Some(roots.path().join("config").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(roots.path().join("data").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(roots.path().join("state").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_CACHE_DIR",
+            Some(roots.path().join("cache").into_os_string()),
+        ),
+    ]);
+    use base64::Engine as _;
+    std::fs::write(
+        roots.path().join("shot.png"),
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG_1X1)
+            .unwrap(),
+    )
+    .unwrap();
+    let wire = Wire::new(responses);
+    let cfg: crate::config::Config = serde_json::from_value(json!({
+        "session_title_model":"off",
+        "custom_providers":{"media-headless":{"provider_type":"anthropic","base_url":wire.base}},
+        "quick_models":{"model-a":{"provider":"media-headless","model":"claude-opus-5-5",
+            "context_window":200000,"input_token_cost":2.0,"output_token_cost":4.0}},
+    }))
+    .unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(roots.path()).unwrap());
+    let paths = crate::paths::process_paths_ref().unwrap();
+    (
+        Headless {
+            roots,
+            wire,
+            cfg,
+            workspace,
+            paths,
+        },
+        environment,
+    )
+}
+
+// `-p -i shot.png` on a persisted Anthropic session sends the image with the
+// prompt, saves it in the native feed, and `--continue` replays it exactly once.
+#[tokio::test]
+async fn headless_image_turn_on_a_persisted_native_session_resumes() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let (fixture, _environment) = headless_fixture(
+        "native-headless-image",
+        vec![
+            response("image-turn-signature", "I see a pixel"),
+            response("follow-up-signature", "still a pixel"),
+        ],
+    );
+    #[cfg(feature = "hooks")]
+    let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
+    let first = fixture.startup(None, "describe the image", true).await;
+    let sid = first.session.id.to_string();
+    let _release = Release(sid.clone());
+    crate::startup::heap_future(|| first.dispatch())
+        .await
+        .unwrap();
+    crate::session::lock::release_session(&sid);
+    let saved = crate::session::storage::load_session_exact(&sid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.native_frontier.refusal(), None);
+    assert_eq!(saved.native_history_snapshot().unwrap().frames().len(), 1);
+    let user_rows: Vec<_> = saved
+        .messages
+        .iter()
+        .filter(|row| row.role == crate::session::MessageRole::User)
+        .collect();
+    assert_eq!(user_rows.len(), 1, "the image and prompt are one user turn");
+    assert!(
+        user_rows[0]
+            .user
+            .as_ref()
+            .is_some_and(|user| user.has_images())
+    );
+    assert_eq!(user_rows[0].content.as_str(), "describe the image");
+
+    let second = fixture.startup(Some(sid.clone()), "and now?", false).await;
+    crate::startup::heap_future(|| second.dispatch())
+        .await
+        .unwrap();
+    crate::session::lock::release_session(&sid);
+    let bodies = fixture.wire.finish();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(image_blocks(&bodies[0]), 1);
+    assert_eq!(
+        bodies[0]["messages"][0]["content"][0]["type"], "image",
+        "images precede the prompt text: {}",
+        bodies[0]["messages"][0]
+    );
+    assert_eq!(
+        bodies[0]["messages"][0]["content"][1]["text"],
+        "describe the image"
+    );
+    assert_eq!(
+        image_blocks(&bodies[1]),
+        1,
+        "the resumed request replays the image once"
+    );
+    assert_eq!(
+        signatures(&bodies[1]),
+        vec!["image-turn-signature".to_string()]
+    );
+    let saved = crate::session::storage::load_session_exact(&sid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.native_history_snapshot().unwrap().frames().len(), 2);
+    assert_eq!(saved.native_frontier.refusal(), None);
+    drop(fixture.roots);
+}
+
+// Several user turns (stream-json) in one process on one persisted native
+// session, an image on the second, then a resumed process.
+#[tokio::test]
+async fn headless_multi_turn_input_on_a_persisted_native_session() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let (fixture, _environment) = headless_fixture(
+        "native-headless-multi-turn",
+        vec![
+            response("turn-one-signature", "answer one"),
+            response("turn-two-signature", "answer two"),
+            response("turn-three-signature", "answer three"),
+            response("turn-four-signature", "answer four"),
+        ],
+    );
+    #[cfg(feature = "hooks")]
+    let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
+    let mut startup = fixture.startup(None, "turn one", false).await;
+    let sid = startup.session.id.to_string();
+    let _release = Release(sid.clone());
+    // The same steps `dispatch` takes before the stream-json loop.
+    startup.join_native_startup().await.unwrap();
+    startup.dispatch_print().await.unwrap();
+    // Turn two arrives as a stream-json line with an image block.
+    startup.cli.message = vec!["turn two".into()];
+    startup.session.pending_media.extend(
+        crate::headless_media::resolve_images(
+            fixture.roots.path(),
+            vec![crate::headless_media::ImageSource::Base64 {
+                media_type: Some("image/png".into()),
+                data: PNG_1X1.into(),
+            }],
+        )
+        .unwrap(),
+    );
+    startup.reopen_native_turn().await.unwrap();
+    startup.dispatch_print().await.unwrap();
+    startup.cli.message = vec!["turn three".into()];
+    startup.reopen_native_turn().await.unwrap();
+    startup.dispatch_print().await.unwrap();
+    crate::session::lock::release_session(&sid);
+    drop(startup);
+
+    let saved = crate::session::storage::load_session_exact(&sid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.native_frontier.refusal(), None);
+    assert_eq!(saved.native_history_snapshot().unwrap().frames().len(), 3);
+
+    // `--continue`: a new process resumes the same chain.
+    let resumed = fixture.startup(Some(sid.clone()), "turn four", false).await;
+    crate::startup::heap_future(|| resumed.dispatch())
+        .await
+        .unwrap();
+    crate::session::lock::release_session(&sid);
+    let bodies = fixture.wire.finish();
+    assert_eq!(bodies.len(), 4);
+    assert_eq!(
+        bodies.iter().map(image_blocks).collect::<Vec<_>>(),
+        [0, 1, 1, 1],
+        "the image of turn two is replayed, never duplicated"
+    );
+    assert_eq!(
+        signatures(&bodies[3]),
+        vec![
+            "turn-one-signature".to_string(),
+            "turn-two-signature".to_string(),
+            "turn-three-signature".to_string()
+        ]
+    );
+    let saved = crate::session::storage::load_session_exact(&sid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.native_history_snapshot().unwrap().frames().len(), 4);
+    assert_eq!(saved.native_frontier.refusal(), None);
+}
+
+// Multi-turn on `--no-session` (nothing saved) keeps working too.
+#[tokio::test]
+async fn headless_multi_turn_input_without_a_saved_session_keeps_the_chain_in_memory() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let (fixture, _environment) = headless_fixture(
+        "native-headless-no-session",
+        vec![
+            response("memory-one-signature", "answer one"),
+            response("memory-two-signature", "answer two"),
+        ],
+    );
+    #[cfg(feature = "hooks")]
+    let _workspace_selection = crate::extras::hooks::retain_test_workspace_selection();
+    let mut startup = fixture.startup(None, "turn one", false).await;
+    startup.cli.no_session = true;
+    startup.join_native_startup().await.unwrap();
+    startup.dispatch_print().await.unwrap();
+    startup.cli.message = vec!["turn two".into()];
+    startup.reopen_native_turn().await.unwrap();
+    startup.dispatch_print().await.unwrap();
+    let bodies = fixture.wire.finish();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(
+        signatures(&bodies[1]),
+        vec!["memory-one-signature".to_string()]
+    );
+}

@@ -138,6 +138,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   text, and hints when a page converts to almost no text.
 ### Sessions
 
+- Headless image attachments (`-i`, stream-json image blocks) and `--input-format stream-json` now
+  work on a persisted provider-native Anthropic session instead of being refused: the images and
+  prompt are one typed user message recorded in the native history, every stream-json turn opens
+  and retires its own native context, and `--continue` resumes the same chain. A `SessionEnd`
+  hook of such a session runs after each turn (mini-agent-siyos).
+
 - The session catalogue (`/sessions`, `--resume`) writes a small `<id>.index` metadata sidecar for
   every session it reads in full; a session with a current sidecar is listed without reading its
   transcript and is no longer charged against the 256 MiB scan budget, so repeated listings reach
