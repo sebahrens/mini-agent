@@ -190,6 +190,12 @@ pub struct Config {
     pub reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Connect and stream-idle deadlines for every provider client, built-in
+    /// or custom (`[provider_timeouts]`). A custom provider's own
+    /// `connect_timeout_secs` / `stream_idle_timeout_secs` take precedence.
+    /// Read at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_timeouts: Option<crate::provider::ProviderTimeouts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_tools: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

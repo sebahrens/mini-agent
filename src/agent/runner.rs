@@ -4013,7 +4013,7 @@ where
                 Err(error) => {
                     park_question!();
                     tracing::error!("agent stream start failed after retries: {error}");
-                    let error = retry::with_context_length_hint(&error.to_string());
+                    let error = retry::with_provider_error_hint(&error);
                     let _ = event_tx
                         .send(AgentEvent::error_with(
                             CompactString::new(error),
@@ -4621,7 +4621,7 @@ where
                             break;
                         }
                         tracing::error!("agent stream error: {e}");
-                        let error = retry::with_context_length_hint(&e.to_string());
+                        let error = retry::with_provider_error_hint(&e);
                         let _ = event_tx
                             .send(AgentEvent::error_with(
                                 CompactString::new(error),
@@ -5068,7 +5068,7 @@ where
         Ok(result) => result,
         Err(error) => return HeadlessTurn::failed_before_start(error),
     }
-    .map_err(|e| anyhow::anyhow!(retry::with_context_length_hint(&e.to_string())));
+    .map_err(|e| anyhow::anyhow!(retry::with_provider_error_hint(&e)));
     let stream = match stream {
         Ok(stream) => stream,
         Err(error) => return HeadlessTurn::failed_before_start(error),
@@ -5472,7 +5472,7 @@ where
                         }
                         // Propagate an exhausted or non-retryable stream failure
                         // instead of returning `Ok` with a truncated response.
-                        fail_turn!(retry::with_context_length_hint(&e.to_string()));
+                        fail_turn!(retry::with_provider_error_hint(&e));
                     }
                 }
                 Ok(true)

@@ -17,6 +17,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   `max_output` per model. Output-limit stops (`max_tokens`, `length`, `max_output_tokens`,
   `MAX_TOKENS`) are no longer silent: a notice is shown, the turn continues with a resume
   instruction (up to 3 times), and a cut-off tool call is reported instead of executed.
+- New `[provider_timeouts]` (`connect_timeout_secs`, `stream_idle_timeout_secs`) applies to
+  built-in providers too, not only `custom_providers`; the default stream-idle deadline rises
+  from 120 s to 300 s, and a deadline failure names the keys to raise.
 
 **Fork release 1.14.2 (2026-10-28)**
 

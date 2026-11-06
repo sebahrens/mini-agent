@@ -4899,26 +4899,81 @@ pub(crate) const DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// Deadline between successive reads of a provider response. It covers the wait
 /// for headers and the wait between streamed events, and resets on every read,
 /// so a long healthy stream is never interrupted.
-pub(crate) const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+pub(crate) const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 
-/// Connect deadline for `custom`, falling back to the documented default.
+/// Upper bound for either configured provider deadline (one day): a stalled
+/// peer must still fail eventually.
+pub(crate) const MAX_PROVIDER_TIMEOUT_SECS: u64 = 86_400;
+
+/// `[provider_timeouts]`: deadlines applied to every provider client. A
+/// custom provider's own `connect_timeout_secs` / `stream_idle_timeout_secs`
+/// take precedence over these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ProviderTimeouts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout_secs: Option<u64>,
+}
+
+static PROVIDER_TIMEOUTS: std::sync::RwLock<ProviderTimeouts> =
+    std::sync::RwLock::new(ProviderTimeouts {
+        connect_timeout_secs: None,
+        stream_idle_timeout_secs: None,
+    });
+
+/// Install the user's `[provider_timeouts]` for clients built from now on.
+/// Called once at startup after the configuration is loaded.
+pub(crate) fn set_provider_timeouts(timeouts: Option<ProviderTimeouts>) {
+    *PROVIDER_TIMEOUTS
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = timeouts.unwrap_or_default();
+}
+
+fn global_provider_timeouts() -> ProviderTimeouts {
+    *PROVIDER_TIMEOUTS
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn bounded_timeout(secs: u64) -> Duration {
+    Duration::from_secs(secs.clamp(1, MAX_PROVIDER_TIMEOUT_SECS))
+}
+
+/// Connect deadline: the custom provider's value, else `[provider_timeouts]`,
+/// else the documented default.
 pub(crate) fn resolve_connect_timeout(custom: Option<&CustomProviderConfig>) -> Duration {
-    Duration::from_secs(
+    resolve_connect_timeout_with(custom, global_provider_timeouts())
+}
+
+fn resolve_connect_timeout_with(
+    custom: Option<&CustomProviderConfig>,
+    global: ProviderTimeouts,
+) -> Duration {
+    bounded_timeout(
         custom
             .and_then(|cfg| cfg.connect_timeout_secs)
-            .unwrap_or(DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS)
-            .max(1),
+            .or(global.connect_timeout_secs)
+            .unwrap_or(DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS),
     )
 }
 
-/// Stream-inactivity deadline for `custom`, falling back to the documented
-/// default.
+/// Stream-inactivity deadline: the custom provider's value, else
+/// `[provider_timeouts]`, else the documented default.
 pub(crate) fn resolve_stream_idle_timeout(custom: Option<&CustomProviderConfig>) -> Duration {
-    Duration::from_secs(
+    resolve_stream_idle_timeout_with(custom, global_provider_timeouts())
+}
+
+fn resolve_stream_idle_timeout_with(
+    custom: Option<&CustomProviderConfig>,
+    global: ProviderTimeouts,
+) -> Duration {
+    bounded_timeout(
         custom
             .and_then(|cfg| cfg.stream_idle_timeout_secs)
-            .unwrap_or(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS)
-            .max(1),
+            .or(global.stream_idle_timeout_secs)
+            .unwrap_or(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS),
     )
 }
 
@@ -4945,9 +5000,27 @@ fn build_http_client_with_route_policy(
     base_url: Option<&str>,
     fixed_route: bool,
 ) -> anyhow::Result<reqwest::Client> {
+    build_http_client_with_timeouts(
+        provider_name,
+        danger_accept_invalid_certs,
+        custom,
+        base_url,
+        fixed_route,
+        global_provider_timeouts(),
+    )
+}
+
+fn build_http_client_with_timeouts(
+    provider_name: &str,
+    danger_accept_invalid_certs: bool,
+    custom: Option<&CustomProviderConfig>,
+    base_url: Option<&str>,
+    fixed_route: bool,
+    timeouts: ProviderTimeouts,
+) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(resolve_connect_timeout(custom))
-        .read_timeout(resolve_stream_idle_timeout(custom))
+        .connect_timeout(resolve_connect_timeout_with(custom, timeouts))
+        .read_timeout(resolve_stream_idle_timeout_with(custom, timeouts))
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             // Vertex credentials bind an exact publisher/project/location path;
             // following even a same-origin redirect would bypass that owner.
@@ -7913,5 +7986,165 @@ impl Drop for NativeRunOwner {
         if let (Some(cleanup), Some(ticket)) = (&mut self.cleanup, self.ticket.take()) {
             cleanup.retain_until_settled(ticket);
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_timeout_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn custom(connect: Option<u64>, idle: Option<u64>) -> CustomProviderConfig {
+        let mut cfg: CustomProviderConfig =
+            toml::from_str("provider_type = \"openai\"\nbase_url = \"http://127.0.0.1:1\"")
+                .unwrap();
+        cfg.connect_timeout_secs = connect;
+        cfg.stream_idle_timeout_secs = idle;
+        cfg
+    }
+
+    #[test]
+    fn global_timeouts_apply_to_built_in_providers_and_custom_values_win() {
+        let global = ProviderTimeouts {
+            connect_timeout_secs: Some(5),
+            stream_idle_timeout_secs: Some(600),
+        };
+        assert_eq!(
+            resolve_connect_timeout_with(None, global),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            resolve_stream_idle_timeout_with(None, global),
+            Duration::from_secs(600)
+        );
+        let own = custom(Some(2), Some(7));
+        assert_eq!(
+            resolve_connect_timeout_with(Some(&own), global),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            resolve_stream_idle_timeout_with(Some(&own), global),
+            Duration::from_secs(7)
+        );
+        // A custom provider without its own values inherits the global ones.
+        let inherits = custom(None, None);
+        assert_eq!(
+            resolve_stream_idle_timeout_with(Some(&inherits), global),
+            Duration::from_secs(600)
+        );
+        // Unset everywhere: the documented defaults.
+        assert_eq!(
+            resolve_stream_idle_timeout_with(None, ProviderTimeouts::default()),
+            Duration::from_secs(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS)
+        );
+        // Zero and absurd values stay bounded.
+        let extreme = ProviderTimeouts {
+            connect_timeout_secs: Some(0),
+            stream_idle_timeout_secs: Some(u64::MAX),
+        };
+        assert_eq!(
+            resolve_connect_timeout_with(None, extreme),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            resolve_stream_idle_timeout_with(None, extreme),
+            Duration::from_secs(MAX_PROVIDER_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn provider_timeouts_parse_from_config() {
+        let cfg: crate::config::Config = toml::from_str(
+            "[provider_timeouts]\nconnect_timeout_secs = 10\nstream_idle_timeout_secs = 900\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.provider_timeouts,
+            Some(ProviderTimeouts {
+                connect_timeout_secs: Some(10),
+                stream_idle_timeout_secs: Some(900),
+            })
+        );
+        assert_eq!(crate::config::Config::default().provider_timeouts, None);
+    }
+
+    /// Serves one request, staying silent for `gap` before the response.
+    async fn silent_server(gap: Duration) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = socket.read(&mut buffer).await;
+            tokio::time::sleep(gap).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+            let _ = socket.shutdown().await;
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn built_in_client_idle_timeout_follows_provider_timeouts() {
+        // Scaled-down form of "idle=600 survives a 150s silent gap": the
+        // configured idle deadline, not the default, governs a built-in
+        // (non-custom) provider client.
+        let (url, server) = silent_server(Duration::from_millis(1500)).await;
+        let patient = build_http_client_with_timeouts(
+            "ollama",
+            false,
+            None,
+            Some(&url),
+            false,
+            ProviderTimeouts {
+                connect_timeout_secs: None,
+                stream_idle_timeout_secs: Some(4),
+            },
+        )
+        .unwrap();
+        let body = patient
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        server.await.unwrap();
+
+        let (url, server) = silent_server(Duration::from_millis(3000)).await;
+        let impatient = build_http_client_with_timeouts(
+            "anthropic",
+            false,
+            None,
+            Some(&url),
+            false,
+            ProviderTimeouts {
+                connect_timeout_secs: None,
+                stream_idle_timeout_secs: Some(1),
+            },
+        )
+        .unwrap();
+        let error = impatient.get(&url).send().await.unwrap_err();
+        assert!(error.is_timeout(), "{error}");
+        let message = crate::retry::with_provider_error_hint(&error);
+        assert!(
+            message.contains("[provider_timeouts] stream_idle_timeout_secs"),
+            "{message}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn non_timeout_errors_get_no_timeout_hint() {
+        let error = std::io::Error::other("bad request");
+        assert_eq!(
+            crate::retry::with_provider_error_hint(&error),
+            "bad request"
+        );
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        assert!(crate::retry::with_provider_error_hint(&timeout).contains("provider_timeouts"));
     }
 }

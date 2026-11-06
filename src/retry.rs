@@ -350,6 +350,31 @@ pub fn is_context_length_error_message(message: &str) -> bool {
             && (lower.contains("exceed") || lower.contains("too long")))
 }
 
+/// The user-facing text of a terminal provider error: the message plus
+/// recovery guidance for context overflow or a provider deadline.
+pub fn with_provider_error_hint(error: &(dyn std::error::Error + 'static)) -> String {
+    let message = with_context_length_hint(&error.to_string());
+    if is_provider_timeout(error) {
+        format!("{message}\n{PROVIDER_TIMEOUT_HINT}")
+    } else {
+        message
+    }
+}
+
+/// Guidance appended to a provider deadline failure, naming the keys to raise.
+pub const PROVIDER_TIMEOUT_HINT: &str = "The provider did not respond within the configured deadline. For slow first tokens (large prompts, local model loading, long reasoning) raise `[provider_timeouts] stream_idle_timeout_secs` (default 300) or `connect_timeout_secs` (default 30); a custom provider's own `stream_idle_timeout_secs` takes precedence.";
+
+fn is_provider_timeout(error: &(dyn std::error::Error + 'static)) -> bool {
+    error_sources(error).any(|candidate| {
+        candidate
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+            || candidate
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+    })
+}
+
 pub fn with_context_length_hint(message: &str) -> String {
     if is_context_length_error_message(message) {
         format!(

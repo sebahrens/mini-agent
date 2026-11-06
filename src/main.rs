@@ -377,6 +377,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     let loaded_warning_count = cfg.load_warnings.len();
     config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
+    provider::set_provider_timeouts(cfg.provider_timeouts);
     for warning in &cfg.load_warnings[loaded_warning_count..] {
         eprintln!("warning: {warning}");
     }
