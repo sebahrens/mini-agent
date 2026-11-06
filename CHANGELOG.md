@@ -12,6 +12,15 @@ Notable changes to mini-agent are documented in this file. The format follows
   advertises `fs.readTextFile`/`fs.writeTextFile`, `read`, `edit` and overwrite `write` use the
   editor's live text and publish through it, still behind the workspace and permission checks
   (mini-agent-oapz6).
+- Context/compaction: a provider context-length rejection compacts once per turn and resumes in the
+  TUI and ACP as in headless (mini-agent-cj9oh); TUI mid-turn compaction covers goal/loop rounds and
+  `--no-session` (mini-agent-wr9nw); `compaction_model` budgets follow its own window
+  (mini-agent-tf54j); `session_retention_days` also prunes at headless and ACP startup
+  (mini-agent-5gfko); a `service_tier` with a USD ceiling warns at startup and in `/cost`
+  (mini-agent-grngd).
+- Hosted web search: new `hosted-web-search-allowed-domains`, `-blocked-domains` and `-max-uses`
+  (mini-agent-8fcmp); granular, regex and mode-level `web_search` denies now withhold the hosted
+  tool (mini-agent-5zh97).
 ### Security
 
 - `read` of a PDF parses in linear time and within node, font and ToUnicode-entry budgets, with a
