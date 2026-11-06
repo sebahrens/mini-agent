@@ -761,6 +761,32 @@ their output: one run captures up to 16 MiB (30 s), each call returns at most
 `total_bytes`, and `truncated` reports output beyond the run ceiling. There are
 still no remotes, fetch/pull/push or network operations.
 
+`status` collapses untracked directories (`? dir/`), runs under a 30 s / 256 KiB budget and
+returns `{records, truncated, counts}`; output past the cap lists only complete records with
+`truncated: true` and a `truncation_note` instead of failing, and every mutation's before/after
+snapshot tolerates truncation. `status` accepts optional `paths`, which narrows the query and lists
+untracked files inside them individually. `stage` expands directory operands with a 16 MiB budget
+and checks attributes over stdin, so a directory of many thousands of files stages; a selection too
+large for that budget fails with a message to stage narrower subdirectories (mini-agent-ql57u).
+
+`commit` and `tag` results always carry `hooks_run: false`, `signed: false` and a `notice`: the
+tool forces `core.hooksPath=/dev/null` and disables commit/tag signing, so repository hooks
+(pre-commit, commit-msg) and required signatures are not applied and the model must not claim they
+passed. `commit` also accepts `signoff` (adds `Signed-off-by`), `allow_empty`, and `amend`. Amend
+is guarded: it needs the separate `git/amend` permission in addition to `git/commit`, an existing
+`HEAD`, and a `HEAD` not contained in any remote-tracking ref (`refs/remotes/*`), so published
+history is never rewritten (mini-agent-v7fnv).
+
+`diff` and `log` take `revision` as a single revision or a range (`a..b`, `a...b`; each side is
+validated with `rev-parse --verify`, so options and malformed operands are rejected). `diff` also
+accepts `revision_to` (two-commit diff) and `staged` (index vs HEAD, or vs `revision`); ranges
+cannot be combined with those. `log` accepts `skip` and returns `skip`/`next_skip` (non-null when a
+full `max_count` page was returned) so history beyond 100 commits is reachable, plus fixed-string
+`author` and `grep` filters. `blame` (one `path`, optional `start_line`/`end_line`/`revision`) is
+paged like `diff` and uses the `git/show` permission key. `reset`, `revert`, `cherry-pick`,
+`merge`, `rebase`, `fetch`, `pull` and `push` are intentionally not offered: they rewrite history
+or touch remotes/network, outside the fixed local-only surface (mini-agent-kg67c).
+
 `src/ui/slash/git.rs` owns parsing, bounded request-path selection, proposal
 validation and SDK-free native actors for `/diff`, `/commit` and `/pr`. The App
 owns the preview, async event receiver and captured session/workspace identity.

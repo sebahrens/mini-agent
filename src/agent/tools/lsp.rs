@@ -168,11 +168,17 @@ impl Tool for LspTool {
                     // `binding` and its descriptor are released here before
                     // the next cache candidate is opened.
                 }
-                let output = self
+                let mut output = self
                     .manager
                     .all_diagnostics_block_for_snapshots(&snapshots)
                     .map(|block| format!("Files with diagnostics:\n{block}"))
                     .unwrap_or_else(|| "No diagnostics.".to_string());
+                let dropped = self.manager.dropped_diagnostic_files();
+                if dropped > 0 {
+                    output.push_str(&format!(
+                        "\n[{dropped} files' diagnostics dropped: cache full]"
+                    ));
+                }
                 Ok(with_coaching(coaching, output))
             }
         }
@@ -204,7 +210,7 @@ pub struct LspNavigateTool {
     pub ask_tx: Option<AskSender>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LspNavigateArgs {
     /// definition | type_definition | implementation | references | hover |
@@ -219,6 +225,18 @@ pub struct LspNavigateArgs {
     pub column: Option<u32>,
     /// Symbol name filter for workspace_symbols.
     pub query: Option<String>,
+    /// rename: the new identifier.
+    #[serde(default)]
+    pub new_name: Option<String>,
+    /// code_actions: 1-based end line of the range (default `line`).
+    #[serde(default)]
+    pub end_line: Option<u32>,
+    /// code_actions: 1-based end column of the range (default `column`).
+    #[serde(default)]
+    pub end_column: Option<u32>,
+    /// code_actions: 1-based number of an action whose edit to preview.
+    #[serde(default)]
+    pub action: Option<u32>,
 }
 
 impl LspNavigateTool {
@@ -243,7 +261,7 @@ impl Tool for LspNavigateTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Semantic code navigation through the project's language server. `op`: definition, type_definition, implementation, references (need `line` and `column`, 1-based, pointing at the symbol), hover (type/docs at that position), symbols (outline of `path`), workspace_symbols (search by `query`; `path` selects the language server). Returns workspace-relative `path:line:column` locations (1-based), capped at 100. Definitions in dependencies or the standard library come back as absolute paths marked `(outside workspace)`; open them with `read` (subject to read permission).".to_string()
+        "Semantic code navigation through the project's language server. `op`: definition, type_definition, implementation, references (need `line` and `column`, 1-based, pointing at the symbol), hover (type/docs at that position), symbols (outline of `path`), workspace_symbols (search by `query`; `path` selects the language server), incoming_calls / outgoing_calls (call hierarchy of the function at `line`/`column`), rename (needs `new_name`; returns the server's workspace edit as a preview and changes NO file; it needs `edit` permission for `path`; apply the edits yourself with `edit`) and code_actions (quick fixes and refactors for `line`/`column`, optionally through `end_line`/`end_column`; pass `action`=N to preview that action's edit; server commands are never executed). An empty answer from a server that is still indexing says so instead of reporting no results. Returns workspace-relative `path:line:column` locations (1-based), capped at 100. Definitions in dependencies or the standard library come back as absolute paths marked `(outside workspace)`; open them with `read` (subject to read permission).".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -252,12 +270,16 @@ impl Tool for LspNavigateTool {
             "properties": {
                 "op": {
                     "type": "string",
-                    "enum": ["definition", "type_definition", "implementation", "references", "hover", "symbols", "workspace_symbols"]
+                    "enum": ["definition", "type_definition", "implementation", "references", "hover", "symbols", "workspace_symbols", "incoming_calls", "outgoing_calls", "rename", "code_actions"]
                 },
                 "path": { "type": "string", "description": "File to query" },
                 "line": { "type": "integer", "minimum": 1, "description": "1-based line (position ops)" },
                 "column": { "type": "integer", "minimum": 1, "description": "1-based column (position ops)" },
-                "query": { "type": "string", "description": "Symbol filter for workspace_symbols" }
+                "query": { "type": "string", "description": "Symbol filter for workspace_symbols" },
+                "new_name": { "type": "string", "maxLength": 256, "description": "rename: the new identifier" },
+                "end_line": { "type": "integer", "minimum": 1, "description": "code_actions: 1-based end line of the range" },
+                "end_column": { "type": "integer", "minimum": 1, "description": "code_actions: 1-based end column of the range" },
+                "action": { "type": "integer", "minimum": 1, "description": "code_actions: preview the edit of this action number" }
             },
             "required": ["op", "path"]
         })
@@ -267,7 +289,7 @@ impl Tool for LspNavigateTool {
         use crate::extras::lsp::navigate::{NavAnswer, NavOp, NavQuery};
         let op = NavOp::parse(args.op.trim()).ok_or_else(|| {
             ToolError::Msg(format!(
-                "Unknown op '{}'. Use definition, type_definition, implementation, references, hover, symbols or workspace_symbols.",
+                "Unknown op '{}'. Use definition, type_definition, implementation, references, hover, symbols, workspace_symbols, incoming_calls, outgoing_calls, rename or code_actions.",
                 args.op
             ))
         })?;
@@ -284,6 +306,45 @@ impl Tool for LspNavigateTool {
         } else {
             (0, 0)
         };
+        let new_name = args.new_name.clone().unwrap_or_default();
+        if op == NavOp::Rename {
+            let valid = !new_name.trim().is_empty()
+                && new_name.len() <= crate::extras::lsp::navigate::MAX_NEW_NAME_BYTES
+                && !new_name.chars().any(char::is_control)
+                && !new_name.chars().any(char::is_whitespace);
+            if !valid {
+                return Err(ToolError::Msg(
+                    "rename needs a `new_name`: a single identifier of at most 256 bytes, without whitespace or control characters.".to_string(),
+                ));
+            }
+        } else if args.new_name.is_some() {
+            return Err(ToolError::Msg(
+                "new_name is supported only by rename.".to_string(),
+            ));
+        }
+        let end = match (op, args.end_line, args.end_column) {
+            (NavOp::CodeActions, Some(line @ 1..), Some(column @ 1..)) => {
+                Some((line - 1, column - 1))
+            }
+            (NavOp::CodeActions, None, None) => None,
+            (NavOp::CodeActions, _, _) => {
+                return Err(ToolError::Msg(
+                    "code_actions needs both end_line and end_column (1-based) or neither."
+                        .to_string(),
+                ));
+            }
+            (_, None, None) => None,
+            _ => {
+                return Err(ToolError::Msg(
+                    "end_line and end_column are supported only by code_actions.".to_string(),
+                ));
+            }
+        };
+        if args.action.is_some() && op != NavOp::CodeActions {
+            return Err(ToolError::Msg(
+                "action is supported only by code_actions.".to_string(),
+            ));
+        }
         let expanded = crate::fs::expand_tilde(&args.path);
         let path = self
             .manager
@@ -313,6 +374,21 @@ impl Tool for LspNavigateTool {
             false,
         )
         .await?;
+        // A rename proposes edits to source files: it also needs `edit`
+        // permission for the file, though nothing is written here.
+        let coaching = if op == NavOp::Rename {
+            let edit_coaching = check_perm_canonical_path(
+                &self.permission,
+                &self.ask_tx,
+                "edit",
+                permission_path.as_ref(),
+                false,
+            )
+            .await?;
+            coaching.or(edit_coaching)
+        } else {
+            coaching
+        };
         // Synchronize the authorized bytes so positions refer to the file on
         // disk, then ask the server.
         let relative = Path::new(&expanded);
@@ -326,8 +402,11 @@ impl Tool for LspNavigateTool {
             line,
             character,
             query: args.query.unwrap_or_default(),
+            end,
+            new_name,
+            action_index: args.action,
         };
-        let answer = self
+        let (answer, indexing) = self
             .manager
             .navigate(&path, &query)
             .await
@@ -426,7 +505,150 @@ impl Tool for LspNavigateTool {
                 }
                 output
             }
+            NavAnswer::Edit(preview) => {
+                let deny = super::walk_deny_filter(&self.permission, "read", Some(&root));
+                render_edit_preview(
+                    &preview,
+                    &root,
+                    deny.as_ref(),
+                    op == NavOp::Rename,
+                    &query.new_name,
+                )
+            }
+            NavAnswer::Actions { actions, truncated } => {
+                render_actions(&actions, truncated, indexing)
+            }
+        };
+        let output = if indexing {
+            let note = "[the language server is still indexing, so this answer may be incomplete; retry in a few seconds]";
+            format!("{output}\n{note}")
+        } else {
+            output
         };
         Ok(with_coaching(coaching, output))
     }
+}
+
+fn render_edit_preview(
+    preview: &crate::extras::lsp::navigate::EditPreview,
+    root: &Path,
+    deny: Option<&super::find_files::PathFilter>,
+    rename: bool,
+    new_name: &str,
+) -> String {
+    let mut hidden = 0usize;
+    let mut body = String::new();
+    let mut files = 0usize;
+    for file in &preview.files {
+        if deny.is_some_and(|deny| deny(&file.path, false)) {
+            hidden += 1;
+            continue;
+        }
+        files += 1;
+        let shown = file
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&file.path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        body.push_str(&format!("{shown}\n"));
+        for edit in &file.edits {
+            body.push_str(&format!(
+                "  {}:{}-{}:{} -> {:?}\n",
+                edit.start.0 + 1,
+                edit.start.1 + 1,
+                edit.end.0 + 1,
+                edit.end.1 + 1,
+                edit.new_text
+            ));
+        }
+        if file.omitted_edits > 0 {
+            body.push_str(&format!(
+                "  [{} more edits in this file not shown]\n",
+                file.omitted_edits
+            ));
+        }
+    }
+    for operation in &preview.file_ops {
+        body.push_str(&format!("file operation: {operation}\n"));
+    }
+    let heading = if rename {
+        format!(
+            "Rename to `{new_name}`: {} edits in {files} files. PREVIEW ONLY, no file was modified; apply the edits with `edit`.",
+            preview.total_edits
+        )
+    } else {
+        format!(
+            "Code action edit: {} edits in {files} files. PREVIEW ONLY, no file was modified; apply the edits with `edit`.",
+            preview.total_edits
+        )
+    };
+    let mut out = if files == 0 && preview.file_ops.is_empty() {
+        format!("{heading}\n(the server returned no edits)")
+    } else {
+        format!("{heading}\n{body}")
+    };
+    if preview.omitted_files > 0 {
+        out.push_str(&format!(
+            "[{} more files not shown (limit {})]\n",
+            preview.omitted_files,
+            crate::extras::lsp::navigate::MAX_EDIT_FILES
+        ));
+    }
+    if preview.outside > 0 {
+        out.push_str(&format!(
+            "[{} edits or operations outside the workspace omitted]\n",
+            preview.outside
+        ));
+    }
+    if hidden > 0 {
+        out.push_str(&format!("[{hidden} files hidden by permission rules]\n"));
+    }
+    out.trim_end().to_string()
+}
+
+fn render_actions(
+    actions: &[crate::extras::lsp::navigate::ActionView],
+    truncated: usize,
+    indexing: bool,
+) -> String {
+    if actions.is_empty() {
+        return if indexing {
+            "No code actions.".to_string()
+        } else {
+            "No code actions available at that position.".to_string()
+        };
+    }
+    let mut out = String::new();
+    for (index, action) in actions.iter().enumerate() {
+        out.push_str(&format!("{}. {}", index + 1, action.title));
+        if let Some(kind) = &action.kind {
+            out.push_str(&format!(" [{kind}]"));
+        }
+        if action.preferred {
+            out.push_str(" (preferred)");
+        }
+        if action.edit_count > 0 {
+            out.push_str(&format!(
+                " (edits {} places in {} files)",
+                action.edit_count, action.edit_files
+            ));
+        }
+        if action.has_command {
+            out.push_str(" (runs a server command; never executed here)");
+        }
+        if let Some(reason) = &action.disabled {
+            out.push_str(&format!(" (disabled: {reason})"));
+        }
+        out.push('\n');
+    }
+    if truncated > 0 {
+        out.push_str(&format!(
+            "[{truncated} more actions not shown (limit {})]\n",
+            crate::extras::lsp::navigate::MAX_ACTIONS
+        ));
+    }
+    out.push_str("Pass `action`=N to preview an action's edit.");
+    out
 }

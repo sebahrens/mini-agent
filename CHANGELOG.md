@@ -92,6 +92,22 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `read` and `web_fetch` open PDFs encrypted with the standard security handler and an empty user
   password (RC4-40/128, AESV2, AES-256); files needing a real password report `password required`
   (mini-agent-6xx6x). Adds the `aes` and `md-5` crates (RustCrypto, already-shared digest stack).
+- `lsp_navigate` waits (bounded) for an indexing server and says "still indexing" instead of
+  "No results", retries `ContentModified`/`ServerCancelled` once, and the LSP client advertises
+  work-done progress (mini-agent-jayd0). It also gains `incoming_calls`/`outgoing_calls`, a
+  preview-only `rename` (needs `edit` permission, changes no file) and `code_actions` (mini-agent-dl2ie).
+- `lsp_diagnostics` no longer silently loses files once the diagnostic cache is full: clean entries
+  are evicted first, then least recently published, and the project-wide listing appends
+  `[N files' diagnostics dropped: cache full]` (mini-agent-643mg).
+- `git` diff/log accept revision ranges (`a..b`, `a...b`), `diff` a second revision and `staged`,
+  `log` `skip`/`next_skip`/`author`/`grep`, and a new `blame` operation; history-rewriting and
+  network operations stay intentionally excluded (mini-agent-kg67c).
+- `git commit` gains `signoff`, `allow_empty` and a guarded `amend` (new `git/amend` permission;
+  refused when HEAD is already in a remote-tracking ref); commit and tag results state that hooks
+  and signing were not run (mini-agent-v7fnv).
+- `git status` collapses untracked directories, accepts `paths`, and reports `truncated`/`counts`
+  instead of failing past 256 KiB (so stage/commit/restore snapshots work in repos with huge
+  untracked trees); `stage` handles directories of many thousands of files (mini-agent-ql57u).
 - `list_dir` pages through every entry of a flat directory (the 10,000-entry cap now applies only to
   depth 2-3 trees); `find_files` accepts `offset`/`limit` and names `continue with offset=N`.
 - `git` diff/show pages and `job_status` polls are self-bounded (git pages scale under

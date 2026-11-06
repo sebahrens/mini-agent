@@ -166,6 +166,9 @@ fn main() {
         });
 
     let mut last_synced: Option<(String, i64)> = None;
+    let nav_behavior = env::var("LSP_FIXTURE_NAV_BEHAVIOR").unwrap_or_default();
+    let mut nav_requests = 0u32;
+    let mut indexing_done = false;
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = io::stdout().lock();
@@ -191,7 +194,7 @@ fn main() {
             let capabilities = if mode == "save-diagnostics" {
                 "{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}}}"
             } else if mode == "navigate" {
-                "{\"definitionProvider\":true,\"referencesProvider\":true,\"hoverProvider\":true,\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true}"
+                "{\"definitionProvider\":true,\"referencesProvider\":true,\"hoverProvider\":true,\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"callHierarchyProvider\":true,\"renameProvider\":true,\"codeActionProvider\":true}"
             } else {
                 "{}"
             };
@@ -202,6 +205,9 @@ fn main() {
         } else if body.contains("\"method\":\"initialized\"") {
             if restart_first {
                 return;
+            }
+            if mode == "navigate" && nav_behavior.starts_with("indexing") {
+                write_frame(&mut stdout, "{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":\"idx\",\"value\":{\"kind\":\"begin\",\"title\":\"Indexing\"}}}");
             }
             if mode == "stop-reading" {
                 // Stay alive with stdin open but never read again: the client's
@@ -291,6 +297,7 @@ fn main() {
             }
         } else if mode == "navigate"
             && (body.contains("\"method\":\"textDocument/")
+                || body.contains("\"method\":\"callHierarchy/")
                 || body.contains("\"method\":\"workspace/symbol\""))
         {
             let id = request_id(&body);
@@ -307,7 +314,55 @@ fn main() {
                 "{{\"start\":{{\"line\":{line},\"character\":{character}}},\"end\":{{\"line\":{line},\"character\":{}}}}}",
                 character + 1
             );
-            let result = if body.contains("textDocument/definition") {
+            nav_requests += 1;
+            if nav_behavior == "modified-once" && nav_requests == 1 {
+                write_frame(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32801,\"message\":\"content modified\"}}}}"));
+                continue;
+            }
+            if nav_behavior == "always-modified" {
+                write_frame(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32802,\"message\":\"cancelled\"}}}}"));
+                continue;
+            }
+            if nav_behavior.starts_with("indexing") && !indexing_done {
+                write_frame(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":[]}}"));
+                if nav_behavior == "indexing-then-ready" {
+                    thread::sleep(Duration::from_millis(150));
+                    write_frame(&mut stdout, "{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":\"idx\",\"value\":{\"kind\":\"end\"}}}");
+                    indexing_done = true;
+                }
+                continue;
+            }
+            let new_name = body
+                .split_once("\"newName\":\"")
+                .map(|(_, rest)| rest.split('"').next().unwrap().to_string())
+                .unwrap_or_default();
+            let item = format!(
+                "{{\"name\":\"inner\",\"kind\":12,\"uri\":\"{uri}\",\"range\":{},\"selectionRange\":{}}}",
+                range(1, 0), range(1, 3)
+            );
+            let result = if body.contains("textDocument/prepareCallHierarchy") {
+                format!("[{item}]")
+            } else if body.contains("callHierarchy/incomingCalls") {
+                format!(
+                    "[{{\"from\":{{\"name\":\"caller\",\"kind\":12,\"uri\":\"{uri}\",\"range\":{},\"selectionRange\":{}}},\"fromRanges\":[{}]}}]",
+                    range(4, 0), range(4, 3), range(5, 2)
+                )
+            } else if body.contains("callHierarchy/outgoingCalls") {
+                format!(
+                    "[{{\"to\":{{\"name\":\"callee\",\"kind\":12,\"uri\":\"{uri}\",\"range\":{},\"selectionRange\":{}}},\"fromRanges\":[{}]}}]",
+                    range(8, 0), range(8, 3), range(1, 2)
+                )
+            } else if body.contains("textDocument/rename") {
+                format!(
+                    "{{\"changes\":{{\"{uri}\":[{{\"range\":{},\"newText\":\"{new_name}\"}},{{\"range\":{},\"newText\":\"{new_name}\"}}],\"file:///nonexistent-outside/lib.rs\":[{{\"range\":{},\"newText\":\"x\"}}]}}}}",
+                    range(1, 3), range(6, 4), range(0, 0)
+                )
+            } else if body.contains("textDocument/codeAction") {
+                format!(
+                    "[{{\"title\":\"Add import\",\"kind\":\"quickfix\",\"isPreferred\":true,\"edit\":{{\"changes\":{{\"{uri}\":[{{\"range\":{},\"newText\":\"use x;\\n\"}}]}}}}}},{{\"title\":\"Run server thing\",\"command\":{{\"title\":\"t\",\"command\":\"do.it\"}}}}]",
+                    range(0, 0)
+                )
+            } else if body.contains("textDocument/definition") {
                 format!("{{\"uri\":\"{uri}\",\"range\":{}}}", range(2, 4))
             } else if body.contains("textDocument/references") {
                 let outside = env::var("LSP_FIXTURE_OUTSIDE_URI")
@@ -1422,6 +1477,7 @@ async fn lsp_process_navigate_tool_maps_locations_and_respects_read_denies() {
         line: position.map(|(line, _)| line),
         column: position.map(|(_, column)| column),
         query: Some("found".into()),
+        ..Default::default()
     };
     let definition = tool
         .call(args("definition", "src/nav.rs", Some((2, 4))))
@@ -1538,6 +1594,7 @@ async fn lsp_process_navigate_names_outside_workspace_locations_subject_to_read_
         line: Some(1),
         column: Some(1),
         query: None,
+        ..Default::default()
     };
     let open = LspNavigateTool::new(manager.clone(), None, None)
         .call(args())
@@ -2427,4 +2484,207 @@ async fn lsp_process_idle_server_is_retired_and_respawned_without_cooldown() {
     manager.shutdown().await;
     drop(manager);
     fixture.cleanup().await;
+}
+
+struct NavFixture {
+    fixture: FixtureBuild,
+    workspace: PathBuf,
+    manager: LspManager,
+}
+
+impl NavFixture {
+    fn new(name: &str, behavior: &str) -> Self {
+        let fixture = FixtureBuild::compile(name);
+        let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/nav.rs"),
+            "struct Outer;\nfn inner() {}\n",
+        )
+        .unwrap();
+        let lease = fixture.path("navigate.lease");
+        let mut server = fixture.config("navigate", &lease);
+        server.extensions = vec![".rs".into()];
+        server
+            .env
+            .insert("LSP_FIXTURE_NAV_BEHAVIOR".into(), behavior.into());
+        let manager = LspManager::new(
+            &LspConfig {
+                servers: HashMap::from([("fixture".into(), server)]),
+                ..Default::default()
+            },
+            Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+        );
+        Self {
+            fixture,
+            workspace,
+            manager,
+        }
+    }
+
+    fn args(op: &str) -> crate::agent::tools::lsp::LspNavigateArgs {
+        crate::agent::tools::lsp::LspNavigateArgs {
+            op: op.into(),
+            path: "src/nav.rs".into(),
+            line: Some(2),
+            column: Some(4),
+            ..Default::default()
+        }
+    }
+
+    async fn finish(self) {
+        self.manager.shutdown().await;
+        drop(self.manager);
+        self.fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn lsp_process_navigate_retries_content_modified_once() {
+    use crate::agent::tools::lsp::LspNavigateTool;
+    let nav = NavFixture::new("nav-modified-once", "modified-once");
+    let tool = LspNavigateTool::new(nav.manager.clone(), None, None);
+    let retried = tool.call(NavFixture::args("definition")).await;
+    nav.finish().await;
+    assert_eq!(retried.unwrap(), "src/nav.rs:3:5");
+
+    let nav = NavFixture::new("nav-always-modified", "always-modified");
+    let tool = LspNavigateTool::new(nav.manager.clone(), None, None);
+    let failed = tool.call(NavFixture::args("definition")).await;
+    nav.finish().await;
+    let failed = failed.unwrap_err().to_string();
+    assert!(failed.contains("again after one retry"), "{failed}");
+}
+
+#[tokio::test]
+async fn lsp_process_navigate_waits_for_indexing_and_reports_still_indexing() {
+    use crate::agent::tools::lsp::LspNavigateTool;
+    let nav = NavFixture::new("nav-indexing-ready", "indexing-then-ready");
+    let tool = LspNavigateTool::new(nav.manager.clone(), None, None);
+    let ready = tool.call(NavFixture::args("definition")).await;
+    nav.finish().await;
+    // The empty first answer waited for progress to end, then asked again.
+    assert_eq!(ready.unwrap(), "src/nav.rs:3:5");
+
+    let nav = NavFixture::new("nav-indexing-forever", "indexing-forever");
+    let tool = LspNavigateTool::new(nav.manager.clone(), None, None);
+    let stuck = tool.call(NavFixture::args("definition")).await;
+    nav.finish().await;
+    let stuck = stuck.unwrap();
+    assert!(stuck.contains("No results."), "{stuck}");
+    assert!(stuck.contains("still indexing"), "{stuck}");
+}
+
+#[tokio::test]
+async fn lsp_process_navigate_call_hierarchy_rename_preview_and_code_actions() {
+    use crate::agent::tools::lsp::LspNavigateTool;
+    let nav = NavFixture::new("nav-new-ops", "none");
+    let tool = LspNavigateTool::new(nav.manager.clone(), None, None);
+    let incoming = tool.call(NavFixture::args("incoming_calls")).await.unwrap();
+    let outgoing = tool.call(NavFixture::args("outgoing_calls")).await.unwrap();
+    let rename = tool
+        .call(crate::agent::tools::lsp::LspNavigateArgs {
+            new_name: Some("renamed".into()),
+            ..NavFixture::args("rename")
+        })
+        .await
+        .unwrap();
+    let missing_name = tool.call(NavFixture::args("rename")).await;
+    let bad_name = tool
+        .call(crate::agent::tools::lsp::LspNavigateArgs {
+            new_name: Some("two words".into()),
+            ..NavFixture::args("rename")
+        })
+        .await;
+    let actions = tool.call(NavFixture::args("code_actions")).await.unwrap();
+    let preview = tool
+        .call(crate::agent::tools::lsp::LspNavigateArgs {
+            action: Some(1),
+            ..NavFixture::args("code_actions")
+        })
+        .await
+        .unwrap();
+    let command_only = tool
+        .call(crate::agent::tools::lsp::LspNavigateArgs {
+            action: Some(2),
+            ..NavFixture::args("code_actions")
+        })
+        .await;
+    let stray = tool
+        .call(crate::agent::tools::lsp::LspNavigateArgs {
+            new_name: Some("x".into()),
+            ..NavFixture::args("definition")
+        })
+        .await;
+    let on_disk = fs::read_to_string(nav.workspace.join("src/nav.rs")).unwrap();
+
+    // Rename is gated by `edit` permission even though it writes nothing.
+    let permission = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                edit: Some(crate::permission::ToolPerm::Simple(
+                    crate::permission::Action::Deny,
+                )),
+                ..Default::default()
+            }),
+            crate::permission::SecurityMode::Standard,
+            Some(nav.workspace.clone()),
+            Some(vec!["guarded".into(), "standard".into()]),
+        )
+        .unwrap(),
+    ));
+    let guarded = LspNavigateTool::new(nav.manager.clone(), Some(permission), None);
+    let denied = guarded
+        .call(crate::agent::tools::lsp::LspNavigateArgs {
+            new_name: Some("renamed".into()),
+            ..NavFixture::args("rename")
+        })
+        .await;
+    let read_op_allowed = guarded.call(NavFixture::args("incoming_calls")).await;
+    nav.finish().await;
+
+    assert_eq!(incoming, "function caller — src/nav.rs:5:4");
+    assert_eq!(outgoing, "function callee — src/nav.rs:9:4");
+    assert!(
+        rename.contains("PREVIEW ONLY, no file was modified"),
+        "{rename}"
+    );
+    assert!(rename.contains("src/nav.rs"), "{rename}");
+    assert!(rename.contains("-> \"renamed\""), "{rename}");
+    assert!(rename.contains("2:4-2:5"), "{rename}");
+    assert!(
+        rename.contains("1 edits or operations outside the workspace omitted"),
+        "{rename}"
+    );
+    assert!(!rename.contains("nonexistent-outside"), "{rename}");
+    assert!(missing_name.unwrap_err().to_string().contains("new_name"));
+    assert!(bad_name.unwrap_err().to_string().contains("new_name"));
+    assert!(
+        actions.contains("1. Add import [quickfix] (preferred) (edits 1 places in 1 files)"),
+        "{actions}"
+    );
+    assert!(
+        actions.contains("2. Run server thing (runs a server command; never executed here)"),
+        "{actions}"
+    );
+    assert!(
+        preview.contains("Code action edit: 1 edits in 1 files. PREVIEW ONLY"),
+        "{preview}"
+    );
+    assert!(preview.contains("\"use x;\\n\""), "{preview}");
+    assert!(
+        command_only
+            .unwrap_err()
+            .to_string()
+            .contains("never executed")
+    );
+    assert!(stray.unwrap_err().to_string().contains("only by rename"));
+    assert_eq!(on_disk, "struct Outer;\nfn inner() {}\n");
+    assert!(
+        denied
+            .unwrap_err()
+            .to_string()
+            .contains("Permission denied")
+    );
+    assert!(read_op_allowed.is_ok());
 }

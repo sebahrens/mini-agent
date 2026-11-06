@@ -236,6 +236,8 @@ fn lsp_process_diagnostic_store_is_scoped_and_cumulatively_bounded() {
     assert!(first.related_information.is_none());
     assert!(first.data.is_none());
     drop(guard);
+    // At the ceiling a new file evicts the least recently published one and
+    // the loss is counted.
     assert_eq!(
         store_diagnostics_for_test(
             &store,
@@ -246,8 +248,14 @@ fn lsp_process_diagnostic_store_is_scoped_and_cumulatively_bounded() {
                 "no".to_string()
             )
         ),
-        None
+        Some(true)
     );
+    let guard = store.lock().unwrap();
+    assert_eq!(guard.len(), 128);
+    assert!(!guard.contains_key("file:///workspace/0.rs"));
+    assert!(guard.contains_key("file:///workspace/overflow.rs"));
+    drop(guard);
+    assert_eq!(store.dropped_files(), 1);
 }
 
 // ── registry ────────────────────────────────────────────────────────────
@@ -1515,10 +1523,14 @@ async fn aggregate_snapshot_caps_high_cardinality_high_volume_diagnostics_before
         accepted > 0,
         "bounded cache must accept an initial diagnostic set"
     );
-    assert!(
-        accepted < 96,
-        "bounded cache must reject an oversized aggregate"
+    assert_eq!(
+        accepted, 96,
+        "a full cache evicts older entries instead of rejecting new ones"
     );
+    let (files, bytes, ..) = manager.diagnostic_cache_metrics();
+    assert!(files < 96, "the byte budget evicted some files");
+    assert!(bytes <= crate::extras::lsp::client::MAX_DIAGNOSTIC_CACHE_BYTES);
+    assert_eq!(manager.dropped_diagnostic_files(), 96 - files);
 
     let first_uri = manager.diagnostic_candidate_uris().remove(0);
     let binding = manager.bind_diagnostic_uri(&first_uri).await.unwrap();
@@ -1567,22 +1579,38 @@ async fn diagnostic_cache_hard_cap_bounds_candidate_sort_cardinality() {
                 "bounded candidate",
             )],
         );
-        assert_eq!(stored, index < cap);
+        assert!(
+            stored,
+            "a new error evicts the least recently published entry"
+        );
     }
     let candidates = manager.diagnostic_candidate_uris();
     assert_eq!(candidates.len(), cap);
     assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
+    // The 32 oldest files were evicted, not the newest ones, and the loss is counted.
+    assert_eq!(manager.dropped_diagnostic_files(), 32);
+    let oldest = root
+        .path()
+        .join("candidate-0000.rs")
+        .canonicalize()
+        .unwrap();
+    let newest = root
+        .path()
+        .join(format!("candidate-{:04}.rs", cap + 31))
+        .canonicalize()
+        .unwrap();
+    assert!(!candidates.contains(&crate::extras::lsp::client::file_uri(&oldest).unwrap()));
+    assert!(candidates.contains(&crate::extras::lsp::client::file_uri(&newest).unwrap()));
 }
 
 #[tokio::test]
 async fn diagnostic_cache_sanitizes_entries_and_enforces_global_byte_budget_on_updates() {
     let root = TempDir::new("diagnostic-cache-byte-budget");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
-    let mut accepted_uris = Vec::new();
-    let mut rejected_uri = None;
+    let mut uris = Vec::new();
 
     // Sanitization bounds every file well below the global budget, so publish
-    // enough files that the byte budget (not the file cap) is what rejects.
+    // enough files that the byte budget (not the file cap) forces eviction.
     for file_index in 0..crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES {
         let path = root.path().join(format!("oversized-{file_index:03}.rs"));
         std::fs::write(&path, "contents").unwrap();
@@ -1600,50 +1628,157 @@ async fn diagnostic_cache_sanitizes_entries_and_enforces_global_byte_budget_on_u
                 diagnostic
             })
             .collect();
-        if manager.publish_diagnostics_for_test(&uri, "rust", diagnostics) {
-            accepted_uris.push(uri);
-        } else {
-            rejected_uri = Some(uri);
-            break;
-        }
+        assert!(
+            manager.publish_diagnostics_for_test(&uri, "rust", diagnostics),
+            "the byte budget evicts older entries instead of rejecting new ones"
+        );
+        uris.push(uri);
     }
 
     let (files, total_bytes, max_count, max_message, has_extension_payload) =
         manager.diagnostic_cache_metrics();
-    assert_eq!(files, accepted_uris.len());
     assert!(files > 0);
     assert!(
-        rejected_uri.is_some(),
-        "global byte budget must reject growth"
+        files < crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES,
+        "eviction must come from the byte budget, not the file cap"
     );
-    assert!(
-        accepted_uris.len() < crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES,
-        "rejection must come from the byte budget, not the file cap"
-    );
+    assert_eq!(manager.dropped_diagnostic_files(), uris.len() - files);
     assert!(total_bytes <= crate::extras::lsp::client::MAX_DIAGNOSTIC_CACHE_BYTES);
     assert!(max_count <= crate::extras::lsp::client::MAX_DIAGNOSTICS_PER_FILE);
     assert!(max_message <= crate::extras::lsp::client::MAX_DIAGNOSTIC_MESSAGE_BYTES);
     assert!(!has_extension_payload);
+    // The newest file is always retained; the oldest was the first victim.
+    assert!(
+        manager
+            .diagnostic_cache_entry_metrics(uris.last().unwrap())
+            .is_some()
+    );
+    assert!(manager.diagnostic_cache_entry_metrics(&uris[0]).is_none());
 
-    // Shrinking an existing entry must subtract its prior retained size so a
-    // previously rejected new entry can consume the released budget.
-    assert!(manager.publish_diagnostics_for_test(&accepted_uris[0], "rust", Vec::new()));
-    let rejected_uri = rejected_uri.unwrap();
-    let replacement = (0..300)
-        .map(|index| {
-            diag(
-                lsp_types::DiagnosticSeverity::ERROR,
-                index,
-                0,
-                &"r".repeat(4096),
-            )
-        })
-        .collect();
-    assert!(manager.publish_diagnostics_for_test(&rejected_uri, "rust", replacement));
-    let (_, total_bytes, max_count, max_message, _) = manager.diagnostic_cache_metrics();
+    // Republishing a dropped file clears its dropped mark.
+    let before = manager.dropped_diagnostic_files();
+    assert!(manager.publish_diagnostics_for_test(
+        &uris[0],
+        "rust",
+        vec![diag(lsp_types::DiagnosticSeverity::ERROR, 0, 0, "back")],
+    ));
+    let (_, total_bytes, ..) = manager.diagnostic_cache_metrics();
     assert!(total_bytes <= crate::extras::lsp::client::MAX_DIAGNOSTIC_CACHE_BYTES);
-    assert!(max_count <= crate::extras::lsp::client::MAX_DIAGNOSTICS_PER_FILE);
-    assert!(max_message <= crate::extras::lsp::client::MAX_DIAGNOSTIC_MESSAGE_BYTES);
+    assert!(manager.dropped_diagnostic_files() >= before.saturating_sub(1));
+}
+
+#[tokio::test]
+async fn full_cache_evicts_clean_entries_first_and_clean_publishes_never_displace_errors() {
+    let root = TempDir::new("diagnostic-cache-clean-first");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let cap = crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES;
+    let uri_for = |name: &str| {
+        let path = root.path().join(name);
+        std::fs::write(&path, "contents").unwrap();
+        crate::extras::lsp::client::file_uri(&path.canonicalize().unwrap()).unwrap()
+    };
+    // The oldest entry has an error; every other entry is clean.
+    let error_uri = uri_for("error.rs");
+    assert!(manager.publish_diagnostics_for_test(
+        &error_uri,
+        "rust",
+        vec![diag(
+            lsp_types::DiagnosticSeverity::ERROR,
+            0,
+            0,
+            "kept error"
+        )],
+    ));
+    for index in 1..cap {
+        let uri = uri_for(&format!("clean-{index:04}.rs"));
+        assert!(manager.publish_diagnostics_for_test(&uri, "rust", Vec::new()));
+    }
+    // A new error evicts a clean entry, not the older error.
+    let fresh = uri_for("fresh.rs");
+    assert!(manager.publish_diagnostics_for_test(
+        &fresh,
+        "rust",
+        vec![diag(
+            lsp_types::DiagnosticSeverity::ERROR,
+            0,
+            0,
+            "fresh error"
+        )],
+    ));
+    assert!(manager.diagnostic_cache_entry_metrics(&error_uri).is_some());
+    assert!(manager.diagnostic_cache_entry_metrics(&fresh).is_some());
+    assert_eq!(
+        manager.dropped_diagnostic_files(),
+        0,
+        "only clean entries were evicted"
+    );
+
+    // Fill the rest with errors; a clean publish for a new file then has no
+    // clean entry to displace and is not stored, and loses nothing.
+    for index in 0..cap {
+        let uri = uri_for(&format!("err-{index:04}.rs"));
+        manager.publish_diagnostics_for_test(
+            &uri,
+            "rust",
+            vec![diag(lsp_types::DiagnosticSeverity::ERROR, 0, 0, "e")],
+        );
+    }
+    let newcomer = uri_for("newcomer.rs");
+    let before = manager.diagnostic_candidate_uris().len();
+    assert!(!manager.publish_diagnostics_for_test(&newcomer, "rust", Vec::new()));
+    assert_eq!(manager.diagnostic_candidate_uris().len(), before);
+}
+
+#[tokio::test]
+async fn re_created_entry_version_stays_above_the_evicted_one() {
+    let root = TempDir::new("diagnostic-cache-version-floor");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let cap = crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES;
+    let uri_for = |name: &str| {
+        let path = root.path().join(name);
+        std::fs::write(&path, "contents").unwrap();
+        crate::extras::lsp::client::file_uri(&path.canonicalize().unwrap()).unwrap()
+    };
+    let first = uri_for("first.rs");
+    for _ in 0..3 {
+        assert!(manager.publish_diagnostics_for_test(&first, "rust", Vec::new()));
+    }
+    let (baseline, _) = manager.diagnostic_cache_entry_metrics(&first).unwrap();
+    for index in 0..cap {
+        let uri = uri_for(&format!("other-{index:04}.rs"));
+        assert!(manager.publish_diagnostics_for_test(&uri, "rust", Vec::new()));
+    }
+    assert!(manager.diagnostic_cache_entry_metrics(&first).is_none());
+    assert!(manager.publish_diagnostics_for_test(&first, "rust", Vec::new()));
+    let (version, _) = manager.diagnostic_cache_entry_metrics(&first).unwrap();
+    assert!(version > baseline, "{version} must exceed {baseline}");
+}
+
+#[tokio::test]
+async fn project_wide_listing_discloses_files_dropped_from_a_full_cache() {
+    let root = TempDir::new("diagnostic-cache-dropped-notice");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let cap = crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES;
+    for index in 0..(cap + 3) {
+        let path = root.path().join(format!("f-{index:04}.rs"));
+        std::fs::write(&path, "contents").unwrap();
+        let uri = crate::extras::lsp::client::file_uri(&path.canonicalize().unwrap()).unwrap();
+        assert!(manager.publish_diagnostics_for_test(
+            &uri,
+            "rust",
+            vec![diag(lsp_types::DiagnosticSeverity::ERROR, 0, 0, "e")],
+        ));
+    }
+    let tool = LspTool {
+        manager: manager.clone(),
+        permission: None,
+        ask_tx: None,
+    };
+    let output = tool.call(LspArgs { path: None }).await.unwrap();
+    assert!(
+        output.contains("[3 files' diagnostics dropped: cache full]"),
+        "{output}"
+    );
 }
 
 #[tokio::test]
@@ -1678,39 +1813,27 @@ async fn oversized_existing_publish_invalidates_stale_diagnostics_and_advances_v
             .collect::<Vec<_>>()
     };
 
-    // Fill with maximum retained entries, then consume the remaining slack
-    // with smaller entries. The first rejected small entry proves that a
-    // maximum-sized replacement of the tiny victim cannot fit globally.
+    // Fill the cache with maximum retained entries so the replacement below
+    // can only fit by evicting others.
     for index in 0..32 {
         let path = root.path().join(format!("large-{index:02}.rs"));
         std::fs::write(&path, "contents").unwrap();
         let uri = crate::extras::lsp::client::file_uri(&path.canonicalize().unwrap()).unwrap();
-        if !manager.publish_diagnostics_for_test(&uri, "rust", large_publish()) {
-            break;
-        }
+        assert!(manager.publish_diagnostics_for_test(&uri, "rust", large_publish()));
     }
-    let mut rejected_small = false;
-    for index in 0..crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES {
-        let path = root.path().join(format!("padding-{index:03}.rs"));
-        std::fs::write(&path, "contents").unwrap();
-        let uri = crate::extras::lsp::client::file_uri(&path.canonicalize().unwrap()).unwrap();
-        let stored = manager.publish_diagnostics_for_test(
-            &uri,
-            "rust",
-            vec![diag(
-                lsp_types::DiagnosticSeverity::ERROR,
-                0,
-                0,
-                &"p".repeat(crate::extras::lsp::client::MAX_DIAGNOSTIC_MESSAGE_BYTES),
-            )],
-        );
-        if !stored {
-            rejected_small = true;
-            break;
-        }
-    }
-    assert!(rejected_small, "test setup must exhaust the cache budget");
 
+    // The victim was the oldest entry and was evicted by the fill; publish it
+    // again so it is the newest, with the diagnostic this test supersedes.
+    assert!(manager.publish_diagnostics_for_test(
+        &victim_uri,
+        "rust",
+        vec![diag(
+            lsp_types::DiagnosticSeverity::ERROR,
+            0,
+            0,
+            "stale diagnostic",
+        )],
+    ));
     let (old_version, old_count) = manager.diagnostic_cache_entry_metrics(&victim_uri).unwrap();
     assert_eq!(old_count, 1);
     assert!(
@@ -1721,19 +1844,15 @@ async fn oversized_existing_publish_invalidates_stale_diagnostics_and_advances_v
             .contains("stale diagnostic")
     );
 
-    // The valid publish is applied as an empty tombstone when its payload
-    // cannot be retained: callers are notified, the version advances, and the
-    // superseded diagnostics can no longer be queried.
+    // The replacement is retained whole by evicting other entries; the entry
+    // being updated is never its own victim and its version advances.
     assert!(manager.publish_diagnostics_for_test(&victim_uri, "rust", large_publish()));
     assert_eq!(
         manager.diagnostic_cache_entry_metrics(&victim_uri),
-        Some((old_version + 1, 0))
-    );
-    assert!(
-        manager
-            .diagnostics_block(&victim, Duration::ZERO)
-            .await
-            .is_none()
+        Some((
+            old_version + 1,
+            crate::extras::lsp::client::MAX_DIAGNOSTICS_PER_FILE
+        ))
     );
     let (_, total_bytes, _, _, _) = manager.diagnostic_cache_metrics();
     assert!(total_bytes <= crate::extras::lsp::client::MAX_DIAGNOSTIC_CACHE_BYTES);
@@ -2266,4 +2385,59 @@ fn idle_timeout_defaults_to_fifteen_minutes_and_zero_disables_retirement() {
     assert_eq!(cfg.idle_timeout(), None);
     cfg.idle_timeout_secs = Some(30);
     assert_eq!(cfg.idle_timeout(), Some(Duration::from_secs(30)));
+}
+
+#[test]
+fn rename_preview_is_bounded_and_never_names_outside_files() {
+    use crate::extras::lsp::navigate::{MAX_EDIT_FILES, MAX_EDITS_PER_FILE, edit_preview};
+    let root = std::path::PathBuf::from("/ws");
+    let map = |uri: &str| uri.strip_prefix("file:///ws/").map(|rest| root.join(rest));
+    let edit = |n: usize| {
+        serde_json::json!({
+            "range": {"start": {"line": n, "character": 0}, "end": {"line": n, "character": 1}},
+            "newText": format!("line one\nforged {}", "x".repeat(10_000)),
+        })
+    };
+    let mut changes = serde_json::Map::new();
+    changes.insert(
+        "file:///ws/many.rs".into(),
+        serde_json::Value::Array((0..200).map(edit).collect()),
+    );
+    for index in 0..(MAX_EDIT_FILES + 5) {
+        changes.insert(
+            format!("file:///ws/f{index}.rs"),
+            serde_json::json!([edit(0)]),
+        );
+    }
+    changes.insert("file:///etc/passwd".into(), serde_json::json!([edit(0)]));
+    let preview = edit_preview(&serde_json::json!({ "changes": changes }), &map);
+    assert_eq!(preview.files.len(), MAX_EDIT_FILES);
+    assert!(preview.omitted_files >= 5, "{}", preview.omitted_files);
+    assert_eq!(preview.outside, 1);
+    let many = preview
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("many.rs"))
+        .unwrap();
+    assert_eq!(many.edits.len(), MAX_EDITS_PER_FILE);
+    assert_eq!(many.omitted_edits, 200 - MAX_EDITS_PER_FILE);
+    assert!(
+        preview
+            .files
+            .iter()
+            .flat_map(|file| &file.edits)
+            .all(|edit| edit.new_text.len() <= 200),
+        "replacement text is cut"
+    );
+    // File operations outside the workspace are counted, never named.
+    let ops = edit_preview(
+        &serde_json::json!({"documentChanges": [
+            {"kind": "delete", "uri": "file:///etc/shadow"},
+            {"kind": "rename", "oldUri": "file:///ws/a.rs", "newUri": "file:///elsewhere/b.rs"},
+            {"kind": "create", "uri": "file:///ws/new.rs"},
+        ]}),
+        &map,
+    );
+    assert_eq!(ops.outside, 2);
+    assert_eq!(ops.file_ops, vec!["create /ws/new.rs".to_string()]);
 }

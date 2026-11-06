@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -317,11 +317,66 @@ pub struct FileDiags {
     pub content: Option<crate::fs::ContentDigest>,
     /// Conservative retained-memory accounting used by the global cache cap.
     pub cached_bytes: usize,
+    /// Store-clock stamp of the last publication; the eviction recency.
+    pub last_touched: u64,
+}
+
+/// URIs whose non-empty diagnostics were evicted (or refused) because the
+/// cache was full. Bounded: past [`MAX_TRACKED_DROPPED`] only a count is kept.
+const MAX_TRACKED_DROPPED: usize = 1024;
+
+#[derive(Default)]
+struct DroppedFiles {
+    uris: std::collections::HashSet<String>,
+    overflow: usize,
+}
+
+/// The diagnostic cache: uri → latest diagnostics plus the bookkeeping that
+/// makes eviction visible. `lock()` exposes the map exactly as before.
+#[derive(Default)]
+pub struct DiagStoreState {
+    map: Mutex<HashMap<String, FileDiags>>,
+    /// Monotonic recency clock for [`FileDiags::last_touched`].
+    clock: AtomicU64,
+    /// Highest version of any evicted entry. A re-created entry starts above
+    /// it so a waiter holding a pre-eviction baseline still sees progress.
+    version_floor: AtomicU64,
+    dropped: Mutex<DroppedFiles>,
+}
+
+impl DiagStoreState {
+    pub fn lock(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashMap<String, FileDiags>>> {
+        self.map.lock()
+    }
+
+    /// Files whose diagnostics were lost to a full cache and not republished.
+    pub fn dropped_files(&self) -> usize {
+        let dropped = self.dropped.lock().unwrap();
+        dropped.uris.len().saturating_add(dropped.overflow)
+    }
+
+    fn note_dropped(&self, uri: &str) {
+        let mut dropped = self.dropped.lock().unwrap();
+        if dropped.uris.contains(uri) {
+            return;
+        }
+        if dropped.uris.len() < MAX_TRACKED_DROPPED {
+            dropped.uris.insert(uri.to_string());
+        } else {
+            dropped.overflow = dropped.overflow.saturating_add(1);
+        }
+    }
+
+    fn note_published(&self, uri: &str) {
+        self.dropped.lock().unwrap().uris.remove(uri);
+    }
 }
 
 /// uri → latest diagnostics. Shared between the manager and every client's
 /// reader task.
-pub type DiagStore = Arc<Mutex<HashMap<String, FileDiags>>>;
+pub type DiagStore = Arc<DiagStoreState>;
 
 /// Hard ceiling for distinct files retained in the diagnostic cache. Updates
 /// to existing files remain allowed at the ceiling; new files are ignored.
@@ -369,6 +424,55 @@ struct DiagnosticProbe {
     version: i64,
     entered: oneshot::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
+}
+
+/// Most distinct server progress tokens tracked at once; further tokens are
+/// ignored so a hostile server cannot grow the set.
+const MAX_PROGRESS_TOKENS: usize = 64;
+/// Delay before the single retry of a request the server cancelled.
+const RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_millis(250)
+};
+/// LSP `ContentModified` and `ServerCancelled` error codes.
+const CONTENT_MODIFIED: i64 = -32801;
+const SERVER_CANCELLED: i64 = -32802;
+
+/// Work-done progress the server has begun and not ended (indexing, loading
+/// the workspace). While non-empty, an empty navigation answer is
+/// indistinguishable from "not ready yet".
+#[derive(Default)]
+struct ProgressState {
+    active: Mutex<std::collections::HashSet<String>>,
+}
+
+impl ProgressState {
+    fn apply(&self, params: &Value) {
+        let token = match params.get("token") {
+            Some(Value::String(token)) => token.clone(),
+            Some(Value::Number(token)) => token.to_string(),
+            _ => return,
+        };
+        let mut active = self.active.lock().unwrap();
+        match params
+            .get("value")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+        {
+            Some("begin") if active.len() < MAX_PROGRESS_TOKENS => {
+                active.insert(token);
+            }
+            Some("end") => {
+                active.remove(&token);
+            }
+            _ => {}
+        }
+    }
+
+    fn busy(&self) -> bool {
+        !self.active.lock().unwrap().is_empty()
+    }
 }
 
 struct TransportState {
@@ -436,6 +540,8 @@ pub struct LspClient {
     save_mode: AtomicU8,
     /// `capabilities` from the server's `initialize` result.
     capabilities: std::sync::OnceLock<Value>,
+    /// Active `$/progress` work-done tokens.
+    progress: Arc<ProgressState>,
     #[cfg(test)]
     sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
     #[cfg(test)]
@@ -549,6 +655,7 @@ impl LspClient {
         let stopped = Arc::new(AtomicBool::new(false));
         let stopped_notify = Arc::new(Notify::new());
         let open = Arc::new(Mutex::new(HashMap::new()));
+        let progress = Arc::new(ProgressState::default());
         // The reader is sequential, but its blocking publication can survive
         // reader cancellation. The supervisor retains this barrier until all
         // cache access and captured file handles have been released.
@@ -573,6 +680,7 @@ impl LspClient {
             let server_root = server_root.clone();
             let transport = transport.clone();
             let diagnostic_work = diagnostic_work.clone();
+            let progress = progress.clone();
             #[cfg(test)]
             let diagnostic_probe = diagnostic_probe.clone();
             tokio::spawn(async move {
@@ -684,6 +792,11 @@ impl LspClient {
                                 }
                             }
                         }
+                        (Some("$/progress"), None) => {
+                            if let Some(params) = msg.get("params") {
+                                progress.apply(params);
+                            }
+                        }
                         // Response to one of our requests.
                         (None, Some(id)) => {
                             if let Some(tx) = pending.lock().unwrap().remove(&id) {
@@ -693,6 +806,7 @@ impl LspClient {
                         _ => {}
                     }
                 }
+                progress.active.lock().unwrap().clear();
                 // Mark the transport unavailable before waking failed requests.
                 transport.close();
                 pending.lock().unwrap().clear();
@@ -759,6 +873,7 @@ impl LspClient {
             idle_task: Mutex::new(None),
             save_mode: AtomicU8::new(SAVE_NONE),
             capabilities: std::sync::OnceLock::new(),
+            progress,
             #[cfg(test)]
             sync_probes: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
@@ -778,7 +893,28 @@ impl LspClient {
                         "willSaveWaitUntil": false,
                         "didSave": true
                     },
-                    "publishDiagnostics": { "versionSupport": true }
+                    "publishDiagnostics": { "versionSupport": true },
+                    "callHierarchy": { "dynamicRegistration": false },
+                    "rename": { "dynamicRegistration": false, "prepareSupport": false },
+                    "codeAction": {
+                        "dynamicRegistration": false,
+                        "isPreferredSupport": true,
+                        "disabledSupport": true,
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": { "valueSet": [
+                                "quickfix", "refactor", "refactor.extract",
+                                "refactor.inline", "refactor.rewrite", "source",
+                                "source.organizeImports"
+                            ] }
+                        }
+                    }
+                },
+                "window": { "workDoneProgress": true },
+                "workspace": {
+                    "workspaceEdit": {
+                        "documentChanges": true,
+                        "resourceOperations": ["create", "rename", "delete"]
+                    }
                 }
             },
             "initializationOptions": cfg.initialization.clone().unwrap_or(Value::Null),
@@ -889,30 +1025,85 @@ impl LspClient {
             .is_some_and(|value| !matches!(value, Value::Null | Value::Bool(false)))
     }
 
+    /// Whether the server has work-done progress (indexing, workspace load)
+    /// in flight.
+    pub(crate) fn is_indexing(&self) -> bool {
+        self.progress.busy()
+    }
+
+    /// Waits until no progress is active, at most `timeout`. Returns whether
+    /// the server went idle.
+    pub(crate) async fn wait_until_idle(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.progress.busy() {
+            if !self.is_usable() || tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        true
+    }
+
     /// Sends a navigation request and returns its `result` (`Value::Null`
     /// for an empty answer). Errors on timeout, transport failure or an
-    /// error response.
+    /// error response. A `ContentModified` (-32801) or `ServerCancelled`
+    /// (-32802) reply is retried once, as the LSP specification directs.
     pub(crate) async fn query(
         &self,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
-        if !self.is_usable() {
-            return Err("language server is not running".to_string());
+        let started = tokio::time::Instant::now();
+        let mut retried = false;
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            match self.query_once(method, params.clone(), remaining).await {
+                Err((Some(CONTENT_MODIFIED | SERVER_CANCELLED), _))
+                    if !retried && started.elapsed() + RETRY_DELAY < timeout =>
+                {
+                    retried = true;
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err((code, message)) => {
+                    return Err(match code {
+                        Some(CONTENT_MODIFIED | SERVER_CANCELLED) => format!(
+                            "{message} (the server reported the document changed or cancelled the request, again after one retry; try again shortly)"
+                        ),
+                        _ => message,
+                    });
+                }
+                Ok(value) => return Ok(value),
+            }
         }
-        let response = self
-            .request(method, params, timeout)
-            .await
-            .ok_or_else(|| format!("'{method}' timed out after {} ms", timeout.as_millis()))?;
+    }
+
+    async fn query_once(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, (Option<i64>, String)> {
+        if !self.is_usable() {
+            return Err((None, "language server is not running".to_string()));
+        }
+        let response = self.request(method, params, timeout).await.ok_or_else(|| {
+            (
+                None,
+                format!("'{method}' timed out after {} ms", timeout.as_millis()),
+            )
+        })?;
         if let Some(error) = response.get("error") {
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            return Err(format!(
-                "'{method}' failed: {}",
-                truncate_utf8_bytes(message, MAX_DIAGNOSTIC_MESSAGE_BYTES)
+            return Err((
+                error.get("code").and_then(Value::as_i64),
+                format!(
+                    "'{method}' failed: {}",
+                    truncate_utf8_bytes(message, MAX_DIAGNOSTIC_MESSAGE_BYTES)
+                ),
             ));
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
@@ -1755,6 +1946,41 @@ pub(crate) fn store_diagnostics(
     stored
 }
 
+/// Evicts one entry other than `keep` (restricted to `server` when given):
+/// clean (empty) entries first, then the least recently published. Returns
+/// the freed bytes, or `None` when nothing is evictable. An evicted entry that
+/// still held diagnostics is recorded as dropped.
+fn evict_one(
+    state: &DiagStoreState,
+    store: &mut HashMap<String, FileDiags>,
+    server: Option<&str>,
+    keep: &str,
+    clean_only: bool,
+) -> Option<usize> {
+    let victim = store
+        .iter()
+        .filter(|(uri, entry)| {
+            uri.as_str() != keep
+                && server.is_none_or(|server| entry.server == server)
+                && (!clean_only || (entry.diagnostics.is_empty() && entry.omitted == 0))
+        })
+        .min_by_key(|(_, entry)| {
+            (
+                !(entry.diagnostics.is_empty() && entry.omitted == 0),
+                entry.last_touched,
+            )
+        })
+        .map(|(uri, _)| uri.clone())?;
+    let entry = store.remove(&victim)?;
+    state
+        .version_floor
+        .fetch_max(entry.version, Ordering::AcqRel);
+    if !entry.diagnostics.is_empty() || entry.omitted > 0 {
+        state.note_dropped(&victim);
+    }
+    Some(entry.cached_bytes)
+}
+
 pub(crate) fn commit_diagnostics(
     diags: &DiagStore,
     uri: String,
@@ -1765,24 +1991,54 @@ pub(crate) fn commit_diagnostics(
 ) -> bool {
     let (diagnostics, omitted) = sanitize_diagnostics(diagnostics);
     let cached_bytes = retained_diagnostic_bytes(&uri, server, &diagnostics);
+    // An incoming clean publication may only displace clean entries: it must
+    // not push out a file that still has errors.
+    let incoming_clean = diagnostics.is_empty() && omitted == 0;
     let mut store = diags.lock().unwrap();
-    if !store.contains_key(&uri)
-        && (store.len() >= MAX_DIAGNOSTIC_FILES
-            || store
-                .values()
-                .filter(|entry| entry.server == server)
-                .count()
-                >= MAX_DIAGNOSTIC_FILES_PER_SERVER)
-    {
-        return false;
+    if !store.contains_key(&uri) {
+        while store.len() >= MAX_DIAGNOSTIC_FILES {
+            if evict_one(diags, &mut store, None, &uri, incoming_clean).is_none() {
+                if !incoming_clean {
+                    diags.note_dropped(&uri);
+                }
+                return false;
+            }
+        }
+        while store
+            .values()
+            .filter(|entry| entry.server == server)
+            .count()
+            >= MAX_DIAGNOSTIC_FILES_PER_SERVER
+        {
+            if evict_one(diags, &mut store, Some(server), &uri, incoming_clean).is_none() {
+                if !incoming_clean {
+                    diags.note_dropped(&uri);
+                }
+                return false;
+            }
+        }
     }
     let old_bytes = store.get(&uri).map(|entry| entry.cached_bytes).unwrap_or(0);
-    let current_bytes: usize = store.values().map(|entry| entry.cached_bytes).sum();
+    let mut current_bytes: usize = store.values().map(|entry| entry.cached_bytes).sum();
+    while current_bytes
+        .saturating_sub(old_bytes)
+        .saturating_add(cached_bytes)
+        > MAX_DIAGNOSTIC_CACHE_BYTES
+    {
+        match evict_one(diags, &mut store, None, &uri, incoming_clean) {
+            Some(freed) => current_bytes = current_bytes.saturating_sub(freed),
+            None => break,
+        }
+    }
     let replacement_bytes = current_bytes
         .saturating_sub(old_bytes)
         .saturating_add(cached_bytes);
+    let touched = diags.clock.fetch_add(1, Ordering::AcqRel).saturating_add(1);
     if replacement_bytes > MAX_DIAGNOSTIC_CACHE_BYTES {
         let Some(entry) = store.get_mut(&uri) else {
+            if !incoming_clean {
+                diags.note_dropped(&uri);
+            }
             return false;
         };
         let mut tombstone_bytes = retained_diagnostic_bytes(&uri, server, &[]);
@@ -1803,16 +2059,20 @@ pub(crate) fn commit_diagnostics(
         entry.identity = identity;
         entry.content = content;
         entry.cached_bytes = tombstone_bytes;
+        entry.last_touched = touched;
+        diags.note_dropped(&uri);
         return true;
     }
-    let entry = store.entry(uri).or_insert_with(|| FileDiags {
+    let floor = diags.version_floor.load(Ordering::Acquire);
+    let entry = store.entry(uri.clone()).or_insert_with(|| FileDiags {
         server: server.to_string(),
-        version: 0,
+        version: floor,
         diagnostics: Vec::new(),
         omitted: 0,
         identity: None,
         content: None,
         cached_bytes: 0,
+        last_touched: touched,
     });
     entry.server.clear();
     entry.server.push_str(server);
@@ -1822,6 +2082,9 @@ pub(crate) fn commit_diagnostics(
     entry.identity = identity;
     entry.content = content;
     entry.cached_bytes = cached_bytes;
+    entry.last_touched = touched;
+    drop(store);
+    diags.note_published(&uri);
     true
 }
 
@@ -1898,19 +2161,6 @@ pub(crate) fn store_diagnostics_for_test(
                 params.get("diagnostics")?.clone(),
             )
             .ok()?;
-            {
-                let store = diags.lock().unwrap();
-                if !store.contains_key(&uri)
-                    && (store.len() >= MAX_DIAGNOSTIC_FILES
-                        || store
-                            .values()
-                            .filter(|entry| entry.server == server)
-                            .count()
-                            >= MAX_DIAGNOSTIC_FILES_PER_SERVER)
-                {
-                    return None;
-                }
-            }
             Some(commit_diagnostics(
                 diags,
                 uri,
