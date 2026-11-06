@@ -367,6 +367,8 @@ mod multimodal_tests;
 mod normalize_tests;
 #[cfg(test)]
 mod paste_burst_tests;
+#[cfg(all(test, feature = "multimodal"))]
+mod pdf_page_image_tests;
 #[cfg(test)]
 mod picker_tests;
 #[cfg(test)]

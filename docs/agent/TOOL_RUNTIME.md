@@ -967,7 +967,21 @@ explains why per page: skipped streams are named; only pages that paint images (
 or inline images) and run no text operator are called probably scanned, with the `pdftoppm`
 export hint; pages with neither text nor images are called blank or vector-only; pages whose
 text operators decode to nothing say their characters could not be mapped. `web_fetch` PDFs use
-the same classification. PDFs
+the same classification.
+
+**Scanned pages as images.** When the captured model accepts images (`ImageReadSupport`, the same
+gate as image reads) and a selected page has no text layer, no skipped streams and paints image
+XObjects, `read` lifts the page image (`src/agent/tools/pdf_images.rs`) and returns it as an image
+block beside the text: JPEG (`DCTDecode`) data passes through unchanged, and Flate, LZW, ASCII85 or
+RunLength image data in gray, RGB, CMYK or indexed colour with 1, 2, 4 or 8 bits per component is
+repacked as PNG; all images then go through the ordinary 5 MiB / 8000 px fit. At most 4 images are
+attached per call (largest image on each page first); the text names which image block belongs to
+which page, and `continue with pages:"N-M"` for scanned pages left over. Fax (`CCITTFaxDecode`),
+`JBIG2Decode`, `JPXDecode`, images over 40 million pixels and stencil masks are named in the result
+instead of attached, and the `pdftoppm` hint remains for them. Without image input (no captured
+transport, or a text-only model) the answer is the text-only scanned message and nothing is
+attached. A provider-native PDF document block is not used: tool results carry only text and
+image content, so page images are the transport for vision models. PDFs
 protected by the standard security handler open when the user password is empty, which is how
 owner-password-only (permission-restricted) files behave in any viewer: RC4-40/128 (revisions 2-3),
 RC4 or AESV2 (revision 4) and AES-256 (revisions 5 and 6) streams are decrypted in memory

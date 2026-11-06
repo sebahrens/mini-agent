@@ -14,6 +14,12 @@ use std::io::Read;
 use super::pdf_crypt;
 use super::pdf_filters;
 
+#[cfg(feature = "multimodal")]
+#[path = "pdf_images.rs"]
+mod pdf_images;
+#[cfg(feature = "multimodal")]
+pub(crate) use pdf_images::PdfImage;
+
 /// Largest PDF file the read tool loads.
 pub(crate) const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
 /// Pages one read call may return; larger documents require `pages`.
@@ -565,6 +571,9 @@ pub(crate) struct PageContent {
     pub(crate) text_operators: bool,
     /// Image XObjects and inline images the page paints.
     pub(crate) images: usize,
+    /// Resource names of the image XObjects the page paints, in paint order.
+    #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
+    pub(crate) image_names: Vec<Vec<u8>>,
 }
 
 /// Why one stream could not be decoded.
@@ -596,6 +605,7 @@ impl std::fmt::Display for StreamError {
 struct ContentFlags {
     text_operators: bool,
     images: usize,
+    image_names: Vec<Vec<u8>>,
 }
 
 impl std::fmt::Display for PdfError {
@@ -935,6 +945,17 @@ impl Document {
 
     /// Decode a stream's data through its filters, within the budgets.
     fn decode(&self, dict: &Dict, raw: &[u8]) -> Result<Vec<u8>, StreamError> {
+        self.decode_inner(dict, raw, false).map(|(data, _)| data)
+    }
+
+    /// [`Self::decode`], optionally stopping at a trailing `DCTDecode`: the
+    /// flag reports that the returned bytes are a JPEG, not decoded pixels.
+    fn decode_inner(
+        &self,
+        dict: &Dict,
+        raw: &[u8],
+        stop_at_dct: bool,
+    ) -> Result<(Vec<u8>, bool), StreamError> {
         let filters: Vec<Vec<u8>> = match dict
             .get(b"Filter")
             .or_else(|| dict.get(b"F"))
@@ -953,7 +974,11 @@ impl Document {
             .or_else(|| dict.get(b"DP"))
             .map(|p| self.resolve(p));
         let mut data = raw.to_vec();
+        let mut jpeg = false;
         for (index, filter) in filters.iter().enumerate() {
+            if jpeg {
+                return Err(StreamError::Corrupt("filters follow DCTDecode"));
+            }
             let parms: Option<&Dict> = match params {
                 Some(Obj::Dict(dict)) if index == 0 => Some(dict),
                 Some(Obj::Array(items)) => items
@@ -997,6 +1022,10 @@ impl Document {
                         _ => Err(pdf_filters::FilterError::Corrupt("invalid ASCIIHex data")),
                     }
                 }
+                b"DCTDecode" | b"DCT" if stop_at_dct => {
+                    jpeg = true;
+                    Ok(std::mem::take(&mut data))
+                }
                 // Encryption is undone before any filter runs.
                 b"Crypt" => Ok(std::mem::take(&mut data)),
                 _ => return Err(StreamError::Unsupported(name)),
@@ -1011,7 +1040,7 @@ impl Document {
             self.decoded_budget
                 .set(self.decoded_budget.get().saturating_sub(data.len() as u64));
         }
-        Ok(data)
+        Ok((data, jpeg))
     }
 
     fn inflate(&self, data: &[u8], limit: usize) -> Result<Vec<u8>, pdf_filters::FilterError> {
@@ -1038,6 +1067,7 @@ impl Document {
     }
 
     /// Extracted text of page `index` (0-based).
+    #[cfg(test)]
     pub(crate) fn page_text(&self, index: usize) -> Result<String, PdfError> {
         Ok(self.page_content(index)?.text)
     }
@@ -1079,6 +1109,7 @@ impl Document {
             notes,
             text_operators: flags.text_operators,
             images: flags.images,
+            image_names: flags.image_names,
         })
     }
 
@@ -1569,6 +1600,9 @@ fn extract_text(
                     && images.contains(name)
                 {
                     flags.images += 1;
+                    if flags.image_names.len() < 64 {
+                        flags.image_names.push(name.clone());
+                    }
                 }
             }
             b"BI" => {
@@ -1694,7 +1728,12 @@ fn page_list(pages: &[usize]) -> String {
 /// Explain why none of the selected pages produced text: undecodable streams
 /// are named, scanned pages (images but no text operators) get the export
 /// hint, and anything else is reported as holding neither text nor images.
-fn no_text_report(path: &str, count: usize, pages: &[(usize, PageContent)]) -> String {
+fn no_text_report(
+    path: &str,
+    count: usize,
+    pages: &[(usize, PageContent)],
+    attached: &Attached,
+) -> String {
     let numbers: Vec<usize> = pages.iter().map(|(page, _)| *page).collect();
     let mut out = format!(
         "PDF: {path} ({count} pages): no text could be extracted from page(s) {}.",
@@ -1715,6 +1754,11 @@ fn no_text_report(path: &str, count: usize, pages: &[(usize, PageContent)]) -> S
         .iter()
         .filter(|(_, c)| c.notes.is_empty() && !c.text_operators && c.images > 0)
         .map(|(page, _)| *page)
+        .collect();
+    out.push_str(&attached.sentence());
+    let scanned: Vec<usize> = scanned
+        .into_iter()
+        .filter(|page| !attached.images.iter().any(|image| image.page == *page))
         .collect();
     if !scanned.is_empty() {
         out.push_str(&format!(
@@ -1748,14 +1792,89 @@ fn no_text_report(path: &str, count: usize, pages: &[(usize, PageContent)]) -> S
     out
 }
 
-/// Render the selected pages' text layer for the read tool, bounded by
-/// `budget` characters. Errors are model-facing guidance.
+/// Images a read may attach for scanned pages.
+#[cfg(feature = "multimodal")]
+pub(crate) const MAX_PDF_IMAGES_PER_READ: usize = 4;
+
+/// One page image handed to the model beside the text result.
+#[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
+struct AttachedImage {
+    page: usize,
+    /// 1-based position among the result's image blocks.
+    number: usize,
+    width: u32,
+    height: u32,
+    mime: &'static str,
+}
+
+/// Page images attached to a result, and pages that could not be.
+#[derive(Default)]
+struct Attached {
+    images: Vec<AttachedImage>,
+    /// Why other scanned pages have no image.
+    problems: Vec<String>,
+}
+
+impl Attached {
+    /// Model-facing sentence mapping image blocks to pages; empty when none.
+    fn sentence(&self) -> String {
+        let mut out = String::new();
+        if !self.images.is_empty() {
+            let items: Vec<String> = self
+                .images
+                .iter()
+                .map(|image| {
+                    format!(
+                        "image {} = page {} ({} x {}, {})",
+                        image.number, image.page, image.width, image.height, image.mime
+                    )
+                })
+                .collect();
+            out.push_str(&format!(
+                " The scanned page image(s) are attached as image blocks: {}; read the text from them.",
+                items.join(", ")
+            ));
+        }
+        if !self.problems.is_empty() {
+            out.push_str(&format!(
+                " Page image(s) not attached: {}.",
+                self.problems.join("; ")
+            ));
+        }
+        out
+    }
+}
+
+/// What [`render_with_images`] produced.
+pub(crate) struct Rendered {
+    pub(crate) text: String,
+    #[cfg(feature = "multimodal")]
+    pub(crate) images: Vec<PdfImage>,
+}
+
+/// [`render_with_images`] without page images.
+#[cfg(test)]
 pub(crate) fn render(
     bytes: &[u8],
     path: &str,
     pages: Option<&str>,
     budget: usize,
 ) -> Result<String, String> {
+    render_with_images(bytes, path, pages, budget, 0).map(|rendered| rendered.text)
+}
+
+/// Render the selected pages' text layer for the read tool, bounded by
+/// `budget` characters. With `max_images > 0`, selected pages that have no
+/// text layer but paint images get their page images lifted (at most
+/// `max_images` blocks) so a vision model can read them. Errors are
+/// model-facing guidance.
+pub(crate) fn render_with_images(
+    bytes: &[u8],
+    path: &str,
+    pages: Option<&str>,
+    budget: usize,
+    max_images: usize,
+) -> Result<Rendered, String> {
     let document = Document::parse(bytes)
         .map_err(|error| format!("Cannot read '{path}' as PDF text: {error}."))?;
     let count = document.page_count();
@@ -1816,8 +1935,57 @@ pub(crate) fn render(
         body.push_str(&block);
         shown.push(page);
     }
+    #[cfg_attr(not(feature = "multimodal"), allow(unused_mut))]
+    let mut attached = Attached::default();
+    #[cfg(feature = "multimodal")]
+    let mut images: Vec<PdfImage> = Vec::new();
+    #[cfg(feature = "multimodal")]
+    {
+        let mut skipped_for_limit = Vec::new();
+        for (page, content) in &without_text {
+            if !content.notes.is_empty() || content.text_operators || content.images == 0 {
+                continue;
+            }
+            let remaining = max_images.saturating_sub(images.len());
+            if max_images == 0 {
+                break;
+            }
+            if remaining == 0 {
+                skipped_for_limit.push(*page);
+                continue;
+            }
+            match document.page_images(*page, content, remaining) {
+                Ok(lifted) => {
+                    for image in lifted {
+                        attached.images.push(AttachedImage {
+                            page: *page,
+                            number: images.len() + 1,
+                            width: image.width,
+                            height: image.height,
+                            mime: image.mime,
+                        });
+                        images.push(image);
+                    }
+                }
+                Err(reason) => attached.problems.push(format!("page {page}: {reason}")),
+            }
+        }
+        if !skipped_for_limit.is_empty() {
+            let list = page_list(&skipped_for_limit);
+            attached.problems.push(format!(
+                "page(s) {list} (limit of {max_images} images per read; continue with pages:\"{}\")",
+                list.replace(", ", ",")
+            ));
+        }
+    }
+    #[cfg(not(feature = "multimodal"))]
+    let _ = max_images;
     if !shown.is_empty() && without_text.len() == shown.len() {
-        return Ok(no_text_report(path, count, &without_text));
+        return Ok(Rendered {
+            text: no_text_report(path, count, &without_text, &attached),
+            #[cfg(feature = "multimodal")]
+            images,
+        });
     }
     let mut out = format!(
         "PDF: {path} ({count} pages; extracted text layer of page(s) {}; no line numbers or edit authorization)\n\n{}",
@@ -1830,7 +1998,15 @@ pub(crate) fn render(
             "\n\n[truncated before page {next}: the output reached the {budget} character read budget; continue with pages:\"{next}-{last}\"]"
         ));
     }
-    Ok(out)
+    let attached_note = attached.sentence();
+    if !attached_note.is_empty() {
+        out.push_str(&format!("\n\n[{}]", attached_note.trim()));
+    }
+    Ok(Rendered {
+        text: out,
+        #[cfg(feature = "multimodal")]
+        images,
+    })
 }
 
 #[cfg(test)]

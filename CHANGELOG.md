@@ -35,6 +35,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `grep`, `find_files` and `list_dir` accept `no_ignore` (default false) to include gitignored and
   generated files, and otherwise count and name the ignored entries they skipped
   (mini-agent-hacmm).
+- `read` on a scanned PDF (pages that paint images and have no text layer) returns the page images
+  (up to 4 per call, JPEG passthrough or PNG) to models that accept images, naming the page of each
+  image and how to continue (mini-agent-totd8).
 - `read` and `web_fetch` open PDFs encrypted with the standard security handler and an empty user
   password (RC4-40/128, AESV2, AES-256); files needing a real password report `password required`
   (mini-agent-6xx6x). Adds the `aes` and `md-5` crates (RustCrypto, already-shared digest stack).
