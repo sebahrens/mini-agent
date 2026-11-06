@@ -1508,6 +1508,26 @@ impl EditTool {
         if bytes.len() as u64 > limit {
             return Err(file_too_large(&expanded, bytes.len() as u64, limit));
         }
+        // A client that holds this workspace-bound UTF-8 file in an editor
+        // supplies its live text instead (unsaved changes included) and later
+        // receives the result through the same channel. The target already
+        // passed the workspace, symlink and permission checks above.
+        let mut client_edit: Option<(super::client_fs::ClientFs, std::path::PathBuf, String)> =
+            None;
+        if let (Some(client), Some(workspace)) = (
+            super::client_fs::read_write_client(self.read_tracker.client_fs.as_ref()),
+            bound_workspace,
+        ) && std::str::from_utf8(&bytes).is_ok()
+        {
+            let client_path = super::client_fs::client_path(workspace, relative);
+            if let Some(text) = super::client_fs::read_client_text(client, &client_path).await {
+                if text.len() as u64 > limit {
+                    return Err(file_too_large(&expanded, text.len() as u64, limit));
+                }
+                bytes = text.clone().into_bytes();
+                client_edit = Some((std::sync::Arc::clone(client), client_path, text));
+            }
+        }
         // Inode identity alone cannot detect an in-place rewrite of this file,
         // so publication is bound to the exact bytes the edit was computed from.
         let base = crate::fs::ContentDigest::of(&bytes);
@@ -1666,45 +1686,51 @@ impl EditTool {
             replacement_excerpts(&ranges)
         };
 
-        let output =
-            if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
-                let workspace = std::sync::Arc::clone(workspace);
-                let owned_relative = relative.to_path_buf();
-                let expected = expected.clone();
-                // Move the output through the blocking publication and take it
-                // back instead of copying the whole file.
-                let encoded = encoded.clone();
-                let (published, output) = crate::agent::runner::spawn_blocking_scoped(move || {
-                    let published = workspace.replace_relative_atomic_expecting(
-                        &owned_relative,
-                        encoded.as_deref().unwrap_or(output.as_bytes()),
-                        &expected,
-                        &base,
-                    );
-                    (published, output)
-                })
+        let output = if let Some((client, client_path, before)) = &client_edit {
+            super::client_fs::write_client_text(client, client_path, before, &output)
                 .await
-                .map_err(|_| ToolError::Msg("Edit publication job failed".to_string()))?;
-                published?;
-                output
-            } else {
-                let resolved = resolved.expect("external edit must resolve an ambient path");
-                let current = tokio::fs::canonicalize(&requested).await?;
-                if current != resolved {
-                    return Err(ToolError::Msg(format!(
-                        "Path changed after permission check: {}",
-                        expanded
-                    )));
-                }
-                crate::fs::atomic_write_resolved_expecting(
-                    &resolved,
+                .map_err(|message| {
+                    ToolError::Msg(format!("Edit of '{expanded}' was not applied: {message}"))
+                })?;
+            output
+        } else if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
+            let workspace = std::sync::Arc::clone(workspace);
+            let owned_relative = relative.to_path_buf();
+            let expected = expected.clone();
+            // Move the output through the blocking publication and take it
+            // back instead of copying the whole file.
+            let encoded = encoded.clone();
+            let (published, output) = crate::agent::runner::spawn_blocking_scoped(move || {
+                let published = workspace.replace_relative_atomic_expecting(
+                    &owned_relative,
                     encoded.as_deref().unwrap_or(output.as_bytes()),
-                    approved_parent.expect("external edit must capture its parent"),
-                    base,
-                )
-                .await?;
-                output
-            };
+                    &expected,
+                    &base,
+                );
+                (published, output)
+            })
+            .await
+            .map_err(|_| ToolError::Msg("Edit publication job failed".to_string()))?;
+            published?;
+            output
+        } else {
+            let resolved = resolved.expect("external edit must resolve an ambient path");
+            let current = tokio::fs::canonicalize(&requested).await?;
+            if current != resolved {
+                return Err(ToolError::Msg(format!(
+                    "Path changed after permission check: {}",
+                    expanded
+                )));
+            }
+            crate::fs::atomic_write_resolved_expecting(
+                &resolved,
+                encoded.as_deref().unwrap_or(output.as_bytes()),
+                approved_parent.expect("external edit must capture its parent"),
+                base,
+            )
+            .await?;
+            output
+        };
         crate::session::file_checkpoints::published();
         let written = encoded.as_deref().unwrap_or(output.as_bytes());
         let after_digest = crate::fs::ContentDigest::of(written);

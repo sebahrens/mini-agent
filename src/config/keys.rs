@@ -342,6 +342,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("acp_history_max_bytes").described("ACP: serialized live-history memory guard (default max(2 MiB, 4 bytes per context-window token))").shaped(ConfigShape::Integer),
     key("acp_max_sessions").described("ACP: concurrently loaded sessions (default 64)").shaped(ConfigShape::Integer),
     key("acp_max_client_mcp_servers").described("ACP: client-supplied MCP servers per session (default 8)").shaped(ConfigShape::Integer),
+    key("acp_client_file_access").described("ACP: let the read, edit and write tools use the client's fs/read_text_file and fs/write_text_file (live editor buffers) when the client advertises them. Default false. A project-local value needs project trust.").shaped(ConfigShape::Bool),
     key("hooks_http_enabled").described("Allow type \"http\" hook handlers to POST event JSON to their configured URL (default false: http hooks stay inert)").shaped(ConfigShape::Bool),
     key("hooks_mcp_tool_enabled").described("Allow type \"mcp_tool\" hook handlers to call a tool on a connected MCP server (default false: they stay inert)").shaped(ConfigShape::Bool),
     key("hooks_model_enabled").described("Allow type \"prompt\" and \"agent\" hook handlers to send the hook event to a model (default false: they stay inert)").shaped(ConfigShape::Bool),

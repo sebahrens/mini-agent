@@ -4451,6 +4451,7 @@ permission-allow = { bash = ["*"] }
 shell = "project-shell"
 verify_command = "project-verifier"
 enable_skill_proposals = true
+acp_client_file_access = true
 custom_providers = {}
 mcp_servers = {}
 lsp = {}
@@ -4468,6 +4469,7 @@ future_security_switch = true
             "shell",
             "verify_command",
             "enable_skill_proposals",
+            "acp_client_file_access",
             "custom_providers",
             "mcp_servers",
             "lsp",

@@ -767,6 +767,7 @@ Accepted top-level keys:
 | `acp_history_max_bytes` | integer | ACP only: serialized live-history memory guard. Default: max(2 MiB, 4 bytes per context-window token); minimum 64 KiB. |
 | `acp_max_sessions` | integer | ACP only: concurrently loaded sessions per process. Default: `64`. |
 | `acp_max_client_mcp_servers` | integer | ACP only: client-supplied MCP servers accepted per `session/new`. Default: `8`. |
+| `acp_client_file_access` | boolean | ACP only: let the `read`, `edit` and `write` tools use the client's `fs/read_text_file` and `fs/write_text_file`, so unsaved editor buffers are visible and writes go through the editor. Default: `false` (closed). Takes effect only when the connected client also advertises the capability in `initialize` (the VS Code extension does when `mini-agent.clientFileAccess` is on). Security-sensitive: a project-local value applies only after project-config trust. See [ACP client file access](#acp-client-file-access). |
 | `max_grep_results`        | integer | Maximum grep matches returned to the main agent. Default: `150`. |
 | `max_find_results`        | integer | Maximum file matches returned to the main agent. Default: `150`. |
 | `max_list_dir_entries`    | integer | Maximum directory entries returned to the main agent per call. Default: `150`. `list_dir` pages past it with `offset` (named in the truncation notice) and may lower it with `limit`. |
@@ -3143,6 +3144,34 @@ mentions are routed for that request only (see
 [SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent)). Tool calls
 that fail, are denied, or whose outcome is unknown are reported with tool-call
 status `failed` instead of `completed`.
+
+### ACP client file access
+
+By default the `read`, `edit` and `write` tools use the local disk, so unsaved
+editor buffers are invisible to the agent and its writes bypass the editor's
+undo stack. Setting `acp_client_file_access = true` (default `false`) lets them
+use the connected client's `fs/read_text_file` and `fs/write_text_file`
+instead. Both conditions must hold, per connection:
+
+1. the operator set `acp_client_file_access = true`. The key is
+   security-sensitive: in `.mini-agent/config.toml` it applies only after
+   project-config trust, and an untrusted or headless checkout leaves it off;
+2. the client advertised `fs.readTextFile` and/or `fs.writeTextFile` in
+   `initialize` (the VS Code extension does so when `mini-agent.clientFileAccess`
+   is on). Without the opt-in the advertisement is ignored.
+
+When open, the seam only changes where the text of an already-authorised file
+comes from and goes to. Every workspace, symlink and permission check still
+runs first on the on-disk path, and only workspace-relative targets are routed:
+absolute paths, paths outside the workspace, notebooks, images, PDFs, UTF-16
+and non-UTF-8 files stay on disk. `read` serves the editor text; `edit` and
+`write` (overwrite) compute against that text, re-read it immediately before
+publishing, and refuse with no change if the editor text moved in the meantime
+(there is no silent clobber of a buffer edited after the read). Creating a new
+file still goes through the normal on-disk path. Each transfer is capped at
+2 MiB. A read the client refuses, fails or answers late (30 s) falls back to the
+disk file; a refused or unconfirmed write is reported as not applied. Shell
+commands and terminals are not delegated.
 
 Each ACP session owns one canonical `Session` history. Accepted user content,
 correlated structured tool call/results, observed usage and terminal assistant

@@ -366,7 +366,25 @@ impl WriteTool {
                 }
                 Ok(Probe::TooLarge) => return Err(overwrite_not_authorized(&expanded)),
                 Ok(Probe::Read(read)) => {
-                    let (metadata, expected, current) = *read;
+                    let (metadata, expected, mut current) = *read;
+                    // A client that holds this file in an editor supplies its
+                    // live text as the preimage, and receives the replacement.
+                    // The target already passed the workspace, symlink and
+                    // permission checks; only the bytes' source changes.
+                    let mut client_overwrite = None;
+                    if let Some(client) =
+                        super::client_fs::read_write_client(self.read_tracker.client_fs.as_ref())
+                        && std::str::from_utf8(&current).is_ok()
+                    {
+                        let client_path = super::client_fs::client_path(workspace, relative);
+                        if let Some(text) =
+                            super::client_fs::read_client_text(client, &client_path).await
+                        {
+                            current = text.clone().into_bytes();
+                            client_overwrite =
+                                Some((std::sync::Arc::clone(client), client_path, text));
+                        }
+                    }
                     let (crc, lines) = full_text_fingerprint(&current)?;
                     if !self
                         .read_tracker
@@ -403,25 +421,42 @@ impl WriteTool {
                     )
                     .await;
                     digests = Some(base);
-                    let workspace = std::sync::Arc::clone(workspace);
-                    let owned_relative = relative.to_path_buf();
-                    // Move the content through the blocking publication and take
-                    // it back instead of copying it.
-                    let content = std::mem::take(&mut args.content);
-                    let (published, content) =
-                        crate::agent::runner::spawn_blocking_scoped(move || {
-                            let published = workspace.replace_relative_atomic_expecting(
-                                &owned_relative,
-                                content.as_bytes(),
-                                &expected,
-                                &base,
-                            );
-                            (published, content)
-                        })
+                    if let Some((client, client_path, before)) = &client_overwrite {
+                        super::client_fs::write_client_text(
+                            client,
+                            client_path,
+                            before,
+                            &args.content,
+                        )
                         .await
-                        .map_err(|_| ToolError::Msg("Write publication job failed".to_string()))?;
-                    args.content = content;
-                    published?;
+                        .map_err(|message| {
+                            ToolError::Msg(format!(
+                                "Write to '{expanded}' was not applied: {message}"
+                            ))
+                        })?;
+                    } else {
+                        let workspace = std::sync::Arc::clone(workspace);
+                        let owned_relative = relative.to_path_buf();
+                        // Move the content through the blocking publication and take
+                        // it back instead of copying it.
+                        let content = std::mem::take(&mut args.content);
+                        let (published, content) =
+                            crate::agent::runner::spawn_blocking_scoped(move || {
+                                let published = workspace.replace_relative_atomic_expecting(
+                                    &owned_relative,
+                                    content.as_bytes(),
+                                    &expected,
+                                    &base,
+                                );
+                                (published, content)
+                            })
+                            .await
+                            .map_err(|_| {
+                                ToolError::Msg("Write publication job failed".to_string())
+                            })?;
+                        args.content = content;
+                        published?;
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     checkpoint =

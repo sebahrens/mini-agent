@@ -1,5 +1,8 @@
 pub(crate) mod ask_user;
 pub(crate) mod bash;
+pub(crate) mod client_fs;
+#[cfg(test)]
+mod client_fs_tests;
 pub(crate) mod concurrency;
 pub(crate) mod crc;
 pub(crate) mod edit;
@@ -262,6 +265,10 @@ pub(crate) struct ReadTracker {
     /// untrack touches only that path's few windows.
     tracked: std::sync::Arc<Mutex<TrackedReads>>,
     pub(crate) instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
+    /// The ACP client's file methods, present only when the operator opted in
+    /// and the client advertised them. `None` (the default) keeps every tool
+    /// on the local disk.
+    pub(crate) client_fs: Option<client_fs::ClientFs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,9 +383,17 @@ impl ReadTracker {
             deny_repeated_reads,
             tracked: std::sync::Arc::new(Mutex::new(TrackedReads::default())),
             instructions: None,
+            client_fs: None,
             #[cfg(feature = "multimodal")]
             image_support: read_image::ImageReadSupport::default(),
         }
+    }
+
+    /// This tracker with the connected client's file methods attached.
+    #[cfg_attr(not(feature = "acp"), allow(dead_code))]
+    pub(crate) fn with_client_fs(mut self, client: Option<client_fs::ClientFs>) -> Self {
+        self.client_fs = client;
+        self
     }
 
     pub(crate) fn check_read(

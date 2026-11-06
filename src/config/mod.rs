@@ -877,6 +877,11 @@ pub struct Config {
     /// ACP: client-supplied MCP servers per session (default 8).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_max_client_mcp_servers: Option<usize>,
+    /// ACP: route the read, edit and write tools through the client's
+    /// `fs/read_text_file` / `fs/write_text_file` when it advertises them
+    /// (default false). Sensitive in project-local configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_client_file_access: Option<bool>,
     /// Allow `type: "http"` hook handlers to send requests. Default false:
     /// http handlers load but are never contacted.
     #[serde(skip_serializing_if = "Option::is_none")]

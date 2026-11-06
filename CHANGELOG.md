@@ -6,6 +6,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- ACP: with the new default-off `acp_client_file_access` (project-trust gated) and a client that
+  advertises `fs.readTextFile`/`fs.writeTextFile`, `read`, `edit` and overwrite `write` use the
+  editor's live text and publish through it, still behind the workspace and permission checks
+  (mini-agent-oapz6).
 ### Security
 
 - `read` of a PDF parses in linear time and within node, font and ToUnicode-entry budgets, with a
