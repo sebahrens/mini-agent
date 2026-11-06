@@ -15,6 +15,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- MCP tool results now render `resource_link` blocks (name, title, URI, MIME, size,
+  description) and audio blocks (`[audio: mime, N bytes]`) instead of counting them as
+  unrenderable (mini-agent-7wieg).
 - `web_fetch` decodes gzip/deflate responses (output capped at the body limit, so bombs are
   truncated), honours the `Content-Type` charset or an HTML `<meta charset>` (Latin-1, Shift-JIS,
   windows-1252 ...), quotes non-HTML text types literally, and refuses binary types such as PDF by

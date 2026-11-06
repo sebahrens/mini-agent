@@ -60,6 +60,10 @@ decoded per-image limit, supported format headers, dimensions and matching MIME
 types. Unsupported, malformed or over-limit images become descriptive
 placeholders with omission notes; an omitted image does not consume the budget
 for later valid images. Non-image blob resources retain their placeholders.
+`resource_link` blocks render as one line naming the link's name, title, URI,
+MIME type, size and description (each single-line and bounded); audio blocks
+render as `[audio: <mime>, <N> bytes]`. Only genuinely unknown block kinds count
+toward the `content block(s) ... were omitted` note.
 Image blob resource URIs are identifiers, not host paths or URLs to fetch.
 
 Accepted images survive the generic spill hook, session persistence, replay and
