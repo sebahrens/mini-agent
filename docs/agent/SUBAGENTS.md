@@ -87,8 +87,16 @@ old jobs before changing their launch history. A saved entry is **data only**:
 there is no deserialized task, grant or resumable handle, and entries last saved
 as active are shown as `interrupted` after restart. The background result store
 has a 256 KiB memory ceiling and a 16 KiB saved-entry ceiling; ordinary report
-defaults remain 32 KiB per child and 128 KiB per batch. No report path is
-dereferenced on import.
+defaults remain 32 KiB per child and 128 KiB per batch. A report longer than
+16 KiB is also written in full to the session's private tool-output directory
+under a name derived only from the session and task IDs, and the saved copy
+ends with `[background task result truncated in the saved session at 16384 of
+N bytes; the full report is kept at <path>; ...]`. After a restart,
+`task_result` and `/tasks result <id>` return that full report (read with the
+private-file checks, at most 256 KiB); if the file is gone, the clipped copy
+and its notice are returned. Saved data never supplies a path: nothing is
+dereferenced on import, and the derived file is deleted when its entry is
+evicted or cleared.
 
 `subagents::background` owns the pool, and `session::background_observation`
 tracks private runtime provenance for the shared account, file checkpoints and

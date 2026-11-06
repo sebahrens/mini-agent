@@ -534,6 +534,91 @@ fn clip(text: &str, cap: usize) -> String {
     format!("{}{suffix}", &text[..end])
 }
 
+/// Opening of the notice that ends a saved result clipped to
+/// [`MAX_SAVED_RESULT_BYTES`].
+const SAVED_RESULT_NOTICE: &str = "[background task result truncated in the saved session";
+
+/// Where a long background report is kept in full: a name derived only from
+/// the session and the validated task id, inside that session's private
+/// tool-output directory. Saved session data never supplies this path.
+fn full_result_path(session_id: &str, id: &str) -> Option<std::path::PathBuf> {
+    uuid::Uuid::parse_str(id).ok()?;
+    let name = crate::paths::digest_filename(
+        "background-task-result",
+        &[session_id.as_bytes(), id.as_bytes()],
+        "txt",
+    )
+    .ok()?;
+    Some(crate::session::storage::tool_output_dir(session_id).join(name))
+}
+
+/// The copy of `text` that the session file keeps. A report longer than the
+/// saved ceiling is written in full to [`full_result_path`] first, and the
+/// saved copy ends with an explicit notice naming its size and that path.
+fn saved_result_copy(session_id: &str, id: &str, text: &str) -> String {
+    if text.len() <= MAX_SAVED_RESULT_BYTES {
+        return text.to_owned();
+    }
+    let stored = full_result_path(session_id, id).filter(|path| {
+        path.parent()
+            .is_some_and(|dir| crate::paths::ensure_private_directory(dir).is_ok())
+            && crate::fs::private_atomic_create_sync(path, text.as_bytes())
+                .inspect_err(
+                    |error| tracing::warn!(%error, "failed to keep full background task result"),
+                )
+                .is_ok()
+    });
+    let notice = match stored {
+        Some(path) => format!(
+            "\n{SAVED_RESULT_NOTICE} at {MAX_SAVED_RESULT_BYTES} of {} bytes; the full report is kept at {}; task_result and /tasks result return it]",
+            text.len(),
+            path.display()
+        ),
+        None => format!(
+            "\n{SAVED_RESULT_NOTICE} at {MAX_SAVED_RESULT_BYTES} of {} bytes; the full report could not be kept]",
+            text.len()
+        ),
+    };
+    let mut end = MAX_SAVED_RESULT_BYTES.saturating_sub(notice.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{notice}", &text[..end])
+}
+
+/// The full report of a restored entry whose saved copy was clipped, read
+/// from its derived path (bounded, private file checks). `None` when the
+/// copy was not clipped or the file is gone.
+fn load_full_result(session_id: &str, id: &str, saved: &str) -> Option<String> {
+    use std::io::Read;
+    if !saved.contains(SAVED_RESULT_NOTICE) {
+        return None;
+    }
+    let path = full_result_path(session_id, id)?;
+    let file = crate::fs::open_private_file(&path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RESULT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_RESULT_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Remove the full-report files of forgotten entries.
+fn delete_full_results(session_id: &str, ids: &[String]) {
+    for id in ids {
+        if let Some(path) = full_result_path(session_id, id)
+            && path.exists()
+            && let Err(error) =
+                crate::session::storage::delete_uncommitted_tool_output(session_id, &path)
+        {
+            tracing::warn!(%error, "failed to delete a forgotten background task result");
+        }
+    }
+}
+
 impl Pool {
     pub(crate) fn for_session(
         session: &mut crate::session::Session,
@@ -682,7 +767,9 @@ impl Pool {
         let (observation, lifetime) = self.observations.admit()?;
         if let Some(id) = evict {
             state.jobs.remove(&id);
-            self.history.remove(&[id], Some(&observation));
+            let ids = [id];
+            self.history.remove(&ids, Some(&observation));
+            delete_full_results(&self.session, &ids);
         }
         let id = uuid::Uuid::new_v4().to_string();
         let job_scope = AgentWorkScope::new();
@@ -893,6 +980,8 @@ impl Pool {
         if !ids.is_empty() {
             self.changed.notify_one();
         }
+        drop(state);
+        delete_full_results(&self.session, &ids);
         ids.len()
     }
 
@@ -950,6 +1039,16 @@ impl Pool {
             .ok_or_else(|| anyhow::anyhow!("unknown task in this session"))?;
         let mut saved = entry.saved.clone();
         saved.result = entry.result.clone();
+        // A restored entry has only its saved copy in memory; a clipped copy
+        // is replaced by the full report kept beside the session.
+        if entry.observation.is_none()
+            && let Some(full) = saved
+                .result
+                .as_deref()
+                .and_then(|text| load_full_result(&self.session, id, text))
+        {
+            saved.result = Some(full);
+        }
         Ok(saved)
     }
     pub(crate) fn request_cancel(&self, id: &str) -> anyhow::Result<SavedTask> {
@@ -1007,13 +1106,16 @@ impl Pool {
         result: Option<String>,
         details: Option<TaskDetails>,
     ) {
+        // Written before taking the state lock: a long report goes to the
+        // session's private tool-output directory.
+        let saved_result = result
+            .as_ref()
+            .map(|text| saved_result_copy(&self.session, id, text));
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = state.jobs.get_mut(id) {
             entry.saved.status = status;
             entry.saved.details = details.filter(TaskDetails::within_bounds);
-            entry.saved.result = result
-                .as_ref()
-                .map(|text| clip(text, MAX_SAVED_RESULT_BYTES));
+            entry.saved.result = saved_result;
             entry.result = result;
             entry.scope = None;
             self.history.set(&entry.saved, entry.observation.as_ref());
@@ -1600,6 +1702,56 @@ mod tests {
         release_tx.send(()).unwrap();
         settled(&pool, &running).await;
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_long_report_survives_resume_in_full_or_with_an_explicit_notice() {
+        let root = crate::tests::OwnedTestDirectory::new("background-long-report");
+        let (session, pool, workspace, run, recorder) = fixture(&root);
+        let report = (0..3500)
+            .map(|line| format!("finding line {line:05}\n"))
+            .collect::<String>();
+        assert!(report.len() > 60 * 1024);
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let expected = report.clone();
+        let id = admission
+            .start(async move { Ok(expected) }, run.clone())
+            .unwrap();
+        assert_eq!(
+            settled(&pool, &id).await.result.as_deref(),
+            Some(report.as_str())
+        );
+
+        let saved = session
+            .background_history
+            .rows()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .result
+            .unwrap();
+        assert!(saved.len() <= MAX_SAVED_RESULT_BYTES);
+        assert!(
+            saved.contains(SAVED_RESULT_NOTICE),
+            "explicit truncation notice"
+        );
+        assert!(saved.contains(&format!("of {} bytes", report.len())));
+
+        let mut imported: crate::session::Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let reloaded = Pool::for_session(&mut imported, 1).unwrap();
+        assert_eq!(
+            reloaded.result(&id).unwrap().result.as_deref(),
+            Some(report.as_str()),
+            "the restored entry returns the full report"
+        );
+
+        // Without the kept file, the clipped copy and its notice remain.
+        delete_full_results(reloaded.session_id(), std::slice::from_ref(&id));
+        let clipped = reloaded.result(&id).unwrap().result.unwrap();
+        assert!(clipped.contains(SAVED_RESULT_NOTICE));
+        pool.close().await;
+        reloaded.close().await;
     }
 
     #[tokio::test]
