@@ -18,6 +18,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/compress",
     "/config",
     "/context",
+    "/copy",
     "/cost",
     "/cron",
     "/doctor",

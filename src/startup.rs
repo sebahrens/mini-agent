@@ -2382,10 +2382,7 @@ impl Startup {
         let mut last_failure = None;
         // Opt-in control channel: stdin is read by a task that answers
         // control lines at once (even mid-turn) and queues the rest.
-        let mut queued = self
-            .cli
-            .stream_json_control
-            .then(|| {
+        let mut queued = self.cli.stream_json_control.then(|| {
             crate::print::spawn_control_reader(
                 output,
                 self.permission.clone(),

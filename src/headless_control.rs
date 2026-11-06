@@ -570,7 +570,9 @@ mod tests {
         ] {
             let waiting = std::sync::Arc::clone(&state);
             let task = tokio::spawn(async move {
-                waiting.ask_escalation("make install", "needs /usr/local").await
+                waiting
+                    .ask_escalation("make install", "needs /usr/local")
+                    .await
             });
             let id = pending_id(&state).await;
             state.handle(classify_line(&response(&id, behavior)).unwrap());

@@ -24,6 +24,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/redo" => handle_redo(ctx).await,
         "/rewind" => handle_rewind(ctx).await,
         "/retry" => handle_retry(ctx).await,
+        "/copy" => handle_copy(parts, ctx).await,
         "/quit" | "/exit" => handle_quit(ctx).await,
         "/history" => handle_history(parts, ctx).await,
         #[cfg(feature = "export")]
@@ -1001,6 +1002,108 @@ async fn handle_retry(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fenced code blocks of `markdown` in order (fence markers excluded). An
+/// unterminated final fence counts as a block that runs to the end.
+fn fenced_code_blocks(markdown: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<(char, usize, Vec<&str>)> = None;
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        let fence = trimmed
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '`' | '~'))
+            .map(|c| (c, trimmed.chars().take_while(|x| *x == c).count()))
+            .filter(|(_, run)| *run >= 3);
+        match (&mut current, fence) {
+            (None, Some((c, run))) => current = Some((c, run, Vec::new())),
+            (Some((open, run, body)), Some((c, found)))
+                if c == *open && found >= *run && trimmed[found..].trim().is_empty() =>
+            {
+                blocks.push(body.join("\n"));
+                current = None;
+            }
+            (Some((_, _, body)), _) => body.push(line),
+            (None, None) => {}
+        }
+    }
+    if let Some((_, _, body)) = current {
+        blocks.push(body.join("\n"));
+    }
+    blocks
+}
+
+/// What `/copy [N]` puts on the clipboard: the last assistant reply, or its
+/// Nth fenced code block (1-based). The error text is shown to the user.
+fn copy_selection(last_reply: Option<&str>, argument: &str) -> Result<(String, String), String> {
+    let reply = last_reply
+        .filter(|reply| !reply.trim().is_empty())
+        .ok_or("no assistant reply to copy yet")?;
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return Ok((reply.to_string(), "last reply".to_string()));
+    }
+    let number: usize =
+        argument.parse().ok().filter(|n| *n >= 1).ok_or(
+            "usage: /copy [N]  (N = the Nth code block of the last reply, counting from 1)",
+        )?;
+    let blocks = fenced_code_blocks(reply);
+    match blocks.get(number - 1) {
+        Some(block) => Ok((
+            block.clone(),
+            format!("code block {number} of {}", blocks.len()),
+        )),
+        None if blocks.is_empty() => {
+            Err("the last reply has no code blocks; /copy copies all of it".into())
+        }
+        None => Err(format!(
+            "the last reply has {} code block{}; /copy 1..{} selects one",
+            blocks.len(),
+            if blocks.len() == 1 { "" } else { "s" },
+            blocks.len()
+        )),
+    }
+}
+
+/// `/copy [N]`: copy the last assistant reply (or its Nth code block) to the
+/// clipboard, with the same OSC 52 / platform fallback and 4 MiB cap as a
+/// mouse selection. The outcome (or why nothing was copied) is always shown.
+async fn handle_copy(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    let last = ctx
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::session::MessageRole::Assistant)
+        .map(|m| m.content.to_string());
+    let (text, what) = match copy_selection(last.as_deref(), parts.get(1).copied().unwrap_or("")) {
+        Ok(selected) => selected,
+        Err(error) => {
+            write_error(ctx.renderer, error);
+            return Ok(());
+        }
+    };
+    let bytes = text.len();
+    match crate::ui::renderer::copy_to_clipboard(&text).await {
+        Ok(crate::ui::renderer::ClipboardCopyOutcome::Confirmed) => {
+            write_ok(ctx.renderer, format!("copied {what} ({bytes} bytes)"))
+        }
+        Ok(crate::ui::renderer::ClipboardCopyOutcome::FallbackRequested) => write_ok(
+            ctx.renderer,
+            format!(
+                "copy of {what} ({bytes} bytes) requested through the terminal; it cannot confirm"
+            ),
+        ),
+        Err(error) => write_error(
+            ctx.renderer,
+            format!(
+                "copy failed: {error}; nothing was copied (use /export to save the transcript, or /copy N for one code block)"
+            ),
+        ),
+    }
+    Ok(())
+}
+
 async fn handle_quit(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     *ctx.is_running = false;
     Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "quit").into())
@@ -1764,5 +1867,58 @@ mod session_persistence_tests {
         let mut reloaded: Session = serde_json::from_str(&serialized).unwrap();
         assert!(!reloaded.redo());
         assert_eq!(reloaded.compacted_context().0, Some("summary"));
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    const REPLY: &str = "Intro\n```rust\nfn a() {}\n```\ntext\n~~~\nsecond\n~~~\n````md\n```inner```\n````\n```\nunterminated";
+
+    #[test]
+    fn code_blocks_are_split_in_order_with_nested_and_unterminated_fences() {
+        let blocks = fenced_code_blocks(REPLY);
+        assert_eq!(
+            blocks,
+            ["fn a() {}", "second", "```inner```", "unterminated"]
+        );
+        assert!(fenced_code_blocks("no code here").is_empty());
+    }
+
+    #[test]
+    fn copy_selects_the_whole_reply_or_the_nth_block_and_explains_every_miss() {
+        assert_eq!(copy_selection(Some(REPLY), "").unwrap().0, REPLY);
+        assert_eq!(copy_selection(Some(REPLY), " 2 ").unwrap().0, "second");
+        assert_eq!(
+            copy_selection(Some(REPLY), "1").unwrap().1,
+            "code block 1 of 4"
+        );
+        assert!(
+            copy_selection(None, "")
+                .unwrap_err()
+                .contains("no assistant reply")
+        );
+        assert!(copy_selection(Some("  "), "").is_err());
+        assert!(
+            copy_selection(Some(REPLY), "9")
+                .unwrap_err()
+                .contains("4 code blocks")
+        );
+        assert!(
+            copy_selection(Some(REPLY), "0")
+                .unwrap_err()
+                .contains("usage")
+        );
+        assert!(
+            copy_selection(Some(REPLY), "x")
+                .unwrap_err()
+                .contains("usage")
+        );
+        assert!(
+            copy_selection(Some("plain"), "1")
+                .unwrap_err()
+                .contains("no code blocks")
+        );
     }
 }
