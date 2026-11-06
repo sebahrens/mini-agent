@@ -977,6 +977,15 @@ pub struct Cli {
     )]
     pub mcp_server: bool,
 
+    /// With `--mcp-server`: let each `run` call pick its own `model`.
+    #[cfg(feature = "mcp")]
+    #[arg(
+        long = "mcp-server-allow-model-override",
+        requires = "mcp_server",
+        help = "With --mcp-server: let `run` calls choose a model per call (default: the server's model only)"
+    )]
+    pub mcp_server_allow_model_override: bool,
+
     #[cfg(any(feature = "acp", feature = "loop"))]
     #[arg(
         long = "idle-exit",

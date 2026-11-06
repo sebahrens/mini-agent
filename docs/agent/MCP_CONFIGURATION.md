@@ -193,8 +193,17 @@ child therefore applies exactly the provider, model, sandbox, permission and
 tool flags the server was started with, and the ordinary headless policy:
 permission asks cannot be answered over MCP and fail closed unless those flags
 allow the action. A non-zero exit returns `isError: true` with stdout and a
-bounded stderr tail; a run is stopped after 30 minutes. Calls are handled one
-at a time. The server process itself runs no tools and opens no connections.
+bounded stderr tail; a run is stopped after 30 minutes. Requests are read while
+a run executes: `ping` is answered, `notifications/cancelled` for the call's
+request id kills the child's whole process group and sends no reply (per the MCP
+cancellation utility), and a `_meta.progressToken` on the call yields
+`notifications/progress` heartbeats every 15 s. Up to 4 runs may overlap; a
+fifth is refused with error `-32000`. A persisted run reports its session id
+(`structuredContent.session_id` and a trailing `[session_id: …]` line); pass it
+back as `session_id` to continue that conversation (`--session` on the child).
+`--mcp-server-allow-model-override` (default off) adds a per-call `model`
+argument; without it `model` is rejected. The server owns the child's
+`--output`, so a forwarded `--output` is dropped. The server process itself runs no tools and opens no connections.
 `--mcp-server` cannot be combined with `-p`, a prompt, `--acp` or `--loop`.
 
 ```json

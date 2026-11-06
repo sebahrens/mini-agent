@@ -6,6 +6,15 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### MCP
+
+- `--mcp-server` handles requests while a `run` executes: `ping` is answered, `notifications/cancelled`
+  kills the run's child process group and sends no reply, a client `progressToken` receives
+  `notifications/progress` heartbeats every 15 s, and up to 4 runs may overlap (a fifth is refused,
+  not queued). `run` now returns the child's session id (also as `structuredContent.session_id`) and
+  accepts `session_id` to continue that conversation; `--mcp-server-allow-model-override` (default
+  off) lets a call pick `model`.
+
 ### Subagents
 
 - A failed `task` child no longer cancels its siblings: the other children run to completion and
