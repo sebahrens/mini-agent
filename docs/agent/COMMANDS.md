@@ -951,8 +951,15 @@ text block `/name args` is expanded with the same trust rules and limits (64 KiB
 includes, 256 KiB expansion) into one ordinary user message. Include reads need existing read
 permission and fail closed when approval would be required. `mode` and `model` frontmatter and an
 authored `%%mode` are not applied over ACP (the editor owns those selections). An unknown name is
-sent to the model as literal text, as before. Headless `-p` does not expand custom commands: a
-leading `/name` stays literal prompt text.
+sent to the model as literal text, as before.
+
+Headless `-p '/name args'` (text input, not loop mode) expands a trusted custom command with the
+same trust rules and limits as ACP, before any piped stdin is appended; `mode`, `model` and an
+authored `%%mode` are not applied. An expansion error (oversized arguments, include denied) fails
+the run before any model request. A name that is a built-in interactive command (for example
+`/help`) is not run: a stderr warning says so and the text is sent literally. Unknown names and
+paths such as `/etc/hosts` stay literal without a warning.
+
 ### Context composition
 
 `/context` shows estimates by section and the five largest live retained tool

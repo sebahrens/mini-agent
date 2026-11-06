@@ -187,7 +187,6 @@ impl CommandTemplate {
     }
 
     /// Whether expansion reads workspace files (and so needs a read policy).
-    #[cfg(any(feature = "acp", test))]
     pub(crate) fn has_includes(&self) -> bool {
         self.segments
             .iter()
@@ -335,6 +334,71 @@ fn parse_segments(body: &str) -> Result<Vec<Segment>, String> {
         segments.push(Segment::Text(literal));
     }
     Ok(segments)
+}
+
+/// Result of looking up a headless `-p "/name args"` prompt.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeadlessCommand {
+    /// The prompt is not a slash command, or names no known command.
+    Literal,
+    /// A trusted custom command expanded into the prompt to send.
+    Expanded(String),
+    /// The name is a built-in (interactive-only) command; text stays literal.
+    BuiltIn(String),
+}
+
+/// Expands a leading `/name args` of a headless prompt with the ACP/TUI trust
+/// rules (project layers only when project config is trusted) and limits
+/// (64 KiB arguments, 8 includes, 256 KiB expansion). The template's `mode` and
+/// `model` are not applied headlessly. Includes need existing read permission;
+/// an approval-required read fails closed.
+pub(crate) fn expand_headless(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    workspace: &crate::paths::WorkspaceBinding,
+    prompt: &str,
+) -> Result<HeadlessCommand, String> {
+    if !prompt.trim_start().starts_with('/') {
+        return Ok(HeadlessCommand::Literal);
+    }
+    let commands = load_for_workspace(workspace);
+    expand_headless_with(&commands, cli, cfg, workspace, prompt)
+}
+
+fn expand_headless_with(
+    commands: &BTreeMap<String, CommandTemplate>,
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    workspace: &crate::paths::WorkspaceBinding,
+    prompt: &str,
+) -> Result<HeadlessCommand, String> {
+    let Some(rest) = prompt.trim().strip_prefix('/') else {
+        return Ok(HeadlessCommand::Literal);
+    };
+    let (name, arguments) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if name.is_empty() || name.contains('/') {
+        return Ok(HeadlessCommand::Literal);
+    }
+    let Some(template) = commands.get(name) else {
+        return Ok(if crate::ui::pickers::list::reserved_command(name) {
+            HeadlessCommand::BuiltIn(name.to_owned())
+        } else {
+            HeadlessCommand::Literal
+        });
+    };
+    let permission = if template.has_includes() {
+        let authority = crate::permission::resolve_configured_execution_authority(cli, cfg)
+            .map_err(|error| error.to_string())?
+            .0;
+        crate::permission::build_noninteractive_permission_with_cli(cli, cfg, authority)
+            .map_err(|error| error.to_string())?
+            .0
+    } else {
+        None
+    };
+    template
+        .expand(arguments.trim(), workspace, &permission)
+        .map(HeadlessCommand::Expanded)
 }
 
 pub(crate) fn load_for_workspace(
@@ -692,6 +756,38 @@ mod tests {
         ] {
             assert!(CommandTemplate::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn headless_prompt_expands_trusted_commands_only_and_flags_builtins() {
+        let root = crate::tests::OwnedTestDirectory::new("command-headless");
+        let paths = paths(root.path());
+        crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
+        let workspace_dir = root.path().join("workspace");
+        let project = workspace_dir.join(".mini-agent/commands");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("fix-issue.md"), "Fix issue $1 (all: $ARGUMENTS)").unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
+        let (cli, cfg) = (crate::cli::Cli::default(), crate::config::Config::default());
+        let run = |commands: &BTreeMap<String, CommandTemplate>, prompt: &str| {
+            expand_headless_with(commands, &cli, &cfg, &workspace, prompt)
+        };
+        let trusted = load_layers(&paths, &workspace, true);
+        assert_eq!(
+            run(&trusted, "/fix-issue 123 now").unwrap(),
+            HeadlessCommand::Expanded("Fix issue 123 (all: 123 now)".into())
+        );
+        // Untrusted project config: the project command is inactive, text literal.
+        let untrusted = load_layers(&paths, &workspace, false);
+        assert_eq!(run(&untrusted, "/fix-issue 123").unwrap(), HeadlessCommand::Literal);
+        // Built-ins are flagged; paths and plain text stay literal.
+        assert_eq!(run(&trusted, "/help").unwrap(), HeadlessCommand::BuiltIn("help".into()));
+        assert_eq!(run(&trusted, "/etc/passwd explain").unwrap(), HeadlessCommand::Literal);
+        assert_eq!(run(&trusted, "summarize").unwrap(), HeadlessCommand::Literal);
+        assert_eq!(run(&trusted, "/unknown x").unwrap(), HeadlessCommand::Literal);
+        // Oversized arguments are refused like the TUI/ACP path.
+        let huge = format!("/fix-issue {}", "a".repeat(MAX_TEMPLATE_BYTES + 1));
+        assert!(run(&trusted, &huge).unwrap_err().contains("64 KiB"));
     }
 
     #[test]
