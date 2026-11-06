@@ -3746,6 +3746,14 @@ Behavior notes:
   diagnostics", never a failed edit.
 - Post-edit diagnostics are capped (errors first, ~20 lines); nothing is
   appended when the file is clean.
+- The client advertises `textDocument/didSave` support. A server that
+  registers for it in its `initialize` result (`textDocumentSync.save`)
+  receives `didSave` right after each synchronized `didOpen`/`didChange`
+  (with the full text only when it asks for `includeText`), because the file
+  is already published on disk. This lets save-triggered checkers such as
+  rust-analyzer's `cargo check` flycheck report type and borrow errors after an
+  edit. Servers that do not register (or use the legacy numeric sync kind)
+  never receive `didSave`.
 
 ## Mutation previews
 

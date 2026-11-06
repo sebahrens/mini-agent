@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -423,6 +423,10 @@ pub struct LspClient {
     last_used_ms: std::sync::atomic::AtomicU64,
     /// The manager's idle watcher, aborted when the client is shut down.
     idle_task: Mutex<Option<JoinHandle<()>>>,
+    /// Whether the server registered for `textDocument/didSave` in its
+    /// `initialize` result: [`SAVE_NONE`], [`SAVE_NOTIFY`] or
+    /// [`SAVE_WITH_TEXT`]. Set once after the handshake.
+    save_mode: AtomicU8,
     #[cfg(test)]
     sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
     #[cfg(test)]
@@ -744,6 +748,7 @@ impl LspClient {
             epoch: tokio::time::Instant::now(),
             last_used_ms: std::sync::atomic::AtomicU64::new(0),
             idle_task: Mutex::new(None),
+            save_mode: AtomicU8::new(SAVE_NONE),
             #[cfg(test)]
             sync_probes: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
@@ -761,7 +766,7 @@ impl LspClient {
                         "dynamicRegistration": false,
                         "willSave": false,
                         "willSaveWaitUntil": false,
-                        "didSave": false
+                        "didSave": true
                     },
                     "publishDiagnostics": { "versionSupport": true }
                 }
@@ -775,15 +780,18 @@ impl LspClient {
         let initialized = client
             .request("initialize", init_params, initialize_timeout)
             .await;
-        if initialized
+        let Some(result) = initialized
             .as_ref()
             .and_then(|response| response.get("result"))
             .and_then(Value::as_object)
-            .is_none()
-        {
+        else {
             client.shutdown().await;
             return None;
-        }
+        };
+        client.save_mode.store(
+            save_mode_from_capabilities(result.get("capabilities")),
+            Ordering::Release,
+        );
         if !client.notify("initialized", json!({})).await {
             client.shutdown().await;
             return None;
@@ -1063,6 +1071,23 @@ impl LspClient {
                 let _ = advanced.send(());
                 let _ = release.await;
             }
+            let save = match self.save_mode.load(Ordering::Acquire) {
+                SAVE_NONE => None,
+                mode => {
+                    let mut params = json!({ "textDocument": { "uri": wire_uri } });
+                    if mode == SAVE_WITH_TEXT {
+                        params["text"] = Value::String(text.clone());
+                    }
+                    Some(
+                        serde_json::to_vec(&json!({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/didSave",
+                            "params": params,
+                        }))
+                        .map_err(std::io::Error::other)?,
+                    )
+                }
+            };
             let (method, params) = match action {
                 Sync::Open => (
                     "textDocument/didOpen",
@@ -1098,6 +1123,12 @@ impl LspClient {
                 rpc::write_frame(write.writer(), &close).await?;
             }
             rpc::write_frame(write.writer(), &body).await?;
+            // Servers such as rust-analyzer run their full checker (flycheck)
+            // only on save. The file is already on disk, so announcing the
+            // save after each synchronized edit is truthful.
+            if let Some(save) = save {
+                rpc::write_frame(write.writer(), &save).await?;
+            }
             Ok::<_, std::io::Error>(Some(baseline))
         })
         .await;
@@ -1142,6 +1173,33 @@ fn take_pipe<T>(pipe: &mut Option<T>, kind: &str, name: &str) -> Option<T> {
         tracing::debug!("lsp[{name}]: child did not provide piped {kind}");
         None
     })
+}
+
+/// The server did not register for `textDocument/didSave`.
+const SAVE_NONE: u8 = 0;
+/// Send `didSave` without the document text.
+const SAVE_NOTIFY: u8 = 1;
+/// Send `didSave` with the full document text (`includeText: true`).
+const SAVE_WITH_TEXT: u8 = 2;
+
+/// Decode `capabilities.textDocumentSync.save` from an `initialize` result.
+/// The legacy numeric `TextDocumentSyncKind` form carries no save options,
+/// so such servers never receive `didSave`.
+fn save_mode_from_capabilities(capabilities: Option<&Value>) -> u8 {
+    match capabilities
+        .and_then(|capabilities| capabilities.get("textDocumentSync"))
+        .and_then(|sync| sync.get("save"))
+    {
+        Some(Value::Bool(true)) => SAVE_NOTIFY,
+        Some(Value::Object(options)) => {
+            if options.get("includeText").and_then(Value::as_bool) == Some(true) {
+                SAVE_WITH_TEXT
+            } else {
+                SAVE_NOTIFY
+            }
+        }
+        _ => SAVE_NONE,
+    }
 }
 
 /// Most `workspace/configuration` items answered in one reply.
@@ -1848,6 +1906,29 @@ mod boundary_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("directory component"), "{error}");
+    }
+
+    #[test]
+    fn did_save_is_sent_only_for_servers_that_register_for_it() {
+        let mode = |capabilities: Value| save_mode_from_capabilities(Some(&capabilities));
+        assert_eq!(save_mode_from_capabilities(None), SAVE_NONE);
+        assert_eq!(mode(json!({})), SAVE_NONE);
+        // Legacy numeric sync kind carries no save registration.
+        assert_eq!(mode(json!({"textDocumentSync": 1})), SAVE_NONE);
+        assert_eq!(mode(json!({"textDocumentSync": {"change": 1}})), SAVE_NONE);
+        assert_eq!(
+            mode(json!({"textDocumentSync": {"save": false}})),
+            SAVE_NONE
+        );
+        assert_eq!(
+            mode(json!({"textDocumentSync": {"save": true}})),
+            SAVE_NOTIFY
+        );
+        assert_eq!(mode(json!({"textDocumentSync": {"save": {}}})), SAVE_NOTIFY);
+        assert_eq!(
+            mode(json!({"textDocumentSync": {"save": {"includeText": true}}})),
+            SAVE_WITH_TEXT
+        );
     }
 
     #[test]

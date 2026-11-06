@@ -57,6 +57,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   lives in the application data directory, which the workspace profile never mounted and which
   explicit-roots profiles mask. The git service launch now binds only the guarded runtime
   directory read-only, after the masks (mini-agent-j053j).
+- LSP post-edit diagnostics now send `textDocument/didSave` after each synchronized edit to
+  servers that register for it (`textDocumentSync.save`, with text only for `includeText`), so
+  save-triggered checkers such as rust-analyzer's `cargo check` can report compiler errors in the
+  edit result. Servers that do not register never receive it (mini-agent-ehqci).
 
 ### Added
 

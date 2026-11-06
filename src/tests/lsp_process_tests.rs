@@ -99,6 +99,12 @@ fn write_probe(body: &str) {
     fs::write(path, value).unwrap();
 }
 
+fn publish_message(writer: &mut impl Write, uri: &str, version: i64, message: &str) {
+    write_frame(writer, &format!(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{uri}\",\"version\":{version},\"diagnostics\":[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}},\"severity\":1,\"message\":\"{message} version {version}\"}}]}}}}"
+    ));
+}
+
 fn append_launch(pid: u32) {
     let Some(path) = env::var_os("LSP_FIXTURE_LAUNCH_LOG") else {
         return;
@@ -159,6 +165,7 @@ fn main() {
                 .is_ok()
         });
 
+    let mut last_synced: Option<(String, i64)> = None;
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = io::stdout().lock();
@@ -181,9 +188,14 @@ fn main() {
                 _ => {}
             }
             let id = request_id(&body);
+            let capabilities = if mode == "save-diagnostics" {
+                "{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}}}"
+            } else {
+                "{}"
+            };
             write_frame(
                 &mut stdout,
-                &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{}}}}}}"),
+                &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{capabilities}}}}}"),
             );
         } else if body.contains("\"method\":\"initialized\"") {
             if restart_first {
@@ -199,6 +211,15 @@ fn main() {
             if mode == "close-stdin" {
                 break;
             }
+        } else if body.contains("\"method\":\"textDocument/didSave\"") {
+            if let Some(path) = env::var_os("LSP_FIXTURE_SAVE_LOG") {
+                let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
+                writeln!(file, "{body}").unwrap();
+            }
+            // Like rust-analyzer's flycheck: the checker runs on save only.
+            if let Some((uri, version)) = last_synced.clone() {
+                publish_message(&mut stdout, &uri, version, "fixture saved diagnostic");
+            }
         } else if body.contains("\"method\":\"textDocument/didClose\"") {
             if let Some(path) = env::var_os("LSP_FIXTURE_SYNC_LOG") {
                 let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
@@ -210,6 +231,17 @@ fn main() {
             if let Some(path) = env::var_os("LSP_FIXTURE_SYNC_LOG") {
                 let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
                 writeln!(file, "{body}").unwrap();
+            }
+            if mode == "save-diagnostics" || mode == "delayed-diagnostics" {
+                let uri = body.split_once("\"uri\":").unwrap().1.split('"').nth(1).unwrap();
+                let version: i64 = body.split_once("\"version\":").unwrap().1
+                    .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+                last_synced = Some((uri.to_string(), version));
+                if mode == "delayed-diagnostics" {
+                    let delay: u64 = env::var("LSP_FIXTURE_PUBLISH_DELAY_MS").unwrap().parse().unwrap();
+                    thread::sleep(Duration::from_millis(delay));
+                    publish_message(&mut stdout, uri, version, "fixture delayed diagnostic");
+                }
             }
             if mode == "diagnostics" {
                 let wire_uri = body.split_once("\"uri\":").unwrap().1.split('"').nth(1).unwrap();
@@ -1117,6 +1149,109 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
             "{output}"
         );
     }
+}
+
+/// Runs one write and one edit through the real tools against a fixture
+/// server in `mode`, returning both tool results.
+async fn write_then_edit_with_fixture(
+    fixture: &FixtureBuild,
+    mode: &str,
+    configure: impl FnOnce(&mut LspServerConfig),
+) -> (Result<String, String>, Result<String, String>) {
+    use crate::agent::tools::{EditArgs, WriteArgs, edit::EditTool, write::WriteTool};
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+    let lease = fixture.path(&format!("{mode}.lease"));
+    let mut server = fixture.config(mode, &lease);
+    server.extensions = vec![".rs".into()];
+    configure(&mut server);
+    let manager = LspManager::new(
+        &LspConfig {
+            servers: HashMap::from([("fixture".into(), server)]),
+            ..Default::default()
+        },
+        Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+    );
+    let write = WriteTool::new(None, None, None)
+        .with_workspace(workspace.clone())
+        .with_lsp(Some(manager.clone()));
+    let edit = EditTool::new(None, None)
+        .with_workspace(workspace.clone())
+        .with_lsp(Some(manager.clone()));
+    crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
+    let path = workspace
+        .join(format!("{mode}.rs"))
+        .to_string_lossy()
+        .into_owned();
+    let written = write
+        .call(WriteArgs {
+            path: path.clone(),
+            content: "before".into(),
+            overwrite: false,
+        })
+        .await
+        .map_err(|error| error.to_string());
+    let edited = edit
+        .call(EditArgs {
+            fuzzy: false,
+            path,
+            block: Some("<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE".into()),
+            replace_all: false,
+            file_crc: None,
+            edits: None,
+        })
+        .await
+        .map_err(|error| error.to_string());
+    manager.shutdown().await;
+    drop(write);
+    drop(edit);
+    drop(manager);
+    (written, edited)
+}
+
+#[tokio::test]
+async fn lsp_process_did_save_delivers_save_only_diagnostics_to_edit_results() {
+    let fixture = FixtureBuild::compile("did-save");
+    let save_log = fixture.path("save.log");
+    let (written, edited) = write_then_edit_with_fixture(&fixture, "save-diagnostics", |server| {
+        server.env.insert(
+            "LSP_FIXTURE_SAVE_LOG".into(),
+            save_log.display().to_string(),
+        );
+    })
+    .await;
+    let saves = fs::read_to_string(&save_log).unwrap_or_default();
+    // A server that does not register for didSave never receives it.
+    let quiet_log = fixture.path("quiet-save.log");
+    let (_, quiet) = write_then_edit_with_fixture(&fixture, "diagnostics", |server| {
+        server.env.insert(
+            "LSP_FIXTURE_SAVE_LOG".into(),
+            quiet_log.display().to_string(),
+        );
+    })
+    .await;
+    let quiet_exists = quiet_log.exists();
+    fixture.cleanup().await;
+    let written = written.unwrap();
+    assert!(written.contains("LSP diagnostics"), "{written}");
+    assert!(
+        written.contains("fixture saved diagnostic version 1"),
+        "{written}"
+    );
+    let edited = edited.unwrap();
+    assert!(
+        edited.contains("fixture saved diagnostic version 2"),
+        "{edited}"
+    );
+    assert_eq!(saves.lines().count(), 2, "{saves}");
+    assert!(
+        saves.lines().all(|line| !line.contains("\"text\"")),
+        "includeText=false must omit the text: {saves}"
+    );
+    assert!(quiet.unwrap().contains("fixture diagnostic version 2"));
+    assert!(
+        !quiet_exists,
+        "didSave sent to a server that did not register"
+    );
 }
 
 #[cfg(unix)]
