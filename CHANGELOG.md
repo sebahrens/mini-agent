@@ -84,6 +84,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Opt-in `hosted-web-search` (default off): Anthropic and OpenAI Responses models can use the provider-hosted `web_search` tool without `EXA_API_KEY`. It replaces the native Exa tool for the main agent, bypasses per-call web_search permission, and requires project trust (mini-agent-5hgoo).
 - `sandbox-network = "allow"` opts contained shell commands into the network (bwrap omits
   `--unshare-net`; Seatbelt allows network and name resolution) without widening filesystem reach.
   The default stays `deny`, a project layer needs project trust, and `/sandbox` plus the

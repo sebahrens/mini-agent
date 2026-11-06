@@ -129,6 +129,10 @@ mod unavailable_provider_tests {
 #[cfg(test)]
 #[path = "provider_effort_tests.rs"]
 mod effort_tests;
+
+#[cfg(test)]
+#[path = "provider_hosted_search_tests.rs"]
+mod hosted_search_tests;
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
 #[cfg(feature = "hooks")]
@@ -462,6 +466,95 @@ pub(crate) fn merge_extra_body(
         // Non-object base (shouldn't happen for routing) — user value takes over.
         (Some(_), extra) => extra,
     }
+}
+
+/// Hosted web-search tool definition for providers that run search
+/// server-side, or `None` where the provider has no supported bridge.
+fn hosted_web_search_tool(model: &AnyModel) -> Option<serde_json::Value> {
+    match model {
+        AnyModel::Anthropic(_) => Some(serde_json::json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5
+        })),
+        AnyModel::OpenAI(OpenAiModel::Responses(_)) => {
+            Some(serde_json::json!({"type": "web_search"}))
+        }
+        _ => None,
+    }
+}
+
+fn web_search_denied(cfg: &Config) -> bool {
+    cfg.permission_deny
+        .as_ref()
+        .is_some_and(|rules| rules.contains_key("web_search"))
+        || cfg
+            .permission
+            .as_ref()
+            .and_then(|value| value.get("web_search"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("deny"))
+}
+
+/// Adds the provider-hosted web-search tool to the main agent's request
+/// parameters. Closed by default: it requires `hosted-web-search = true`, an
+/// Anthropic or OpenAI Responses model, an eligible `web_search` tool, no
+/// `web_search = deny` rule and `web-search-provider` not `off`. Hosted tools
+/// run provider-side and so bypass the per-call network permission, which is
+/// why this is never implied by any other setting.
+pub(crate) fn with_hosted_web_search(
+    model: &AnyModel,
+    cli: &Cli,
+    cfg: &Config,
+    extra_body: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if !cfg.hosted_web_search.unwrap_or(false)
+        || cfg.web_search_provider.as_deref() == Some("off")
+        || web_search_denied(cfg)
+        || !cli.tool_is_eligible(cfg, "web_search")
+    {
+        return extra_body;
+    }
+    let Some(tool) = hosted_web_search_tool(model) else {
+        return extra_body;
+    };
+    let mut body = match extra_body {
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(map)) => map,
+        other => return other,
+    };
+    match body.get_mut("tools") {
+        Some(serde_json::Value::Array(tools)) => {
+            let present = tools.iter().any(|t| {
+                t.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|ty| ty.starts_with("web_search"))
+            });
+            if !present {
+                tools.push(tool);
+            }
+        }
+        Some(_) => return Some(serde_json::Value::Object(body)),
+        None => {
+            body.insert("tools".into(), serde_json::Value::Array(vec![tool]));
+        }
+    }
+    Some(serde_json::Value::Object(body))
+}
+
+/// Whether request parameters already carry a hosted `web_search` tool, in
+/// which case the native function tool of the same name is not registered.
+pub(crate) fn declares_hosted_web_search(params: Option<&serde_json::Value>) -> bool {
+    params
+        .and_then(|p| p.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|t| {
+                t.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|ty| ty.starts_with("web_search"))
+            })
+        })
 }
 
 /// `params` with `num_ctx` set to `context_window` unless it already names
@@ -6164,6 +6257,7 @@ async fn build_agent_with_probe_snapshot(
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "js")] completed_probe: Option<crate::sandbox::worker::WorkerContainmentStatus>,
 ) -> AnyAgent {
+    let extra_body = with_hosted_web_search(&model, cli, cfg, extra_body);
     let native_host = (
         workspace.clone(),
         permission.clone(),
