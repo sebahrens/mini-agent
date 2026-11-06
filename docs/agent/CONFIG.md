@@ -1743,7 +1743,7 @@ table. This feeds the status line, the spend account, and `max_budget_usd`
 for both the main session and subagent/advisor/judge calls.
 
 A custom provider with no `model_prices` entry (and no catalog or listing
-price) is unpriced: headless `--output-format json` reports `"cost": 0` and
+price) is unpriced: headless `--output json` reports `"cost": 0` and
 adds `"cost_unpriced": true`, so 0 means "not priced", not "free". Cached
 tokens are read from the response's `prompt_tokens_details.cached_tokens`
 (Chat Completions) and stay 0 when the gateway omits that field.

@@ -335,7 +335,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
 | `--max-budget-usd AMOUNT` | Finite nonnegative recorded-spend ceiling for the logical session, including auxiliary requests. Refused required continuation reports `budget` and exits nonzero; admitted work can exceed the estimate. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `--output-schema FILE` | With plain `-p`, validate an answer against a bounded offline JSON schema; default JSON envelope, at most two tool-free repairs. |
-| `--output text\|json\|stream-json` | With `-p`, select the final answer (default), one JSON result, or streamed NDJSON events. Machine output conflicts with `--pure-stdout`. |
+| `--output text\|json\|stream-json` | With `-p`, select the final answer (default), one JSON result, or streamed NDJSON events. Machine output conflicts with `--pure-stdout`. `--output-format` is accepted as a hidden alias for scripts written for Claude Code. |
 | `--input-format text\|stream-json` | With `-p`, `stream-json` reads newline-delimited JSON user messages from stdin and runs each as a turn in one session (requires `--output stream-json`; see below). |
 | `--stream-json-preview-bytes N` | With `-p`, cap stream-json text, tool-argument, tool-result and diff previews at `N` bytes (256–1,048,576; default 8,192). |
 | `--max-stdin-bytes N` | With `-p`, piped-stdin limit (per input line with `--input-format stream-json`; 1,024–67,108,864; default 1,048,576). |

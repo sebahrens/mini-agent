@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### ACP, IDE and headless
 
+- `--output-format` is accepted as a hidden alias of `--output` (scripts written for Claude Code's
+  `claude -p --output-format stream-json`); the docs now use `--output` throughout.
 - `!` shell commands now time out after 120 s by default (was 30 s) and accept a per-command
   deadline, `!timeout=300 cargo test` (clamped to 1-600 s). A timed-out command reports
   `timed out after N s` with how to raise it. The 1 MiB output cap is unchanged and is still

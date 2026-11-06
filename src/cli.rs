@@ -158,6 +158,7 @@ pub struct Cli {
 
     #[arg(
         long = "output",
+        alias = "output-format",
         value_name = "FORMAT",
         value_enum,
         requires = "print",
@@ -1632,6 +1633,30 @@ pub fn write_completions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_format_is_a_hidden_alias_of_output() {
+        for flag in ["--output", "--output-format"] {
+            let cli = Cli::try_parse_from(["mini-agent", "-p", flag, "stream-json", "hi"]).unwrap();
+            assert!(
+                matches!(cli.output, Some(OutputFormat::StreamJson)),
+                "{flag}"
+            );
+        }
+        let joined =
+            Cli::try_parse_from(["mini-agent", "-p", "--output-format=json", "hi"]).unwrap();
+        assert!(matches!(joined.output, Some(OutputFormat::Json)));
+        // Same constraints as --output: needs -p, rejects unknown formats.
+        assert!(Cli::try_parse_from(["mini-agent", "--output-format", "json"]).is_err());
+        assert!(Cli::try_parse_from(["mini-agent", "-p", "--output-format", "xml", "hi"]).is_err());
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        assert!(
+            !help.contains("output-format"),
+            "alias stays hidden from --help"
+        );
+    }
+
     #[test]
     fn response_max_tokens_follows_the_catalog_output_ceiling() {
         use super::{DEFAULT_MAX_TOKENS_CEILING, FALLBACK_MAX_TOKENS, resolve_response_max_tokens};
