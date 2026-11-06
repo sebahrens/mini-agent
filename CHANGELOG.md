@@ -15,6 +15,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Nested `AGENTS.md`/`CLAUDE.md` loading no longer makes `read`/`edit`/`write` fail after 64
+  distinct directories, 64 sources or 128 KiB: directories without instruction files no longer
+  count, budget overflow skips the directory with a visible "sources not shown" notice, a source
+  over 16 KiB is truncated with a marker, an oversized notice defers sources instead of failing, and
+  more than 128 delivery receipts evict the oldest instead of terminating the run (CONFIG.md
+  "Nested instruction limits").
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

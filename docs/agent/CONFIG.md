@@ -3005,6 +3005,24 @@ reject symlinks and multiple hard links, and use at most four include levels,
 earlier root content retains priority. Physical file aliases and include cycles
 are deduplicated while preserving the first authored scope/order.
 
+#### Nested instruction limits
+
+These bounds never fail the triggering `read`, `edit`, `write` or `notebook_edit`
+call and never end the run; exceeding one degrades visibly:
+
+| Limit | Value | Behaviour when exceeded |
+|-------|-------|-------------------------|
+| Bytes per source | 16 KiB | Source truncated at a UTF-8 boundary with an `[mini-agent: instruction source truncated …]` marker; read the file directly for the rest. |
+| Directories with instruction files | 64 | Further directories' sources are skipped; the read result names them in a "sources not shown" notice. |
+| Retained sources / bytes | 64 / 128 KiB (and the remainder of the 512 KiB context budget) | Same as above: skipped directory named in a notice. |
+| Directories without instruction files | 4,096 cached | Past the cap they are re-probed on each touch (no failure). |
+| Path depth considered | 64 components | Deeper targets fail the instruction lookup with a bounded error. |
+| One notice result | 32 KiB | Sources that do not fit are deferred and named; they are offered again once the delivered ones are reviewed. A deferred or skipped source never blocks a mutation. |
+| Delivery receipts per run | 128 | The oldest receipt is evicted; its sources become eligible for re-delivery. |
+
+Invalid UTF-8, linked (symlink/hard-link) sources, include escapes and the
+four-level / 32-node include limits still fail closed with a bounded error.
+
 A first mutation can return "Mutation not executed" with a private instruction
 notice. It changes no file and grants no permission: only a subsequent accepted
 request containing that exact native notice enables instruction-reviewed retry.
