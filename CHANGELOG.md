@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `read_mcp_resource` continuation pages reuse the first read for two minutes (one server request,
+  one permission decision) and show a `content_hash`; a changed resource is reported
+  (mini-agent-0kbkd). `list_mcp_resources` continuation hints name `server=` so paging an unscoped
+  listing no longer skips other servers' entries (mini-agent-b9g1r).
 - `--mcp-server-timeout <secs>` and `--mcp-server-max-runs <n>` (defaults 1800 and 4, shown in the
   `run` tool description); a timed-out `run` is stopped with SIGTERM first and reports the child's
   stderr tail and its saved session id (mini-agent-tu8q0).

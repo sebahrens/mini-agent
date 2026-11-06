@@ -224,6 +224,15 @@ paging; a truncated listing names the `offset` that continues it.
 `+xml`, with parameters ignored). Longer text is cut at a character boundary
 with a marker naming the `offset` to pass back (`length` is optional); at most
 4 MiB of a resource is retained, and a server that sends more is flagged.
+Continuation pages reuse the first read: the fetched text (at most four
+resources) is cached for two minutes per session, so paging through a resource
+costs one server request and one permission decision. Every page header shows a
+`content_hash` (12 hex digits of SHA-256); pass it back with `offset`, and if
+the resource changed the read restarts from byte 0 and says so (a fresh read at
+offset 0 also reports a change since the previous one). Bytes beyond the 4 MiB
+fetch bound stay unreachable and the header says so. Unscoped
+`list_mcp_resources` paging is per server, so its `more matches` hint names
+`server=<name>` (and the query/limit in use).
 Binary parts and non-text MIME types are omitted with a note stating the part
 size and MIME type, and a resource with nothing readable is refused with that
 reason. Operator `@mcp:` attachments stay strict: text over 256 KiB is refused
