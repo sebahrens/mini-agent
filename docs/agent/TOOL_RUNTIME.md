@@ -1606,7 +1606,16 @@ request bodies to 256 KiB and response bodies to 1 MiB for search and the JS
 broker. `web_fetch` reads at most 10 MiB of a response body; a larger body is not
 an error: the first 10 MiB are converted and the result states
 `Response body truncated at N bytes`, while the excerpt/spill path covers only that
-prefix. Encoded or non-UTF-8 bodies are rejected. A native HTTP operation has one deadline spanning DNS,
+prefix. Native exchanges send a host-controlled `Accept-Encoding: gzip, deflate`
+and decode those codings with an output cap equal to the body cap, so a
+decompression bomb is truncated (`web_fetch`) or rejected (`web_search`) without
+being materialized; other codings (`br`, `zstd`, stacked lists) are refused.
+Text is decoded with the `Content-Type` charset (or, for HTML without one, a
+`<meta charset>` sniff over the first KiB; UTF-8 otherwise). `web_fetch` decodes
+malformed text with replacement characters and refuses binary media types (PDF,
+images, archives, `application/octet-stream`) by name without downloading the
+body; HTML and XHTML are converted, other text types (plain, JSON, XML, source)
+are quoted literally. Search and the JS broker reject non-UTF-8 bodies. A native HTTP operation has one deadline spanning DNS,
 approval, redirects and body consumption: ten seconds for `web_search` and the JS
 broker, `web-fetch-timeout-secs` (default 30, clamped 1..=300) for `web_fetch`,
 whose idle read bound is half that deadline (at least three seconds). DNS and

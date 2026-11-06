@@ -746,6 +746,7 @@ pub(crate) fn validate_header_limits(
     Ok(())
 }
 
+#[cfg(all(feature = "js", feature = "sandbox"))]
 pub(crate) fn reject_encoded_response(
     headers: &reqwest::header::HeaderMap,
 ) -> Result<(), FetchError> {
@@ -826,6 +827,11 @@ pub(crate) struct NativeFetchLimits {
     pub(crate) total_timeout: Duration,
     /// Longest idle gap allowed between two body reads.
     pub(crate) read_timeout: Duration,
+    /// Decode malformed text with replacement characters instead of failing.
+    pub(crate) lossy_text: bool,
+    /// Do not download a body whose content type is binary (see
+    /// `is_textual_content_type`); the result reports the type instead.
+    pub(crate) skip_binary_body: bool,
 }
 
 impl Default for NativeFetchLimits {
@@ -835,6 +841,8 @@ impl Default for NativeFetchLimits {
             truncate_body: false,
             total_timeout: FETCH_TOTAL_TIMEOUT,
             read_timeout: FETCH_READ_TIMEOUT,
+            lossy_text: false,
+            skip_binary_body: false,
         }
     }
 }
@@ -868,11 +876,189 @@ pub(crate) const WEB_FETCH_DEFAULT_BODY_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// A completed native exchange. `truncated_at` is set when the body exceeded
 /// a truncating cap; `text` then holds only the retained prefix.
+/// `content_type` is the sanitized media type essence (`type/subtype`), and
+/// `binary` is set when a binary body was skipped (`text` is then empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeFetchResult {
     pub status: u16,
     pub text: String,
     pub truncated_at: Option<usize>,
+    pub content_type: Option<String>,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeContentCoding {
+    Gzip,
+    Deflate,
+}
+
+/// Native exchanges advertise only codings they can decode with a bounded
+/// output (`gzip`, `deflate`). Any other coding, or a stacked coding list, is
+/// refused rather than passed through as garbage text.
+fn native_content_coding(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<Option<NativeContentCoding>, FetchError> {
+    let mut coding = None;
+    for value in headers.get_all(reqwest::header::CONTENT_ENCODING) {
+        let value = value
+            .to_str()
+            .map_err(|_| FetchError::UnsupportedContentEncoding)?;
+        for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let next = match token.to_ascii_lowercase().as_str() {
+                "identity" => continue,
+                "gzip" | "x-gzip" => NativeContentCoding::Gzip,
+                "deflate" => NativeContentCoding::Deflate,
+                _ => return Err(FetchError::UnsupportedContentEncoding),
+            };
+            if coding.replace(next).is_some() {
+                return Err(FetchError::UnsupportedContentEncoding);
+            }
+        }
+    }
+    Ok(coding)
+}
+
+/// `type/subtype` essence of a Content-Type header, lowercased and limited to
+/// media-type token characters so a hostile header cannot inject text.
+fn native_media_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let value = headers.get(reqwest::header::CONTENT_TYPE)?.to_str().ok()?;
+    let essence = value.split(';').next()?.trim().to_ascii_lowercase();
+    (!essence.is_empty()
+        && essence.len() <= 127
+        && essence.contains('/')
+        && essence
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/.+-_".contains(&b)))
+    .then_some(essence)
+}
+
+fn native_charset(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let value = headers.get(reqwest::header::CONTENT_TYPE)?.to_str().ok()?;
+    value.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+    })
+}
+
+/// Whether a media type is text that `web_fetch` can usefully convert.
+/// A missing type is treated as text (servers commonly omit it).
+pub(crate) fn is_textual_content_type(media_type: Option<&str>) -> bool {
+    let Some(media_type) = media_type else {
+        return true;
+    };
+    let (kind, subtype) = media_type.split_once('/').unwrap_or((media_type, ""));
+    kind == "text"
+        || subtype.ends_with("+json")
+        || subtype.ends_with("+xml")
+        || (kind == "application"
+            && matches!(
+                subtype,
+                "json"
+                    | "xml"
+                    | "javascript"
+                    | "ecmascript"
+                    | "x-javascript"
+                    | "x-sh"
+                    | "x-yaml"
+                    | "yaml"
+                    | "toml"
+                    | "x-toml"
+                    | "sql"
+                    | "graphql"
+                    | "x-ndjson"
+                    | "ndjson"
+                    | "x-www-form-urlencoded"
+            ))
+}
+
+/// `<meta charset>` / `http-equiv` sniff over the first KiB of an HTML body
+/// when the header names no charset.
+fn sniff_meta_charset(body: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(&body[..body.len().min(1024)]).to_ascii_lowercase();
+    let at = head.find("charset=")? + "charset=".len();
+    let rest = head[at..].trim_start_matches(['"', '\'', ' ']);
+    let label: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+        .collect();
+    (!label.is_empty()).then_some(label)
+}
+
+/// Decompress a retained body with an output cap. Output beyond `cap` is a
+/// decompression bomb for a strict client and a truncation for a truncating
+/// one; either way at most `cap` bytes are ever materialized.
+fn native_decode_coding(
+    coding: NativeContentCoding,
+    body: &[u8],
+    cap: usize,
+    truncate: bool,
+    input_truncated: bool,
+) -> Result<(Vec<u8>, bool), FetchError> {
+    use std::io::Read as _;
+    let mut reader: Box<dyn std::io::Read + '_> = match coding {
+        NativeContentCoding::Gzip => Box::new(flate2::read::MultiGzDecoder::new(body)),
+        // HTTP "deflate" is zlib-wrapped; some servers send raw DEFLATE.
+        NativeContentCoding::Deflate if body.first().is_some_and(|b| b & 0x0f == 8) => {
+            Box::new(flate2::read::ZlibDecoder::new(body))
+        }
+        NativeContentCoding::Deflate => Box::new(flate2::read::DeflateDecoder::new(body)),
+    };
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok((output, input_truncated)),
+            Ok(read) => {
+                if output.len().saturating_add(read) > cap {
+                    if !truncate {
+                        return Err(FetchError::ResponseBodyTooLarge);
+                    }
+                    output.extend_from_slice(&buffer[..cap - output.len()]);
+                    return Ok((output, true));
+                }
+                output.extend_from_slice(&buffer[..read]);
+            }
+            // A body cut at the compressed cap ends mid-stream; keep what
+            // decoded cleanly before that point.
+            Err(_) if input_truncated => return Ok((output, true)),
+            Err(error) => return Err(FetchError::RequestFailed(error.to_string())),
+        }
+    }
+}
+
+/// Convert a retained body to text using its declared (or sniffed) charset.
+/// Strict mode rejects malformed input; lossy mode substitutes U+FFFD.
+fn native_decode_text(
+    body: Vec<u8>,
+    charset: Option<&str>,
+    html: bool,
+    truncated: bool,
+    lossy: bool,
+) -> Result<String, FetchError> {
+    let sniffed = if charset.is_none() && html {
+        sniff_meta_charset(&body)
+    } else {
+        None
+    };
+    let label = charset.or(sniffed.as_deref());
+    let encoding = label
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    if encoding == encoding_rs::UTF_8 && !lossy {
+        return native_body_text(body, truncated);
+    }
+    if lossy {
+        // BOM sniffing overrides the label, as browsers do.
+        let (text, _, _) = encoding.decode(&body);
+        return Ok(text.into_owned());
+    }
+    encoding
+        .decode_without_bom_handling_and_without_replacement(&body)
+        .map(std::borrow::Cow::into_owned)
+        .ok_or(FetchError::InvalidUtf8)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -957,9 +1143,12 @@ pub(crate) async fn send_async(
         .map_err(|_| FetchError::ClientBuild("client build task panicked".to_string()))??;
         ASYNC_CLIENTS.insert(&key, addresses, built)
     };
+    // Accept-Encoding is host-controlled (callers cannot set it) and lists
+    // only the codings `native_decode_coding` bounds.
     let mut builder = client
         .request(request.method.clone(), url.clone())
-        .headers(request.headers.clone());
+        .headers(request.headers.clone())
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate");
     if let Some(body) = &request.body {
         builder = builder.body(body.clone());
     }
@@ -970,7 +1159,6 @@ pub(crate) async fn send_async(
         limits.response_header_max_bytes,
         FetchError::ResponseHeadersTooLarge,
     )?;
-    reject_encoded_response(response.headers())?;
     if is_followable_redirect(response.status()) {
         let location = response
             .headers()
@@ -983,11 +1171,23 @@ pub(crate) async fn send_async(
                 .map_err(|_| FetchError::InvalidRedirect)?,
         ));
     }
+    let coding = native_content_coding(response.headers())?;
+    let content_type = native_media_type(response.headers());
+    let charset = native_charset(response.headers());
+    let status = response.status().as_u16();
+    if native.skip_binary_body && !is_textual_content_type(content_type.as_deref()) {
+        return Ok(NativeTransportOutcome::Complete(NativeFetchResult {
+            status,
+            text: String::new(),
+            truncated_at: None,
+            content_type,
+            binary: true,
+        }));
+    }
     let cap = native.body_max_bytes;
     if !native.truncate_body && response.content_length().is_some_and(|n| n > cap as u64) {
         return Err(FetchError::ResponseBodyTooLarge);
     }
-    let status = response.status().as_u16();
     let mut body = Vec::new();
     let mut truncated = false;
     while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
@@ -1003,10 +1203,20 @@ pub(crate) async fn send_async(
         }
         body.extend_from_slice(&chunk);
     }
+    let (body, truncated) = match coding {
+        Some(coding) => native_decode_coding(coding, &body, cap, native.truncate_body, truncated)?,
+        None => (body, truncated),
+    };
+    let html = content_type
+        .as_deref()
+        .is_none_or(|t| t == "text/html" || t == "application/xhtml+xml");
+    let text = native_decode_text(body, charset.as_deref(), html, truncated, native.lossy_text)?;
     Ok(NativeTransportOutcome::Complete(NativeFetchResult {
         status,
-        text: native_body_text(body, truncated)?,
+        text,
         truncated_at: truncated.then_some(cap),
+        content_type,
+        binary: false,
     }))
 }
 
@@ -1533,7 +1743,7 @@ pub(crate) mod web_http_tests {
     async fn web_http_native_wire_caps_encoding_utf8_and_credential_redirect_denial() {
         for (response, expected) in [
             (Peer::response(&"x".repeat(FETCH_RESPONSE_BODY_MAX_BYTES+1)),"response body exceeds"),
-            ("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\nx".into(),"content encoding"),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Encoding: br\r\nConnection: close\r\n\r\nx".into(),"content encoding"),
             ("HTTP/1.1 302 Found\r\nLocation: https://evil.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),"replay a non-GET"),
         ] {
             let peer=Peer::new(vec![response]);let client=fixture_client(&peer);

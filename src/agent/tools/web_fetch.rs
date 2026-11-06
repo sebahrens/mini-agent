@@ -58,6 +58,8 @@ fn web_fetch_limits() -> NativeFetchLimits {
     NativeFetchLimits {
         body_max_bytes: WEB_FETCH_DEFAULT_BODY_MAX_BYTES,
         truncate_body: true,
+        lossy_text: true,
+        skip_binary_body: true,
         ..NativeFetchLimits::default()
     }
     .with_total_timeout_secs(None)
@@ -79,7 +81,7 @@ impl Tool for WebFetchTool {
     type Error = ToolError;
     fn description(&self) -> String {
         format!(
-            "Retrieve a public HTTPS page as untrusted reference text. GET only; no credentials or custom headers. DNS, origin permission and each redirect are checked. Reads at most {} of the response body (a larger body is truncated at that point and marked so) within a {}-second deadline covering DNS, approval, redirects and the body. Returns up to 50,000 text characters, with a private session spill pointer when available. Optional prompt describes your retrieval focus; it does not invoke another model.",
+            "Retrieve a public HTTPS page as untrusted reference text. GET only; no credentials or custom headers. DNS, origin permission and each redirect are checked. Decodes gzip/deflate and declared charsets; binary types (PDF, images, archives) are refused with their content type. Reads at most {} of the response body (a larger body is truncated at that point and marked so) within a {}-second deadline covering DNS, approval, redirects and the body. Returns up to 50,000 text characters, with a private session spill pointer when available. Optional prompt describes your retrieval focus; it does not invoke another model.",
             mib(self.body_max_bytes),
             self.timeout_secs
         )
@@ -111,7 +113,21 @@ impl Tool for WebFetchTool {
                 response.status
             )));
         }
-        let text = page_text(&response.text);
+        if response.binary {
+            return Err(ToolError::Msg(format!(
+                "web_fetch does not support binary content type '{}' (HTTP {}); only text, HTML, JSON and XML responses are converted, and the body was not downloaded. Fetch a text or HTML version of the resource instead.",
+                response.content_type.as_deref().unwrap_or("unknown"),
+                response.status
+            )));
+        }
+        let text = match response.content_type.as_deref() {
+            // A declared non-HTML text type (plain text, JSON, XML, source)
+            // is quoted as-is; markup conversion applies only to HTML.
+            Some(t) if t != "text/html" && t != "application/xhtml+xml" => {
+                safe_text(&response.text)
+            }
+            _ => page_text(&response.text),
+        };
         let mut chars = text.chars();
         let excerpt: String = chars.by_ref().take(MAX_TEXT_CHARS).collect();
         let truncated = chars.next().is_some();
@@ -530,6 +546,159 @@ mod web_fetch_body_cap_tests {
                 .unwrap()
                 .contains("TAIL_PAST_CAP")
         );
+    }
+}
+
+#[cfg(test)]
+mod web_fetch_encoding_tests {
+    use super::super::web_http::web_http_tests::{Peer, fixture_client};
+    use super::*;
+    use std::io::Write;
+
+    fn raw(headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    async fn fetch(
+        response: Vec<u8>,
+        limits: NativeFetchLimits,
+    ) -> (Result<String, ToolError>, Peer) {
+        let peer = Peer::new_bytes(vec![response]);
+        let tool = WebFetchTool {
+            body_max_bytes: limits.body_max_bytes,
+            timeout_secs: 30,
+            client: fixture_client(&peer).with_limits(limits),
+            session_id: "unused".into(),
+            spills: None,
+        };
+        let result = Tool::call(
+            &tool,
+            WebFetchArgs {
+                url: "http://fixture.invalid/page".into(),
+                prompt: None,
+            },
+        )
+        .await;
+        (result, peer)
+    }
+
+    #[tokio::test]
+    async fn web_fetch_decodes_latin1_gzip_and_refuses_binary_and_bombs() {
+        // ISO-8859-1 declared in the header.
+        let (page, _) = fetch(
+            raw(
+                "Content-Type: text/html; charset=ISO-8859-1\r\n",
+                b"<p>caf\xe9 cr\xe8me</p>",
+            ),
+            web_fetch_limits(),
+        )
+        .await;
+        assert!(page.unwrap().contains("> café crème"));
+        // Charset sniffed from <meta> when the header names none.
+        let (page, _) = fetch(
+            raw(
+                "Content-Type: text/html\r\n",
+                b"<html><head><meta charset=\"windows-1252\"></head><p>na\xefve \x93quoted\x94</p>",
+            ),
+            web_fetch_limits(),
+        )
+        .await;
+        assert!(page.unwrap().contains("naïve “quoted”"));
+        // gzip-encoded body, and the request advertised only bounded codings.
+        let (page, peer) = fetch(
+            raw(
+                "Content-Type: text/plain; charset=utf-8\r\nContent-Encoding: gzip\r\n",
+                &gzip("compressed héllo".as_bytes()),
+            ),
+            web_fetch_limits(),
+        )
+        .await;
+        assert!(page.unwrap().contains("> compressed héllo"));
+        let request = peer.requests.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(
+            request.contains("accept-encoding: gzip, deflate"),
+            "{request}"
+        );
+        // A decompression bomb is cut at the body cap, never materialized whole.
+        let cap = 64 * 1024;
+        let bomb = gzip(&vec![b'a'; 8 * 1024 * 1024]);
+        assert!(bomb.len() < cap);
+        let (page, _) = fetch(
+            raw(
+                "Content-Type: text/plain\r\nContent-Encoding: gzip\r\n",
+                &bomb,
+            ),
+            NativeFetchLimits {
+                body_max_bytes: cap,
+                ..web_fetch_limits()
+            },
+        )
+        .await;
+        let page = page.unwrap();
+        assert!(
+            page.contains("Response body truncated at 65536 bytes"),
+            "{page}"
+        );
+        // The strict (search) contract rejects the same bomb.
+        let peer = Peer::new_bytes(vec![raw(
+            "Content-Type: application/json\r\nContent-Encoding: gzip\r\n",
+            &bomb,
+        )]);
+        let error = fixture_client(&peer)
+            .with_limits(NativeFetchLimits {
+                body_max_bytes: cap,
+                ..NativeFetchLimits::default()
+            })
+            .execute(
+                "http://fixture.invalid/s",
+                &FetchRequest::get(),
+                "web_search",
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("response body exceeds"), "{error}");
+        // A PDF is refused by type, without an encoding error.
+        let (error, _) = fetch(
+            raw(
+                "Content-Type: application/pdf\r\n",
+                b"%PDF-1.7 \xff\xfe binary",
+            ),
+            web_fetch_limits(),
+        )
+        .await;
+        let error = error.unwrap_err().to_string();
+        assert!(
+            error.contains("binary content type 'application/pdf'"),
+            "{error}"
+        );
+        assert!(!error.contains("UTF-8"));
+        // Unsupported codings stay explicit.
+        let (error, _) = fetch(raw("Content-Encoding: br\r\n", b"xx"), web_fetch_limits()).await;
+        assert!(error.unwrap_err().to_string().contains("content encoding"));
+        // JSON is quoted literally, not run through HTML conversion.
+        let (page, _) = fetch(
+            raw(
+                "Content-Type: application/json\r\n",
+                br#"{"tag":"<b>x</b>"}"#,
+            ),
+            web_fetch_limits(),
+        )
+        .await;
+        assert!(page.unwrap().contains(r#"> {"tag":"<b>x</b>"}"#));
     }
 }
 

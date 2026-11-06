@@ -167,6 +167,10 @@ lsp-types = { version = "0.97", optional = true }
 rquickjs = { version = "0.12", default-features = false, features = ["std"], optional = true }
 url = { version = "2", optional = true }
 zip = { version = "=9.0.5", default-features = false, features = ["deflate"] }
+# Native web_fetch: bounded gzip/deflate decoding and charset conversion. Both
+# are already in the graph (zip's zlib-rs deflate backend, reqwest's charset).
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+encoding_rs = "0.8"
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 matrixmultiply = { version = "0.3.11", optional = true, features = ["threading"] }
 hnsw_rs = { version = "0.3.4", optional = true }

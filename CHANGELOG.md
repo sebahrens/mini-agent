@@ -15,6 +15,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `web_fetch` decodes gzip/deflate responses (output capped at the body limit, so bombs are
+  truncated), honours the `Content-Type` charset or an HTML `<meta charset>` (Latin-1, Shift-JIS,
+  windows-1252 ...), quotes non-HTML text types literally, and refuses binary types such as PDF by
+  name instead of reporting a UTF-8 error (mini-agent-bl9kt).
 - `web_fetch` no longer fails on a response body over its byte cap: it reads the first 10 MiB
   (raised from 1 MiB), converts that prefix and states `Response body truncated at N bytes`; the
   cap is named in the tool description (mini-agent-8qfag).
