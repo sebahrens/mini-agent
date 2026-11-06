@@ -1081,6 +1081,7 @@ pub(crate) const MCP_TOOL_PROGRESS_CEILING: Duration = Duration::from_secs(30 * 
 /// alive while a silent one is still cut off after `timeout`. On expiry rmcp
 /// notifies the server that the request was cancelled and the error is
 /// [`ServiceError::Timeout`] carrying whichever bound fired.
+#[cfg_attr(not(feature = "hooks"), allow(dead_code))]
 pub(crate) async fn call_tool_bounded(
     peer: &Peer<RoleClient>,
     params: CallToolRequestParams,
