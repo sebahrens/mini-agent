@@ -262,6 +262,23 @@ pub(crate) fn model_max_output(provider: &str, model: &str) -> Option<u64> {
         .map(|&tokens| u64::from(tokens))
 }
 
+/// The largest catalog output ceiling listed for `model` under any provider,
+/// for callers that know a model id but not the provider route (reserve sizing).
+pub(crate) fn model_max_output_any_provider(model: &str) -> Option<u64> {
+    CATALOG
+        .max_output
+        .values()
+        .filter_map(|models| models.get(model))
+        .max()
+        .map(|&tokens| u64::from(tokens))
+}
+
+/// Provider names present in the catalog (tests iterate every listed model).
+#[cfg(test)]
+pub(crate) fn catalog_provider_names() -> Vec<&'static str> {
+    CATALOG.entries.keys().map(String::as_str).collect()
+}
+
 /// Explicit immutable input modality for a catalog provider/model ID.
 /// Unknown gateways remain unknown; this lookup does not guess from model names.
 #[cfg(feature = "multimodal")]

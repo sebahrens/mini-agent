@@ -48,6 +48,9 @@ pub const DEFAULT_MAX_BASH_OUTPUT_LINES: u64 = 2000;
 /// unset (fraction of the context window of real provider prompt pressure).
 pub const DEFAULT_MID_TURN_COMPACT_THRESHOLD: f64 = 0.9;
 pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
+/// Room kept above the response cap in the default `reserve_tokens`, so the
+/// summarizer request itself still fits when compaction fires.
+pub const RESERVE_SUMMARIZER_HEADROOM: u64 = 8_000;
 pub const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
 
 /// Captured layer participation for diagnostics. Only catalogue key names
@@ -1240,9 +1243,13 @@ impl Config {
     /// context window instead of being a fixed constant: a fixed 8k reserve on
     /// a 1M-token model would defer compaction until the window is ~99% full,
     /// leaving the summarizer an impossibly large history to compress in one
-    /// call. `window/10` bounded below by the default response cap (16_384, so
-    /// one maximal response can never overshoot the window) and above by
-    /// `window/2` (so tiny windows keep most of their space usable).
+    /// call. `window/10` bounded below by the response cap this model will
+    /// actually be asked for (`max_tokens`, else the catalog default of
+    /// `min(model max output, 32_000)`) plus [`RESERVE_SUMMARIZER_HEADROOM`], so a
+    /// request sent just under the compaction threshold still fits its own
+    /// `max_tokens` inside the window (providers reject `input + max_tokens`
+    /// over the window), and above by `window/2` (so tiny windows keep most of
+    /// their space usable).
     pub fn resolve_reserve_tokens(
         &self,
         model_id: &str,
@@ -1259,7 +1266,16 @@ impl Config {
                 return rt;
             }
         }
-        (context_window / 10).max(16_384).min(context_window / 2)
+        let ceiling = crate::models_catalog::model_max_output_any_provider(model_id);
+        let response_cap = match (self.max_tokens, ceiling) {
+            (Some(explicit), Some(ceiling)) => explicit.min(ceiling),
+            (Some(explicit), None) => explicit,
+            (None, Some(ceiling)) => ceiling.min(crate::cli::DEFAULT_MAX_TOKENS_CEILING),
+            (None, None) => crate::cli::FALLBACK_MAX_TOKENS,
+        };
+        (context_window / 10)
+            .max(response_cap.saturating_add(RESERVE_SUMMARIZER_HEADROOM))
+            .min(context_window / 2)
     }
 
     /// Recent-token budget kept verbatim through a compaction. When unset the
@@ -2267,8 +2283,12 @@ mod tests {
     fn reserve_tokens_default_scales_with_context_window() {
         let cfg = Config::default();
         let qm = HashMap::new();
-        // Small/medium windows keep the response-cap floor.
-        assert_eq!(cfg.resolve_reserve_tokens("m", &qm, 128_000), 16_384);
+        // Small/medium windows keep the response-cap (+ summarizer headroom)
+        // floor; an unknown model uses the 16_384 fallback cap.
+        assert_eq!(
+            cfg.resolve_reserve_tokens("m", &qm, 128_000),
+            16_384 + RESERVE_SUMMARIZER_HEADROOM
+        );
         // Large windows scale to a tenth so compaction is not deferred to 99%.
         assert_eq!(cfg.resolve_reserve_tokens("m", &qm, 1_000_000), 100_000);
         // Tiny windows never reserve more than half the window.
@@ -2279,6 +2299,49 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(explicit.resolve_reserve_tokens("m", &qm, 1_000_000), 9_999);
+    }
+
+    // mini-agent-tzdjw: compaction must fire early enough that the next request
+    // still fits `input + max_tokens` in the window.
+    #[test]
+    fn default_reserve_covers_the_default_response_cap_for_every_catalog_model() {
+        let cfg = Config::default();
+        let qm = HashMap::new();
+        let mut checked = 0;
+        for provider in crate::models_catalog::catalog_provider_names() {
+            for entry in crate::models_catalog::catalog_entries(provider).unwrap() {
+                let Some(window) = entry.context_length.map(u64::from) else {
+                    continue;
+                };
+                if window == 0 || window > 256_000 {
+                    continue;
+                }
+                let reserve = cfg.resolve_reserve_tokens(&entry.id, &qm, window);
+                let cap = crate::cli::resolve_response_max_tokens(None, provider, &entry.id);
+                // A window cannot hold more than half as reserve; otherwise the
+                // reserve must cover the whole response cap.
+                assert!(
+                    reserve >= cap.min(window / 2),
+                    "{provider}/{}: reserve {reserve} < max_tokens {cap} (window {window})",
+                    entry.id
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "catalog scan covered {checked} models");
+    }
+
+    #[test]
+    fn explicit_max_tokens_raises_the_default_reserve() {
+        let qm = HashMap::new();
+        let cfg = Config {
+            max_tokens: Some(30_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_reserve_tokens("unlisted-model", &qm, 200_000),
+            30_000 + RESERVE_SUMMARIZER_HEADROOM
+        );
     }
 
     #[test]
