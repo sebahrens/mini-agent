@@ -20,6 +20,17 @@ const MAX_TOTAL_DECODED: u64 = 256 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_OBJECTS: usize = 1_000_000;
 const MAX_PAGES: usize = 100_000;
+/// Parsed nodes (array elements, dictionary entries, scalars) one top-level
+/// object may contain.
+const MAX_NODES_PER_OBJECT: usize = 1_000_000;
+/// Parsed nodes, including discarded ones, a whole document may cost.
+const MAX_TOTAL_NODES: usize = 4_000_000;
+/// Fonts one page's resources may declare.
+const MAX_FONTS_PER_PAGE: usize = 1024;
+/// ToUnicode map entries one page may materialise across all its fonts.
+const MAX_CMAP_ENTRIES_PER_PAGE: usize = 262_144;
+/// Wall-clock bound on locating and expanding objects.
+const PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Whether `bytes` (a file prefix) carries the PDF header.
 pub(crate) fn is_pdf(prefix: &[u8]) -> bool {
@@ -87,11 +98,20 @@ fn is_delimiter(byte: u8) -> bool {
 struct Lexer<'a> {
     data: &'a [u8],
     pos: usize,
+    /// Nodes parsed since the current top-level `object` call began.
+    nodes_object: usize,
+    /// Every node this lexer has parsed, kept or discarded.
+    nodes_total: usize,
 }
 
 impl<'a> Lexer<'a> {
     fn new(data: &'a [u8], pos: usize) -> Self {
-        Self { data, pos }
+        Self {
+            data,
+            pos,
+            nodes_object: 0,
+            nodes_total: 0,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -129,6 +149,14 @@ impl<'a> Lexer<'a> {
     /// Parse one object. `None` at end of input or on a structural error.
     fn object(&mut self, depth: usize) -> Option<Obj> {
         if depth > MAX_DEPTH {
+            return None;
+        }
+        if depth == 0 {
+            self.nodes_object = 0;
+        }
+        self.nodes_object += 1;
+        self.nodes_total += 1;
+        if self.nodes_object > MAX_NODES_PER_OBJECT {
             return None;
         }
         self.skip_whitespace();
@@ -340,6 +368,19 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|offset| offset + from)
 }
 
+/// `needle` starting within the first `slack` bytes at or after `from`.
+fn find_near(haystack: &[u8], needle: &[u8], from: usize, slack: usize) -> Option<usize> {
+    let end = from
+        .saturating_add(slack)
+        .saturating_add(needle.len())
+        .min(haystack.len());
+    let window = haystack.get(from..end)?;
+    window
+        .windows(needle.len())
+        .position(|candidate| candidate == needle)
+        .map(|offset| offset + from)
+}
+
 /// The parsed object table plus the bounded decoder budget.
 pub(crate) struct Document {
     objects: HashMap<u32, Obj>,
@@ -353,6 +394,7 @@ pub(crate) enum PdfError {
     Encrypted,
     Malformed(&'static str),
     TooLarge,
+    TimedOut,
 }
 
 impl std::fmt::Display for PdfError {
@@ -362,18 +404,38 @@ impl std::fmt::Display for PdfError {
                 f.write_str("the PDF is encrypted; text extraction is not supported")
             }
             PdfError::Malformed(reason) => write!(f, "the PDF could not be parsed ({reason})"),
-            PdfError::TooLarge => f.write_str("the PDF exceeds the decoding budget"),
+            PdfError::TooLarge => f.write_str(
+                "the PDF exceeds the parsing budget (too many objects, nested nodes, fonts or ToUnicode entries, or too many decoded bytes)",
+            ),
+            PdfError::TimedOut => {
+                f.write_str("parsing the PDF exceeded its time limit; the file is likely malformed")
+            }
         }
     }
 }
 
 impl Document {
     pub(crate) fn parse(data: &[u8]) -> Result<Self, PdfError> {
+        Self::parse_until(data, std::time::Instant::now() + PARSE_DEADLINE)
+    }
+
+    fn parse_until(data: &[u8], deadline: std::time::Instant) -> Result<Self, PdfError> {
         let mut objects: HashMap<u32, Obj> = HashMap::new();
         let mut encrypted = false;
         let mut position = 0;
+        let mut nodes = 0usize;
+        // Once one stream lacks `endstream`, no later one can have it either.
+        let mut endstream_missing = false;
+        // Bytes the lexer walked for candidates that failed to parse.
+        let mut wasted = 0usize;
+        let waste_cap = data.len().saturating_mul(8).saturating_add(1 << 20);
+        let mut candidates = 0usize;
         while let Some(found) = find(data, b"obj", position) {
             position = found + 3;
+            candidates += 1;
+            if candidates.is_multiple_of(256) && std::time::Instant::now() >= deadline {
+                return Err(PdfError::TimedOut);
+            }
             if objects.len() >= MAX_OBJECTS {
                 return Err(PdfError::TooLarge);
             }
@@ -388,9 +450,21 @@ impl Document {
                 continue;
             };
             let mut lexer = Lexer::new(data, found + 3);
-            let Some(object) = lexer.object(0) else {
+            let parsed = lexer.object(0);
+            nodes = nodes.saturating_add(lexer.nodes_total);
+            if nodes > MAX_TOTAL_NODES {
+                return Err(PdfError::TooLarge);
+            }
+            let Some(object) = parsed else {
+                wasted = wasted.saturating_add(lexer.pos.saturating_sub(found));
+                if wasted > waste_cap {
+                    // Further candidates would only rescan the same bytes.
+                    break;
+                }
                 continue;
             };
+            // Never rescan the bytes this object consumed.
+            position = position.max(lexer.pos);
             let object = match object {
                 Obj::Dict(dict) => {
                     lexer.skip_whitespace();
@@ -405,17 +479,21 @@ impl Document {
                         let declared = dict
                             .get(b"Length")
                             .and_then(Obj::as_num)
-                            .map(|length| length as usize);
+                            .map(|length| length as usize)
+                            .and_then(|length| start.checked_add(length));
                         let end = match declared {
-                            Some(length)
-                                if start + length <= data.len()
-                                    && find(data, b"endstream", start + length)
-                                        .is_some_and(|e| e - (start + length) < 4) =>
+                            Some(end)
+                                if end <= data.len()
+                                    && find_near(data, b"endstream", end, 3).is_some() =>
                             {
-                                start + length
+                                end
                             }
                             _ => {
+                                if endstream_missing {
+                                    continue;
+                                }
                                 let Some(end) = find(data, b"endstream", start) else {
+                                    endstream_missing = true;
                                     continue;
                                 };
                                 let mut end = end;
@@ -442,9 +520,22 @@ impl Document {
         }
         // Classic trailers are not objects; check them separately.
         let mut position = 0;
+        let mut trailers = 0usize;
         while let Some(found) = find(data, b"trailer", position) {
             position = found + 7;
-            if let Some(Obj::Dict(dict)) = Lexer::new(data, found + 7).object(0)
+            trailers += 1;
+            if trailers.is_multiple_of(256) && std::time::Instant::now() >= deadline {
+                return Err(PdfError::TimedOut);
+            }
+            let mut lexer = Lexer::new(data, found + 7);
+            let parsed = lexer.object(0);
+            nodes = nodes.saturating_add(lexer.nodes_total);
+            if nodes > MAX_TOTAL_NODES {
+                return Err(PdfError::TooLarge);
+            }
+            // Never rescan the bytes this trailer consumed.
+            position = position.max(lexer.pos);
+            if let Some(Obj::Dict(dict)) = parsed
                 && dict.get(b"Encrypt").is_some()
             {
                 encrypted = true;
@@ -458,12 +549,16 @@ impl Document {
             pages: Vec::new(),
             decoded_budget: std::cell::Cell::new(MAX_TOTAL_DECODED),
         };
-        document.expand_object_streams()?;
+        document.expand_object_streams(nodes, deadline)?;
         document.collect_pages()?;
         Ok(document)
     }
 
-    fn expand_object_streams(&mut self) -> Result<(), PdfError> {
+    fn expand_object_streams(
+        &mut self,
+        mut nodes: usize,
+        deadline: std::time::Instant,
+    ) -> Result<(), PdfError> {
         let streams: Vec<(Dict, Vec<u8>)> = self
             .objects
             .values()
@@ -492,16 +587,26 @@ impl Document {
                 };
                 entries.push((number as u32, offset as usize));
             }
-            for (number, offset) in entries {
-                if self.objects.len() >= MAX_OBJECTS {
+            nodes = nodes.saturating_add(header.nodes_total);
+            for (index, (number, offset)) in entries.into_iter().enumerate() {
+                if self.objects.len() >= MAX_OBJECTS || nodes > MAX_TOTAL_NODES {
                     return Err(PdfError::TooLarge);
+                }
+                if index.is_multiple_of(256) && std::time::Instant::now() >= deadline {
+                    return Err(PdfError::TimedOut);
                 }
                 if self.objects.contains_key(&number) {
                     continue;
                 }
-                if let Some(object) = Lexer::new(&decoded, first.saturating_add(offset)).object(0) {
+                let mut lexer = Lexer::new(&decoded, first.saturating_add(offset));
+                let object = lexer.object(0);
+                nodes = nodes.saturating_add(lexer.nodes_total);
+                if let Some(object) = object {
                     self.objects.insert(number, object);
                 }
+            }
+            if nodes > MAX_TOTAL_NODES {
+                return Err(PdfError::TooLarge);
             }
         }
         Ok(())
@@ -667,9 +772,9 @@ impl Document {
     }
 
     /// Extracted text of page `index` (0-based).
-    pub(crate) fn page_text(&self, index: usize) -> String {
+    pub(crate) fn page_text(&self, index: usize) -> Result<String, PdfError> {
         let Some((page, resources)) = self.pages.get(index) else {
-            return String::new();
+            return Ok(String::new());
         };
         let mut content = Vec::new();
         let streams: Vec<&Obj> = match page.get(b"Contents").map(|c| self.resolve(c)) {
@@ -685,18 +790,25 @@ impl Document {
                 content.push(b'\n');
             }
         }
-        let fonts = self.fonts(resources.as_ref());
-        normalize_text(&extract_text(&content, &fonts))
+        let fonts = self.fonts(resources.as_ref())?;
+        Ok(normalize_text(&extract_text(&content, &fonts)))
     }
 
-    fn fonts(&self, resources: Option<&Dict>) -> HashMap<Vec<u8>, FontDecoder> {
+    fn fonts(&self, resources: Option<&Dict>) -> Result<HashMap<Vec<u8>, FontDecoder>, PdfError> {
         let mut fonts = HashMap::new();
         let Some(font_dict) = resources
             .and_then(|resources| resources.get(b"Font"))
             .and_then(|fonts| self.resolve(fonts).as_dict())
         else {
-            return fonts;
+            return Ok(fonts);
         };
+        if font_dict.0.len() > MAX_FONTS_PER_PAGE {
+            return Err(PdfError::TooLarge);
+        }
+        // One decoded map per ToUnicode stream object, shared by every font
+        // that points at it, with one entry budget for the whole page.
+        let mut shared: HashMap<u32, SharedCmap> = HashMap::new();
+        let mut entries_left = MAX_CMAP_ENTRIES_PER_PAGE;
         for (name, font) in &font_dict.0 {
             let Some(font) = self.resolve(font).as_dict() else {
                 continue;
@@ -711,18 +823,43 @@ impl Document {
             };
             let mut decoder = FontDecoder {
                 code_bytes: if composite { 2 } else { 1 },
-                map: HashMap::new(),
+                map: std::rc::Rc::default(),
                 composite,
                 mac_roman,
             };
-            if let Some(Obj::Stream(dict, raw)) = font.get(b"ToUnicode").map(|t| self.resolve(t))
+            let to_unicode = font.get(b"ToUnicode");
+            let key = match to_unicode {
+                Some(Obj::Ref(number)) => Some(*number),
+                _ => None,
+            };
+            if let Some((code_bytes, map)) = key.and_then(|key| shared.get(&key)) {
+                if let Some(code_bytes) = code_bytes {
+                    decoder.code_bytes = *code_bytes;
+                }
+                decoder.map = std::rc::Rc::clone(map);
+            } else if let Some(Obj::Stream(dict, raw)) = to_unicode.map(|t| self.resolve(t))
                 && let Some(cmap) = self.decode(dict, raw)
             {
-                decoder.load_cmap(&cmap);
+                let default_bytes = decoder.code_bytes;
+                let mut map = HashMap::new();
+                let code_bytes = FontDecoder::load_cmap(&cmap, &mut map, &mut entries_left)?;
+                if let Some(code_bytes) = code_bytes {
+                    decoder.code_bytes = code_bytes;
+                }
+                decoder.map = std::rc::Rc::new(map);
+                if let Some(key) = key {
+                    shared.insert(
+                        key,
+                        (
+                            code_bytes.filter(|bytes| *bytes != default_bytes),
+                            std::rc::Rc::clone(&decoder.map),
+                        ),
+                    );
+                }
             }
             fonts.insert(name.clone(), decoder);
         }
-        fonts
+        Ok(fonts)
     }
 }
 
@@ -757,9 +894,13 @@ fn object_number_before(data: &[u8], obj_at: usize) -> Option<u32> {
     std::str::from_utf8(&data[start..end]).ok()?.parse().ok()
 }
 
+/// A decoded ToUnicode map shared by every font pointing at its stream, with
+/// the code width it declared.
+type SharedCmap = (Option<usize>, std::rc::Rc<HashMap<u32, String>>);
+
 struct FontDecoder {
     code_bytes: usize,
-    map: HashMap<u32, String>,
+    map: std::rc::Rc<HashMap<u32, String>>,
     composite: bool,
     mac_roman: bool,
 }
@@ -780,7 +921,14 @@ fn code_value(bytes: &[u8]) -> u32 {
 }
 
 impl FontDecoder {
-    fn load_cmap(&mut self, cmap: &[u8]) {
+    /// Parse a ToUnicode CMap into `map`, charging `entries_left`. Returns the
+    /// declared code width, if any.
+    fn load_cmap(
+        cmap: &[u8],
+        map: &mut HashMap<u32, String>,
+        entries_left: &mut usize,
+    ) -> Result<Option<usize>, PdfError> {
+        let mut code_bytes = None;
         let mut lexer = Lexer::new(cmap, 0);
         let mut operands: Vec<Obj> = Vec::new();
         #[derive(Clone, Copy, PartialEq)]
@@ -791,8 +939,10 @@ impl FontDecoder {
             Range,
         }
         let mut mode = Mode::None;
-        let mut entries = 0usize;
         while let Some(token) = lexer.object(0) {
+            if lexer.nodes_total > MAX_TOTAL_NODES {
+                return Err(PdfError::TooLarge);
+            }
             match token {
                 Obj::Keyword(keyword) => {
                     match keyword.as_slice() {
@@ -809,12 +959,16 @@ impl FontDecoder {
                     match (mode, operands.as_slice()) {
                         (Mode::Codespace, [Obj::Str(low), Obj::Str(_)]) => {
                             if !low.is_empty() {
-                                self.code_bytes = low.len().min(4);
+                                code_bytes = Some(low.len().min(4));
                             }
                             operands.clear();
                         }
                         (Mode::Char, [Obj::Str(source), Obj::Str(target)]) => {
-                            self.map.insert(code_value(source), utf16be(target));
+                            if *entries_left == 0 {
+                                return Err(PdfError::TooLarge);
+                            }
+                            *entries_left -= 1;
+                            map.insert(code_value(source), utf16be(target));
                             operands.clear();
                         }
                         (Mode::Range, [Obj::Str(low), Obj::Str(high), target]) => {
@@ -822,15 +976,16 @@ impl FontDecoder {
                             for (step, code) in
                                 (low..=high.min(low.saturating_add(65_535))).enumerate()
                             {
-                                entries += 1;
-                                if entries > 1_000_000 {
-                                    return;
+                                if *entries_left == 0 {
+                                    return Err(PdfError::TooLarge);
                                 }
+                                *entries_left -= 1;
                                 let text = match target {
                                     Obj::Str(base) if !base.is_empty() => {
                                         let mut base = base.clone();
                                         let last = base.len() - 1;
-                                        let bumped = u16::from(base[last]) + step as u16;
+                                        let bumped =
+                                            u16::from(base[last]).wrapping_add(step as u16);
                                         base[last] = (bumped & 0xff) as u8;
                                         if last > 0 {
                                             base[last - 1] =
@@ -844,7 +999,7 @@ impl FontDecoder {
                                     },
                                     _ => continue,
                                 };
-                                self.map.insert(code, text);
+                                map.insert(code, text);
                             }
                             operands.clear();
                         }
@@ -854,6 +1009,7 @@ impl FontDecoder {
                 }
             }
         }
+        Ok(code_bytes)
     }
 
     fn decode(&self, bytes: &[u8], out: &mut String) {
@@ -986,7 +1142,7 @@ impl TextLayout {
 fn extract_text(content: &[u8], fonts: &HashMap<Vec<u8>, FontDecoder>) -> String {
     let fallback = FontDecoder {
         code_bytes: 1,
-        map: HashMap::new(),
+        map: std::rc::Rc::default(),
         composite: false,
         mac_roman: false,
     };
@@ -1236,7 +1392,9 @@ pub(crate) fn render(
     let mut without_text = Vec::new();
     let mut stopped_at = None;
     for &page in &selected {
-        let text = document.page_text(page - 1);
+        let text = document.page_text(page - 1).map_err(|error| {
+            format!("Cannot read page {page} of '{path}' as PDF text: {error}.")
+        })?;
         let mut block = if text.is_empty() {
             without_text.push(page);
             format!("--- page {page} ---\n[no text layer on this page]\n\n")
@@ -1388,8 +1546,8 @@ mod tests {
         assert!(is_pdf(&pdf));
         let document = Document::parse(&pdf).unwrap();
         assert_eq!(document.page_count(), 2);
-        assert_eq!(document.page_text(0), "Hello (PDF) world\nSec ond");
-        assert_eq!(document.page_text(1), "Page two text\nnext line");
+        assert_eq!(document.page_text(0).unwrap(), "Hello (PDF) world\nSec ond");
+        assert_eq!(document.page_text(1).unwrap(), "Page two text\nnext line");
     }
 
     #[test]
@@ -1401,7 +1559,7 @@ mod tests {
             true,
         );
         let document = Document::parse(&pdf).unwrap();
-        assert_eq!(document.page_text(0), "HéabcH");
+        assert_eq!(document.page_text(0).unwrap(), "HéabcH");
     }
 
     #[test]
@@ -1411,7 +1569,7 @@ mod tests {
             false,
         );
         let document = Document::parse(&pdf).unwrap();
-        assert_eq!(document.page_text(0), "");
+        assert_eq!(document.page_text(0).unwrap(), "");
         let trailer = find(&pdf, b"/Root", 0).unwrap();
         pdf.splice(trailer..trailer, b"/Encrypt 9 0 R ".iter().copied());
         assert_eq!(Document::parse(&pdf).err(), Some(PdfError::Encrypted));
@@ -1461,7 +1619,7 @@ mod tests {
         );
         let document = Document::parse(&pdf).unwrap();
         assert_eq!(document.page_count(), 1);
-        assert_eq!(document.page_text(0), "Compressed objects");
+        assert_eq!(document.page_text(0).unwrap(), "Compressed objects");
     }
 
     #[test]
@@ -1474,5 +1632,159 @@ mod tests {
         assert!(parse_page_selection("10", 9).is_err());
         assert!(parse_page_selection("1-21", 30).is_err());
         assert!(parse_page_selection("", 3).is_err());
+    }
+
+    fn repeated(unit: &str, bytes: usize) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut index = 1;
+        while out.len() < bytes {
+            out.extend_from_slice(format!("{index} 0 obj{unit}").as_bytes());
+            index += 1;
+        }
+        out
+    }
+
+    fn assert_fast(data: &[u8]) {
+        let started = std::time::Instant::now();
+        let _ = Document::parse(data);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "parse took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn unterminated_streams_and_strings_parse_in_linear_time() {
+        assert_fast(&repeated("<</Length 0>>stream\n", 1 << 20));
+        assert_fast(&repeated("(", 1 << 20));
+        assert_fast(&repeated("<", 1 << 20));
+        assert_fast(&repeated("[", 1 << 20));
+        assert_fast(&repeated("[(", 1 << 20));
+        assert_fast(&repeated("<</A [", 1 << 20));
+        let mut trailers = b"%PDF-1.7\n".to_vec();
+        while trailers.len() < (1 << 20) {
+            trailers.extend_from_slice(b"trailer(");
+        }
+        assert_fast(&trailers);
+    }
+
+    #[test]
+    fn huge_declared_stream_length_does_not_overflow() {
+        let pdf = b"%PDF-1.7\n1 0 obj<</Length 1e300>>stream\nabc\nendstream endobj\n";
+        let _ = Document::parse(pdf);
+        let pdf =
+            b"%PDF-1.7\n1 0 obj<</Length 18446744073709551615>>stream\nabc\nendstream endobj\n";
+        let _ = Document::parse(pdf);
+    }
+
+    #[test]
+    fn expired_deadline_aborts_parsing() {
+        let data = repeated("<</Length 0>>", 1 << 20);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(
+            Document::parse_until(&data, past).err(),
+            Some(PdfError::TimedOut)
+        );
+    }
+
+    #[test]
+    fn compressed_array_bomb_fails_fast_with_too_large() {
+        use std::io::Write;
+        // 100 header entries all pointing at one 8M-element array.
+        let mut header = String::new();
+        for number in 1..=100 {
+            header.push_str(&format!("{number} 0 "));
+        }
+        let mut body = header.clone().into_bytes();
+        body.push(b'[');
+        let chunk = "0 ".repeat(1 << 16);
+        for _ in 0..128 {
+            body.extend_from_slice(chunk.as_bytes());
+        }
+        body.push(b']');
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let packed = encoder.finish().unwrap();
+        let mut pdf = format!(
+            "%PDF-1.7\n9 0 obj<</Type /ObjStm /N 100 /First {} /Filter /FlateDecode /Length {}>>\nstream\n",
+            header.len(),
+            packed.len()
+        )
+        .into_bytes();
+        pdf.extend_from_slice(&packed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let started = std::time::Instant::now();
+        assert_eq!(Document::parse(&pdf).err(), Some(PdfError::TooLarge));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    fn font_page_pdf(fonts: usize, shared_cmap: bool) -> Vec<u8> {
+        let mut objects: Vec<String> = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        ];
+        let mut font_entries = String::new();
+        for index in 0..fonts {
+            font_entries.push_str(&format!("/F{index} {} 0 R ", 6 + index));
+        }
+        objects.push(format!(
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << {font_entries}>> >> >>"
+        ));
+        let content = "BT /F0 12 Tf <0001> Tj ET";
+        objects.push(format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ));
+        let cmap = "begincmap 1 begincodespacerange <0000> <FFFF> endcodespacerange 1 beginbfrange <0000> <FFFF> <0041> endbfrange endcmap";
+        objects.push(format!(
+            "<< /Length {} >>\nstream\n{cmap}\nendstream",
+            cmap.len()
+        ));
+        for index in 0..fonts {
+            let map = if shared_cmap { 5 } else { 6 + fonts + index };
+            objects.push(format!(
+                "<< /Type /Font /Subtype /Type0 /ToUnicode {map} 0 R >>"
+            ));
+        }
+        if !shared_cmap {
+            for _ in 0..fonts {
+                objects.push(format!(
+                    "<< /Length {} >>\nstream\n{cmap}\nendstream",
+                    cmap.len()
+                ));
+            }
+        }
+        let mut out = b"%PDF-1.7\n".to_vec();
+        for (index, object) in objects.iter().enumerate() {
+            out.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn two_thousand_font_page_fails_with_too_large() {
+        let pdf = font_page_pdf(2000, true);
+        let document = Document::parse(&pdf).unwrap();
+        assert_eq!(document.page_text(0), Err(PdfError::TooLarge));
+    }
+
+    #[test]
+    fn per_font_cmaps_share_one_entry_budget_per_page() {
+        // 65_536 entries per cmap, one distinct stream per font: the page
+        // budget (262_144) is exhausted by the fifth font.
+        let pdf = font_page_pdf(8, false);
+        let document = Document::parse(&pdf).unwrap();
+        assert_eq!(document.page_text(0), Err(PdfError::TooLarge));
+    }
+
+    #[test]
+    fn fonts_sharing_a_to_unicode_stream_decode_it_once() {
+        // Eight fonts, one 65_536-entry stream: fits the budget only because
+        // the decoded map is shared.
+        let pdf = font_page_pdf(8, true);
+        let document = Document::parse(&pdf).unwrap();
+        assert_eq!(document.page_text(0).unwrap(), "B");
     }
 }
