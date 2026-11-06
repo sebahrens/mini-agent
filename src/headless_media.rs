@@ -221,8 +221,26 @@ pub(crate) fn images_user_message(
     PersistedUserMessage::new(blocks).map_err(anyhow::Error::msg)
 }
 
+/// The refusal for headless image / stream-json input on a provider-native
+/// (persisted Anthropic) session: it names the combinations that do work.
+pub(crate) fn native_history_refusal(what: &str) -> String {
+    format!(
+        "{what} do not support provider-native (Anthropic) session history yet. Working \
+         combinations: add --no-session (nothing is saved), or use a non-Anthropic provider \
+         (see GET_STARTED.md, `-i`)."
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_history_refusal_names_the_working_combinations() {
+        let message = super::native_history_refusal("image attachments");
+        assert!(message.starts_with("image attachments do not support provider-native"));
+        assert!(message.contains("--no-session"), "{message}");
+        assert!(message.contains("non-Anthropic provider"), "{message}");
+    }
+
     use super::*;
 
     #[test]

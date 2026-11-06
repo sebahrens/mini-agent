@@ -338,7 +338,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--output-schema FILE` | With plain `-p`, validate an answer against a bounded offline JSON schema; default JSON envelope, at most two tool-free repairs. |
 | `--output text\|json\|stream-json` | With `-p`, select the final answer (default), one JSON result, or streamed NDJSON events. Machine output conflicts with `--pure-stdout`. `--output-format` is accepted as a hidden alias for scripts written for Claude Code. |
 | `--input-format text\|stream-json` | With `-p`, `stream-json` reads newline-delimited JSON user messages from stdin and runs each as a turn in one session (requires `--output stream-json`; see below). |
-| `-i`, `--image FILE` | With `-p`, attach an image (png, jpeg, gif, webp); repeatable (at most 8, 2 MiB each and 4 MiB in total after the same downscaling `/add` applies). Sent with the first turn and saved in the session like a pasted image. A model the catalog lists as text-only refuses the run before any request; images cannot be combined with a `!` command or provider-native session history. |
+| `-i`, `--image FILE` | With `-p`, attach an image (png, jpeg, gif, webp); repeatable (at most 8, 2 MiB each and 4 MiB in total after the same downscaling `/add` applies). Sent with the first turn and saved in the session like a pasted image. A model the catalog lists as text-only refuses the run before any request; images cannot be combined with a `!` command. With the Anthropic provider, images (and `--input-format stream-json`) need `--no-session` or a non-Anthropic provider, because a persisted Anthropic session keeps provider-native history that cannot hold image turns yet; the refusal names these options. |
 | `--stream-json-preview-bytes N` | With `-p`, cap stream-json text, tool-argument, tool-result and diff previews at `N` bytes (256–1,048,576; default 8,192). |
 | `--max-stdin-bytes N` | With `-p`, piped-stdin limit (per input line with `--input-format stream-json`; 1,024–67,108,864; default 1,048,576). |
 | `--quiet` | With `-p`, silence reasoning, stdin notices, and tool progress on stderr. Errors and operational warnings remain visible. Conflicts with `--pure-stdout`. |
@@ -421,7 +421,7 @@ after that `result`. Malformed, non-`user`, unsupported-block, invalid or too-la
 `{"type":"input_error","message":...}` record and are skipped. The run ends at stdin EOF and exits
 nonzero if any turn failed. Approvals behave as in any headless run (no prompts; `Ask` denies
 unless an opted-in `PermissionRequest` hook answers). Provider-native (Anthropic) session history
-is not supported in this mode yet; use `--acp` for multi-turn native sessions. Partial-message
+is not supported in this mode yet: add `--no-session` (nothing is saved), use a non-Anthropic provider, or use `--acp` for multi-turn native sessions. Partial-message
 (token-delta) events are not emitted.
 
 Runtime stdout and stderr writes preserve backpressure and event order. Consumers should drain

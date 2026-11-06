@@ -2292,7 +2292,8 @@ impl Startup {
     async fn dispatch_print_stream_input(&mut self) -> anyhow::Result<()> {
         if self.native_ticket.is_some() || self.native_headless.is_some() {
             anyhow::bail!(
-                "--input-format stream-json does not support provider-native session history yet; use --acp for multi-turn native sessions"
+                "{} Or use --acp for multi-turn native sessions.",
+                crate::headless_media::native_history_refusal("--input-format stream-json turns")
             );
         }
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
@@ -2399,7 +2400,8 @@ impl Startup {
         anyhow::ensure!(!is_bang, "images cannot be attached to a `!` shell command");
         anyhow::ensure!(
             self.native_ticket.is_none() && self.native_headless.is_none(),
-            "image attachments do not support provider-native session history yet"
+            "{}",
+            crate::headless_media::native_history_refusal("image attachments")
         );
         #[cfg(feature = "multimodal")]
         crate::headless_media::ensure_vision(&self.session.provider, &self.session.model)
