@@ -5113,6 +5113,14 @@ mod tests {
         ))
     }
 
+    fn gemini_context_length_turn() -> crate::agent::runner::HeadlessTurn {
+        crate::agent::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            crate::retry::with_context_length_hint(
+                "400 Bad Request INVALID_ARGUMENT: The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."
+            )
+        ))
+    }
+
     fn ok_turn(text: &str) -> crate::agent::runner::HeadlessTurn {
         crate::agent::runner::HeadlessTurn {
             response: text.to_owned(),
@@ -5164,6 +5172,37 @@ mod tests {
         assert_eq!(prompts, ["do the thing", "do the thing"]);
         assert_eq!(relieved.prompt, "do the thing");
         assert!(!relieved.persisted);
+    }
+
+    // mini-agent-n1dwl: a Gemini-worded 400 gets the same single compact+retry.
+    #[tokio::test]
+    async fn headless_gemini_context_length_rejection_compacts_once_and_retries_once() {
+        let mut session = relief_session();
+        let cfg = crate::config::Config::default();
+        let mut runs = 0;
+        let mut compactions = 0;
+        let relieved = relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, _prompt: &str, _history, _mid_turn| {
+                runs += 1;
+                if runs == 1 {
+                    gemini_context_length_turn()
+                } else {
+                    ok_turn("done")
+                }
+            },
+            async |_session: &mut crate::session::Session, _pending| {
+                compactions += 1;
+                Ok((crate::event::UsageDelta::default(), true))
+            },
+        )
+        .await;
+        assert!(relieved.turn.failure.is_none(), "{:?}", relieved.turn.failure);
+        assert_eq!((runs, compactions), (2, 1));
     }
 
     #[tokio::test]
