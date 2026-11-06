@@ -15,6 +15,13 @@ pub struct AgentSkillManifest {
     ///
     /// These references never activate, approve, or otherwise widen a learned skill.
     pub learned_js: Vec<String>,
+    /// Claude Code `disable-model-invocation: true`: the skill is excluded from
+    /// automatic selection, the catalog listing and `skills_search`, but can
+    /// still be pinned explicitly with `/<name>`. Only ever narrows.
+    pub disable_model_invocation: bool,
+    /// Claude Code `user-invocable: false`: hidden from the `/` picker and the
+    /// `/skills` list and not pinnable by the user. Defaults to true.
+    pub user_invocable: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +58,33 @@ struct RawManifest {
     allowed_tools: Option<String>,
     #[serde(default, rename = "learned-js")]
     learned_js: Vec<String>,
+    #[serde(
+        default,
+        rename = "disable-model-invocation",
+        deserialize_with = "lenient_bool"
+    )]
+    disable_model_invocation: Option<bool>,
+    #[serde(default, rename = "user-invocable", deserialize_with = "lenient_bool")]
+    user_invocable: Option<bool>,
+}
+
+/// Claude Code flags accept YAML booleans or the strings `true`/`false`; any
+/// other value is ignored (the default applies) rather than rejecting the package.
+fn lenient_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_yaml_ng::Value;
+    let raw: Option<Value> = Option::deserialize(deserializer)?;
+    Ok(match raw {
+        Some(Value::Bool(flag)) => Some(flag),
+        Some(Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 fn scalar_to_string(value: &serde_yaml_ng::Value) -> Option<String> {
@@ -130,6 +164,8 @@ pub(super) fn parse_skill_markdown(bytes: &[u8]) -> Result<AgentSkillManifest, M
         metadata: raw.metadata,
         allowed_tools: raw.allowed_tools,
         learned_js: raw.learned_js,
+        disable_model_invocation: raw.disable_model_invocation.unwrap_or(false),
+        user_invocable: raw.user_invocable.unwrap_or(true),
     })
 }
 
@@ -224,6 +260,15 @@ mod tests {
         );
         assert!(!manifest.metadata.contains_key("nested"));
         assert!(!manifest.metadata.contains_key("empty"));
+        assert!(manifest.disable_model_invocation);
+        assert!(!manifest.user_invocable);
+        let plain = parse_skill_markdown(b"---\nname: p\ndescription: d\n---\n").unwrap();
+        assert!(!plain.disable_model_invocation && plain.user_invocable);
+        let stringy = parse_skill_markdown(
+            b"---\nname: p\ndescription: d\ndisable-model-invocation: \"True\"\nuser-invocable: maybe\n---\n",
+        )
+        .unwrap();
+        assert!(stringy.disable_model_invocation && stringy.user_invocable);
     }
 
     #[test]

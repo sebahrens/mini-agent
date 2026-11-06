@@ -59,6 +59,13 @@ the trusted skill context on every turn, so the model can pick a skill by name a
 counted in a final "N more skills omitted" line. The listing grants no permissions. All four keys
 are read at startup.
 
+Claude Code invocation flags are honoured, and only ever narrow behaviour. A skill with
+`disable-model-invocation: true` is excluded from automatic selection, the
+`skills_catalog_bytes` listing and `skills_search`, but stays discoverable and can still be
+pinned with `/<name>`. A skill with `user-invocable: false` is hidden from the `/` picker and
+`/skills`, cannot be pinned, and remains selectable by relevance and `skills_search`. Values
+may be YAML booleans or the strings `true`/`false`; anything else is ignored.
+
 `/skills` lists names, origins and bounded one-line descriptions and opens the command picker.
 `/<skill-name> [arguments]` pins the exact captured skill for the next ordinary turn and its automatic
 continuations. Arguments remain literal user text. Builtins and custom command templates take precedence;

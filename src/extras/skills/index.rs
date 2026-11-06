@@ -28,6 +28,11 @@ pub struct AgentSkillRecord {
     pub allowed_tools: Option<String>,
     /// Exact learned-JS identities declared by the immutable Agent Skill tree.
     pub learned_js: Vec<String>,
+    /// `disable-model-invocation: true`: never auto-selected, listed or returned
+    /// by `skills_search`; still pinnable by the user.
+    pub disable_model_invocation: bool,
+    /// `user-invocable: false`: hidden from the `/` picker and not pinnable.
+    pub user_invocable: bool,
     pub(crate) embedding: Vec<f32>,
 }
 
@@ -182,6 +187,7 @@ impl AgentSkillIndex {
         let mut ranked = self
             .records
             .iter()
+            .filter(|record| !record.disable_model_invocation)
             .filter_map(|record| {
                 let score = query
                     .iter()
@@ -251,6 +257,7 @@ impl AgentSkillIndex {
             .records
             .iter()
             .zip(documents)
+            .filter(|(record, _)| !record.disable_model_invocation)
             .filter_map(|(record, document)| {
                 let document_length = document.len() as f32;
                 let score = weighted_terms
@@ -336,6 +343,8 @@ mod tests {
             resources: Vec::new(),
             allowed_tools: None,
             learned_js: Vec::new(),
+            disable_model_invocation: false,
+            user_invocable: true,
             embedding,
         }
     }
