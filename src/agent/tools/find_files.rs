@@ -820,7 +820,7 @@ impl BoundDirectory {
                     // no-follow and relative to the parent descriptor).
                     let is_directory = kind == EntryKind::Directory;
                     let path = self.approved_root.join(&name);
-                    if is_directory && is_skip_dir(name.to_str().unwrap_or("")) {
+                    if is_directory && skip_directory(&self.root, &name) {
                         continue;
                     }
                     if is_ignored(&chain, &path, is_directory)
@@ -922,7 +922,7 @@ impl BoundDirectory {
             };
             let path = self.approved_root.join(&name);
             let is_directory = metadata.is_dir();
-            if is_directory && is_skip_dir(name.to_str().unwrap_or("")) {
+            if is_directory && skip_directory(&self.root, &name) {
                 continue;
             }
             if is_ignored(&chain, &path, is_directory) || self.is_hidden(&path, is_directory) {
@@ -990,7 +990,7 @@ impl BoundDirectory {
                 EntryKind::Directory | EntryKind::File => {
                     let is_directory = kind == EntryKind::Directory;
                     let path = self.approved_root.join(&name);
-                    if (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
+                    if (is_directory && skip_directory(&self.root, &name))
                         || is_ignored(&chain, &path, is_directory)
                         || self.is_hidden(&path, is_directory)
                     {
@@ -1017,7 +1017,7 @@ impl BoundDirectory {
                     let path = self.approved_root.join(&name);
                     let is_directory = metadata.is_dir();
                     if (!is_directory && !metadata.is_file())
-                        || (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
+                        || (is_directory && skip_directory(&self.root, &name))
                         || is_ignored(&chain, &path, is_directory)
                         || self.is_hidden(&path, is_directory)
                     {
@@ -1088,6 +1088,70 @@ impl DirectoryFrame {
     }
 }
 
+/// Manifests whose sibling `target` directory is build output.
+const BUILD_MANIFESTS: &[&str] = &[
+    "Cargo.toml",
+    "pom.xml",
+    "build.sbt",
+    "build.gradle",
+    "build.gradle.kts",
+    "project.clj",
+];
+
+/// Whether the directory `name` inside `parent` is a dependency/build
+/// directory to skip. With no configured `skip_dirs`, `node_modules` is always
+/// skipped and `target` only next to a build manifest, so a source package
+/// named `target` stays searchable.
+pub(super) fn skip_directory(parent: &File, name: &std::ffi::OsStr) -> bool {
+    let name = name.to_str().unwrap_or("");
+    if is_skip_dir(name) {
+        return true;
+    }
+    name == "target"
+        && crate::agent::tools::limits::skip_dirs().is_none()
+        && BUILD_MANIFESTS.iter().any(|manifest| {
+            matches!(
+                bound_platform::child_info(parent, std::ffi::OsStr::new(manifest)),
+                Ok((EntryKind::File, _))
+            )
+        })
+}
+
+/// Bounded record of directories a walk skipped as dependency/build output.
+#[derive(Default)]
+pub(super) struct SkippedDirectories {
+    examples: Vec<PathBuf>,
+    count: usize,
+}
+
+impl SkippedDirectories {
+    fn record(&mut self, relative: &Path) {
+        self.count += 1;
+        if self.examples.len() < 5 {
+            self.examples.push(relative.to_path_buf());
+        }
+    }
+
+    /// One-line notice; empty when nothing was skipped.
+    pub(super) fn notice(&self) -> String {
+        if self.count == 0 {
+            return String::new();
+        }
+        let mut names: Vec<String> = self
+            .examples
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        if self.count > names.len() {
+            names.push(format!("+{} more", self.count - names.len()));
+        }
+        format!(
+            "\n[skipped dependency/build directories: {}; pass one as path to search it, or set [tool_limits] skip_dirs]",
+            names.join(", ")
+        )
+    }
+}
+
 pub(super) const SEARCH_ENTRY_BUDGET: usize = 100_000;
 pub(super) const SEARCH_MAX_DIRECTORY_DEPTH: usize = 256;
 
@@ -1109,6 +1173,7 @@ pub(crate) struct BoundWalker {
     /// yielded files and descended directories take an owned copy.
     scratch_relative: PathBuf,
     scratch_approved: PathBuf,
+    skipped_directories: SkippedDirectories,
 }
 
 /// Called with the entry's path relative to the walk root and its file name.
@@ -1139,7 +1204,13 @@ impl BoundWalker {
             file_filter: None,
             scratch_relative: PathBuf::new(),
             scratch_approved: PathBuf::new(),
+            skipped_directories: SkippedDirectories::default(),
         })
+    }
+
+    /// Directories this walk skipped as dependency/build output.
+    pub(super) fn skipped_directories(&self) -> &SkippedDirectories {
+        &self.skipped_directories
     }
 }
 
@@ -1223,9 +1294,16 @@ impl Iterator for BoundWalker {
             let approved_path = &self.scratch_approved;
             let hidden = self.hidden.as_ref();
             let mut file_filter = self.file_filter.as_mut();
+            let skipped_directories = &mut self.skipped_directories;
             let mut dropped = |is_directory: bool| {
-                (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
-                    || is_ignored(&frame.matchers, approved_path, is_directory)
+                if is_directory
+                    && !is_ignored(&frame.matchers, approved_path, is_directory)
+                    && skip_directory(&frame.directory, &name)
+                {
+                    skipped_directories.record(relative_path);
+                    return true;
+                }
+                is_ignored(&frame.matchers, approved_path, is_directory)
                     || hidden.is_some_and(|hidden| hidden(approved_path, is_directory))
                     || (!is_directory
                         && file_filter
@@ -1737,7 +1815,7 @@ impl Tool for FindFilesTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore. Sorts by name by default, or newest modification time with sort `mtime`; ties use path order, unavailable times sort last. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.".to_string()
+        "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore. Sorts by name by default, or newest modification time with sort `mtime`; ties use path order, unavailable times sort last. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1856,7 +1934,7 @@ impl Tool for FindFilesTool {
         let max_results = usize::try_from(self.max_results).unwrap_or(usize::MAX);
         let sort = args.sort;
         let cancellation = crate::agent::runner::current_work_cancellation();
-        let (first_results, total_matches, work_limit_hit) =
+        let (first_results, total_matches, work_limit_hit, skipped_notice) =
             crate::agent::runner::spawn_blocking_scoped(move || -> Result<_, ToolError> {
                 // The pattern is evaluated on the name before a file is
                 // opened, so only matching files cost an open and fstat.
@@ -1894,7 +1972,12 @@ impl Tool for FindFilesTool {
                 if walker.cancelled() {
                     return Err(ToolError::Msg("find_files cancelled".into()));
                 }
-                Ok((first_results, total_matches, walker.work_limit_hit()))
+                Ok((
+                    first_results,
+                    total_matches,
+                    walker.work_limit_hit(),
+                    walker.skipped_directories().notice(),
+                ))
             })
             .await
             .map_err(|error| {
@@ -1905,6 +1988,7 @@ impl Tool for FindFilesTool {
         } else {
             ""
         };
+        let work_notice = format!("{skipped_notice}{work_notice}");
         if total_matches == 0 {
             let msg =
                 format!("No files found matching the pattern.\n{no_matches_hint}{work_notice}");

@@ -6,7 +6,7 @@
 //! tests never install a value, so they observe the documented defaults and
 //! exercise non-default bounds through the explicit-parameter helpers.
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use crate::config::Config;
 
@@ -88,6 +88,25 @@ static CURRENT: RwLock<ToolLimits> = RwLock::new(ToolLimits {
     notebook_max_bytes: DEFAULT_NOTEBOOK_MAX_BYTES,
 });
 
+/// `[tool_limits] skip_dirs`: when set, exactly these directory names are
+/// skipped by recursive searches and listings (VCS metadata always is);
+/// `None` keeps the built-in rule (`node_modules`, and `target` beside a
+/// build manifest).
+static SKIP_DIRS: RwLock<Option<Arc<[String]>>> = RwLock::new(None);
+
+/// Install the configured skip-directory names (`None` = built-in rule).
+pub fn install_skip_dirs(names: Option<Vec<String>>) {
+    *SKIP_DIRS.write().unwrap_or_else(|error| error.into_inner()) = names.map(Arc::from);
+}
+
+/// The configured skip-directory names, if any.
+pub fn skip_dirs() -> Option<Arc<[String]>> {
+    SKIP_DIRS
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
 /// Install the limits resolved from the active configuration.
 pub fn install(limits: ToolLimits) {
     *CURRENT.write().unwrap_or_else(|error| error.into_inner()) = limits;
@@ -116,6 +135,11 @@ mod tests {
             MIN_MAX_RESULT_CHARS
         );
         assert!(toml::from_str::<Config>("[tool_limits]\nunknown = 1\n").is_err());
+        let skip: Config = toml::from_str("[tool_limits]\nskip_dirs = [\"dist\"]\n").unwrap();
+        assert_eq!(
+            skip.tool_limits.unwrap().skip_dirs,
+            Some(vec!["dist".to_owned()])
+        );
         let width: Config = toml::from_str("[tool_limits]\nmax_read_line_chars = 500\n").unwrap();
         assert_eq!(ToolLimits::from_config(&width).max_read_line_chars, 500);
         let notebook: Config =

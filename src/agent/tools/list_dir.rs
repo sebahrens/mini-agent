@@ -145,7 +145,7 @@ impl Tool for ListDirTool {
 
     fn description(&self) -> String {
         format!(
-            "List files and directories in a directory. Respects .gitignore and hides dependency/build directories and VCS metadata unless requested explicitly. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.{} Page with offset (the truncation notice names the next offset); depth 2-3 expands subdirectories into an indented tree under the same cap.",
+            "List files and directories in a directory. Respects .gitignore and hides VCS metadata, node_modules and target directories beside a build manifest unless requested explicitly. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.{} Page with offset (the truncation notice names the next offset); depth 2-3 expands subdirectories into an indented tree under the same cap.",
             match self.max_entries {
                 Some(cap) => format!(" Returns at most {cap} entries per call."),
                 None => String::new(),

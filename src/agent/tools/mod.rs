@@ -663,8 +663,17 @@ impl From<serde_json::Error> for ToolError {
     }
 }
 
+/// Directory names skipped by name alone: VCS metadata plus `node_modules`,
+/// or exactly the configured `[tool_limits] skip_dirs`. `target` is skipped
+/// only beside a build manifest (see `find_files::skip_directory`).
 pub fn is_skip_dir(name: &str) -> bool {
-    matches!(name, "node_modules" | "target") || is_vcs_metadata(name)
+    if is_vcs_metadata(name) {
+        return true;
+    }
+    match limits::skip_dirs() {
+        Some(names) => names.iter().any(|skip| skip == name),
+        None => name == "node_modules",
+    }
 }
 
 pub fn is_vcs_metadata(name: &str) -> bool {

@@ -11,9 +11,11 @@ fn skip_node_modules() {
     assert!(is_skip_dir("node_modules"));
 }
 
+/// `target` depends on its parent (build manifest beside it), so the
+/// name-only rule does not skip it; see the find_files skip tests.
 #[test]
-fn skip_target() {
-    assert!(is_skip_dir("target"));
+fn skip_target_is_context_dependent() {
+    assert!(!is_skip_dir("target"));
 }
 
 #[test]

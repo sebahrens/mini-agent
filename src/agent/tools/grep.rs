@@ -22,6 +22,7 @@ const MAX_MULTILINE_MATCHES: usize = 100_000;
 struct GrepSearchResult {
     file_count: usize,
     skipped: SkippedFiles,
+    skipped_directories: String,
     files_with_matches: usize,
     results: Vec<String>,
     emitted_results: usize,
@@ -600,10 +601,11 @@ impl GrepSearch {
         }
     }
 
-    fn finish(self, walker_work_limit_hit: bool) -> GrepSearchResult {
+    fn finish(self, walker_work_limit_hit: bool, skipped_directories: String) -> GrepSearchResult {
         GrepSearchResult {
             file_count: self.file_count,
             skipped: self.skipped,
+            skipped_directories,
             files_with_matches: self.files_with_matches,
             results: self.results,
             emitted_results: self.emitted_results,
@@ -653,7 +655,10 @@ fn search_target(
             if walker.cancelled() {
                 return Err(ToolError::Msg("grep cancelled".into()));
             }
-            Ok(search.finish(walker.work_limit_hit()))
+            Ok(search.finish(
+                walker.work_limit_hit(),
+                walker.skipped_directories().notice(),
+            ))
         }
         SearchTarget::File(entry) => {
             // An explicitly named file is searched even when an ignore rule
@@ -677,7 +682,7 @@ fn search_target(
             if let Some(error) = search.skipped.explicit_file_error(&path, len) {
                 return Err(error);
             }
-            Ok(search.finish(false))
+            Ok(search.finish(false, String::new()))
         }
     }
 }
@@ -736,7 +741,7 @@ impl Tool for GrepTool {
 
     fn description(&self) -> String {
         format!(
-            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. Respects .gitignore. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly. `path` may name a single file to search only that file.",
+            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. Respects .gitignore. Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. `path` may name a single file to search only that file.",
             self.max_results, MAX_OUTPUT_LINE_CHARS
         )
     }
@@ -942,6 +947,7 @@ impl Tool for GrepTool {
         let GrepSearchResult {
             file_count,
             skipped,
+            skipped_directories,
             files_with_matches,
             results: all_results,
             emitted_results,
@@ -955,7 +961,7 @@ impl Tool for GrepTool {
             ""
         };
         let skipped_notice = skipped.notice();
-        let work_notice = format!("{skipped_notice}{work_notice}");
+        let work_notice = format!("{skipped_notice}{skipped_directories}{work_notice}");
         if all_results.is_empty() && offset > 0 && seen_results > 0 {
             let msg = format!(
                 "No results at offset {offset}: this search produced {seen_results} results in total; use a smaller offset.{work_notice}"

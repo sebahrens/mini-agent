@@ -1040,6 +1040,11 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let max_find_results = cfg.resolve_max_find_results();
         let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
         tools::limits::install(tools::limits::ToolLimits::from_config(cfg));
+        tools::limits::install_skip_dirs(
+            cfg.tool_limits
+                .as_ref()
+                .and_then(|limits| limits.skip_dirs.clone()),
+        );
         let formatter = shell_tool_enabled
             .then(|| tools::format_after_edit::FormatAfterEdit::new(&cfg.format, sandbox.clone()))
             .flatten();

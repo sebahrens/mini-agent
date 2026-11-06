@@ -1060,4 +1060,8 @@ pub struct ToolLimitsConfig {
     /// Raw notebook size accepted by the cell view and `notebook_edit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notebook_max_bytes: Option<u64>,
+    /// Directory names recursive searches and listings skip at any depth.
+    /// Unset keeps the built-in rule; `[]` skips only VCS metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_dirs: Option<Vec<String>>,
 }

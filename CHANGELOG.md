@@ -38,6 +38,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   scanned PDFs report that they have no text layer and suggest exporting pages as images.
 - `list_dir` accepts `offset`, `limit` and `depth` (up to 3): entries past the cap are reachable
   through the `continue with offset=N` notice, and depth renders a bounded indented tree.
+- `grep`, `find_files` and `list_dir` no longer hide every directory named `target`: only one beside
+  a build manifest (`Cargo.toml`, `pom.xml`, ...) is skipped, skipped dependency/build directories
+  are named in a notice, and `[tool_limits] skip_dirs` makes the set configurable.
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

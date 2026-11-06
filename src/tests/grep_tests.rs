@@ -510,3 +510,58 @@ async fn grep_offset_pages_lines_files_only_and_count_without_overlap() {
         );
     }
 }
+
+/// mini-agent-nzs2j: a source directory named `target` is searched; build
+/// output (`target` beside Cargo.toml) and nested `node_modules` are skipped
+/// and named in a notice.
+#[tokio::test]
+async fn search_skips_only_build_target_and_node_modules_and_names_them() {
+    use crate::agent::tools::{FindFilesArgs, FindFilesTool};
+    use rig::tool::Tool;
+    let root = crate::tests::OwnedTestDirectory::new("skip-dirs");
+    let write = |relative: &str| {
+        let path = root.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "needle\n").unwrap();
+    };
+    write("src/target/lib.rs");
+    write("crate/Cargo.toml");
+    write("crate/target/debug/build.rs");
+    write("web/pkg/package.json");
+    write("web/pkg/node_modules/dep/index.rs");
+
+    let grep = GrepTool::new(None, None, 50)
+        .call(search_args(root.path(), serde_json::json!({})))
+        .await
+        .unwrap();
+    assert!(grep.contains("src/target/lib.rs:1:needle"), "{grep}");
+    assert!(!grep.contains("crate/target/debug"), "{grep}");
+    assert!(!grep.contains("node_modules/dep"), "{grep}");
+    assert!(
+        grep.contains("[skipped dependency/build directories: "),
+        "{grep}"
+    );
+    assert!(grep.contains("crate/target"), "{grep}");
+    assert!(grep.contains("web/pkg/node_modules"), "{grep}");
+
+    let args: FindFilesArgs = serde_json::from_value(serde_json::json!({
+        "pattern": "*.rs",
+        "path": root.path().to_string_lossy(),
+    }))
+    .unwrap();
+    let found = FindFilesTool::new(None, None, 50).call(args).await.unwrap();
+    assert!(found.contains("src/target/lib.rs"), "{found}");
+    assert!(!found.contains("debug/build.rs"), "{found}");
+    assert!(!found.contains("dep/index.rs"), "{found}");
+    assert!(found.contains("crate/target"), "{found}");
+
+    // Naming a skipped directory explicitly still searches it.
+    let explicit = GrepTool::new(None, None, 50)
+        .call(search_args(
+            &root.path().join("crate/target"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert!(explicit.contains("debug/build.rs:1:needle"), "{explicit}");
+}

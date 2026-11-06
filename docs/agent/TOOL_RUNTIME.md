@@ -351,6 +351,16 @@ persistent chain for nested directories, so descent does not clone every prior
 matcher. `grep` reads only an 8 KiB prefix before rejecting a binary file and
 does not load the remainder of that file.
 
+Recursive `grep`, `find_files` and `list_dir` skip VCS metadata (`.git`, `.hg`,
+`.svn`, `.bzr`), every `node_modules` directory, and a `target` directory only when
+its parent holds a build manifest (`Cargo.toml`, `pom.xml`, `build.sbt`,
+`build.gradle`, `build.gradle.kts`, `project.clj`). A source package named `target`
+elsewhere is searched; `.gitignore` still hides ignored output. `grep` and
+`find_files` end with `[skipped dependency/build directories: a/node_modules,
+crate/target (+N more); ...]` when a non-ignored directory was skipped. Naming a
+skipped directory as `path` searches it. `[tool_limits] skip_dirs` replaces the
+built-in rule with an explicit list of names.
+
 `write` creates files by default. For a deliberate full-file replacement, the
 caller must first read the current file completely and then set
 `overwrite=true`; the shared read tracker checks the current metadata and
