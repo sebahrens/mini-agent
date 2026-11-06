@@ -126,6 +126,112 @@ fn response_code(response: &reqwest::Response) -> StatusCode {
     response.status()
 }
 
+/// Most same-origin redirect hops followed for one MCP HTTP request.
+pub(crate) const MCP_HTTP_MAX_REDIRECTS: usize = 5;
+
+/// Marker that starts a redirect refusal; connection notices surface the
+/// bounded text after it (it names only an origin and path).
+pub(crate) const MCP_REDIRECT_REFUSED: &str = "MCP HTTP redirect refused:";
+
+/// `scheme://host:port/path` of a redirect target, without credentials,
+/// query or fragment, bounded for display.
+fn redirect_display(url: &reqwest::Url) -> String {
+    let mut shown = format!(
+        "{}://{}{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or(""),
+        url.port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default(),
+        url.path()
+    );
+    if shown.len() > 512 {
+        let mut end = 512;
+        while !shown.is_char_boundary(end) {
+            end -= 1;
+        }
+        shown.truncate(end);
+        shown.push('…');
+    }
+    shown
+}
+
+/// Classify a response as a redirect. `Ok(None)`: not a redirect. `Ok(Some)`:
+/// a same-origin target this request may follow (same scheme, host and port,
+/// so the pinned, policy-checked destination is unchanged and the request's
+/// credentials stay with their origin). `Err`: a redirect that is refused, with
+/// a message naming the target so the configuration can be corrected.
+fn same_origin_redirect(
+    current: &str,
+    response: &reqwest::Response,
+    preserves_body: bool,
+) -> Result<Option<String>, HttpError> {
+    let code = response_code(response);
+    let followable = matches!(
+        code,
+        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+    ) || (!preserves_body
+        && matches!(
+            code,
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
+        ));
+    if !code.is_redirection() || code == StatusCode::NOT_MODIFIED {
+        return Ok(None);
+    }
+    let refuse = |detail: String| {
+        Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+            format!("{MCP_REDIRECT_REFUSED} HTTP {code} {detail}"),
+        )))
+    };
+    let Ok(current) = reqwest::Url::parse(current) else {
+        return refuse("from an unparsable request URL".into());
+    };
+    let Some(target) = response
+        .headers()
+        .get(http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|location| current.join(location).ok())
+    else {
+        return refuse("without a usable Location".into());
+    };
+    let same_origin = target.scheme() == current.scheme()
+        && target.host_str() == current.host_str()
+        && target.port_or_known_default() == current.port_or_known_default()
+        && target.username().is_empty()
+        && target.password().is_none();
+    if followable && same_origin {
+        return Ok(Some(target.to_string()));
+    }
+    let reason = if same_origin {
+        "would change the request method"
+    } else {
+        "leaves the configured origin"
+    };
+    refuse(format!(
+        "to {} ({reason}); set the server URL to the redirect target",
+        redirect_display(&target)
+    ))
+}
+
+/// The bounded redirect refusal inside a connection error, if any. Only text
+/// this module generated (an origin and path) is returned, never the rest of
+/// the transport error, which may carry an expanded credential.
+pub(crate) fn redirect_refusal(error: &anyhow::Error) -> Option<String> {
+    let rendered = format!("{error:#}");
+    let start = rendered.find(MCP_REDIRECT_REFUSED)?;
+    let tail = &rendered[start..];
+    let end = tail
+        .find("; set the server URL to the redirect target")
+        .map(|end| end + "; set the server URL to the redirect target".len())
+        .or_else(|| tail.find(" redirects").map(|end| end + " redirects".len()))
+        .unwrap_or_else(|| tail.len().min(160));
+    let mut end = end.min(800);
+    while !tail.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(tail[..end].replace(['\n', '\r'], " "))
+}
+
 fn starts_with_mime(content_type: Option<&str>, mime: &str) -> bool {
     content_type.is_some_and(|ct| ct.as_bytes().starts_with(mime.as_bytes()))
 }
@@ -359,19 +465,37 @@ impl StreamableHttpClient for BoundedHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, HttpError> {
-        let mut request = self
-            .inner
-            .get(uri.as_ref())
-            .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "))
-            .header(HEADER_SESSION_ID, session_id.as_ref());
-        if let Some(last_event_id) = last_event_id {
-            request = request.header(HEADER_LAST_EVENT_ID, last_event_id);
-        }
-        if let Some(token) = auth_token {
-            request = request.bearer_auth(token);
-        }
-        let request = apply_custom_headers(request, custom_headers)?;
-        let response = request.send().await.map_err(StreamableHttpError::Client)?;
+        let mut target = uri.to_string();
+        let mut hops = 0;
+        let response = loop {
+            let mut request = self
+                .inner
+                .get(target.as_str())
+                .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "))
+                .header(HEADER_SESSION_ID, session_id.as_ref());
+            if let Some(last_event_id) = &last_event_id {
+                request = request.header(HEADER_LAST_EVENT_ID, last_event_id);
+            }
+            if let Some(token) = &auth_token {
+                request = request.bearer_auth(token);
+            }
+            let request = apply_custom_headers(request, custom_headers.clone())?;
+            let response = request.send().await.map_err(StreamableHttpError::Client)?;
+            match same_origin_redirect(&target, &response, false)? {
+                Some(next) if hops < MCP_HTTP_MAX_REDIRECTS => {
+                    hops += 1;
+                    target = next;
+                }
+                Some(_) => {
+                    return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                        format!(
+                            "{MCP_REDIRECT_REFUSED} more than {MCP_HTTP_MAX_REDIRECTS} redirects"
+                        ),
+                    )));
+                }
+                None => break response,
+            }
+        };
         if response_code(&response) == StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
@@ -429,24 +553,44 @@ impl StreamableHttpClient for BoundedHttpClient {
     ) -> Result<StreamableHttpPostResponse, HttpError> {
         let cap = self.max_body_bytes;
         let body = serde_json::to_vec(&message)?;
-        let mut request = self
-            .inner
-            .post(uri.as_ref())
-            .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "))
-            .header(CONTENT_TYPE, JSON_MIME_TYPE);
-        if let Some(token) = auth_token {
-            request = request.bearer_auth(token);
-        }
-        let mut request = apply_custom_headers(request, custom_headers)?;
         let session_was_attached = session_id.is_some();
-        if let Some(session_id) = session_id {
-            request = request.header(HEADER_SESSION_ID, session_id.as_ref());
-        }
-        let mut response = request
-            .body(body)
-            .send()
-            .await
-            .map_err(StreamableHttpError::Client)?;
+        let mut target = uri.to_string();
+        let mut hops = 0;
+        let mut response = loop {
+            let mut request = self
+                .inner
+                .post(target.as_str())
+                .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "))
+                .header(CONTENT_TYPE, JSON_MIME_TYPE);
+            if let Some(token) = &auth_token {
+                request = request.bearer_auth(token);
+            }
+            let mut request = apply_custom_headers(request, custom_headers.clone())?;
+            if let Some(session_id) = &session_id {
+                request = request.header(HEADER_SESSION_ID, session_id.as_ref());
+            }
+            let response = request
+                .body(body.clone())
+                .send()
+                .await
+                .map_err(StreamableHttpError::Client)?;
+            // 307/308 replay the same POST body; only same-origin targets are
+            // followed, so the pinned destination and credentials are unchanged.
+            match same_origin_redirect(&target, &response, true)? {
+                Some(next) if hops < MCP_HTTP_MAX_REDIRECTS => {
+                    hops += 1;
+                    target = next;
+                }
+                Some(_) => {
+                    return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                        format!(
+                            "{MCP_REDIRECT_REFUSED} more than {MCP_HTTP_MAX_REDIRECTS} redirects"
+                        ),
+                    )));
+                }
+                None => break response,
+            }
+        };
         let code = response_code(&response);
         if code == StatusCode::UNAUTHORIZED
             && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
@@ -646,6 +790,14 @@ mod tests {
     }
 
     async fn read_request(stream: &mut TcpStream) -> Option<(String, serde_json::Value)> {
+        read_request_with_path(stream)
+            .await
+            .map(|(method, _, body)| (method, body))
+    }
+
+    async fn read_request_with_path(
+        stream: &mut TcpStream,
+    ) -> Option<(String, String, serde_json::Value)> {
         let mut buffer = Vec::new();
         let header_end = loop {
             if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -660,6 +812,7 @@ mod tests {
         };
         let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
         let method = head.split(' ').next()?.to_string();
+        let path = head.split(' ').nth(1)?.to_string();
         let length = head
             .lines()
             .find_map(|line| {
@@ -681,14 +834,21 @@ mod tests {
         }
         let body = serde_json::from_slice(&buffer[header_end..header_end + length])
             .unwrap_or(serde_json::Value::Null);
-        Some((method, body))
+        Some((method, path, body))
     }
 
     async fn handle(mut stream: TcpStream, respond: Respond) {
         let Some((method, body)) = read_request(&mut stream).await else {
             return;
         };
-        let response = match (method.as_str(), body.get("id")) {
+        let response = respond_to(&method, &body, &respond);
+        // The client may hang up once it hits the cap.
+        let _ = stream.write_all(&response).await;
+        let _ = stream.shutdown().await;
+    }
+
+    fn respond_to(method: &str, body: &serde_json::Value, respond: &Respond) -> Vec<u8> {
+        match (method, body.get("id")) {
             ("POST", None) => http_response("202 Accepted", "text/plain", b""),
             ("POST", Some(id)) => match body["method"].as_str() {
                 Some("initialize") => http_response(
@@ -707,10 +867,115 @@ mod tests {
                 None => http_response("400 Bad Request", "text/plain", b""),
             },
             _ => http_response("405 Method Not Allowed", "text/plain", b""),
+        }
+    }
+
+    /// Like `serve`, but every request to `/mcp` is answered with `redirect`
+    /// (a status line and Location); other paths are served normally.
+    async fn serve_redirecting(redirect: &'static str, location: String) -> Option<String> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("loopback bind failed: {error}"),
         };
-        // The client may hang up once it hits the cap.
-        let _ = stream.write_all(&response).await;
-        let _ = stream.shutdown().await;
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let respond: Respond = Arc::new(|method, id| match method {
+            "tools/list" => http_response(
+                "200 OK",
+                "application/json",
+                &json_result(
+                    id,
+                    serde_json::json!({"tools": [{"name": "probe", "inputSchema": {"type": "object"}}]}),
+                ),
+            ),
+            _ => http_response("404 Not Found", "text/plain", b""),
+        });
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let respond = Arc::clone(&respond);
+                let location = location.clone();
+                tokio::spawn(async move {
+                    let Some((method, path, body)) = read_request_with_path(&mut stream).await
+                    else {
+                        return;
+                    };
+                    let response = if path == "/mcp" {
+                        format!(
+                            "HTTP/1.1 {redirect}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes()
+                    } else {
+                        respond_to(&method, &body, &respond)
+                    };
+                    let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        Some(url)
+    }
+
+    #[tokio::test]
+    async fn same_origin_307_redirect_is_followed_and_cross_origin_is_named() {
+        let Some(url) = serve_redirecting("307 Temporary Redirect", "/mcp/".into()).await else {
+            return;
+        };
+        let handle = connect(&url).await;
+        let tools = list_all_tools_bounded(&handle.peer(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+
+        // A private/metadata redirect target is never followed; the error
+        // names it (origin and path only) so the configuration can be fixed.
+        let Some(url) = serve_redirecting(
+            "308 Permanent Redirect",
+            "http://169.254.169.254/latest/meta-data?token=SECRET".into(),
+        )
+        .await
+        else {
+            return;
+        };
+        let error = McpClientHandle::connect_http_with_timeout(
+            "redirecting".into(),
+            &url,
+            &HashMap::new(),
+            None,
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .err()
+        .expect("a cross-origin redirect must not connect");
+        let refusal = super::redirect_refusal(&error).expect("refusal is surfaced");
+        assert!(
+            refusal.contains(
+                "to http://169.254.169.254/latest/meta-data (leaves the configured origin)"
+            ),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("SECRET"), "{refusal}");
+
+        // A POST redirect that would change the method is refused, not replayed.
+        let Some(url) = serve_redirecting("302 Found", "/mcp/".into()).await else {
+            return;
+        };
+        let error = McpClientHandle::connect_http_with_timeout(
+            "redirecting".into(),
+            &url,
+            &HashMap::new(),
+            None,
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            super::redirect_refusal(&error)
+                .unwrap()
+                .contains("would change the request method")
+        );
     }
 
     /// Loopback streamable-HTTP MCP server that answers `initialize` itself

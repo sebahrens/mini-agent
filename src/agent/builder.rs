@@ -638,6 +638,12 @@ fn configure_file_checkpoints(cfg: &Config) {
     let _ = limits;
 }
 
+/// The native Exa `web_search` tool is registered only when not switched
+/// off and `EXA_API_KEY` is present: without a key it could only fail.
+fn native_web_search_registered(cfg: &Config, exa_key_present: bool) -> bool {
+    cfg.web_search_provider.as_deref() != Some("off") && exa_key_present
+}
+
 fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec<&'static str> {
     if cli.resolve_no_tools(cfg) {
         return Vec::new();
@@ -656,7 +662,7 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         "ask_user_question",
     ];
     names.push("git");
-    if cfg.web_search_provider.as_deref() != Some("off") {
+    if native_web_search_registered(cfg, tools::web_search::exa_api_key_present()) {
         names.push("web_search");
     }
     if registered_shell_capability(cli, cfg, sandbox).is_some() {
@@ -1118,10 +1124,13 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 cfg.web_fetch_allow_http.unwrap_or(false),
                 tool_output_session_id,
                 tool_result_spills.clone(),
+                cfg.web_fetch_timeout_secs,
             )));
         }
+        // Without EXA_API_KEY the native tool could only fail, so it is not
+        // registered; the keyless built-in Exa MCP server is the fallback.
         if cli.tool_is_eligible(cfg, "web_search")
-            && cfg.web_search_provider.as_deref() != Some("off")
+            && native_web_search_registered(cfg, tools::web_search::exa_api_key_present())
         {
             base_tools.push(Box::new(tools::web_search::WebSearchTool::new(
                 permission.clone(),
@@ -1254,6 +1263,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                         && cfg.web_search_provider.as_deref() != Some("off"),
                     fetch_origins: cfg.web_fetch_origins.clone(),
                     fetch_allow_http: cfg.web_fetch_allow_http.unwrap_or(false),
+                    fetch_timeout_secs: cfg.web_fetch_timeout_secs,
                     search_provider: cfg.web_search_provider.clone(),
                     session_id: tool_output_session_id.to_string(),
                 },
@@ -1442,6 +1452,35 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 all_tools.push(Box::new(crate::extras::mcp::deferred::McpSearch(
                     search_binding.clone(),
                 )));
+            }
+            // Model-facing resource tools, only when a connected server
+            // offers resources. They use auxiliary permission identities.
+            let resource_servers = manager.resource_servers();
+            if !resource_servers.is_empty() {
+                use crate::extras::mcp::resource_tools::{
+                    ListMcpResourcesTool, ReadMcpResourceTool,
+                };
+                let selected = |name: &str| {
+                    cli.tools.is_empty()
+                        || cli
+                            .tools
+                            .iter()
+                            .any(|tool| canonical_tool_name(tool) == name)
+                };
+                if selected("list_mcp_resources") {
+                    all_tools.push(Box::new(ListMcpResourcesTool::new(
+                        resource_servers.clone(),
+                        permission.clone(),
+                        ask_tx.clone(),
+                    )));
+                }
+                if selected("read_mcp_resource") {
+                    all_tools.push(Box::new(ReadMcpResourceTool::new(
+                        resource_servers,
+                        permission.clone(),
+                        ask_tx.clone(),
+                    )));
+                }
             }
         }
 
@@ -2442,18 +2481,36 @@ mod extra_file_tests {
         assert!(headless.contains("In iterative loop mode"));
         assert!(!headless.to_ascii_lowercase().contains("ask the user"));
     }
+    #[test]
+    fn web_native_search_is_hidden_without_an_exa_key_or_when_off() {
+        let on = crate::config::Config::default();
+        let off = crate::config::Config {
+            web_search_provider: Some("off".into()),
+            ..Default::default()
+        };
+        assert!(super::native_web_search_registered(&on, true));
+        assert!(!super::native_web_search_registered(&on, false));
+        assert!(!super::native_web_search_registered(&off, true));
+    }
     #[tokio::test]
     async fn web_native_builder_exposes_actual_sdk_schemas_and_honors_tool_selection() {
         let root = crate::tests::OwnedTestDirectory::new("web-builder");
         let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
         let mut context = empty_ctx();
         context.workspace_root = root.path().to_path_buf();
+        // The native search tool is advertised only when EXA_API_KEY is set
+        // (see `native_web_search_registered`); follow the ambient state.
+        let key = crate::agent::tools::web_search::exa_api_key_present();
         for (tools, no_tools, provider, expected) in [
             (
                 vec!["web_fetch", "web_search"],
                 false,
                 None,
-                vec!["web_fetch", "web_search"],
+                if key {
+                    vec!["web_fetch", "web_search"]
+                } else {
+                    vec!["web_fetch"]
+                },
             ),
             (vec!["web_fetch"], false, None, vec!["web_fetch"]),
             (vec!["web_fetch", "web_search"], true, None, vec![]),

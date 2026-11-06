@@ -3217,6 +3217,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "crossterm",
  "dirs",
+ "encoding_rs",
  "fastembed",
  "flate2",
  "futures",

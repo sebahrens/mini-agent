@@ -324,7 +324,8 @@ impl ToolDyn for McpTool {
                         ServiceError::Timeout { .. } => format!(
                             "MCP tool '{tool_name}' on server '{server_name}' timed out after {} ms; \
                              the server may be hung or the request too large. Retry with a \
-                             narrower request, or raise `mcp_tool_timeout_secs` in the config.",
+                             narrower request, or raise `mcp_tool_timeout_secs` (or this server's \
+                             `tool_timeout_sec`) in the config.",
                             call_timeout.as_millis()
                         ),
                         other => format!("MCP tool error: {other}"),
@@ -494,6 +495,12 @@ fn render_success_content(
                 }
                 _ => unsupported += 1,
             },
+            ContentBlock::ResourceLink(link) => parts.push(render_resource_link(&link)),
+            ContentBlock::Audio(audio) => parts.push(format!(
+                "[audio: {}, {} bytes]",
+                one_line(&audio.mime_type, 128),
+                base64_decoded_len(&audio.data)
+            )),
             _ => unsupported += 1,
         }
     }
@@ -532,6 +539,40 @@ fn render_success_content(
     } else {
         serde_json::json!({"response": response, "parts": images}).to_string()
     }
+}
+
+/// Single-line, character-bounded rendering of server-supplied metadata.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let mut line: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max_chars)
+        .collect();
+    if text.chars().count() > max_chars {
+        line.push('…');
+    }
+    line.trim().to_owned()
+}
+
+/// A `resource_link` block names a resource the server did not inline. Its
+/// identifying fields are rendered so the model can cite or fetch it.
+fn render_resource_link(link: &rmcp::model::Resource) -> String {
+    let mut line = format!("[resource link: {}", one_line(&link.name, 256));
+    if let Some(title) = link.title.as_deref().filter(|t| !t.is_empty()) {
+        line.push_str(&format!(" ({})", one_line(title, 256)));
+    }
+    line.push_str(&format!(", uri: {}", one_line(&link.uri, 2048)));
+    if let Some(mime) = link.mime_type.as_deref() {
+        line.push_str(&format!(", {}", one_line(mime, 128)));
+    }
+    if let Some(size) = link.size {
+        line.push_str(&format!(", {size} bytes"));
+    }
+    if let Some(description) = link.description.as_deref().filter(|d| !d.is_empty()) {
+        line.push_str(&format!(" - {}", one_line(description, 1024)));
+    }
+    line.push(']');
+    line
 }
 
 fn collect_image(
@@ -939,6 +980,29 @@ mod tests {
             render_small(blocks, None),
             "[mcp output begins]\n> first\n> [image: image/svg+xml, 5 bytes] [image omitted: unsupported image format]\n> [resource: file:///report.pdf, application/pdf, 6 bytes]\n> [resource: urn:binary, application/octet-stream, 1 bytes]\n[mcp output ends]"
         );
+    }
+
+    #[test]
+    fn resource_links_and_audio_render_their_identifying_fields() {
+        let mut link = rmcp::model::Resource::new("file:///repo/src/main.rs", "main.rs");
+        link.description = Some("Entry point\nwith newline".into());
+        link.mime_type = Some("text/x-rust".into());
+        link.size = Some(42);
+        let output = render_small(
+            vec![
+                ContentBlock::ResourceLink(link),
+                ContentBlock::Audio(rmcp::model::AudioContent::new("AAAA", "audio/wav")),
+            ],
+            None,
+        );
+        assert!(
+            output.contains(
+                "[resource link: main.rs, uri: file:///repo/src/main.rs, text/x-rust, 42 bytes - Entry point with newline]"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("[audio: audio/wav, 3 bytes]"), "{output}");
+        assert!(!output.contains("cannot render"), "{output}");
     }
 
     #[test]

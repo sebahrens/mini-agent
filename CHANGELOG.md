@@ -214,6 +214,19 @@ Notable changes to mini-agent are documented in this file. The format follows
   over 16 KiB is truncated with a marker, an oversized notice defers sources instead of failing, and
   more than 128 delivery receipts evict the oldest instead of terminating the run (CONFIG.md
   "Nested instruction limits").
+- HTTP MCP servers behind same-origin redirects (e.g. `/mcp` -> `/mcp/` 307/308) now connect;
+  other redirects stay refused and the connection notice names the target origin and path
+  (mini-agent-iqjva).
+- MCP tool results now render `resource_link` blocks (name, title, URI, MIME, size,
+  description) and audio blocks (`[audio: mime, N bytes]`) instead of counting them as
+  unrenderable (mini-agent-7wieg).
+- `web_fetch` decodes gzip/deflate responses (output capped at the body limit, so bombs are
+  truncated), honours the `Content-Type` charset or an HTML `<meta charset>` (Latin-1, Shift-JIS,
+  windows-1252 ...), quotes non-HTML text types literally, and refuses binary types such as PDF by
+  name instead of reporting a UTF-8 error (mini-agent-bl9kt).
+- `web_fetch` no longer fails on a response body over its byte cap: it reads the first 10 MiB
+  (raised from 1 MiB), converts that prefix and states `Response body truncated at N bytes`; the
+  cap is named in the tool description (mini-agent-8qfag).
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for
@@ -291,6 +304,31 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Opt-in `mini-agent --mcp-server` serves mini-agent over MCP on stdio with one `run` tool; each
+  call runs the prompt as a headless `-p` child with the server's own sandbox, permission,
+  provider and tool flags (asks fail closed) (mini-agent-ybwl5).
+- Model-facing `list_mcp_resources` and `read_mcp_resource` tools reuse the bounded resource
+  catalogue and text-only read path under auxiliary (non-tool) permission identities, so
+  headless and autonomous runs can use resource-oriented MCP servers (mini-agent-ir8af).
+- MCP: stdio servers get the `roots` capability (`roots/list` returns the workspace root;
+  remote servers get none); URL-mode elicitation shows the link for the user to open and
+  answer Done/Decline; sampling stays explicitly refused and documented (mini-agent-a67h7).
+- MCP `notifications/tools/list_changed` is honoured: the connection relists at the next tool
+  collection and the TUI rebuilds the agent before the next turn; a failed relist keeps the
+  previous tools with a notice (mini-agent-7mqfb).
+- MCP server entries accept `enabled = false`, `enabled_tools` and `disabled_tools`; the
+  selection applies before the 128-tool cap and `/mcp <server>` reports excluded counts
+  (mini-agent-nkmpj).
+- MCP server entries accept `startup_timeout_sec` (initialize, default 10 s; also raises the
+  30 s `tools/list` budget) and `tool_timeout_sec` (per-server `tools/call`, default
+  `mcp_tool_timeout_secs` = 120 s), clamped to 1..=3600 (mini-agent-02r1x).
+- `web_search` accepts optional `num_results` (<= 10), `allowed_domains` / `blocked_domains`
+  (enforced locally as well) and `recency`; snippets grow to 3,000 characters. Without
+  `EXA_API_KEY` the native tool is no longer registered, leaving the keyless Exa MCP server
+  (mini-agent-5hgoo).
+- `web-fetch-timeout-secs` sets the total `web_fetch` deadline (default raised from 10 s to 30 s,
+  clamped 1..=300); the idle read bound derives from it (half, at least 3 s) and the tool
+  description states the deadline (mini-agent-6s7vs).
 - `js-fetch-origins` accepts the strings `"all"` (no narrowing) and `"none"` (deny every JS `fetch()`) as
   well as an array of exact origins; other strings are rejected with an error naming the three forms.
   A project config cannot widen inherited origins to `"all"`. When the key is unset, a one-time
@@ -398,6 +436,9 @@ upstream changes that are new relative to this fork.
 
 ### Changed
 
+- `web_fetch` converts HTML to Markdown: links keep absolute targets resolved against the final
+  URL, and headings (h1-h6), nested lists, fenced code, inline code, simple tables and image alt
+  text are preserved, so the model can follow links from a docs index (mini-agent-bksyr).
 - Add `gemini-pro-latest` to the embedded model catalog.
 - Web fetches reuse up to two idle keep-alive connections per host for 30 s, and `grep` reuses
   one read buffer across files instead of allocating per file.

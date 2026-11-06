@@ -1674,7 +1674,11 @@ stack budget. No production stack-size override is introduced.
 `src/agent/tools/web_http.rs` owns the parent-only URL/origin policy, public-address
 checks, process-wide DNS budget, request/response caps and pinned HTTP transports
 shared by native web tools and the JS broker. `web_fetch.rs` implements GET-only
-page retrieval and minimal HTML-to-text conversion; `web_search.rs` implements
+page retrieval and a bounded, non-executing HTML-to-Markdown conversion (links as
+`[text](absolute-url)` resolved against the final URL, `#` headings for h1-h6,
+`-`/`1.` lists, fenced `pre` blocks, inline code, simple pipe tables and image
+alt text; script/style/noscript/template bodies and comments omitted; output at
+most twice the input and link targets at most 2 KiB); `web_search.rs` implements
 fixed-endpoint Exa search. These tools are available without the `js`, `sandbox`
 or `mcp` Cargo features and use the same mandatory model-tool decorators as other
 built-ins. `--no-tools` and named `--tools` selection apply normally.
@@ -1686,7 +1690,11 @@ private/special addresses and mixed public/private DNS answers are refused. DNS
 answers are checked before approval and pinned for the exchange; redirects are
 never followed by reqwest. `web_fetch` independently validates and authorizes
 at most five redirects. Search posts only to `https://api.exa.ai/search`, captures
-`EXA_API_KEY` when the agent is built, and refuses every redirect. Keys never come
+`EXA_API_KEY` when the agent is built (the tool is not registered without it),
+and refuses every redirect. Optional `num_results` (<= 10), `allowed_domains` /
+`blocked_domains` and `recency` map to Exa `numResults`, `includeDomains` /
+`excludeDomains` and `startPublishedDate`; domain filters are re-applied to the
+returned URLs. Keys never come
 from a tool argument, are never sent to returned search URLs, and backend error
 bodies are not exposed. Exact credential echoes in returned titles/snippets are
 redacted within the same character caps; result URLs containing the captured
@@ -1704,10 +1712,24 @@ permission checks as for other native tools. It retains mandatory financial
 admission, concurrency, destination checks, network caps and cancellation.
 
 The parent limits request headers to 64/16 KiB, response headers to 128/64 KiB,
-request bodies to 256 KiB and response bodies to 1 MiB. Encoded or non-UTF-8 bodies
-are rejected. A native HTTP operation has one ten-second deadline spanning DNS,
-approval, redirects and body consumption, with three-second DNS/connect/read
-bounds. Cancellation drops native approval and asynchronous socket work. The
+request bodies to 256 KiB and response bodies to 1 MiB for search and the JS
+broker. `web_fetch` reads at most 10 MiB of a response body; a larger body is not
+an error: the first 10 MiB are converted and the result states
+`Response body truncated at N bytes`, while the excerpt/spill path covers only that
+prefix. Native exchanges send a host-controlled `Accept-Encoding: gzip, deflate`
+and decode those codings with an output cap equal to the body cap, so a
+decompression bomb is truncated (`web_fetch`) or rejected (`web_search`) without
+being materialized; other codings (`br`, `zstd`, stacked lists) are refused.
+Text is decoded with the `Content-Type` charset (or, for HTML without one, a
+`<meta charset>` sniff over the first KiB; UTF-8 otherwise). `web_fetch` decodes
+malformed text with replacement characters and refuses binary media types (PDF,
+images, archives, `application/octet-stream`) by name without downloading the
+body; HTML and XHTML are converted, other text types (plain, JSON, XML, source)
+are quoted literally. Search and the JS broker reject non-UTF-8 bodies. A native HTTP operation has one deadline spanning DNS,
+approval, redirects and body consumption: ten seconds for `web_search` and the JS
+broker, `web-fetch-timeout-secs` (default 30, clamped 1..=300) for `web_fetch`,
+whose idle read bound is half that deadline (at least three seconds). DNS and
+connect bounds stay at three seconds. Cancellation drops native approval and asynchronous socket work. The
 non-abortable OS resolver remains bounded by four process-wide permits; its
 actual scoped blocking closure retains the permit and turn ownership until it
 returns. Private spill writes also retain scoped ownership until the OS operation

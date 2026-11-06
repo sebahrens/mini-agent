@@ -759,6 +759,7 @@ fn percent_decode_handles_plus_and_hex() {
 #[test]
 fn oauth_config_round_trips_through_serde() {
     let cfg = McpServerConfig::Url {
+        options: Default::default(),
         allow_local: false,
         url: "https://example.com/mcp".to_string(),
         defer: Default::default(),

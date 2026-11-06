@@ -556,6 +556,14 @@ pub struct Config {
         alias = "web_search_provider"
     )]
     pub web_search_provider: Option<String>,
+    /// Total `web_fetch` deadline in seconds (DNS, approval, redirects and
+    /// body). Default 30; clamped to 1..=300.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "web-fetch-timeout-secs",
+        alias = "web_fetch_timeout_secs"
+    )]
+    pub web_fetch_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "allow-all-mcp-calls")]
     pub allow_all_mcp_calls: Option<bool>,
     /// Bound on one MCP `tools/call` round trip, in seconds. Default: 120.

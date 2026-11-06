@@ -125,6 +125,8 @@ tokio = { version = "1", features = [
     "fs",
     "net",
     "io-util",
+    # `--mcp-server` serves JSON-RPC on the process's stdio.
+    "io-std",
 ] }
 anyhow = "1"
 cap-std = "4.0.2"
@@ -172,6 +174,8 @@ zip = { version = "=9.0.5", default-features = false, features = ["deflate"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
 # Inflates PDF content streams for read's text extraction; already linked by zip.
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+# Native web_fetch: charset conversion (already in the graph via reqwest).
+encoding_rs = "0.8"
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 matrixmultiply = { version = "0.3.11", optional = true, features = ["threading"] }
 hnsw_rs = { version = "0.3.4", optional = true }

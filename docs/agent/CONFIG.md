@@ -846,7 +846,7 @@ Accepted top-level keys:
 | `enable-context7-mcp`     | boolean | Auto-configure the Context7 MCP server. Default: `false`.                                                                                                              |
 | `enable-grepapp-mcp`      | boolean | Auto-configure the Grep.app MCP server. Default: `false`.                                                                                                              |
 | `allow_all_mcp_calls`     | boolean | When `true`, permission checks are skipped for all MCP tool calls. Default: `false`.                                                                                   |
-| `mcp_tool_timeout_secs`   | integer | Bound on one MCP `tools/call` round trip, in seconds. A call that exceeds it is cancelled and reported to the model as a tool error. Default: `120` (minimum `1`).       |
+| `mcp_tool_timeout_secs`   | integer | Bound on one MCP `tools/call` round trip, in seconds. A call that exceeds it is cancelled and reported to the model as a tool error. Default: `120` (minimum `1`). A server entry's `tool_timeout_sec` overrides it; `startup_timeout_sec` overrides the 10 s initialize / 30 s `tools/list` bounds (see MCP_CONFIGURATION.md). |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 | `acp_host`                | string  | TCP bind host for ACP server mode (equivalent to `--acp-host`).                                                                                                              |
 | `acp_port`                | integer | TCP bind port for ACP server mode (equivalent to `--acp-port`, default: 7243).                                                                                               |
@@ -4336,14 +4336,27 @@ session’s active Task jobs and completed reports awaiting next-turn notice.
 
 Native `web_fetch` and `web_search` tools do not require JS or MCP. They can be
 selected with `--tools web_fetch,web_search`, and `--no-tools` removes both.
-`EXA_API_KEY` also supplies native Exa search; a missing key produces an error
-before network I/O. Exa service charges are separate from model-usage totals.
+`EXA_API_KEY` also supplies native Exa search. Without the key the native
+`web_search` tool is not registered at all (the model never sees a tool that can
+only fail); the keyless built-in Exa MCP server (`enable-exa-mcp`, default on)
+remains available for search. Exa service charges are separate from model-usage
+totals.
+
+`web_search` accepts `query` plus optional `num_results` (1..=10, default 5),
+`allowed_domains` or `blocked_domains` (bare domains, subdomains included, at
+most 20; not both) and `recency` (`day`, `week`, `month`, `year`). The filters
+are sent to Exa and also enforced on the returned URLs. Each result carries a
+title (256 characters) and a snippet of at most 3,000 characters.
+Provider-native hosted search (Anthropic `web_search` server tool, OpenAI
+Responses `web_search`) is not bridged: hosted tools are stripped from provider
+requests by policy because they bypass per-call network permission.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `web-fetch-origins` (`web_fetch_origins`) | omitted | Exact permitted HTTP(S) origins; omitted accepts any otherwise-safe public origin, an empty/invalid list denies all. This restriction does not grant permission. |
 | `web-fetch-allow-http` (`web_fetch_allow_http`) | `false` | Permit plaintext HTTP to otherwise-safe public destinations. Private addresses remain denied. |
 | `web-search-provider` (`web_search_provider`) | `"exa"` | Fixed-endpoint Exa search, or `"off"` to omit the tool. Other provider names fail visibly before I/O. |
+| `web-fetch-timeout-secs` (`web_fetch_timeout_secs`) | `30` | Total `web_fetch` deadline in seconds, spanning DNS, approval, redirects and body. Clamped to 1..=300. The idle gap allowed between body reads is half of it (at least 3 s). `web_search` keeps its fixed 10 s deadline. |
 
 These are authority-sensitive project config keys and require existing project
 trust. They are independent of `js-fetch-origins`/`js-fetch-allow-http`; changing

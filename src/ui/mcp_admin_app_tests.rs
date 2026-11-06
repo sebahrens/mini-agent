@@ -969,6 +969,7 @@ async fn retained_source_revoked_after_endpoint_lookup_makes_zero_connections() 
     let server = Server::new(false).await;
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
     let cfg = crate::extras::mcp::config::McpServerConfig::Url {
+        options: Default::default(),
         url: server.url(),
         defer: Default::default(),
         allow_local: true,

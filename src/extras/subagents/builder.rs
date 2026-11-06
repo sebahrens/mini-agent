@@ -107,6 +107,8 @@ pub(crate) struct ParentWebTools {
     pub(crate) search: bool,
     pub(crate) fetch_origins: Option<Vec<String>>,
     pub(crate) fetch_allow_http: bool,
+    /// The parent's `web_fetch_timeout_secs`.
+    pub(crate) fetch_timeout_secs: Option<u64>,
     pub(crate) search_provider: Option<String>,
     /// Session whose private tool-output directory keeps large pages.
     pub(crate) session_id: String,
@@ -812,6 +814,7 @@ pub(crate) fn persona_tools(
                 web.fetch_allow_http,
                 &web.session_id,
                 None,
+                web.fetch_timeout_secs,
             )));
         }
         if kinds.contains(&AgentTool::WebSearch) {

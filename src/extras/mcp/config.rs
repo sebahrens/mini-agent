@@ -132,6 +132,9 @@ pub enum McpServerConfig {
         /// Network authority requested for this service process.
         #[serde(default, skip_serializing_if = "McpStdioNetwork::is_inherit")]
         network: McpStdioNetwork,
+        /// Per-server timeouts and tool selection.
+        #[serde(flatten, default)]
+        options: Box<McpServerOptions>,
     },
     Url {
         url: String,
@@ -144,6 +147,9 @@ pub enum McpServerConfig {
         headers: HashMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         oauth: Option<OAuthConfig>,
+        /// Per-server timeouts and tool selection.
+        #[serde(flatten, default)]
+        options: Box<McpServerOptions>,
     },
     /// A built-in registration whose endpoint and trust identity cannot be
     /// supplied or changed through deserialized user configuration.
@@ -153,6 +159,74 @@ pub enum McpServerConfig {
         #[serde(default)]
         headers: HashMap<String, String>,
     },
+}
+
+/// Accepted per-server timeout range in seconds; values are clamped into it.
+pub(crate) const MCP_SERVER_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=3600;
+
+/// Per-server operational settings shared by command and URL servers. Every
+/// field is optional and omitted from serialization when unset, so existing
+/// configurations (and their project source proofs) are unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerOptions {
+    /// Bound on connect + initialize (and, for HTTP, OAuth restore). It also
+    /// bounds the server's `tools/list` enumeration. Defaults: 10 s / 30 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_timeout_sec: Option<u64>,
+    /// Bound on one `tools/call` for this server, overriding the global
+    /// `mcp_tool_timeout_secs` (default 120 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_timeout_sec: Option<u64>,
+    /// `false` keeps the entry configured but never connects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// When set, only these server tool names are registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+    /// Server tool names never registered. Applied after `enabled_tools`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
+}
+
+fn clamp_timeout(secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(secs.clamp(
+        *MCP_SERVER_TIMEOUT_SECS_RANGE.start(),
+        *MCP_SERVER_TIMEOUT_SECS_RANGE.end(),
+    ))
+}
+
+impl McpServerOptions {
+    /// Initialization bound: the configured value or `default`.
+    pub(crate) fn startup_timeout(&self, default: std::time::Duration) -> std::time::Duration {
+        self.startup_timeout_sec.map_or(default, clamp_timeout)
+    }
+
+    /// `tools/list` bound: a configured startup timeout raises (never lowers)
+    /// the list budget, so a slow server given more time to start also gets
+    /// it to enumerate.
+    pub(crate) fn list_timeout(&self, default: std::time::Duration) -> std::time::Duration {
+        self.startup_timeout_sec
+            .map_or(default, |secs| clamp_timeout(secs).max(default))
+    }
+
+    /// Whether the entry should be connected at all (default `true`).
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled != Some(false)
+    }
+
+    /// Whether a tool with this exact server-side name may be registered.
+    /// The selection applies before the per-server tool cap.
+    pub(crate) fn admits_tool(&self, name: &str) -> bool {
+        self.enabled_tools
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|tool| tool == name))
+            && !self.disabled_tools.iter().any(|tool| tool == name)
+    }
+
+    /// `tools/call` bound: the configured value or `default`.
+    pub(crate) fn tool_timeout(&self, default: std::time::Duration) -> std::time::Duration {
+        self.tool_timeout_sec.map_or(default, clamp_timeout)
+    }
 }
 
 /// Network authority is a launch property, independent from permission to
@@ -185,6 +259,14 @@ impl McpServerConfig {
 
     pub(crate) fn built_in(identity: TrustedMcpServer, headers: HashMap<String, String>) -> Self {
         Self::BuiltIn { identity, headers }
+    }
+
+    /// Per-server options; built-in registrations use the defaults.
+    pub(crate) fn options(&self) -> McpServerOptions {
+        match self {
+            Self::Command { options, .. } | Self::Url { options, .. } => (**options).clone(),
+            Self::BuiltIn { .. } => McpServerOptions::default(),
+        }
     }
 
     pub(crate) const fn trusted_identity(&self) -> Option<TrustedMcpServer> {
@@ -263,4 +345,69 @@ impl OAuthSettings {
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+#[cfg(test)]
+mod options_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn mcp_server_options_deserialize_flattened_and_clamp() {
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "server", "startup_timeout_sec": 30, "tool_timeout_sec": 0
+        }))
+        .unwrap();
+        let options = config.options();
+        assert_eq!(options.startup_timeout_sec, Some(30));
+        let default = Duration::from_secs(10);
+        assert_eq!(options.startup_timeout(default), Duration::from_secs(30));
+        assert_eq!(
+            options.list_timeout(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            options.list_timeout(Duration::from_secs(5)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            options.tool_timeout(Duration::from_secs(120)),
+            Duration::from_secs(1)
+        );
+        let url: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url": "https://mcp.example/mcp", "startup_timeout_sec": 99999
+        }))
+        .unwrap();
+        assert_eq!(
+            url.options().startup_timeout(default),
+            Duration::from_secs(3600)
+        );
+        // Unset options keep every default and serialize to nothing new.
+        let plain: McpServerConfig =
+            serde_json::from_value(serde_json::json!({"command": "server"})).unwrap();
+        assert_eq!(plain.options(), McpServerOptions::default());
+        assert_eq!(plain.options().startup_timeout(default), default);
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(!text.contains("timeout"), "{text}");
+        assert!(!text.contains("enabled"), "{text}");
+    }
+
+    #[test]
+    fn mcp_server_tool_selection_and_enable_toggle() {
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "server", "enabled_tools": ["a", "b"], "disabled_tools": ["b"]
+        }))
+        .unwrap();
+        let options = config.options();
+        assert!(options.is_enabled());
+        assert!(options.admits_tool("a"));
+        assert!(!options.admits_tool("b"));
+        assert!(!options.admits_tool("c"));
+        let off: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url": "https://mcp.example/mcp", "enabled": false
+        }))
+        .unwrap();
+        assert!(!off.options().is_enabled());
+        assert!(McpServerOptions::default().admits_tool("anything"));
+    }
 }

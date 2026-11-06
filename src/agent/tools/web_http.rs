@@ -225,6 +225,9 @@ pub(crate) const FETCH_RESPONSE_HEADER_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const FETCH_RESPONSE_HEADER_MAX_COUNT: usize = 128;
 pub(crate) const FETCH_RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
 
+// Only the JS broker transport uses these since the native exchange
+// returns `NativeFetchResult`.
+#[cfg_attr(not(all(feature = "js", feature = "sandbox")), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FetchResult {
     pub status: u16,
@@ -433,12 +436,18 @@ impl std::fmt::Display for FetchError {
 
 impl std::error::Error for FetchError {}
 
+// Only the JS broker transport uses these since the native exchange
+// returns `NativeFetchResult`.
+#[cfg_attr(not(all(feature = "js", feature = "sandbox")), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FetchTransportOutcome {
     Complete(FetchResult),
     Redirect(Url),
 }
 
+// Only the JS broker transport uses these since the native exchange
+// returns `NativeFetchResult`.
+#[cfg_attr(not(all(feature = "js", feature = "sandbox")), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FetchLimits {
     pub(crate) connect_timeout: Duration,
@@ -746,6 +755,7 @@ pub(crate) fn validate_header_limits(
     Ok(())
 }
 
+#[cfg(all(feature = "js", feature = "sandbox"))]
 pub(crate) fn reject_encoded_response(
     headers: &reqwest::header::HeaderMap,
 ) -> Result<(), FetchError> {
@@ -813,13 +823,279 @@ pub(crate) fn resolve_os_addresses(host: &str, port: u16) -> Result<Vec<SocketAd
 const POOL_MAX_IDLE_PER_HOST: usize = 2;
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-client bounds for the native (`web_fetch` / `web_search`) exchange.
+/// The defaults are the historical strict contract: a body over the cap fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeFetchLimits {
+    /// Maximum response body bytes retained.
+    pub(crate) body_max_bytes: usize,
+    /// Keep the first `body_max_bytes` of a larger body and mark the result
+    /// truncated instead of failing the exchange.
+    pub(crate) truncate_body: bool,
+    /// Absolute deadline spanning DNS, approval, every redirect and body read.
+    pub(crate) total_timeout: Duration,
+    /// Longest idle gap allowed between two body reads.
+    pub(crate) read_timeout: Duration,
+    /// Decode malformed text with replacement characters instead of failing.
+    pub(crate) lossy_text: bool,
+    /// Do not download a body whose content type is binary (see
+    /// `is_textual_content_type`); the result reports the type instead.
+    pub(crate) skip_binary_body: bool,
+}
+
+impl Default for NativeFetchLimits {
+    fn default() -> Self {
+        Self {
+            body_max_bytes: FETCH_RESPONSE_BODY_MAX_BYTES,
+            truncate_body: false,
+            total_timeout: FETCH_TOTAL_TIMEOUT,
+            read_timeout: FETCH_READ_TIMEOUT,
+            lossy_text: false,
+            skip_binary_body: false,
+        }
+    }
+}
+
+/// Default `web_fetch` total deadline (`web-fetch-timeout-secs`).
+pub(crate) const WEB_FETCH_DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Accepted `web-fetch-timeout-secs` range; values outside are clamped.
+pub(crate) const WEB_FETCH_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
+
+impl NativeFetchLimits {
+    /// Total deadline from a configured second count (clamped to
+    /// `WEB_FETCH_TIMEOUT_SECS_RANGE`). The idle read bound derives from it:
+    /// half the total, never below the historical three seconds nor above
+    /// the total itself.
+    pub(crate) fn with_total_timeout_secs(mut self, secs: Option<u64>) -> Self {
+        let secs = secs.unwrap_or(WEB_FETCH_DEFAULT_TIMEOUT_SECS).clamp(
+            *WEB_FETCH_TIMEOUT_SECS_RANGE.start(),
+            *WEB_FETCH_TIMEOUT_SECS_RANGE.end(),
+        );
+        self.total_timeout = Duration::from_secs(secs);
+        self.read_timeout = (self.total_timeout / 2)
+            .max(FETCH_READ_TIMEOUT)
+            .min(self.total_timeout);
+        self
+    }
+}
+
+/// Default `web_fetch` raw body cap. HTML shrinks substantially during text
+/// conversion, so the cap is larger than the strict shared 1 MiB JS/search cap.
+pub(crate) const WEB_FETCH_DEFAULT_BODY_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// A completed native exchange. `truncated_at` is set when the body exceeded
+/// a truncating cap; `text` then holds only the retained prefix.
+/// `content_type` is the sanitized media type essence (`type/subtype`), and
+/// `binary` is set when a binary body was skipped (`text` is then empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeFetchResult {
+    pub status: u16,
+    pub text: String,
+    pub truncated_at: Option<usize>,
+    pub content_type: Option<String>,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeContentCoding {
+    Gzip,
+    Deflate,
+}
+
+/// Native exchanges advertise only codings they can decode with a bounded
+/// output (`gzip`, `deflate`). Any other coding, or a stacked coding list, is
+/// refused rather than passed through as garbage text.
+fn native_content_coding(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<Option<NativeContentCoding>, FetchError> {
+    let mut coding = None;
+    for value in headers.get_all(reqwest::header::CONTENT_ENCODING) {
+        let value = value
+            .to_str()
+            .map_err(|_| FetchError::UnsupportedContentEncoding)?;
+        for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let next = match token.to_ascii_lowercase().as_str() {
+                "identity" => continue,
+                "gzip" | "x-gzip" => NativeContentCoding::Gzip,
+                "deflate" => NativeContentCoding::Deflate,
+                _ => return Err(FetchError::UnsupportedContentEncoding),
+            };
+            if coding.replace(next).is_some() {
+                return Err(FetchError::UnsupportedContentEncoding);
+            }
+        }
+    }
+    Ok(coding)
+}
+
+/// `type/subtype` essence of a Content-Type header, lowercased and limited to
+/// media-type token characters so a hostile header cannot inject text.
+fn native_media_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let value = headers.get(reqwest::header::CONTENT_TYPE)?.to_str().ok()?;
+    let essence = value.split(';').next()?.trim().to_ascii_lowercase();
+    (!essence.is_empty()
+        && essence.len() <= 127
+        && essence.contains('/')
+        && essence
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/.+-_".contains(&b)))
+    .then_some(essence)
+}
+
+fn native_charset(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let value = headers.get(reqwest::header::CONTENT_TYPE)?.to_str().ok()?;
+    value.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+    })
+}
+
+/// Whether a media type is text that `web_fetch` can usefully convert.
+/// A missing type is treated as text (servers commonly omit it).
+pub(crate) fn is_textual_content_type(media_type: Option<&str>) -> bool {
+    let Some(media_type) = media_type else {
+        return true;
+    };
+    let (kind, subtype) = media_type.split_once('/').unwrap_or((media_type, ""));
+    kind == "text"
+        || subtype.ends_with("+json")
+        || subtype.ends_with("+xml")
+        || (kind == "application"
+            && matches!(
+                subtype,
+                "json"
+                    | "xml"
+                    | "javascript"
+                    | "ecmascript"
+                    | "x-javascript"
+                    | "x-sh"
+                    | "x-yaml"
+                    | "yaml"
+                    | "toml"
+                    | "x-toml"
+                    | "sql"
+                    | "graphql"
+                    | "x-ndjson"
+                    | "ndjson"
+                    | "x-www-form-urlencoded"
+            ))
+}
+
+/// `<meta charset>` / `http-equiv` sniff over the first KiB of an HTML body
+/// when the header names no charset.
+fn sniff_meta_charset(body: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(&body[..body.len().min(1024)]).to_ascii_lowercase();
+    let at = head.find("charset=")? + "charset=".len();
+    let rest = head[at..].trim_start_matches(['"', '\'', ' ']);
+    let label: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+        .collect();
+    (!label.is_empty()).then_some(label)
+}
+
+/// Decompress a retained body with an output cap. Output beyond `cap` is a
+/// decompression bomb for a strict client and a truncation for a truncating
+/// one; either way at most `cap` bytes are ever materialized.
+fn native_decode_coding(
+    coding: NativeContentCoding,
+    body: &[u8],
+    cap: usize,
+    truncate: bool,
+    input_truncated: bool,
+) -> Result<(Vec<u8>, bool), FetchError> {
+    use std::io::Read as _;
+    let mut reader: Box<dyn std::io::Read + '_> = match coding {
+        NativeContentCoding::Gzip => Box::new(flate2::read::MultiGzDecoder::new(body)),
+        // HTTP "deflate" is zlib-wrapped; some servers send raw DEFLATE.
+        NativeContentCoding::Deflate if body.first().is_some_and(|b| b & 0x0f == 8) => {
+            Box::new(flate2::read::ZlibDecoder::new(body))
+        }
+        NativeContentCoding::Deflate => Box::new(flate2::read::DeflateDecoder::new(body)),
+    };
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok((output, input_truncated)),
+            Ok(read) => {
+                if output.len().saturating_add(read) > cap {
+                    if !truncate {
+                        return Err(FetchError::ResponseBodyTooLarge);
+                    }
+                    output.extend_from_slice(&buffer[..cap - output.len()]);
+                    return Ok((output, true));
+                }
+                output.extend_from_slice(&buffer[..read]);
+            }
+            // A body cut at the compressed cap ends mid-stream; keep what
+            // decoded cleanly before that point.
+            Err(_) if input_truncated => return Ok((output, true)),
+            Err(error) => return Err(FetchError::RequestFailed(error.to_string())),
+        }
+    }
+}
+
+/// Convert a retained body to text using its declared (or sniffed) charset.
+/// Strict mode rejects malformed input; lossy mode substitutes U+FFFD.
+fn native_decode_text(
+    body: Vec<u8>,
+    charset: Option<&str>,
+    html: bool,
+    truncated: bool,
+    lossy: bool,
+) -> Result<String, FetchError> {
+    let sniffed = if charset.is_none() && html {
+        sniff_meta_charset(&body)
+    } else {
+        None
+    };
+    let label = charset.or(sniffed.as_deref());
+    let encoding = label
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    if encoding == encoding_rs::UTF_8 && !lossy {
+        return native_body_text(body, truncated);
+    }
+    if lossy {
+        // BOM sniffing overrides the label, as browsers do.
+        let (text, _, _) = encoding.decode(&body);
+        return Ok(text.into_owned());
+    }
+    encoding
+        .decode_without_bom_handling_and_without_replacement(&body)
+        .map(std::borrow::Cow::into_owned)
+        .ok_or(FetchError::InvalidUtf8)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeTransportOutcome {
+    Complete(NativeFetchResult),
+    Redirect(Url),
+}
+
+/// Strict UTF-8 conversion of a retained body prefix. A truncated prefix may
+/// end inside a multi-byte sequence; that incomplete tail is dropped.
+fn native_body_text(mut body: Vec<u8>, truncated: bool) -> Result<String, FetchError> {
+    if truncated
+        && let Err(error) = std::str::from_utf8(&body)
+        && error.error_len().is_none()
+    {
+        body.truncate(error.valid_up_to());
+    }
+    String::from_utf8(body).map_err(|_| FetchError::InvalidUtf8)
+}
+
 /// One pinned, redirect-disabled asynchronous HTTP exchange. The caller owns
 /// the absolute deadline spanning DNS, approval, every redirect and body read.
 pub(crate) async fn send_async(
     url: Url,
     request: &FetchRequest,
     addresses: &[SocketAddr],
-) -> Result<FetchTransportOutcome, FetchError> {
+    native: &NativeFetchLimits,
+) -> Result<NativeTransportOutcome, FetchError> {
     let limits = FetchLimits::default();
     validate_header_limits(
         &request.headers,
@@ -835,9 +1111,14 @@ pub(crate) async fn send_async(
         return Err(FetchError::RequestBodyTooLarge);
     }
     let host = url.host_str().ok_or(FetchError::MissingHost)?;
-    // Limits are the compile-time defaults, so the client depends only on the
-    // pinned host and destination set.
-    let client = if let Some(client) = ASYNC_CLIENTS.lookup(host, addresses) {
+    // Header/body caps are compile-time defaults. The pinned client also bakes in the idle-read and total bounds, so they
+    // are part of the cache key alongside the host.
+    let key = format!(
+        "{host}|{}|{}",
+        native.read_timeout.as_millis(),
+        native.total_timeout.as_millis()
+    );
+    let client = if let Some(client) = ASYNC_CLIENTS.lookup(&key, addresses) {
         client
     } else {
         // A cache miss builds a fresh client, which synchronously parses the
@@ -848,6 +1129,7 @@ pub(crate) async fn send_async(
         // cancellation check or a sibling exchange's timers.
         let host_owned = host.to_string();
         let addresses_owned = addresses.to_vec();
+        let (read_timeout, total_timeout) = (native.read_timeout, native.total_timeout);
         let built = tokio::task::spawn_blocking(move || {
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -859,8 +1141,8 @@ pub(crate) async fn send_async(
                 .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
                 .pool_idle_timeout(POOL_IDLE_TIMEOUT)
                 .connect_timeout(limits.connect_timeout)
-                .read_timeout(limits.read_timeout)
-                .timeout(limits.total_timeout)
+                .read_timeout(read_timeout)
+                .timeout(total_timeout)
                 .user_agent(concat!("mini-agent-web/", env!("CARGO_PKG_VERSION")))
                 .resolve_to_addrs(&host_owned, &addresses_owned)
                 .build()
@@ -868,11 +1150,14 @@ pub(crate) async fn send_async(
         })
         .await
         .map_err(|_| FetchError::ClientBuild("client build task panicked".to_string()))??;
-        ASYNC_CLIENTS.insert(host, addresses, built)
+        ASYNC_CLIENTS.insert(&key, addresses, built)
     };
+    // Accept-Encoding is host-controlled (callers cannot set it) and lists
+    // only the codings `native_decode_coding` bounds.
     let mut builder = client
         .request(request.method.clone(), url.clone())
-        .headers(request.headers.clone());
+        .headers(request.headers.clone())
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate");
     if let Some(body) = &request.body {
         builder = builder.body(body.clone());
     }
@@ -883,7 +1168,6 @@ pub(crate) async fn send_async(
         limits.response_header_max_bytes,
         FetchError::ResponseHeadersTooLarge,
     )?;
-    reject_encoded_response(response.headers())?;
     if is_followable_redirect(response.status()) {
         let location = response
             .headers()
@@ -891,41 +1175,70 @@ pub(crate) async fn send_async(
             .ok_or(FetchError::InvalidRedirect)?
             .to_str()
             .map_err(|_| FetchError::InvalidRedirect)?;
-        return Ok(FetchTransportOutcome::Redirect(
+        return Ok(NativeTransportOutcome::Redirect(
             url.join(location)
                 .map_err(|_| FetchError::InvalidRedirect)?,
         ));
     }
-    if response
-        .content_length()
-        .is_some_and(|n| n > limits.response_body_max_bytes as u64)
-    {
+    let coding = native_content_coding(response.headers())?;
+    let content_type = native_media_type(response.headers());
+    let charset = native_charset(response.headers());
+    let status = response.status().as_u16();
+    if native.skip_binary_body && !is_textual_content_type(content_type.as_deref()) {
+        return Ok(NativeTransportOutcome::Complete(NativeFetchResult {
+            status,
+            text: String::new(),
+            truncated_at: None,
+            content_type,
+            binary: true,
+        }));
+    }
+    let cap = native.body_max_bytes;
+    if !native.truncate_body && response.content_length().is_some_and(|n| n > cap as u64) {
         return Err(FetchError::ResponseBodyTooLarge);
     }
     let mut body = Vec::new();
+    let mut truncated = false;
     while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
-        if body.len().saturating_add(chunk.len()) > limits.response_body_max_bytes {
-            return Err(FetchError::ResponseBodyTooLarge);
+        if body.len().saturating_add(chunk.len()) > cap {
+            if !native.truncate_body {
+                return Err(FetchError::ResponseBodyTooLarge);
+            }
+            // Retain exactly the cap and stop reading; the rest is never
+            // buffered. Dropping the response closes the connection.
+            body.extend_from_slice(&chunk[..cap - body.len()]);
+            truncated = true;
+            break;
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(FetchTransportOutcome::Complete(FetchResult {
-        status: response.status().as_u16(),
-        text: String::from_utf8(body).map_err(|_| FetchError::InvalidUtf8)?,
+    let (body, truncated) = match coding {
+        Some(coding) => native_decode_coding(coding, &body, cap, native.truncate_body, truncated)?,
+        None => (body, truncated),
+    };
+    let html = content_type
+        .as_deref()
+        .is_none_or(|t| t == "text/html" || t == "application/xhtml+xml");
+    let text = native_decode_text(body, charset.as_deref(), html, truncated, native.lossy_text)?;
+    Ok(NativeTransportOutcome::Complete(NativeFetchResult {
+        status,
+        text,
+        truncated_at: truncated.then_some(cap),
+        content_type,
+        binary: false,
     }))
 }
 
 #[derive(Clone)]
 pub(crate) struct NativeWebClient {
     policy: FetchPolicy,
+    limits: NativeFetchLimits,
     permission: Option<super::PermCheck>,
     ask_tx: Option<super::AskSender>,
     #[cfg(test)]
     pub(crate) test_resolution: Option<(Vec<SocketAddr>, Vec<SocketAddr>)>,
     #[cfg(test)]
     pub(crate) test_transport_http: bool,
-    #[cfg(test)]
-    pub(crate) test_total_timeout: Duration,
 }
 
 impl NativeWebClient {
@@ -936,15 +1249,20 @@ impl NativeWebClient {
     ) -> Self {
         Self {
             policy,
+            limits: NativeFetchLimits::default(),
             permission,
             ask_tx,
             #[cfg(test)]
             test_resolution: None,
             #[cfg(test)]
             test_transport_http: false,
-            #[cfg(test)]
-            test_total_timeout: FETCH_TOTAL_TIMEOUT,
         }
+    }
+
+    /// Replace the native body/timeout bounds for this client.
+    pub(crate) fn with_limits(mut self, limits: NativeFetchLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     #[cfg(all(test, feature = "acp"))]
@@ -999,7 +1317,7 @@ impl NativeWebClient {
         request: &FetchRequest,
         tool: &str,
         follow: bool,
-    ) -> Result<(Url, FetchResult), super::ToolError> {
+    ) -> Result<(Url, NativeFetchResult), super::ToolError> {
         let work = async {
             let mut url = self.policy.authorize(raw_url).map_err(native_error)?;
             for redirects in 0..=FETCH_MAX_REDIRECTS {
@@ -1051,12 +1369,12 @@ impl NativeWebClient {
                 } else {
                     send_url
                 };
-                match send_async(send_url, request, &addresses)
+                match send_async(send_url, request, &addresses, &self.limits)
                     .await
                     .map_err(native_error)?
                 {
-                    FetchTransportOutcome::Complete(result) => return Ok((url, result)),
-                    FetchTransportOutcome::Redirect(next) => {
+                    NativeTransportOutcome::Complete(result) => return Ok((url, result)),
+                    NativeTransportOutcome::Redirect(next) => {
                         if !follow || request.method != reqwest::Method::GET {
                             return Err(native_error(FetchError::RedirectReplayDenied));
                         }
@@ -1075,10 +1393,7 @@ impl NativeWebClient {
             }
             Err(native_error(FetchError::TooManyRedirects))
         };
-        #[cfg(not(test))]
-        let total_timeout = FETCH_TOTAL_TIMEOUT;
-        #[cfg(test)]
-        let total_timeout = self.test_total_timeout;
+        let total_timeout = self.limits.total_timeout;
         tokio::select! { biased;
             _ = crate::agent::runner::current_work_scope_cancelled() => Err(native_error(FetchError::Cancelled)),
             result = tokio::time::timeout(total_timeout, work) => result.unwrap_or_else(|_| Err(native_error(FetchError::TimedOut))),
@@ -1437,7 +1752,7 @@ pub(crate) mod web_http_tests {
     async fn web_http_native_wire_caps_encoding_utf8_and_credential_redirect_denial() {
         for (response, expected) in [
             (Peer::response(&"x".repeat(FETCH_RESPONSE_BODY_MAX_BYTES+1)),"response body exceeds"),
-            ("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\nx".into(),"content encoding"),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Encoding: br\r\nConnection: close\r\n\r\nx".into(),"content encoding"),
             ("HTTP/1.1 302 Found\r\nLocation: https://evil.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),"replay a non-GET"),
         ] {
             let peer=Peer::new(vec![response]);let client=fixture_client(&peer);
@@ -1900,7 +2215,7 @@ mod web_deadline_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         client.ask_tx = Some(tx);
         client.permission = Some(checker.clone());
-        client.test_total_timeout = Duration::from_millis(750);
+        client.limits.total_timeout = Duration::from_millis(750);
         let request = FetchRequest::get();
         let fetch = client.execute("http://fixture.invalid/docs", &request, "web_fetch", true);
         let late = async {
@@ -1941,7 +2256,7 @@ mod web_deadline_tests {
         let setup = setup.elapsed();
         let peer = Peer::new(vec![String::new()]);
         let mut client = fixture_client(&peer);
-        client.test_total_timeout = setup * 3 + Duration::from_millis(75);
+        client.limits.total_timeout = setup * 3 + Duration::from_millis(75);
         let before = std::time::Instant::now();
         let error = client
             .execute(
@@ -1956,7 +2271,7 @@ mod web_deadline_tests {
         assert!(error.contains("timed out"));
         let elapsed = before.elapsed();
         assert!(
-            elapsed < client.test_total_timeout + setup + Duration::from_secs(1),
+            elapsed < client.limits.total_timeout + setup + Duration::from_secs(1),
             "elapsed {elapsed:?} with TLS setup {setup:?}"
         );
         assert_eq!(peer.count(), 1);
@@ -1987,6 +2302,7 @@ mod web_stream_body_tests {
             .unwrap(),
             &FetchRequest::get(),
             &[peer.address],
+            &NativeFetchLimits::default(),
         )
         .await
         .unwrap_err();
@@ -2008,6 +2324,7 @@ mod web_stream_body_tests {
             .unwrap(),
             &FetchRequest::get(),
             &[peer.address],
+            &NativeFetchLimits::default(),
         )
         .await
         .unwrap_err();

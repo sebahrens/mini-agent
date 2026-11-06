@@ -65,14 +65,21 @@ pub(crate) struct BoundedModelMetadata {
 pub struct ListedTools {
     pub entries: Vec<ListedTool>,
     pub(crate) reached_tool_cap: bool,
+    /// Tools the server listed that the entry's `enabled_tools` /
+    /// `disabled_tools` selection excluded (they do not count toward the cap).
+    pub(crate) filtered_by_config: usize,
 }
 
 pub(crate) async fn list_bounded_tools(
     peer: &Peer<RoleClient>,
     timeout: Duration,
+    options: &super::config::McpServerOptions,
 ) -> Result<Arc<ListedTools>, ServiceError> {
-    let tools = list_all_tools_bounded(peer, timeout).await?;
-    Ok(Arc::new(bound_listed_tools(tools)))
+    let (tools, filtered) =
+        list_all_tools_selected(peer, timeout, &|name| options.admits_tool(name)).await?;
+    let mut listed = bound_listed_tools(tools);
+    listed.filtered_by_config = filtered;
+    Ok(Arc::new(listed))
 }
 
 pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
@@ -98,6 +105,88 @@ pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
     ListedTools {
         entries,
         reached_tool_cap,
+        filtered_by_config: 0,
+    }
+}
+
+/// Per-connection `tools/list` cache invalidated by
+/// `notifications/tools/list_changed`. The flag is shared with the
+/// connection's client handler, which sets it when the notification arrives.
+#[derive(Default)]
+pub(crate) struct ToolListCache {
+    cell: Mutex<Arc<tokio::sync::OnceCell<Arc<ListedTools>>>>,
+    changed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Outcome of a cached listing; `kept_previous` is set when a relist after
+/// `list_changed` failed and the previous successful set was retained.
+pub(crate) struct CachedListing {
+    pub(crate) listed: Arc<ListedTools>,
+    pub(crate) kept_previous: Option<ServiceError>,
+}
+
+impl ToolListCache {
+    pub(crate) fn with_flag(changed: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            cell: Mutex::default(),
+            changed,
+        }
+    }
+
+    fn current(&self) -> Arc<tokio::sync::OnceCell<Arc<ListedTools>>> {
+        self.cell.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether the server announced a changed tool list since the last listing.
+    pub(crate) fn is_stale(&self) -> bool {
+        self.changed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initialized(&self) -> bool {
+        self.current().initialized()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self) -> Option<Arc<ListedTools>> {
+        self.current().get().cloned()
+    }
+
+    /// The cached listing, listing with `list` on first use or after a
+    /// `list_changed` notification. A failed relist keeps (and re-caches) the
+    /// previous successful set and reports the error; a failed first listing
+    /// is returned and not cached.
+    pub(crate) async fn get_or_list<F, Fut>(&self, list: F) -> Result<CachedListing, ServiceError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<ListedTools>, ServiceError>>,
+    {
+        let mut previous = None;
+        if self
+            .changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let mut cell = self.cell.lock().unwrap_or_else(|e| e.into_inner());
+            previous = cell.get().cloned();
+            *cell = Arc::new(tokio::sync::OnceCell::new());
+        }
+        let cell = self.current();
+        match cell.get_or_try_init(list).await {
+            Ok(listed) => Ok(CachedListing {
+                listed: listed.clone(),
+                kept_previous: None,
+            }),
+            Err(error) => match previous {
+                Some(previous) => {
+                    let _ = cell.set(previous.clone());
+                    Ok(CachedListing {
+                        listed: previous,
+                        kept_previous: Some(error),
+                    })
+                }
+                None => Err(error),
+            },
+        }
     }
 }
 
@@ -110,10 +199,12 @@ pub struct McpClientHandle {
     pub(crate) liveness: std::sync::Arc<()>,
     pub(crate) auxiliary: Arc<tokio::sync::OnceCell<super::catalogue::Catalogue>>,
     /// Successful `tools/list` of this connection generation. A reconnect is a
-    /// new handle (and cell); failures are not cached. Without a
-    /// `notifications/tools/list_changed` subscription, re-listing on every
-    /// agent rebuild could not observe anything this cache hides.
-    pub(crate) tools: Arc<tokio::sync::OnceCell<Arc<ListedTools>>>,
+    /// new handle (and cache); failures are not cached. A server's
+    /// `notifications/tools/list_changed` marks it stale, so the next
+    /// collection (the next agent build) lists again.
+    pub(crate) tools: Arc<ToolListCache>,
+    /// Per-server options captured from the configuration that connected.
+    pub(crate) options: super::config::McpServerOptions,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -374,7 +465,8 @@ impl McpClientHandle {
         config: &McpServerConfig,
         workspace: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        Self::connect_with_timeout_in(server_name, config, MCP_INITIALIZE_TIMEOUT, workspace).await
+        let timeout = config.options().startup_timeout(MCP_INITIALIZE_TIMEOUT);
+        Self::connect_with_timeout_in(server_name, config, timeout, workspace).await
     }
 
     #[cfg(test)]
@@ -427,10 +519,11 @@ impl McpClientHandle {
         workspace: &Arc<crate::paths::WorkspaceBinding>,
         admission: &(dyn Fn() -> bool + Send + Sync),
     ) -> anyhow::Result<Self> {
+        let timeout = config.options().startup_timeout(MCP_INITIALIZE_TIMEOUT);
         Self::connect_bound_with_timeout_in(
             server_name,
             config,
-            MCP_INITIALIZE_TIMEOUT,
+            timeout,
             workspace.root(),
             Some(workspace),
             Some(admission),
@@ -460,6 +553,10 @@ impl McpClientHandle {
         if crate::agent::runner::current_work_scope_is_cancelled() {
             anyhow::bail!("MCP connection cancelled");
         }
+        anyhow::ensure!(
+            config.options().is_enabled(),
+            "MCP server '{server_name}' is disabled by configuration (enabled = false)"
+        );
         let result: anyhow::Result<Self> = match config {
             McpServerConfig::Command {
                 command,
@@ -496,7 +593,10 @@ impl McpClientHandle {
                     )
                 })?;
                 validate()?;
-                let elicitation = super::elicitation::Handler::default();
+                // A stdio server already runs in the captured workspace; it
+                // may learn that root through `roots/list`.
+                let elicitation = super::elicitation::Handler::with_root(workspace);
+                let tools_changed = elicitation.tools_changed.clone();
                 let (transport, cleanup_complete, stderr) =
                     spawn_stdio_server(cmd, MCP_STDIO_MAX_LINE_BYTES, elicitation.forms.clone())
                         .map_err(|error| {
@@ -561,7 +661,8 @@ impl McpClientHandle {
                     source_proof: None,
                     liveness: std::sync::Arc::new(()),
                     auxiliary: Arc::new(tokio::sync::OnceCell::new()),
-                    tools: Arc::new(tokio::sync::OnceCell::new()),
+                    tools: Arc::new(ToolListCache::with_flag(tools_changed)),
+                    options: Default::default(),
                 })
             }
             McpServerConfig::Url {
@@ -605,6 +706,7 @@ impl McpClientHandle {
             }
         };
         let mut handle = result?;
+        handle.options = config.options();
         if validate().is_err() || crate::agent::runner::current_work_scope_is_cancelled() {
             // A completed handshake cannot confer authority after its retained
             // workspace changed. Join this exact candidate before rejecting it.
@@ -646,6 +748,7 @@ impl McpClientHandle {
             .custom_headers(custom_headers);
         let oauth_settings = oauth.and_then(|o| o.settings());
         let elicitation = super::elicitation::Handler::default();
+        let tools_changed = elicitation.tools_changed.clone();
         // Every response body and SSE event is capped (see `bounded_http`).
         let http_client = BoundedHttpClient::new(
             http_client_for(initialize_timeout, endpoint)?,
@@ -702,7 +805,8 @@ impl McpClientHandle {
             source_proof: None,
             liveness: std::sync::Arc::new(()),
             auxiliary: Arc::new(tokio::sync::OnceCell::new()),
-            tools: Arc::new(tokio::sync::OnceCell::new()),
+            tools: Arc::new(ToolListCache::with_flag(tools_changed)),
+            options: Default::default(),
         })
     }
 
@@ -752,9 +856,15 @@ impl McpClientHandle {
     pub async fn cached_tools(&self) -> Result<Arc<ListedTools>, ServiceError> {
         let peer = self.running_service.peer();
         self.tools
-            .get_or_try_init(|| list_bounded_tools(peer, MCP_LIST_TOOLS_TIMEOUT))
+            .get_or_list(|| {
+                list_bounded_tools(
+                    peer,
+                    self.options.list_timeout(MCP_LIST_TOOLS_TIMEOUT),
+                    &self.options,
+                )
+            })
             .await
-            .cloned()
+            .map(|cached| cached.listed)
     }
 }
 
@@ -790,10 +900,25 @@ fn http_client_for(
 /// on the number of pages. A timeout cancels the in-flight request on the
 /// server side (rmcp sends `notifications/cancelled`) and surfaces as
 /// [`ServiceError::Timeout`].
+#[cfg(test)]
 pub(crate) async fn list_all_tools_bounded(
     peer: &Peer<RoleClient>,
     timeout: Duration,
 ) -> Result<Vec<Tool>, ServiceError> {
+    list_all_tools_selected(peer, timeout, &|_| true)
+        .await
+        .map(|(tools, _)| tools)
+}
+
+/// Bounded `tools/list` keeping only tools `admit` accepts. Selection
+/// runs per page before the tool cap, so excluded tools never displace an
+/// admitted one; the second value counts excluded tools.
+pub(crate) async fn list_all_tools_selected(
+    peer: &Peer<RoleClient>,
+    timeout: Duration,
+    admit: &(dyn Fn(&str) -> bool + Sync),
+) -> Result<(Vec<Tool>, usize), ServiceError> {
+    let mut filtered = 0_usize;
     let deadline = tokio::time::Instant::now() + timeout;
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
@@ -816,7 +941,16 @@ pub(crate) async fn list_all_tools_bounded(
             Err(ServiceError::Timeout { .. }) => return Err(ServiceError::Timeout { timeout }),
             Err(error) => return Err(error),
         };
-        let reached_tool_cap = extend_tools_capped(&mut tools, result.tools);
+        let page: Vec<Tool> = result
+            .tools
+            .into_iter()
+            .filter(|tool| {
+                let admitted = admit(tool.name.as_ref());
+                filtered += usize::from(!admitted);
+                admitted
+            })
+            .collect();
+        let reached_tool_cap = extend_tools_capped(&mut tools, page);
         pages += 1;
         if reached_tool_cap {
             tracing::debug!(
@@ -835,7 +969,7 @@ pub(crate) async fn list_all_tools_bounded(
             next => cursor = next,
         }
     }
-    Ok(tools)
+    Ok((tools, filtered))
 }
 
 fn extend_tools_capped(tools: &mut Vec<Tool>, page: Vec<Tool>) -> bool {

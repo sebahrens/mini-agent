@@ -1369,6 +1369,19 @@ pub(crate) async fn start_main_run_with_directive(
             stale.retire(Duration::from_secs(5)).await?;
         }
     }
+    // A server announced `tools/list_changed`: rebuild so this turn's first
+    // request advertises the relisted tool set.
+    #[cfg(feature = "mcp")]
+    if ui
+        .mcp_manager
+        .as_ref()
+        .is_some_and(|manager| manager.tool_list_changed())
+    {
+        run.agent = None;
+        if let Some(stale) = prebuild.take() {
+            stale.retire(Duration::from_secs(5)).await?;
+        }
+    }
     // Even an explicitly rebuilt agent must wait for pending startup services.
     resolve_prebuild(&mut run.agent, ui, prebuild, slash.reasoning_enabled).await;
 

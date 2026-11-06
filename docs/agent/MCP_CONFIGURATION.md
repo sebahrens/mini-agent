@@ -53,8 +53,15 @@ URL servers require public addresses by default. Explicit `allow_local=true`
 also permits loopback-only endpoints: IPv4 `127/8`, IPv6 `::1`, normalized mapped
 loopback and DNS names resolving exclusively to loopback. DNS results remain
 pinned. Mixed public/loopback sets, LAN/private addresses, link-local/metadata
-addresses and wildcard listeners remain forbidden. Local clients bypass proxies;
-MCP redirects remain forbidden. OAuth may contact the exact captured local server
+addresses and wildcard listeners remain forbidden. Local clients bypass proxies.
+MCP transport requests follow at most five same-origin redirects (same scheme,
+host and port, so the pinned, policy-checked destination and the request's
+credentials are unchanged): `307`/`308` replay the POST body, and GET streams
+also follow `301`/`302`/`303`. Every other redirect (another host, port or
+scheme, including private or metadata targets, or a method-changing POST
+redirect) is refused, and the connection notice names the target as
+`scheme://host:port/path` (no query) so the configured URL can be corrected.
+OAuth may contact the exact captured local server
 origin, while other authorization hosts retain the public-address policy.
 
 Live edit, trust, reconnect, shutdown and OAuth callback stages are owned by the
@@ -144,6 +151,57 @@ no product configuration, marker, journal, permission or fallback is changed.
 The four prior native experiments remain unchanged. The added control requires
 its own exact native Windows discovery/execution before any new kernel claim.
 
+## Per-server timeouts
+
+Command and URL server entries accept two optional timeout fields (seconds,
+clamped to 1..=3600). Built-in registrations use the defaults.
+
+| Field | Default | Bounds |
+| --- | --- | --- |
+| `startup_timeout_sec` | 10 s | Connect, OAuth restore/refresh and the `initialize` handshake. It also raises (never lowers) the server's `tools/list` budget, default 30 s. |
+| `tool_timeout_sec` | `mcp_tool_timeout_secs` (120 s) | One `tools/call` on this server. |
+
+```json
+{"mcp_servers": {"slow": {"command": "npx", "args": ["-y", "some-mcp"],
+  "startup_timeout_sec": 60, "tool_timeout_sec": 300}}}
+```
+
+## Per-server tool selection and enable toggle
+
+Command and URL entries also accept:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | `false` keeps the entry configured but never launches or connects it (startup and explicit reconnect both refuse). |
+| `enabled_tools` | omitted | Only these exact server tool names are registered. |
+| `disabled_tools` | `[]` | These exact server tool names are never registered (applied after `enabled_tools`). |
+
+Selection runs on each `tools/list` page before the 128-tool per-server cap, so
+the cap counts only admitted tools and a selected tool past index 128 is still
+reached. `/mcp <server>` shows how many listed tools the selection excluded.
+Selection only narrows the registered set; it grants no permission.
+
+## MCP server mode (`--mcp-server`)
+
+`mini-agent --mcp-server [flags]` serves mini-agent itself to another agent or
+IDE over MCP on stdio (newline-delimited JSON-RPC: `initialize`, `ping`,
+`tools/list`, `tools/call`). It is opt-in and off by default. It offers one
+tool, `run` (`prompt`, at most 256 KiB), which launches this executable as
+`mini-agent [flags] -p -- <prompt>` in the server's working directory and
+returns the final answer (stdout, at most 1 MiB, with a truncation note). The
+child therefore applies exactly the provider, model, sandbox, permission and
+tool flags the server was started with, and the ordinary headless policy:
+permission asks cannot be answered over MCP and fail closed unless those flags
+allow the action. A non-zero exit returns `isError: true` with stdout and a
+bounded stderr tail; a run is stopped after 30 minutes. Calls are handled one
+at a time. The server process itself runs no tools and opens no connections.
+`--mcp-server` cannot be combined with `-p`, a prompt, `--acp` or `--loop`.
+
+```json
+{"mcpServers": {"mini-agent": {"command": "mini-agent",
+  "args": ["--mcp-server", "--read-only"]}}}
+```
+
 ## Captured source checks at tool dispatch
 
 Each configured connection retains its captured workspace, selected server and
@@ -163,10 +221,15 @@ MCP permission and question prompts revalidate their source once per second
 instead of on every event-loop pass; prompt creation, key handling and the
 reply paths keep the full check.
 
-A connection keeps its first successful `tools/list` result, so agent rebuilds do
-not page `tools/list` again; a reconnect is a
-new connection, failures are not cached, and mini-agent does not subscribe to
-`tools/list_changed`. Shutdown closes all servers concurrently, and a worktree
+A connection keeps its last successful `tools/list` result, so agent rebuilds do
+not page `tools/list` again; a reconnect is a new connection and failures are not
+cached. A server's `notifications/tools/list_changed` marks that connection's
+listing stale: the next tool collection lists it again, and the interactive
+session rebuilds the agent before the next turn so its first model request
+advertises the new set (deferred schemas, source-proof checks, tool selection
+and the tool cap apply as for the first listing). If that relist fails, the
+previous set is kept and a notice says so. Prompt and resource catalogues are
+still discovered once per connection. Shutdown closes all servers concurrently, and a worktree
 switch closes the previous binding's servers while the new binding connects.
 
 ## Deferred tool schemas

@@ -788,10 +788,21 @@ async fn handle_mcp(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
 
             match handle.cached_tools().await {
                 Ok(listed) => {
-                    if listed.entries.is_empty() {
-                        write_ok(ctx.renderer, format!("server '{}' has no tools", name));
+                    let filtered = if listed.filtered_by_config > 0 {
+                        format!(
+                            " ({} excluded by enabled_tools/disabled_tools)",
+                            listed.filtered_by_config
+                        )
                     } else {
-                        write_ok(ctx.renderer, format!("tools on '{}':", name));
+                        String::new()
+                    };
+                    if listed.entries.is_empty() {
+                        write_ok(
+                            ctx.renderer,
+                            format!("server '{}' has no tools{filtered}", name),
+                        );
+                    } else {
+                        write_ok(ctx.renderer, format!("tools on '{}'{filtered}:", name));
                         for entry in &listed.entries {
                             let tool = &entry.definition;
                             let desc = tool.description.as_deref().unwrap_or("");

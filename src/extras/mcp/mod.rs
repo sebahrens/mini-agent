@@ -9,6 +9,8 @@ pub(crate) mod forms;
 pub(crate) mod health;
 pub mod oauth;
 pub(crate) mod project;
+pub(crate) mod resource_tools;
+pub(crate) mod server;
 pub mod tool;
 
 use std::collections::HashMap;
@@ -351,6 +353,18 @@ impl McpClientManager {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        // `enabled = false` keeps an entry configured but never launches it.
+        let mut disabled = Vec::new();
+        sorted.retain(|(name, cfg)| {
+            let enabled = cfg.options().is_enabled();
+            if !enabled {
+                disabled.push(name.clone());
+            }
+            enabled
+        });
+        for name in &disabled {
+            tracing::debug!("MCP server '{name}' is disabled by configuration (enabled = false)");
+        }
 
         let workspace_path = workspace.to_path_buf();
         let sem = Arc::new(tokio::sync::Semaphore::new(MAX_MCP_CONNECT_CONCURRENCY));
@@ -425,12 +439,17 @@ impl McpClientManager {
                     handle.spawn_auxiliary_discovery();
                     handles.push(handle);
                 }
-                Err(_) => {
+                Err(error) => {
                     // Transport errors may contain an expanded URL or header
                     // credential. Health retains the typed outcome separately.
+                    // A refused redirect is the exception: its bounded,
+                    // generated text names only the target origin and path.
                     tracing::debug!("Failed to connect to MCP server '{}'", name);
+                    let detail = bounded_http::redirect_refusal(&error)
+                        .map(|refusal| format!(": {refusal}"))
+                        .unwrap_or_else(|| " (credential values omitted)".to_string());
                     notices.push(McpNotice::error(format!(
-                        "MCP server '{name}' not connected (credential values omitted)"
+                        "MCP server '{name}' not connected{detail}"
                     )));
                 }
             }
@@ -438,6 +457,30 @@ impl McpClientManager {
         let mut manager = Self::with_notices(handles, notices);
         manager.health = health;
         manager
+    }
+
+    /// Connected servers that advertised the resources capability, for the
+    /// model-facing resource tools.
+    pub(crate) fn resource_servers(&self) -> Vec<resource_tools::ResourceServer> {
+        self.handles
+            .iter()
+            .filter(|handle| {
+                handle
+                    .peer()
+                    .peer_info()
+                    .is_some_and(|info| info.capabilities.resources.is_some())
+            })
+            .map(|handle| resource_tools::ResourceServer {
+                client: catalogue::RpcClient::capture(handle),
+                catalogue: handle.auxiliary.clone(),
+            })
+            .collect()
+    }
+
+    /// Whether any connected server announced `tools/list_changed` since its
+    /// tools were last collected; the next agent build relists it.
+    pub(crate) fn tool_list_changed(&self) -> bool {
+        self.handles.iter().any(|handle| handle.tools.is_stale())
     }
 
     /// Drain and return any pending connection and tool-collection notices.
@@ -494,6 +537,9 @@ impl McpClientManager {
                 let source_proof = handle.source_proof.clone();
                 let elicitation = handle.elicitation.clone();
                 let liveness = Arc::downgrade(&handle.liveness);
+                let list_timeout = handle.options.list_timeout(timeouts.list);
+                let call_timeout = handle.options.tool_timeout(timeouts.call);
+                let options = handle.options.clone();
                 let live_peer = peer.clone();
                 let client_is_live: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                     liveness.upgrade().is_some() && !live_peer.is_transport_closed()
@@ -503,10 +549,13 @@ impl McpClientManager {
                     .begin(&server_name, health::AttemptKind::Catalogue);
                 async move {
                     let _permit = sem.acquire_owned().await;
-                    let result = listed
-                        .get_or_try_init(|| client::list_bounded_tools(&peer, timeouts.list))
-                        .await
-                        .cloned();
+                    let cached = listed
+                        .get_or_list(|| client::list_bounded_tools(&peer, list_timeout, &options))
+                        .await;
+                    let (result, kept_previous) = match cached {
+                        Ok(cached) => (Ok(cached.listed), cached.kept_previous),
+                        Err(error) => (Err(error), None),
+                    };
                     let outcome = match &result {
                         Ok(_) => health::AttemptOutcome::Succeeded,
                         Err(rmcp::ServiceError::Timeout { .. }) => health::AttemptOutcome::TimedOut,
@@ -521,6 +570,8 @@ impl McpClientManager {
                         client_is_live,
                         peer,
                         result,
+                        (list_timeout, call_timeout),
+                        kept_previous,
                     )
                 }
             })
@@ -537,8 +588,19 @@ impl McpClientManager {
             client_is_live,
             peer,
             result,
+            (list_timeout, call_timeout),
+            kept_previous,
         ) in results
         {
+            if let Some(error) = &kept_previous {
+                self.push_tool_notice(format!(
+                    "MCP server '{server_name}' announced a changed tool list, but relisting failed ({}); keeping its previous tools",
+                    match error {
+                        rmcp::ServiceError::Timeout { .. } => "timed out",
+                        _ => "server error",
+                    }
+                ));
+            }
             match result {
                 Ok(tools) => {
                     tracing::debug!(
@@ -569,7 +631,7 @@ impl McpClientManager {
                             peer: peer.clone(),
                             permission: permission.clone(),
                             ask_tx: ask_tx.clone(),
-                            call_timeout: timeouts.call,
+                            call_timeout,
                             spill_scope: self.spill_scope.clone(),
                             spill_limits: self.spill_limits,
                         });
@@ -597,11 +659,11 @@ impl McpClientManager {
                     tracing::debug!(
                         "MCP server '{}': tools/list timed out after {} ms",
                         server_name,
-                        timeouts.list.as_millis()
+                        list_timeout.as_millis()
                     );
                     self.push_tool_notice(format!(
                         "MCP server '{server_name}' tools unavailable: tools/list timed out after {} ms",
-                        timeouts.list.as_millis()
+                        list_timeout.as_millis()
                     ));
                 }
                 Err(e) => {
@@ -908,6 +970,7 @@ mod tests {
     /// with a non-zero code (simulates a server that refuses to connect).
     fn failing_config() -> McpServerConfig {
         McpServerConfig::Command {
+            options: Default::default(),
             defer: Default::default(),
             command: if cfg!(windows) {
                 "cmd".to_string()

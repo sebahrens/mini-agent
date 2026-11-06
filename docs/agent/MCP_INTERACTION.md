@@ -45,6 +45,28 @@ not rewritten or reread. Runtime attachment selections are not imported or
 restored from saved sessions. Resource text is server-supplied data, not verified
 host-file content.
 
+## Model-facing resource tools
+
+When at least one connected server advertises the resources capability, the
+model also gets two tools (subject to `--tools` selection):
+
+- `list_mcp_resources` (optional `server`) returns the cached, bounded catalogue
+  (URI, name, MIME type, description) quoted as untrusted server metadata. It
+  sends no RPC; a server whose discovery is still pending says so.
+- `read_mcp_resource` (`server`, `uri`) performs one `resources/read` (30 s
+  bound) and returns the text quoted as untrusted reference data, under the same
+  text-only contract as `@mcp:` selections (at most 32 contents and 256 KiB;
+  binary contents refused). The URI may come from the listing or a
+  `resource_link` in a tool result; it is an opaque operand, never opened or
+  fetched locally.
+
+Both pass the same source check and cost admission as operator selections and
+are authorized under auxiliary identities distinct from remote tool names:
+policy input `mcp_tool:<server>:resources/list` / `mcp_tool:<server>:resources/read`
+with the approval identity naming the exact URI. A grant for a remote tool does
+not authorize them; headless runs need an explicit allow rule (unmatched asks
+fail closed). Prompts remain operator-only (`/mcp:<server>:<prompt>`).
+
 ## Tool-result images
 
 Successful `tools/call` results deliver PNG, JPEG, GIF and WebP image blocks and
@@ -60,6 +82,10 @@ decoded per-image limit, supported format headers, dimensions and matching MIME
 types. Unsupported, malformed or over-limit images become descriptive
 placeholders with omission notes; an omitted image does not consume the budget
 for later valid images. Non-image blob resources retain their placeholders.
+`resource_link` blocks render as one line naming the link's name, title, URI,
+MIME type, size and description (each single-line and bounded); audio blocks
+render as `[audio: <mime>, <N> bytes]`. Only genuinely unknown block kinds count
+toward the `content block(s) ... were omitted` note.
 Image blob resource URIs are identifiers, not host paths or URLs to fetch.
 
 Accepted images survive the generic spill hook, session persistence, replay and
@@ -75,7 +101,20 @@ connection. Its frontend, Question turn, Run and cancellation scope are captured
 from that RPC, not inferred from a tool name, callback text or a last-running
 request. Ambiguous concurrent RPCs, reused request IDs and retired sources are
 refused. The callback is an owned part of the original work scope and stops with
-that work. URL elicitation and server sampling are unsupported. Headless declines forms; ACP cancels unsupported forms; they never supply a permission answer instead.
+that work. Headless declines forms; ACP cancels unsupported forms; they never supply a permission answer instead.
+
+URL-mode elicitation is advertised and follows the same exact-RPC lease, owner,
+cancellation and cost checks as forms. The user sees the server message and the
+link and chooses `Done` (accept, no content) or `Decline`; mini-agent never opens
+or fetches the URL itself. Only absolute HTTPS links (or loopback HTTP) of at most
+1,536 bytes without embedded credentials are shown; anything else is declined.
+
+Stdio servers receive the `roots` capability and `roots/list` returns the
+captured workspace root as a `file://` URI; URL (remote) servers get no roots
+capability, so local paths are not disclosed to them. Server sampling
+(`sampling/createMessage`) is deliberately not advertised and is answered with
+method-not-found: a server-initiated model request would bypass the operator's
+turn, budget and permission flow.
 
 The interactive form overlay uses the ordinary typed question editor, while
 agent, side-question and other UI channels continue to drain. Esc or Ctrl-C

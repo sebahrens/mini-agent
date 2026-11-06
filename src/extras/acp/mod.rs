@@ -2274,6 +2274,7 @@ fn client_mcp_servers(
             accepted.insert(
                 stdio.name.clone(),
                 McpServerConfig::Command {
+                    options: Default::default(),
                     command: stdio.command.to_string_lossy().into_owned(),
                     defer: Default::default(),
                     args: stdio.args.clone(),
@@ -8721,6 +8722,7 @@ mod protocol_tests {
             mcp_servers: Some(HashMap::from([(
                 "editor-tools".to_string(),
                 McpServerConfig::Url {
+                    options: Default::default(),
                     allow_local: false,
                     url: "https://configured.example/mcp".to_string(),
                     defer: Default::default(),

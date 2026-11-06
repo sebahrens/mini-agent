@@ -151,12 +151,19 @@ fn main() {
         return;
     }
 
+    if let Some(delay) = env::var("MCP_FIXTURE_STARTUP_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        thread::sleep(Duration::from_millis(delay));
+    }
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     let mut pending_aux: Option<String> = None;
     let mut aux_id = 0_u64;
     let mut concurrent_ids = Vec::<String>::new();
     let mut concurrent_answers = Vec::<String>::new();
+    let mut list_calls = 0_u32;
     for line in stdin.lock().lines() {
         let line = line.unwrap();
         let compact = line.replace(' ', "").replace('\t', "");
@@ -241,6 +248,29 @@ fn main() {
                 );
                 continue;
             }
+            if mode.starts_with("list-changed") {
+                list_calls += 1;
+                if list_calls > 1 {
+                    let response = if mode == "list-changed-fail" {
+                        format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32603,\"message\":\"relist failure\"}}}}")
+                    } else {
+                        format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"probe\",\"inputSchema\":{{\"type\":\"object\"}}}},{{\"name\":\"added\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}")
+                    };
+                    write_response(&mut stdout, &response);
+                    continue;
+                }
+            }
+            if mode == "many-tools" {
+                let tools = (0..200)
+                    .map(|index| format!("{{\"name\":\"t{index}\",\"inputSchema\":{{\"type\":\"object\"}}}}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                write_response(
+                    &mut stdout,
+                    &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{tools}]}}}}"),
+                );
+                continue;
+            }
             write_response(
                 &mut stdout,
                 &format!(
@@ -253,7 +283,21 @@ fn main() {
             if mode == "hang-tools-call" {
                 continue;
             }
+            if mode.starts_with("list-changed") {
+                write_response(
+                    &mut stdout,
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}",
+                );
+            }
             let id = request_id(&compact);
+            if mode == "aux-roots" {
+                pending_aux = Some(id);
+                write_response(
+                    &mut stdout,
+                    "{\"jsonrpc\":\"2.0\",\"id\":\"aux-form-roots\",\"method\":\"roots/list\"}",
+                );
+                continue;
+            }
             if mode == "aux-elicit-concurrent" {
                 concurrent_ids.push(id);
                 if concurrent_ids.len() == 2 {
@@ -423,6 +467,7 @@ impl FixtureBuild {
             env.insert("MCP_FIXTURE_TOOL_NAME".to_string(), tool_name.to_string());
         }
         McpServerConfig::Command {
+            options: Default::default(),
             defer: Default::default(),
             command,
             args,
@@ -799,6 +844,7 @@ async fn mcp_command_transport_uses_the_explicit_workspace() {
     let workspace = fixture.root.join("selected workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let config = McpServerConfig::Command {
+        options: Default::default(),
         command: fixture.executable.display().to_string(),
         defer: Default::default(),
         args: Vec::new(),
@@ -829,6 +875,7 @@ async fn mcp_stdio_failure_cleanup_is_bounded_and_leaves_no_child() {
     let fixture = FixtureBuild::compile();
 
     let missing = McpServerConfig::Command {
+        options: Default::default(),
         command: "mini-agent-mcp-fixture-that-does-not-exist".to_string(),
         defer: Default::default(),
         args: Vec::new(),
@@ -1614,6 +1661,239 @@ async fn mcp_tool_call_hang_times_out_with_tool_error() {
 }
 
 #[tokio::test]
+async fn mcp_per_server_startup_and_tool_timeouts_override_the_defaults() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("slow-start");
+    let mut config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "hang-tools-call",
+        &lease,
+    );
+    let McpServerConfig::Command { env, options, .. } = &mut config else {
+        unreachable!()
+    };
+    // Slower than the 10 s default initialize bound.
+    env.insert("MCP_FIXTURE_STARTUP_DELAY_MS".into(), "12000".into());
+    options.startup_timeout_sec = Some(30);
+    options.tool_timeout_sec = Some(1);
+    let started = std::time::Instant::now();
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .expect("startup_timeout_sec = 30 admits a 12 s startup");
+    assert!(started.elapsed() >= Duration::from_secs(12));
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let mut tools = manager
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Allow)),
+            None,
+            McpToolTimeouts::default(),
+        )
+        .await;
+    let tool = tools
+        .iter_mut()
+        .find(|tool| tool.name() == "probe")
+        .expect("fixture tool must be listed");
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(Duration::from_secs(10), tool.call("{}".to_string()))
+        .await
+        .expect("the per-server tool timeout bounds the call")
+        .expect_err("a hung tools/call must fail");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let message = error.to_string();
+    assert!(message.contains("timed out after 1000 ms"), "{message}");
+    assert!(message.contains("tool_timeout_sec"), "{message}");
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_enabled_and_disabled_tools_apply_before_the_cap_and_enabled_false_skips() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("many-tools");
+    let mut config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "many-tools",
+        &lease,
+    );
+    let McpServerConfig::Command { options, .. } = &mut config else {
+        unreachable!()
+    };
+    // Both selected tools sit past the 128-tool cap in server order.
+    options.enabled_tools = Some(vec!["t150".into(), "t199".into(), "t3".into()]);
+    options.disabled_tools = vec!["t3".into()];
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .unwrap();
+    let listed = handle.cached_tools().await.unwrap();
+    let names: Vec<_> = listed
+        .entries
+        .iter()
+        .map(|entry| entry.definition.name.to_string())
+        .collect();
+    assert_eq!(names, ["t150", "t199"]);
+    assert_eq!(listed.filtered_by_config, 198);
+    assert!(!listed.reached_tool_cap);
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let tools = manager
+        .collect_tools_with_timeouts(None, None, McpToolTimeouts::default())
+        .await;
+    assert_eq!(tools.len(), 2);
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+
+    // disabled_tools alone: 50 removed before the cap, the cap counts the rest.
+    let mut config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "many-tools",
+        &lease,
+    );
+    let McpServerConfig::Command { options, .. } = &mut config else {
+        unreachable!()
+    };
+    options.disabled_tools = (0..50).map(|index| format!("t{index}")).collect();
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .unwrap();
+    let listed = handle.cached_tools().await.unwrap();
+    assert_eq!(listed.entries.len(), 128);
+    assert_eq!(listed.entries[0].definition.name, "t50");
+    assert!(listed.reached_tool_cap);
+    let pid = wait_for_pid(&lease).await;
+    shutdown(McpClientManager::from_handles(vec![handle])).await;
+    assert_process_reaped(pid).await;
+
+    // enabled = false never launches the server.
+    let _ = std::fs::remove_file(&lease);
+    let McpServerConfig::Command { options, .. } = &mut config else {
+        unreachable!()
+    };
+    options.enabled = Some(false);
+    let error = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .err()
+        .expect("a disabled server must not connect")
+        .to_string();
+    assert!(error.contains("disabled"), "{error}");
+    assert!(!lease.exists());
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_tools_list_changed_relists_at_the_next_collection_or_keeps_the_old_set() {
+    let fixture = FixtureBuild::compile();
+    for (mode, expected) in [
+        ("list-changed", vec!["added", "probe"]),
+        ("list-changed-fail", vec!["probe"]),
+    ] {
+        let lease = fixture.lease(mode);
+        let handle = McpClientHandle::connect(
+            CompactString::new("fixture"),
+            &fixture.config(
+                fixture.executable.display().to_string(),
+                Vec::new(),
+                mode,
+                &lease,
+            ),
+        )
+        .await
+        .unwrap();
+        let mut manager = McpClientManager::from_handles(vec![handle]);
+        let permission = Some(permission_for(Action::Allow));
+        let tools = manager
+            .collect_tools_with_timeouts(permission.clone(), None, McpToolTimeouts::default())
+            .await;
+        assert_eq!(tools.len(), 1);
+        assert!(!manager.tool_list_changed());
+        // The call makes the server announce notifications/tools/list_changed.
+        tools[0].call("{}".to_string()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.tool_list_changed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the notification marks the connection's tools stale");
+        let tools = manager
+            .collect_tools_with_timeouts(permission, None, McpToolTimeouts::default())
+            .await;
+        let mut names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+        names.sort();
+        assert_eq!(names, expected, "{mode}");
+        assert!(!manager.tool_list_changed());
+        let notices = manager.take_notices();
+        if mode == "list-changed-fail" {
+            assert!(
+                notices.iter().any(|notice| notice
+                    .message()
+                    .contains("relisting failed (server error); keeping its previous tools")),
+                "{notices:?}"
+            );
+        } else {
+            assert!(notices.is_empty(), "{notices:?}");
+        }
+        let pid = wait_for_pid(&lease).await;
+        shutdown(manager).await;
+        assert_process_reaped(pid).await;
+    }
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_stdio_server_lists_the_workspace_root_and_sampling_stays_unadvertised() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("aux-roots");
+    let workspace = fixture.root.join("roots workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let handle = McpClientHandle::connect_in(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "aux-roots",
+            &lease,
+        ),
+        &workspace,
+    )
+    .await
+    .unwrap();
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let tools = manager
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Allow)),
+            None,
+            McpToolTimeouts::default(),
+        )
+        .await;
+    let output = tools[0].call("{}".to_string()).await.unwrap();
+    let expected = reqwest::Url::from_directory_path(&workspace).unwrap();
+    // The tool output is the server's escaped copy of our roots/list reply.
+    assert!(
+        output
+            .replace("\\\"", "\"")
+            .contains(&format!("\"uri\":\"{expected}\"")),
+        "{output}"
+    );
+    let trace = std::fs::read_to_string(lease.with_extension("rpc")).unwrap();
+    let initialize = trace
+        .lines()
+        .find(|line| line.contains("\"initialize\""))
+        .unwrap();
+    assert!(initialize.contains("\"roots\""), "{initialize}");
+    assert!(!initialize.contains("\"sampling\""), "{initialize}");
+    assert!(initialize.contains("\"url\""), "{initialize}");
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
 async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
     let fixture = FixtureBuild::compile();
     let alpha_lease = fixture.lease("dup-alpha");
@@ -1715,7 +1995,7 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
     );
     assert!(Arc::ptr_eq(
         &listed_before,
-        manager.handles[0].tools.get().unwrap()
+        &manager.handles[0].tools.get().unwrap()
     ));
 
     let alpha_output = tools
@@ -2400,6 +2680,82 @@ async fn mcp_auxiliary_stdio_catalogue_and_selected_literal_reads_are_bounded_an
     let (prompt, resource) = result.unwrap();
     assert!(prompt.contains("Prompt BODY 雪") && prompt.contains("/commit %%next code"));
     assert_eq!(resource, "Resource BODY 雪");
+}
+
+#[tokio::test]
+async fn mcp_model_resource_tools_list_and_read_under_auxiliary_permissions_headlessly() {
+    use crate::extras::mcp::resource_tools::{ListMcpResourcesTool, ReadMcpResourceTool};
+    let fixture = FixtureBuild::compile();
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux",
+        &fixture.lease("resource-tools"),
+    );
+    let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+        .await
+        .unwrap();
+    handle.discover_auxiliary().await;
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let servers = manager.resource_servers();
+    assert_eq!(servers.len(), 1);
+    let uri = manager.handles[0].auxiliary.get().unwrap().resources[0]
+        .uri
+        .clone();
+
+    // Headless (no ask channel) with explicit auxiliary allows.
+    let allowed = Some(permission_for_named_tools(&[
+        ("owned", "resources/list"),
+        ("owned", "resources/read"),
+    ]));
+    let list = ListMcpResourcesTool::new(servers.clone(), allowed.clone(), None);
+    let listing = ToolDyn::call(&list, serde_json::json!({}).to_string())
+        .await
+        .unwrap();
+    assert!(
+        listing.contains("server 'owned': 1 resource(s)"),
+        "{listing}"
+    );
+    assert!(listing.contains(&format!("- uri: {uri}")), "{listing}");
+    let read = ReadMcpResourceTool::new(servers.clone(), allowed, None);
+    let text = ToolDyn::call(
+        &read,
+        serde_json::json!({"server":"owned","uri":uri}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(text.contains("> Resource BODY 雪"), "{text}");
+
+    // A tool-call grant does not authorize resources, and headless asks fail closed.
+    let tool_only = Some(permission_for_named_tools(&[("owned", "probe")]));
+    let read = ReadMcpResourceTool::new(servers.clone(), tool_only.clone(), None);
+    let error = ToolDyn::call(
+        &read,
+        serde_json::json!({"server":"owned","uri":uri}).to_string(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("not permitted"), "{error}");
+    let list = ListMcpResourcesTool::new(servers.clone(), tool_only, None);
+    assert!(
+        ToolDyn::call(&list, serde_json::json!({}).to_string())
+            .await
+            .is_err()
+    );
+    let unknown = ToolDyn::call(
+        &ReadMcpResourceTool::new(servers, None, None),
+        serde_json::json!({"server":"other","uri":"x"}).to_string(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        unknown.contains("no connected MCP server named 'other'"),
+        "{unknown}"
+    );
+    manager.shutdown().await;
+    fixture.cleanup();
 }
 
 #[tokio::test]
