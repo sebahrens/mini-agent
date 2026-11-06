@@ -2683,6 +2683,82 @@ async fn mcp_auxiliary_stdio_catalogue_and_selected_literal_reads_are_bounded_an
 }
 
 #[tokio::test]
+async fn mcp_model_resource_tools_list_and_read_under_auxiliary_permissions_headlessly() {
+    use crate::extras::mcp::resource_tools::{ListMcpResourcesTool, ReadMcpResourceTool};
+    let fixture = FixtureBuild::compile();
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux",
+        &fixture.lease("resource-tools"),
+    );
+    let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+        .await
+        .unwrap();
+    handle.discover_auxiliary().await;
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let servers = manager.resource_servers();
+    assert_eq!(servers.len(), 1);
+    let uri = manager.handles[0].auxiliary.get().unwrap().resources[0]
+        .uri
+        .clone();
+
+    // Headless (no ask channel) with explicit auxiliary allows.
+    let allowed = Some(permission_for_named_tools(&[
+        ("owned", "resources/list"),
+        ("owned", "resources/read"),
+    ]));
+    let list = ListMcpResourcesTool::new(servers.clone(), allowed.clone(), None);
+    let listing = ToolDyn::call(&list, serde_json::json!({}).to_string())
+        .await
+        .unwrap();
+    assert!(
+        listing.contains("server 'owned': 1 resource(s)"),
+        "{listing}"
+    );
+    assert!(listing.contains(&format!("- uri: {uri}")), "{listing}");
+    let read = ReadMcpResourceTool::new(servers.clone(), allowed, None);
+    let text = ToolDyn::call(
+        &read,
+        serde_json::json!({"server":"owned","uri":uri}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(text.contains("> Resource BODY 雪"), "{text}");
+
+    // A tool-call grant does not authorize resources, and headless asks fail closed.
+    let tool_only = Some(permission_for_named_tools(&[("owned", "probe")]));
+    let read = ReadMcpResourceTool::new(servers.clone(), tool_only.clone(), None);
+    let error = ToolDyn::call(
+        &read,
+        serde_json::json!({"server":"owned","uri":uri}).to_string(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("not permitted"), "{error}");
+    let list = ListMcpResourcesTool::new(servers.clone(), tool_only, None);
+    assert!(
+        ToolDyn::call(&list, serde_json::json!({}).to_string())
+            .await
+            .is_err()
+    );
+    let unknown = ToolDyn::call(
+        &ReadMcpResourceTool::new(servers, None, None),
+        serde_json::json!({"server":"other","uri":"x"}).to_string(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        unknown.contains("no connected MCP server named 'other'"),
+        "{unknown}"
+    );
+    manager.shutdown().await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
 async fn mcp_manager_connect_fills_the_auxiliary_catalogue_off_the_connect_path() {
     let fixture = FixtureBuild::compile();
     let lease = fixture.lease("auxiliary-detached");

@@ -9,6 +9,7 @@ pub(crate) mod forms;
 pub(crate) mod health;
 pub mod oauth;
 pub(crate) mod project;
+pub(crate) mod resource_tools;
 pub mod tool;
 
 use std::collections::HashMap;
@@ -449,6 +450,24 @@ impl McpClientManager {
         let mut manager = Self::with_notices(handles, notices);
         manager.health = health;
         manager
+    }
+
+    /// Connected servers that advertised the resources capability, for the
+    /// model-facing resource tools.
+    pub(crate) fn resource_servers(&self) -> Vec<resource_tools::ResourceServer> {
+        self.handles
+            .iter()
+            .filter(|handle| {
+                handle
+                    .peer()
+                    .peer_info()
+                    .is_some_and(|info| info.capabilities.resources.is_some())
+            })
+            .map(|handle| resource_tools::ResourceServer {
+                client: catalogue::RpcClient::capture(handle),
+                catalogue: handle.auxiliary.clone(),
+            })
+            .collect()
     }
 
     /// Whether any connected server announced `tools/list_changed` since its

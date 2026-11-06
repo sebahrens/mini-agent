@@ -73,6 +73,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Model-facing `list_mcp_resources` and `read_mcp_resource` tools reuse the bounded resource
+  catalogue and text-only read path under auxiliary (non-tool) permission identities, so
+  headless and autonomous runs can use resource-oriented MCP servers (mini-agent-ir8af).
 - MCP: stdio servers get the `roots` capability (`roots/list` returns the workspace root;
   remote servers get none); URL-mode elicitation shows the link for the user to open and
   answer Done/Decline; sampling stays explicitly refused and documented (mini-agent-a67h7).

@@ -45,6 +45,28 @@ not rewritten or reread. Runtime attachment selections are not imported or
 restored from saved sessions. Resource text is server-supplied data, not verified
 host-file content.
 
+## Model-facing resource tools
+
+When at least one connected server advertises the resources capability, the
+model also gets two tools (subject to `--tools` selection):
+
+- `list_mcp_resources` (optional `server`) returns the cached, bounded catalogue
+  (URI, name, MIME type, description) quoted as untrusted server metadata. It
+  sends no RPC; a server whose discovery is still pending says so.
+- `read_mcp_resource` (`server`, `uri`) performs one `resources/read` (30 s
+  bound) and returns the text quoted as untrusted reference data, under the same
+  text-only contract as `@mcp:` selections (at most 32 contents and 256 KiB;
+  binary contents refused). The URI may come from the listing or a
+  `resource_link` in a tool result; it is an opaque operand, never opened or
+  fetched locally.
+
+Both pass the same source check and cost admission as operator selections and
+are authorized under auxiliary identities distinct from remote tool names:
+policy input `mcp_tool:<server>:resources/list` / `mcp_tool:<server>:resources/read`
+with the approval identity naming the exact URI. A grant for a remote tool does
+not authorize them; headless runs need an explicit allow rule (unmatched asks
+fail closed). Prompts remain operator-only (`/mcp:<server>:<prompt>`).
+
 ## Tool-result images
 
 Successful `tools/call` results deliver PNG, JPEG, GIF and WebP image blocks and

@@ -1388,6 +1388,35 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                     search_binding.clone(),
                 )));
             }
+            // Model-facing resource tools, only when a connected server
+            // offers resources. They use auxiliary permission identities.
+            let resource_servers = manager.resource_servers();
+            if !resource_servers.is_empty() {
+                use crate::extras::mcp::resource_tools::{
+                    ListMcpResourcesTool, ReadMcpResourceTool,
+                };
+                let selected = |name: &str| {
+                    cli.tools.is_empty()
+                        || cli
+                            .tools
+                            .iter()
+                            .any(|tool| canonical_tool_name(tool) == name)
+                };
+                if selected("list_mcp_resources") {
+                    all_tools.push(Box::new(ListMcpResourcesTool::new(
+                        resource_servers.clone(),
+                        permission.clone(),
+                        ask_tx.clone(),
+                    )));
+                }
+                if selected("read_mcp_resource") {
+                    all_tools.push(Box::new(ReadMcpResourceTool::new(
+                        resource_servers,
+                        permission.clone(),
+                        ask_tx.clone(),
+                    )));
+                }
+            }
         }
 
         #[cfg(feature = "advisor")]
