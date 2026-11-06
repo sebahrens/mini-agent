@@ -2594,6 +2594,76 @@ fn late_stdin_producer_is_marked_on_machine_output_even_with_quiet() {
     assert_eq!(last["stdin_idle_secs"], 2);
 }
 
+// mini-agent-f71r6: the stream-json `system` records describe the effective
+// mode, working directory and containment, the tools the model actually has,
+// and the connection state of every configured MCP server.
+#[cfg(all(unix, feature = "mcp"))]
+#[test]
+fn stream_json_system_records_report_mode_cwd_sandbox_tools_and_mcp_status() {
+    let root = TempRoot::new();
+    let server = root.local_provider("tool_completed");
+    let binary = tested_binary();
+    let mut config = std::fs::read_to_string(root.0.join("config.toml")).unwrap();
+    config.push_str(&format!(
+        "[mcp_servers.alive]\ncommand={}\nargs=[\"--mcp-server\",\"--no-sandbox\",\"--no-context-files\",\"--no-tools\",\"--provider\",\"local-test\",\"--model\",\"test\"]\n[mcp_servers.broken]\ncommand=\"/nonexistent/mini-agent-mcp-fixture\"\n",
+        toml::Value::String(binary.to_string_lossy().into_owned())
+    ));
+    std::fs::write(root.0.join("config.toml"), config).unwrap();
+    // A non-built-in name in the allowlist keeps MCP eligible.
+    let mut command = root.provider_command("write,mcp__alive__run");
+    command.args(["-p", "--output", "stream-json", "write the file"]);
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    server.join().unwrap().unwrap();
+    assert!(output.status.success(), "{stderr}");
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let init = &rows[0];
+    assert_eq!(
+        (init["type"].as_str(), init["subtype"].as_str()),
+        (Some("system"), Some("init"))
+    );
+    assert_eq!(init["permission_mode"], "yolo", "{init}");
+    assert_eq!(
+        std::fs::canonicalize(init["cwd"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&root.0).unwrap()
+    );
+    assert_eq!(init["sandbox"]["enabled"], false, "{init}");
+    assert!(init["sandbox"]["profile"].is_string() && init["sandbox"]["network"].is_string());
+    let capabilities = rows
+        .iter()
+        .find(|row| row["subtype"] == "capabilities")
+        .expect("capabilities record");
+    assert_eq!(capabilities["session_id"], init["session_id"]);
+    let tools: Vec<&str> = capabilities["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool.as_str().unwrap())
+        .collect();
+    assert!(tools.contains(&"write"), "{tools:?}");
+    assert!(tools.contains(&"write"), "{tools:?}");
+    let servers = capabilities["mcp_servers"].as_array().unwrap();
+    let named = |name: &str| servers.iter().find(|server| server["name"] == name);
+    let alive = named("alive").expect("configured server listed");
+    assert_eq!(alive["status"], "connected");
+    assert!(alive.get("error").is_none());
+    let broken = named("broken").expect("configured server listed");
+    assert_eq!(broken["status"], "failed");
+    assert!(
+        broken["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("not connected") && !error.contains("nonexistent")),
+        "{servers:?}"
+    );
+    // The capabilities record precedes the first model-driven event.
+    let position = rows.iter().position(|row| row["subtype"] == "capabilities");
+    assert!(position < rows.iter().position(|row| row["type"] == "result"));
+}
+
 #[test]
 fn stream_json_reports_real_tool_order_usage_identity_and_terminal_failures() {
     for (outcome, ephemeral) in [

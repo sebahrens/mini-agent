@@ -468,6 +468,27 @@ until its exact join or forced process exit. Forced transport shutdown can leave
 line. An interrupted output transport cannot promise delivery of a final record. This output path
 does not change inherited blocking, append, async, or access modes.
 
+### stream-json `system` records
+
+`--output stream-json` starts with `system` records that describe the run the driver actually got.
+They are additive: unknown fields must be ignored.
+
+```json
+{"type":"system","subtype":"init","session_id":"...","session_name":"...","ephemeral":false,"provider":"anthropic","model":"claude-sonnet-5-5","cwd":"/work/repo","permission_mode":"standard","sandbox":{"enabled":true,"backend":"seatbelt","profile":"workspace","network":"deny"}}
+{"type":"system","subtype":"capabilities","session_id":"...","tools":["edit","read","write"],"mcp_servers":[{"name":"docs","status":"connected"},{"name":"db","status":"failed","error":"not connected (credential values omitted)"}]}
+```
+
+- `init` comes first. `permission_mode` is the effective mode after flags, project config and policy;
+  `sandbox` names the effective containment (`enabled`, `backend`, `profile`, `network`; no paths).
+  `stdin_abandoned` and `stdin_idle_secs` appear when a silent piped stdin was dropped (see
+  `--stdin-idle-secs`).
+- `capabilities` follows once the agent is built and MCP servers have connected, before the first model
+  request: `tools` is the sorted list of tool names the model was given, and `mcp_servers` lists every
+  configured server with a `status` of `connected`, `failed`, `timed_out`, `cancelled`, `pending`,
+  `disabled`, `not_started` (MCP was not enabled for this run, for example by `--no-tools`) or
+  `not_connected`. A non-connected server carries a bounded `error` that never contains credential values.
+  The same connection failures still go to stderr as text.
+
 Final JSON and NDJSON results include `session_id`, `session_name`, and `session_persisted`.
 IDs identify the actual selected or forked session; `--no-session` still has a logical ID but
 sets persistence false. Early input errors use null identity. The initial stream event describes

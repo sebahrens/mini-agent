@@ -2675,6 +2675,18 @@ impl Sandbox {
         self.profile
     }
 
+    /// The effective containment for machine output (`system` init record of
+    /// `-p --output stream-json`): whether it is active, the backend, the
+    /// filesystem profile and the network policy. Names only, no paths.
+    pub(crate) fn effective_summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.enabled,
+            "backend": self.backend,
+            "profile": self.profile.name(),
+            "network": self.network.name(),
+        })
+    }
+
     pub(crate) fn set_profile(&mut self, profile: SandboxProfile) -> Result<(), String> {
         if self.running_background_job_count() != 0
             || !self

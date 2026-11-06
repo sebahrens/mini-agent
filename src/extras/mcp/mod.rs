@@ -138,6 +138,22 @@ pub struct McpClientManager {
     /// retained live handles and bounded diagnostic origin rows.
     configured_count: Option<usize>,
     deferred_view: Mutex<std::sync::Weak<deferred::DiscoveryView>>,
+    /// Bounded, credential-free reason each configured server failed to
+    /// connect, kept after [`Self::take_notices`] drains the notices so
+    /// machine output can still report it (mini-agent-f71r6).
+    connect_errors: std::collections::BTreeMap<String, String>,
+}
+
+/// One configured MCP server's connection state for machine output
+/// (`system` `capabilities` record of `-p --output stream-json`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct McpServerStatus {
+    pub(crate) name: String,
+    /// `connected`, `failed`, `timed_out`, `cancelled`, `pending`,
+    /// `disabled`, `not_started` or `not_connected`.
+    pub(crate) status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
 }
 
 impl McpClientManager {
@@ -163,7 +179,75 @@ impl McpClientManager {
             origins_omitted: false,
             configured_count: None,
             deferred_view: Mutex::new(std::sync::Weak::new()),
+            connect_errors: Default::default(),
         }
+    }
+
+    /// Status rows for a run that did not start MCP at all (`--no-tools`, or a
+    /// `--tools` list that names no MCP tool).
+    pub(crate) fn not_started_statuses(
+        configured: &HashMap<String, config::McpServerConfig>,
+    ) -> Vec<McpServerStatus> {
+        let mut names: Vec<&String> = configured.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| McpServerStatus {
+                name: name.clone(),
+                status: "not_started",
+                error: Some("MCP is not enabled for this run (--no-tools or --tools)".to_owned()),
+            })
+            .collect()
+    }
+
+    /// Connection status of every configured server, sorted by name. A
+    /// failed server carries the same bounded reason the stderr notice gives,
+    /// never a credential value.
+    pub(crate) fn server_statuses(
+        &self,
+        configured: &HashMap<String, config::McpServerConfig>,
+    ) -> Vec<McpServerStatus> {
+        let health = self.health.snapshot();
+        let mut names: Vec<&String> = configured.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let enabled = configured
+                    .get(name)
+                    .is_none_or(|server| server.options().is_enabled());
+                let connected = self
+                    .handles
+                    .iter()
+                    .any(|handle| handle.server_name.as_str() == name.as_str());
+                let outcome = health
+                    .servers
+                    .get(name)
+                    .and_then(|server| server.connection)
+                    .map(|attempt| attempt.outcome);
+                let status = if !enabled {
+                    "disabled"
+                } else if connected {
+                    "connected"
+                } else {
+                    match outcome {
+                        Some(health::AttemptOutcome::Failed) => "failed",
+                        Some(health::AttemptOutcome::TimedOut) => "timed_out",
+                        Some(health::AttemptOutcome::Cancelled) => "cancelled",
+                        Some(health::AttemptOutcome::Pending) => "pending",
+                        _ if self.connect_errors.contains_key(name) => "failed",
+                        _ => "not_connected",
+                    }
+                };
+                McpServerStatus {
+                    name: name.clone(),
+                    status,
+                    error: (status != "connected")
+                        .then(|| self.connect_errors.get(name).cloned())
+                        .flatten(),
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn capture_deferred_view(&self, view: &Arc<deferred::DiscoveryView>) {
@@ -435,6 +519,7 @@ impl McpClientManager {
 
         let mut handles = Vec::with_capacity(results.len());
         let mut notices = Vec::new();
+        let mut connect_errors = std::collections::BTreeMap::new();
         for (name, result) in results {
             match result {
                 Ok(handle) => {
@@ -453,6 +538,7 @@ impl McpClientManager {
                     let detail = bounded_http::redirect_refusal(&error)
                         .map(|refusal| format!(": {refusal}"))
                         .unwrap_or_else(|| " (credential values omitted)".to_string());
+                    connect_errors.insert(name.clone(), format!("not connected{detail}"));
                     notices.push(McpNotice::error(format!(
                         "MCP server '{name}' not connected{detail}"
                     )));
@@ -461,6 +547,7 @@ impl McpClientManager {
         }
         let mut manager = Self::with_notices(handles, notices);
         manager.health = health;
+        manager.connect_errors = connect_errors;
         manager
     }
 

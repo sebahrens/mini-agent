@@ -2564,7 +2564,27 @@ impl Startup {
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
         let json_output = output.format != OutputFormat::Text;
         let identity = (self.session.id.to_string(), self.session.name.to_string());
-        let mut system = serde_json::json!({"type":"system", "session_id":identity.0, "session_name":identity.1, "ephemeral":self.cli.no_session, "provider":self.session.provider, "model":self.session.model});
+        // The effective mode and containment: project config or a policy can
+        // differ from what the caller asked for (mini-agent-f71r6).
+        let permission_mode = self
+            .permission
+            .as_ref()
+            .map(|permission| {
+                permission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .mode()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "standard".to_owned());
+        let mut system = serde_json::json!({
+            "type":"system", "subtype":"init", "session_id":identity.0,
+            "session_name":identity.1, "ephemeral":self.cli.no_session,
+            "provider":self.session.provider, "model":self.session.model,
+            "cwd":self.workspace.root().to_string_lossy(),
+            "permission_mode":permission_mode,
+            "sandbox":self.sandbox.effective_summary(),
+        });
         crate::print::annotate_stdin_abandoned(&mut system);
         output.emit_event(system).await?;
         // The `git status` baseline runs concurrently with the work that
@@ -2795,6 +2815,41 @@ impl Startup {
             let agent = agent.with_headless_turn_directive(self.headless_agent_directive.take());
             #[cfg(feature = "mcp")]
             report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
+            // What the model can actually use, and which configured MCP
+            // servers did not connect, before the first request
+            // (mini-agent-f71r6).
+            if json_output {
+                let mut tools: Vec<String> = agent
+                    .context_tool_definitions()
+                    .await
+                    .map(|definitions| {
+                        definitions
+                            .into_iter()
+                            .map(|definition| definition.name)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                tools.sort();
+                #[cfg(feature = "mcp")]
+                let mcp_servers = match (&mcp_manager, self.cfg.mcp_servers.as_ref()) {
+                    (Some(manager), Some(configured)) => manager.server_statuses(configured),
+                    // MCP did not start for this run (`--no-tools` or a
+                    // `--tools` list naming no MCP tool): say so rather than
+                    // implying the configured servers are absent.
+                    (None, Some(configured)) => {
+                        crate::extras::mcp::McpClientManager::not_started_statuses(configured)
+                    }
+                    _ => Vec::new(),
+                };
+                #[cfg(not(feature = "mcp"))]
+                let mcp_servers: Vec<serde_json::Value> = Vec::new();
+                output
+                    .emit_event(serde_json::json!({
+                        "type":"system", "subtype":"capabilities",
+                        "session_id":identity.0, "tools":tools, "mcp_servers":mcp_servers,
+                    }))
+                    .await?;
+            }
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_start();
             }

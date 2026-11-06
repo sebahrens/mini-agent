@@ -45,6 +45,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `-p --output stream-json` `system` records now describe the effective run: `init` gains `subtype`, `cwd`, `permission_mode` and `sandbox`, and a new `capabilities` record lists the model's tool names and each configured MCP server's connection status (with a credential-free error for a failed one) (mini-agent-f71r6).
 - Managed `mcp.allowed_servers` / `denied_servers` entries can be tables pinning `command` and `args` or `url`
   next to the name, so a same-named user or project server with another launch spec is refused; bare
   names keep matching by name only (mini-agent-pqeki).
