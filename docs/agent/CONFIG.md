@@ -4317,6 +4317,9 @@ open_editor = ["ctrl+x"]
 undo = ["ctrl+z"]
 ```
 
+`Ctrl+Z` suspends the TUI to the shell on Unix unless you bind it (as `undo` above does);
+see COMMANDS.md.
+
 `/keys` lists the effective action/chord map. Empty arrays disable an action;
 explicit chords must be unique. At most eight chords per action are accepted,
 with a 40-byte limit per chord. Ctrl, Alt, Shift, Super, named navigation keys,
