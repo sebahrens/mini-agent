@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `mini-agent update` now also replaces LICENSE, NOTICE, SOURCE.md and THIRD_PARTY_LICENSES under `share/doc/mini-agent` from the verified archive when that directory exists and is writable, and otherwise prints a one-line warning naming install.sh (mini-agent-uwug1).
 - TUI: Ctrl+J and a trailing backslash before Enter now insert a newline in terminals that cannot report Shift+Enter; docs name which terminals deliver Shift+Enter (mini-agent-z2sll).
 - Managed policy: `/sandbox <profile>` (the only run-time profile switch) now refuses a profile above `max_profile`
   naming the managed file (mini-agent-el299); `max_profile` also clears explicit sandbox read/write/toolchain/Windows
