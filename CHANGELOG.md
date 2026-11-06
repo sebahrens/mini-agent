@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- TUI: Ctrl+J and a trailing backslash before Enter now insert a newline in terminals that cannot report Shift+Enter; docs name which terminals deliver Shift+Enter (mini-agent-z2sll).
 - Managed policy: `/sandbox <profile>` (the only run-time profile switch) now refuses a profile above `max_profile`
   naming the managed file (mini-agent-el299); `max_profile` also clears explicit sandbox read/write/toolchain/Windows
   roots outside a new `sandbox.allowed_roots` allowance, and `allowed_hosts` caps `sandbox-network` at `allowlist`

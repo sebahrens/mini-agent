@@ -319,7 +319,8 @@ Here is some keybindings to speed up your coding experience:
 | `PgUp` / `PgDn` / `Alt+Up` / `Alt+Down` | Scroll chat a page (Shift/Ctrl+wheel too; `/top` and `/bottom` need no keys) |
 | `Home` / `End` | Start/end of the input line (empty input: jump to top/bottom) |
 | `Ctrl+Home` / `Ctrl+End` / `Alt+Shift+Up` / `Alt+Shift+Down` / `Alt+<` / `Alt+>` | Jump to top/bottom of chat |
-| `Shift+Enter` / `Alt+Enter` | Insert a newline |
+| `Shift+Enter` / `Alt+Enter` | Insert a newline (Shift+Enter needs a terminal with the kitty keyboard protocol; Terminal.app, the default VS Code terminal and plain tmux send it as Enter) |
+| `Ctrl+J` / `\` then `Enter` | Insert a newline in any terminal (see the keybindings table in [COMMANDS.md](COMMANDS.md#keybindings) for binding `newline`) |
 | `/` | Open the command picker; Tab inserts the highlight, Enter runs a command or argument typed in full |
 | `@<query>` | Open the file picker; Tab or Enter inserts the highlighted path, a space closes it |
 | `@agent:<name>` | Ask the model to delegate the request to that specialist persona through `task` (requires the `subagents` feature; see [SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent)); unknown names are refused |
