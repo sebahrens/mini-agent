@@ -175,6 +175,7 @@ Command and URL entries also accept:
 | `enabled` | `true` | `false` keeps the entry configured but never launches or connects it (startup and explicit reconnect both refuse). |
 | `enabled_tools` | omitted | Only these exact server tool names are registered. |
 | `disabled_tools` | `[]` | These exact server tool names are never registered (applied after `enabled_tools`). |
+| `parallel_read_only` | `false` | Opt in: this server's tools that advertise `readOnlyHint: true` share the parallel tool lane instead of the exclusive one, so several can run alongside reads and each other. A server's hint is its own claim, so it is ignored unless you set this. |
 
 Selection runs on each `tools/list` page before the 128-tool per-server cap, so
 the cap counts only admitted tools and a selected tool past index 128 is still

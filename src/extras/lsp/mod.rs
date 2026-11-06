@@ -296,6 +296,8 @@ pub(crate) struct DiagnosticSnapshot {
     uri: String,
     lines: Vec<String>,
     truncated: bool,
+    /// Diagnostics the cache dropped at storage time (per-file cap).
+    omitted: usize,
 }
 
 impl DiagnosticSnapshot {
@@ -783,7 +785,7 @@ impl LspManager {
             if !diagnostic_identity_is_current(&uri, &file) {
                 return None;
             }
-            format_file_diags(&file.server, &file.diagnostics)
+            format_file_diags(&file.server, &file.diagnostics, file.omitted)
         })
         .await
         .ok()
@@ -1023,6 +1025,7 @@ impl LspManager {
             uri: binding.uri.clone(),
             lines,
             truncated,
+            omitted: cached.omitted,
         })
     }
 
@@ -1036,6 +1039,9 @@ impl LspManager {
         for snapshot in entries {
             for line in &snapshot.lines {
                 out.push_str(line);
+            }
+            if snapshot.omitted > 0 && !snapshot.lines.is_empty() {
+                out.push_str(&omitted_notice(&snapshot.uri, snapshot.omitted));
             }
             if snapshot.truncated {
                 out.push_str("\n  … (truncated)");
@@ -1361,7 +1367,11 @@ fn diagnostics_timeout_notice(server: &str, wait: Duration) -> String {
 
 /// "LSP diagnostics (server):" header + one line per error/warning, capped.
 /// `None` when there is nothing worth reporting (clean edits stay silent).
-fn format_file_diags(server: &str, diags: &[lsp_types::Diagnostic]) -> Option<String> {
+fn format_file_diags(
+    server: &str,
+    diags: &[lsp_types::Diagnostic],
+    omitted: usize,
+) -> Option<String> {
     let mut sorted: Vec<_> = diags
         .iter()
         .filter(|d| d.severity <= Some(DiagnosticSeverity::WARNING))
@@ -1378,7 +1388,20 @@ fn format_file_diags(server: &str, diags: &[lsp_types::Diagnostic]) -> Option<St
         }
         out.push_str(&format_diag_line("", d));
     }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "\n  … {omitted} more diagnostics not shown (server published more than the {} kept per file)",
+            client::MAX_DIAGNOSTICS_PER_FILE
+        ));
+    }
     Some(out)
+}
+
+fn omitted_notice(uri: &str, omitted: usize) -> String {
+    let name = client::file_path(uri)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "file".to_string());
+    format!("\n  … {omitted} more diagnostics not shown for {name}")
 }
 
 fn format_diag_line(location_prefix: &str, d: &lsp_types::Diagnostic) -> String {

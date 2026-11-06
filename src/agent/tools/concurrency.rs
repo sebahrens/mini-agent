@@ -27,12 +27,27 @@ enum ToolAccess {
     /// (or await its change notification), so they share the lane. `stop`
     /// mutates a job and stays exclusive, as does any unparseable request.
     JobStatus,
+    /// `task`: the default explorer persona is read-only, so such calls share
+    /// the lane and several can overlap. Any `agent_type` (a persona may be
+    /// `mode: write`), `resume` (the stored child may be a write persona) or
+    /// worktree option keeps the exclusive lease.
+    Task,
+    /// `git`: only the inspection operations share the lane.
+    Git,
 }
 
 fn access_for(name: &str) -> ToolAccess {
     match name {
         "read" | "grep" | "find_files" | "list_dir" | "todo_read" | "memory_read"
         | "memory_search" | "advisor" | "skills_search" => ToolAccess::Read,
+        // Semantic navigation only queries the server. Its document sync is
+        // serialized per document inside the LSP client, and it never edits.
+        "lsp_navigate" => ToolAccess::Read,
+        // Resource listing/reading is read-only on the MCP side and each call
+        // is permission-checked under its own auxiliary identity.
+        "list_mcp_resources" | "read_mcp_resource" | "task_evidence" => ToolAccess::Read,
+        "task" => ToolAccess::Task,
+        "git" => ToolAccess::Git,
         // Network-only: each call is independently permission-checked and
         // DNS-bounded, and the only local effect is a private per-call spill.
         // `lsp_diagnostics` stays exclusive: it syncs documents into the
@@ -59,6 +74,31 @@ fn access_for_call(access: ToolAccess, args: &str) -> ToolAccess {
             match action {
                 Some(None) => ToolAccess::Read,
                 Some(Some(Some(action))) if matches!(action.as_str(), "poll" | "wait" | "list") => {
+                    ToolAccess::Read
+                }
+                _ => ToolAccess::Write,
+            }
+        }
+        ToolAccess::Task => {
+            let Ok(serde_json::Value::Object(map)) = serde_json::from_str(args) else {
+                return ToolAccess::Write;
+            };
+            let absent = |key: &str| map.get(key).is_none_or(serde_json::Value::is_null);
+            if ["agent_type", "resume", "isolation", "base_ref"]
+                .iter()
+                .all(|key| absent(key))
+            {
+                ToolAccess::Read
+            } else {
+                ToolAccess::Write
+            }
+        }
+        ToolAccess::Git => {
+            let operation = serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|value| value.get("operation")?.as_str().map(str::to_owned));
+            match operation.as_deref() {
+                Some("status" | "diff" | "log" | "show" | "branches" | "stash_list") => {
                     ToolAccess::Read
                 }
                 _ => ToolAccess::Write,
@@ -153,9 +193,17 @@ struct ConcurrencyBoundTool {
 }
 
 impl ConcurrencyBoundTool {
-    fn new(inner: Box<dyn ToolDyn>, lane: Arc<RwLock<()>>) -> Self {
+    fn new(
+        inner: Box<dyn ToolDyn>,
+        lane: Arc<RwLock<()>>,
+        shared_names: &std::collections::HashSet<String>,
+    ) -> Self {
         let name = inner.name();
-        let access = access_for(&name);
+        let access = if shared_names.contains(&name) {
+            ToolAccess::Read
+        } else {
+            access_for(&name)
+        };
         Self {
             inner,
             lane,
@@ -167,7 +215,7 @@ impl ConcurrencyBoundTool {
     async fn lease(&self, args: &str) -> Arc<LaneSlot> {
         let lease = match access_for_call(self.access, args) {
             ToolAccess::Read => Lease::Shared(Arc::clone(&self.lane).read_owned().await),
-            ToolAccess::Write | ToolAccess::JobStatus => {
+            ToolAccess::Write | ToolAccess::JobStatus | ToolAccess::Task | ToolAccess::Git => {
                 Lease::Exclusive(Arc::clone(&self.lane).write_owned().await)
             }
         };
@@ -286,11 +334,26 @@ impl ToolDyn for ConcurrencyBoundTool {
 }
 
 pub(crate) fn bind(tools: Vec<Box<dyn ToolDyn>>) -> Vec<Box<dyn ToolDyn>> {
+    bind_with_shared(tools, &std::collections::HashSet::new())
+}
+
+/// [`bind`] with extra tool names that take a shared lease. Used for MCP
+/// tools whose server is configured `parallel_read_only` and which advertise
+/// `readOnlyHint`; the set is empty (everything unknown stays exclusive)
+/// unless the user opted a server in.
+pub(crate) fn bind_with_shared(
+    tools: Vec<Box<dyn ToolDyn>>,
+    shared_names: &std::collections::HashSet<String>,
+) -> Vec<Box<dyn ToolDyn>> {
     let lane = Arc::new(RwLock::new(()));
     tools
         .into_iter()
         .map(|tool| {
-            Box::new(ConcurrencyBoundTool::new(tool, Arc::clone(&lane))) as Box<dyn ToolDyn>
+            Box::new(ConcurrencyBoundTool::new(
+                tool,
+                Arc::clone(&lane),
+                shared_names,
+            )) as Box<dyn ToolDyn>
         })
         .collect()
 }
@@ -405,6 +468,136 @@ mod tests {
         let _ = joined.await.unwrap();
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
         assert_eq!(access_for("lsp_diagnostics"), ToolAccess::Write);
+    }
+
+    #[test]
+    fn access_table_for_parallel_safe_tools() {
+        for (name, args, expected) in [
+            ("task", r#"{"prompts":["a"]}"#, ToolAccess::Read),
+            (
+                "task",
+                r#"{"prompts":["a"],"agent_type":null}"#,
+                ToolAccess::Read,
+            ),
+            (
+                "task",
+                r#"{"briefs":[{"objective":"x"}]}"#,
+                ToolAccess::Read,
+            ),
+            (
+                "task",
+                r#"{"prompts":["a"],"agent_type":"impl"}"#,
+                ToolAccess::Write,
+            ),
+            (
+                "task",
+                r#"{"prompts":["a"],"resume":"c1"}"#,
+                ToolAccess::Write,
+            ),
+            (
+                "task",
+                r#"{"prompts":["a"],"isolation":"worktree"}"#,
+                ToolAccess::Write,
+            ),
+            (
+                "task",
+                r#"{"prompts":["a"],"base_ref":"main"}"#,
+                ToolAccess::Write,
+            ),
+            ("task", "not json", ToolAccess::Write),
+            ("task", "[]", ToolAccess::Write),
+            ("git", r#"{"operation":"status"}"#, ToolAccess::Read),
+            (
+                "git",
+                r#"{"operation":"diff","paths":["a"]}"#,
+                ToolAccess::Read,
+            ),
+            ("git", r#"{"operation":"log"}"#, ToolAccess::Read),
+            ("git", r#"{"operation":"show"}"#, ToolAccess::Read),
+            (
+                "git",
+                r#"{"operation":"commit","message":"m"}"#,
+                ToolAccess::Write,
+            ),
+            (
+                "git",
+                r#"{"operation":"restore","paths":["a"]}"#,
+                ToolAccess::Write,
+            ),
+            ("git", r#"{"operation":"stage"}"#, ToolAccess::Write),
+            ("git", r#"{"operation":7}"#, ToolAccess::Write),
+            ("git", "{}", ToolAccess::Write),
+            ("git", "not json", ToolAccess::Write),
+            ("lsp_navigate", "{}", ToolAccess::Read),
+            ("list_mcp_resources", "{}", ToolAccess::Read),
+            ("read_mcp_resource", "{}", ToolAccess::Read),
+            ("task_evidence", "{}", ToolAccess::Read),
+            // Default closed: unknown and MCP-looking names stay exclusive.
+            ("some_mcp_tool", "{}", ToolAccess::Write),
+            ("lsp_diagnostics", "{}", ToolAccess::Write),
+            ("shell", "{}", ToolAccess::Write),
+        ] {
+            assert_eq!(
+                access_for_call(access_for(name), args),
+                expected,
+                "{name} {args}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_shares_only_when_named_in_the_opt_in_set() {
+        // Default closed: without the opt-in set the tool serializes.
+        for (opted_in, expected_max) in [(false, 1), (true, 2)] {
+            let (first, entered, release, maximum) = probe("srv_tool");
+            let mut second = first.clone();
+            second.entered = Arc::clone(&entered);
+            second.release = Arc::clone(&release);
+            let shared = if opted_in {
+                std::collections::HashSet::from(["srv_tool".to_owned()])
+            } else {
+                std::collections::HashSet::new()
+            };
+            let tools = bind_with_shared(vec![Box::new(first), Box::new(second)], &shared);
+            let joined = tokio::spawn(async move {
+                let one = tools[0].call("{}".to_owned());
+                let two = tools[1].call("{}".to_owned());
+                tokio::join!(one, two)
+            });
+            entered.notified().await;
+            let second_started =
+                tokio::time::timeout(std::time::Duration::from_millis(100), entered.notified())
+                    .await
+                    .is_ok();
+            assert_eq!(second_started, opted_in);
+            release.notify_waiters();
+            // Let a serialized second call start and finish.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            release.notify_waiters();
+            let _ = joined.await.unwrap();
+            assert_eq!(maximum.load(Ordering::SeqCst), expected_max);
+        }
+    }
+
+    #[tokio::test]
+    async fn two_default_task_calls_overlap_but_persona_tasks_do_not() {
+        let (first, entered, release, maximum) = probe("task");
+        let mut second = first.clone();
+        second.entered = Arc::clone(&entered);
+        second.release = Arc::clone(&release);
+        let tools = bind(vec![Box::new(first), Box::new(second)]);
+        let joined = tokio::spawn(async move {
+            let one = tools[0].call(r#"{"prompts":["a"]}"#.to_owned());
+            let two = tools[1].call(r#"{"prompts":["b"]}"#.to_owned());
+            tokio::join!(one, two)
+        });
+        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("second read-only task must start while the first runs");
+        release.notify_waiters();
+        let _ = joined.await.unwrap();
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -241,7 +241,7 @@ impl Tool for LspNavigateTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Semantic code navigation through the project's language server. `op`: definition, type_definition, implementation, references (need `line` and `column`, 1-based, pointing at the symbol), hover (type/docs at that position), symbols (outline of `path`), workspace_symbols (search by `query`; `path` selects the language server). Returns workspace-relative `path:line:column` locations (1-based), capped at 100.".to_string()
+        "Semantic code navigation through the project's language server. `op`: definition, type_definition, implementation, references (need `line` and `column`, 1-based, pointing at the symbol), hover (type/docs at that position), symbols (outline of `path`), workspace_symbols (search by `query`; `path` selects the language server). Returns workspace-relative `path:line:column` locations (1-based), capped at 100. Definitions in dependencies or the standard library come back as absolute paths marked `(outside workspace)`; open them with `read` (subject to read permission).".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -353,9 +353,35 @@ impl Tool for LspNavigateTool {
                 // rule hides the location rather than naming the file.
                 let deny = super::walk_deny_filter(&self.permission, "read", Some(&root));
                 let mut denied = 0usize;
+                let mut outside = outside;
                 let mut lines = Vec::new();
                 for item in items {
-                    if deny.as_ref().is_some_and(|deny| deny(&item.path, false)) {
+                    if item.external {
+                        // A location the server placed outside the workspace
+                        // (dependency or standard library source) is named by
+                        // its absolute path only when the `read` rules do not
+                        // deny it, so the model can then `read` it under the
+                        // ordinary permission flow. Nothing is read here.
+                        if item.path.starts_with(&root) {
+                            outside += 1;
+                            continue;
+                        }
+                        let allowed = match (&self.permission, item.path.to_str()) {
+                            (_, None) => false,
+                            (None, Some(_)) => true,
+                            (Some(permission), Some(path)) => !matches!(
+                                permission
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .check_path("read", path),
+                                crate::permission::checker::CheckResult::Denied(_)
+                            ),
+                        };
+                        if !allowed {
+                            denied += 1;
+                            continue;
+                        }
+                    } else if deny.as_ref().is_some_and(|deny| deny(&item.path, false)) {
                         denied += 1;
                         continue;
                     }
@@ -366,7 +392,10 @@ impl Tool for LspNavigateTool {
                         .display()
                         .to_string()
                         .replace('\\', "/");
-                    let location = format!("{shown}:{}:{}", item.line + 1, item.character + 1);
+                    let mut location = format!("{shown}:{}:{}", item.line + 1, item.character + 1);
+                    if item.external {
+                        location.push_str(" (outside workspace)");
+                    }
                     lines.push(match item.label {
                         Some(label) => {
                             format!("{}{label} — {location}", "  ".repeat(item.depth))

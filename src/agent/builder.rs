@@ -1250,6 +1250,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let mut mcp_hook_identities = std::collections::HashMap::new();
         #[cfg(feature = "mcp")]
         let mut deferred_metadata = std::collections::HashMap::new();
+        // MCP tools that may share the parallel lane (opt-in per server and
+        // only with `readOnlyHint: true`).
+        #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
+        let mut parallel_mcp_names = std::collections::HashSet::<String>::new();
         #[cfg(feature = "mcp")]
         let mut catalogue_fingerprint = sha2::Sha256::new();
 
@@ -1445,6 +1449,18 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                         ),
                     );
                 }
+                if t.definition
+                    .annotations
+                    .as_ref()
+                    .is_some_and(|a| a.read_only_hint == Some(true))
+                    && cfg
+                        .mcp_servers
+                        .as_ref()
+                        .and_then(|servers| servers.get(t.server_name.as_str()))
+                        .is_some_and(|server| server.options().parallel_read_only)
+                {
+                    parallel_mcp_names.insert(rig::tool::ToolDyn::name(&t));
+                }
                 #[cfg(feature = "hooks")]
                 mcp_hook_identities.insert(
                     rig::tool::ToolDyn::name(&t),
@@ -1575,7 +1591,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let all_tools =
             crate::extras::hooks::wrap_from_global(all_tools, permission.clone(), ask_tx.clone());
 
-        let all_tools = tools::concurrency::bind(all_tools);
+        let all_tools = tools::concurrency::bind_with_shared(all_tools, &parallel_mcp_names);
 
         #[cfg(feature = "mcp")]
         let all_tools = {

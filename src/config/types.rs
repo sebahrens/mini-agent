@@ -55,6 +55,14 @@ pub struct SubagentPolicy {
     /// Child evidence stores kept per session (default 64, at most 1024).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_max_children: Option<usize>,
+    /// Child conversations kept for `task {"resume": id}` (default 16, at
+    /// most 256). The oldest is dropped first and the drop is reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_resume_max_children: Option<usize>,
+    /// Serialized size above which a child is not resumable (default 8 MiB,
+    /// at most 256 MiB). A larger child gets a host note instead of an id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_resume_max_bytes: Option<usize>,
 }
 
 #[cfg(feature = "subagents")]

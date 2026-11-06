@@ -3785,9 +3785,13 @@ locations (1-based). Only files inside the session workspace can be queried;
 the file is checked against the `read` policy (rules written for `read`
 apply, as for `lsp_diagnostics`) and synchronized from disk before the
 request. Result locations are mapped back through the same URI translation
-as diagnostics: locations outside the workspace or through symlink aliases
-are counted but never named, and files hidden by a `read` deny rule are
-counted as hidden. Results are capped at 100 locations/symbols (excess is
+as diagnostics. A location outside the workspace (dependency or standard
+library source) is listed by its canonical absolute path and marked
+`(outside workspace)` when it is an existing regular file the `read` rules do
+not deny, so it can be opened with `read` under the normal permission flow;
+denied ones are counted as hidden, and non-file URIs, missing files and paths
+with control characters are counted but never named. Symlink aliases of
+workspace files are counted but never named. Results are capped at 100 locations/symbols (excess is
 reported with a count), hover text at 8 KiB (marked when truncated), and
 each request at 10 seconds. An op the server does not advertise in its
 `initialize` capabilities (for example no `implementationProvider`) fails
@@ -3910,7 +3914,7 @@ enabled = "auto"          # omitted also means auto; false disables, true is exp
 [lsp.servers.rust]          # override a built-in default
 command = "rust-analyzer"
 extensions = [".rs"]
-inherit_env = ["PATH"]      # named parent values only
+inherit_env = ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"]  # named parent values only; replaces the built-in list (PATH, HOME, XDG_*, GOPATH, GOCACHE, CARGO_HOME, VIRTUAL_ENV, ...)
 
 [lsp.servers.myserver]      # fully custom server
 command = "my-ls"
@@ -3959,7 +3963,10 @@ Behavior notes:
   cooldown. The watcher sleeps until the deadline and does not poll.
 - The child environment is cleared. `inherit_env` delegates named parent
   values and `env` supplies explicit values; explicit values win. Built-ins
-  delegate only `PATH` so they can find project toolchains.
+  delegate `PATH`, `HOME`, `XDG_*`, temp dirs and non-secret toolchain
+  variables (`GOPATH`, `GOCACHE`, `GOMODCACHE`, `GOFLAGS`, `CARGO_HOME`,
+  `RUSTUP_HOME`, `VIRTUAL_ENV`, `JAVA_HOME`) so they find project toolchains
+  and caches; setting `inherit_env` on a server replaces that list.
 - Omitting `sandbox` explicitly trusts the configured workspace service. A
   requested backend fails closed when unavailable. `network = "deny"` starts
   only when that backend can enforce network denial; it never falls back to an
@@ -4289,6 +4296,12 @@ contract entirely and returns the child's text verbatim.
 `evidence_max_child_bytes` (16777216) and `evidence_max_children` (64) bound
 the host-recorded child evidence store; see
 [Evidence handles](SUBAGENTS.md#evidence-handles) for ceilings and effects.
+
+`[subagents] task_resume_max_children` (default 16, at most 256) and
+`task_resume_max_bytes` (default 8388608, at most 256 MiB) bound the in-memory
+child conversations that `task {"resume": id}` can continue. A child over the
+byte limit is reported with a `child not resumable` host note instead of an id,
+and dropping the oldest child to stay within the count is reported too.
 
 ### Hook event parity
 

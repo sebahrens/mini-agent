@@ -234,6 +234,21 @@ fn main() {
                 let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
                 writeln!(file, "{body}").unwrap();
             }
+            if mode.starts_with("flood-") {
+                let uri = body.split_once("\"uri\":").unwrap().1.split('"').nth(1).unwrap();
+                let version: i64 = body.split_once("\"version\":").unwrap().1
+                    .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+                let count: usize = mode["flood-".len()..].parse().unwrap();
+                // Warnings first, one error last: a correct cap keeps the error.
+                let items: Vec<String> = (0..count).map(|i| {
+                    let severity = if i + 1 == count { 1 } else { 2 };
+                    format!("{{\"range\":{{\"start\":{{\"line\":{i},\"character\":0}},\"end\":{{\"line\":{i},\"character\":1}}}},\"severity\":{severity},\"message\":\"flood item {i} version {version}\"}}")
+                }).collect();
+                write_frame(&mut stdout, &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{uri}\",\"version\":{version},\"diagnostics\":[{}]}}}}",
+                    items.join(",")
+                ));
+            }
             if mode == "save-diagnostics" || mode == "delayed-diagnostics" {
                 let uri = body.split_once("\"uri\":").unwrap().1.split('"').nth(1).unwrap();
                 let version: i64 = body.split_once("\"version\":").unwrap().1
@@ -295,8 +310,10 @@ fn main() {
             let result = if body.contains("textDocument/definition") {
                 format!("{{\"uri\":\"{uri}\",\"range\":{}}}", range(2, 4))
             } else if body.contains("textDocument/references") {
+                let outside = env::var("LSP_FIXTURE_OUTSIDE_URI")
+                    .unwrap_or_else(|_| "file:///nonexistent-outside/lib.rs".to_string());
                 format!(
-                    "[{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"file:///nonexistent-outside/lib.rs\",\"range\":{}}}]",
+                    "[{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"{uri}\",\"range\":{}}},{{\"uri\":\"{outside}\",\"range\":{}}}]",
                     range(0, 3), range(5, 0), range(1, 1)
                 )
             } else if body.contains("textDocument/hover") {
@@ -1303,6 +1320,37 @@ async fn lsp_process_did_save_delivers_save_only_diagnostics_to_edit_results() {
 }
 
 #[tokio::test]
+async fn lsp_process_oversized_publish_is_truncated_and_keeps_server_alive() {
+    let fixture = FixtureBuild::compile("flood-publish");
+    for (count, omitted) in [(51_usize, 1_usize), (500, 450)] {
+        let mode = format!("flood-{count}");
+        let (written, edited) = write_then_edit_with_fixture(&fixture, &mode, |server| {
+            server.wait_ms = Some(10_000);
+        })
+        .await;
+        // Both the first publish (write) and the second (edit) must arrive:
+        // the second proves the same server connection survived the first.
+        let written = written.unwrap();
+        let edited = edited.unwrap();
+        for (label, output, version) in [("write", &written, 1), ("edit", &edited, 2)] {
+            assert!(
+                output.contains(&format!("flood item {} version {version}", count - 1)),
+                "{count}/{label}: the error must survive the cap: {output}"
+            );
+            assert!(
+                output.contains(&format!("{omitted} more diagnostics not shown")),
+                "{count}/{label}: {output}"
+            );
+            assert!(
+                !output.contains("timed out") && !output.contains("no diagnostics received"),
+                "{count}/{label}: {output}"
+            );
+        }
+    }
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
 async fn lsp_process_configured_wait_admits_slow_publish_and_timeout_is_reported() {
     let fixture = FixtureBuild::compile("slow-publish");
     // Publishes 3 s after each sync: beyond the 1 s default. The window is
@@ -1456,6 +1504,79 @@ async fn lsp_process_navigate_tool_maps_locations_and_respects_read_denies() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn lsp_process_navigate_names_outside_workspace_locations_subject_to_read_rules() {
+    use crate::agent::tools::lsp::{LspNavigateArgs, LspNavigateTool};
+    let fixture = FixtureBuild::compile("navigate-outside");
+    let workspace = fixture.workspace("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("src/nav.rs"),
+        "struct Outer;\nfn inner() {}\n",
+    )
+    .unwrap();
+    let dependency = fixture.path("deps/lib.rs");
+    fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+    fs::write(&dependency, "pub fn dep() {}\n").unwrap();
+    let dependency = dependency.canonicalize().unwrap();
+    let mut server = fixture.config("navigate", &fixture.path("navigate-outside.lease"));
+    server.extensions = vec![".rs".into()];
+    server.env.insert(
+        "LSP_FIXTURE_OUTSIDE_URI".into(),
+        file_uri(&dependency).unwrap(),
+    );
+    let manager = LspManager::new(
+        &LspConfig {
+            servers: HashMap::from([("fixture".into(), server)]),
+            ..Default::default()
+        },
+        Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+    );
+    let args = || LspNavigateArgs {
+        op: "references".into(),
+        path: "src/nav.rs".into(),
+        line: Some(1),
+        column: Some(1),
+        query: None,
+    };
+    let open = LspNavigateTool::new(manager.clone(), None, None)
+        .call(args())
+        .await
+        .unwrap();
+    let permission = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                read: Some(crate::permission::ToolPerm::Granular(
+                    [("**/deps/**".to_string(), crate::permission::Action::Deny)].into(),
+                )),
+                ..Default::default()
+            }),
+            crate::permission::SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["guarded".into(), "standard".into()]),
+        )
+        .unwrap(),
+    ));
+    let guarded = LspNavigateTool::new(manager.clone(), Some(permission), None)
+        .call(args())
+        .await
+        .unwrap();
+    manager.shutdown().await;
+    drop(manager);
+    fixture.cleanup().await;
+    let expected = format!("{}:2:2 (outside workspace)", dependency.display());
+    assert!(open.contains(&expected), "{open}");
+    assert!(!open.contains("outside the workspace omitted"), "{open}");
+    assert!(
+        !guarded.contains(&dependency.display().to_string()),
+        "{guarded}"
+    );
+    assert!(
+        guarded.contains("[1 results hidden by permission rules]"),
+        "{guarded}"
+    );
+}
+
 #[tokio::test]
 async fn lsp_process_permission_wait_rejects_leaf_and_parent_symlink_retargets() {
     use crate::agent::tools::lsp::{LspArgs, LspTool};
