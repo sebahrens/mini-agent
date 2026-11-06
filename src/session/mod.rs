@@ -3989,7 +3989,10 @@ mod truncated_output_format_tests {
     /// The original char-iterator formulation the byte-slicing one must equal.
     fn reference(output: &str, output_chars: usize, notice: &str) -> String {
         let head: String = output.chars().take(TOOL_RESULT_HEAD_CHARS).collect();
-        let tail_start = output_chars.saturating_sub(TOOL_RESULT_TAIL_CHARS);
+        // The tail never repeats characters already shown in the head.
+        let tail_start = output_chars
+            .saturating_sub(TOOL_RESULT_TAIL_CHARS)
+            .max(TOOL_RESULT_HEAD_CHARS.min(output_chars));
         let tail: String = output.chars().skip(tail_start).collect();
         let omitted = output_chars.saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
         format!(

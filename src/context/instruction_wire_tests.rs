@@ -1294,8 +1294,10 @@ async fn context63_actual_read_edit_and_notebook_consumers_require_accepted_noti
             if name == "notebook_edit" {
                 let after: Value = serde_json::from_str(&after).unwrap();
                 assert_eq!(after["cells"][0]["source"], json!(["after\n"]));
-                assert_eq!(after["cells"][0]["execution_count"], 8);
-                assert_eq!(after["cells"][0]["outputs"][0]["text"], "saved-output");
+                // Replacing a code cell clears its stale outputs and count
+                // (mini-agent-mnhpz); other notebook state is untouched.
+                assert_eq!(after["cells"][0]["execution_count"], Value::Null);
+                assert_eq!(after["cells"][0]["outputs"], json!([]));
                 assert_eq!(after["metadata"]["opaque"], "retained");
                 assert!(!fixture.tracker.permits_full_overwrite(
                     &target.to_string_lossy(),
