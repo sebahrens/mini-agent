@@ -900,6 +900,22 @@ pub struct Config {
     /// event to a model. Default false: they load but never run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks_model_enabled: Option<bool>,
+    /// `type: "mcp_tool"` hooks may call any tool of their server without a
+    /// per-call prompt. Default false: only tools the server marks
+    /// `readOnlyHint: true` are callable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_mcp_tool_unprompted: Option<bool>,
+    /// `type: "agent"` hooks may read workspace files (read-only, bounded)
+    /// and send their text to the model. Default false: verdict without tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_agent_read_files: Option<bool>,
+    /// Added skill directories (like `--add-dir`): each is searched for
+    /// `.claude/skills` and `.agents/skills`. Default none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_extra_dirs: Option<Vec<String>>,
+    /// Plugin directories: each is searched for `skills/`. Default none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_plugin_dirs: Option<Vec<String>>,
     /// Let PermissionRequest hooks answer approvals (allow once / deny).
     /// Default false: they only observe.
     #[serde(skip_serializing_if = "Option::is_none")]

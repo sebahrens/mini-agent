@@ -34,6 +34,17 @@ It does not reveal stored source or tests and cannot install, approve, activate,
 Queries are non-empty and limited to 8 KiB. Instruction selection is adopted only from the intact final
 successful host tool result; a redacted or spilled result cannot silently install an instruction candidate.
 
+### Added directories and plugin roots
+
+Beyond the workspace roots (`.mini-agent/skills`, `.claude/skills`, `.agents/skills`, then the
+nested directories between the launch directory and the workspace root, then `~/.claude/skills`
+and `~/.agents/skills`), `--add-dir DIR` (repeatable) and `skills_extra_dirs` add DIR's
+`.claude/skills` and `.agents/skills`, and `skills_plugin_dirs` add `<plugin>/skills`. They are
+off by default, rank below every other root for name clashes (added dirs before plugins), carry
+user authority with the normal read-permission check, and cannot be set by an untrusted project
+config. Discovery from the launch directory up to the workspace root covers monorepo packages;
+skills are not re-scanned per touched file.
+
 ### Selection limits and the always-visible catalog
 
 Each turn injects at most `skills_max_selected` (default 3, at most 16) Agent Skills whose

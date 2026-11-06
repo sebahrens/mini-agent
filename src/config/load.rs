@@ -4309,6 +4309,27 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    fn hook_and_skill_root_opt_ins_are_never_benign_project_keys() {
+        for key in [
+            "hooks_mcp_tool_enabled",
+            "hooks_mcp_tool_unprompted",
+            "hooks_model_enabled",
+            "hooks_agent_read_files",
+            "skills_extra_dirs",
+            "skills_plugin_dirs",
+        ] {
+            assert!(
+                !super::BENIGN_PROJECT_CONFIG_KEYS.contains(&key),
+                "{key} must need project trust"
+            );
+        }
+        let config = crate::config::Config::default();
+        assert!(config.hooks_mcp_tool_unprompted.is_none());
+        assert!(config.hooks_agent_read_files.is_none());
+        assert!(config.skills_extra_dirs.is_none());
+    }
+
+    #[test]
     fn project_statusline_without_git_status_segments_stays_benign() {
         let (_root, _, sensitive) = split_project_override(
             "[[statusline.lines]]\n\

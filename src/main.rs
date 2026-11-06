@@ -632,7 +632,21 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     }
     let version_changed = docs::ensure_global()?;
     #[cfg(feature = "agent-skills")]
-    extras::skills::index::AgentSkillSearchPolicy::configure(&cfg);
+    {
+        extras::skills::index::AgentSkillSearchPolicy::configure(&cfg);
+        let path_list = |list: &Option<Vec<String>>| -> Vec<std::path::PathBuf> {
+            list.iter()
+                .flatten()
+                .map(std::path::PathBuf::from)
+                .collect()
+        };
+        let mut add_dirs = path_list(&cfg.skills_extra_dirs);
+        add_dirs.extend(cli.add_dir.iter().cloned());
+        extras::skills::session::configure_extra_roots(
+            add_dirs,
+            path_list(&cfg.skills_plugin_dirs),
+        );
+    }
     // ── Hooks: load settings.json config, apply trust, install dispatcher ──
     // Done this early (before provider/API-key resolution) so `--hooks-test`
     // is a pure config/dispatch dry run that needs no API key and makes no
@@ -642,6 +656,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         crate::extras::hooks::set_http_hooks_enabled(cfg.hooks_http_enabled.unwrap_or(false));
         crate::extras::hooks::backend::set_mcp_tool_hooks_enabled(
             cfg.hooks_mcp_tool_enabled.unwrap_or(false),
+        );
+        crate::extras::hooks::backend::set_mcp_tool_hooks_unprompted(
+            cfg.hooks_mcp_tool_unprompted.unwrap_or(false),
+        );
+        crate::extras::hooks::backend::set_agent_hook_reads(
+            cfg.hooks_agent_read_files.unwrap_or(false),
         );
         crate::extras::hooks::backend::set_model_hooks_enabled(
             cfg.hooks_model_enabled.unwrap_or(false),

@@ -758,6 +758,10 @@ Accepted top-level keys:
 | `hooks_mcp_tool_enabled` | boolean | Allow `type: "mcp_tool"` hook handlers to call a tool on a connected MCP server. Default: `false` (they load but never run). Requires `hooks` and `mcp`. See [Prompt, agent and MCP tool handlers](#prompt-agent-and-mcp-tool-handlers). |
 | `hooks_model_enabled` | boolean | Allow `type: "prompt"` and `"agent"` hook handlers to send the hook event to a model. Default: `false` (they load but never run). Requires `hooks`. See [Prompt, agent and MCP tool handlers](#prompt-agent-and-mcp-tool-handlers). |
 | `hooks_permission_decisions` | boolean | Let `PermissionRequest` hooks answer a pending approval with allow (once) or deny, including in headless runs. Default: `false` (observe only). Requires `hooks`. See [Hook event parity](#hook-event-parity). |
+| `hooks_mcp_tool_unprompted` | boolean | Let `mcp_tool` hooks call any tool of their server without a per-call prompt. Default: `false`: a hook may only call a tool the server annotates `readOnlyHint: true` (and not `destructiveHint: true`). Needs `hooks_mcp_tool_enabled`. Needs project trust when set in a project file. |
+| `hooks_agent_read_files` | boolean | Let `agent` hooks read workspace files and send their text to the model. Default: `false` (tool-free verdict). Needs `hooks_model_enabled`. Needs project trust when set in a project file. |
+| `skills_extra_dirs` | string array | Added skill directories (like `--add-dir DIR`, repeatable): each is searched for `.claude/skills` and `.agents/skills`. Default: none. Lowest-precedence roots, user authority, read-permission checked, at most 16. Needs project trust when set in a project file. |
+| `skills_plugin_dirs` | string array | Plugin directories: each is searched for `skills/` (`<plugin>/skills/<name>/SKILL.md`). Default: none. Same rules as `skills_extra_dirs`. |
 | `skills_max_selected` | integer | Agent Skills injected per turn by prompt relevance. Default: `3` (at most 16). Requires `agent-skills`. See [SKILLS.md](SKILLS.md#selection-limits-and-the-always-visible-catalog). |
 | `skills_score_floor` | number | Minimum relevance score for automatic Agent Skill selection, 0.0–1.0. Default: `0.20`. |
 | `skills_catalog_bytes` | integer | Bytes of an always-visible name/description catalog of every authorized skill in the skill context. Default: `0` (off); at most 65,536. |
@@ -1253,7 +1257,9 @@ prompt and model are shown in the project-hook approval prompt; `command`, `args
   read like a command hook's stdout after exit 0, an error result like a non-zero exit, a missing or
   closed server as a failure. `${a.b.c}` inside `input` string values is replaced by that path of the
   event JSON (nothing else is evaluated). The call is made by operator-authored, trust-approved
-  configuration and does not prompt per call. The server is resolved by name among the servers
+  configuration and does not prompt per call, so by default (`hooks_mcp_tool_unprompted` unset) the
+  tool must be listed by the server with `readOnlyHint: true`; any other tool, an unlisted tool or a
+  failed lookup is refused. Set `hooks_mcp_tool_unprompted = true` to allow any tool. The server is resolved by name among the servers
   connected in this process, so give servers distinct names when several ACP sessions run.
 - `prompt` and `agent` need `hooks_model_enabled = true`, which sends the event JSON to a model
   provider. The handler's text is the instruction; `$ARGUMENTS` is replaced by the event (bounded
@@ -1261,9 +1267,13 @@ prompt and model are shown in the project-hook approval prompt; `command`, `args
   `{"ok": true|false, "reason": "..."}`: `false` blocks through the event's normal block path, an
   unparseable reply is a failure. The model is the startup model (or `model`, a quick-model name or a
   model of that provider); usage is attributed to the current run. Default timeouts: 30 s (`prompt`),
-  60 s (`agent`). The `agent` type is currently a tool-free, single-turn verdict: it cannot read files
-  or run tools, so it can never change anything, but it also cannot investigate like Claude Code's
-  agent hook.
+  60 s (`agent`). By default the `agent` type is a tool-free verdict. With
+  `hooks_agent_read_files = true` it becomes a read-only investigator: it may answer
+  `{"read": "relative/path"}` up to 5 times (32 KiB per file, UTF-8 text) before giving its verdict.
+  Reads go through the workspace capability (no `..`, absolute paths or symlinks, regular files only)
+  and refuse `.git`, `.env*`, `.ssh`, `.aws`, key/pem files and names containing `secret` or
+  `credential`. File text is sent to the model as untrusted data. It has no write, shell or network
+  tools. The model is still the startup model, not live `/model` switches.
 
 ### Events
 

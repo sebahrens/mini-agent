@@ -177,6 +177,14 @@ pub struct Cli {
     pub input_format: Option<InputFormat>,
 
     #[arg(
+        long = "add-dir",
+        value_name = "DIR",
+        action = clap::ArgAction::Append,
+        help = "Also discover Agent Skills in DIR/.claude/skills and DIR/.agents/skills; repeatable (adds to skills_extra_dirs)"
+    )]
+    pub add_dir: Vec<std::path::PathBuf>,
+
+    #[arg(
         short = 'i',
         long = "image",
         value_name = "FILE",
