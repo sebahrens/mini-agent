@@ -4455,7 +4455,11 @@ impl AnyAgent {
             let turn = dispatch!(&inner, prompt, history);
             let turn = match fallback_input {
                 Some((route, prompt, history)) if fallback_eligible(&turn) => {
-                    match self.fallback_agent(&inner, &route) {
+                    #[cfg(feature = "agent-skills")]
+                    let primary_inner: &AnyAgentInner = &inner;
+                    #[cfg(not(feature = "agent-skills"))]
+                    let primary_inner: &AnyAgentInner = inner;
+                    match self.fallback_agent(primary_inner, &route) {
                         Some(fallback) => {
                             let notice = route.notice(&self.inner.model_id(), &turn);
                             tracing::warn!("{notice}");
