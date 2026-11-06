@@ -1,4 +1,5 @@
 mod accept;
+mod client_fs;
 mod commands;
 pub mod config;
 mod cron;
@@ -967,6 +968,9 @@ struct AcpState {
     /// the operator explicitly trusts them.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     client_mcp: ClientMcpPolicy,
+    /// Operator opt-in (`acp_client_file_access`) plus the file capabilities
+    /// the client advertised; closed by default.
+    client_fs: client_fs::ClientFsGate,
     #[cfg(test)]
     prompt_fixture: Option<PromptFixture>,
     #[cfg(test)]
@@ -1449,6 +1453,7 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
     #[cfg(feature = "subagents")]
     init_acp_subagents(&cli, &cfg);
 
+    let cfg_client_file_access = cfg.acp_client_file_access == Some(true);
     let state = Arc::new(AcpState {
         idle: idle::Idle::new(
             cli.idle_exit_secs
@@ -1470,6 +1475,7 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
             is_tcp,
             std::env::var(ACP_TRUST_CLIENT_MCP_ENV).is_ok_and(|value| value == "1"),
         ),
+        client_fs: client_fs::ClientFsGate::new(cfg_client_file_access),
         #[cfg(test)]
         prompt_fixture: None,
         #[cfg(test)]
@@ -1719,11 +1725,12 @@ fn receive_cancel(state: &AcpState, session_id: &SessionId) -> Option<u64> {
 // --- Request Handlers ---
 
 async fn handle_initialize(
-    _req: InitializeRequest,
+    req: InitializeRequest,
     responder: Responder<InitializeResponse>,
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let _activity = state.idle.admit()?;
+    state.client_fs.record(&req.client_capabilities);
     let caps = acp_capabilities();
 
     let resp = InitializeResponse::new(acp_protocol_version())
@@ -2753,6 +2760,8 @@ fn spawn_turn(
         registration,
         hook_lease,
     } = snapshot;
+    // Closed unless the operator opted in and the client advertised it.
+    let read_tracker = read_tracker.with_client_fs(state.client_fs.handle(&cx, &session_id));
 
     control.attach_sandbox(sandbox.clone());
 
@@ -7046,6 +7055,7 @@ mod protocol_tests {
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
             client_mcp: ClientMcpPolicy::Sandboxed,
+            client_fs: Default::default(),
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -7075,6 +7085,7 @@ mod protocol_tests {
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
             client_mcp: ClientMcpPolicy::Sandboxed,
+            client_fs: Default::default(),
             prompt_fixture: None,
             runner_fixture: Some(runner_fixture),
             #[cfg(feature = "mcp")]
@@ -7103,6 +7114,7 @@ mod protocol_tests {
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
             client_mcp: ClientMcpPolicy::Sandboxed,
+            client_fs: Default::default(),
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -7144,6 +7156,7 @@ mod protocol_tests {
             shell_search_path: Some(std::ffi::OsString::from("bin")),
             hook_roots: None,
             client_mcp: ClientMcpPolicy::Sandboxed,
+            client_fs: Default::default(),
             prompt_fixture: None,
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -11903,6 +11916,7 @@ brainstorm = "no-such-quick-model"
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
             client_mcp: ClientMcpPolicy::Sandboxed,
+            client_fs: Default::default(),
             prompt_fixture: Some(fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]

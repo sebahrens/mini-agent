@@ -296,6 +296,27 @@ impl Tool for ReadTool {
 }
 
 impl ReadTool {
+    /// The connected client's text for a workspace-bound regular file, when the
+    /// client file seam is open and the client has the file. Called only after
+    /// the authority checks; `None` means read the file from disk.
+    async fn client_text(
+        &self,
+        workspace: Option<&std::sync::Arc<crate::paths::WorkspaceBinding>>,
+        relative: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Option<String> {
+        let client = self.read_tracker.client_fs.as_ref()?;
+        let workspace = workspace?;
+        if !metadata.is_file() {
+            return None;
+        }
+        super::client_fs::read_client_text(
+            client,
+            &super::client_fs::client_path(workspace, relative),
+        )
+        .await
+    }
+
     async fn read_inner(
         &self,
         args: ReadArgs,
@@ -612,6 +633,12 @@ impl ReadTool {
                 }
                 _ => return Err(not_utf8(&path)),
             }
+        } else if let Some(text) = self.client_text(bound_workspace, relative, &metadata).await {
+            // The editor holds this file: serve its live text (unsaved changes
+            // included). The path already passed the workspace, symlink and
+            // permission checks above; the client only supplies its text.
+            let len = text.len() as u64;
+            (Box::pin(std::io::Cursor::new(text.into_bytes())), len, None)
         } else {
             (Box::pin(reader), metadata.len(), None)
         };
